@@ -10,7 +10,9 @@ import torch
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
+from stockagent.training.linear_runner import run_training_linear
 from stockagent.training.trainer import run_training
+from stockagent.training.xgboost_runner import run_training_xgboost
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +39,13 @@ def main() -> None:
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
-    results = run_training(panel, folds, config, args.output_dir, resume=args.resume)
+    model_name = config.training.model_name.strip().lower()
+    if model_name == "xgboost":
+        results = run_training_xgboost(panel, folds, config, args.output_dir)
+    elif model_name in {"ridge", "elasticnet"}:
+        results = run_training_linear(panel, folds, config, args.output_dir, model_name=model_name)
+    else:
+        results = run_training(panel, folds, config, args.output_dir, resume=args.resume)
 
     summary_path = Path(args.output_dir) / "summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

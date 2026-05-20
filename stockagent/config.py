@@ -56,6 +56,8 @@ class TrainingConfig:
     batch_mode: str
     non_blocking_transfer: bool
     model_name: str = "mlp"
+    num_layers: int = 1
+    residual_norm: bool = True
     enable_torch_compile: bool = False
     chunk_rows: int = 0
     lookback: int = 1
@@ -75,6 +77,19 @@ class TrainingConfig:
     num_workers: int = 0
     weight_decay: float = 1e-5
     loss_type: str = "mse"  # "mse" or "sharpe"
+    xgb_n_estimators: int = 600
+    xgb_max_depth: int = 6
+    xgb_learning_rate: float = 0.05
+    xgb_subsample: float = 0.8
+    xgb_colsample_bytree: float = 0.8
+    xgb_reg_lambda: float = 1.0
+    ridge_alpha: float = 1.0
+    ridge_fit_intercept: bool = True
+    elasticnet_alpha: float = 1.0
+    elasticnet_l1_ratio: float = 0.5
+    elasticnet_fit_intercept: bool = True
+    elasticnet_max_iter: int = 2000
+    elasticnet_tol: float = 1e-4
 
 
 @dataclass(slots=True)
@@ -114,6 +129,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     training = raw.setdefault("training", {})
     training.setdefault("model_name", "mlp")
+    training.setdefault("num_layers", 1)
+    training.setdefault("residual_norm", True)
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
     training.setdefault("batch_size_train", training.get("batch_size", 32))
@@ -133,6 +150,19 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("num_workers", 0)
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("loss_type", "mse")
+    training.setdefault("xgb_n_estimators", 600)
+    training.setdefault("xgb_max_depth", 6)
+    training.setdefault("xgb_learning_rate", 0.05)
+    training.setdefault("xgb_subsample", 0.8)
+    training.setdefault("xgb_colsample_bytree", 0.8)
+    training.setdefault("xgb_reg_lambda", 1.0)
+    training.setdefault("ridge_alpha", 1.0)
+    training.setdefault("ridge_fit_intercept", True)
+    training.setdefault("elasticnet_alpha", 1.0)
+    training.setdefault("elasticnet_l1_ratio", 0.5)
+    training.setdefault("elasticnet_fit_intercept", True)
+    training.setdefault("elasticnet_max_iter", 2000)
+    training.setdefault("elasticnet_tol", 1e-4)
 
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)

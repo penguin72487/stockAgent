@@ -4,7 +4,9 @@ from typing import Callable
 
 from stockagent.config import ExperimentConfig
 from stockagent.models.base import PortfolioModel
+from stockagent.models.gru import CrossSectionalGRU
 from stockagent.models.mlp import CrossSectionalMLP
+from stockagent.models.transformer import CrossSectionalTransformer
 
 ModelBuilder = Callable[[ExperimentConfig, int, int], PortfolioModel]
 
@@ -16,11 +18,39 @@ def _build_mlp(config: ExperimentConfig, num_features: int, num_symbols: int) ->
         num_symbols=num_symbols,
         hidden_dim=config.training.hidden_dim,
         dropout=config.training.dropout,
+        num_layers=config.training.num_layers,
+        residual_norm=config.training.residual_norm,
+    )
+
+
+def _build_transformer(config: ExperimentConfig, num_features: int, num_symbols: int) -> PortfolioModel:
+    return CrossSectionalTransformer(
+        lookback=config.training.lookback,
+        num_features=num_features,
+        num_symbols=num_symbols,
+        hidden_dim=config.training.hidden_dim,
+        dropout=config.training.dropout,
+        num_layers=config.training.num_layers,
+        residual_norm=config.training.residual_norm,
+    )
+
+
+def _build_gru(config: ExperimentConfig, num_features: int, num_symbols: int) -> PortfolioModel:
+    return CrossSectionalGRU(
+        lookback=config.training.lookback,
+        num_features=num_features,
+        num_symbols=num_symbols,
+        hidden_dim=config.training.hidden_dim,
+        dropout=config.training.dropout,
+        num_layers=config.training.num_layers,
+        residual_norm=config.training.residual_norm,
     )
 
 
 MODEL_REGISTRY: dict[str, ModelBuilder] = {
+    "gru": _build_gru,
     "mlp": _build_mlp,
+    "transformer": _build_transformer,
 }
 
 
