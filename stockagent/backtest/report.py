@@ -354,3 +354,48 @@ def plot_equity_curve_log(
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
+
+
+def plot_fold_first_year_returns(
+    fold_ids: list[int],
+    first_years: list[int],
+    strategy_first_year_log_returns: list[float],
+    baseline_first_year_log_returns: list[float],
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot single-chart yearly cumulative return (chained) from fold first test years."""
+    if not fold_ids:
+        return
+
+    per_year: dict[int, tuple[float, float]] = {}
+    for _, year, strat_log, base_log in sorted(
+        zip(fold_ids, first_years, strategy_first_year_log_returns, baseline_first_year_log_returns),
+        key=lambda item: item[1],
+    ):
+        # If multiple folds map to the same first-year, keep the latest one in sorted order.
+        per_year[int(year)] = (float(strat_log), float(base_log))
+
+    years = sorted(per_year.keys())
+    strat_logs = np.array([per_year[y][0] for y in years], dtype=np.float64)
+    base_logs = np.array([per_year[y][1] for y in years], dtype=np.float64)
+
+    strat_nav = np.exp(np.cumsum(strat_logs))
+    base_nav = np.exp(np.cumsum(base_logs))
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(years, strat_nav, marker="o", linewidth=2.2, label="Strategy")
+    ax.plot(years, base_nav, marker="o", linewidth=2.2, label="Baseline")
+    ax.set_xticks(years)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Cumulative NAV (log scale, start=1)")
+    ax.set_title("Walkforward First-Test-Year Cumulative NAV (Chained by Year)")
+    ax.set_yscale("log")
+    ax.axhline(y=1.0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend()
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
