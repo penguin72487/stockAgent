@@ -46,6 +46,10 @@ class TrainingConfig:
     non_blocking_transfer: bool
     lookback: int = 1
     batch_size: int = 32
+    min_batch_size: int = 1
+    auto_batch_size: bool = False
+    vram_budget_gb: float = 8.0
+    vram_safety_margin_gb: float = 1.0
     epochs: int = 1000
     learning_rate: float = 1e-3
     hidden_dim: int = 1024
@@ -80,6 +84,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training = raw.setdefault("training", {})
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
+    training.setdefault("min_batch_size", 1)
+    training.setdefault("auto_batch_size", False)
+    training.setdefault("vram_budget_gb", 8.0)
+    training.setdefault("vram_safety_margin_gb", 1.0)
     training.setdefault("epochs", 10)
     training.setdefault("learning_rate", 1e-3)
     training.setdefault("hidden_dim", 128)
