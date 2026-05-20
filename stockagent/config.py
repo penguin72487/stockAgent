@@ -47,6 +47,7 @@ class TrainingConfig:
     target: str
     batch_mode: str
     non_blocking_transfer: bool
+    model_name: str = "mlp"
     enable_torch_compile: bool = False
     chunk_rows: int = 0
     lookback: int = 1
@@ -94,6 +95,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward.setdefault("require_future_test_year", True)
 
     training = raw.setdefault("training", {})
+    training.setdefault("model_name", "mlp")
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
     training.setdefault("batch_size_train", training.get("batch_size", 32))
