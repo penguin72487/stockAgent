@@ -19,6 +19,8 @@ data:
 
 walk_forward:
   min_train_years: 1
+  val_years: 1
+  require_future_test_year: false
 
 trading:
   frequency: daily
@@ -42,6 +44,10 @@ training:
   num_workers: 16
   weight_decay: 0.00001
   loss_type: sharpe
+  min_batch_size: 1
+  auto_batch_size: false
+  vram_budget_gb: 8.0
+  vram_safety_margin_gb: 1.0
 
 evaluation:
   primary_baseline: universe_average_return
@@ -52,3 +58,5 @@ evaluation:
     - max_drawdown
     - turnover
     - excess_return_vs_universe_average
+  gamma_sharpe: 1.0
+  gamma_turnover: 0.1
