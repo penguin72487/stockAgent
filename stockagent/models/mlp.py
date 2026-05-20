@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from stockagent.models.base import PortfolioModel
 
@@ -25,9 +26,12 @@ class CrossSectionalMLP(PortfolioModel):
         self.num_symbols = num_symbols
         self.embedding_dim = embedding_dim
         self.lookback = lookback
+        self.num_features = num_features
+        # Tensor Core GEMM is most efficient when K dimension is a multiple of 8.
+        self.padded_num_features = ((num_features + 7) // 8) * 8
 
         # Feature embedding shared across timesteps.
-        self.feature_embedding = nn.Linear(num_features, embedding_dim)
+        self.feature_embedding = nn.Linear(self.padded_num_features, embedding_dim)
 
         # Pure-MLP temporal projection (flatten lookback dimension).
         self.temporal_mlp = nn.Sequential(
@@ -55,9 +59,12 @@ class CrossSectionalMLP(PortfolioModel):
         Returns:
             weights: [B, S]
         """
-        B, lookback, S, F = x.shape
+        B, lookback, S, feat_dim = x.shape
         x = x.permute(0, 2, 1, 3)  # [B, S, lookback, F]
-        x = x.reshape(B * S, lookback, F)  # [B*S, lookback, F]
+        x = x.reshape(B * S, lookback, feat_dim)  # [B*S, lookback, F]
+
+        if self.padded_num_features > feat_dim:
+            x = F.pad(x, (0, self.padded_num_features - feat_dim), mode="constant", value=0.0)
 
         # Feature embedding
         x = self.feature_embedding(x)  # [B*S, lookback, embedding_dim]

@@ -21,7 +21,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback + 1} dates.")
 
         returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-        tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
+        # Tradable mask should only reflect same-day availability, not future label existence.
+        tradable = panel.tradable_mask
 
         # Cache tensors once to avoid per-item numpy copies.
         self.features_t = torch.from_numpy(panel.features)
