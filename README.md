@@ -24,6 +24,13 @@ Multi-asset Taiwan stock trading research workspace.
 - Runner defaults are centralized in `configs/runner.env`.
 - Outputs include one folder per walk-forward fold and a top-level `summary.json`.
 
+## Yahoo Finance 台股股票與 ETF OHLCV 下載
+
+- 安裝依賴後可用 `python download_yahoo_tw_ohlcv.py --output-dir data_yahoo_tw_ohlcv` 另存一份 Yahoo Finance 台股資料。
+- 腳本會從 TWSE/OTC 清單整理四位數代碼（股票 + ETF），轉成 Yahoo 的 `.TW` / `.TWO` 代碼後平行下載 2000-01-01 到今天的 OHLCV。
+- 每檔股票輸出成一個 parquet 檔，例如 `2330_features.parquet`，欄位為 `date/open/max/min/close/Trading_Volume`。
+- 可用 `--workers 8` 控制平行度，或用 `--symbols 2330 6488` 先做小範圍驗證。
+
 ## Environment
 
 - Conda or mamba environment: `fintech`

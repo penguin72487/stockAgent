@@ -12,10 +12,10 @@ environment:
   target_vram_fraction: 0.7
 
 data:
-  parquet_root: data_parquet
-  benchmark_name: universe_average_return
-  benchmark_required: false
-  benchmark_source: derived_from_panel
+  parquet_root: data_yahoo_tw_ohlcv
+  benchmark_name: "0050"
+  benchmark_required: true
+  benchmark_source: symbol_ohlcv
   universe_mode: all_daily_symbols
 
 walk_forward:
@@ -43,19 +43,19 @@ training:
   backend: pytorch
   model_name: MLP
   num_layers: 2
-  residual_norm: true
+  residual_norm: false
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
-  non_blocking_transfer: true
+  non_blocking_transfer: false
   lookback: 1
   batch_size: 1024
   batch_size_train: 1024
   batch_size_eval: 1024
   epochs: 1000
   learning_rate: 0.001
-  hidden_dim: 1024
-  dropout: 0.2
-  num_workers: 8
+  hidden_dim: 512
+  dropout: 0.1
+  num_workers: 28
   weight_decay: 0.00001
   loss_type: sharpe
   xgb_n_estimators: 600
@@ -78,7 +78,7 @@ training:
   target_vram_fraction: 0.7
 
 evaluation:
-  primary_baseline: universe_average_return
+  primary_baseline: "0050"
   metrics:
     - cumulative_return
     - annualized_return

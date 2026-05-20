@@ -25,7 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from stockagent.backtest.report import (
-    compute_god_mode_returns,
     compute_metrics,
     generate_annual_report,
     plot_annual_performance,
@@ -1446,18 +1445,14 @@ def run_training(
             with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
                 json.dump(asdict(fold_result), f, indent=2)
 
-            god_returns = compute_god_mode_returns(
-                test_returns.numpy(),
-                test_masks.numpy(),
-            )
             _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
-            report = generate_annual_report(test_bt, test_dates, god_returns=god_returns)
+            report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
 
-            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png", god_returns=god_returns)
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png", god_returns=god_returns)
+            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
             _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 
