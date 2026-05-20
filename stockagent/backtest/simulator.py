@@ -283,6 +283,8 @@ def run_backtest_integer_shares(
 
     if execution_mode == "intraday_next_open" and open_matrix is None:
         raise ValueError("intraday_next_open mode requires open_prices")
+    if execution_mode == "overnight_tplus2" and close_matrix is None:
+        raise ValueError("overnight_tplus2 mode requires close_prices (raw close)")
 
     strategy_returns = np.zeros(t_len, dtype=np.float32)
     turnovers = np.zeros(t_len, dtype=np.float32)
@@ -395,7 +397,8 @@ def run_backtest_integer_shares(
                 )
                 continue
 
-            close_t = close_matrix[t] if close_matrix is not None else np.ones(n_symbols, dtype=np.float64)
+            # T+2 模式使用當日原始 close 價格做整股買賣張數計算。
+            close_t = close_matrix[t]
             tradable_today = m[t] & np.isfinite(close_t) & (close_t > 1e-12)
 
             if pending_settlement[t] > 0.0:
@@ -466,17 +469,18 @@ def run_backtest_integer_shares(
             weights_history[t] = (close_holdings.astype(np.float64) * close_t / total_equity_now).astype(np.float32)
 
             day_rows: list[HoldingsRecord] = []
-            day_rows.append(
-                HoldingsRecord(
-                    date=date_text[t],
-                    symbol="CASH",
-                    shares=0,
-                    price=1.0,
-                    market_value=float(cash),
-                    holding_ratio=float(cash / total_equity_now),
-                    is_cash=True,
+            if cash > 0.0:
+                day_rows.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol="CASH",
+                        shares=0,
+                        price=1.0,
+                        market_value=float(cash),
+                        holding_ratio=float(cash / total_equity_now),
+                        is_cash=True,
+                    )
                 )
-            )
             if receivable > 0.0:
                 day_rows.append(
                     HoldingsRecord(
@@ -492,6 +496,8 @@ def run_backtest_integer_shares(
             nonzero = np.flatnonzero(close_holdings > 0)
             for idx in nonzero.tolist():
                 mv = float(close_holdings[idx] * close_t[idx])
+                if mv <= 0.0:
+                    continue
                 day_rows.append(
                     HoldingsRecord(
                         date=date_text[t],

@@ -10,4 +10,5 @@ flash-attn>=2.5
 xformers>=0.0.24
 xgboost>=2.0
 scikit-learn>=1.4
+yfinance>=0.2.65
 

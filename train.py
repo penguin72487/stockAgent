@@ -4,7 +4,9 @@ import argparse
 import json
 from dataclasses import asdict
 from pathlib import Path
+import re
 
+import numpy as np
 import torch
 
 from stockagent.config import load_config
@@ -20,11 +22,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="configs/experiment_baseline.yaml", help="Path to experiment config")
     parser.add_argument("--output-dir", default="artifacts", help="Directory for training outputs")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume from fold checkpoints when available")
+    parser.add_argument(
+        "--start-fold",
+        type=int,
+        default=3,
+        help="Skip folds before this id (default: 3). Use 1 to run all folds.",
+    )
     return parser.parse_args()
+
+
+def _extract_symbol_code(name: str) -> str | None:
+    text = (name or "").strip().upper()
+    if re.fullmatch(r"\d{4}", text):
+        return text
+    match = re.search(r"(\d{4})", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _apply_benchmark_override(panel, benchmark_name: str, benchmark_required: bool) -> None:
+    # Keep current universe benchmark unless user explicitly points to a symbol like 0050.
+    if benchmark_name.strip().lower() in {"universe_average_return", "derived_from_panel", "universe_average"}:
+        return
+
+    code = _extract_symbol_code(benchmark_name)
+    if code is None:
+        if benchmark_required:
+            raise ValueError(f"Unsupported benchmark_name: {benchmark_name}")
+        print(f"[benchmark] unsupported benchmark_name={benchmark_name}, fallback to universe average")
+        return
+
+    symbol_index = {symbol: idx for idx, symbol in enumerate(panel.symbols)}
+    idx = symbol_index.get(code)
+    if idx is None:
+        if benchmark_required:
+            raise ValueError(f"Benchmark symbol {code} not found in panel symbols")
+        print(f"[benchmark] symbol {code} not found, fallback to universe average")
+        return
+
+    returns = np.nan_to_num(panel.returns_1d[:, idx], nan=0.0, posinf=0.0, neginf=0.0)
+    tradable = panel.tradable_mask[:, idx].astype(bool)
+    panel.benchmark_returns = np.where(tradable, returns, 0.0).astype(np.float32)
+    print(f"[benchmark] using symbol {code} as benchmark ({int(tradable.sum())} tradable days)")
 
 
 def main() -> None:
     args = parse_args()
+    if args.start_fold < 1:
+        raise ValueError("--start-fold must be >= 1")
+
     config = load_config(args.config)
     if config.environment.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
@@ -33,12 +80,18 @@ def main() -> None:
             "Please run on a GPU-enabled environment."
         )
     panel = build_panel(config.data.parquet_root)
+    _apply_benchmark_override(panel, config.data.benchmark_name, config.data.benchmark_required)
+
     folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
+    folds = [fold for fold in folds if fold.fold_id >= args.start_fold]
+    if not folds:
+        raise ValueError(f"No folds available after applying --start-fold {args.start_fold}")
+
     model_name = config.training.model_name.strip().lower()
     if model_name == "xgboost":
         results = run_training_xgboost(panel, folds, config, args.output_dir)
