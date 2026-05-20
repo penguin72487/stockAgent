@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from dataclasses import asdict, dataclass
@@ -13,6 +14,14 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+# ✅ OPTIMIZATION: Configure logging for training monitoring
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger(__name__)
 
 from stockagent.backtest.report import compute_metrics, generate_annual_report, plot_annual_performance, plot_equity_curve, plot_equity_curve_log
 from stockagent.backtest.simulator import BacktestResultTensor, run_backtest_torch
@@ -303,9 +312,11 @@ def _train_epoch(
     model.train()
     total_loss = 0.0
     steps = 0
+    
     for batch in loader:
         batch = _move_batch(batch, device, non_blocking)
         optimizer.zero_grad(set_to_none=True)
+        
         with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
             weights = model(batch["x"], batch["tradable_mask"])
             loss = sharpe_aware_loss(
@@ -316,11 +327,33 @@ def _train_epoch(
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
+        
         scaler.scale(loss).backward()
+        
+        # ✅ OPTIMIZATION: Monitor gradient norms for training stability
+        grad_norm = 0.0
+        for param in model.parameters():
+            if param.grad is not None:
+                grad_norm += param.grad.data.norm(2).item() ** 2
+        grad_norm = grad_norm ** 0.5
+        
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
+        
         total_loss += float(loss.detach().cpu())
         steps += 1
+        
+        # ✅ OPTIMIZATION: Log VRAM usage every 10 steps
+        if steps % 10 == 0 and device.type == "cuda":
+            vram_gb = torch.cuda.memory_allocated(device) / 1e9
+            vram_reserved_gb = torch.cuda.memory_reserved(device) / 1e9
+            logger.info(
+                f"Step {steps} | Loss {loss:.6f} | GradNorm {grad_norm:.4f} | "
+                f"VRAM {vram_gb:.2f}GB/{vram_reserved_gb:.2f}GB"
+            )
+    
     return total_loss / max(steps, 1)
 
 
