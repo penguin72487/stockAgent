@@ -29,3 +29,4 @@ Multi-asset Taiwan stock trading research workspace.
 - Conda or mamba environment: `fintech`
 - Training target: CUDA with Tensor Core acceleration
 - Recommended activation command: `mamba activate fintech`
+mamba env export -n fintech --no-builds > fintech_environment.yml
