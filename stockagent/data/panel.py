@@ -200,11 +200,20 @@ def build_panel(parquet_root: str | Path) -> PanelData:
 
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # ✅ FIXED: Feature standardization (z-score normalization)
+    # Compute mean and std across all dates and symbols
+    features_mean = np.mean(features, axis=(0, 1), keepdims=True)  # [1, 1, F]
+    features_std = np.std(features, axis=(0, 1), keepdims=True) + 1e-8  # [1, 1, F]
+    features_normalized = (features - features_mean) / features_std
+    features_normalized = np.nan_to_num(features_normalized, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    print(f"[panel] feature normalization: mean={features_mean.squeeze().mean():.6f}, std={features_std.squeeze().mean():.6f}")
+
     panel = PanelData(
         dates=np.array(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
         feature_names=feature_columns,
-        features=features,
+        features=features_normalized,  # Use normalized features
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
         alive_mask=alive_mask,

@@ -190,4 +190,5 @@ __marimo__/
 data_parquet/*
 artifacts/*
 *.7z
+artifacts_test/*
 

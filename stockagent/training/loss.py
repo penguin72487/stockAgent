@@ -37,7 +37,7 @@ def sharpe_aware_loss(
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
 ) -> Tensor:
-    """Optimized Sharpe-aware loss with gradient flow and numerical stability."""
+    """Improved Sharpe-aware loss with numerically stable gradient flow."""
     mask_f = tradable_mask.to(dtype=weights.dtype)
     masked_weights = weights * mask_f
     weight_sum = masked_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
@@ -54,13 +54,23 @@ def sharpe_aware_loss(
     turnover = (normalized_weights - prev_weights).abs().sum(dim=1)
     turnover_cost = (turnover * fee_per_side).mean()
 
-    # Improved Sharpe: numerically stable
+    # ✅ FIXED: Improved Sharpe with stable gradients
+    # Epsilon is added inside the square root to prevent gradient explosion
     mean_return = gross_returns.mean()
     centered = gross_returns - mean_return
-    variance = (centered ** 2).mean().clamp_min(1e-8)
-    std_return = torch.sqrt(variance)
+    variance = (centered ** 2).mean()
+    
+    eps = 1e-8
+    std_return = torch.sqrt(variance + eps)  # Epsilon inside sqrt for stable gradients
     annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights.dtype))
-    sharpe = mean_return / std_return * annualizer
+    
+    # Clamp Sharpe to prevent extreme values
+    sharpe = torch.clamp(
+        mean_return / std_return * annualizer,
+        min=-10.0,
+        max=10.0
+    )
     
     # Composite loss
-    return -gamma_sharpe * sharpe + gamma_turnover * turnover_cost
+    loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_cost
+    return loss

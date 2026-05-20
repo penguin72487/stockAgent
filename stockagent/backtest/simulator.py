@@ -64,20 +64,24 @@ def _vectorized_backtest_torch(
     tradable_mask: torch.Tensor,
     fee_per_side: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # ✅ FIXED: Simplified and more numerically stable weight normalization
     weights_history = weights.float().clone()
+    
+    # Step 1: Mask non-tradable symbols
     weights_history = weights_history.masked_fill(~tradable_mask.bool(), 0.0)
-
-    weight_sums = weights_history.sum(dim=1, keepdim=True)
-    nonzero = weight_sums.squeeze(1) > 0
-    safe_sums = weight_sums.clamp_min(1e-12)
-    weights_history[nonzero] = weights_history[nonzero] / safe_sums[nonzero]
-
+    
+    # Step 2: Normalize weights (simplified logic)
+    weight_sums = weights_history.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    weights_history = weights_history / weight_sums  # Direct broadcast normalization
+    
+    # Step 3: Compute turnover
     prev = torch.cat(
-        [torch.zeros((1, weights_history.size(1)), dtype=weights_history.dtype, device=weights_history.device), weights_history[:-1]],
+        [torch.zeros_like(weights_history[:1]), weights_history[:-1]],
         dim=0,
     )
     turnovers = (weights_history - prev).abs().sum(dim=1)
 
+    # Step 4: Compute strategy returns
     gross = (weights_history * future_returns.float()).sum(dim=1)
     strategy_returns = gross - fee_per_side * turnovers
     return strategy_returns.float(), turnovers.float(), weights_history.float()

@@ -82,6 +82,109 @@ def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
     raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
 
 
+def find_optimal_batch_size(
+    model: nn.Module,
+    sample_loader: DataLoader,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    target_vram_fraction: float = 0.85,
+    vram_budget_gb: float = 12.0,
+) -> int:
+    """
+    ✅ Binary search to find maximum safe batch size.
+    
+    Args:
+        model: Model to test
+        sample_loader: DataLoader with samples
+        device: GPU device
+        amp_dtype: Mixed precision dtype
+        target_vram_fraction: Target VRAM utilization (0.85 = 85%)
+        vram_budget_gb: Total VRAM budget in GB
+    
+    Returns:
+        Maximum safe batch size
+    """
+    if device.type != 'cuda':
+        return len(sample_loader.dataset)
+    
+    # Get a single sample to estimate memory
+    model.eval()
+    test_batch = next(iter(sample_loader))
+    test_batch = _move_batch(test_batch, device, non_blocking=True)
+    
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    
+    with torch.inference_mode():
+        with autocast(device_type='cuda', enabled=True, dtype=amp_dtype):
+            _ = model(test_batch["x"], test_batch["tradable_mask"])
+    
+    single_sample_bytes = torch.cuda.max_memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    
+    max_batch_size = len(sample_loader.dataset)
+    target_bytes = int(vram_budget_gb * 1024**3 * target_vram_fraction)
+    estimated_max = max(1, target_bytes // max(single_sample_bytes, 1))
+    
+    # Binary search
+    low, high = 1, min(estimated_max, max_batch_size)
+    best_batch_size = 1
+    
+    print(f"  [batch search] single sample: {single_sample_bytes/1024**2:.1f}MB, target: {target_bytes/1024**3:.1f}GB, range: [{low}, {high}]")
+    
+    while low <= high:
+        mid = (low + high) // 2
+        
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+            
+            # Create temporary loader for testing
+            temp_loader = DataLoader(
+                sample_loader.dataset,
+                batch_size=mid,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+            )
+            
+            model.train()
+            test_batch = next(iter(temp_loader))
+            test_batch = _move_batch(test_batch, device, non_blocking=True)
+            
+            with autocast(device_type='cuda', enabled=True, dtype=amp_dtype):
+                logits = model(test_batch["x"], test_batch["tradable_mask"])
+                loss = sharpe_aware_loss(
+                    logits,
+                    test_batch["future_log_returns"],
+                    test_batch["tradable_mask"],
+                    fee_per_side=0.0,
+                )
+            
+            loss.backward()
+            used_memory = torch.cuda.max_memory_allocated()
+            
+            if used_memory <= target_bytes:
+                best_batch_size = mid
+                low = mid + 1
+                print(f"  ✅ batch_size {mid}: {used_memory/1024**3:.1f}GB OK")
+            else:
+                high = mid - 1
+                print(f"  ❌ batch_size {mid}: {used_memory/1024**3:.1f}GB exceeds")
+            
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                high = mid - 1
+                print(f"  ❌ batch_size {mid}: OOM")
+            else:
+                raise
+    
+    print(f"  [batch search] final result: {best_batch_size}")
+    return best_batch_size
+
+
 def _build_loader(dataset: CrossSectionalDataset, batch_size: int, shuffle: bool, config: ExperimentConfig, device: torch.device) -> DataLoader:
     workers = config.training.num_workers
     loader_kwargs: dict = {
@@ -371,37 +474,31 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 training_mode=False,
             )
 
-            train_batch_size = _budget_batch_size(
-                dataset_size=len(train_ds),
-                requested_cap=config.training.batch_size,
-                budget_bytes=effective_budget_bytes,
-                static_bytes=train_static_bytes,
-                sample_bytes=train_sample_bytes,
-                min_batch_size=min_batch_size,
+            # ✅ FIXED: Use binary search for adaptive batch size
+            # Create a temporary model for batch size search
+            temp_model = CrossSectionalMLP(
+                lookback=config.training.lookback,
+                num_features=len(panel.feature_names),
+                num_symbols=panel.num_symbols,
+                hidden_dim=config.training.hidden_dim,
+                dropout=config.training.dropout,
+            ).to(device)
+            
+            # Binary search for training batch size
+            print(f"[Fold {fold.fold_id}] searching optimal train batch size...")
+            temp_train_loader = _build_loader(train_ds, 1, False, config, device)
+            train_batch_size = find_optimal_batch_size(
+                model=temp_model,
+                sample_loader=temp_train_loader,
+                device=device,
+                amp_dtype=amp_dtype,
+                target_vram_fraction=0.85,
+                vram_budget_gb=config.training.vram_budget_gb,
             )
-            val_batch_size = _budget_batch_size(
-                dataset_size=len(val_ds),
-                requested_cap=config.training.batch_size,
-                budget_bytes=effective_budget_bytes,
-                static_bytes=eval_static_bytes,
-                sample_bytes=eval_sample_bytes,
-                min_batch_size=1,
-            )
-            test_batch_size = _budget_batch_size(
-                dataset_size=len(test_ds),
-                requested_cap=config.training.batch_size,
-                budget_bytes=effective_budget_bytes,
-                static_bytes=eval_static_bytes,
-                sample_bytes=eval_sample_bytes,
-                min_batch_size=1,
-            )
-
-            print(
-                f"[Fold {fold.fold_id}] vram_budget={config.training.vram_budget_gb:.1f}GB "
-                f"margin={config.training.vram_safety_margin_gb:.1f}GB "
-                f"train_sample={train_sample_bytes / (1024 ** 2):.2f}MB "
-                f"eval_sample={eval_sample_bytes / (1024 ** 2):.2f}MB"
-            )
+            
+            # Use smaller batch sizes for validation/test (inference is less memory intensive)
+            val_batch_size = min(train_batch_size * 2, len(val_ds))
+            test_batch_size = min(train_batch_size * 2, len(test_ds))
         else:
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size)
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size)
@@ -508,7 +605,7 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         with (fold_dir / "metrics.json").open("w", encoding="utf-8") as f:
             json.dump(asdict(fold_result), f, indent=2)
 
-        test_dates = panel.dates[fold.test_indices]
+        test_dates = panel.dates[test_ds.valid_indices]
         test_bt = test_bt_t.to_numpy()
         report = generate_annual_report(test_bt, test_dates)
         print("\n" + report)
