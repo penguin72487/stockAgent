@@ -8,4 +8,5 @@ polars>=0.20
 transformers>=4.40
 flash-attn>=2.5
 xformers>=0.0.24
+yfinance>=0.2.65
 
