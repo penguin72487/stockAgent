@@ -5,6 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+try:
+    import cupy as cp
+except Exception:  # pragma: no cover - optional GPU dependency
+    cp = None
+
 
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
@@ -180,6 +185,46 @@ def run_backtest_torch(
     )
 
 
+def run_backtest_cupy(
+    weights,
+    future_returns,
+    tradable_mask,
+    benchmark_returns,
+    fee_per_side: float,
+) -> BacktestResult:
+    """GPU backtest core with CuPy, returned as numpy BacktestResult."""
+    if cp is None:
+        return run_backtest(
+            np.asarray(weights),
+            np.asarray(future_returns),
+            np.asarray(tradable_mask),
+            np.asarray(benchmark_returns),
+            fee_per_side,
+        )
+
+    w = cp.asarray(weights, dtype=cp.float32).copy()
+    r = cp.asarray(future_returns, dtype=cp.float32)
+    m = cp.asarray(tradable_mask).astype(cp.bool_)
+    b = cp.asarray(benchmark_returns, dtype=cp.float32)
+
+    w = cp.where(m, w, cp.zeros_like(w))
+    denom = cp.clip(w.sum(axis=1, keepdims=True), 1e-12, None)
+    w = w / denom
+
+    weights_history = cp.concatenate([cp.zeros_like(w[:1]), w[:-1]], axis=0)
+    prev = cp.concatenate([cp.zeros_like(weights_history[:1]), weights_history[:-1]], axis=0)
+    turnovers = cp.abs(weights_history - prev).sum(axis=1)
+    gross = (weights_history * r).sum(axis=1)
+    strategy_returns = gross - np.float32(fee_per_side) * turnovers
+
+    return BacktestResult(
+        strategy_returns=cp.asnumpy(strategy_returns.astype(cp.float32)),
+        benchmark_returns=cp.asnumpy(b.astype(cp.float32)),
+        turnovers=cp.asnumpy(turnovers.astype(cp.float32)),
+        weights_history=cp.asnumpy(weights_history.astype(cp.float32)),
+    )
+
+
 def run_backtest_integer_shares(
     weights: np.ndarray,
     future_returns: np.ndarray,
@@ -262,6 +307,16 @@ def run_backtest_integer_shares(
 
     cash = float(initial_capital)
 
+    bankrupt = False
+    bankruptcy_day = None
+    # 只要破產，後續全部歸零
+    def _force_bankrupt(t):
+        nonlocal cash, close_holdings, pending_settlement
+        cash = 0.0
+        close_holdings[:] = 0
+        pending_settlement[:] = 0.0
+        return t
+
     if execution_mode == "intraday_next_open":
         pending_target_w = np.zeros(n_symbols, dtype=np.float64)
         for t in range(t_len):
@@ -320,12 +375,53 @@ def run_backtest_integer_shares(
         pending_settlement = np.zeros(t_len + settlement_delay_days + 2, dtype=np.float64)
         total_equity_prev = float(initial_capital)
 
+
         for t in range(t_len):
+            if bankrupt:
+                strategy_returns[t] = -np.inf
+                turnovers[t] = 0.0
+                weights_history[t] = 0.0
+                # 只記錄現金歸零
+                records.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol="CASH",
+                        shares=0,
+                        price=1.0,
+                        market_value=0.0,
+                        holding_ratio=1.0,
+                        is_cash=True,
+                    )
+                )
+                continue
+
             close_t = close_matrix[t] if close_matrix is not None else np.ones(n_symbols, dtype=np.float64)
             tradable_today = m[t] & np.isfinite(close_t) & (close_t > 1e-12)
 
             if pending_settlement[t] > 0.0:
                 cash += float(pending_settlement[t])
+
+            # 破產判斷：T日開盤前現金<0，或任何已到期交割金額未能支付
+            # 允許交割日前一天補足現金，只要交割當天開盤前現金>=0就不算破產
+            if cash < -1e-6:
+                bankrupt = True
+                bankruptcy_day = t
+                _force_bankrupt(t)
+                strategy_returns[t] = -np.inf
+                turnovers[t] = 0.0
+                weights_history[t] = 0.0
+                records.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol="CASH",
+                        shares=0,
+                        price=1.0,
+                        market_value=0.0,
+                        holding_ratio=1.0,
+                        is_cash=True,
+                    )
+                )
+                continue
 
             sellable = (close_holdings > 0) & tradable_today
             sell_shares = np.where(sellable, close_holdings, 0)

@@ -8,4 +8,6 @@ polars>=0.20
 transformers>=4.40
 flash-attn>=2.5
 xformers>=0.0.24
+xgboost>=2.0
+scikit-learn>=1.4
 

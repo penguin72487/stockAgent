@@ -9,7 +9,7 @@ environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  target_vram_fraction: 0.85
+  target_vram_fraction: 0.7
 
 data:
   parquet_root: data_parquet
@@ -25,11 +25,12 @@ walk_forward:
 
 trading:
   frequency: daily
-  fee_per_side: 0.001
-  long_only: true
+  fee_per_side: 0.0
+  long_only: false
   cash_allowed: true
   use_all_tradable_symbols: true
-  execution_mode: overnight_tplus2
+  # execution_mode: "overnight_tplus2"
+  # execution_mode: "intraday_next_open" # "intraday_next_open" or "overnight_tplus2"
   lot_size: 1000
   min_fee: 20
   intraday_buy_fee_rate: 0.001425
@@ -40,26 +41,41 @@ trading:
 
 training:
   backend: pytorch
-  model_name: mlp
+  model_name: MLP
+  num_layers: 2
+  residual_norm: true
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   lookback: 1
-  batch_size: 2048
-  batch_size_train: 2048
-  batch_size_eval: 2048
+  batch_size: 1024
+  batch_size_train: 1024
+  batch_size_eval: 1024
   epochs: 1000
   learning_rate: 0.001
   hidden_dim: 1024
-  dropout: 0.1
-  num_workers: 16
+  dropout: 0.2
+  num_workers: 8
   weight_decay: 0.00001
   loss_type: sharpe
-  min_batch_size: 32
+  xgb_n_estimators: 600
+  xgb_max_depth: 12
+  xgb_learning_rate: 0.05
+  xgb_subsample: 0.8
+  xgb_colsample_bytree: 0.8
+  xgb_reg_lambda: 1.0
+  ridge_alpha: 1.0
+  ridge_fit_intercept: true
+  elasticnet_alpha: 1.0
+  elasticnet_l1_ratio: 0.5
+  elasticnet_fit_intercept: true
+  elasticnet_max_iter: 2000
+  elasticnet_tol: 0.0001
+  min_batch_size: 4
   auto_batch_size: true
   vram_budget_gb: 16
-  vram_safety_margin_gb: 1.0
-  target_vram_fraction: 1
+  vram_safety_margin_gb: 2.5
+  target_vram_fraction: 0.7
 
 evaluation:
   primary_baseline: universe_average_return

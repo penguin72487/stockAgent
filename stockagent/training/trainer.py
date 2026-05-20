@@ -971,6 +971,18 @@ def run_training(
 ) -> list[FoldResult]:
     device = _resolve_device(config)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    model_name = config.training.model_name.strip().lower()
+
+    if device.type == "cuda" and amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        print("[runtime] bf16 is not supported on this GPU, falling back to fp16 autocast")
+        amp_dtype = torch.float16
+
+    # Transformer + bf16 can be unstable on some CUDA/cuBLAS stacks.
+    # Prefer stability (fp32 path) over speed for training continuity.
+    if device.type == "cuda" and model_name == "transformer" and amp_dtype == torch.bfloat16:
+        print("[runtime] transformer detected: disabling bf16 autocast for stability (using fp32 path)")
+        amp_dtype = None
+
     if config.environment.use_tensor_cores and device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -992,6 +1004,7 @@ def run_training(
         f"cuda_available={torch.cuda.is_available()} "
         f"num_gpus={torch.cuda.device_count()} "
         f"amp_dtype={config.environment.amp_dtype} "
+        f"effective_amp={amp_dtype} "
         f"tensor_cores={config.environment.use_tensor_cores}"
     )
 
@@ -1033,6 +1046,7 @@ def run_training(
             budget_bytes = int(config.training.vram_budget_gb * (1024 ** 3))
             margin_bytes = int(config.training.vram_safety_margin_gb * (1024 ** 3))
             effective_budget_bytes = max(0, budget_bytes - margin_bytes)
+            model_name = config.training.model_name.strip().lower()
 
             estimation_model = build_model(
                 config=config,
@@ -1058,22 +1072,58 @@ def run_training(
                 training_mode=False,
             )
 
-            temp_model = build_model(
-                config=config,
-                num_features=len(panel.feature_names),
-                num_symbols=panel.num_symbols,
-            ).to(device)
+            # Transformer attention/activation footprints are typically larger than
+            # the simple MLP-oriented estimator below. Add conservative headroom.
+            if model_name == "transformer":
+                train_sample_bytes = int(train_sample_bytes * 8.0)
+                eval_sample_bytes = int(eval_sample_bytes * 6.0)
 
-            print(f"[Train {train_years}] searching optimal train batch size...")
-            temp_train_loader = _build_loader(train_ds, 1, False, config, device)
-            train_batch_size = find_optimal_batch_size(
-                model=temp_model,
-                sample_loader=temp_train_loader,
-                device=device,
-                amp_dtype=amp_dtype,
-                target_vram_fraction=config.training.target_vram_fraction,
-                vram_budget_gb=config.training.vram_budget_gb,
+            requested_train_cap = config.training.batch_size_train
+            if model_name == "transformer":
+                # Keep transformer training micro-batches conservative on large universes.
+                requested_train_cap = min(requested_train_cap, 8)
+
+            train_batch_size = _budget_batch_size(
+                dataset_size=len(train_ds),
+                requested_cap=requested_train_cap,
+                budget_bytes=effective_budget_bytes,
+                static_bytes=train_static_bytes,
+                sample_bytes=train_sample_bytes,
+                min_batch_size=min_batch_size,
             )
+
+            # Dynamic CUDA probing can trigger illegal-address failures on some
+            # drivers/runtime combinations, especially with Transformer kernels.
+            # Keep probing for non-transformer models, but fail-safe to estimate.
+            if model_name != "transformer":
+                try:
+                    temp_model = build_model(
+                        config=config,
+                        num_features=len(panel.feature_names),
+                        num_symbols=panel.num_symbols,
+                    ).to(device)
+
+                    print(f"[Train {train_years}] searching optimal train batch size...")
+                    temp_train_loader = _build_loader(train_ds, 1, False, config, device)
+                    train_batch_size = find_optimal_batch_size(
+                        model=temp_model,
+                        sample_loader=temp_train_loader,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        target_vram_fraction=config.training.target_vram_fraction,
+                        vram_budget_gb=config.training.vram_budget_gb,
+                    )
+                except Exception as probe_error:
+                    print(
+                        f"[Train {train_years}] auto batch probing failed, "
+                        f"falling back to budget estimate: {probe_error}"
+                    )
+            else:
+                print(
+                    f"[Train {train_years}] using conservative auto batch estimate for transformer "
+                    f"(train={train_batch_size})"
+                )
+
             train_batch_size = max(min_batch_size, train_batch_size)
         else:
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
@@ -1094,8 +1144,12 @@ def run_training(
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
             test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size_eval)
             if config.training.auto_batch_size and device.type == "cuda":
-                val_batch_size = min(train_batch_size * 2, len(val_ds))
-                test_batch_size = min(train_batch_size * 2, len(test_ds))
+                if config.training.model_name.strip().lower() == "transformer":
+                    val_batch_size = min(train_batch_size, len(val_ds))
+                    test_batch_size = min(train_batch_size, len(test_ds))
+                else:
+                    val_batch_size = min(train_batch_size * 2, len(val_ds))
+                    test_batch_size = min(train_batch_size * 2, len(test_ds))
 
             fold_dir = _fold_dir(output_path, fold.fold_id)
             fold_dir.mkdir(parents=True, exist_ok=True)
