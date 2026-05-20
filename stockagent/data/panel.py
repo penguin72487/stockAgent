@@ -11,7 +11,7 @@ import pandas as pd
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 4
+PANEL_CACHE_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -127,6 +127,11 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
     )
 
 
+def _print_feature_overview(panel: PanelData) -> None:
+    feature_list = ", ".join(panel.feature_names)
+    print(f"[panel] features ({len(panel.feature_names)}): {feature_list}")
+
+
 def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
     """Check if cache is valid based on source hash and mtime."""
     if not meta_path.exists():
@@ -169,7 +174,9 @@ def build_panel(parquet_root: str | Path) -> PanelData:
     # Check cache validity
     if _check_cache_valid(meta_path, parquet_paths):
         print(f"[panel] loading cache (valid): {cache_path}")
-        return _load_panel_cache(cache_path)
+        panel = _load_panel_cache(cache_path)
+        _print_feature_overview(panel)
+        return panel
 
     print(f"[panel] building from {len(parquet_paths)} parquet files...")
     
@@ -220,20 +227,15 @@ def build_panel(parquet_root: str | Path) -> PanelData:
     sum_ret = np.nansum(np.where(tradable_mask, returns_1d, 0.0), axis=1)
     benchmark_returns = np.where(n_tradable > 0, sum_ret / n_tradable, 0.0).astype(np.float32)
 
+    # Keep raw log-return features in panel; fold-local normalization is applied
+    # later in training using train-period statistics only to prevent data leakage.
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # ✅ OPTIMIZATION: Feature standardization (Z-score normalization)
-    # This prevents Transformer attention weights from diverging due to feature scale differences
-    features_mean = np.mean(features, axis=(0, 1), keepdims=True)
-    features_std = np.std(features, axis=(0, 1), keepdims=True) + 1e-8
-    features_normalized = (features - features_mean) / features_std
-    print(f"[panel] feature normalization applied: mean={features_mean.mean():.6f}, std={features_std.mean():.6f}")
 
     panel = PanelData(
         dates=np.array(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
         feature_names=feature_columns,
-        features=features_normalized,
+        features=features,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
         alive_mask=alive_mask,
@@ -244,4 +246,5 @@ def build_panel(parquet_root: str | Path) -> PanelData:
     source_hash = _compute_source_hash(parquet_paths)
     _save_panel_cache(cache_path, meta_path, panel, source_hash)
     print(f"[panel] cache saved: {cache_path}")
+    _print_feature_overview(panel)
     return panel
