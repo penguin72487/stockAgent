@@ -175,7 +175,8 @@ def run_backtest_integer_shares(
     benchmark_returns: np.ndarray,
     *,
     initial_capital: float = 1_000_000.0,
-    fee_rate: float = 0.001,
+    buy_fee_rate: float = 0.001425,
+    sell_fee_rate: float = 0.004425,
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
@@ -270,8 +271,8 @@ def run_backtest_integer_shares(
         sell_notional = float(np.dot(sell_qty.astype(np.float64), current_prices))
         buy_notional = float(np.dot(buy_qty.astype(np.float64), current_prices))
 
-        available_cash = cash + sell_notional
-        max_affordable_buy = available_cash / (1.0 + fee_rate) if fee_rate >= 0.0 else available_cash
+        available_cash = cash + sell_notional - sell_notional * sell_fee_rate
+        max_affordable_buy = available_cash / (1.0 + buy_fee_rate) if buy_fee_rate >= 0.0 else available_cash
 
         if buy_notional > max_affordable_buy + 1e-9 and buy_notional > 0.0:
             scale = max(0.0, max_affordable_buy / buy_notional)
@@ -313,11 +314,13 @@ def run_backtest_integer_shares(
                     )
                     continue
 
-        traded_notional = float(np.dot(np.abs(delta).astype(np.float64), current_prices))
-        fee = fee_rate * traded_notional
+        buy_fee = buy_fee_rate * buy_notional
+        sell_fee = sell_fee_rate * sell_notional
+        fee = buy_fee + sell_fee
+        traded_notional = buy_notional + sell_notional
 
         shares = desired_shares
-        cash = cash + sell_notional - buy_notional - fee
+        cash = cash + sell_notional - sell_fee - buy_notional - buy_fee
         if cash < 0 and abs(cash) < 1e-7:
             cash = 0.0
 

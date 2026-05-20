@@ -388,8 +388,9 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
     all_dates: list[np.ndarray] = []
     first_year_fold_ids: list[int] = []
     first_year_labels: list[int] = []
-    first_year_strategy_log: list[float] = []
-    first_year_baseline_log: list[float] = []
+    all_first_year_dates: list[np.ndarray] = []
+    all_first_year_strategy_log: list[np.ndarray] = []
+    all_first_year_baseline_log: list[np.ndarray] = []
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
@@ -408,10 +409,9 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
         if years.size > 0:
             first_year = int(np.min(years))
             mask = years == first_year
-            first_year_fold_ids.append(result.fold_id)
-            first_year_labels.append(first_year)
-            first_year_strategy_log.append(float(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).sum()))
-            first_year_baseline_log.append(float(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).sum()))
+            all_first_year_dates.append(fold_dates[mask])
+            all_first_year_strategy_log.append(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).astype(np.float64))
+            all_first_year_baseline_log.append(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).astype(np.float64))
 
     if not all_dates:
         return
@@ -430,12 +430,11 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
         output_path / "walkforward_equity_curve_log.png",
     )
 
-    if first_year_fold_ids:
+    if all_first_year_dates:
         plot_fold_first_year_returns(
-            first_year_fold_ids,
-            first_year_labels,
-            first_year_strategy_log,
-            first_year_baseline_log,
+            all_first_year_dates,
+            all_first_year_strategy_log,
+            all_first_year_baseline_log,
             output_path / "walkforward_first_year_cumulative_returns.png",
         )
 
@@ -905,6 +904,55 @@ def _evaluate_split_torch(
     return backtest, ic, metrics
 
 
+def _compute_metrics_from_tensors(
+    strategy_returns: torch.Tensor,
+    benchmark_returns: torch.Tensor,
+    turnovers: torch.Tensor,
+) -> dict[str, float]:
+    """Compute performance metrics directly from tensors to avoid repeated numpy conversions."""
+    r = torch.nan_to_num(strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    b = torch.nan_to_num(benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    t = torch.nan_to_num(turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+
+    if r.numel() == 0:
+        return {
+            "cumulative_return": 0.0,
+            "annualized_return": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+            "turnover": 0.0,
+            "daily_hit_rate": 0.0,
+            "excess_return_vs_universe_average": 0.0,
+            "cumulative_benchmark": 0.0,
+        }
+
+    sum_r = float(r.sum().item())
+    sum_b = float(b.sum().item())
+    cum_r = float(torch.expm1(torch.tensor(sum_r, dtype=torch.float64)).item())
+    cum_b = float(torch.expm1(torch.tensor(sum_b, dtype=torch.float64)).item())
+
+    avg = r.mean()
+    std = r.std(unbiased=False)
+    ann_r = float(torch.expm1(avg * 252.0).item())
+    sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
+
+    equity = torch.exp(torch.cumsum(r, dim=0))
+    running_max = torch.cummax(equity, dim=0).values
+    dd = equity / running_max.clamp_min(1e-12) - 1.0
+    max_dd = float(dd.min().item()) if dd.numel() else 0.0
+
+    return {
+        "cumulative_return": cum_r,
+        "annualized_return": ann_r,
+        "sharpe": sharpe,
+        "max_drawdown": max_dd,
+        "turnover": float(t.mean().item()) if t.numel() else 0.0,
+        "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),
+        "excess_return_vs_universe_average": cum_r - cum_b,
+        "cumulative_benchmark": cum_b,
+    }
+
+
 def run_training(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -1130,6 +1178,7 @@ def run_training(
             leave=True,
             dynamic_ncols=True,
         )
+        val_backtest: BacktestResultTensor | None = None
         for epoch in epoch_pbar:
             train_loss = _train_epoch_tensor(
                 model,
@@ -1212,7 +1261,24 @@ def run_training(
                     }
                 )
 
-        for fold_id, context in fold_contexts.items():
+        # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
+        # the epoch loop does not run; compute validation backtest once for reporting.
+        if val_backtest is None:
+            val_backtest, _, _ = _evaluate_tensor_batch(
+                model,
+                combined_val_x,
+                combined_val_returns,
+                combined_val_masks,
+                combined_val_bench,
+                device,
+                amp_dtype,
+                config.trading.fee_per_side,
+                chunk_rows=eval_chunk_rows,
+            )
+        if val_backtest is None:
+            raise RuntimeError("Validation backtest is unavailable in eval stage.")
+
+        for index, (fold_id, context) in enumerate(fold_contexts.items()):
             fold = context["fold"]
             fold_dir = context["fold_dir"]
             best_checkpoint_path = context["checkpoint_best_path"]
@@ -1236,12 +1302,9 @@ def run_training(
                 chunk_rows=eval_chunk_rows,
             )
 
-            val_backtest_slice = BacktestResult(
-                strategy_returns=val_backtest.strategy_returns[start:end].detach().cpu().numpy().astype(np.float32),
-                benchmark_returns=val_backtest.benchmark_returns[start:end].detach().cpu().numpy().astype(np.float32),
-                turnovers=val_backtest.turnovers[start:end].detach().cpu().numpy().astype(np.float32),
-                weights_history=val_backtest.weights_history[start:end].detach().cpu().numpy().astype(np.float32),
-            )
+            start = val_offsets[index]
+            end = val_offsets[index + 1]
+
             val_ic = ic_summary(
                 compute_ic_series_torch(
                     val_backtest.weights_history[start:end],
@@ -1249,7 +1312,11 @@ def run_training(
                     combined_val_masks[start:end],
                 ).cpu().numpy()
             )
-            val_met = compute_metrics(val_backtest_slice)
+            val_met = _compute_metrics_from_tensors(
+                val_backtest.strategy_returns[start:end],
+                val_backtest.benchmark_returns[start:end],
+                val_backtest.turnovers[start:end],
+            )
 
             test_dates = panel.dates[context["test_ds"].valid_indices]
             test_close_prices = panel.close_prices[context["test_ds"].valid_indices]
@@ -1259,7 +1326,8 @@ def run_training(
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
-                fee_rate=0.001,
+                buy_fee_rate=0.001425,
+                sell_fee_rate=0.004425,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
