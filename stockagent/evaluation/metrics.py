@@ -4,7 +4,6 @@ import math
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 
 def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -35,7 +34,7 @@ def compute_ic_series(
 ) -> np.ndarray:                 # [T] daily Spearman IC
     T = alpha_scores.shape[0]
     ics = np.zeros(T, dtype=np.float32)
-        for t in range(T):
+    for t in range(T):
         mask = (
             tradable_mask[t].astype(bool)
             & np.isfinite(future_log_returns[t])

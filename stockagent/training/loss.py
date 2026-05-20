@@ -1,23 +1,16 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
 from torch import Tensor
 
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
-    """MSE loss computed only over tradable symbols."""
     mask_f = mask.to(dtype=predictions.dtype)
     error = (predictions - targets).pow(2) * mask_f
     return error.sum() / mask_f.sum().clamp_min(1.0)
 
 
 def masked_ic_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
-    """Negative mean rank-IC across batch rows (minimise to maximise IC).
-
-    Uses a differentiable rank-correlation approximation via Pearson
-    on double-argsort ranks.
-    """
     ics: list[Tensor] = []
     for i in range(predictions.size(0)):
         m = mask[i]
@@ -37,52 +30,29 @@ def masked_ic_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor
 
 
 def sharpe_aware_loss(
-    alpha_scores: Tensor,
+    weights: Tensor,
     future_log_returns: Tensor,
     tradable_mask: Tensor,
-    top_k: int,
     fee_per_side: float = 0.0,
 ) -> Tensor:
-    """Sharpe-aware loss that optimizes realized Sharpe ratio.
-    
-    For each batch:
-    1. Select top-k by alpha_scores
-    2. Compute portfolio returns
-    3. Compute Sharpe ratio across batch days
-    4. Return negative Sharpe (to minimize)
-    """
-    batch_size, num_symbols = alpha_scores.shape
-    device = alpha_scores.device
-    dtype = alpha_scores.dtype
-    
-    alpha_scores_np = alpha_scores.detach().cpu().numpy()
-    future_log_returns_np = future_log_returns.detach().cpu().numpy()
-    tradable_mask_np = tradable_mask.detach().cpu().numpy()
-    
-    portfolio_rets = []
-    
-    for b in range(batch_size):
-        scores = alpha_scores_np[b]
-        rets = future_log_returns_np[b]
-        mask = tradable_mask_np[b].astype(bool)
-        
-        valid_idx = np.flatnonzero(mask & np.isfinite(scores))
-        if valid_idx.size == 0:
-            portfolio_rets.append(0.0)
-            continue
-            
-        k = min(top_k, valid_idx.size)
-        top_indices = valid_idx[np.argsort(scores[valid_idx])[-k:]]
-        
-        weights = np.zeros(num_symbols, dtype=np.float32)
-        weights[top_indices] = 1.0 / k
-        
-        port_ret = float(np.dot(weights, np.nan_to_num(rets, nan=0.0)))
-        portfolio_rets.append(port_ret)
-    
-    rets_array = np.array(portfolio_rets, dtype=np.float32)
-    mean_ret = float(rets_array.mean())
-    std_ret = float(rets_array.std(ddof=0)) + 1e-8
-    sharpe = mean_ret / std_ret * np.sqrt(252.0)
-    
-    return torch.tensor(-sharpe, dtype=dtype, device=device, requires_grad=False)
+    """Sharpe-aware loss for direct portfolio weights."""
+    mask_f = tradable_mask.to(dtype=weights.dtype)
+    masked_weights = weights * mask_f
+    weight_sum = masked_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    normalized_weights = masked_weights / weight_sum
+
+    returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
+    gross_returns = (normalized_weights * returns).sum(dim=1)
+
+    prev_weights = torch.cat(
+        [normalized_weights.new_zeros(1, normalized_weights.size(1)), normalized_weights[:-1]],
+        dim=0,
+    )
+    turnover = (normalized_weights - prev_weights).abs().sum(dim=1)
+    net_returns = gross_returns - fee_per_side * turnover
+
+    mean_return = net_returns.mean()
+    std_return = net_returns.std(unbiased=False).clamp_min(1e-8)
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights.dtype))
+    sharpe = mean_return / std_return * annualizer
+    return -sharpe
