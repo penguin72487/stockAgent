@@ -10,6 +10,8 @@ import pandas as pd
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
+LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
+PANEL_CACHE_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -51,20 +53,19 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
         vol = frame["Trading_Volume"].replace(0, np.nan)
         frame["Trading_Volume"] = np.log(vol / vol.shift(1))
 
-    fundamental_cols = [c for c in frame.columns
-                        if c not in {"open", "max", "min", "close", "Trading_Volume",
-                                     "date", "symbol", "return_1d", "tradable"}
-                        and pd.api.types.is_numeric_dtype(frame[c])]
-    for col in fundamental_cols:
-        x = frame[col].to_numpy(dtype=np.float64)
-        frame[col] = np.sign(x) * np.log1p(np.abs(x))
-
     return frame
 
 
 def _get_feature_columns(frame: pd.DataFrame) -> list[str]:
-    numeric_columns = frame.select_dtypes(include=[np.number]).columns.tolist()
-    return [column for column in numeric_columns if column not in RESERVED_COLUMNS]
+    numeric_columns = set(frame.select_dtypes(include=[np.number]).columns.tolist())
+    feature_columns = [
+        column
+        for column in LOG_RETURN_FEATURE_COLUMNS
+        if column in numeric_columns and column not in RESERVED_COLUMNS
+    ]
+    if not feature_columns:
+        raise ValueError("No log-return feature columns found in symbol frame")
+    return feature_columns
 
 
 def _panel_cache_path(parquet_root: str | Path) -> Path:
@@ -99,7 +100,7 @@ def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, sourc
     )
     
     meta = {
-        'version': 2,
+        'version': PANEL_CACHE_VERSION,
         'source_hash': source_hash,
         'num_dates': panel.num_dates,
         'num_symbols': panel.num_symbols,
@@ -132,7 +133,7 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
             meta = pickle.load(f)
         
         expected_hash = _compute_source_hash(parquet_paths)
-        return meta.get('source_hash') == expected_hash and meta.get('version') == 2
+        return meta.get('source_hash') == expected_hash and meta.get('version') == PANEL_CACHE_VERSION
     except Exception:
         return False
 
@@ -200,20 +201,11 @@ def build_panel(parquet_root: str | Path) -> PanelData:
 
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # ✅ FIXED: Feature standardization (z-score normalization)
-    # Compute mean and std across all dates and symbols
-    features_mean = np.mean(features, axis=(0, 1), keepdims=True)  # [1, 1, F]
-    features_std = np.std(features, axis=(0, 1), keepdims=True) + 1e-8  # [1, 1, F]
-    features_normalized = (features - features_mean) / features_std
-    features_normalized = np.nan_to_num(features_normalized, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    print(f"[panel] feature normalization: mean={features_mean.squeeze().mean():.6f}, std={features_std.squeeze().mean():.6f}")
-
     panel = PanelData(
         dates=np.array(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
         feature_names=feature_columns,
-        features=features_normalized,  # Use normalized features
+        features=features,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
         alive_mask=alive_mask,
