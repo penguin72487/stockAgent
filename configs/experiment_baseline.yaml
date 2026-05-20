@@ -18,11 +18,7 @@ data:
   universe_mode: all_daily_symbols
 
 walk_forward:
-  mode: expanding_by_year
   min_train_years: 1
-  val_years: 1
-  test_years: remaining
-  require_future_test_year: true
 
 trading:
   frequency: daily

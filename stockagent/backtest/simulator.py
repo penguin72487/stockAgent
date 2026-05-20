@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 
 @dataclass(slots=True)
@@ -15,36 +16,71 @@ class BacktestResult:
     weights_history: np.ndarray    # [T, S] realised portfolio weights
 
 
+@dataclass(slots=True)
+class BacktestResultTensor:
+    """Torch tensor container for a single backtest simulation run."""
+
+    strategy_returns: torch.Tensor   # [T]
+    benchmark_returns: torch.Tensor  # [T]
+    turnovers: torch.Tensor          # [T]
+    weights_history: torch.Tensor    # [T, S]
+
+    def to_numpy(self) -> BacktestResult:
+        return BacktestResult(
+            strategy_returns=self.strategy_returns.detach().cpu().numpy().astype(np.float32),
+            benchmark_returns=self.benchmark_returns.detach().cpu().numpy().astype(np.float32),
+            turnovers=self.turnovers.detach().cpu().numpy().astype(np.float32),
+            weights_history=self.weights_history.detach().cpu().numpy().astype(np.float32),
+        )
+
+
 def _vectorized_backtest(
     weights: np.ndarray,
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
     fee_per_side: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    T, S = weights.shape
-    strategy_returns = np.zeros(T, dtype=np.float32)
-    turnovers = np.zeros(T, dtype=np.float32)
-    weights_history = np.zeros((T, S), dtype=np.float32)
+    weights_history = np.asarray(weights, dtype=np.float32).copy()
+    weights_history[~tradable_mask.astype(bool)] = 0.0
 
-    prev_weights = np.zeros(S, dtype=np.float32)
-    for t in range(T):
-        day_weights = np.asarray(weights[t], dtype=np.float32).copy()
-        day_mask = tradable_mask[t].astype(bool)
-        day_weights[~day_mask] = 0.0
-        weight_sum = float(day_weights.sum())
-        if weight_sum > 0:
-            day_weights /= weight_sum
+    weight_sums = weights_history.sum(axis=1, keepdims=True)
+    nonzero = weight_sums.squeeze(1) > 0
+    weights_history[nonzero] /= weight_sums[nonzero]
 
-        turnover = float(np.abs(day_weights - prev_weights).sum())
-        gross = float(np.dot(day_weights, future_returns[t]))
-        net = gross - turnover * fee_per_side
+    prev = np.concatenate([
+        np.zeros((1, weights_history.shape[1]), dtype=np.float32),
+        weights_history[:-1],
+    ], axis=0)
+    turnovers = np.abs(weights_history - prev).sum(axis=1).astype(np.float32)
 
-        strategy_returns[t] = net
-        turnovers[t] = turnover
-        weights_history[t] = day_weights
-        prev_weights = day_weights
+    gross = np.einsum("ts,ts->t", weights_history, future_returns, dtype=np.float32)
+    strategy_returns = gross - fee_per_side * turnovers
+    return strategy_returns.astype(np.float32), turnovers, weights_history
 
-    return strategy_returns, turnovers, weights_history
+
+def _vectorized_backtest_torch(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    fee_per_side: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    weights_history = weights.float().clone()
+    weights_history = weights_history.masked_fill(~tradable_mask.bool(), 0.0)
+
+    weight_sums = weights_history.sum(dim=1, keepdim=True)
+    nonzero = weight_sums.squeeze(1) > 0
+    safe_sums = weight_sums.clamp_min(1e-12)
+    weights_history[nonzero] = weights_history[nonzero] / safe_sums[nonzero]
+
+    prev = torch.cat(
+        [torch.zeros((1, weights_history.size(1)), dtype=weights_history.dtype, device=weights_history.device), weights_history[:-1]],
+        dim=0,
+    )
+    turnovers = (weights_history - prev).abs().sum(dim=1)
+
+    gross = (weights_history * future_returns.float()).sum(dim=1)
+    strategy_returns = gross - fee_per_side * turnovers
+    return strategy_returns.float(), turnovers.float(), weights_history.float()
 
 
 def run_backtest(
@@ -65,6 +101,29 @@ def run_backtest(
     return BacktestResult(
         strategy_returns=strategy_returns,
         benchmark_returns=benchmark_returns.astype(np.float32),
+        turnovers=turnovers,
+        weights_history=weights_history,
+    )
+
+
+def run_backtest_torch(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    benchmark_returns: torch.Tensor,
+    fee_per_side: float,
+) -> BacktestResultTensor:
+    """Simulate daily portfolio execution from model weights in torch."""
+    strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
+        weights,
+        future_returns,
+        tradable_mask,
+        fee_per_side,
+    )
+
+    return BacktestResultTensor(
+        strategy_returns=strategy_returns,
+        benchmark_returns=benchmark_returns.float(),
         turnovers=turnovers,
         weights_history=weights_history,
     )
