@@ -1181,6 +1181,11 @@ def run_training(
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
+        # Early stopping parameters
+        patience = max(1, int(config.training.epochs * 0.2))  # 20% of total epochs
+        no_improvement_epochs = 0
+        best_loss = float("inf")
+
         epoch_pbar = tqdm(
             range(start_epoch, config.training.epochs + 1),
             desc=f"Train {train_years} Epochs",
@@ -1261,11 +1266,22 @@ def run_training(
                 scaler=scaler,
             )
 
+            mean_val_loss = float(np.mean(val_losses))
+            if mean_val_loss < best_loss:
+                best_loss = mean_val_loss
+                no_improvement_epochs = 0
+            else:
+                no_improvement_epochs += 1
+
+            if no_improvement_epochs >= patience:
+                print(f"[Train {train_years}] Early stopping at epoch {epoch} due to no improvement in validation loss.")
+                break
+
             if val_losses:
                 epoch_pbar.set_postfix(
                     {
                         "train_loss": f"{train_loss:.6f}",
-                        "val_mean": f"{float(np.mean(val_losses)):.6f}",
+                        "val_mean": f"{mean_val_loss:.6f}",
                         "best_val": f"{min(float(c['best_val_loss']) for c in fold_contexts.values()):.6f}",
                     }
                 )

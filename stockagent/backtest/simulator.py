@@ -305,7 +305,7 @@ def run_backtest_integer_shares(
                 HoldingsRecord(
                     date=date_text[t],
                     symbol="CASH",
-                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                    shares=0,
                     price=1.0,
                     market_value=float(cash),
                     holding_ratio=1.0,
@@ -374,7 +374,7 @@ def run_backtest_integer_shares(
                 HoldingsRecord(
                     date=date_text[t],
                     symbol="CASH",
-                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                    shares=0,
                     price=1.0,
                     market_value=float(cash),
                     holding_ratio=float(cash / total_equity_now),
@@ -386,7 +386,7 @@ def run_backtest_integer_shares(
                     HoldingsRecord(
                         date=date_text[t],
                         symbol="RECEIVABLE",
-                        shares=int(_floor_to_int64(receivable, non_negative=True).item()),
+                        shares=0,
                         price=1.0,
                         market_value=receivable,
                         holding_ratio=float(receivable / total_equity_now),
