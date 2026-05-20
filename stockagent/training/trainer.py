@@ -20,7 +20,7 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series, ic_summary
 from stockagent.models.mlp import CrossSectionalMLP
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
-from stockagent.training.loss import masked_mse_loss, masked_ic_loss, sharpe_aware_loss
+from stockagent.training.loss import sharpe_aware_loss
 
 
 @dataclass(slots=True)
@@ -61,16 +61,13 @@ def _build_loader(dataset: CrossSectionalDataset, batch_size: int, shuffle: bool
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=config.training.num_workers,
-        pin_memory=(device.type == "cuda"),  # only pin when GPU is present
+        pin_memory=(device.type == "cuda"),
         collate_fn=collate_batch,
     )
 
 
 def _move_batch(batch: dict[str, torch.Tensor], device: torch.device, non_blocking: bool) -> dict[str, torch.Tensor]:
-    return {
-        key: value.to(device=device, non_blocking=non_blocking)
-        for key, value in batch.items()
-    }
+    return {key: value.to(device=device, non_blocking=non_blocking) for key, value in batch.items()}
 
 
 def _train_epoch(
@@ -81,28 +78,22 @@ def _train_epoch(
     device: torch.device,
     amp_dtype: torch.dtype,
     non_blocking: bool,
-    loss_type: str = "mse",
-    top_k: int = 20,
-    fee_per_side: float = 0.001,
+    fee_per_side: float,
 ) -> float:
     model.train()
     total_loss = 0.0
     steps = 0
-        for batch in loader:
+    for batch in loader:
         batch = _move_batch(batch, device, non_blocking)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
-            predictions = model(batch["x"])
-            if loss_type == "sharpe":
-                loss = sharpe_aware_loss(
-                    predictions,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    top_k,
-                    fee_per_side,
-                )
-            else:  # mse
-                loss = masked_mse_loss(predictions, batch["y"], batch["tradable_mask"])
+            weights = model(batch["x"], batch["tradable_mask"])
+            loss = sharpe_aware_loss(
+                weights,
+                batch["future_log_returns"],
+                batch["tradable_mask"],
+                fee_per_side,
+            )
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -121,11 +112,11 @@ def _eval_val_loss(
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
-          for batch in loader:
+        for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
             with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
-                predictions = model(batch["x"])
-                loss = masked_mse_loss(predictions, batch["y"], batch["tradable_mask"])
+                weights = model(batch["x"], batch["tradable_mask"])
+                loss = sharpe_aware_loss(weights, batch["future_log_returns"], batch["tradable_mask"], fee_per_side=0.0)
             losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("inf")
 
@@ -137,25 +128,25 @@ def _collect_predictions(
     amp_dtype: torch.dtype,
     non_blocking: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Collect all (alpha_scores, future_log_returns, tradable_mask, benchmark) from a loader."""
+    """Collect all (weights, future_log_returns, tradable_mask, benchmark) from a loader."""
     model.eval()
-    all_scores: list[np.ndarray] = []
+    all_weights: list[np.ndarray] = []
     all_log_ret: list[np.ndarray] = []
     all_masks: list[np.ndarray] = []
     all_bench: list[np.ndarray] = []
 
     with torch.no_grad():
-            for batch in loader:
+        for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
             with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
-                predictions = model(batch["x"])
-            all_scores.append(predictions.detach().float().cpu().numpy())
+                weights = model(batch["x"], batch["tradable_mask"])
+            all_weights.append(weights.detach().float().cpu().numpy())
             all_log_ret.append(batch["future_log_returns"].detach().float().cpu().numpy())
             all_masks.append(batch["tradable_mask"].detach().cpu().numpy())
             all_bench.append(batch["benchmark"].detach().float().cpu().numpy())
 
     return (
-        np.concatenate(all_scores, axis=0),
+        np.concatenate(all_weights, axis=0),
         np.concatenate(all_log_ret, axis=0),
         np.concatenate(all_masks, axis=0),
         np.concatenate(all_bench, axis=0),
@@ -177,19 +168,19 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
     output_path.mkdir(parents=True, exist_ok=True)
 
     results: list[FoldResult] = []
-    fold_list = list(folds)  # Convert to list for progress bar
-        for fold in fold_list:
+    fold_list = list(folds)
+    for fold in tqdm(fold_list, desc="Folds", unit="fold"):
         print(f"\n{'='*60}")
         print(f"[Fold {fold.fold_id}]  train={fold.train_years}  val={fold.val_years}  test={fold.test_years}")
         print(f"{'='*60}")
 
         train_ds = CrossSectionalDataset(panel, fold.train_indices, config.training.lookback)
-        val_ds   = CrossSectionalDataset(panel, fold.val_indices,   config.training.lookback)
-        test_ds  = CrossSectionalDataset(panel, fold.test_indices,  config.training.lookback)
+        val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
+        test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
 
-        train_loader = _build_loader(train_ds, config.training.batch_size, True,  config, device)
-        val_loader   = _build_loader(val_ds,   config.training.batch_size, False, config, device)
-        test_loader  = _build_loader(test_ds,  config.training.batch_size, False, config, device)
+        train_loader = _build_loader(train_ds, config.training.batch_size, False, config, device)
+        val_loader = _build_loader(val_ds, config.training.batch_size, False, config, device)
+        test_loader = _build_loader(test_ds, config.training.batch_size, False, config, device)
 
         model = CrossSectionalMLP(
             lookback=config.training.lookback,
@@ -209,7 +200,7 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         best_state: dict | None = None
         best_val_loss = float("inf")
 
-            epoch_pbar = tqdm(range(1, config.training.epochs + 1), desc=f"Fold {fold.fold_id} Epochs", leave=True)
+        epoch_pbar = tqdm(range(1, config.training.epochs + 1), desc=f"Fold {fold.fold_id} Epochs", leave=True, dynamic_ncols=True)
         for epoch in epoch_pbar:
             train_loss = _train_epoch(
                 model,
@@ -219,16 +210,13 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 device,
                 amp_dtype,
                 config.training.non_blocking_transfer,
-                config.training.loss_type,
-                config.training.top_k,
                 config.trading.fee_per_side,
             )
-            val_loss   = _eval_val_loss(model, val_loader, device, amp_dtype, config.training.non_blocking_transfer)
-            marker = " *" if val_loss < best_val_loss else ""
+            val_loss = _eval_val_loss(model, val_loader, device, amp_dtype, config.training.non_blocking_transfer)
             epoch_pbar.set_postfix({
                 "train_loss": f"{train_loss:.6f}",
                 "val_loss": f"{val_loss:.6f}",
-                "best": f"{best_val_loss:.6f}"
+                "best": f"{best_val_loss:.6f}",
             })
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -237,21 +225,19 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # --- val backtest + IC ---
-        val_scores, val_log_ret, val_masks, val_bench = _collect_predictions(
+        val_weights, val_log_ret, val_masks, val_bench = _collect_predictions(
             model, val_loader, device, amp_dtype, config.training.non_blocking_transfer
         )
-        val_bt     = run_backtest(val_scores, val_log_ret, val_masks, val_bench, config.trading.fee_per_side, config.training.top_k)
-        val_ic     = ic_summary(compute_ic_series(val_scores, val_log_ret, val_masks))
-        val_met    = compute_metrics(val_bt)
+        val_bt = run_backtest(val_weights, val_log_ret, val_masks, val_bench, config.trading.fee_per_side)
+        val_ic = ic_summary(compute_ic_series(val_weights, val_log_ret, val_masks))
+        val_met = compute_metrics(val_bt)
 
-        # --- test backtest + IC ---
-        test_scores, test_log_ret, test_masks, test_bench = _collect_predictions(
+        test_weights, test_log_ret, test_masks, test_bench = _collect_predictions(
             model, test_loader, device, amp_dtype, config.training.non_blocking_transfer
         )
-        test_bt    = run_backtest(test_scores, test_log_ret, test_masks, test_bench, config.trading.fee_per_side, config.training.top_k)
-        test_ic    = ic_summary(compute_ic_series(test_scores, test_log_ret, test_masks))
-        test_met   = compute_metrics(test_bt)
+        test_bt = run_backtest(test_weights, test_log_ret, test_masks, test_bench, config.trading.fee_per_side)
+        test_ic = ic_summary(compute_ic_series(test_weights, test_log_ret, test_masks))
+        test_met = compute_metrics(test_bt)
 
         print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
         print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
@@ -274,21 +260,17 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         torch.save(model.state_dict(), fold_dir / "model.pt")
         with (fold_dir / "metrics.json").open("w", encoding="utf-8") as f:
             json.dump(asdict(fold_result), f, indent=2)
-        
-        # Generate annual reports and plots for test set
+
         test_dates = panel.dates[fold.test_indices]
-        
-        # Text report
         report = generate_annual_report(test_bt, test_dates)
         print("\n" + report)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
-        
-        # Equity curve plot
+
         try:
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
-        except Exception as e:
-            print(f"  Warning: could not generate plots: {e}")
+        except Exception as exc:
+            print(f"  Warning: could not generate plots: {exc}")
 
     return results
