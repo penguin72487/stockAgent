@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -318,7 +319,7 @@ def _evaluate_tensor_batch(
             returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=True)
             mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=True)
             bench_chunk = benchmark[start:end].to(device=device, non_blocking=True)
-            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
             weights_chunks.append(weights_chunk.float().cpu())
@@ -363,7 +364,7 @@ def _auto_chunk_rows(
     with torch.inference_mode():
         x_probe = x[:probe_rows].to(device=device, non_blocking=True)
         mask_probe = tradable_mask[:probe_rows].to(device=device, non_blocking=True)
-        with autocast(device_type=device.type, enabled=True, dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             _ = model(x_probe, mask_probe)
     torch.cuda.synchronize(device)
     peak_alloc = torch.cuda.max_memory_allocated(device)
@@ -462,12 +463,20 @@ def _resolve_device(config: ExperimentConfig) -> torch.device:
     return torch.device(requested)
 
 
-def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
+def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype | None:
     if amp_dtype == "bf16":
         return torch.bfloat16
     if amp_dtype == "fp16":
         return torch.float16
+    if amp_dtype == "tf32":
+        return None
     raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
+
+
+def _autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
+    if device.type != "cuda" or amp_dtype is None:
+        return nullcontext()
+    return autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
 
 
 def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
@@ -517,7 +526,7 @@ def find_optimal_batch_size(
     torch.cuda.empty_cache()
     
     with torch.inference_mode():
-        with autocast(device_type='cuda', enabled=True, dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             _ = model(test_batch["x"], test_batch["tradable_mask"])
     
     single_sample_bytes = torch.cuda.max_memory_allocated()
@@ -553,7 +562,7 @@ def find_optimal_batch_size(
             test_batch = next(iter(temp_loader))
             test_batch = _move_batch(test_batch, device, non_blocking=True)
             
-            with autocast(device_type='cuda', enabled=True, dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 logits = model(test_batch["x"], test_batch["tradable_mask"])
                 loss = sharpe_aware_loss(
                     logits,
@@ -616,7 +625,7 @@ def _move_batch(batch: dict[str, torch.Tensor], device: torch.device, non_blocki
     return {key: value.to(device=device, non_blocking=non_blocking) for key, value in batch.items()}
 
 
-def _amp_bytes(amp_dtype: torch.dtype) -> int:
+def _amp_bytes(amp_dtype: torch.dtype | None) -> int:
     if amp_dtype in (torch.float16, torch.bfloat16):
         return 2
     return 4
@@ -702,7 +711,7 @@ def _train_epoch(
         batch = _move_batch(batch, device, non_blocking)
         optimizer.zero_grad(set_to_none=True)
         
-        with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             weights = model(batch["x"], batch["tradable_mask"])
             loss = sharpe_aware_loss(
                 weights,
@@ -773,7 +782,7 @@ def _train_epoch_tensor(
         batch_mask = tradable_mask[idx].to(device=device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             weights = model(batch_x, batch_mask)
             loss = sharpe_aware_loss(
                 weights,
@@ -811,7 +820,7 @@ def _eval_val_loss(
     with torch.inference_mode():
         for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
-            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 weights = model(batch["x"], batch["tradable_mask"])
                 loss = sharpe_aware_loss(
                     weights, 
@@ -845,7 +854,7 @@ def _collect_predictions(
     with torch.inference_mode():
         for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
-            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 weights = model(batch["x"], batch["tradable_mask"])
             weights_cpu = weights.float().cpu()
             returns_cpu = batch["future_log_returns"].float().cpu()
@@ -981,7 +990,9 @@ def run_training(
     print(
         f"[runtime] device={device.type} "
         f"cuda_available={torch.cuda.is_available()} "
-        f"num_gpus={torch.cuda.device_count()}"
+        f"num_gpus={torch.cuda.device_count()} "
+        f"amp_dtype={config.environment.amp_dtype} "
+        f"tensor_cores={config.environment.use_tensor_cores}"
     )
 
     output_path = Path(output_dir)
@@ -1317,15 +1328,28 @@ def run_training(
             )
 
             test_dates = panel.dates[context["test_ds"].valid_indices]
+            test_open_prices = panel.open_prices[context["test_ds"].valid_indices]
             test_close_prices = panel.close_prices[context["test_ds"].valid_indices]
+            execution_mode = config.trading.execution_mode
+            if execution_mode == "intraday_next_open":
+                buy_fee_rate = config.trading.intraday_buy_fee_rate
+                sell_fee_rate = config.trading.intraday_sell_fee_rate
+            else:
+                buy_fee_rate = config.trading.overnight_buy_fee_rate
+                sell_fee_rate = config.trading.overnight_sell_fee_rate
             test_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt_t.weights_history.detach().cpu().numpy(),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
-                buy_fee_rate=0.001425,
-                sell_fee_rate=0.004425,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+                min_fee=config.trading.min_fee,
+                execution_mode=execution_mode,
+                lot_size=config.trading.lot_size,
+                settlement_delay_days=config.trading.settlement_delay_days,
+                open_prices=test_open_prices,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,

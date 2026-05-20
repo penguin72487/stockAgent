@@ -29,6 +29,14 @@ trading:
   long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true
+  execution_mode: overnight_tplus2
+  lot_size: 1000
+  min_fee: 20
+  intraday_buy_fee_rate: 0.001425
+  intraday_sell_fee_rate: 0.002925
+  overnight_buy_fee_rate: 0.001425
+  overnight_sell_fee_rate: 0.004425
+  settlement_delay_days: 2
 
 training:
   backend: pytorch

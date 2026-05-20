@@ -11,7 +11,7 @@ import pandas as pd
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 5
+PANEL_CACHE_VERSION = 6
 
 
 @dataclass(slots=True)
@@ -24,6 +24,7 @@ class PanelData:
     tradable_mask: np.ndarray
     alive_mask: np.ndarray
     benchmark_returns: np.ndarray
+    open_prices: np.ndarray
     close_prices: np.ndarray
 
     @property
@@ -40,6 +41,7 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame["date"] = pd.to_datetime(frame["date"])
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = path.name.replace("_features.parquet", "")
+    frame["open_raw"] = frame["open"].astype(np.float32)
     frame["close_raw"] = frame["close"].astype(np.float32)
 
     frame["return_1d"] = np.log(frame["close"].shift(-1) / frame["close"])
@@ -99,6 +101,7 @@ def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, sourc
         tradable_mask=panel.tradable_mask,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
+        open_prices=panel.open_prices,
         close_prices=panel.close_prices,
     )
     
@@ -123,6 +126,7 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         tradable_mask=cached["tradable_mask"],
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
+        open_prices=cached["open_prices"],
         close_prices=cached["close_prices"],
     )
 
@@ -206,6 +210,7 @@ def build_panel(parquet_root: str | Path) -> PanelData:
 
     features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    open_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
@@ -219,6 +224,7 @@ def build_panel(parquet_root: str | Path) -> PanelData:
 
         features[row_indices, symbol_idx, :] = aligned[feature_columns].to_numpy(dtype=np.float32)
         returns_1d[row_indices, symbol_idx] = aligned["return_1d"].to_numpy(dtype=np.float32)
+        open_prices[row_indices, symbol_idx] = aligned["open_raw"].to_numpy(dtype=np.float32)
         close_prices[row_indices, symbol_idx] = aligned["close_raw"].to_numpy(dtype=np.float32)
         tradable_mask[row_indices, symbol_idx] = aligned["tradable"].to_numpy(dtype=bool)
         alive_mask[row_indices, symbol_idx] = aligned["close"].notna().to_numpy(dtype=bool)
@@ -240,6 +246,7 @@ def build_panel(parquet_root: str | Path) -> PanelData:
         tradable_mask=tradable_mask,
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
+        open_prices=open_prices,
         close_prices=close_prices,
     )
     

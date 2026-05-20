@@ -39,6 +39,14 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     use_all_tradable_symbols: bool
+    execution_mode: str = "overnight_tplus2"
+    lot_size: int = 1000
+    min_fee: float = 20.0
+    intraday_buy_fee_rate: float = 0.001425
+    intraday_sell_fee_rate: float = 0.002925
+    overnight_buy_fee_rate: float = 0.001425
+    overnight_sell_fee_rate: float = 0.004425
+    settlement_delay_days: int = 2
 
 
 @dataclass(slots=True)
@@ -93,6 +101,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward.setdefault("min_train_years", 1)
     walk_forward.setdefault("val_years", 1)
     walk_forward.setdefault("require_future_test_year", True)
+
+    trading = raw.setdefault("trading", {})
+    trading.setdefault("execution_mode", "overnight_tplus2")
+    trading.setdefault("lot_size", 1000)
+    trading.setdefault("min_fee", 20.0)
+    trading.setdefault("intraday_buy_fee_rate", 0.001425)
+    trading.setdefault("intraday_sell_fee_rate", 0.002925)
+    trading.setdefault("overnight_buy_fee_rate", 0.001425)
+    trading.setdefault("overnight_sell_fee_rate", 0.004425)
+    trading.setdefault("settlement_delay_days", 2)
 
     training = raw.setdefault("training", {})
     training.setdefault("model_name", "mlp")
