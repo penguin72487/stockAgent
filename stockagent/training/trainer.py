@@ -43,7 +43,7 @@ from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
-from stockagent.models.mlp import CrossSectionalMLP
+from stockagent.models import build_model
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.loss import sharpe_aware_loss
 
@@ -1019,12 +1019,10 @@ def run_training(
             margin_bytes = int(config.training.vram_safety_margin_gb * (1024 ** 3))
             effective_budget_bytes = max(0, budget_bytes - margin_bytes)
 
-            estimation_model = CrossSectionalMLP(
-                lookback=config.training.lookback,
+            estimation_model = build_model(
+                config=config,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
-                hidden_dim=config.training.hidden_dim,
-                dropout=config.training.dropout,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             eval_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=False)
@@ -1045,12 +1043,10 @@ def run_training(
                 training_mode=False,
             )
 
-            temp_model = CrossSectionalMLP(
-                lookback=config.training.lookback,
+            temp_model = build_model(
+                config=config,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
-                hidden_dim=config.training.hidden_dim,
-                dropout=config.training.dropout,
             ).to(device)
 
             print(f"[Train {train_years}] searching optimal train batch size...")
@@ -1118,12 +1114,10 @@ def run_training(
         for length in val_lengths:
             val_offsets.append(val_offsets[-1] + length)
 
-        model = CrossSectionalMLP(
-            lookback=config.training.lookback,
+        model = build_model(
+            config=config,
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
-            hidden_dim=config.training.hidden_dim,
-            dropout=config.training.dropout,
         ).to(device)
 
         if config.training.enable_torch_compile and hasattr(torch, "compile"):

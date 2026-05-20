@@ -32,6 +32,7 @@ trading:
 
 training:
   backend: pytorch
+  model_name: mlp
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
