@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the stockAgent baseline model")
     parser.add_argument("--config", default="configs/experiment_baseline.yaml", help="Path to experiment config")
     parser.add_argument("--output-dir", default="artifacts", help="Directory for training outputs")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume from fold checkpoints when available")
     return parser.parse_args()
 
 
@@ -36,7 +37,7 @@ def main() -> None:
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
-    results = run_training(panel, folds, config, args.output_dir)
+    results = run_training(panel, folds, config, args.output_dir, resume=args.resume)
 
     summary_path = Path(args.output_dir) / "summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

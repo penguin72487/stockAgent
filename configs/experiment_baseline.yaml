@@ -50,7 +50,7 @@ training:
   auto_batch_size: true
   vram_budget_gb: 16
   vram_safety_margin_gb: 1.0
-  target_vram_fraction: 0.85
+  target_vram_fraction: 1
 
 evaluation:
   primary_baseline: universe_average_return
