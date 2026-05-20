@@ -1,2 +1,2 @@
 # stockAgent
-a stockAgent for
+a stockAgent for muti symble
