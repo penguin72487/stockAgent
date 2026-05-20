@@ -32,25 +32,42 @@ def compute_ic_series(
     future_log_returns: np.ndarray,  # [T, S]
     tradable_mask: np.ndarray,   # [T, S]
 ) -> np.ndarray:                 # [T] daily Spearman IC
-    T = alpha_scores.shape[0]
-    ics = np.zeros(T, dtype=np.float32)
-    for t in range(T):
-        mask = (
-            tradable_mask[t].astype(bool)
-            & np.isfinite(future_log_returns[t])
-            & np.isfinite(alpha_scores[t])
-        )
-        if mask.sum() < 2:
-            continue
-        p = alpha_scores[t, mask].astype(np.float64)
-        r = future_log_returns[t, mask].astype(np.float64)
-        p_rank = p.argsort().argsort().astype(np.float64)
-        r_rank = r.argsort().argsort().astype(np.float64)
-        p_c = p_rank - p_rank.mean()
-        r_c = r_rank - r_rank.mean()
-        denom = math.sqrt((p_c**2).sum() * (r_c**2).sum()) + 1e-8
-        ics[t] = float((p_c * r_c).sum() / denom)
-    return ics
+    scores_t = torch.from_numpy(alpha_scores).float()
+    returns_t = torch.from_numpy(future_log_returns).float()
+    mask_t = torch.from_numpy(tradable_mask.astype(bool))
+    return compute_ic_series_torch(scores_t, returns_t, mask_t).cpu().numpy().astype(np.float32)
+
+
+def compute_ic_series_torch(
+    alpha_scores: torch.Tensor,    # [T, S]
+    future_log_returns: torch.Tensor,  # [T, S]
+    tradable_mask: torch.Tensor,   # [T, S]
+) -> torch.Tensor:                # [T]
+    scores_t = alpha_scores.float()
+    returns_t = future_log_returns.float()
+    mask_t = tradable_mask.bool()
+
+    valid_mask = mask_t & torch.isfinite(scores_t) & torch.isfinite(returns_t)
+    mask_f = valid_mask.float()
+    valid_count = mask_f.sum(dim=1)
+
+    # Use masked fill then argsort(argsort()) for rank approximation.
+    s_fill = torch.where(valid_mask, scores_t, torch.full_like(scores_t, -1e30))
+    r_fill = torch.where(valid_mask, returns_t, torch.full_like(returns_t, -1e30))
+    s_rank = torch.argsort(torch.argsort(s_fill, dim=1), dim=1).float()
+    r_rank = torch.argsort(torch.argsort(r_fill, dim=1), dim=1).float()
+
+    denom_count = valid_count.clamp_min(1.0).unsqueeze(1)
+    s_mean = (s_rank * mask_f).sum(dim=1, keepdim=True) / denom_count
+    r_mean = (r_rank * mask_f).sum(dim=1, keepdim=True) / denom_count
+
+    s_c = (s_rank - s_mean) * mask_f
+    r_c = (r_rank - r_mean) * mask_f
+    cov = (s_c * r_c).sum(dim=1)
+    denom = torch.sqrt((s_c.pow(2).sum(dim=1) * r_c.pow(2).sum(dim=1)).clamp_min(1e-8))
+    ic = cov / denom
+    ic = torch.where(valid_count >= 2, ic, torch.zeros_like(ic))
+    return ic.float()
 
 
 def ic_summary(ic_series: np.ndarray) -> dict[str, float]:

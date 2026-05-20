@@ -4,14 +4,9 @@ import math
 from pathlib import Path
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 from stockagent.backtest.simulator import BacktestResult
-
-try:
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
 
 
 def compute_metrics(result: BacktestResult) -> dict[str, float]:
@@ -153,10 +148,6 @@ def plot_annual_performance(
         dates: datetime64 array [T]
         output_path: optional file path to save figure
     """
-    if not HAS_MATPLOTLIB:
-        print("matplotlib not available, skipping plot")
-        return
-    
     annual_metrics = compute_metrics_by_year(result, dates)
     years = sorted(annual_metrics.keys())
     
@@ -211,10 +202,6 @@ def plot_equity_curve(
         dates: datetime64 array [T]
         output_path: optional file path to save figure
     """
-    if not HAS_MATPLOTLIB:
-        print("matplotlib not available, skipping plot")
-        return
-    
     r = np.nan_to_num(result.strategy_returns, nan=0.0)
     b = np.nan_to_num(result.benchmark_returns, nan=0.0)
     
@@ -229,6 +216,42 @@ def plot_equity_curve(
     ax.set_title("Strategy vs Benchmark Equity Curve")
     ax.legend()
     ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_equity_curve_log(
+    result: BacktestResult,
+    dates: np.ndarray,
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot cumulative equity curve for strategy and benchmark (log scale Y-axis).
+    
+    Args:
+        result: BacktestResult
+        dates: datetime64 array [T]
+        output_path: optional file path to save figure
+    """
+    r = np.nan_to_num(result.strategy_returns, nan=0.0)
+    b = np.nan_to_num(result.benchmark_returns, nan=0.0)
+    
+    strategy_equity = np.exp(np.cumsum(r))
+    benchmark_equity = np.exp(np.cumsum(b))
+    
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
+    ax.set_yscale("log")
+    ax.set_title("Strategy vs Benchmark Equity Curve (Log Scale)")
+    ax.legend()
+    ax.grid(True, alpha=0.3, which="both")
     
     plt.tight_layout()
     

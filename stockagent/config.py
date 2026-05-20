@@ -26,11 +26,7 @@ class DataConfig:
 
 @dataclass(slots=True)
 class WalkForwardConfig:
-    mode: str
     min_train_years: int
-    val_years: int
-    test_years: str
-    require_future_test_year: bool
 
 
 @dataclass(slots=True)
@@ -78,6 +74,9 @@ class ExperimentConfig:
 
 
 def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
+    walk_forward = raw.setdefault("walk_forward", {})
+    walk_forward.setdefault("min_train_years", 1)
+
     training = raw.setdefault("training", {})
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)

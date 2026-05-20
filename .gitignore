@@ -189,3 +189,5 @@ __marimo__/
 .streamlit/secrets.toml
 data_parquet/*
 artifacts/*
+*.7z
+
