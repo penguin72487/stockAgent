@@ -23,8 +23,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from stockagent.backtest.report import compute_god_mode_returns, compute_metrics, generate_annual_report, plot_annual_performance, plot_equity_curve, plot_equity_curve_log
-from stockagent.backtest.simulator import BacktestResult, BacktestResultTensor, run_backtest_torch
+from stockagent.backtest.report import (
+    compute_god_mode_returns,
+    compute_metrics,
+    generate_annual_report,
+    plot_annual_performance,
+    plot_equity_curve,
+    plot_equity_curve_log,
+    plot_fold_first_year_returns,
+)
+from stockagent.backtest.simulator import (
+    BacktestResult,
+    BacktestResultTensor,
+    HoldingsRecord,
+    run_backtest_integer_shares,
+    run_backtest_torch,
+)
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
@@ -210,15 +224,26 @@ def _save_backtest_artifact(output_path: Path, result: BacktestResult, dates: np
 
 def _save_holdings_csv(
     output_path: Path,
-    weights_history: np.ndarray,
-    dates: np.ndarray,
-    symbols: list[str],
+    holdings: list[HoldingsRecord],
 ) -> None:
-    """Save daily portfolio weights as a CSV with columns: date, <symbol>, ..."""
+    """Save daily holdings detail sorted by holding ratio."""
     import pandas as pd  # already a transitive dependency
-    date_strs = pd.to_datetime(dates).strftime("%Y-%m-%d").tolist()
-    df = pd.DataFrame(weights_history, columns=symbols)
-    df.insert(0, "date", date_strs)
+
+    rows = [
+        {
+            "date": row.date,
+            "symbol": row.symbol,
+            "shares": int(row.shares),
+            "price": float(row.price),
+            "market_value": float(row.market_value),
+            "holding_ratio": float(row.holding_ratio),
+            "is_cash": bool(row.is_cash),
+        }
+        for row in holdings
+    ]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["date", "holding_ratio", "symbol"], ascending=[True, False, True])
     df.to_csv(output_path, index=False)
 
 
@@ -361,6 +386,10 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
     all_turnovers: list[np.ndarray] = []
     all_weights: list[np.ndarray] = []
     all_dates: list[np.ndarray] = []
+    first_year_fold_ids: list[int] = []
+    first_year_labels: list[int] = []
+    first_year_strategy_log: list[float] = []
+    first_year_baseline_log: list[float] = []
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
@@ -373,6 +402,16 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
         all_turnovers.append(fold_backtest.turnovers)
         all_weights.append(fold_backtest.weights_history)
         all_dates.append(fold_dates)
+
+        years = np.asarray(fold_dates, dtype="datetime64[D]").astype(object)
+        years = np.array([d.year for d in years])
+        if years.size > 0:
+            first_year = int(np.min(years))
+            mask = years == first_year
+            first_year_fold_ids.append(result.fold_id)
+            first_year_labels.append(first_year)
+            first_year_strategy_log.append(float(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).sum()))
+            first_year_baseline_log.append(float(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).sum()))
 
     if not all_dates:
         return
@@ -390,6 +429,15 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
         combined_dates,
         output_path / "walkforward_equity_curve_log.png",
     )
+
+    if first_year_fold_ids:
+        plot_fold_first_year_returns(
+            first_year_fold_ids,
+            first_year_labels,
+            first_year_strategy_log,
+            first_year_baseline_log,
+            output_path / "walkforward_first_year_cumulative_returns.png",
+        )
 
 
 def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult | None:
@@ -1176,7 +1224,7 @@ def run_training(
                 best_val_loss = float(context["best_val_loss"])
 
             test_x, test_returns, test_masks, test_bench = _dataset_to_tensors(context["test_ds"])
-            test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
+            test_bt_t, test_ic, _ = _evaluate_tensor_batch(
                 model,
                 test_x,
                 test_returns,
@@ -1203,6 +1251,21 @@ def run_training(
             )
             val_met = compute_metrics(val_backtest_slice)
 
+            test_dates = panel.dates[context["test_ds"].valid_indices]
+            test_close_prices = panel.close_prices[context["test_ds"].valid_indices]
+            test_bt, holdings_records = run_backtest_integer_shares(
+                weights=test_bt_t.weights_history.detach().cpu().numpy(),
+                future_returns=test_returns.detach().cpu().numpy(),
+                tradable_mask=test_masks.detach().cpu().numpy(),
+                benchmark_returns=test_bench.detach().cpu().numpy(),
+                initial_capital=1_000_000.0,
+                fee_rate=0.001,
+                close_prices=test_close_prices,
+                symbols=panel.symbols,
+                dates=test_dates,
+            )
+            test_met = compute_metrics(test_bt)
+
             print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
             print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
 
@@ -1223,8 +1286,6 @@ def run_training(
             with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
                 json.dump(asdict(fold_result), f, indent=2)
 
-            test_dates = panel.dates[context["test_ds"].valid_indices]
-            test_bt = test_bt_t.to_numpy()
             god_returns = compute_god_mode_returns(
                 test_returns.numpy(),
                 test_masks.numpy(),
@@ -1238,7 +1299,7 @@ def run_training(
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png", god_returns=god_returns)
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png", god_returns=god_returns)
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
-            _save_holdings_csv(fold_dir / "holdings.csv", test_bt.weights_history, test_dates, panel.symbols)
+            _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
 
