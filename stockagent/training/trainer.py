@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -80,6 +82,19 @@ def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
     if amp_dtype == "fp16":
         return torch.float16
     raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
+
+
+def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
+    """Return whether torch.compile is safe to enable in current environment."""
+    if device.type != "cuda":
+        return False, "torch.compile is only enabled for CUDA in this project"
+
+    # Inductor+Triton on CUDA needs a host C compiler at runtime.
+    compiler = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if not compiler:
+        return False, "no host C compiler found (set CC or install gcc/clang)"
+
+    return True, f"compiler={compiler}"
 
 
 def find_optimal_batch_size(
@@ -282,6 +297,8 @@ def _train_epoch(
     amp_dtype: torch.dtype,
     non_blocking: bool,
     fee_per_side: float,
+    gamma_sharpe: float,
+    gamma_turnover: float,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -296,8 +313,8 @@ def _train_epoch(
                 batch["future_log_returns"],
                 batch["tradable_mask"],
                 fee_per_side,
-                gamma_sharpe=1.0,
-                gamma_turnover=0.1,
+                gamma_sharpe=gamma_sharpe,
+                gamma_turnover=gamma_turnover,
             )
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -313,6 +330,9 @@ def _eval_val_loss(
     device: torch.device,
     amp_dtype: torch.dtype,
     non_blocking: bool,
+    fee_per_side: float,
+    gamma_sharpe: float,
+    gamma_turnover: float,
 ) -> float:
     model.eval()
     losses: list[float] = []
@@ -325,9 +345,9 @@ def _eval_val_loss(
                     weights, 
                     batch["future_log_returns"], 
                     batch["tradable_mask"], 
-                    fee_per_side=0.0,
-                    gamma_sharpe=1.0,
-                    gamma_turnover=0.1,
+                    fee_per_side=fee_per_side,
+                    gamma_sharpe=gamma_sharpe,
+                    gamma_turnover=gamma_turnover,
                 )
             losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("inf")
@@ -441,6 +461,10 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
         test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
 
+        if len(test_ds) == 0:
+            print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+            continue
+
         min_batch_size = max(1, config.training.min_batch_size)
 
         if config.training.auto_batch_size and device.type == "cuda":
@@ -492,7 +516,7 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 sample_loader=temp_train_loader,
                 device=device,
                 amp_dtype=amp_dtype,
-                target_vram_fraction=0.85,
+                target_vram_fraction=config.training.target_vram_fraction,
                 vram_budget_gb=config.training.vram_budget_gb,
             )
             
@@ -500,9 +524,9 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
             val_batch_size = min(train_batch_size * 2, len(val_ds))
             test_batch_size = min(train_batch_size * 2, len(test_ds))
         else:
-            train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size)
-            val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size)
-            test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size)
+            train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
+            val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
+            test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size_eval)
 
         print(
             f"[Fold {fold.fold_id}] using batch_size "
@@ -520,13 +544,17 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
             dropout=config.training.dropout,
         ).to(device)
 
-        # Compile model for speed (PyTorch 2.0+)
-        if hasattr(torch, "compile") and device.type == "cuda":
-            try:
-                model = torch.compile(model, mode="reduce-overhead")
-                print(f"[Fold {fold.fold_id}] torch.compile enabled (mode=reduce-overhead)")
-            except Exception as e:
-                print(f"[Fold {fold.fold_id}] torch.compile failed, falling back to eager: {e}")
+        # Compile model for speed (PyTorch 2.0+) when environment supports it.
+        if hasattr(torch, "compile"):
+            can_compile, reason = _can_enable_torch_compile(device)
+            if can_compile:
+                try:
+                    model = torch.compile(model, mode="reduce-overhead")
+                    print(f"[Fold {fold.fold_id}] torch.compile enabled (mode=reduce-overhead, {reason})")
+                except Exception as e:
+                    print(f"[Fold {fold.fold_id}] torch.compile failed, falling back to eager: {e}")
+            else:
+                print(f"[Fold {fold.fold_id}] torch.compile skipped: {reason}")
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -549,8 +577,19 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 amp_dtype,
                 config.training.non_blocking_transfer,
                 config.trading.fee_per_side,
+                config.evaluation.gamma_sharpe,
+                config.evaluation.gamma_turnover,
             )
-            val_loss = _eval_val_loss(model, val_loader, device, amp_dtype, config.training.non_blocking_transfer)
+            val_loss = _eval_val_loss(
+                model,
+                val_loader,
+                device,
+                amp_dtype,
+                config.training.non_blocking_transfer,
+                config.trading.fee_per_side,
+                config.evaluation.gamma_sharpe,
+                config.evaluation.gamma_turnover,
+            )
             epoch_pbar.set_postfix({
                 "train_loss": f"{train_loss:.6f}",
                 "val_loss": f"{val_loss:.6f}",

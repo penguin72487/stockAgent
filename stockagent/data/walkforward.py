@@ -20,6 +20,8 @@ class WalkForwardFold:
 def build_expanding_year_folds(
     dates: np.ndarray,
     min_train_years: int,
+    val_years: int = 1,
+    require_future_test_year: bool = True,
 ) -> list[WalkForwardFold]:
     """Build non-overlapping folds by enumerating train/val split points.
 
@@ -35,6 +37,15 @@ def build_expanding_year_folds(
 
     total_years = len(unique_years)
     min_i = max(1, min_train_years)
+
+    # NOTE:
+    # Fold rule requested by user:
+    #   train = [1..i], val = [i+1..j], test = [j+1..n]
+    #   i in [1..n-2], j in [i+1..n-1]
+    # We keep val_years/require_future_test_year in function signature for API
+    # compatibility, but fold enumeration follows the rule above.
+    _ = val_years
+    _ = require_future_test_year
 
     for i in range(min_i, total_years - 1):
         for j in range(i + 1, total_years):
@@ -62,7 +73,6 @@ def build_expanding_year_folds(
                     test_years=test_year_slice,
                 )
             )
-
     if not folds:
         raise ValueError("No valid walk-forward folds could be constructed")
     return folds

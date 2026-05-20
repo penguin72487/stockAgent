@@ -33,6 +33,8 @@ def main() -> None:
     folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,
+        val_years=config.walk_forward.val_years,
+        require_future_test_year=config.walk_forward.require_future_test_year,
     )
     results = run_training(panel, folds, config, args.output_dir)
 

@@ -13,6 +13,7 @@ class EnvironmentConfig:
     device: str
     use_tensor_cores: bool
     amp_dtype: str
+    target_vram_fraction: float = 0.85
 
 
 @dataclass(slots=True)
@@ -27,6 +28,8 @@ class DataConfig:
 @dataclass(slots=True)
 class WalkForwardConfig:
     min_train_years: int
+    val_years: int = 1
+    require_future_test_year: bool = True
 
 
 @dataclass(slots=True)
@@ -46,10 +49,13 @@ class TrainingConfig:
     non_blocking_transfer: bool
     lookback: int = 1
     batch_size: int = 32
+    batch_size_train: int = 32
+    batch_size_eval: int = 32
     min_batch_size: int = 1
     auto_batch_size: bool = False
     vram_budget_gb: float = 8.0
     vram_safety_margin_gb: float = 1.0
+    target_vram_fraction: float = 0.85
     epochs: int = 1000
     learning_rate: float = 1e-3
     hidden_dim: int = 1024
@@ -64,6 +70,8 @@ class TrainingConfig:
 class EvaluationConfig:
     primary_baseline: str
     metrics: list[str]
+    gamma_sharpe: float = 1.0
+    gamma_turnover: float = 0.1
 
 
 @dataclass(slots=True)
@@ -80,14 +88,19 @@ class ExperimentConfig:
 def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward = raw.setdefault("walk_forward", {})
     walk_forward.setdefault("min_train_years", 1)
+    walk_forward.setdefault("val_years", 1)
+    walk_forward.setdefault("require_future_test_year", True)
 
     training = raw.setdefault("training", {})
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
+    training.setdefault("batch_size_train", training.get("batch_size", 32))
+    training.setdefault("batch_size_eval", training.get("batch_size", 32))
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
     training.setdefault("vram_budget_gb", 8.0)
     training.setdefault("vram_safety_margin_gb", 1.0)
+    training.setdefault("target_vram_fraction", 0.85)
     training.setdefault("epochs", 10)
     training.setdefault("learning_rate", 1e-3)
     training.setdefault("hidden_dim", 128)
@@ -96,6 +109,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("num_workers", 0)
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("loss_type", "mse")
+
+    evaluation = raw.setdefault("evaluation", {})
+    evaluation.setdefault("gamma_sharpe", 1.0)
+    evaluation.setdefault("gamma_turnover", 0.1)
     return raw
 
 

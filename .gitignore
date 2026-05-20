@@ -191,4 +191,4 @@ data_parquet/*
 artifacts/*
 *.7z
 artifacts_test/*
-
+artifacts_smoke/*
