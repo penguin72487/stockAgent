@@ -15,6 +15,10 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         fold_start_idx = int(self.date_indices[0])
         min_valid_idx = fold_start_idx + lookback - 1
         self.valid_indices = self.date_indices[self.date_indices > min_valid_idx]  # Use > instead of >=
+        
+        # ✅ OPTIMIZATION: Error checking for insufficient data
+        if len(self.valid_indices) == 0:
+            raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback + 1} dates.")
 
         returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)

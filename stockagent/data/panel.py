@@ -124,7 +124,7 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
 
 
 def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
-    """Check if cache is valid based on source hash."""
+    """Check if cache is valid based on source hash and mtime."""
     if not meta_path.exists():
         return False
     
@@ -132,9 +132,24 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         
+        # ✅ OPTIMIZATION: Check both version and source hash for cache validity
         expected_hash = _compute_source_hash(parquet_paths)
-        return meta.get('source_hash') == expected_hash and meta.get('version') == PANEL_CACHE_VERSION
-    except Exception:
+        cache_valid = (
+            meta.get('source_hash') == expected_hash and 
+            meta.get('version') == PANEL_CACHE_VERSION
+        )
+        
+        if cache_valid:
+            # Also verify that cache file itself is newer than source files
+            cache_mtime = meta_path.stat().st_mtime
+            source_mtimes = [p.stat().st_mtime for p in parquet_paths]
+            if cache_mtime < max(source_mtimes):
+                # Cache is older than source files, invalidate
+                return False
+        
+        return cache_valid
+    except Exception as e:
+        print(f"[panel] cache validation error: {e}")
         return False
 
 
@@ -201,11 +216,18 @@ def build_panel(parquet_root: str | Path) -> PanelData:
 
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # ✅ OPTIMIZATION: Feature standardization (Z-score normalization)
+    # This prevents Transformer attention weights from diverging due to feature scale differences
+    features_mean = np.mean(features, axis=(0, 1), keepdims=True)
+    features_std = np.std(features, axis=(0, 1), keepdims=True) + 1e-8
+    features_normalized = (features - features_mean) / features_std
+    print(f"[panel] feature normalization applied: mean={features_mean.mean():.6f}, std={features_std.mean():.6f}")
+
     panel = PanelData(
         dates=np.array(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
         feature_names=feature_columns,
-        features=features,
+        features=features_normalized,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
         alive_mask=alive_mask,

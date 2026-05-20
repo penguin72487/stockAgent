@@ -36,18 +36,18 @@ training:
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   lookback: 1
-  batch_size: 1024
-  batch_size_train: 1024
-  batch_size_eval: 512
-  epochs: 100
+  batch_size: 2048
+  batch_size_train: 2048
+  batch_size_eval: 2048
+  epochs: 1000
   learning_rate: 0.001
   hidden_dim: 1024
   dropout: 0.1
   num_workers: 16
   weight_decay: 0.00001
   loss_type: sharpe
-  min_batch_size: 1
-  auto_batch_size: false
+  min_batch_size: 32
+  auto_batch_size: true
   vram_budget_gb: 16
   vram_safety_margin_gb: 1.0
   target_vram_fraction: 0.85
