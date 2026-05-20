@@ -41,7 +41,7 @@ training:
   batch_size: 2048
   batch_size_train: 2048
   batch_size_eval: 2048
-  epochs: 100
+  epochs: 1000
   learning_rate: 0.001
   hidden_dim: 512
   hidden_layers: 2
