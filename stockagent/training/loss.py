@@ -64,12 +64,7 @@ def sharpe_aware_loss(
     std_return = torch.sqrt(variance + eps)  # Epsilon inside sqrt for stable gradients
     annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights.dtype))
     
-    # Clamp Sharpe to prevent extreme values
-    sharpe = torch.clamp(
-        mean_return / std_return * annualizer,
-        min=-10.0,
-        max=10.0
-    )
+    sharpe = mean_return / std_return * annualizer
     
     # Composite loss
     loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_cost

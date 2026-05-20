@@ -23,8 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from stockagent.backtest.report import compute_metrics, generate_annual_report, plot_annual_performance, plot_equity_curve, plot_equity_curve_log
-from stockagent.backtest.simulator import BacktestResultTensor, run_backtest_torch
+from stockagent.backtest.report import compute_god_mode_returns, compute_metrics, generate_annual_report, plot_annual_performance, plot_equity_curve, plot_equity_curve_log
+from stockagent.backtest.simulator import BacktestResult, BacktestResultTensor, run_backtest_torch
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
@@ -70,6 +70,336 @@ class PredictionBufferPool:
         self.returns = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.float32)
         self.masks = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.bool)
         self.bench = torch.empty((self.capacity_rows,), dtype=torch.float32)
+
+
+def _fold_dir(output_path: Path, fold_id: int) -> Path:
+    return output_path / f"fold_{fold_id:02d}"
+
+
+def _checkpoint_path(fold_dir: Path) -> Path:
+    return fold_dir / "checkpoint_last.pt"
+
+
+def _best_checkpoint_path(fold_dir: Path) -> Path:
+    return fold_dir / "checkpoint_best.pt"
+
+
+def _metrics_path(fold_dir: Path) -> Path:
+    return fold_dir / "metrics.json"
+
+
+def _model_path(fold_dir: Path) -> Path:
+    return fold_dir / "model.pt"
+
+
+def _backtest_path(fold_dir: Path) -> Path:
+    return fold_dir / "test_backtest.npz"
+
+
+def _group_key(train_years: list[int]) -> tuple[int, ...]:
+    return tuple(train_years)
+
+
+def _group_id(train_years: list[int]) -> str:
+    return "train_" + "-".join(str(year) for year in train_years)
+
+
+def _group_dir(output_path: Path, train_years: list[int]) -> Path:
+    return output_path / _group_id(train_years)
+
+
+def _group_checkpoint_path(output_path: Path, train_years: list[int]) -> Path:
+    return _group_dir(output_path, train_years) / "checkpoint_last.pt"
+
+
+def _summary_path(output_path: Path) -> Path:
+    return output_path / "summary.json"
+
+
+def _load_fold_result(metrics_path: Path) -> FoldResult:
+    with metrics_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return FoldResult(**payload)
+
+
+def _write_summary(results: list[FoldResult], output_path: Path) -> None:
+    summary_path = _summary_path(output_path)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump([asdict(result) for result in results], handle, indent=2)
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return getattr(model, "_orig_mod", model)
+
+
+def _state_dict_for_save(model: nn.Module) -> dict[str, torch.Tensor]:
+    return _unwrap_model(model).state_dict()
+
+
+def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
+    cleaned_state_dict = {
+        key.removeprefix("_orig_mod."): value for key, value in state_dict.items()
+    }
+    _unwrap_model(model).load_state_dict(cleaned_state_dict)
+
+
+def _save_fold_checkpoint(
+    checkpoint_path: Path,
+    *,
+    fold: WalkForwardFold,
+    epoch: int,
+    best_val_loss: float,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "fold_id": fold.fold_id,
+            "epoch": epoch,
+            "train_years": fold.train_years,
+            "val_years": fold.val_years,
+            "test_years": fold.test_years,
+            "best_val_loss": best_val_loss,
+            "model_state_dict": _state_dict_for_save(model),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+        },
+        checkpoint_path,
+    )
+
+
+def _load_checkpoint(checkpoint_path: Path) -> dict:
+    return torch.load(checkpoint_path, map_location="cpu")
+
+
+def _save_group_checkpoint(
+    checkpoint_path: Path,
+    *,
+    train_years: list[int],
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "train_years": train_years,
+            "epoch": epoch,
+            "model_state_dict": _state_dict_for_save(model),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+        },
+        checkpoint_path,
+    )
+
+
+def _save_backtest_artifact(output_path: Path, result: BacktestResult, dates: np.ndarray) -> None:
+    np.savez_compressed(
+        output_path,
+        strategy_returns=result.strategy_returns,
+        benchmark_returns=result.benchmark_returns,
+        turnovers=result.turnovers,
+        weights_history=result.weights_history,
+        dates=np.asarray(dates),
+    )
+
+
+def _save_holdings_csv(
+    output_path: Path,
+    weights_history: np.ndarray,
+    dates: np.ndarray,
+    symbols: list[str],
+) -> None:
+    """Save daily portfolio weights as a CSV with columns: date, <symbol>, ..."""
+    import pandas as pd  # already a transitive dependency
+    date_strs = pd.to_datetime(dates).strftime("%Y-%m-%d").tolist()
+    df = pd.DataFrame(weights_history, columns=symbols)
+    df.insert(0, "date", date_strs)
+    df.to_csv(output_path, index=False)
+
+
+def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarray]:
+    data = np.load(output_path)
+    result = BacktestResult(
+        strategy_returns=data["strategy_returns"].astype(np.float32),
+        benchmark_returns=data["benchmark_returns"].astype(np.float32),
+        turnovers=data["turnovers"].astype(np.float32),
+        weights_history=data["weights_history"].astype(np.float32),
+    )
+    dates = np.asarray(data["dates"])
+    return result, dates
+
+
+def _dataset_to_tensors(dataset: CrossSectionalDataset) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
+    if dataset.lookback == 1:
+        x = dataset.features_t[valid_indices].unsqueeze(1)
+    else:
+        x = torch.stack([dataset[i]["x"] for i in range(len(dataset))], dim=0)
+    returns = dataset.future_log_returns_t[valid_indices]
+    masks = dataset.tradable_mask_t[valid_indices]
+    bench = dataset.benchmark_t[valid_indices]
+    return x, returns, masks, bench
+
+
+def _combine_datasets_to_tensors(
+    datasets: list[CrossSectionalDataset],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    xs: list[torch.Tensor] = []
+    returns: list[torch.Tensor] = []
+    masks: list[torch.Tensor] = []
+    bench: list[torch.Tensor] = []
+    lengths: list[int] = []
+    for dataset in datasets:
+        x, y, m, b = _dataset_to_tensors(dataset)
+        xs.append(x)
+        returns.append(y)
+        masks.append(m)
+        bench.append(b)
+        lengths.append(int(x.size(0)))
+    return (
+        torch.cat(xs, dim=0),
+        torch.cat(returns, dim=0),
+        torch.cat(masks, dim=0),
+        torch.cat(bench, dim=0),
+        lengths,
+    )
+
+
+def _evaluate_tensor_batch(
+    model: nn.Module,
+    x: torch.Tensor,
+    future_log_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    benchmark: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    fee_per_side: float,
+    chunk_rows: int,
+) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
+    model.eval()
+    weights_chunks: list[torch.Tensor] = []
+    returns_chunks: list[torch.Tensor] = []
+    masks_chunks: list[torch.Tensor] = []
+    benchmark_chunks: list[torch.Tensor] = []
+    with torch.inference_mode():
+        for start in range(0, x.size(0), chunk_rows):
+            end = min(start + chunk_rows, x.size(0))
+            x_chunk = x[start:end].to(device=device, non_blocking=True)
+            returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=True)
+            mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=True)
+            bench_chunk = benchmark[start:end].to(device=device, non_blocking=True)
+            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+                weights_chunk = model(x_chunk, mask_chunk)
+
+            weights_chunks.append(weights_chunk.float().cpu())
+            returns_chunks.append(returns_chunk.float().cpu())
+            masks_chunks.append(mask_chunk.cpu())
+            benchmark_chunks.append(bench_chunk.float().cpu())
+
+        weights = torch.cat(weights_chunks, dim=0)
+        future_log_returns_cpu = torch.cat(returns_chunks, dim=0)
+        tradable_mask_cpu = torch.cat(masks_chunks, dim=0)
+        benchmark_cpu = torch.cat(benchmark_chunks, dim=0)
+
+        backtest = run_backtest_torch(weights, future_log_returns_cpu, tradable_mask_cpu, benchmark_cpu, fee_per_side)
+        ic = ic_summary(compute_ic_series_torch(weights, future_log_returns_cpu, tradable_mask_cpu).cpu().numpy())
+        metrics = compute_metrics(backtest.to_numpy())
+    return backtest, ic, metrics
+
+
+def _auto_chunk_rows(
+    model: nn.Module,
+    x: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    target_vram_fraction: float,
+) -> int:
+    if device.type != "cuda":
+        return max(1, min(256, int(x.size(0))))
+
+    total_rows = int(x.size(0))
+    if total_rows <= 1:
+        return 1
+
+    torch.cuda.empty_cache()
+    free_mem, _ = torch.cuda.mem_get_info(device)
+
+    # Measure per-row incremental VRAM cost on a tiny probe, then size chunk
+    # from currently free VRAM. This avoids OOM-driven probing.
+    probe_rows = max(1, min(32, total_rows))
+    torch.cuda.reset_peak_memory_stats(device)
+    base_alloc = torch.cuda.memory_allocated(device)
+    with torch.inference_mode():
+        x_probe = x[:probe_rows].to(device=device, non_blocking=True)
+        mask_probe = tradable_mask[:probe_rows].to(device=device, non_blocking=True)
+        with autocast(device_type=device.type, enabled=True, dtype=amp_dtype):
+            _ = model(x_probe, mask_probe)
+    torch.cuda.synchronize(device)
+    peak_alloc = torch.cuda.max_memory_allocated(device)
+
+    incremental_bytes = max(1, peak_alloc - base_alloc)
+    bytes_per_row = max(1, incremental_bytes // probe_rows)
+
+    # Keep headroom for allocator/workspace fluctuations.
+    usable_bytes = int(free_mem * target_vram_fraction * 0.9)
+    estimated_rows = usable_bytes // bytes_per_row
+
+    return max(1, min(total_rows, int(estimated_rows)))
+
+
+def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
+    _write_summary(results, output_path)
+
+    all_strategy_returns: list[np.ndarray] = []
+    all_benchmark_returns: list[np.ndarray] = []
+    all_turnovers: list[np.ndarray] = []
+    all_weights: list[np.ndarray] = []
+    all_dates: list[np.ndarray] = []
+
+    for result in sorted(results, key=lambda item: item.fold_id):
+        fold_dir = _fold_dir(output_path, result.fold_id)
+        backtest_path = _backtest_path(fold_dir)
+        if not backtest_path.exists():
+            continue
+        fold_backtest, fold_dates = _load_backtest_artifact(backtest_path)
+        all_strategy_returns.append(fold_backtest.strategy_returns)
+        all_benchmark_returns.append(fold_backtest.benchmark_returns)
+        all_turnovers.append(fold_backtest.turnovers)
+        all_weights.append(fold_backtest.weights_history)
+        all_dates.append(fold_dates)
+
+    if not all_dates:
+        return
+
+    combined_backtest = BacktestResult(
+        strategy_returns=np.concatenate(all_strategy_returns, axis=0),
+        benchmark_returns=np.concatenate(all_benchmark_returns, axis=0),
+        turnovers=np.concatenate(all_turnovers, axis=0),
+        weights_history=np.concatenate(all_weights, axis=0),
+    )
+    combined_dates = np.concatenate(all_dates, axis=0)
+
+    plot_equity_curve_log(
+        combined_backtest,
+        combined_dates,
+        output_path / "walkforward_equity_curve_log.png",
+    )
+
+
+def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult | None:
+    fold_dir = _fold_dir(output_path, fold_id)
+    metrics_path = _metrics_path(fold_dir)
+    model_path = _model_path(fold_dir)
+    backtest_path = _backtest_path(fold_dir)
+    if metrics_path.exists() and model_path.exists() and backtest_path.exists():
+        return _load_fold_result(metrics_path)
+    return None
 
 
 
@@ -209,7 +539,14 @@ def find_optimal_batch_size(
     return best_batch_size
 
 
-def _build_loader(dataset: CrossSectionalDataset, batch_size: int, shuffle: bool, config: ExperimentConfig, device: torch.device) -> DataLoader:
+def _build_loader(
+    dataset: CrossSectionalDataset,
+    batch_size: int,
+    shuffle: bool,
+    config: ExperimentConfig,
+    device: torch.device,
+    drop_last: bool = False,
+) -> DataLoader:
     workers = config.training.num_workers
     loader_kwargs: dict = {
         "dataset": dataset,
@@ -217,6 +554,7 @@ def _build_loader(dataset: CrossSectionalDataset, batch_size: int, shuffle: bool
         "shuffle": shuffle,
         "num_workers": workers,
         "pin_memory": (device.type == "cuda"),
+        "drop_last": drop_last,
         "collate_fn": collate_batch,
     }
     if workers > 0:
@@ -357,6 +695,60 @@ def _train_epoch(
     return total_loss / max(steps, 1)
 
 
+def _train_epoch_tensor(
+    model: nn.Module,
+    x: torch.Tensor,
+    future_log_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    batch_size: int,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    fee_per_side: float,
+    gamma_sharpe: float,
+    gamma_turnover: float,
+) -> float:
+    model.train()
+    total_rows = int(x.size(0))
+    if total_rows == 0:
+        return 0.0
+
+    order = torch.randperm(total_rows)
+    total_loss = 0.0
+    steps = 0
+
+    for start in range(0, total_rows, batch_size):
+        end = min(start + batch_size, total_rows)
+        idx = order[start:end]
+        batch_x = x[idx].to(device=device, non_blocking=True)
+        batch_ret = future_log_returns[idx].to(device=device, non_blocking=True)
+        batch_mask = tradable_mask[idx].to(device=device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            weights = model(batch_x, batch_mask)
+            loss = sharpe_aware_loss(
+                weights,
+                batch_ret,
+                batch_mask,
+                fee_per_side,
+                gamma_sharpe=gamma_sharpe,
+                gamma_turnover=gamma_turnover,
+            )
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += float(loss.detach().cpu())
+        steps += 1
+
+    return total_loss / max(steps, 1)
+
+
 def _eval_val_loss(
     model: nn.Module,
     loader: DataLoader,
@@ -465,7 +857,13 @@ def _evaluate_split_torch(
     return backtest, ic, metrics
 
 
-def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: ExperimentConfig, output_dir: str | Path) -> list[FoldResult]:
+def run_training(
+    panel: PanelData,
+    folds: Iterable[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+    resume: bool = True,
+) -> list[FoldResult]:
     device = _resolve_device(config)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     if config.environment.use_tensor_cores and device.type == "cuda":
@@ -473,6 +871,13 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        try:
+            import torch._inductor.config as inductor_config  # type: ignore
+
+            inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+            inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
+        except Exception:
+            pass
     print(
         f"[runtime] device={device.type} "
         f"cuda_available={torch.cuda.is_available()} "
@@ -482,22 +887,35 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    results: list[FoldResult] = []
+    results_by_fold: dict[int, FoldResult] = {}
     buffer_pool = PredictionBufferPool()
     fold_list = list(folds)
-    for fold in tqdm(fold_list, desc="Folds", unit="fold"):
-        print(f"\n{'='*60}")
-        print(f"[Fold {fold.fold_id}]  train={fold.train_years}  val={fold.val_years}  test={fold.test_years}")
-        print(f"{'='*60}")
 
-        train_ds = CrossSectionalDataset(panel, fold.train_indices, config.training.lookback)
-        val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-        test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+    if resume:
+        for fold in fold_list:
+            completed = _load_completed_fold_result(output_path, fold.fold_id)
+            if completed is not None:
+                results_by_fold[fold.fold_id] = completed
+        if results_by_fold:
+            _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
 
-        if len(test_ds) == 0:
-            print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+    grouped_folds: dict[tuple[int, ...], list[WalkForwardFold]] = {}
+    for fold in fold_list:
+        grouped_folds.setdefault(_group_key(fold.train_years), []).append(fold)
+
+    for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
+        train_years = list(train_years_key)
+        pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
+        if not pending_folds:
+            print(f"[Train {train_years}] already completed, skipping")
             continue
 
+        print(f"\n{'='*80}")
+        print(f"[Train {train_years}] folds={len(group_folds)} pending={len(pending_folds)}")
+        print(f"{'='*80}")
+
+        train_reference = group_folds[0]
+        train_ds = CrossSectionalDataset(panel, train_reference.train_indices, config.training.lookback)
         min_batch_size = max(1, config.training.min_batch_size)
 
         if config.training.auto_batch_size and device.type == "cuda":
@@ -531,8 +949,6 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 training_mode=False,
             )
 
-            # ✅ FIXED: Use binary search for adaptive batch size
-            # Create a temporary model for batch size search
             temp_model = CrossSectionalMLP(
                 lookback=config.training.lookback,
                 num_features=len(panel.feature_names),
@@ -540,9 +956,8 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
             ).to(device)
-            
-            # Binary search for training batch size
-            print(f"[Fold {fold.fold_id}] searching optimal train batch size...")
+
+            print(f"[Train {train_years}] searching optimal train batch size...")
             temp_train_loader = _build_loader(train_ds, 1, False, config, device)
             train_batch_size = find_optimal_batch_size(
                 model=temp_model,
@@ -552,22 +967,60 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
                 target_vram_fraction=config.training.target_vram_fraction,
                 vram_budget_gb=config.training.vram_budget_gb,
             )
-            
-            # Use smaller batch sizes for validation/test (inference is less memory intensive)
-            val_batch_size = min(train_batch_size * 2, len(val_ds))
-            test_batch_size = min(train_batch_size * 2, len(test_ds))
+            train_batch_size = max(min_batch_size, train_batch_size)
         else:
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
+
+        print(f"[Train {train_years}] using batch_size train={train_batch_size}")
+        train_x, train_returns, train_masks, _ = _dataset_to_tensors(train_ds)
+
+        fold_contexts: dict[int, dict[str, object]] = {}
+        for fold in pending_folds:
+            print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
+            val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
+            test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+
+            if len(test_ds) == 0:
+                print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+                continue
+
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
             test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size_eval)
+            if config.training.auto_batch_size and device.type == "cuda":
+                val_batch_size = min(train_batch_size * 2, len(val_ds))
+                test_batch_size = min(train_batch_size * 2, len(test_ds))
 
-        print(
-            f"[Fold {fold.fold_id}] using batch_size "
-            f"train={train_batch_size} val={val_batch_size} test={test_batch_size}"
+            fold_dir = _fold_dir(output_path, fold.fold_id)
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_last_path = _checkpoint_path(fold_dir)
+            checkpoint_best_path = _best_checkpoint_path(fold_dir)
+
+            fold_contexts[fold.fold_id] = {
+                "fold": fold,
+                "fold_dir": fold_dir,
+                "val_ds": val_ds,
+                "test_ds": test_ds,
+                "val_loader": _build_loader(val_ds, val_batch_size, False, config, device),
+                "test_loader": _build_loader(test_ds, test_batch_size, False, config, device),
+                "checkpoint_last_path": checkpoint_last_path,
+                "checkpoint_best_path": checkpoint_best_path,
+                "best_val_loss": float("inf"),
+            }
+
+            if resume and checkpoint_best_path.exists():
+                checkpoint = _load_checkpoint(checkpoint_best_path)
+                fold_contexts[fold.fold_id]["best_val_loss"] = float(checkpoint.get("best_val_loss", float("inf")))
+
+        if not fold_contexts:
+            continue
+
+        val_datasets = [context["val_ds"] for context in fold_contexts.values()]
+        combined_val_x, combined_val_returns, combined_val_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
+            val_datasets,  # type: ignore[arg-type]
         )
-        train_loader = _build_loader(train_ds, train_batch_size, False, config, device)
-        val_loader = _build_loader(val_ds, val_batch_size, False, config, device)
-        test_loader = _build_loader(test_ds, test_batch_size, False, config, device)
+        val_offsets: list[int] = [0]
+        for length in val_lengths:
+            val_offsets.append(val_offsets[-1] + length)
 
         model = CrossSectionalMLP(
             lookback=config.training.lookback,
@@ -577,17 +1030,16 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
             dropout=config.training.dropout,
         ).to(device)
 
-        # Compile model for speed (PyTorch 2.0+) when environment supports it.
-        if hasattr(torch, "compile"):
+        if config.training.enable_torch_compile and hasattr(torch, "compile"):
             can_compile, reason = _can_enable_torch_compile(device)
             if can_compile:
                 try:
                     model = torch.compile(model, mode="reduce-overhead")
-                    print(f"[Fold {fold.fold_id}] torch.compile enabled (mode=reduce-overhead, {reason})")
+                    print(f"[Train {train_years}] torch.compile enabled (mode=reduce-overhead, {reason})")
                 except Exception as e:
-                    print(f"[Fold {fold.fold_id}] torch.compile failed, falling back to eager: {e}")
+                    print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
-                print(f"[Fold {fold.fold_id}] torch.compile skipped: {reason}")
+                print(f"[Train {train_years}] torch.compile skipped: {reason}")
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -596,96 +1048,198 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
         )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
 
-        best_state: dict | None = None
-        best_val_loss = float("inf")
+        group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
+        start_epoch = 1
+        if resume and group_checkpoint_path.exists():
+            checkpoint = _load_checkpoint(group_checkpoint_path)
+            if list(checkpoint.get("train_years", [])) == train_years:
+                _load_state_dict(model, checkpoint["model_state_dict"])
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                start_epoch = int(checkpoint.get("epoch", 0)) + 1
+                print(f"[Train {train_years}] resumed from epoch {start_epoch}")
 
-        epoch_pbar = tqdm(range(1, config.training.epochs + 1), desc=f"Fold {fold.fold_id} Epochs", leave=True, dynamic_ncols=True)
+        if start_epoch > config.training.epochs:
+            print(f"[Train {train_years}] checkpoint already reached epoch {config.training.epochs}; evaluating only")
+
+        if config.training.chunk_rows > 0:
+            eval_chunk_rows = min(config.training.chunk_rows, int(combined_val_x.size(0)))
+            print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (manual)")
+        else:
+            eval_chunk_rows = _auto_chunk_rows(
+                model=model,
+                x=combined_val_x,
+                tradable_mask=combined_val_masks,
+                device=device,
+                amp_dtype=amp_dtype,
+                target_vram_fraction=config.training.target_vram_fraction,
+            )
+            print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
+
+        epoch_pbar = tqdm(
+            range(start_epoch, config.training.epochs + 1),
+            desc=f"Train {train_years} Epochs",
+            leave=True,
+            dynamic_ncols=True,
+        )
         for epoch in epoch_pbar:
-            train_loss = _train_epoch(
+            train_loss = _train_epoch_tensor(
                 model,
-                train_loader,
+                train_x,
+                train_returns,
+                train_masks,
                 optimizer,
                 scaler,
-                device,
-                amp_dtype,
-                config.training.non_blocking_transfer,
-                config.trading.fee_per_side,
-                config.evaluation.gamma_sharpe,
-                config.evaluation.gamma_turnover,
+                batch_size=train_batch_size,
+                device=device,
+                amp_dtype=amp_dtype,
+                fee_per_side=config.trading.fee_per_side,
+                gamma_sharpe=config.evaluation.gamma_sharpe,
+                gamma_turnover=config.evaluation.gamma_turnover,
             )
-            val_loss = _eval_val_loss(
+
+            val_backtest, _, _ = _evaluate_tensor_batch(
                 model,
-                val_loader,
+                combined_val_x,
+                combined_val_returns,
+                combined_val_masks,
+                combined_val_bench,
                 device,
                 amp_dtype,
-                config.training.non_blocking_transfer,
                 config.trading.fee_per_side,
-                config.evaluation.gamma_sharpe,
-                config.evaluation.gamma_turnover,
+                chunk_rows=eval_chunk_rows,
             )
-            epoch_pbar.set_postfix({
-                "train_loss": f"{train_loss:.6f}",
-                "val_loss": f"{val_loss:.6f}",
-                "best": f"{best_val_loss:.6f}",
-            })
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        if best_state is not None:
-            model.load_state_dict(best_state)
+            val_losses: list[float] = []
+            for index, (fold_id, context) in enumerate(fold_contexts.items()):
+                start = val_offsets[index]
+                end = val_offsets[index + 1]
+                val_loss_tensor = sharpe_aware_loss(
+                    val_backtest.weights_history[start:end],
+                    combined_val_returns[start:end],
+                    combined_val_masks[start:end],
+                    fee_per_side=config.trading.fee_per_side,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                )
+                val_loss = float(val_loss_tensor.detach().cpu())
+                val_losses.append(val_loss)
+                if val_loss < float(context["best_val_loss"]):
+                    context["best_val_loss"] = val_loss
+                    _save_fold_checkpoint(
+                        context["checkpoint_best_path"],
+                        fold=context["fold"],
+                        epoch=epoch,
+                        best_val_loss=val_loss,
+                        model=model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                    )
 
-        val_bt_t, val_ic, val_met = _evaluate_split_torch(
-            model,
-            val_loader,
-            device,
-            amp_dtype,
-            config.training.non_blocking_transfer,
-            config.trading.fee_per_side,
-            buffer_pool,
-        )
+                _save_fold_checkpoint(
+                    context["checkpoint_last_path"],
+                    fold=context["fold"],
+                    epoch=epoch,
+                    best_val_loss=float(context["best_val_loss"]),
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                )
 
-        test_bt_t, test_ic, test_met = _evaluate_split_torch(
-            model,
-            test_loader,
-            device,
-            amp_dtype,
-            config.training.non_blocking_transfer,
-            config.trading.fee_per_side,
-            buffer_pool,
-        )
+            _save_group_checkpoint(
+                group_checkpoint_path,
+                train_years=train_years,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+            )
 
-        print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-        print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            if val_losses:
+                epoch_pbar.set_postfix(
+                    {
+                        "train_loss": f"{train_loss:.6f}",
+                        "val_mean": f"{float(np.mean(val_losses)):.6f}",
+                        "best_val": f"{min(float(c['best_val_loss']) for c in fold_contexts.values()):.6f}",
+                    }
+                )
 
-        fold_result = FoldResult(
-            fold_id=fold.fold_id,
-            train_years=fold.train_years,
-            val_years=fold.val_years,
-            test_years=fold.test_years,
-            best_val_loss=best_val_loss,
-            val_ic=val_ic,
-            val_metrics=val_met,
-            test_ic=test_ic,
-            test_metrics=test_met,
-        )
-        results.append(fold_result)
+        for fold_id, context in fold_contexts.items():
+            fold = context["fold"]
+            fold_dir = context["fold_dir"]
+            best_checkpoint_path = context["checkpoint_best_path"]
+            if best_checkpoint_path.exists():
+                checkpoint = _load_checkpoint(best_checkpoint_path)
+                _load_state_dict(model, checkpoint["model_state_dict"])
+                best_val_loss = float(checkpoint.get("best_val_loss", context["best_val_loss"]))
+            else:
+                best_val_loss = float(context["best_val_loss"])
 
-        fold_dir = output_path / f"fold_{fold.fold_id:02d}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), fold_dir / "model.pt")
-        with (fold_dir / "metrics.json").open("w", encoding="utf-8") as f:
-            json.dump(asdict(fold_result), f, indent=2)
+            test_x, test_returns, test_masks, test_bench = _dataset_to_tensors(context["test_ds"])
+            test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
+                model,
+                test_x,
+                test_returns,
+                test_masks,
+                test_bench,
+                device,
+                amp_dtype,
+                config.trading.fee_per_side,
+                chunk_rows=eval_chunk_rows,
+            )
 
-        test_dates = panel.dates[test_ds.valid_indices]
-        test_bt = test_bt_t.to_numpy()
-        report = generate_annual_report(test_bt, test_dates)
-        print("\n" + report)
-        with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
-            f.write(report)
+            val_backtest_slice = BacktestResult(
+                strategy_returns=val_backtest.strategy_returns[start:end].detach().cpu().numpy().astype(np.float32),
+                benchmark_returns=val_backtest.benchmark_returns[start:end].detach().cpu().numpy().astype(np.float32),
+                turnovers=val_backtest.turnovers[start:end].detach().cpu().numpy().astype(np.float32),
+                weights_history=val_backtest.weights_history[start:end].detach().cpu().numpy().astype(np.float32),
+            )
+            val_ic = ic_summary(
+                compute_ic_series_torch(
+                    val_backtest.weights_history[start:end],
+                    combined_val_returns[start:end],
+                    combined_val_masks[start:end],
+                ).cpu().numpy()
+            )
+            val_met = compute_metrics(val_backtest_slice)
 
-        plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
-        plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
 
-    return results
+            fold_result = FoldResult(
+                fold_id=fold.fold_id,
+                train_years=fold.train_years,
+                val_years=fold.val_years,
+                test_years=fold.test_years,
+                best_val_loss=best_val_loss,
+                val_ic=val_ic,
+                val_metrics=val_met,
+                test_ic=test_ic,
+                test_metrics=test_met,
+            )
+            results_by_fold[fold.fold_id] = fold_result
+
+            torch.save(_state_dict_for_save(model), _model_path(fold_dir))
+            with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
+                json.dump(asdict(fold_result), f, indent=2)
+
+            test_dates = panel.dates[context["test_ds"].valid_indices]
+            test_bt = test_bt_t.to_numpy()
+            god_returns = compute_god_mode_returns(
+                test_returns.numpy(),
+                test_masks.numpy(),
+            )
+            _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+            report = generate_annual_report(test_bt, test_dates, god_returns=god_returns)
+            print("\n" + report)
+            with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
+                f.write(report)
+
+            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png", god_returns=god_returns)
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png", god_returns=god_returns)
+            plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+            _save_holdings_csv(fold_dir / "holdings.csv", test_bt.weights_history, test_dates, panel.symbols)
+
+            _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+
+    return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

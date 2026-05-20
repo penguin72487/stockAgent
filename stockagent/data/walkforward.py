@@ -23,56 +23,48 @@ def build_expanding_year_folds(
     val_years: int = 1,
     require_future_test_year: bool = True,
 ) -> list[WalkForwardFold]:
-    """Build non-overlapping folds by enumerating train/val split points.
+    """Build expanding-window folds with fixed 1-year validation.
 
-    Given unique years [1..n], enumerate:
-    - train = [1..i]
-    - val   = [i+1..j]
-    - test  = [j+1..n]
-    where i in [min_train_years .. n-2], j in [i+1 .. n-1].
+    For each valid train endpoint i (0-based index into unique_years):
+    - train = unique_years[:i]          (expanding, at least min_train_years)
+    - val   = [unique_years[i]]         (fixed 1 year)
+    - test  = unique_years[i+1:]        (all remaining years)
+
+    i ranges from min_train_years to n-2, so there is always at least 1 test year.
+    val_years and require_future_test_year are kept for API compatibility.
     """
+    _ = val_years
+    _ = require_future_test_year
+
     years = pd.to_datetime(dates).year.to_numpy()
     unique_years = sorted(pd.unique(years).tolist())
     folds: list[WalkForwardFold] = []
 
     total_years = len(unique_years)
-    min_i = max(1, min_train_years)
+    # i is the index of the val year; train = years[:i], val = [years[i]], test = years[i+1:]
+    # need at least min_train_years before val, and at least 1 year after val
+    for i in range(min_train_years, total_years - 1):
+        train_year_slice = unique_years[:i]
+        val_year_slice = [unique_years[i]]
+        test_year_slice = unique_years[i + 1:]
 
-    # NOTE:
-    # Fold rule requested by user:
-    #   train = [1..i], val = [i+1..j], test = [j+1..n]
-    #   i in [1..n-2], j in [i+1..n-1]
-    # We keep val_years/require_future_test_year in function signature for API
-    # compatibility, but fold enumeration follows the rule above.
-    _ = val_years
-    _ = require_future_test_year
+        train_indices = np.flatnonzero(np.isin(years, train_year_slice))
+        val_indices = np.flatnonzero(np.isin(years, val_year_slice))
+        test_indices = np.flatnonzero(np.isin(years, test_year_slice))
+        if train_indices.size == 0 or val_indices.size == 0 or test_indices.size == 0:
+            continue
 
-    for i in range(min_i, total_years - 1):
-        for j in range(i + 1, total_years):
-            train_year_slice = unique_years[:i]
-            val_year_slice = unique_years[i:j]
-            test_year_slice = unique_years[j:]
-
-            if not test_year_slice:
-                continue
-
-            train_indices = np.flatnonzero(np.isin(years, train_year_slice))
-            val_indices = np.flatnonzero(np.isin(years, val_year_slice))
-            test_indices = np.flatnonzero(np.isin(years, test_year_slice))
-            if train_indices.size == 0 or val_indices.size == 0 or test_indices.size == 0:
-                continue
-
-            folds.append(
-                WalkForwardFold(
-                    fold_id=len(folds) + 1,
-                    train_indices=train_indices,
-                    val_indices=val_indices,
-                    test_indices=test_indices,
-                    train_years=train_year_slice,
-                    val_years=val_year_slice,
-                    test_years=test_year_slice,
-                )
+        folds.append(
+            WalkForwardFold(
+                fold_id=len(folds) + 1,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                test_indices=test_indices,
+                train_years=train_year_slice,
+                val_years=val_year_slice,
+                test_years=test_year_slice,
             )
+        )
     if not folds:
         raise ValueError("No valid walk-forward folds could be constructed")
     return folds

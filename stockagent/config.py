@@ -13,7 +13,7 @@ class EnvironmentConfig:
     device: str
     use_tensor_cores: bool
     amp_dtype: str
-    target_vram_fraction: float = 0.85
+    target_vram_fraction: float = 1
 
 
 @dataclass(slots=True)
@@ -47,6 +47,8 @@ class TrainingConfig:
     target: str
     batch_mode: str
     non_blocking_transfer: bool
+    enable_torch_compile: bool = False
+    chunk_rows: int = 0
     lookback: int = 1
     batch_size: int = 32
     batch_size_train: int = 32
@@ -55,7 +57,7 @@ class TrainingConfig:
     auto_batch_size: bool = False
     vram_budget_gb: float = 8.0
     vram_safety_margin_gb: float = 1.0
-    target_vram_fraction: float = 0.85
+    target_vram_fraction: float = 1
     epochs: int = 1000
     learning_rate: float = 1e-3
     hidden_dim: int = 1024
@@ -98,6 +100,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("batch_size_eval", training.get("batch_size", 32))
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
+    training.setdefault("enable_torch_compile", False)
+    training.setdefault("chunk_rows", 0)
     training.setdefault("vram_budget_gb", 8.0)
     training.setdefault("vram_safety_margin_gb", 1.0)
     training.setdefault("target_vram_fraction", 0.85)
