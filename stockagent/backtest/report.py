@@ -357,43 +357,46 @@ def plot_equity_curve_log(
 
 
 def plot_fold_first_year_returns(
-    fold_ids: list[int],
-    first_years: list[int],
-    strategy_first_year_log_returns: list[float],
-    baseline_first_year_log_returns: list[float],
+    all_first_year_dates: list[np.ndarray],
+    all_first_year_strategy_log: list[np.ndarray],
+    all_first_year_baseline_log: list[np.ndarray],
     output_path: str | Path | None = None,
 ) -> None:
-    """Plot single-chart yearly cumulative return (chained) from fold first test years."""
-    if not fold_ids:
+    """Plot all folds' first test-year daily cumulative NAV as a single line per strategy/baseline, X axis is date, Y axis is log scale."""
+    import pandas as pd
+    if not all_first_year_dates:
         return
 
-    per_year: dict[int, tuple[float, float]] = {}
-    for _, year, strat_log, base_log in sorted(
-        zip(fold_ids, first_years, strategy_first_year_log_returns, baseline_first_year_log_returns),
-        key=lambda item: item[1],
-    ):
-        # If multiple folds map to the same first-year, keep the latest one in sorted order.
-        per_year[int(year)] = (float(strat_log), float(base_log))
+    # Concatenate all folds' first-year daily returns and dates
+    all_dates = np.concatenate(all_first_year_dates)
+    all_strategy = np.concatenate(all_first_year_strategy_log)
+    all_baseline = np.concatenate(all_first_year_baseline_log)
 
-    years = sorted(per_year.keys())
-    strat_logs = np.array([per_year[y][0] for y in years], dtype=np.float64)
-    base_logs = np.array([per_year[y][1] for y in years], dtype=np.float64)
+    # Sort by date
+    order = np.argsort(all_dates)
+    dates_sorted = all_dates[order]
+    strat_sorted = all_strategy[order]
+    base_sorted = all_baseline[order]
 
-    strat_nav = np.exp(np.cumsum(strat_logs))
-    base_nav = np.exp(np.cumsum(base_logs))
+    # Compute cumulative NAV
+    strat_nav = np.exp(np.cumsum(strat_sorted))
+    base_nav = np.exp(np.cumsum(base_sorted))
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(years, strat_nav, marker="o", linewidth=2.2, label="Strategy")
-    ax.plot(years, base_nav, marker="o", linewidth=2.2, label="Baseline")
-    ax.set_xticks(years)
-    ax.set_xlabel("Year")
+    # Convert dates to pandas for better x-axis formatting
+    date_pd = pd.to_datetime(dates_sorted)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(date_pd, strat_nav, label="Strategy", linewidth=2.2)
+    ax.plot(date_pd, base_nav, label="Baseline", linewidth=2.2)
+    ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
-    ax.set_title("Walkforward First-Test-Year Cumulative NAV (Chained by Year)")
+    ax.set_title("Walkforward First-Test-Year Daily Cumulative NAV (All Folds)")
     ax.set_yscale("log")
     ax.axhline(y=1.0, color="black", linewidth=0.8)
     ax.grid(True, alpha=0.3, which="both")
     ax.legend()
 
+    fig.autofmt_xdate()
     plt.tight_layout()
     if output_path:
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
