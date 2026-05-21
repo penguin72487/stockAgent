@@ -23,6 +23,7 @@ class DataConfig:
     benchmark_required: bool
     benchmark_source: str
     universe_mode: str
+    use_rapids: bool = True
 
 
 @dataclass(slots=True)
@@ -61,6 +62,7 @@ class TrainingConfig:
     epochs: int = 1000
     learning_rate: float = 1e-3
     hidden_dim: int = 1024
+    hidden_layers: int = 2
     dropout: float = 0.1
     top_k: int = 20
     num_workers: int = 0
@@ -108,6 +110,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("epochs", 10)
     training.setdefault("learning_rate", 1e-3)
     training.setdefault("hidden_dim", 128)
+    training.setdefault("hidden_layers", 2)
     training.setdefault("dropout", 0.1)
     training.setdefault("top_k", 20)
     training.setdefault("num_workers", 0)
@@ -117,6 +120,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)
     evaluation.setdefault("gamma_turnover", 0.1)
+
+    data = raw.setdefault("data", {})
+    data.setdefault("use_rapids", True)
     return raw
 
 

@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -301,7 +303,7 @@ def _evaluate_tensor_batch(
     tradable_mask: torch.Tensor,
     benchmark: torch.Tensor,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     fee_per_side: float,
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
@@ -317,22 +319,26 @@ def _evaluate_tensor_batch(
             returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=True)
             mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=True)
             bench_chunk = benchmark[start:end].to(device=device, non_blocking=True)
-            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
-            weights_chunks.append(weights_chunk.float().cpu())
-            returns_chunks.append(returns_chunk.float().cpu())
-            masks_chunks.append(mask_chunk.cpu())
-            benchmark_chunks.append(bench_chunk.float().cpu())
+            weights_chunks.append(weights_chunk.float())
+            returns_chunks.append(returns_chunk.float())
+            masks_chunks.append(mask_chunk)
+            benchmark_chunks.append(bench_chunk.float())
 
         weights = torch.cat(weights_chunks, dim=0)
-        future_log_returns_cpu = torch.cat(returns_chunks, dim=0)
-        tradable_mask_cpu = torch.cat(masks_chunks, dim=0)
-        benchmark_cpu = torch.cat(benchmark_chunks, dim=0)
+        future_log_returns_t = torch.cat(returns_chunks, dim=0)
+        tradable_mask_t = torch.cat(masks_chunks, dim=0)
+        benchmark_t = torch.cat(benchmark_chunks, dim=0)
 
-        backtest = run_backtest_torch(weights, future_log_returns_cpu, tradable_mask_cpu, benchmark_cpu, fee_per_side)
-        ic = ic_summary(compute_ic_series_torch(weights, future_log_returns_cpu, tradable_mask_cpu).cpu().numpy())
-        metrics = compute_metrics(backtest.to_numpy())
+        backtest = run_backtest_torch(weights, future_log_returns_t, tradable_mask_t, benchmark_t, fee_per_side)
+        ic = ic_summary(compute_ic_series_torch(weights, future_log_returns_t, tradable_mask_t).detach().cpu().numpy())
+        metrics = _compute_metrics_from_tensors(
+            backtest.strategy_returns,
+            backtest.benchmark_returns,
+            backtest.turnovers,
+        )
     return backtest, ic, metrics
 
 
@@ -341,8 +347,11 @@ def _auto_chunk_rows(
     x: torch.Tensor,
     tradable_mask: torch.Tensor,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     target_vram_fraction: float,
+    vram_budget_gb: float,
+    vram_safety_margin_gb: float,
+    measured_free_bytes: int | None = None,
 ) -> int:
     if device.type != "cuda":
         return max(1, min(256, int(x.size(0))))
@@ -352,7 +361,18 @@ def _auto_chunk_rows(
         return 1
 
     torch.cuda.empty_cache()
-    free_mem, _ = torch.cuda.mem_get_info(device)
+    free_mem, total_mem = torch.cuda.mem_get_info(device)
+    effective_free_mem = int(free_mem if measured_free_bytes is None else min(int(free_mem), int(measured_free_bytes)))
+    reserved_mem = torch.cuda.memory_reserved(device)
+
+    if measured_free_bytes is not None:
+        # Caller already computed the remaining VRAM budget (for example: 16GB - train_batch_used).
+        usable_pool_bytes = min(effective_free_mem, int(total_mem))
+    else:
+        budget_bytes = int(max(0.0, vram_budget_gb - vram_safety_margin_gb) * (1024 ** 3))
+        # Respect both: per-process budget headroom and global free VRAM on the device.
+        process_remaining = max(0, budget_bytes - int(reserved_mem))
+        usable_pool_bytes = min(process_remaining, effective_free_mem, int(total_mem))
 
     # Measure per-row incremental VRAM cost on a tiny probe, then size chunk
     # from currently free VRAM. This avoids OOM-driven probing.
@@ -362,7 +382,7 @@ def _auto_chunk_rows(
     with torch.inference_mode():
         x_probe = x[:probe_rows].to(device=device, non_blocking=True)
         mask_probe = tradable_mask[:probe_rows].to(device=device, non_blocking=True)
-        with autocast(device_type=device.type, enabled=True, dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             _ = model(x_probe, mask_probe)
     torch.cuda.synchronize(device)
     peak_alloc = torch.cuda.max_memory_allocated(device)
@@ -371,7 +391,7 @@ def _auto_chunk_rows(
     bytes_per_row = max(1, incremental_bytes // probe_rows)
 
     # Keep headroom for allocator/workspace fluctuations.
-    usable_bytes = int(free_mem * target_vram_fraction * 0.9)
+    usable_bytes = int(usable_pool_bytes * target_vram_fraction * 0.9)
     estimated_rows = usable_bytes // bytes_per_row
 
     return max(1, min(total_rows, int(estimated_rows)))
@@ -461,12 +481,20 @@ def _resolve_device(config: ExperimentConfig) -> torch.device:
     return torch.device(requested)
 
 
-def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype:
+def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype | None:
     if amp_dtype == "bf16":
         return torch.bfloat16
     if amp_dtype == "fp16":
         return torch.float16
+    if amp_dtype == "tf32":
+        return None
     raise ValueError(f"Unsupported amp dtype: {amp_dtype}")
+
+
+def _autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
+    if device.type != "cuda" or amp_dtype is None:
+        return nullcontext()
+    return autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
 
 
 def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
@@ -482,14 +510,51 @@ def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
     return True, f"compiler={compiler}"
 
 
+def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
+    """Return (total_bytes, used_bytes, free_bytes) from nvidia-smi for one GPU."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+
+    for raw in proc.stdout.strip().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            idx = int(parts[0])
+            total_mb = int(parts[1])
+            used_mb = int(parts[2])
+            free_mb = int(parts[3])
+        except ValueError:
+            continue
+        if idx == device_index:
+            mib = 1024**2
+            return total_mb * mib, used_mb * mib, free_mb * mib
+    return None
+
+
 def find_optimal_batch_size(
     model: nn.Module,
     sample_loader: DataLoader,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     target_vram_fraction: float = 0.85,
     vram_budget_gb: float = 12.0,
-) -> int:
+    vram_safety_margin_gb: float = 1.0,
+) -> tuple[int, int]:
     """
     ✅ Binary search to find maximum safe batch size.
     
@@ -500,12 +565,15 @@ def find_optimal_batch_size(
         amp_dtype: Mixed precision dtype
         target_vram_fraction: Target VRAM utilization (0.85 = 85%)
         vram_budget_gb: Total VRAM budget in GB
+        vram_safety_margin_gb: Reserved headroom in GB to avoid OOM due allocator/workspace spikes
     
     Returns:
-        Maximum safe batch size
+        (maximum safe batch size, measured used bytes at that batch size)
     """
     if device.type != 'cuda':
-        return len(sample_loader.dataset)
+        return len(sample_loader.dataset), 0
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
     
     # Get a single sample to estimate memory
     model.eval()
@@ -516,21 +584,56 @@ def find_optimal_batch_size(
     torch.cuda.empty_cache()
     
     with torch.inference_mode():
-        with autocast(device_type='cuda', enabled=True, dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             _ = model(test_batch["x"], test_batch["tradable_mask"])
     
-    single_sample_bytes = torch.cuda.max_memory_allocated()
+    single_sample_bytes = torch.cuda.max_memory_reserved()
     torch.cuda.reset_peak_memory_stats()
     
     max_batch_size = len(sample_loader.dataset)
-    target_bytes = int(vram_budget_gb * 1024**3 * target_vram_fraction)
+    margin_bytes = int(max(0.0, vram_safety_margin_gb) * 1024**3)
+    budget_bytes = int(max(0.0, vram_budget_gb) * 1024**3)
+
+    smi = _query_nvidia_smi_free_bytes(device_index)
+    if smi is not None:
+        smi_total, smi_used, smi_free = smi
+        hard_cap_bytes = max(1, min(budget_bytes, smi_total) - margin_bytes)
+        # Use actual global free VRAM from nvidia-smi, then keep safety margin.
+        free_after_margin = max(0, smi_free - margin_bytes)
+        free_cap_bytes = int(free_after_margin * target_vram_fraction)
+        target_bytes = min(hard_cap_bytes, free_cap_bytes)
+        mem_source = (
+            f"nvidia-smi total={smi_total/1024**3:.1f}GB "
+            f"used={smi_used/1024**3:.1f}GB free={smi_free/1024**3:.1f}GB"
+        )
+    else:
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        hard_cap_bytes = max(1, min(budget_bytes, int(total_mem)) - margin_bytes)
+        free_after_margin = max(0, int(free_mem) - margin_bytes)
+        free_cap_bytes = int(free_after_margin * target_vram_fraction)
+        target_bytes = min(hard_cap_bytes, free_cap_bytes)
+        mem_source = (
+            f"torch.mem_get_info total={total_mem/1024**3:.1f}GB "
+            f"free={free_mem/1024**3:.1f}GB"
+        )
+
+    target_bytes = max(1, target_bytes)
     estimated_max = max(1, target_bytes // max(single_sample_bytes, 1))
     
     # Binary search
     low, high = 1, min(estimated_max, max_batch_size)
     best_batch_size = 1
+    best_used_bytes = int(single_sample_bytes)
     
-    print(f"  [batch search] single sample: {single_sample_bytes/1024**2:.1f}MB, target: {target_bytes/1024**3:.1f}GB, range: [{low}, {high}]")
+    print(
+        f"  [batch search] single sample(reserved): {single_sample_bytes/1024**2:.1f}MB, "
+        f"target: {target_bytes/1024**3:.1f}GB "
+        f"(hard_cap={hard_cap_bytes/1024**3:.1f}GB, budget={vram_budget_gb:.1f}GB, margin={vram_safety_margin_gb:.1f}GB, frac={target_vram_fraction:.2f}, {mem_source}), "
+        f"range: [{low}, {high}]"
+    )
+
+    # Include optimizer-state allocation (Adam moments) in peak memory estimation.
+    temp_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     
     while low <= high:
         mid = (low + high) // 2
@@ -551,8 +654,9 @@ def find_optimal_batch_size(
             model.train()
             test_batch = next(iter(temp_loader))
             test_batch = _move_batch(test_batch, device, non_blocking=True)
+            model.zero_grad(set_to_none=True)
             
-            with autocast(device_type='cuda', enabled=True, dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 logits = model(test_batch["x"], test_batch["tradable_mask"])
                 loss = sharpe_aware_loss(
                     logits,
@@ -562,16 +666,25 @@ def find_optimal_batch_size(
                 )
             
             loss.backward()
-            used_memory = torch.cuda.max_memory_allocated()
+            temp_optimizer.step()
+            temp_optimizer.zero_grad(set_to_none=True)
+            used_memory = torch.cuda.max_memory_reserved()
+
+            smi_after = _query_nvidia_smi_free_bytes(device_index)
+            if smi_after is not None:
+                _, smi_used_after, _ = smi_after
+                used_memory = max(used_memory, int(smi_used_after))
             
             if used_memory <= target_bytes:
                 best_batch_size = mid
+                best_used_bytes = int(used_memory)
                 low = mid + 1
                 print(f"  ✅ batch_size {mid}: {used_memory/1024**3:.1f}GB OK")
             else:
                 high = mid - 1
                 print(f"  ❌ batch_size {mid}: {used_memory/1024**3:.1f}GB exceeds")
-            
+            del test_batch, logits, loss
+            model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             
         except RuntimeError as e:
@@ -582,7 +695,7 @@ def find_optimal_batch_size(
                 raise
     
     print(f"  [batch search] final result: {best_batch_size}")
-    return best_batch_size
+    return best_batch_size, best_used_bytes
 
 
 def _build_loader(
@@ -615,7 +728,7 @@ def _move_batch(batch: dict[str, torch.Tensor], device: torch.device, non_blocki
     return {key: value.to(device=device, non_blocking=non_blocking) for key, value in batch.items()}
 
 
-def _amp_bytes(amp_dtype: torch.dtype) -> int:
+def _amp_bytes(amp_dtype: torch.dtype | None) -> int:
     if amp_dtype in (torch.float16, torch.bfloat16):
         return 2
     return 4
@@ -636,7 +749,7 @@ def _estimate_sample_bytes(
     num_symbols: int,
     num_features: int,
     hidden_dim: int,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     training_mode: bool,
 ) -> int:
     input_dim = lookback * num_features
@@ -687,7 +800,7 @@ def _train_epoch(
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
     gamma_sharpe: float,
@@ -701,7 +814,7 @@ def _train_epoch(
         batch = _move_batch(batch, device, non_blocking)
         optimizer.zero_grad(set_to_none=True)
         
-        with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             weights = model(batch["x"], batch["tradable_mask"])
             loss = sharpe_aware_loss(
                 weights,
@@ -750,7 +863,7 @@ def _train_epoch_tensor(
     scaler: GradScaler,
     batch_size: int,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
@@ -772,7 +885,7 @@ def _train_epoch_tensor(
         batch_mask = tradable_mask[idx].to(device=device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+        with _autocast_context(device, amp_dtype):
             weights = model(batch_x, batch_mask)
             loss = sharpe_aware_loss(
                 weights,
@@ -799,7 +912,7 @@ def _eval_val_loss(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
     gamma_sharpe: float,
@@ -810,7 +923,7 @@ def _eval_val_loss(
     with torch.inference_mode():
         for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
-            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 weights = model(batch["x"], batch["tradable_mask"])
                 loss = sharpe_aware_loss(
                     weights, 
@@ -828,7 +941,7 @@ def _collect_predictions(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     non_blocking: bool,
     buffers: PredictionBufferPool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -844,7 +957,7 @@ def _collect_predictions(
     with torch.inference_mode():
         for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
-            with autocast(device_type=device.type, enabled=device.type == "cuda", dtype=amp_dtype):
+            with _autocast_context(device, amp_dtype):
                 weights = model(batch["x"], batch["tradable_mask"])
             weights_cpu = weights.float().cpu()
             returns_cpu = batch["future_log_returns"].float().cpu()
@@ -884,7 +997,7 @@ def _evaluate_split_torch(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    amp_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
     buffers: PredictionBufferPool,
@@ -983,6 +1096,13 @@ def run_training(
         f"cuda_available={torch.cuda.is_available()} "
         f"num_gpus={torch.cuda.device_count()}"
     )
+    if device.type == "cuda":
+        amp_mode = "tf32" if amp_dtype is None else str(amp_dtype).replace("torch.", "")
+        print(
+            f"[runtime] precision_mode={amp_mode} "
+            f"allow_tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
+            f"allow_tf32_cudnn={torch.backends.cudnn.allow_tf32}"
+        )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1017,6 +1137,7 @@ def run_training(
         train_reference = group_folds[0]
         train_ds = CrossSectionalDataset(panel, train_reference.train_indices, config.training.lookback)
         min_batch_size = max(1, config.training.min_batch_size)
+        train_batch_used_bytes = 0
 
         if config.training.auto_batch_size and device.type == "cuda":
             budget_bytes = int(config.training.vram_budget_gb * (1024 ** 3))
@@ -1029,6 +1150,7 @@ def run_training(
                 num_symbols=panel.num_symbols,
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
+                hidden_layers=config.training.hidden_layers,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             eval_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=False)
@@ -1055,17 +1177,19 @@ def run_training(
                 num_symbols=panel.num_symbols,
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
+                hidden_layers=config.training.hidden_layers,
             ).to(device)
 
             print(f"[Train {train_years}] searching optimal train batch size...")
             temp_train_loader = _build_loader(train_ds, 1, False, config, device)
-            train_batch_size = find_optimal_batch_size(
+            train_batch_size, train_batch_used_bytes = find_optimal_batch_size(
                 model=temp_model,
                 sample_loader=temp_train_loader,
                 device=device,
                 amp_dtype=amp_dtype,
                 target_vram_fraction=config.training.target_vram_fraction,
                 vram_budget_gb=config.training.vram_budget_gb,
+                vram_safety_margin_gb=config.training.vram_safety_margin_gb,
             )
             train_batch_size = max(min_batch_size, train_batch_size)
         else:
@@ -1128,6 +1252,7 @@ def run_training(
             num_symbols=panel.num_symbols,
             hidden_dim=config.training.hidden_dim,
             dropout=config.training.dropout,
+            hidden_layers=config.training.hidden_layers,
         ).to(device)
 
         if config.training.enable_torch_compile and hasattr(torch, "compile"):
@@ -1166,6 +1291,22 @@ def run_training(
             eval_chunk_rows = min(config.training.chunk_rows, int(combined_val_x.size(0)))
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (manual)")
         else:
+            measured_free_bytes: int | None = None
+            if train_batch_used_bytes > 0:
+                budget_bytes = int(max(0.0, config.training.vram_budget_gb) * (1024 ** 3))
+                measured_free_bytes = max(1, budget_bytes - int(train_batch_used_bytes))
+                print(
+                    f"[Train {train_years}] pre-chunk free VRAM from budget: "
+                    f"{measured_free_bytes/1024**3:.2f}GB "
+                    f"(={config.training.vram_budget_gb:.1f}GB - {train_batch_used_bytes/1024**3:.2f}GB)"
+                )
+            else:
+                device_index = device.index if device.index is not None else torch.cuda.current_device()
+                smi_mem = _query_nvidia_smi_free_bytes(device_index)
+                if smi_mem is not None:
+                    _, _, smi_free = smi_mem
+                    measured_free_bytes = int(smi_free)
+                    print(f"[Train {train_years}] pre-chunk free VRAM (nvidia-smi): {smi_free/1024**3:.2f}GB")
             eval_chunk_rows = _auto_chunk_rows(
                 model=model,
                 x=combined_val_x,
@@ -1173,6 +1314,9 @@ def run_training(
                 device=device,
                 amp_dtype=amp_dtype,
                 target_vram_fraction=config.training.target_vram_fraction,
+                vram_budget_gb=config.training.vram_budget_gb,
+                vram_safety_margin_gb=config.training.vram_safety_margin_gb,
+                measured_free_bytes=measured_free_bytes,
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
@@ -1215,10 +1359,12 @@ def run_training(
             for index, (fold_id, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
+                val_returns_slice = combined_val_returns[start:end].to(device=device, non_blocking=True)
+                val_masks_slice = combined_val_masks[start:end].to(device=device, non_blocking=True)
                 val_loss_tensor = sharpe_aware_loss(
                     val_backtest.weights_history[start:end],
-                    combined_val_returns[start:end],
-                    combined_val_masks[start:end],
+                    val_returns_slice,
+                    val_masks_slice,
                     fee_per_side=config.trading.fee_per_side,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
@@ -1312,8 +1458,8 @@ def run_training(
             val_ic = ic_summary(
                 compute_ic_series_torch(
                     val_backtest.weights_history[start:end],
-                    combined_val_returns[start:end],
-                    combined_val_masks[start:end],
+                    combined_val_returns[start:end].to(device=device, non_blocking=True),
+                    combined_val_masks[start:end].to(device=device, non_blocking=True),
                 ).cpu().numpy()
             )
             val_met = _compute_metrics_from_tensors(

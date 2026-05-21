@@ -4,14 +4,20 @@ from dataclasses import dataclass
 from pathlib import Path
 import hashlib
 import pickle
+import os
 
 import numpy as np
 import pandas as pd
 
+try:
+    import cudf
+except Exception:  # pragma: no cover - optional GPU dependency
+    cudf = None
+
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 6
+PANEL_CACHE_VERSION = 7
 
 
 @dataclass(slots=True)
@@ -69,6 +75,98 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
         frame["Trading_Volume"] = _safe_log_ratio(vol, vol.shift(1))
 
     return frame
+
+
+def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
+    if cudf is None:
+        raise RuntimeError("cuDF is not available")
+
+    gdf = cudf.read_parquet(path)
+    gdf["date"] = cudf.to_datetime(gdf["date"])
+    gdf = gdf.sort_values("date").reset_index(drop=True)
+    gdf["symbol"] = path.name.replace("_features.parquet", "")
+    gdf["close_raw"] = gdf["close"].astype("float32")
+
+    nxt_close = gdf["close"].shift(-1)
+    valid_ret = (nxt_close > 0) & (gdf["close"] > 0)
+    ret_ratio = (nxt_close / gdf["close"]).where(valid_ret)
+    gdf["return_1d"] = np.log(ret_ratio)
+
+    if "Trading_Volume" in gdf.columns:
+        vol = gdf["Trading_Volume"].fillna(0)
+    else:
+        vol = 0
+    gdf["tradable"] = gdf["close"].notnull() & (vol > 0)
+
+    for col in ["open", "max", "min", "close"]:
+        if col in gdf.columns:
+            prev = gdf[col].shift(1)
+            valid = (gdf[col] > 0) & (prev > 0)
+            ratio = (gdf[col] / prev).where(valid)
+            gdf[col] = np.log(ratio)
+
+    if "Trading_Volume" in gdf.columns:
+        vol = gdf["Trading_Volume"].astype("float64")
+        prev_vol = vol.shift(1)
+        valid_vol = (vol > 0) & (prev_vol > 0)
+        vol_ratio = (vol / prev_vol).where(valid_vol)
+        gdf["Trading_Volume"] = np.log(vol_ratio)
+
+    return gdf.to_pandas()
+
+
+def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> PanelData:
+    feature_columns = _get_feature_columns(frame_all)
+
+    all_dates = sorted(frame_all["date"].dropna().unique().tolist())
+    num_dates = len(all_dates)
+    num_symbols = len(symbols)
+    num_features = len(feature_columns)
+
+    features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
+    returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+
+    date_index = {date: idx for idx, date in enumerate(all_dates)}
+    symbol_index = {symbol: idx for idx, symbol in enumerate(symbols)}
+
+    frame_all = frame_all[frame_all["symbol"].isin(symbols)].copy()
+    row_idx = frame_all["date"].map(date_index).to_numpy(dtype=np.int64)
+    sym_idx = frame_all["symbol"].map(symbol_index).to_numpy(dtype=np.int64)
+
+    for feat_idx, col in enumerate(feature_columns):
+        features[row_idx, sym_idx, feat_idx] = frame_all[col].to_numpy(dtype=np.float32, copy=False)
+
+    returns_1d[row_idx, sym_idx] = frame_all["return_1d"].to_numpy(dtype=np.float32, copy=False)
+    close_prices[row_idx, sym_idx] = frame_all["close_raw"].to_numpy(dtype=np.float32, copy=False)
+    tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
+    alive_mask[row_idx, sym_idx] = frame_all["close"].notna().to_numpy(dtype=bool, copy=False)
+
+    n_tradable = tradable_mask.sum(axis=1)
+    sum_ret = np.nansum(np.where(tradable_mask, returns_1d, 0.0), axis=1)
+    benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
+    np.divide(
+        sum_ret,
+        n_tradable,
+        out=benchmark_returns,
+        where=n_tradable > 0,
+    )
+
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return PanelData(
+        dates=np.array(all_dates, dtype="datetime64[ns]"),
+        symbols=symbols,
+        feature_names=feature_columns,
+        features=features,
+        returns_1d=returns_1d,
+        tradable_mask=tradable_mask,
+        alive_mask=alive_mask,
+        benchmark_returns=benchmark_returns,
+        close_prices=close_prices,
+    )
 
 
 def _get_feature_columns(frame: pd.DataFrame) -> list[str]:
@@ -175,7 +273,7 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
         return False
 
 
-def build_panel(parquet_root: str | Path) -> PanelData:
+def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob("*_features.parquet"))
     if not parquet_paths:
@@ -192,6 +290,31 @@ def build_panel(parquet_root: str | Path) -> PanelData:
         return panel
 
     print(f"[panel] building from {len(parquet_paths)} parquet files...")
+
+    env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
+    use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
+    if use_cudf:
+        try:
+            symbol_frames_cudf: list[pd.DataFrame] = []
+            valid_paths_cudf: list[Path] = []
+            for path in parquet_paths:
+                frame = _load_symbol_frame_cudf(path)
+                if len(frame) == 0:
+                    continue
+                symbol_frames_cudf.append(frame)
+                valid_paths_cudf.append(path)
+
+            if symbol_frames_cudf:
+                symbols_cudf = [path.name.replace("_features.parquet", "") for path in valid_paths_cudf]
+                frame_all_cudf = pd.concat(symbol_frames_cudf, ignore_index=True)
+                panel = _build_panel_from_frame(frame_all_cudf, symbols_cudf)
+                source_hash = _compute_source_hash(parquet_paths)
+                _save_panel_cache(cache_path, meta_path, panel, source_hash)
+                print(f"[panel] cache saved: {cache_path} (cuDF path)")
+                _print_feature_overview(panel)
+                return panel
+        except Exception as exc:
+            print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
     
     symbol_frames: list[pd.DataFrame] = []
     valid_paths: list[Path] = []
@@ -208,53 +331,9 @@ def build_panel(parquet_root: str | Path) -> PanelData:
     if not symbol_frames:
         raise RuntimeError("No valid parquet files could be loaded.")
 
-    feature_columns = _get_feature_columns(symbol_frames[0])
-
-    all_dates = sorted({date for frame in symbol_frames for date in frame["date"].tolist()})
     symbols = [path.name.replace("_features.parquet", "") for path in valid_paths]
-
-    num_dates = len(all_dates)
-    num_symbols = len(symbols)
-    num_features = len(feature_columns)
-
-    features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
-    returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-    close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-    tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-    alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-
-    date_index = {date: idx for idx, date in enumerate(all_dates)}
-    for symbol_idx, frame in enumerate(symbol_frames):
-        frame = frame.set_index("date")
-        valid_dates = frame.index.intersection(all_dates)
-        row_indices = np.array([date_index[date] for date in valid_dates], dtype=np.int64)
-        aligned = frame.loc[valid_dates]
-
-        features[row_indices, symbol_idx, :] = aligned[feature_columns].to_numpy(dtype=np.float32)
-        returns_1d[row_indices, symbol_idx] = aligned["return_1d"].to_numpy(dtype=np.float32)
-        close_prices[row_indices, symbol_idx] = aligned["close_raw"].to_numpy(dtype=np.float32)
-        tradable_mask[row_indices, symbol_idx] = aligned["tradable"].to_numpy(dtype=bool)
-        alive_mask[row_indices, symbol_idx] = aligned["close"].notna().to_numpy(dtype=bool)
-
-    n_tradable = tradable_mask.sum(axis=1)
-    sum_ret = np.nansum(np.where(tradable_mask, returns_1d, 0.0), axis=1)
-    benchmark_returns = np.where(n_tradable > 0, sum_ret / n_tradable, 0.0).astype(np.float32)
-
-    # Keep raw log-return features in panel; fold-local normalization is applied
-    # later in training using train-period statistics only to prevent data leakage.
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    panel = PanelData(
-        dates=np.array(all_dates, dtype="datetime64[ns]"),
-        symbols=symbols,
-        feature_names=feature_columns,
-        features=features,
-        returns_1d=returns_1d,
-        tradable_mask=tradable_mask,
-        alive_mask=alive_mask,
-        benchmark_returns=benchmark_returns,
-        close_prices=close_prices,
-    )
+    frame_all = pd.concat(symbol_frames, ignore_index=True)
+    panel = _build_panel_from_frame(frame_all, symbols)
     
     source_hash = _compute_source_hash(parquet_paths)
     _save_panel_cache(cache_path, meta_path, panel, source_hash)

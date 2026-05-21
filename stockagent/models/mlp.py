@@ -19,11 +19,21 @@ def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Te
 
 class CrossSectionalMLP(nn.Module):
     """Optimized MLP with feature embedding + conditional Transformer (flash-attn)."""
-    def __init__(self, lookback: int, num_features: int, num_symbols: int, hidden_dim: int, dropout: float, embedding_dim: int = 64) -> None:
+    def __init__(
+        self,
+        lookback: int,
+        num_features: int,
+        num_symbols: int,
+        hidden_dim: int,
+        dropout: float,
+        embedding_dim: int = 64,
+        hidden_layers: int = 2,
+    ) -> None:
         super().__init__()
         self.num_symbols = num_symbols
         self.embedding_dim = embedding_dim
         self.lookback = lookback
+        self.hidden_layers = max(0, int(hidden_layers))
         
         # Feature embedding: compress F features to embedding_dim
         self.feature_embedding = nn.Linear(num_features, embedding_dim)
@@ -61,13 +71,23 @@ class CrossSectionalMLP(nn.Module):
             )
             self.use_transformer = False
         
-        # Portfolio scoring head
-        self.portfolio_head = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        # Portfolio scoring head with configurable hidden depth.
+        head_layers: list[nn.Module] = []
+        if self.hidden_layers <= 0:
+            head_layers.append(nn.Linear(embedding_dim, 1))
+        else:
+            in_dim = embedding_dim
+            for _ in range(self.hidden_layers):
+                head_layers.extend(
+                    [
+                        nn.Linear(in_dim, hidden_dim),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                    ]
+                )
+                in_dim = hidden_dim
+            head_layers.append(nn.Linear(hidden_dim, 1))
+        self.portfolio_head = nn.Sequential(*head_layers)
 
     def forward(self, x: torch.Tensor, tradable_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Return per-symbol portfolio weights.
