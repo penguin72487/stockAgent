@@ -8,7 +8,7 @@ environment:
   conda_env: fintech
   device: cuda
   use_tensor_cores: true
-  amp_dtype: bf16
+  amp_dtype: tf32
   target_vram_fraction: 0.85
 
 data:
@@ -17,6 +17,7 @@ data:
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
+  use_rapids: true
 
 walk_forward:
   min_train_years: 1
@@ -35,13 +36,15 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
+  enable_torch_compile: false
   lookback: 1
   batch_size: 2048
   batch_size_train: 2048
   batch_size_eval: 2048
-  epochs: 1000
+  epochs: 10000
   learning_rate: 0.001
   hidden_dim: 1024
+  hidden_layers: 1
   dropout: 0.1
   num_workers: 16
   weight_decay: 0.00001
@@ -49,7 +52,7 @@ training:
   min_batch_size: 32
   auto_batch_size: true
   vram_budget_gb: 16
-  vram_safety_margin_gb: 1.0
+  vram_safety_margin_gb: 0.7
   target_vram_fraction: 1
 
 evaluation:

@@ -186,7 +186,7 @@ def run_backtest_integer_shares(
     Trading assumptions:
     - Initial capital is cash only.
     - Stock shares are integer lots: floor(target_value / current_price).
-    - Fee is charged daily as fee_rate * traded_notional.
+    - Buy and sell fees are charged separately by buy_fee_rate/sell_fee_rate.
     - Cash is a virtual asset with 0 daily return.
     """
     w = np.asarray(weights, dtype=np.float64)
@@ -294,7 +294,7 @@ def run_backtest_integer_shares(
             candidate_prices = current_prices[tradable_target]
             candidate_prices = candidate_prices[np.isfinite(candidate_prices) & (candidate_prices > 1e-12)]
             if candidate_prices.size > 0:
-                min_buy_cost = float(candidate_prices.min() * (1.0 + fee_rate))
+                min_buy_cost = float(candidate_prices.min() * (1.0 + buy_fee_rate))
                 if max_affordable_buy + 1e-12 < min_buy_cost:
                     strategy_returns[t] = 0.0
                     turnovers[t] = 0.0
