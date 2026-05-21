@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 8
+PANEL_CACHE_VERSION = 9
 
 
 @dataclass(slots=True)
@@ -52,7 +52,10 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
 
             gdf["open_raw"] = gdf["open"].astype("float32")
             gdf["close_raw"] = gdf["close"].astype("float32")
-            gdf["return_1d"] = np.log(gdf["close"].shift(-1) / gdf["close"])
+            if "adj_close" not in gdf.columns:
+                gdf["adj_close"] = gdf["close"]
+            price_for_return = gdf["adj_close"] if "adj_close" in gdf.columns else gdf["close"]
+            gdf["return_1d"] = np.log(price_for_return.shift(-1) / price_for_return)
 
             if "Trading_Volume" in gdf.columns:
                 volume = gdf["Trading_Volume"].fillna(0)
@@ -80,8 +83,10 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame["symbol"] = path.name.replace("_features.parquet", "")
     frame["open_raw"] = frame["open"].astype(np.float32)
     frame["close_raw"] = frame["close"].astype(np.float32)
+    if "adj_close" not in frame.columns:
+        frame["adj_close"] = frame["close"]
 
-    frame["return_1d"] = np.log(frame["close"].shift(-1) / frame["close"])
+    frame["return_1d"] = np.log(frame["adj_close"].shift(-1) / frame["adj_close"])
 
     volume = frame["Trading_Volume"] if "Trading_Volume" in frame.columns else pd.Series(0.0, index=frame.index)
     frame["tradable"] = frame["close"].notna() & pd.Series(volume).fillna(0).gt(0)
@@ -165,7 +170,7 @@ def _build_panel_cudf_batch(parquet_paths: list[Path]) -> PanelData:
         raise RuntimeError("cuDF is not available.")
 
     frames = []
-    base_cols = ["date", "open", "max", "min", "close", "Trading_Volume"]
+    base_cols = ["date", "open", "max", "min", "close", "adj_close", "Trading_Volume"]
     symbols = [path.name.replace("_features.parquet", "") for path in parquet_paths]
 
     for path, symbol in zip(parquet_paths, symbols):
@@ -192,8 +197,10 @@ def _build_panel_cudf_batch(parquet_paths: list[Path]) -> PanelData:
     gdf["open_raw"] = gdf["open"].astype("float32")
     gdf["close_raw"] = gdf["close"].astype("float32")
 
-    close_next = gdf.groupby("symbol")["close"].shift(-1)
-    gdf["return_1d"] = np.log(close_next / gdf["close"])
+    if "adj_close" not in gdf.columns:
+        gdf["adj_close"] = gdf["close"]
+    adj_next = gdf.groupby("symbol")["adj_close"].shift(-1)
+    gdf["return_1d"] = np.log(adj_next / gdf["adj_close"])
 
     volume_raw = gdf["Trading_Volume"].fillna(0)
     gdf["tradable"] = gdf["close"].notnull() & (volume_raw > 0)

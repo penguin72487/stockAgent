@@ -11,4 +11,6 @@ xformers>=0.0.24
 xgboost>=2.0
 scikit-learn>=1.4
 yfinance>=0.2.65
+gymnasium>=0.29
+stable-baselines3>=2.3
 

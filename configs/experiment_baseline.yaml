@@ -13,9 +13,9 @@ environment:
 
 data:
   parquet_root: data_yahoo_tw_ohlcv
-  benchmark_name: "0050"
-  benchmark_required: true
-  benchmark_source: symbol_ohlcv
+  benchmark_name: "universe_average_return"
+  benchmark_required: false
+  benchmark_source: universe_average_return
   universe_mode: all_daily_symbols
 
 walk_forward:
@@ -41,41 +41,116 @@ trading:
 
 training:
   backend: pytorch
-  model_name: MLP
-  num_layers: 2
-  residual_norm: false
+  model_name: TD3 # options: MLP, GRU, Transformer, XGBoost, Ridge, ElasticNet, PPO, DDPG, TD3, SAC
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: false
   lookback: 1
-  batch_size: 1024
-  batch_size_train: 1024
-  batch_size_eval: 1024
   epochs: 1000
-  learning_rate: 0.001
-  hidden_dim: 512
-  dropout: 0.1
   num_workers: 28
-  weight_decay: 0.00001
-  loss_type: sharpe
-  xgb_n_estimators: 600
-  xgb_max_depth: 12
-  xgb_learning_rate: 0.05
-  xgb_subsample: 0.8
-  xgb_colsample_bytree: 0.8
-  xgb_reg_lambda: 1.0
-  ridge_alpha: 1.0
-  ridge_fit_intercept: true
-  elasticnet_alpha: 1.0
-  elasticnet_l1_ratio: 0.5
-  elasticnet_fit_intercept: true
-  elasticnet_max_iter: 2000
-  elasticnet_tol: 0.0001
   min_batch_size: 4
   auto_batch_size: true
   vram_budget_gb: 16
   vram_safety_margin_gb: 2.5
   target_vram_fraction: 0.7
+  model_configs:
+    mlp:
+      num_layers: 2
+      residual_norm: false
+      batch_size: 1024
+      batch_size_train: 1024
+      batch_size_eval: 1024
+      learning_rate: 0.001
+      hidden_dim: 512
+      dropout: 0.3
+      weight_decay: 1.0
+      loss_type: sharpe
+
+    gru:
+      num_layers: 2
+      residual_norm: false
+      batch_size: 1024
+      batch_size_train: 1024
+      batch_size_eval: 1024
+      learning_rate: 0.001
+      hidden_dim: 512
+      dropout: 0.3
+      weight_decay: 1.0
+      loss_type: sharpe
+
+    transformer:
+      num_layers: 2
+      residual_norm: false
+      batch_size: 256
+      batch_size_train: 256
+      batch_size_eval: 256
+      learning_rate: 0.0005
+      hidden_dim: 512
+      dropout: 0.1
+      weight_decay: 0.01
+      loss_type: sharpe
+
+    xgboost:
+      xgb_n_estimators: 600
+      xgb_max_depth: 12
+      xgb_learning_rate: 0.05
+      xgb_subsample: 0.8
+      xgb_colsample_bytree: 0.8
+      xgb_reg_lambda: 1.0
+
+    ridge:
+      ridge_alpha: 1.0
+      ridge_fit_intercept: true
+
+    elasticnet:
+      elasticnet_alpha: 1.0
+      elasticnet_l1_ratio: 0.5
+      elasticnet_fit_intercept: true
+      elasticnet_max_iter: 2000
+      elasticnet_tol: 0.0001
+
+    ppo:
+      learning_rate: 0.001
+      rl_total_timesteps: 20000
+      rl_batch_size: 256
+      rl_n_steps: 2048
+      rl_gamma: 0.99
+      rl_policy_hidden_dim: 256
+      rl_max_symbols: 64
+      rl_device: cuda
+
+    ddpg:
+      learning_rate: 0.001
+      rl_total_timesteps: 20000
+      rl_batch_size: 256
+      rl_buffer_size: 200000
+      rl_learning_starts: 1000
+      rl_gamma: 0.99
+      rl_policy_hidden_dim: 256
+      rl_max_symbols: 64
+      rl_device: cuda
+
+    td3:
+      learning_rate: 0.001
+      rl_total_timesteps: 20000
+      rl_batch_size: 256
+      rl_buffer_size: 200000
+      rl_learning_starts: 1000
+      rl_gamma: 0.99
+      rl_policy_hidden_dim: 256
+      rl_max_symbols: 64
+      rl_device: cuda
+
+    sac:
+      learning_rate: 0.001
+      rl_total_timesteps: 20000
+      rl_batch_size: 256
+      rl_buffer_size: 200000
+      rl_learning_starts: 1000
+      rl_gamma: 0.99
+      rl_policy_hidden_dim: 256
+      rl_max_symbols: 64
+      rl_device: cuda
 
 evaluation:
   primary_baseline: "0050"
