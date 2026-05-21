@@ -90,6 +90,15 @@ class TrainingConfig:
     elasticnet_fit_intercept: bool = True
     elasticnet_max_iter: int = 2000
     elasticnet_tol: float = 1e-4
+    rl_total_timesteps: int = 20000
+    rl_batch_size: int = 256
+    rl_n_steps: int = 2048
+    rl_buffer_size: int = 200000
+    rl_learning_starts: int = 1000
+    rl_gamma: float = 0.99
+    rl_policy_hidden_dim: int = 256
+    rl_max_symbols: int = 64
+    rl_device: str = ""
 
 
 @dataclass(slots=True)
@@ -163,10 +172,50 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("elasticnet_fit_intercept", True)
     training.setdefault("elasticnet_max_iter", 2000)
     training.setdefault("elasticnet_tol", 1e-4)
+    training.setdefault("rl_total_timesteps", 20000)
+    training.setdefault("rl_batch_size", 256)
+    training.setdefault("rl_n_steps", 2048)
+    training.setdefault("rl_buffer_size", 200000)
+    training.setdefault("rl_learning_starts", 1000)
+    training.setdefault("rl_gamma", 0.99)
+    training.setdefault("rl_policy_hidden_dim", 256)
+    training.setdefault("rl_max_symbols", 64)
+    training.setdefault("rl_device", "")
 
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)
     evaluation.setdefault("gamma_turnover", 0.1)
+    return raw
+
+
+def _apply_model_configs(raw: dict[str, Any]) -> dict[str, Any]:
+    training = raw.setdefault("training", {})
+    model_name = str(training.get("model_name", "mlp")).strip().lower()
+    model_configs = training.pop("model_configs", None)
+    if not isinstance(model_configs, dict):
+        return raw
+
+    lowered_map = {str(key).strip().lower(): value for key, value in model_configs.items()}
+    selected = lowered_map.get(model_name)
+    if not isinstance(selected, dict):
+        return raw
+
+    valid_fields = set(TrainingConfig.__dataclass_fields__.keys())
+    unknown = [key for key in selected.keys() if key not in valid_fields]
+    if unknown:
+        raise ValueError(
+            f"Unknown keys in training.model_configs.{model_name}: {unknown}. "
+            f"Valid keys: {sorted(valid_fields)}"
+        )
+
+    training.update(selected)
+
+    # Preserve batch_size convenience behavior for profile overrides.
+    if "batch_size" in selected and "batch_size_train" not in selected:
+        training["batch_size_train"] = training["batch_size"]
+    if "batch_size" in selected and "batch_size_eval" not in selected:
+        training["batch_size_eval"] = training["batch_size"]
+
     return raw
 
 
@@ -175,6 +224,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raw = yaml.safe_load(handle)
 
     raw = _merge_defaults(raw)
+    raw = _apply_model_configs(raw)
     return ExperimentConfig(
         experiment_name=raw["experiment_name"],
         environment=EnvironmentConfig(**raw["environment"]),

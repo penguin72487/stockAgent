@@ -927,6 +927,7 @@ def _compute_metrics_from_tensors(
             "cumulative_return": 0.0,
             "annualized_return": 0.0,
             "sharpe": 0.0,
+            "baseline_sharpe": 0.0,
             "max_drawdown": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
@@ -941,8 +942,11 @@ def _compute_metrics_from_tensors(
 
     avg = r.mean()
     std = r.std(unbiased=False)
+    avg_b = b.mean()
+    std_b = b.std(unbiased=False)
     ann_r = float(torch.expm1(avg * 252.0).item())
     sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
+    baseline_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
 
     equity = torch.exp(torch.cumsum(r, dim=0))
     running_max = torch.cummax(equity, dim=0).values
@@ -953,6 +957,7 @@ def _compute_metrics_from_tensors(
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
         "sharpe": sharpe,
+        "baseline_sharpe": baseline_sharpe,
         "max_drawdown": max_dd,
         "turnover": float(t.mean().item()) if t.numel() else 0.0,
         "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),

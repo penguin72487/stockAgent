@@ -26,7 +26,7 @@ ISIN_SOURCES = {
     "otc": ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO"),
 }
 CODE_NAME_PATTERN = re.compile(r"^(?P<code>\d{4,6}[A-Z]{0,2})[\s\u3000]+(?P<name>.+)$")
-OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
+OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adj_close", "Trading_Volume"]
 PROBE_STATUSES = {"historical_found", "no_history", "failed"}
 ASSET_CFICODE_PREFIXES = ("ES", "CE")
 
@@ -363,8 +363,14 @@ def _normalize_history(frame: pd.DataFrame) -> pd.DataFrame:
         "High": "max",
         "Low": "min",
         "Close": "close",
+        "Adj Close": "adj_close",
         "Volume": "Trading_Volume",
     }
+    # Some symbols may not provide Adj Close; fallback to Close for total-return compatibility.
+    if "Adj Close" not in frame.columns and "Close" in frame.columns:
+        frame = frame.copy()
+        frame["Adj Close"] = frame["Close"]
+
     missing = [column for column in rename_map if column not in frame.columns]
     if missing:
         raise ValueError(f"Yahoo response missing expected columns: {missing}")
@@ -375,11 +381,11 @@ def _normalize_history(frame: pd.DataFrame) -> pd.DataFrame:
         normalized = normalized.rename(columns={normalized.columns[0]: "date"})
 
     normalized["date"] = pd.to_datetime(normalized["date"], utc=True).dt.tz_localize(None)
-    for column in ["open", "max", "min", "close"]:
+    for column in ["open", "max", "min", "close", "adj_close"]:
         normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     normalized["Trading_Volume"] = pd.to_numeric(normalized["Trading_Volume"], errors="coerce")
 
-    normalized = normalized.dropna(subset=["date", "open", "max", "min", "close"])
+    normalized = normalized.dropna(subset=["date", "open", "max", "min", "close", "adj_close"])
     normalized["Trading_Volume"] = normalized["Trading_Volume"].fillna(0).astype("int64")
     normalized = normalized.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     return normalized[OUTPUT_COLUMNS].reset_index(drop=True)
@@ -391,6 +397,8 @@ def _load_existing_history(path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     existing = existing.copy()
+    if "adj_close" not in existing.columns:
+        existing["adj_close"] = existing["close"]
     existing["date"] = pd.to_datetime(existing["date"], utc=True).dt.tz_localize(None)
     return existing[OUTPUT_COLUMNS].sort_values("date").drop_duplicates(subset=["date"], keep="last")
 
@@ -501,8 +509,10 @@ def _fill_symbol_by_calendar(path: Path, calendar: pd.DatetimeIndex) -> FillResu
         )
 
     prev_close = reindexed["close"].ffill()
+    prev_adj_close = reindexed["adj_close"].ffill()
     for column in ["open", "max", "min", "close"]:
         reindexed.loc[inserted_rows, column] = prev_close.loc[inserted_rows]
+    reindexed.loc[inserted_rows, "adj_close"] = prev_adj_close.loc[inserted_rows]
 
     reindexed.loc[inserted_rows, "Trading_Volume"] = 0
     reindexed["Trading_Volume"] = pd.to_numeric(reindexed["Trading_Volume"], errors="coerce").fillna(0).astype("int64")

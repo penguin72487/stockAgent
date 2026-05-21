@@ -13,6 +13,7 @@ from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.training.linear_runner import run_training_linear
+from stockagent.training.rl_runner import run_training_rl
 from stockagent.training.trainer import run_training
 from stockagent.training.xgboost_runner import run_training_xgboost
 
@@ -41,7 +42,21 @@ def _extract_symbol_code(name: str) -> str | None:
     return None
 
 
-def _apply_benchmark_override(panel, benchmark_name: str, benchmark_required: bool) -> None:
+def _apply_benchmark_override(panel, benchmark_name: str, benchmark_required: bool, benchmark_source: str) -> None:
+    benchmark_mode = (benchmark_source or benchmark_name).strip().lower()
+
+    if benchmark_mode in {"universe_average_return", "derived_from_panel", "universe_average"}:
+        # Panel default is daily average return over all tradable symbols.
+        print("[benchmark] using universe average daily return (all tradable symbols)")
+        return
+
+    if benchmark_mode in {"universe_cumulative_return", "universe_cumulative", "all_symbols_cumulative"}:
+        returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0)
+        tradable = panel.tradable_mask.astype(bool)
+        panel.benchmark_returns = np.where(tradable, returns, 0.0).sum(axis=1).astype(np.float32)
+        print("[benchmark] using universe cumulative daily return (sum across all tradable symbols)")
+        return
+
     # Keep current universe benchmark unless user explicitly points to a symbol like 0050.
     if benchmark_name.strip().lower() in {"universe_average_return", "derived_from_panel", "universe_average"}:
         return
@@ -80,7 +95,12 @@ def main() -> None:
             "Please run on a GPU-enabled environment."
         )
     panel = build_panel(config.data.parquet_root)
-    _apply_benchmark_override(panel, config.data.benchmark_name, config.data.benchmark_required)
+    _apply_benchmark_override(
+        panel,
+        config.data.benchmark_name,
+        config.data.benchmark_required,
+        config.data.benchmark_source,
+    )
 
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -97,6 +117,8 @@ def main() -> None:
         results = run_training_xgboost(panel, folds, config, args.output_dir)
     elif model_name in {"ridge", "elasticnet"}:
         results = run_training_linear(panel, folds, config, args.output_dir, model_name=model_name)
+    elif model_name in {"ppo", "ddpg", "td3", "sac"}:
+        results = run_training_rl(panel, folds, config, args.output_dir, resume=args.resume)
     else:
         results = run_training(panel, folds, config, args.output_dir, resume=args.resume)
 
