@@ -11,7 +11,7 @@ import pandas as pd
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 5
+PANEL_CACHE_VERSION = 6
 
 
 @dataclass(slots=True)
@@ -35,25 +35,38 @@ class PanelData:
         return int(self.features.shape[1])
 
 
+def _safe_log_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Compute log(numerator / denominator) only where both values are finite and > 0."""
+    num = pd.to_numeric(numerator, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    den = pd.to_numeric(denominator, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    out = np.full(num.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(num) & np.isfinite(den) & (num > 0.0) & (den > 0.0)
+    np.divide(num, den, out=out, where=valid)
+    np.log(out, out=out, where=valid)
+    out[~valid] = np.nan
+    return pd.Series(out, index=numerator.index)
+
+
 def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame = pd.read_parquet(path).copy()
-    frame["date"] = pd.to_datetime(frame["date"])
+    if not pd.api.types.is_datetime64_any_dtype(frame["date"]):
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = path.name.replace("_features.parquet", "")
     frame["close_raw"] = frame["close"].astype(np.float32)
 
-    frame["return_1d"] = np.log(frame["close"].shift(-1) / frame["close"])
+    frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
 
     volume = frame["Trading_Volume"] if "Trading_Volume" in frame.columns else pd.Series(0.0, index=frame.index)
     frame["tradable"] = frame["close"].notna() & pd.Series(volume).fillna(0).gt(0)
 
     for col in ["open", "max", "min", "close"]:
         if col in frame.columns:
-            frame[col] = np.log(frame[col] / frame[col].shift(1))
+            frame[col] = _safe_log_ratio(frame[col], frame[col].shift(1))
 
     if "Trading_Volume" in frame.columns:
-        vol = frame["Trading_Volume"].replace(0, np.nan)
-        frame["Trading_Volume"] = np.log(vol / vol.shift(1))
+        vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+        frame["Trading_Volume"] = _safe_log_ratio(vol, vol.shift(1))
 
     return frame
 

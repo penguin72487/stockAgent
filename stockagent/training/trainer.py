@@ -24,7 +24,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 from stockagent.backtest.report import (
-    compute_god_mode_returns,
     compute_metrics,
     generate_annual_report,
     plot_annual_performance,
@@ -919,6 +918,7 @@ def _compute_metrics_from_tensors(
             "cumulative_return": 0.0,
             "annualized_return": 0.0,
             "sharpe": 0.0,
+            "baseline_sharpe": 0.0,
             "max_drawdown": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
@@ -933,8 +933,11 @@ def _compute_metrics_from_tensors(
 
     avg = r.mean()
     std = r.std(unbiased=False)
+    avg_b = b.mean()
+    std_b = b.std(unbiased=False)
     ann_r = float(torch.expm1(avg * 252.0).item())
     sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
+    baseline_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
 
     equity = torch.exp(torch.cumsum(r, dim=0))
     running_max = torch.cummax(equity, dim=0).values
@@ -945,6 +948,7 @@ def _compute_metrics_from_tensors(
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
         "sharpe": sharpe,
+        "baseline_sharpe": baseline_sharpe,
         "max_drawdown": max_dd,
         "turnover": float(t.mean().item()) if t.numel() else 0.0,
         "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),
@@ -1354,18 +1358,14 @@ def run_training(
             with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
                 json.dump(asdict(fold_result), f, indent=2)
 
-            god_returns = compute_god_mode_returns(
-                test_returns.numpy(),
-                test_masks.numpy(),
-            )
             _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
-            report = generate_annual_report(test_bt, test_dates, god_returns=god_returns)
+            report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
 
-            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png", god_returns=god_returns)
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png", god_returns=god_returns)
+            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
             _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 

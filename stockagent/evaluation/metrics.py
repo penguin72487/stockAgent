@@ -92,8 +92,11 @@ def summarize_returns(strategy_returns: np.ndarray, benchmark_returns: np.ndarra
     cum_b = float(np.expm1(b.sum()))
     avg = float(r.mean())
     std = float(r.std(ddof=0))
+    avg_b = float(b.mean())
+    std_b = float(b.std(ddof=0))
     ann_r = float(np.expm1(avg * 252.0))
     sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
+    baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
     equity = np.exp(np.cumsum(r))
     running_max = np.maximum.accumulate(equity)
     dd = equity / np.clip(running_max, 1e-12, None) - 1.0
@@ -101,6 +104,7 @@ def summarize_returns(strategy_returns: np.ndarray, benchmark_returns: np.ndarra
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
         "sharpe": sharpe,
+        "baseline_sharpe": baseline_sharpe,
         "max_drawdown": float(dd.min(initial=0.0)),
         "turnover": float(turnover.mean()) if turnover.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
