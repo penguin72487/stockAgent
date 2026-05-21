@@ -574,22 +574,6 @@ def find_optimal_batch_size(
         return len(sample_loader.dataset), 0
 
     device_index = device.index if device.index is not None else torch.cuda.current_device()
-    
-    # Get a single sample to estimate memory
-    model.eval()
-    test_batch = next(iter(sample_loader))
-    test_batch = _move_batch(test_batch, device, non_blocking=True)
-    
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-    
-    with torch.inference_mode():
-        with _autocast_context(device, amp_dtype):
-            _ = model(test_batch["x"], test_batch["tradable_mask"])
-    
-    single_sample_bytes = torch.cuda.max_memory_reserved()
-    torch.cuda.reset_peak_memory_stats()
-    
     max_batch_size = len(sample_loader.dataset)
     margin_bytes = int(max(0.0, vram_safety_margin_gb) * 1024**3)
     budget_bytes = int(max(0.0, vram_budget_gb) * 1024**3)
@@ -618,53 +602,39 @@ def find_optimal_batch_size(
         )
 
     target_bytes = max(1, target_bytes)
-    estimated_max = max(1, target_bytes // max(single_sample_bytes, 1))
-    
-    # Binary search
-    low, high = 1, min(estimated_max, max_batch_size)
     best_batch_size = 1
-    best_used_bytes = int(single_sample_bytes)
-    
-    print(
-        f"  [batch search] single sample(reserved): {single_sample_bytes/1024**2:.1f}MB, "
-        f"target: {target_bytes/1024**3:.1f}GB "
-        f"(hard_cap={hard_cap_bytes/1024**3:.1f}GB, budget={vram_budget_gb:.1f}GB, margin={vram_safety_margin_gb:.1f}GB, frac={target_vram_fraction:.2f}, {mem_source}), "
-        f"range: [{low}, {high}]"
-    )
+    best_used_bytes = 0
 
     # Include optimizer-state allocation (Adam moments) in peak memory estimation.
     temp_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    
-    while low <= high:
-        mid = (low + high) // 2
-        
+
+    def _measure_candidate(batch_size: int) -> tuple[bool, int]:
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+        temp_loader = DataLoader(
+            sample_loader.dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+        model.train()
+        local_batch = next(iter(temp_loader))
+        local_batch = _move_batch(local_batch, device, non_blocking=True)
+        model.zero_grad(set_to_none=True)
+
         try:
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.empty_cache()
-            
-            # Create temporary loader for testing
-            temp_loader = DataLoader(
-                sample_loader.dataset,
-                batch_size=mid,
-                shuffle=False,
-                num_workers=0,
-                pin_memory=True,
-            )
-            
-            model.train()
-            test_batch = next(iter(temp_loader))
-            test_batch = _move_batch(test_batch, device, non_blocking=True)
-            model.zero_grad(set_to_none=True)
-            
             with _autocast_context(device, amp_dtype):
-                logits = model(test_batch["x"], test_batch["tradable_mask"])
+                logits = model(local_batch["x"], local_batch["tradable_mask"])
                 loss = sharpe_aware_loss(
                     logits,
-                    test_batch["future_log_returns"],
-                    test_batch["tradable_mask"],
+                    local_batch["future_log_returns"],
+                    local_batch["tradable_mask"],
                     fee_per_side=0.0,
                 )
-            
+
             loss.backward()
             temp_optimizer.step()
             temp_optimizer.zero_grad(set_to_none=True)
@@ -674,22 +644,83 @@ def find_optimal_batch_size(
             if smi_after is not None:
                 _, smi_used_after, _ = smi_after
                 used_memory = max(used_memory, int(smi_used_after))
-            
+
+            ok = used_memory <= target_bytes
+            return ok, int(used_memory)
+        finally:
+            model.zero_grad(set_to_none=True)
+            temp_optimizer.zero_grad(set_to_none=True)
+            del local_batch
+            if 'logits' in locals():
+                del logits
+            if 'loss' in locals():
+                del loss
+            torch.cuda.empty_cache()
+
+    # Bracket search by actual runtime usage instead of single-sample reserved memory.
+    low = 1
+    high = 1
+    ok, used_bytes = _measure_candidate(1)
+    if not ok:
+        print(
+            f"  [batch search] target: {target_bytes/1024**3:.1f}GB "
+            f"(hard_cap={hard_cap_bytes/1024**3:.1f}GB, budget={vram_budget_gb:.1f}GB, margin={vram_safety_margin_gb:.1f}GB, frac={target_vram_fraction:.2f}, {mem_source})"
+        )
+        print(f"  ❌ batch_size 1: {used_bytes/1024**3:.1f}GB exceeds")
+        return 1, int(used_bytes)
+
+    best_batch_size = 1
+    best_used_bytes = int(used_bytes)
+    print(
+        f"  [batch search] target: {target_bytes/1024**3:.1f}GB "
+        f"(hard_cap={hard_cap_bytes/1024**3:.1f}GB, budget={vram_budget_gb:.1f}GB, margin={vram_safety_margin_gb:.1f}GB, frac={target_vram_fraction:.2f}, {mem_source})"
+    )
+    print(f"  ✅ batch_size 1: {used_bytes/1024**3:.1f}GB OK")
+
+    while high < max_batch_size:
+        candidate = min(max_batch_size, high * 2)
+        ok, used_bytes = _measure_candidate(candidate)
+        if ok:
+            best_batch_size = candidate
+            best_used_bytes = int(used_bytes)
+            low = candidate
+            high = candidate
+            print(f"  ✅ batch_size {candidate}: {used_bytes/1024**3:.1f}GB OK")
+            if candidate == max_batch_size:
+                print(f"  [batch search] final result: {best_batch_size}")
+                return best_batch_size, best_used_bytes
+            continue
+
+        low = max(1, high)
+        high = candidate
+        print(f"  ❌ batch_size {candidate}: {used_bytes/1024**3:.1f}GB exceeds")
+        break
+
+    if high == low and best_batch_size == max_batch_size:
+        print(f"  [batch search] final result: {best_batch_size}")
+        return best_batch_size, best_used_bytes
+    
+    search_low = best_batch_size + 1
+    search_high = high - 1 if high > best_batch_size else best_batch_size
+    print(f"  [batch search] refine range: [{search_low}, {search_high}]")
+
+    while search_low <= search_high:
+        mid = (search_low + search_high) // 2
+
+        try:
+            ok, used_memory = _measure_candidate(mid)
             if used_memory <= target_bytes:
                 best_batch_size = mid
                 best_used_bytes = int(used_memory)
-                low = mid + 1
+                search_low = mid + 1
                 print(f"  ✅ batch_size {mid}: {used_memory/1024**3:.1f}GB OK")
             else:
-                high = mid - 1
+                search_high = mid - 1
                 print(f"  ❌ batch_size {mid}: {used_memory/1024**3:.1f}GB exceeds")
-            del test_batch, logits, loss
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            
+
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                high = mid - 1
+                search_high = mid - 1
                 print(f"  ❌ batch_size {mid}: OOM")
             else:
                 raise
