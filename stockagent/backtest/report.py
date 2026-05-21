@@ -18,31 +18,28 @@ def _safe_expm1(log_sum: float) -> float:
     return math.expm1(log_sum)
 
 
+def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
+    """Build a plot-safe equity curve from log returns."""
+    clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
+    cum_log = np.cumsum(clean)
+    # Keep plotting range finite to avoid matplotlib overflow warnings.
+    return np.exp(np.clip(cum_log, -745.0, 80.0))
 
-def compute_god_mode_returns(
-    future_log_returns: np.ndarray,
-    tradable_mask: np.ndarray,
-) -> np.ndarray:
-    """Theoretical maximum: each day pick the single tradable stock with highest return.
 
-    Args:
-        future_log_returns: [T, S] log returns
-        tradable_mask:       [T, S] bool mask
-
-    Returns:
-        god_returns: [T] log returns of perfect daily selection
-    """
-    masked = np.where(tradable_mask.astype(bool), future_log_returns, -np.inf)
-    god = np.max(masked, axis=1).astype(np.float32)  # [T]
-    god = np.where(np.isneginf(god), 0.0, god)  # no tradable stocks → 0
-    return god
+def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
+    """Compute max drawdown in log-space without unstable exp/divide operations."""
+    clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
+    cum_log = np.cumsum(clean)
+    running_max_log = np.maximum.accumulate(cum_log)
+    dd = np.expm1(np.clip(cum_log - running_max_log, -745.0, 0.0))
+    return float(dd.min(initial=0.0))
 
 
 def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
     Returns a dict with:
-        cumulative_return, annualized_return, sharpe, max_drawdown,
+        cumulative_return, annualized_return, sharpe, baseline_sharpe, max_drawdown,
         turnover, daily_hit_rate, excess_return_vs_universe_average,
         cumulative_benchmark
     """
@@ -55,18 +52,19 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
 
     avg = float(r.mean())
     std = float(r.std(ddof=0))
+    avg_b = float(b.mean())
+    std_b = float(b.std(ddof=0))
     ann_r = _safe_expm1(float(avg * 252.0))
     sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
+    baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
 
-    equity = np.exp(np.cumsum(r.astype(np.float64)))
-    running_max = np.maximum.accumulate(equity)
-    dd = equity / np.clip(running_max, 1e-12, None) - 1.0
-    max_dd = float(dd.min(initial=0.0))
+    max_dd = _max_drawdown_from_log_returns(r)
 
     return {
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
         "sharpe": sharpe,
+        "baseline_sharpe": baseline_sharpe,
         "max_drawdown": max_dd,
         "turnover": float(result.turnovers.mean()) if result.turnovers.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
@@ -78,21 +76,17 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
 def compute_metrics_by_year(
     result: BacktestResult,
     dates: np.ndarray,
-    god_returns: np.ndarray | None = None,
 ) -> dict[int, dict[str, float]]:
     """Compute annual performance metrics.
 
     Args:
         result: BacktestResult containing daily returns
         dates: numpy array of datetime64 (shape [T])
-        god_returns: optional [T] log returns for theoretical max (god mode)
-
     Returns:
         dict mapping year -> annual metrics
     """
     r = np.nan_to_num(result.strategy_returns, nan=0.0)
     b = np.nan_to_num(result.benchmark_returns, nan=0.0)
-    g = np.nan_to_num(god_returns, nan=0.0) if god_returns is not None else None
 
     # Extract year from dates
     years = np.asarray(dates, dtype='datetime64[D]').astype(object)
@@ -109,26 +103,25 @@ def compute_metrics_by_year(
         cum_b = _safe_expm1(float(b_year.sum()))
         avg = float(r_year.mean())
         std = float(r_year.std(ddof=0)) + 1e-8
+        avg_b = float(b_year.mean())
+        std_b = float(b_year.std(ddof=0)) + 1e-8
         ann_r = _safe_expm1(float(avg * 252.0))
         sharpe = float(avg / std * math.sqrt(252.0))
+        baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0))
 
-        equity = np.exp(np.cumsum(r_year.astype(np.float64)))
-        running_max = np.maximum.accumulate(equity)
-        dd = equity / np.clip(running_max, 1e-12, None) - 1.0
-        max_dd = float(dd.min(initial=0.0))
+        max_dd = _max_drawdown_from_log_returns(r_year)
 
         entry: dict[str, float] = {
             "cumulative_return": cum_r,
             "annualized_return": ann_r,
             "sharpe": sharpe,
+            "baseline_sharpe": baseline_sharpe,
             "max_drawdown": max_dd,
             "turnover": float(turnover_year.mean()),
             "daily_hit_rate": float((r_year > 0).mean()),
             "excess_return_vs_universe_average": cum_r - cum_b,
             "cumulative_benchmark": cum_b,
         }
-        if g is not None:
-            entry["god_cumulative_return"] = _safe_expm1(float(g[mask].sum()))
         annual_metrics[int(year)] = entry
 
     return annual_metrics
@@ -138,7 +131,6 @@ def generate_annual_report(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | None = None,
-    god_returns: np.ndarray | None = None,
 ) -> str:
     """Generate a text report of annual performance.
 
@@ -146,44 +138,31 @@ def generate_annual_report(
         result: BacktestResult
         dates: datetime64 array [T]
         output_path: optional file path to save report
-        god_returns: optional [T] log returns for theoretical max (god mode)
-
     Returns:
         formatted report string
     """
-    annual_metrics = compute_metrics_by_year(result, dates, god_returns=god_returns)
-    has_god = god_returns is not None
+    annual_metrics = compute_metrics_by_year(result, dates)
 
-    # Column widths: Year(8) Strategy(12) Baseline(12) Excess(12) Sharpe(10) MaxDD(10) Turnover(10) [GodMode(14)]
-    width = 97 if not has_god else 112
+    # Column widths: Year(8) Strategy(12) Baseline(12) Excess(12) Sharpe(10) BaseSharpe(11) MaxDD(10) Turnover(10)
+    width = 109
     lines = ["Annual Performance Report", "=" * width]
     header = (
         f"{'Year':<8} {'Strategy':>12} {'Baseline':>12} {'Excess':>12} "
-        f"{'Sharpe':>10} {'Max DD':>10} {'Turnover':>10}"
+        f"{'Sharpe':>10} {'BaseShrp':>11} {'Max DD':>10} {'Turnover':>10}"
     )
-    if has_god:
-        header += f" {'GodMode':>14}"
     lines.append(header)
     lines.append("-" * width)
 
-    # Accumulate totals for summary row
-    strat_log_sum = 0.0
-    bench_log_sum = 0.0
-    god_log_sum = 0.0
-
     r_all = np.nan_to_num(result.strategy_returns, nan=0.0)
     b_all = np.nan_to_num(result.benchmark_returns, nan=0.0)
-    g_all = np.nan_to_num(god_returns, nan=0.0) if has_god else None
 
     for year in sorted(annual_metrics.keys()):
         m = annual_metrics[year]
         row = (
             f"{year:<8} {m['cumulative_return']:>11.2%} {m['cumulative_benchmark']:>12.2%} "
             f"{m['excess_return_vs_universe_average']:>12.2%} "
-            f"{m['sharpe']:>10.3f} {m['max_drawdown']:>10.2%} {m['turnover']:>10.4f}"
+            f"{m['sharpe']:>10.3f} {m['baseline_sharpe']:>11.3f} {m['max_drawdown']:>10.2%} {m['turnover']:>10.4f}"
         )
-        if has_god:
-            row += f" {m.get('god_cumulative_return', float('nan')):>13.2%}"
         lines.append(row)
 
     # --- Summary row (full-period) ---
@@ -192,20 +171,18 @@ def generate_annual_report(
     cum_b_total = _safe_expm1(float(b_all.sum()))
     avg = float(r_all.mean())
     std = float(r_all.std(ddof=0)) + 1e-8
+    avg_b = float(b_all.mean())
+    std_b = float(b_all.std(ddof=0)) + 1e-8
     sharpe_total = float(avg / std * math.sqrt(252.0))
-    equity_total = np.exp(np.cumsum(r_all.astype(np.float64)))
-    dd_total = equity_total / np.maximum.accumulate(equity_total).clip(1e-12) - 1.0
-    max_dd_total = float(dd_total.min(initial=0.0))
+    baseline_sharpe_total = float(avg_b / std_b * math.sqrt(252.0))
+    max_dd_total = _max_drawdown_from_log_returns(r_all)
     turnover_total = float(result.turnovers.mean()) if result.turnovers.size else 0.0
 
     summary_row = (
         f"{'TOTAL':<8} {cum_r_total:>11.2%} {cum_b_total:>12.2%} "
         f"{cum_r_total - cum_b_total:>12.2%} "
-        f"{sharpe_total:>10.3f} {max_dd_total:>10.2%} {turnover_total:>10.4f}"
+        f"{sharpe_total:>10.3f} {baseline_sharpe_total:>11.3f} {max_dd_total:>10.2%} {turnover_total:>10.4f}"
     )
-    if has_god:
-        cum_g_total = _safe_expm1(float(g_all.sum()))
-        summary_row += f" {cum_g_total:>13.2%}"
     lines.append(summary_row)
 
     report = "\n".join(lines)
@@ -235,6 +212,7 @@ def plot_annual_performance(
     strategy_returns = [annual_metrics[y]["cumulative_return"] for y in years]
     benchmark_returns = [annual_metrics[y]["cumulative_benchmark"] for y in years]
     sharpe_ratios = [annual_metrics[y]["sharpe"] for y in years]
+    baseline_sharpes = [annual_metrics[y]["baseline_sharpe"] for y in years]
     
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
@@ -255,7 +233,8 @@ def plot_annual_performance(
     
     # Panel 2: Sharpe ratio by year
     ax = axes[1]
-    ax.plot(years, sharpe_ratios, marker="o", linewidth=2, markersize=8, label="Sharpe Ratio")
+    ax.plot(years, sharpe_ratios, marker="o", linewidth=2, markersize=8, label="Strategy Sharpe")
+    ax.plot(years, baseline_sharpes, marker="s", linewidth=2, markersize=6, label="Baseline Sharpe")
     ax.set_xlabel("Year")
     ax.set_ylabel("Sharpe Ratio")
     ax.set_title("Annual Sharpe Ratio")
@@ -275,7 +254,6 @@ def plot_equity_curve(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | Path | None = None,
-    god_returns: np.ndarray | None = None,
 ) -> None:
     """Plot cumulative equity curve for strategy and benchmark.
 
@@ -283,22 +261,16 @@ def plot_equity_curve(
         result: BacktestResult
         dates: datetime64 array [T]
         output_path: optional file path to save figure
-        god_returns: optional [T] log returns for theoretical max (god mode)
     """
     r = np.nan_to_num(result.strategy_returns, nan=0.0)
     b = np.nan_to_num(result.benchmark_returns, nan=0.0)
 
-    strategy_equity = np.exp(np.cumsum(r.astype(np.float64)))
-    benchmark_equity = np.exp(np.cumsum(b.astype(np.float64)))
+    strategy_equity = _safe_equity_for_plot(r)
+    benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
     ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
-    if god_returns is not None:
-        g = np.nan_to_num(god_returns, nan=0.0)
-        god_equity = np.exp(np.cumsum(g.astype(np.float64)))
-        ax.plot(dates, god_equity, label="God Mode (theoretical max)", linewidth=1.5,
-                linestyle="--", color="gold", alpha=0.9)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
     ax.set_title("Strategy vs Benchmark Equity Curve")
@@ -317,7 +289,6 @@ def plot_equity_curve_log(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | Path | None = None,
-    god_returns: np.ndarray | None = None,
 ) -> None:
     """Plot cumulative equity curve for strategy and benchmark (log scale Y-axis).
 
@@ -325,22 +296,16 @@ def plot_equity_curve_log(
         result: BacktestResult
         dates: datetime64 array [T]
         output_path: optional file path to save figure
-        god_returns: optional [T] log returns for theoretical max (god mode)
     """
     r = np.nan_to_num(result.strategy_returns, nan=0.0)
     b = np.nan_to_num(result.benchmark_returns, nan=0.0)
 
-    strategy_equity = np.exp(np.cumsum(r.astype(np.float64)))
-    benchmark_equity = np.exp(np.cumsum(b.astype(np.float64)))
+    strategy_equity = _safe_equity_for_plot(r)
+    benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
     ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
-    if god_returns is not None:
-        g = np.nan_to_num(god_returns, nan=0.0)
-        god_equity = np.exp(np.cumsum(g.astype(np.float64)))
-        ax.plot(dates, god_equity, label="God Mode (theoretical max)", linewidth=1.5,
-                linestyle="--", color="gold", alpha=0.9)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
     ax.set_yscale("log")
@@ -379,8 +344,8 @@ def plot_fold_first_year_returns(
     base_sorted = all_baseline[order]
 
     # Compute cumulative NAV
-    strat_nav = np.exp(np.cumsum(strat_sorted))
-    base_nav = np.exp(np.cumsum(base_sorted))
+    strat_nav = _safe_equity_for_plot(strat_sorted)
+    base_nav = _safe_equity_for_plot(base_sorted)
 
     # Convert dates to pandas for better x-axis formatting
     date_pd = pd.to_datetime(dates_sorted)
