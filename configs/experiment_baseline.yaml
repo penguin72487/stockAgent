@@ -26,7 +26,9 @@ walk_forward:
 
 trading:
   frequency: daily
-  fee_per_side: 0.001
+  fee_per_side: 0.0
+  buy_fee_rate: 0.001425
+  sell_fee_rate: 0.002925
   long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true

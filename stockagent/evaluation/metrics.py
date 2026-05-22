@@ -18,8 +18,7 @@ def select_top_k_weights(scores: np.ndarray, tradable_mask: np.ndarray, top_k: i
     valid_idx = np.flatnonzero(tradable_mask & np.isfinite(scores))
     if valid_idx.size == 0:
         return weights
-    chosen = valid_idx[np.argsort(scores[valid_idx])[-min(top_k, valid_idx.size) :]]
-    weights[chosen] = 1.0 / float(chosen.size)
+    weights[valid_idx] = 1.0 / float(valid_idx.size)
     return weights
 
 

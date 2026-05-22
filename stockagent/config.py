@@ -40,6 +40,8 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     use_all_tradable_symbols: bool
+    buy_fee_rate: float = 0.0
+    sell_fee_rate: float = 0.0
 
 
 @dataclass(slots=True)
@@ -120,6 +122,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)
     evaluation.setdefault("gamma_turnover", 0.1)
+
+    trading = raw.setdefault("trading", {})
+    trading.setdefault("buy_fee_rate", trading.get("fee_per_side", 0.0))
+    trading.setdefault("sell_fee_rate", trading.get("fee_per_side", 0.0))
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", True)

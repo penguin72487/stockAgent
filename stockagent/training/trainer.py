@@ -378,6 +378,8 @@ def _evaluate_tensor_batch(
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     chunk_rows: int,
     cash_symbol_mask: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
@@ -413,6 +415,8 @@ def _evaluate_tensor_batch(
             masks_t,
             bench_t,
             fee_per_side,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
             cash_symbol_mask=cash_symbol_mask,
         )
         ic = ic_summary(compute_ic_series_torch(weights_t, returns_t, masks_t).detach().cpu().numpy())
@@ -974,6 +978,8 @@ def _train_epoch(
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     gamma_sharpe: float,
     gamma_turnover: float,
     cash_symbol_mask: torch.Tensor | None = None,
@@ -993,6 +999,8 @@ def _train_epoch(
                 batch["future_log_returns"],
                 batch["tradable_mask"],
                 fee_per_side=fee_per_side,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
                 cash_symbol_mask=cash_symbol_mask,
@@ -1040,6 +1048,8 @@ def _train_epoch_tensor(
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     gamma_sharpe: float,
     gamma_turnover: float,
     cash_symbol_mask: torch.Tensor | None = None,
@@ -1071,6 +1081,8 @@ def _train_epoch_tensor(
                 batch_mask,
                 sample_mask=batch_sample_mask,
                 fee_per_side=fee_per_side,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
                 cash_symbol_mask=cash_symbol_mask,
@@ -1095,6 +1107,8 @@ def _eval_val_loss(
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     gamma_sharpe: float,
     gamma_turnover: float,
     cash_symbol_mask: torch.Tensor | None = None,
@@ -1111,6 +1125,8 @@ def _eval_val_loss(
                     batch["future_log_returns"], 
                     batch["tradable_mask"], 
                     fee_per_side=fee_per_side,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
                     gamma_sharpe=gamma_sharpe,
                     gamma_turnover=gamma_turnover,
                     cash_symbol_mask=cash_symbol_mask,
@@ -1182,6 +1198,8 @@ def _evaluate_split_torch(
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
     fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     buffers: PredictionBufferPool,
     cash_symbol_mask: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
@@ -1199,6 +1217,8 @@ def _evaluate_split_torch(
         masks,
         bench,
         fee_per_side,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
         cash_symbol_mask=cash_symbol_mask,
     )
     ic = ic_summary(compute_ic_series_torch(weights, log_ret, masks).cpu().numpy())
@@ -1269,6 +1289,8 @@ def run_training(
 ) -> list[FoldResult]:
     device = _resolve_device(config)
     cash_symbol_mask = _cash_symbol_mask_from_symbols(panel.symbols)
+    buy_fee_rate = float(getattr(config.trading, "buy_fee_rate", config.trading.fee_per_side))
+    sell_fee_rate = float(getattr(config.trading, "sell_fee_rate", config.trading.fee_per_side))
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     if config.environment.use_tensor_cores and device.type == "cuda":
@@ -1349,6 +1371,7 @@ def run_training(
                 num_symbols=panel.num_symbols,
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
+                long_only=config.trading.long_only,
                 hidden_layers=config.training.hidden_layers,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
@@ -1376,6 +1399,7 @@ def run_training(
                 num_symbols=panel.num_symbols,
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
+                long_only=config.trading.long_only,
                 hidden_layers=config.training.hidden_layers,
             ).to(device)
 
@@ -1477,6 +1501,7 @@ def run_training(
             num_symbols=panel.num_symbols,
             hidden_dim=config.training.hidden_dim,
             dropout=config.training.dropout,
+            long_only=config.trading.long_only,
             hidden_layers=config.training.hidden_layers,
         ).to(device)
         compiled_train_model: nn.Module = model
@@ -1573,6 +1598,8 @@ def run_training(
                 amp_dtype=amp_dtype,
                 non_blocking=non_blocking,
                 fee_per_side=config.trading.fee_per_side,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
                 cash_symbol_mask=cash_symbol_mask,
@@ -1588,6 +1615,8 @@ def run_training(
                 amp_dtype,
                 non_blocking,
                 config.trading.fee_per_side,
+                buy_fee_rate,
+                sell_fee_rate,
                 chunk_rows=eval_chunk_rows,
                 cash_symbol_mask=cash_symbol_mask,
             )
@@ -1603,6 +1632,8 @@ def run_training(
                     val_returns_slice,
                     val_masks_slice,
                     fee_per_side=config.trading.fee_per_side,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                     cash_symbol_mask=cash_symbol_mask,
@@ -1662,6 +1693,8 @@ def run_training(
                 amp_dtype,
                 non_blocking,
                 config.trading.fee_per_side,
+                buy_fee_rate,
+                sell_fee_rate,
                 chunk_rows=eval_chunk_rows,
                 cash_symbol_mask=cash_symbol_mask,
             )
@@ -1698,6 +1731,8 @@ def run_training(
                 amp_dtype,
                 non_blocking,
                 config.trading.fee_per_side,
+                buy_fee_rate,
+                sell_fee_rate,
                 chunk_rows=eval_chunk_rows,
                 cash_symbol_mask=cash_symbol_mask,
             )
@@ -1727,8 +1762,8 @@ def run_training(
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
-                buy_fee_rate=0.001425,
-                sell_fee_rate=0.002925,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 lot_size=1000,
                 open_prices=test_open_prices,
                 close_prices=test_close_prices,
