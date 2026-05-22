@@ -17,8 +17,8 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
-LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume", "next_open"]
-PANEL_CACHE_VERSION = 10
+LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "adjclose", "Trading_Volume", "next_open"]
+PANEL_CACHE_VERSION = 11
 CASH_SYMBOL_NAMES = {"CASH", "現金"}
 
 
@@ -70,6 +70,10 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     max_num = pd.to_numeric(frame["max"], errors="coerce")
     min_num = pd.to_numeric(frame["min"], errors="coerce")
     close_num = pd.to_numeric(frame["close"], errors="coerce")
+    if "adjclose" in frame.columns:
+        adjclose_num = pd.to_numeric(frame["adjclose"], errors="coerce")
+    else:
+        adjclose_num = close_num
     if "Trading_Volume" in frame.columns:
         volume_num = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
     else:
@@ -79,17 +83,25 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame["close_raw"] = close_num.astype(np.float32)
 
     # User-defined feature timing:
-    # - open/max/min/close/Trading_Volume use previous-day values at row t
+    # - open/max/min/close/adjclose/Trading_Volume use previous-day values at row t
     # - next_open is today's open used as execution buy price
     frame["open"] = open_num.shift(1).astype(np.float32)
     frame["max"] = max_num.shift(1).astype(np.float32)
     frame["min"] = min_num.shift(1).astype(np.float32)
     frame["close"] = close_num.shift(1).astype(np.float32)
+    frame["adjclose"] = adjclose_num.shift(1).astype(np.float32)
     frame["Trading_Volume"] = volume_num.shift(1).astype(np.float32)
     frame["next_open"] = open_num.astype(np.float32)
 
-    # Day-trading target: same-day open->close log return.
-    frame["return_1d"] = _safe_log_ratio(close_num, open_num)
+    # Back-calculate adjusted open from same-day adjustment factor, then
+    # compute same-day log return on adjusted prices.
+    adj_factor = np.full(len(frame), np.nan, dtype=np.float64)
+    close_arr = close_num.to_numpy(dtype=np.float64, copy=False)
+    adjclose_arr = adjclose_num.to_numpy(dtype=np.float64, copy=False)
+    valid_factor = np.isfinite(close_arr) & np.isfinite(adjclose_arr) & (close_arr > 0.0)
+    np.divide(adjclose_arr, close_arr, out=adj_factor, where=valid_factor)
+    adj_open_arr = open_num.to_numpy(dtype=np.float64, copy=False) * adj_factor
+    frame["return_1d"] = _safe_log_ratio(pd.Series(adjclose_arr, index=frame.index), pd.Series(adj_open_arr, index=frame.index))
 
     volume = volume_num
     frame["tradable"] = (
@@ -113,6 +125,10 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     max_num = gdf["max"].astype("float64")
     min_num = gdf["min"].astype("float64")
     close_num = gdf["close"].astype("float64")
+    if "adjclose" in gdf.columns:
+        adjclose_num = gdf["adjclose"].astype("float64")
+    else:
+        adjclose_num = close_num
     if "Trading_Volume" in gdf.columns:
         volume_num = gdf["Trading_Volume"].astype("float64")
     else:
@@ -124,11 +140,15 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     gdf["max"] = max_num.shift(1).astype("float32")
     gdf["min"] = min_num.shift(1).astype("float32")
     gdf["close"] = close_num.shift(1).astype("float32")
+    gdf["adjclose"] = adjclose_num.shift(1).astype("float32")
     gdf["Trading_Volume"] = volume_num.shift(1).astype("float32")
     gdf["next_open"] = open_num.astype("float32")
 
-    valid_ret = (close_num > 0) & (open_num > 0)
-    ret_ratio = (close_num / open_num).where(valid_ret)
+    valid_factor = (close_num > 0) & close_num.notna() & adjclose_num.notna()
+    adj_factor = (adjclose_num / close_num).where(valid_factor)
+    adj_open = open_num * adj_factor
+    valid_ret = (adjclose_num > 0) & (adj_open > 0)
+    ret_ratio = (adjclose_num / adj_open).where(valid_ret)
     gdf["return_1d"] = np.log(ret_ratio)
 
     vol = volume_num.fillna(0)
