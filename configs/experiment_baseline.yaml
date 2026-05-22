@@ -35,7 +35,7 @@ trading:
   long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true
-  lot_size: 1000
+  lot_size: 1
   min_fee_per_side: 20.0
 
 model:

@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "benchmark_return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "adjclose", "Trading_Volume", "next_open"]
-PANEL_CACHE_VERSION = 13
+PANEL_CACHE_VERSION = 14
 CASH_SYMBOL_NAMES = {"CASH", "現金"}
 MAX_ABS_DAILY_LOG_RETURN = 1.0
 
@@ -175,8 +175,13 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     return gdf.to_pandas()
 
 
-def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> PanelData:
-    feature_columns = _get_feature_columns(frame_all)
+def _build_panel_from_frame(
+    frame_all: pd.DataFrame,
+    symbols: list[str],
+    *,
+    include_next_open_feature: bool,
+) -> PanelData:
+    feature_columns = _get_feature_columns(frame_all, include_next_open_feature=include_next_open_feature)
 
     all_dates = sorted(frame_all["date"].dropna().unique().tolist())
     num_dates = len(all_dates)
@@ -242,17 +247,20 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
     )
 
 
-def _get_feature_columns(frame: pd.DataFrame) -> list[str]:
+def _get_feature_columns(frame: pd.DataFrame, *, include_next_open_feature: bool) -> list[str]:
     numeric_columns = set(frame.select_dtypes(include=[np.number]).columns.tolist())
+    expected_columns = LOG_RETURN_FEATURE_COLUMNS if include_next_open_feature else [
+        column for column in LOG_RETURN_FEATURE_COLUMNS if column != "next_open"
+    ]
     feature_columns = [
         column
-        for column in LOG_RETURN_FEATURE_COLUMNS
+        for column in expected_columns
         if column in numeric_columns and column not in RESERVED_COLUMNS
     ]
-    if len(feature_columns) != len(LOG_RETURN_FEATURE_COLUMNS):
+    if len(feature_columns) != len(expected_columns):
         raise ValueError(
             "Missing log-return feature columns in symbol frame: "
-            f"expected={LOG_RETURN_FEATURE_COLUMNS}, got={feature_columns}"
+            f"expected={expected_columns}, got={feature_columns}"
         )
     return feature_columns
 
@@ -310,7 +318,14 @@ def _compute_source_hash(paths: list[Path]) -> str:
     return hasher.hexdigest()
 
 
-def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, source_hash: str) -> None:
+def _save_panel_cache(
+    cache_path: Path,
+    meta_path: Path,
+    panel: PanelData,
+    source_hash: str,
+    *,
+    include_next_open_feature: bool,
+) -> None:
     np.savez_compressed(
         cache_path,
         dates=panel.dates,
@@ -330,6 +345,7 @@ def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, sourc
         'source_hash': source_hash,
         'num_dates': panel.num_dates,
         'num_symbols': panel.num_symbols,
+        'include_next_open_feature': bool(include_next_open_feature),
     }
     with open(meta_path, 'wb') as f:
         pickle.dump(meta, f)
@@ -356,7 +372,12 @@ def _print_feature_overview(panel: PanelData) -> None:
     print(f"[panel] features ({len(panel.feature_names)}): {feature_list}")
 
 
-def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
+def _check_cache_valid(
+    meta_path: Path,
+    parquet_paths: list[Path],
+    *,
+    include_next_open_feature: bool,
+) -> bool:
     """Check if cache is valid based on source hash and mtime."""
     if not meta_path.exists():
         return False
@@ -369,7 +390,8 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
         expected_hash = _compute_source_hash(parquet_paths)
         cache_valid = (
             meta.get('source_hash') == expected_hash and 
-            meta.get('version') == PANEL_CACHE_VERSION
+            meta.get('version') == PANEL_CACHE_VERSION and
+            bool(meta.get('include_next_open_feature', True)) == bool(include_next_open_feature)
         )
         
         if cache_valid:
@@ -386,7 +408,12 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
         return False
 
 
-def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
+def build_panel(
+    parquet_root: str | Path,
+    use_rapids: bool = True,
+    *,
+    include_next_open_feature: bool = True,
+) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob("*_features.parquet"))
     if not parquet_paths:
@@ -396,7 +423,7 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
     meta_path = _cache_meta_path(parquet_root)
     
     # Check cache validity
-    if _check_cache_valid(meta_path, parquet_paths):
+    if _check_cache_valid(meta_path, parquet_paths, include_next_open_feature=include_next_open_feature):
         print(f"[panel] loading cache (valid): {cache_path}")
         panel = _load_panel_cache(cache_path)
         _print_feature_overview(panel)
@@ -420,9 +447,19 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
             if symbol_frames_cudf:
                 symbols_cudf = [path.name.replace("_features.parquet", "") for path in valid_paths_cudf]
                 frame_all_cudf = pd.concat(symbol_frames_cudf, ignore_index=True)
-                panel = _build_panel_from_frame(frame_all_cudf, symbols_cudf)
+                panel = _build_panel_from_frame(
+                    frame_all_cudf,
+                    symbols_cudf,
+                    include_next_open_feature=include_next_open_feature,
+                )
                 source_hash = _compute_source_hash(parquet_paths)
-                _save_panel_cache(cache_path, meta_path, panel, source_hash)
+                _save_panel_cache(
+                    cache_path,
+                    meta_path,
+                    panel,
+                    source_hash,
+                    include_next_open_feature=include_next_open_feature,
+                )
                 print(f"[panel] cache saved: {cache_path} (cuDF path)")
                 _print_feature_overview(panel)
                 return panel
@@ -436,10 +473,20 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
 
     symbols = [path.name.replace("_features.parquet", "") for path in valid_paths]
     frame_all = pd.concat(symbol_frames, ignore_index=True)
-    panel = _build_panel_from_frame(frame_all, symbols)
+    panel = _build_panel_from_frame(
+        frame_all,
+        symbols,
+        include_next_open_feature=include_next_open_feature,
+    )
     
     source_hash = _compute_source_hash(parquet_paths)
-    _save_panel_cache(cache_path, meta_path, panel, source_hash)
+    _save_panel_cache(
+        cache_path,
+        meta_path,
+        panel,
+        source_hash,
+        include_next_open_feature=include_next_open_feature,
+    )
     print(f"[panel] cache saved: {cache_path}")
     _print_feature_overview(panel)
     return panel
