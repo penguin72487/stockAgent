@@ -46,7 +46,7 @@ from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
-from stockagent.models.mlp import CrossSectionalMLP
+from stockagent.models import build_model
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.loss import sharpe_aware_loss
 
@@ -923,7 +923,7 @@ def _estimate_sample_bytes(
     lookback: int,
     num_symbols: int,
     num_features: int,
-    hidden_dim: int,
+    model_width: int,
     amp_dtype: torch.dtype | None,
     training_mode: bool,
 ) -> int:
@@ -938,7 +938,7 @@ def _estimate_sample_bytes(
     benchmark_bytes = fp32_bytes
 
     # Approximate forward activations per sample for MLP.
-    activation_elements = num_symbols * (input_dim + hidden_dim + hidden_dim + 1)
+    activation_elements = num_symbols * (input_dim + model_width + model_width + 1)
     if training_mode:
         # Save activations for backward plus temporary gradients/workspace.
         activation_bytes = int(activation_elements * amp_bytes * 6)
@@ -985,7 +985,7 @@ def _train_epoch(
     cash_symbol_mask: torch.Tensor | None = None,
 ) -> float:
     model.train()
-    total_loss = 0.0
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
     
     for batch in loader:
@@ -1007,32 +1007,24 @@ def _train_epoch(
             )
         
         scaler.scale(loss).backward()
-        
-        # ✅ OPTIMIZATION: Monitor gradient norms for training stability
-        grad_norm = 0.0
-        for param in model.parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.data.norm(2).item() ** 2
-        grad_norm = grad_norm ** 0.5
-        
+
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
-        
-        total_loss += float(loss.detach().cpu())
+
+        total_loss_t += loss.detach().float()
         steps += 1
-        
-        # ✅ OPTIMIZATION: Log VRAM usage every 10 steps
+
         if steps % 10 == 0 and device.type == "cuda":
             vram_gb = torch.cuda.memory_allocated(device) / 1e9
             vram_reserved_gb = torch.cuda.memory_reserved(device) / 1e9
             logger.info(
-                f"Step {steps} | Loss {loss:.6f} | GradNorm {grad_norm:.4f} | "
+                f"Step {steps} | Loss {float(loss.detach()):.6f} | "
                 f"VRAM {vram_gb:.2f}GB/{vram_reserved_gb:.2f}GB"
             )
-    
-    return total_loss / max(steps, 1)
+
+    return float((total_loss_t / max(steps, 1)).item())
 
 
 def _train_epoch_tensor(
@@ -1061,7 +1053,7 @@ def _train_epoch_tensor(
 
     num_batches = total_rows // batch_size
     batch_order = torch.randperm(num_batches).tolist()
-    total_loss = 0.0
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
 
     for batch_idx in batch_order:
@@ -1094,10 +1086,10 @@ def _train_epoch_tensor(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += float(loss.detach().cpu())
+        total_loss_t += loss.detach().float()
         steps += 1
 
-    return total_loss / max(steps, 1)
+    return float((total_loss_t / max(steps, 1)).item())
 
 
 def _eval_val_loss(
@@ -1114,7 +1106,8 @@ def _eval_val_loss(
     cash_symbol_mask: torch.Tensor | None = None,
 ) -> float:
     model.eval()
-    losses: list[float] = []
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    steps = 0
     with torch.inference_mode():
         for batch in loader:
             batch = _move_batch(batch, device, non_blocking)
@@ -1131,8 +1124,11 @@ def _eval_val_loss(
                     gamma_turnover=gamma_turnover,
                     cash_symbol_mask=cash_symbol_mask,
                 )
-            losses.append(float(loss.detach().cpu()))
-    return float(np.mean(losses)) if losses else float("inf")
+            total_loss_t += loss.detach().float()
+            steps += 1
+    if steps == 0:
+        return float("inf")
+    return float((total_loss_t / steps).item())
 
 
 def _collect_predictions(
@@ -1288,6 +1284,15 @@ def run_training(
     resume: bool = True,
 ) -> list[FoldResult]:
     device = _resolve_device(config)
+    model_name = str(getattr(config.model, "name", "mlp"))
+    model_params = dict(getattr(config.model, "params", {}) or {})
+    model_lookback = int(model_params.get("lookback", config.training.lookback))
+    model_width = int(
+        model_params.get(
+            "memory_hidden_dim",
+            model_params.get("hidden_dim", model_params.get("d_model", 128)),
+        )
+    )
     cash_symbol_mask = _cash_symbol_mask_from_symbols(panel.symbols)
     buy_fee_rate = float(getattr(config.trading, "buy_fee_rate", config.trading.fee_per_side))
     sell_fee_rate = float(getattr(config.trading, "sell_fee_rate", config.trading.fee_per_side))
@@ -1317,6 +1322,21 @@ def run_training(
         f"cuda_available={torch.cuda.is_available()} "
         f"num_gpus={torch.cuda.device_count()}"
     )
+    print(f"[runtime] model={model_name} lookback={model_lookback}")
+    if model_name.strip().lower() in {"portfolio_transformer", "portfolio_tf"}:
+        selected_backend = str(model_params.get("attention_backend", "auto"))
+        backend_source = str(model_params.get("attention_backend_source", "config"))
+        backend_ms = model_params.get("attention_backend_ms")
+        if isinstance(backend_ms, (int, float)):
+            print(
+                f"[runtime] portfolio_attention_backend={selected_backend} "
+                f"source={backend_source} ms={float(backend_ms):.6f}"
+            )
+        else:
+            print(
+                f"[runtime] portfolio_attention_backend={selected_backend} "
+                f"source={backend_source}"
+            )
     if device.type == "cuda":
         amp_mode = "tf32" if amp_dtype is None else str(amp_dtype).replace("torch.", "")
         print(
@@ -1356,7 +1376,7 @@ def run_training(
         print(f"{'='*80}")
 
         train_reference = group_folds[0]
-        train_ds = CrossSectionalDataset(panel, train_reference.train_indices, config.training.lookback)
+        train_ds = CrossSectionalDataset(panel, train_reference.train_indices, model_lookback)
         min_batch_size = max(1, config.training.min_batch_size)
         train_batch_used_bytes = 0
 
@@ -1365,42 +1385,38 @@ def run_training(
             margin_bytes = int(config.training.vram_safety_margin_gb * (1024 ** 3))
             effective_budget_bytes = max(0, budget_bytes - margin_bytes)
 
-            estimation_model = CrossSectionalMLP(
-                lookback=config.training.lookback,
+            estimation_model = build_model(
+                model_name=model_name,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
-                hidden_dim=config.training.hidden_dim,
-                dropout=config.training.dropout,
                 long_only=config.trading.long_only,
-                hidden_layers=config.training.hidden_layers,
+                model_params=model_params,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             eval_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=False)
             train_sample_bytes = _estimate_sample_bytes(
-                lookback=config.training.lookback,
+                lookback=model_lookback,
                 num_symbols=panel.num_symbols,
                 num_features=len(panel.feature_names),
-                hidden_dim=config.training.hidden_dim,
+                model_width=model_width,
                 amp_dtype=amp_dtype,
                 training_mode=True,
             )
             eval_sample_bytes = _estimate_sample_bytes(
-                lookback=config.training.lookback,
+                lookback=model_lookback,
                 num_symbols=panel.num_symbols,
                 num_features=len(panel.feature_names),
-                hidden_dim=config.training.hidden_dim,
+                model_width=model_width,
                 amp_dtype=amp_dtype,
                 training_mode=False,
             )
 
-            temp_model = CrossSectionalMLP(
-                lookback=config.training.lookback,
+            temp_model = build_model(
+                model_name=model_name,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
-                hidden_dim=config.training.hidden_dim,
-                dropout=config.training.dropout,
                 long_only=config.trading.long_only,
-                hidden_layers=config.training.hidden_layers,
+                model_params=model_params,
             ).to(device)
 
             print(f"[Train {train_years}] searching optimal train batch size...")
@@ -1414,7 +1430,26 @@ def run_training(
                 vram_budget_gb=config.training.vram_budget_gb,
                 vram_safety_margin_gb=config.training.vram_safety_margin_gb,
             )
-            train_batch_size = max(min_batch_size, train_batch_size)
+
+            safety_factor = float(getattr(config.training, "auto_batch_safety_factor", 0.8))
+            if config.training.enable_torch_compile:
+                safety_factor *= float(getattr(config.training, "compile_batch_safety_factor", 0.85))
+            safety_factor = min(1.0, max(0.1, safety_factor))
+
+            adjusted_batch_size = max(1, int(train_batch_size * safety_factor))
+            if adjusted_batch_size < train_batch_size:
+                print(
+                    f"[Train {train_years}] applying safety factor {safety_factor:.2f}: "
+                    f"batch {train_batch_size} -> {adjusted_batch_size}"
+                )
+            train_batch_size = adjusted_batch_size
+
+            if train_batch_size < min_batch_size:
+                print(
+                    f"[Train {train_years}] auto batch found {train_batch_size} < min_batch_size={min_batch_size}; "
+                    "using auto result to avoid VRAM overflow"
+                )
+            train_batch_size = max(1, train_batch_size)
         else:
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
 
@@ -1442,8 +1477,8 @@ def run_training(
         fold_contexts: dict[int, dict[str, object]] = {}
         for fold in pending_folds:
             print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
-            val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-            test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+            val_ds = CrossSectionalDataset(panel, fold.val_indices, model_lookback)
+            test_ds = CrossSectionalDataset(panel, fold.test_indices, model_lookback)
 
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
@@ -1495,14 +1530,12 @@ def run_training(
         for length in val_lengths:
             val_offsets.append(val_offsets[-1] + length)
 
-        model = CrossSectionalMLP(
-            lookback=config.training.lookback,
+        model = build_model(
+            model_name=model_name,
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
-            hidden_dim=config.training.hidden_dim,
-            dropout=config.training.dropout,
             long_only=config.trading.long_only,
-            hidden_layers=config.training.hidden_layers,
+            model_params=model_params,
         ).to(device)
         compiled_train_model: nn.Module = model
 
@@ -1570,8 +1603,9 @@ def run_training(
                 raise RuntimeError(f"Aggressive compile mode requested, but compile precheck failed: {reason}")
 
             try:
-                compiled_train_model = torch.compile(model, mode="max-autotune")
-                print(f"[Train {train_years}] torch.compile enabled (mode=max-autotune, {reason})")
+                compile_mode = str(getattr(config.training, "torch_compile_mode", "reduce-overhead"))
+                compiled_train_model = torch.compile(model, mode=compile_mode)
+                print(f"[Train {train_years}] torch.compile enabled (mode={compile_mode}, {reason})")
             except Exception as e:
                 raise RuntimeError(
                     f"Aggressive compile mode requested and compile failed. No eager fallback is allowed. Root cause: {e}"

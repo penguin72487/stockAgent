@@ -12,7 +12,11 @@ stockAgent/
 │   │   ├── panel.py            # 讀取 parquet，建立 features/returns/mask panel
 │   │   └── walkforward.py      # 年度 expanding-window fold 切分
 │   ├── models/
-│   │   └── mlp.py              # CrossSectionalMLP 模型
+│   │   ├── base.py             # 抽象模型介面與權重正規化
+│   │   ├── factory.py          # 模型工廠（由 config 選擇）
+│   │   ├── mlp.py              # CrossSectionalMLP（只看當日特徵）
+│   │   ├── portfolio_transformer.py # Portfolio Transformer 類模型
+│   │   └── temporal_cross_asset.py # 時間編碼 + 跨資產編碼模型
 │   ├── training/
 │   │   ├── dataset.py          # 訓練資料集與 collate
 │   │   ├── loss.py             # Sharpe-aware loss
@@ -25,7 +29,8 @@ stockAgent/
 │   └── evaluation/
 │       └── metrics.py          # IC 與統計指標
 ├── configs/
-│   └── experiment_baseline.yaml # 主要實驗設定
+│   ├── experiment_baseline.yaml # 主要實驗設定
+│   └── models/                  # 模型專屬超參數設定
 ├── train.py                    # 訓練入口
 ├── download_yahoo_tw_ohlcv.py  # 資料下載入口
 ├── data_parquet/               # 特徵資料與下載報表
@@ -50,7 +55,10 @@ stockAgent/
 | `stockagent/config.py` | 載入與標準化實驗設定 | YAML 檔案 | `ExperimentConfig` |
 | `stockagent/data/panel.py` | parquet 轉為密集張量與遮罩 | `data_parquet/*.parquet` | `PanelData` |
 | `stockagent/data/walkforward.py` | 年度擴張式資料切分 | `dates` | `WalkForwardFold[]` |
-| `stockagent/models/mlp.py` | 橫截面權重/分數預測 | `[B, L, S, F]` 特徵與 mask | 每日 symbol 權重 |
+| `stockagent/models/factory.py` | 依設定建立模型 | model name + model params | 可訓練模型實體 |
+| `stockagent/models/mlp.py` | 橫截面權重/分數預測（不看 lookback） | `[B, L, S, F]` 特徵與 mask | 每日 symbol 權重 |
+| `stockagent/models/portfolio_transformer.py` | Portfolio Transformer 類直出權重模型 | `[B, L, S, F]` 特徵與 mask | 每日 symbol 權重 |
+| `stockagent/models/temporal_cross_asset.py` | 時間+跨資產編碼 | `[B, L, S, F]` 特徵與 mask | 每日 symbol 權重 |
 | `stockagent/training/trainer.py` | 訓練、checkpoint、驗證、測試 | `PanelData`, folds, config | fold metrics, checkpoints |
 | `stockagent/backtest/simulator.py` | 報酬、換手、交易成本模擬 | weights, returns, tradable_mask | `BacktestResult` |
 | `stockagent/backtest/report.py` | 圖表與年度報告輸出 | 回測結果 | 圖檔、`annual_report.txt` |
@@ -76,7 +84,11 @@ README 最後更新日：2026-05-22
 
 ## 模型架構（詳細）
 
-目前主模型為 `stockagent/models/mlp.py` 的 `CrossSectionalMLP`，設計目標是一次處理同一天所有股票的橫截面決策。
+目前模型由 `stockagent/models/factory.py` 依 `configs/experiment_*.yaml` 的 `model` 區塊決定。
+
+- `mlp`：`CrossSectionalMLP`，只使用最新一天（當日）特徵做橫截面決策。
+- `portfolio_transformer`：先做每檔股票時間 Transformer，再做跨資產 Transformer + decoder attention，直接輸出投組權重。
+- `temporal_cross_asset`：先做單一股票時序編碼，再做跨資產注意力編碼。
 
 ### 輸入與輸出
 

@@ -1,0 +1,21 @@
+# [B, L, S, F] -> temporal encoder -> [B, S, D] -> cross-asset encoder -> [B, S]
+lookback: 20
+d_model: 128
+dropout: 0.1
+
+# Temporal encoder: tcn | gru | transformer (or small_transformer)
+temporal_encoder: gru
+temporal_layers: 2
+temporal_nhead: 4
+temporal_ff_dim: 256
+tcn_kernel_size: 3
+
+# Cross-asset encoder: transformer | set_transformer
+cross_asset_encoder: transformer
+cross_asset_layers: 2
+cross_asset_nhead: 4
+cross_asset_ff_dim: 256
+set_inducing_points: 16
+
+# Hint for VRAM estimator in trainer auto-batch mode
+memory_hidden_dim: 128

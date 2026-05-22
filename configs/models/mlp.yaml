@@ -1,0 +1,7 @@
+# MLP is intentionally cross-sectional only: no temporal lookback modeling.
+lookback: 1
+hidden_dim: 512
+hidden_layers: 2
+dropout: 0.1
+embedding_dim: 64
+memory_hidden_dim: 512
