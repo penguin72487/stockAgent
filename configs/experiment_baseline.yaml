@@ -36,7 +36,7 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  enable_torch_compile: false
+  enable_torch_compile: true
   lookback: 1
   batch_size: 2048
   batch_size_train: 2048
