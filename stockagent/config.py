@@ -41,6 +41,9 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     use_all_tradable_symbols: bool
+    backtest_rule: str = "day_trade"
+    lot_size: int = 1000
+    min_fee_per_side: float = 20.0
     buy_fee_rate: float = 0.0
     sell_fee_rate: float = 0.0
 
@@ -145,6 +148,36 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     evaluation.setdefault("gamma_turnover", 0.1)
 
     trading = raw.setdefault("trading", {})
+    trading.setdefault("backtest_rule", "day_trade")
+
+    rule_defaults = {
+        "day_trade": {
+            "lot_size": 1000,
+            "buy_fee_rate": 0.001425,
+            "sell_fee_rate": 0.002925,
+            "min_fee_per_side": 20.0,
+        },
+        "basic": {
+            "lot_size": 1,
+            "buy_fee_rate": 0.001425,
+            "sell_fee_rate": 0.004425,
+            "min_fee_per_side": 20.0,
+        },
+        "overnight": {
+            "lot_size": 1,
+            "buy_fee_rate": 0.001425,
+            "sell_fee_rate": 0.004425,
+            "min_fee_per_side": 20.0,
+        },
+    }
+    rule_name = str(trading.get("backtest_rule", "day_trade")).strip().lower().replace("-", "_")
+    if rule_name not in rule_defaults:
+        raise ValueError(
+            "Unknown trading.backtest_rule. Expected one of day_trade, basic, overnight; "
+            f"got {trading.get('backtest_rule')!r}"
+        )
+    trading["backtest_rule"] = rule_name
+    trading.update(rule_defaults[rule_name])
     trading.setdefault("buy_fee_rate", trading.get("fee_per_side", 0.0))
     trading.setdefault("sell_fee_rate", trading.get("fee_per_side", 0.0))
 

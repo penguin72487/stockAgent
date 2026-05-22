@@ -37,6 +37,9 @@ def sharpe_aware_loss(
     fee_per_side: float = 0.0,
     buy_fee_rate: float | None = None,
     sell_fee_rate: float | None = None,
+    backtest_rule: str = "day_trade",
+    min_fee_per_side: float = 20.0,
+    assumed_capital: float = 1_000_000.0,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
     cash_symbol_mask: Tensor | None = None,
@@ -49,6 +52,13 @@ def sharpe_aware_loss(
         buy_fee_rate = fee_per_side
     if sell_fee_rate is None:
         sell_fee_rate = fee_per_side
+
+    rule_name = str(backtest_rule).strip().lower().replace("-", "_")
+    if rule_name not in {"day_trade", "basic", "overnight"}:
+        raise ValueError(
+            "Unsupported backtest_rule for sharpe_aware_loss: "
+            f"{backtest_rule!r}"
+        )
 
     weights_f = weights.float()
     tradable_bool = tradable_mask.bool()
@@ -82,7 +92,22 @@ def sharpe_aware_loss(
 
     turnovers = (buy_turnover + sell_turnover).sum(dim=1)
     gross = (weights_history * returns).sum(dim=1)
-    net_returns = gross - buy_fee_rate * buy_turnover.sum(dim=1) - sell_fee_rate * sell_turnover.sum(dim=1)
+    buy_turnover_sum = buy_turnover.sum(dim=1)
+    sell_turnover_sum = sell_turnover.sum(dim=1)
+
+    buy_fee = buy_fee_rate * buy_turnover_sum
+    sell_fee = sell_fee_rate * sell_turnover_sum
+
+    if min_fee_per_side > 0.0:
+        fee_floor = torch.as_tensor(
+            min_fee_per_side / max(float(assumed_capital), 1.0),
+            device=weights.device,
+            dtype=weights_f.dtype,
+        )
+        buy_fee = torch.where(buy_turnover_sum > 0, torch.maximum(buy_fee, fee_floor), buy_fee)
+        sell_fee = torch.where(sell_turnover_sum > 0, torch.maximum(sell_fee, fee_floor), sell_fee)
+
+    net_returns = gross - buy_fee - sell_fee
 
     valid_count = sample_mask_f.sum().clamp_min(1.0)
 

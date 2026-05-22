@@ -94,10 +94,6 @@ README 最後更新日：2026-05-22
 
 - 輸入 `x` 形狀：`[B, lookback, S, F]`
 - 輸入 `tradable_mask` 形狀：`[B, S]`
-- 輸出 `weights` 形狀：`[B, S]`
-
-其中：
-
 - `B` = batch 內日期樣本數
 - `lookback` = 回看天數
 - `S` = 當日全市場 symbols 數量
@@ -152,6 +148,33 @@ Panel 由 `stockagent/data/panel.py` 建立，核心輸出：
 - `close_raw > 0`
 - `Trading_Volume > 0`
 - 報酬絕對值未超過風險閾值（極端值會被過濾）
+
+### 回測模式切換
+
+`configs/experiment_baseline.yaml` 的 `trading.backtest_rule` 可以切成三種模式：
+
+- 目前 `configs/experiment_baseline.yaml` 設定為 `basic`
+
+- `day_trade`
+	- 當沖，開盤買、收盤賣
+	- 只能買整數張，1 張 = 1000 股
+	- 買賣費率分別是 `0.1425%` / `0.2925%`
+	- 單邊最低手續費 `20` 元
+- `basic`
+	- 買股票使用當日 `close` 價格成交
+	- 收盤調整部位
+	- 可以買零股，採整股計算
+	- 買賣費率分別是 `0.1425%` / `0.4425%`
+	- 單邊最低手續費 `20` 元
+- `overnight`
+	- 收盤買、收盤調整部位
+	- 可以買零股，採整股計算
+	- 買入現金在 `T+2` 開盤前扣款，賣出現金在 `T+2` 收盤後入帳
+	- 若扣款日現金不足，回測直接判定破產
+	- 買賣費率分別是 `0.1425%` / `0.4425%`
+	- 單邊最低手續費 `20` 元
+
+訓練時的 `sharpe_aware_loss` 也會使用同一組買賣費率與最低手續費設定，避免 loss 與回測成本假設分離。
 
 ## 訓練流程（詳細）
 
@@ -223,12 +246,7 @@ Panel 由 `stockagent/data/panel.py` 建立，核心輸出：
 ### 測試（Test）
 
 - 測試指標完全 out-of-sample（各 fold 的 test years）
-- 回測交易假設（整股版）目前為：
-	- 初始資金：1,000,000
-	- 買入費率：`buy_fee_rate`
-	- 賣出費率：`sell_fee_rate`
-	- 單位：每手 1000 股
-	- 同日開盤買入、收盤平倉
+- 回測交易假設由 `trading.backtest_rule` 決定，並會同步套用到 loss
 
 ### 目前可直接執行的測試腳本
 

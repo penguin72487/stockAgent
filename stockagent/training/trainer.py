@@ -980,6 +980,8 @@ def _train_epoch(
     fee_per_side: float,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    backtest_rule: str,
+    min_fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
     cash_symbol_mask: torch.Tensor | None = None,
@@ -1001,6 +1003,8 @@ def _train_epoch(
                 fee_per_side=fee_per_side,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
+                backtest_rule=backtest_rule,
+                min_fee_per_side=min_fee_per_side,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
                 cash_symbol_mask=cash_symbol_mask,
@@ -1042,6 +1046,8 @@ def _train_epoch_tensor(
     fee_per_side: float,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    backtest_rule: str,
+    min_fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
     cash_symbol_mask: torch.Tensor | None = None,
@@ -1075,6 +1081,8 @@ def _train_epoch_tensor(
                 fee_per_side=fee_per_side,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
+                backtest_rule=backtest_rule,
+                min_fee_per_side=min_fee_per_side,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
                 cash_symbol_mask=cash_symbol_mask,
@@ -1101,6 +1109,8 @@ def _eval_val_loss(
     fee_per_side: float,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    backtest_rule: str,
+    min_fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
     cash_symbol_mask: torch.Tensor | None = None,
@@ -1120,6 +1130,8 @@ def _eval_val_loss(
                     fee_per_side=fee_per_side,
                     buy_fee_rate=buy_fee_rate,
                     sell_fee_rate=sell_fee_rate,
+                    backtest_rule=backtest_rule,
+                    min_fee_per_side=min_fee_per_side,
                     gamma_sharpe=gamma_sharpe,
                     gamma_turnover=gamma_turnover,
                     cash_symbol_mask=cash_symbol_mask,
@@ -1294,8 +1306,11 @@ def run_training(
         )
     )
     cash_symbol_mask = _cash_symbol_mask_from_symbols(panel.symbols)
+    backtest_rule = str(getattr(config.trading, "backtest_rule", "day_trade"))
     buy_fee_rate = float(getattr(config.trading, "buy_fee_rate", config.trading.fee_per_side))
     sell_fee_rate = float(getattr(config.trading, "sell_fee_rate", config.trading.fee_per_side))
+    lot_size = int(getattr(config.trading, "lot_size", 1000))
+    min_fee_per_side = float(getattr(config.trading, "min_fee_per_side", 20.0))
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     if config.environment.use_tensor_cores and device.type == "cuda":
@@ -1323,6 +1338,12 @@ def run_training(
         f"num_gpus={torch.cuda.device_count()}"
     )
     print(f"[runtime] model={model_name} lookback={model_lookback}")
+    print(
+        "[runtime] trading_rule="
+        f"{backtest_rule} lot_size={lot_size} "
+        f"buy_fee={buy_fee_rate:.6f} sell_fee={sell_fee_rate:.6f} "
+        f"min_fee={min_fee_per_side:.2f}"
+    )
     if model_name.strip().lower() in {"portfolio_transformer", "portfolio_tf"}:
         selected_backend = str(model_params.get("attention_backend", "auto"))
         backend_source = str(model_params.get("attention_backend_source", "config"))
@@ -1670,6 +1691,8 @@ def run_training(
                 fee_per_side=config.trading.fee_per_side,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
+                backtest_rule=backtest_rule,
+                min_fee_per_side=min_fee_per_side,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
                 cash_symbol_mask=cash_symbol_mask,
@@ -1704,6 +1727,8 @@ def run_training(
                     fee_per_side=config.trading.fee_per_side,
                     buy_fee_rate=buy_fee_rate,
                     sell_fee_rate=sell_fee_rate,
+                    backtest_rule=backtest_rule,
+                    min_fee_per_side=min_fee_per_side,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                     cash_symbol_mask=cash_symbol_mask,
@@ -1832,9 +1857,11 @@ def run_training(
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
+                backtest_rule=backtest_rule,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
-                lot_size=1000,
+                lot_size=lot_size,
+                min_fee_per_side=min_fee_per_side,
                 open_prices=test_open_prices,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
