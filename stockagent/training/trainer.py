@@ -25,6 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+CASH_SYMBOL_NAMES = {"CASH", "現金"}
+
 from stockagent.backtest.report import (
     compute_metrics,
     generate_annual_report,
@@ -85,6 +87,11 @@ class PredictionBufferPool:
         self.returns = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.float32)
         self.masks = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.bool)
         self.bench = torch.empty((self.capacity_rows,), dtype=torch.float32)
+
+
+def _cash_symbol_mask_from_symbols(symbols: list[str]) -> torch.Tensor:
+    normalized = [str(symbol).strip().upper() for symbol in symbols]
+    return torch.tensor([name in CASH_SYMBOL_NAMES for name in normalized], dtype=torch.bool)
 
 
 def _fold_dir(output_path: Path, fold_id: int) -> Path:
@@ -230,6 +237,19 @@ def _save_holdings_csv(
     """Save daily holdings detail sorted by holding ratio."""
     import pandas as pd  # already a transitive dependency
 
+    columns = [
+        "date",
+        "symbol",
+        "shares",
+        "price",
+        "market_value",
+        "holding_ratio",
+        "is_cash",
+        "traded_notional",
+        "buy_fee",
+        "sell_fee",
+    ]
+
     rows = [
         {
             "date": row.date,
@@ -239,13 +259,16 @@ def _save_holdings_csv(
             "market_value": float(row.market_value),
             "holding_ratio": float(row.holding_ratio),
             "is_cash": bool(row.is_cash),
+            "traded_notional": float(row.traded_notional),
+            "buy_fee": float(row.buy_fee),
+            "sell_fee": float(row.sell_fee),
         }
         for row in holdings
     ]
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=columns)
     if not df.empty:
         df = df.sort_values(["date", "holding_ratio", "symbol"], ascending=[True, False, True])
-    df.to_csv(output_path, index=False)
+    df.to_csv(output_path, index=False, columns=columns)
 
 
 def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarray]:
@@ -356,6 +379,7 @@ def _evaluate_tensor_batch(
     non_blocking: bool,
     fee_per_side: float,
     chunk_rows: int,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     total_rows = int(x.size(0))
@@ -383,7 +407,14 @@ def _evaluate_tensor_batch(
             masks_t[start:end].copy_(mask_chunk)
             bench_t[start:end].copy_(bench_chunk.float())
 
-        backtest = run_backtest_torch(weights_t, returns_t, masks_t, bench_t, fee_per_side)
+        backtest = run_backtest_torch(
+            weights_t,
+            returns_t,
+            masks_t,
+            bench_t,
+            fee_per_side,
+            cash_symbol_mask=cash_symbol_mask,
+        )
         ic = ic_summary(compute_ic_series_torch(weights_t, returns_t, masks_t).detach().cpu().numpy())
         metrics = _compute_metrics_from_tensors(
             backtest.strategy_returns,
@@ -945,6 +976,7 @@ def _train_epoch(
     fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -960,9 +992,10 @@ def _train_epoch(
                 weights,
                 batch["future_log_returns"],
                 batch["tradable_mask"],
-                fee_per_side,
+                fee_per_side=fee_per_side,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
+                cash_symbol_mask=cash_symbol_mask,
             )
         
         scaler.scale(loss).backward()
@@ -1009,6 +1042,7 @@ def _train_epoch_tensor(
     fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> float:
     model.train()
     total_rows = int(x.size(0))
@@ -1039,6 +1073,7 @@ def _train_epoch_tensor(
                 fee_per_side=fee_per_side,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
+                cash_symbol_mask=cash_symbol_mask,
             )
 
         scaler.scale(loss).backward()
@@ -1062,6 +1097,7 @@ def _eval_val_loss(
     fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> float:
     model.eval()
     losses: list[float] = []
@@ -1077,6 +1113,7 @@ def _eval_val_loss(
                     fee_per_side=fee_per_side,
                     gamma_sharpe=gamma_sharpe,
                     gamma_turnover=gamma_turnover,
+                    cash_symbol_mask=cash_symbol_mask,
                 )
             losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("inf")
@@ -1146,6 +1183,7 @@ def _evaluate_split_torch(
     non_blocking: bool,
     fee_per_side: float,
     buffers: PredictionBufferPool,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     weights, log_ret, masks, bench = _collect_predictions(
         model,
@@ -1155,7 +1193,14 @@ def _evaluate_split_torch(
         non_blocking,
         buffers,
     )
-    backtest = run_backtest_torch(weights, log_ret, masks, bench, fee_per_side)
+    backtest = run_backtest_torch(
+        weights,
+        log_ret,
+        masks,
+        bench,
+        fee_per_side,
+        cash_symbol_mask=cash_symbol_mask,
+    )
     ic = ic_summary(compute_ic_series_torch(weights, log_ret, masks).cpu().numpy())
     metrics = compute_metrics(backtest.to_numpy())
     return backtest, ic, metrics
@@ -1223,6 +1268,7 @@ def run_training(
     resume: bool = True,
 ) -> list[FoldResult]:
     device = _resolve_device(config)
+    cash_symbol_mask = _cash_symbol_mask_from_symbols(panel.symbols)
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     if config.environment.use_tensor_cores and device.type == "cuda":
@@ -1529,6 +1575,7 @@ def run_training(
                 fee_per_side=config.trading.fee_per_side,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
+                cash_symbol_mask=cash_symbol_mask,
             )
 
             val_backtest, _, _ = _evaluate_tensor_batch(
@@ -1542,6 +1589,7 @@ def run_training(
                 non_blocking,
                 config.trading.fee_per_side,
                 chunk_rows=eval_chunk_rows,
+                cash_symbol_mask=cash_symbol_mask,
             )
 
             val_losses: list[float] = []
@@ -1557,6 +1605,7 @@ def run_training(
                     fee_per_side=config.trading.fee_per_side,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    cash_symbol_mask=cash_symbol_mask,
                 )
                 val_loss = float(val_loss_tensor.detach().cpu())
                 val_losses.append(val_loss)
@@ -1614,6 +1663,7 @@ def run_training(
                 non_blocking,
                 config.trading.fee_per_side,
                 chunk_rows=eval_chunk_rows,
+                cash_symbol_mask=cash_symbol_mask,
             )
         if val_backtest is None:
             raise RuntimeError("Validation backtest is unavailable in eval stage.")
@@ -1649,6 +1699,7 @@ def run_training(
                 non_blocking,
                 config.trading.fee_per_side,
                 chunk_rows=eval_chunk_rows,
+                cash_symbol_mask=cash_symbol_mask,
             )
 
             start = val_offsets[index]
