@@ -272,6 +272,63 @@ def _dataset_to_tensors(dataset: CrossSectionalDataset) -> tuple[torch.Tensor, t
     return x, returns, masks, bench
 
 
+def _prepare_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
+    prepared = tensor.contiguous()
+    if pin_memory and prepared.device.type == "cpu" and not prepared.is_pinned():
+        prepared = prepared.pin_memory()
+    return prepared
+
+
+def _prepare_split_tensors(
+    x: torch.Tensor,
+    returns: torch.Tensor,
+    masks: torch.Tensor,
+    bench: torch.Tensor,
+    device: torch.device,
+    non_blocking: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    pin_memory = device.type == "cuda" and non_blocking
+    return (
+        _prepare_host_tensor(x, pin_memory),
+        _prepare_host_tensor(returns, pin_memory),
+        _prepare_host_tensor(masks, pin_memory),
+        _prepare_host_tensor(bench, pin_memory),
+    )
+
+
+def _pad_rows(tensor: torch.Tensor, target_rows: int, fill_value: int | float | bool = 0) -> torch.Tensor:
+    current_rows = int(tensor.size(0))
+    if current_rows >= target_rows:
+        return tensor
+
+    pad_shape = (target_rows - current_rows, *tensor.shape[1:])
+    padded = tensor.new_full(pad_shape, fill_value)
+    return torch.cat([tensor, padded], dim=0)
+
+
+def _pad_training_tensors(
+    x: torch.Tensor,
+    returns: torch.Tensor,
+    masks: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    total_rows = int(x.size(0))
+    if total_rows == 0:
+        return x, returns, masks, torch.empty((0,), dtype=torch.bool)
+
+    padded_rows = ((total_rows + batch_size - 1) // batch_size) * batch_size
+    sample_mask = torch.ones(total_rows, dtype=torch.bool)
+    if padded_rows == total_rows:
+        return x, returns, masks, sample_mask
+
+    return (
+        _pad_rows(x, padded_rows, 0),
+        _pad_rows(returns, padded_rows, 0.0),
+        _pad_rows(masks, padded_rows, False),
+        _pad_rows(sample_mask, padded_rows, False),
+    )
+
+
 def _combine_datasets_to_tensors(
     datasets: list[CrossSectionalDataset],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
@@ -304,6 +361,7 @@ def _evaluate_tensor_batch(
     benchmark: torch.Tensor,
     device: torch.device,
     amp_dtype: torch.dtype | None,
+    non_blocking: bool,
     fee_per_side: float,
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
@@ -315,10 +373,10 @@ def _evaluate_tensor_batch(
     with torch.inference_mode():
         for start in range(0, x.size(0), chunk_rows):
             end = min(start + chunk_rows, x.size(0))
-            x_chunk = x[start:end].to(device=device, non_blocking=True)
-            returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=True)
-            mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=True)
-            bench_chunk = benchmark[start:end].to(device=device, non_blocking=True)
+            x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
+            returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
+            mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
+            bench_chunk = benchmark[start:end].to(device=device, non_blocking=non_blocking)
             with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
@@ -497,17 +555,48 @@ def _autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
     return autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
 
 
+def _resolve_host_compilers() -> tuple[str | None, str | None]:
+    cc_candidates = [
+        os.environ.get("CC"),
+        "cc",
+        "gcc",
+        "clang",
+        "x86_64-conda-linux-gnu-cc",
+    ]
+    cxx_candidates = [
+        os.environ.get("CXX"),
+        "c++",
+        "g++",
+        "clang++",
+        "x86_64-conda-linux-gnu-c++",
+    ]
+
+    def _resolve(candidates: list[str | None]) -> str | None:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            resolved = candidate if os.path.isabs(candidate) else shutil.which(candidate)
+            if resolved:
+                return resolved
+        return None
+
+    return _resolve(cc_candidates), _resolve(cxx_candidates)
+
+
 def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
     """Return whether torch.compile is safe to enable in current environment."""
     if device.type != "cuda":
         return False, "torch.compile is only enabled for CUDA in this project"
 
     # Inductor+Triton on CUDA needs a host C compiler at runtime.
-    compiler = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
-    if not compiler:
-        return False, "no host C compiler found (set CC or install gcc/clang)"
+    cc, cxx = _resolve_host_compilers()
+    if not cc or not cxx:
+        return False, "no host C/C++ compiler found (set CC/CXX or install gcc/clang)"
 
-    return True, f"compiler={compiler}"
+    os.environ.setdefault("CC", cc)
+    os.environ.setdefault("CXX", cxx)
+
+    return True, f"CC={cc}, CXX={cxx}"
 
 
 def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
@@ -890,11 +979,13 @@ def _train_epoch_tensor(
     x: torch.Tensor,
     future_log_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     batch_size: int,
     device: torch.device,
     amp_dtype: torch.dtype | None,
+    non_blocking: bool,
     fee_per_side: float,
     gamma_sharpe: float,
     gamma_turnover: float,
@@ -904,16 +995,18 @@ def _train_epoch_tensor(
     if total_rows == 0:
         return 0.0
 
-    order = torch.randperm(total_rows)
+    num_batches = total_rows // batch_size
+    batch_order = torch.randperm(num_batches).tolist()
     total_loss = 0.0
     steps = 0
 
-    for start in range(0, total_rows, batch_size):
+    for batch_idx in batch_order:
+        start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
-        idx = order[start:end]
-        batch_x = x[idx].to(device=device, non_blocking=True)
-        batch_ret = future_log_returns[idx].to(device=device, non_blocking=True)
-        batch_mask = tradable_mask[idx].to(device=device, non_blocking=True)
+        batch_x = x[start:end].to(device=device, non_blocking=non_blocking)
+        batch_ret = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
+        batch_mask = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
+        batch_sample_mask = sample_mask[start:end].to(device=device, non_blocking=non_blocking)
 
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
@@ -922,7 +1015,8 @@ def _train_epoch_tensor(
                 weights,
                 batch_ret,
                 batch_mask,
-                fee_per_side,
+                sample_mask=batch_sample_mask,
+                fee_per_side=fee_per_side,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
@@ -1109,6 +1203,7 @@ def run_training(
     resume: bool = True,
 ) -> list[FoldResult]:
     device = _resolve_device(config)
+    non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     if config.environment.use_tensor_cores and device.type == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -1228,6 +1323,24 @@ def run_training(
 
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
         train_x, train_returns, train_masks, _ = _dataset_to_tensors(train_ds)
+        train_x, train_returns, train_masks, train_sample_mask = _pad_training_tensors(
+            train_x,
+            train_returns,
+            train_masks,
+            train_batch_size,
+        )
+        train_x, train_returns, train_masks, _ = _prepare_split_tensors(
+            train_x,
+            train_returns,
+            train_masks,
+            torch.empty(0),
+            device,
+            non_blocking,
+        )
+        train_sample_mask = _prepare_host_tensor(
+            train_sample_mask,
+            pin_memory=(device.type == "cuda" and non_blocking),
+        )
 
         fold_contexts: dict[int, dict[str, object]] = {}
         for fold in pending_folds:
@@ -1273,6 +1386,14 @@ def run_training(
         combined_val_x, combined_val_returns, combined_val_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
             val_datasets,  # type: ignore[arg-type]
         )
+        combined_val_x, combined_val_returns, combined_val_masks, combined_val_bench = _prepare_split_tensors(
+            combined_val_x,
+            combined_val_returns,
+            combined_val_masks,
+            combined_val_bench,
+            device,
+            non_blocking,
+        )
         val_offsets: list[int] = [0]
         for length in val_lengths:
             val_offsets.append(val_offsets[-1] + length)
@@ -1285,17 +1406,7 @@ def run_training(
             dropout=config.training.dropout,
             hidden_layers=config.training.hidden_layers,
         ).to(device)
-
-        if config.training.enable_torch_compile and hasattr(torch, "compile"):
-            can_compile, reason = _can_enable_torch_compile(device)
-            if can_compile:
-                try:
-                    model = torch.compile(model, mode="reduce-overhead")
-                    print(f"[Train {train_years}] torch.compile enabled (mode=reduce-overhead, {reason})")
-                except Exception as e:
-                    print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
-            else:
-                print(f"[Train {train_years}] torch.compile skipped: {reason}")
+        compiled_train_model: nn.Module = model
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -1351,6 +1462,17 @@ def run_training(
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
+        if config.training.enable_torch_compile and hasattr(torch, "compile"):
+            can_compile, reason = _can_enable_torch_compile(device)
+            if can_compile:
+                try:
+                    compiled_train_model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+                    print(f"[Train {train_years}] torch.compile enabled (mode=max-autotune-no-cudagraphs, {reason})")
+                except Exception as e:
+                    print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
+            else:
+                print(f"[Train {train_years}] torch.compile skipped: {reason}")
+
         epoch_pbar = tqdm(
             range(start_epoch, config.training.epochs + 1),
             desc=f"Train {train_years} Epochs",
@@ -1360,15 +1482,17 @@ def run_training(
         val_backtest: BacktestResultTensor | None = None
         for epoch in epoch_pbar:
             train_loss = _train_epoch_tensor(
-                model,
+                compiled_train_model,
                 train_x,
                 train_returns,
                 train_masks,
+                train_sample_mask,
                 optimizer,
                 scaler,
                 batch_size=train_batch_size,
                 device=device,
                 amp_dtype=amp_dtype,
+                non_blocking=non_blocking,
                 fee_per_side=config.trading.fee_per_side,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
@@ -1382,6 +1506,7 @@ def run_training(
                 combined_val_bench,
                 device,
                 amp_dtype,
+                non_blocking,
                 config.trading.fee_per_side,
                 chunk_rows=eval_chunk_rows,
             )
@@ -1390,8 +1515,8 @@ def run_training(
             for index, (fold_id, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
-                val_returns_slice = combined_val_returns[start:end].to(device=device, non_blocking=True)
-                val_masks_slice = combined_val_masks[start:end].to(device=device, non_blocking=True)
+                val_returns_slice = combined_val_returns[start:end].to(device=device, non_blocking=non_blocking)
+                val_masks_slice = combined_val_masks[start:end].to(device=device, non_blocking=non_blocking)
                 val_loss_tensor = sharpe_aware_loss(
                     val_backtest.weights_history[start:end],
                     val_returns_slice,
@@ -1453,6 +1578,7 @@ def run_training(
                 combined_val_bench,
                 device,
                 amp_dtype,
+                non_blocking,
                 config.trading.fee_per_side,
                 chunk_rows=eval_chunk_rows,
             )
@@ -1471,6 +1597,14 @@ def run_training(
                 best_val_loss = float(context["best_val_loss"])
 
             test_x, test_returns, test_masks, test_bench = _dataset_to_tensors(context["test_ds"])
+            test_x, test_returns, test_masks, test_bench = _prepare_split_tensors(
+                test_x,
+                test_returns,
+                test_masks,
+                test_bench,
+                device,
+                non_blocking,
+            )
             test_bt_t, test_ic, _ = _evaluate_tensor_batch(
                 model,
                 test_x,
@@ -1479,6 +1613,7 @@ def run_training(
                 test_bench,
                 device,
                 amp_dtype,
+                non_blocking,
                 config.trading.fee_per_side,
                 chunk_rows=eval_chunk_rows,
             )
@@ -1489,8 +1624,8 @@ def run_training(
             val_ic = ic_summary(
                 compute_ic_series_torch(
                     val_backtest.weights_history[start:end],
-                    combined_val_returns[start:end].to(device=device, non_blocking=True),
-                    combined_val_masks[start:end].to(device=device, non_blocking=True),
+                    combined_val_returns[start:end].to(device=device, non_blocking=non_blocking),
+                    combined_val_masks[start:end].to(device=device, non_blocking=non_blocking),
                 ).cpu().numpy()
             )
             val_met = _compute_metrics_from_tensors(

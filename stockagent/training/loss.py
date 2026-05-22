@@ -33,18 +33,25 @@ def sharpe_aware_loss(
     weights: Tensor,
     future_log_returns: Tensor,
     tradable_mask: Tensor,
+    sample_mask: Tensor | None = None,
     fee_per_side: float = 0.0,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
 ) -> Tensor:
     """Improved Sharpe-aware loss with numerically stable gradient flow."""
     mask_f = tradable_mask.to(dtype=weights.dtype)
+    if sample_mask is None:
+        sample_mask_f = torch.ones(weights.size(0), device=weights.device, dtype=weights.dtype)
+    else:
+        sample_mask_f = sample_mask.to(device=weights.device, dtype=weights.dtype)
+
     masked_weights = weights * mask_f
     weight_sum = masked_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
     normalized_weights = masked_weights / weight_sum
 
     returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
     gross_returns = (normalized_weights * returns).sum(dim=1)
+    valid_count = sample_mask_f.sum().clamp_min(1.0)
 
     # Turnover cost
     prev_weights = torch.cat(
@@ -52,13 +59,14 @@ def sharpe_aware_loss(
         dim=0,
     )
     turnover = (normalized_weights - prev_weights).abs().sum(dim=1)
-    turnover_cost = (turnover * fee_per_side).mean()
+    turnover_cost = ((turnover * sample_mask_f).sum() * fee_per_side) / valid_count
 
     # ✅ FIXED: Improved Sharpe with stable gradients
     # Epsilon is added inside the square root to prevent gradient explosion
-    mean_return = gross_returns.mean()
-    centered = gross_returns - mean_return
-    variance = (centered ** 2).mean()
+    masked_returns = gross_returns * sample_mask_f
+    mean_return = masked_returns.sum() / valid_count
+    centered = (gross_returns - mean_return) * sample_mask_f
+    variance = (centered ** 2).sum() / valid_count
     
     eps = 1e-8
     std_return = torch.sqrt(variance + eps)  # Epsilon inside sqrt for stable gradients

@@ -99,27 +99,23 @@ class CrossSectionalMLP(nn.Module):
         Returns:
             weights: [B, S]
         """
-        B, lookback, S, F = x.shape
-        x = x.permute(0, 2, 1, 3)  # [B, S, lookback, F]
-        x = x.reshape(B * S, lookback, F)  # [B*S, lookback, F]
-        
-        # Feature embedding
-        x = self.feature_embedding(x)  # [B*S, lookback, embedding_dim]
-        
-        # ✅ OPTIMIZATION: Conditional processing based on lookback
-        if self.use_transformer:
+        if not self.use_transformer:
+            x = x[:, 0, :, :]  # [B, S, F]
+            x = self.feature_embedding(x)  # [B, S, embedding_dim]
+            logits = self.portfolio_head(x).squeeze(-1)  # [B, S]
+        else:
+            B, lookback, S, F = x.shape
+            x = x.permute(0, 2, 1, 3).flatten(0, 1)  # [B*S, lookback, F]
+
+            # Feature embedding
+            x = self.feature_embedding(x)  # [B*S, lookback, embedding_dim]
+
             # Transformer (flash-attn v2 for speed and memory efficiency)
             output = self.transformer(inputs_embeds=x, return_dict=True)
-            x = output.last_hidden_state  # [B*S, lookback, embedding_dim]
-            # Pool: take last timestep
-            x = x[:, -1, :]  # [B*S, embedding_dim]
-        else:
-            # For lookback=1, just take the single timestep
-            x = x[:, 0, :]  # [B*S, embedding_dim]
-        
-        # Portfolio scoring
-        logits = self.portfolio_head(x).squeeze(-1)  # [B*S]
-        logits = logits.reshape(B, S)
+            x = output.last_hidden_state[:, -1, :]  # [B*S, embedding_dim]
+
+            # Portfolio scoring
+            logits = self.portfolio_head(x).squeeze(-1).view(B, S)  # [B, S]
         
         # Apply softmax with mask
         if tradable_mask is not None:
