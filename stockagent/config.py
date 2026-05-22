@@ -53,6 +53,8 @@ class TrainingConfig:
     non_blocking_transfer: bool
     enable_torch_compile: bool = False
     torch_compile_mode: str = "reduce-overhead"
+    compile_max_autotune_gemm: str = "auto"
+    compile_autotune_min_sms: int = 80
     chunk_rows: int = 0
     lookback: int = 1
     batch_size: int = 32
@@ -60,6 +62,7 @@ class TrainingConfig:
     batch_size_eval: int = 32
     min_batch_size: int = 1
     auto_batch_size: bool = False
+    batch_safety_factor: float = 0.8
     auto_batch_safety_factor: float = 0.8
     compile_batch_safety_factor: float = 0.85
     vram_budget_gb: float = 8.0
@@ -116,10 +119,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("batch_size_eval", training.get("batch_size", 32))
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
+    training.setdefault("batch_safety_factor", training.get("auto_batch_safety_factor", 0.8))
     training.setdefault("auto_batch_safety_factor", 0.8)
     training.setdefault("compile_batch_safety_factor", 0.85)
     training.setdefault("enable_torch_compile", False)
     training.setdefault("torch_compile_mode", "reduce-overhead")
+    training.setdefault("compile_max_autotune_gemm", "auto")
+    training.setdefault("compile_autotune_min_sms", 80)
     training.setdefault("chunk_rows", 0)
     training.setdefault("vram_budget_gb", 8.0)
     training.setdefault("vram_safety_margin_gb", 1.0)
