@@ -566,6 +566,7 @@ def _simulate_basic_backtest(
     turnovers = np.zeros(t_len, dtype=np.float32)
     stock_weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
     records: list[HoldingsRecord] = []
+    prev_day_equity = float(initial_capital)
 
     for t in range(t_len):
         close_price = close_matrix[t]
@@ -579,8 +580,8 @@ def _simulate_basic_backtest(
             target_w /= gross_exposure
 
         current_value = positions.astype(np.float64) * close_price
-        equity_before = max(float(cash + current_value.sum()), 1e-12)
-        desired_value = equity_before * target_w
+        equity_before_trade = max(float(cash + current_value.sum()), 1e-12)
+        desired_value = equity_before_trade * target_w
 
         target_shares = np.zeros(n_symbols, dtype=np.int64)
         valid = (close_price > 1e-12) & (desired_value > 0.0)
@@ -600,11 +601,12 @@ def _simulate_basic_backtest(
         cash = cash - buy_notional - buy_fee + sell_notional - sell_fee
         positions = target_shares
         market_value = positions.astype(np.float64) * close_price
-        nav_end = max(cash + market_value.sum(), 1e-12)
+        nav_end = max(float(cash + market_value.sum()), 1e-12)
 
-        stock_weights_history[t] = (market_value / equity_before).astype(np.float32)
-        turnovers[t] = float((buy_notional + sell_notional) / equity_before)
-        strategy_returns[t] = np.float32(np.log(nav_end / equity_before))
+        stock_weights_history[t] = (market_value / nav_end).astype(np.float32)
+        turnovers[t] = float((buy_notional + sell_notional) / max(prev_day_equity, 1e-12))
+        strategy_returns[t] = np.float32(np.log(nav_end / max(prev_day_equity, 1e-12)))
+        prev_day_equity = nav_end
 
         records.append(
             HoldingsRecord(
@@ -613,14 +615,14 @@ def _simulate_basic_backtest(
                 shares=int(_floor_to_int64(cash, non_negative=True).item()),
                 price=1.0,
                 market_value=float(cash),
-                holding_ratio=1.0 if cash > 0.0 else 0.0,
+                holding_ratio=float(cash / nav_end) if cash > 0.0 else 0.0,
                 is_cash=True,
             )
         )
 
         traded_idx = np.flatnonzero(delta_shares != 0)
         if traded_idx.size > 0:
-            denom = max(equity_before, 1e-12)
+            denom = max(nav_end, 1e-12)
             for idx in traded_idx.tolist():
                 shares_i = int(delta_shares[idx])
                 notional_i = float(abs(shares_i) * close_price[idx])

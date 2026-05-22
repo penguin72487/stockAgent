@@ -30,7 +30,11 @@ def main() -> None:
             "but torch.cuda.is_available() is False. "
             "Please run on a GPU-enabled environment."
         )
-    panel = build_panel(config.data.parquet_root, use_rapids=config.data.use_rapids)
+    panel = build_panel(
+        config.data.parquet_root,
+        use_rapids=config.data.use_rapids,
+        include_next_open_feature=(str(config.trading.backtest_rule).strip().lower().replace("-", "_") != "basic"),
+    )
     folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,

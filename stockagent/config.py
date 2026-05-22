@@ -177,7 +177,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             f"got {trading.get('backtest_rule')!r}"
         )
     trading["backtest_rule"] = rule_name
-    trading.update(rule_defaults[rule_name])
+    for key, value in rule_defaults[rule_name].items():
+        trading.setdefault(key, value)
     trading.setdefault("buy_fee_rate", trading.get("fee_per_side", 0.0))
     trading.setdefault("sell_fee_rate", trading.get("fee_per_side", 0.0))
 
