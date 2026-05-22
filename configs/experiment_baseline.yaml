@@ -8,7 +8,7 @@ environment:
   conda_env: fintech
   device: cuda
   use_tensor_cores: true
-  amp_dtype: tf32
+  amp_dtype: bf16
   target_vram_fraction: 0.85
 
 data:
@@ -33,29 +33,40 @@ trading:
   cash_allowed: true
   use_all_tradable_symbols: true
 
+# model:
+#   name: mlp
+#   config_path: models/mlp.yaml
+
+# model:
+#   name: temporal_cross_asset
+#   config_path: models/temporal_cross_asset.yaml
+
+model:
+  name: portfolio_transformer
+  config_path: models/portfolio_transformer.yaml
+
 training:
   backend: pytorch
   target: daily_return
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   enable_torch_compile: true
-  lookback: 1
+  torch_compile_mode: reduce-overhead
   batch_size: 2048
   batch_size_train: 2048
   batch_size_eval: 2048
   epochs: 1000
   learning_rate: 0.001
-  hidden_dim: 512
-  hidden_layers: 2
-  dropout: 0.1
   num_workers: 16
   weight_decay: 0.00001
   loss_type: sharpe
-  min_batch_size: 32
+  min_batch_size: 1
   auto_batch_size: true
+  auto_batch_safety_factor: 0.75
+  compile_batch_safety_factor: 0.8
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
-  target_vram_fraction: 1
+  target_vram_fraction: 0.9
 
 evaluation:
   primary_baseline: universe_average_return

@@ -3,8 +3,6 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from stockagent.backtest.simulator import run_backtest_torch
-
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
     mask_f = mask.to(dtype=predictions.dtype)
@@ -43,33 +41,49 @@ def sharpe_aware_loss(
     gamma_turnover: float = 0.1,
     cash_symbol_mask: Tensor | None = None,
 ) -> Tensor:
-    """Sharpe-aware loss built from the same continuous backtest path used in evaluation."""
+    """Vectorized Sharpe-aware loss with transaction costs on GPU.
+
+    This path avoids creating backtest container objects in each train step.
+    """
     if buy_fee_rate is None:
         buy_fee_rate = fee_per_side
     if sell_fee_rate is None:
         sell_fee_rate = fee_per_side
 
-    mask_f = tradable_mask.to(dtype=weights.dtype)
+    weights_f = weights.float()
+    tradable_bool = tradable_mask.bool()
+
     if sample_mask is None:
-        sample_mask_f = torch.ones(weights.size(0), device=weights.device, dtype=weights.dtype)
+        sample_mask_f = torch.ones(weights.size(0), device=weights.device, dtype=weights_f.dtype)
     else:
-        sample_mask_f = sample_mask.to(device=weights.device, dtype=weights.dtype)
+        sample_mask_f = sample_mask.to(device=weights.device, dtype=weights_f.dtype)
 
-    returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
-    benchmark = torch.zeros(weights.size(0), device=weights.device, dtype=weights.dtype)
-    backtest = run_backtest_torch(
-        weights=weights,
-        future_returns=returns,
-        tradable_mask=tradable_mask,
-        benchmark_returns=benchmark,
-        fee_per_side=fee_per_side,
-        buy_fee_rate=buy_fee_rate,
-        sell_fee_rate=sell_fee_rate,
-        cash_symbol_mask=cash_symbol_mask,
-    )
+    returns = torch.nan_to_num(future_log_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
-    net_returns = backtest.strategy_returns.to(dtype=weights.dtype)
-    turnovers = backtest.turnovers.to(dtype=weights.dtype)
+    weights_history = weights_f.masked_fill(~tradable_bool, 0.0)
+    denom = weights_history.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
+    weights_history = weights_history / denom
+
+    prev = torch.cat([torch.zeros_like(weights_history[:1]), weights_history[:-1]], dim=0)
+    delta = weights_history - prev
+    buy_turnover = torch.relu(delta)
+    sell_turnover = torch.relu(-delta)
+
+    if cash_symbol_mask is not None:
+        cash_mask = cash_symbol_mask.to(device=weights_history.device, dtype=torch.bool)
+        if cash_mask.ndim != 1 or cash_mask.numel() != weights_history.size(1):
+            raise ValueError(
+                "cash_symbol_mask shape must match num_symbols: "
+                f"expected ({weights_history.size(1)},), got {tuple(cash_mask.shape)}"
+            )
+        mask_view = cash_mask.unsqueeze(0)
+        buy_turnover = buy_turnover.masked_fill(mask_view, 0.0)
+        sell_turnover = sell_turnover.masked_fill(mask_view, 0.0)
+
+    turnovers = (buy_turnover + sell_turnover).sum(dim=1)
+    gross = (weights_history * returns).sum(dim=1)
+    net_returns = gross - buy_fee_rate * buy_turnover.sum(dim=1) - sell_fee_rate * sell_turnover.sum(dim=1)
+
     valid_count = sample_mask_f.sum().clamp_min(1.0)
 
     turnover_penalty = ((turnovers * sample_mask_f).sum()) / valid_count
@@ -81,7 +95,7 @@ def sharpe_aware_loss(
 
     eps = 1e-8
     std_return = torch.sqrt(variance + eps)
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights.dtype))
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights_f.dtype))
 
     sharpe = mean_return / std_return * annualizer
 

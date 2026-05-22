@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,7 @@ class TrainingConfig:
     batch_mode: str
     non_blocking_transfer: bool
     enable_torch_compile: bool = False
+    torch_compile_mode: str = "reduce-overhead"
     chunk_rows: int = 0
     lookback: int = 1
     batch_size: int = 32
@@ -58,6 +60,8 @@ class TrainingConfig:
     batch_size_eval: int = 32
     min_batch_size: int = 1
     auto_batch_size: bool = False
+    auto_batch_safety_factor: float = 0.8
+    compile_batch_safety_factor: float = 0.85
     vram_budget_gb: float = 8.0
     vram_safety_margin_gb: float = 1.0
     target_vram_fraction: float = 1
@@ -81,6 +85,13 @@ class EvaluationConfig:
 
 
 @dataclass(slots=True)
+class ModelConfig:
+    name: str = "mlp"
+    config_path: str = ""
+    params: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
 class ExperimentConfig:
     experiment_name: str
     environment: EnvironmentConfig
@@ -89,6 +100,7 @@ class ExperimentConfig:
     trading: TradingConfig
     training: TrainingConfig
     evaluation: EvaluationConfig
+    model: ModelConfig
 
 
 def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
@@ -104,7 +116,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("batch_size_eval", training.get("batch_size", 32))
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
+    training.setdefault("auto_batch_safety_factor", 0.8)
+    training.setdefault("compile_batch_safety_factor", 0.85)
     training.setdefault("enable_torch_compile", False)
+    training.setdefault("torch_compile_mode", "reduce-overhead")
     training.setdefault("chunk_rows", 0)
     training.setdefault("vram_budget_gb", 8.0)
     training.setdefault("vram_safety_margin_gb", 1.0)
@@ -129,14 +144,128 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", True)
+
+    model = raw.setdefault("model", {})
+    model.setdefault("name", "mlp")
+    model.setdefault("config_path", "")
+    model.setdefault("params", {})
     return raw
 
 
+def _load_model_params(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    model_section = raw.setdefault("model", {})
+    model_name = str(model_section.get("name", "mlp"))
+    model_params = dict(model_section.get("params", {}) or {})
+    external_path = str(model_section.get("config_path", "") or "")
+
+    if not external_path:
+        default_path = config_path.parent / "models" / f"{model_name}.yaml"
+        if default_path.exists():
+            external_path = str(default_path)
+
+    if external_path:
+        resolved = Path(external_path)
+        if not resolved.is_absolute():
+            resolved = (config_path.parent / resolved).resolve()
+        with resolved.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"Model config must be a mapping: {resolved}")
+        model_params = {**loaded, **model_params}
+        model_section["config_path"] = str(resolved)
+
+    if model_name in {"portfolio_transformer", "portfolio_tf"}:
+        model_params = _apply_portfolio_backend_report(
+            model_params=model_params,
+            config_path=config_path,
+        )
+
+    model_section["params"] = model_params
+    return raw
+
+
+def _resolve_report_path(report_path: str, config_path: Path) -> Path | None:
+    candidate = Path(report_path)
+    candidates: list[Path] = []
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        # Common layouts:
+        # - config under configs/, report under artifacts/
+        # - direct execution from workspace root
+        candidates.append((config_path.parent / candidate).resolve())
+        candidates.append((config_path.parent.parent / candidate).resolve())
+        candidates.append((Path.cwd() / candidate).resolve())
+
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def _apply_portfolio_backend_report(model_params: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    params = dict(model_params)
+    requested_backend = str(params.get("attention_backend", "auto")).lower()
+    auto_select = bool(params.get("auto_select_backend_from_report", True))
+    if requested_backend != "auto" or not auto_select:
+        params.setdefault("attention_backend_source", "config")
+        return params
+
+    report_ref = str(params.get("acceleration_report_path", "artifacts/acceleration_report.json"))
+    report_path = _resolve_report_path(report_ref, config_path)
+    if report_path is None:
+        params.setdefault("attention_backend_source", f"auto(no-report:{report_ref})")
+        return params
+
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:
+        params.setdefault("attention_backend_source", f"auto(report-read-failed:{report_path})")
+        return params
+
+    checks = payload.get("checks", [])
+    if not isinstance(checks, list):
+        params.setdefault("attention_backend_source", f"auto(report-invalid:{report_path})")
+        return params
+
+    best_backend: str | None = None
+    best_ms: float | None = None
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", ""))
+        if not name.startswith("portfolio_backend:"):
+            continue
+        backend = name.split(":", 1)[1].strip().lower()
+        if backend == "auto":
+            continue
+        if not bool(item.get("ok", False)):
+            continue
+        ms = item.get("ms")
+        if not isinstance(ms, (int, float)):
+            continue
+        ms_value = float(ms)
+        if best_ms is None or ms_value < best_ms:
+            best_ms = ms_value
+            best_backend = backend
+
+    if best_backend is None:
+        params.setdefault("attention_backend_source", f"auto(no-usable-check:{report_path})")
+        return params
+
+    params["attention_backend"] = best_backend
+    params["attention_backend_source"] = f"report:{report_path}"
+    params["attention_backend_ms"] = best_ms
+    return params
+
+
 def load_config(path: str | Path) -> ExperimentConfig:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle)
 
     raw = _merge_defaults(raw)
+    raw = _load_model_params(raw, config_path.resolve())
     return ExperimentConfig(
         experiment_name=raw["experiment_name"],
         environment=EnvironmentConfig(**raw["environment"]),
@@ -145,4 +274,5 @@ def load_config(path: str | Path) -> ExperimentConfig:
         trading=TradingConfig(**raw["trading"]),
         training=TrainingConfig(**raw["training"]),
         evaluation=EvaluationConfig(**raw["evaluation"]),
+        model=ModelConfig(**raw["model"]),
     )

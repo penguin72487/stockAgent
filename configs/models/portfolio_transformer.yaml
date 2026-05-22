@@ -1,0 +1,24 @@
+# Portfolio Transformer style direct allocation model
+# [B, L, S, F] -> time Transformer -> cross-asset Transformer -> decoder attention -> [B, S]
+lookback: 20
+d_model: 128
+dropout: 0.1
+
+time_layers: 2
+time_nhead: 4
+time_ff_dim: 256
+
+cross_layers: 2
+cross_nhead: 4
+cross_ff_dim: 256
+
+decoder_queries: 4
+max_time_batch: 32768
+attention_backend: auto  # auto | sdpa | xformers | flash_attn_2
+auto_select_backend_from_report: true
+acceleration_report_path: artifacts/acceleration_report.json
+use_transformer_engine: false
+use_fp8: false
+
+# Hint for auto-batch memory estimator
+memory_hidden_dim: 128
