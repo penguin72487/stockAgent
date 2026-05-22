@@ -65,4 +65,4 @@ evaluation:
     - turnover
     - excess_return_vs_universe_average
   gamma_sharpe: 1.0
-  gamma_turnover: 0.1
+  gamma_turnover: 0.0

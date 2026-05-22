@@ -75,7 +75,7 @@ class EvaluationConfig:
     primary_baseline: str
     metrics: list[str]
     gamma_sharpe: float = 1.0
-    gamma_turnover: float = 0.1
+    gamma_turnover: float = 0.0
 
 
 @dataclass(slots=True)
@@ -119,7 +119,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)
-    evaluation.setdefault("gamma_turnover", 0.1)
+    evaluation.setdefault("gamma_turnover", 0.0)
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", True)

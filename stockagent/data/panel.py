@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 7
+PANEL_CACHE_VERSION = 8
 
 
 @dataclass(slots=True)
@@ -144,14 +144,15 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
     tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
     alive_mask[row_idx, sym_idx] = frame_all["close"].notna().to_numpy(dtype=bool, copy=False)
 
-    n_tradable = tradable_mask.sum(axis=1)
-    sum_ret = np.nansum(np.where(tradable_mask, returns_1d, 0.0), axis=1)
+    valid_returns = np.isfinite(returns_1d)
+    n_valid = valid_returns.sum(axis=1)
+    sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
     benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
     np.divide(
         sum_ret,
-        n_tradable,
+        n_valid,
         out=benchmark_returns,
-        where=n_tradable > 0,
+        where=n_valid > 0,
     )
 
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
@@ -199,7 +200,13 @@ def _compute_source_hash(paths: list[Path]) -> str:
     return hasher.hexdigest()
 
 
-def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, source_hash: str) -> None:
+def _save_panel_cache(
+    cache_path: Path,
+    meta_path: Path,
+    panel: PanelData,
+    source_hash: str,
+    backend_key: str,
+) -> None:
     np.savez_compressed(
         cache_path,
         dates=panel.dates,
@@ -216,6 +223,7 @@ def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, sourc
     meta = {
         'version': PANEL_CACHE_VERSION,
         'source_hash': source_hash,
+        'backend_key': backend_key,
         'num_dates': panel.num_dates,
         'num_symbols': panel.num_symbols,
     }
@@ -243,7 +251,7 @@ def _print_feature_overview(panel: PanelData) -> None:
     print(f"[panel] features ({len(panel.feature_names)}): {feature_list}")
 
 
-def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
+def _check_cache_valid(meta_path: Path, parquet_paths: list[Path], backend_key: str) -> bool:
     """Check if cache is valid based on source hash and mtime."""
     if not meta_path.exists():
         return False
@@ -256,7 +264,8 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path]) -> bool:
         expected_hash = _compute_source_hash(parquet_paths)
         cache_valid = (
             meta.get('source_hash') == expected_hash and 
-            meta.get('version') == PANEL_CACHE_VERSION
+            meta.get('version') == PANEL_CACHE_VERSION and
+            meta.get('backend_key') == backend_key
         )
         
         if cache_valid:
@@ -281,18 +290,19 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
 
     cache_path = _panel_cache_path(parquet_root)
     meta_path = _cache_meta_path(parquet_root)
+
+    env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
+    use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
+    backend_key = "cudf" if use_cudf else "pandas"
     
     # Check cache validity
-    if _check_cache_valid(meta_path, parquet_paths):
+    if _check_cache_valid(meta_path, parquet_paths, backend_key):
         print(f"[panel] loading cache (valid): {cache_path}")
         panel = _load_panel_cache(cache_path)
         _print_feature_overview(panel)
         return panel
 
     print(f"[panel] building from {len(parquet_paths)} parquet files...")
-
-    env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
-    use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
     if use_cudf:
         try:
             symbol_frames_cudf: list[pd.DataFrame] = []
@@ -309,12 +319,13 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
                 frame_all_cudf = pd.concat(symbol_frames_cudf, ignore_index=True)
                 panel = _build_panel_from_frame(frame_all_cudf, symbols_cudf)
                 source_hash = _compute_source_hash(parquet_paths)
-                _save_panel_cache(cache_path, meta_path, panel, source_hash)
+                _save_panel_cache(cache_path, meta_path, panel, source_hash, backend_key)
                 print(f"[panel] cache saved: {cache_path} (cuDF path)")
                 _print_feature_overview(panel)
                 return panel
         except Exception as exc:
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
+            backend_key = "pandas"
     
     symbol_frames: list[pd.DataFrame] = []
     valid_paths: list[Path] = []
@@ -336,7 +347,7 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
     panel = _build_panel_from_frame(frame_all, symbols)
     
     source_hash = _compute_source_hash(parquet_paths)
-    _save_panel_cache(cache_path, meta_path, panel, source_hash)
+    _save_panel_cache(cache_path, meta_path, panel, source_hash, backend_key)
     print(f"[panel] cache saved: {cache_path}")
     _print_feature_overview(panel)
     return panel
