@@ -52,6 +52,8 @@ training:
   non_blocking_transfer: true
   enable_torch_compile: true
   torch_compile_mode: reduce-overhead
+  compile_max_autotune_gemm: "on"   # auto | on | off
+  compile_autotune_min_sms: 66
   batch_size: 2048
   batch_size_train: 2048
   batch_size_eval: 2048
@@ -62,8 +64,7 @@ training:
   loss_type: sharpe
   min_batch_size: 1
   auto_batch_size: true
-  auto_batch_safety_factor: 0.75
-  compile_batch_safety_factor: 0.8
+  batch_safety_factor: 0.9
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
   target_vram_fraction: 0.9

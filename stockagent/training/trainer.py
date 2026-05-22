@@ -1431,9 +1431,13 @@ def run_training(
                 vram_safety_margin_gb=config.training.vram_safety_margin_gb,
             )
 
-            safety_factor = float(getattr(config.training, "auto_batch_safety_factor", 0.8))
-            if config.training.enable_torch_compile:
-                safety_factor *= float(getattr(config.training, "compile_batch_safety_factor", 0.85))
+            safety_factor = float(
+                getattr(
+                    config.training,
+                    "batch_safety_factor",
+                    getattr(config.training, "auto_batch_safety_factor", 0.8),
+                )
+            )
             safety_factor = min(1.0, max(0.1, safety_factor))
 
             adjusted_batch_size = max(1, int(train_batch_size * safety_factor))
@@ -1603,6 +1607,38 @@ def run_training(
                 raise RuntimeError(f"Aggressive compile mode requested, but compile precheck failed: {reason}")
 
             try:
+                try:
+                    props = torch.cuda.get_device_properties(device)
+                    sm_count = int(getattr(props, "multi_processor_count", 0))
+                except Exception:
+                    sm_count = 0
+
+                raw_policy = getattr(config.training, "compile_max_autotune_gemm", "auto")
+                if isinstance(raw_policy, bool):
+                    autotune_policy = "on" if raw_policy else "off"
+                else:
+                    autotune_policy = str(raw_policy).strip().lower()
+                if autotune_policy not in {"auto", "on", "off"}:
+                    autotune_policy = "auto"
+                min_sms = int(getattr(config.training, "compile_autotune_min_sms", 80))
+                enable_autotune = autotune_policy == "on" or (
+                    autotune_policy == "auto" and sm_count >= min_sms
+                )
+
+                try:
+                    import torch._inductor.config as inductor_config  # type: ignore
+
+                    if hasattr(inductor_config, "max_autotune_gemm"):
+                        inductor_config.max_autotune_gemm = bool(enable_autotune)
+                    if hasattr(inductor_config, "max_autotune"):
+                        inductor_config.max_autotune = bool(enable_autotune)
+                    print(
+                        f"[Train {train_years}] inductor max_autotune_gemm={enable_autotune} "
+                        f"(policy={autotune_policy}, SMs={sm_count}, min_sms={min_sms})"
+                    )
+                except Exception:
+                    pass
+
                 compile_mode = str(getattr(config.training, "torch_compile_mode", "reduce-overhead"))
                 compiled_train_model = torch.compile(model, mode=compile_mode)
                 print(f"[Train {train_years}] torch.compile enabled (mode={compile_mode}, {reason})")
