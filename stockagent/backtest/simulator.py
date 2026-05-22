@@ -176,25 +176,30 @@ def run_backtest_integer_shares(
     *,
     initial_capital: float = 1_000_000.0,
     buy_fee_rate: float = 0.001425,
-    sell_fee_rate: float = 0.004425,
+    sell_fee_rate: float = 0.002925,
+    lot_size: int = 1000,
+    open_prices: np.ndarray | None = None,
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
 ) -> tuple[BacktestResult, list[HoldingsRecord]]:
-    """Daily backtest with integer shares, virtual cash, and daily fee settlement.
+    """Day-trade backtest: buy at open and force liquidate at same-day close.
 
     Trading assumptions:
     - Initial capital is cash only.
-    - Stock shares are integer lots: floor(target_value / current_price).
+    - Shares are bought in integer lots (1 lot = ``lot_size`` shares).
     - Buy and sell fees are charged separately by buy_fee_rate/sell_fee_rate.
-    - Cash is a virtual asset with 0 daily return.
+    - All positions are closed at the same day's close (no overnight holdings).
     """
     w = np.asarray(weights, dtype=np.float64)
-    r = np.nan_to_num(np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    _ = np.asarray(future_returns, dtype=np.float64)  # Kept for API compatibility.
     m = np.asarray(tradable_mask, dtype=bool)
     b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
     t_len, n_symbols = w.shape
+    if lot_size <= 0:
+        raise ValueError(f"lot_size must be positive, got {lot_size}")
+
     if symbols is None:
         symbols = [f"SYM_{idx:04d}" for idx in range(n_symbols)]
     if dates is None:
@@ -206,45 +211,47 @@ def run_backtest_integer_shares(
     turnovers = np.zeros(t_len, dtype=np.float32)
     stock_weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
 
-    if close_prices is not None:
-        price_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        if price_matrix.shape != (t_len, n_symbols):
+    if open_prices is None:
+        open_matrix = None
+    else:
+        open_matrix = np.nan_to_num(np.asarray(open_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        if open_matrix.shape != (t_len, n_symbols):
+            raise ValueError(
+                "open_prices shape must match (num_days, num_symbols): "
+                f"expected {(t_len, n_symbols)}, got {open_matrix.shape}"
+            )
+
+    if close_prices is None:
+        close_matrix = None
+    else:
+        close_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        if close_matrix.shape != (t_len, n_symbols):
             raise ValueError(
                 "close_prices shape must match (num_days, num_symbols): "
-                f"expected {(t_len, n_symbols)}, got {price_matrix.shape}"
+                f"expected {(t_len, n_symbols)}, got {close_matrix.shape}"
             )
-        current_prices = np.where(price_matrix[0] > 1e-12, price_matrix[0], 1.0)
-    else:
-        price_matrix = None
-        current_prices = np.ones(n_symbols, dtype=np.float64)
-    shares = np.zeros(n_symbols, dtype=np.int64)
-    cash = float(initial_capital)
-    cash_hold_mode = False
 
+    if open_matrix is None and close_matrix is None:
+        raise ValueError("At least one of open_prices or close_prices must be provided.")
+
+    if open_matrix is None:
+        open_matrix = close_matrix.copy()
+    if close_matrix is None:
+        close_matrix = open_matrix.copy()
+
+    prev_open = np.where(open_matrix[0] > 1e-12, open_matrix[0], 1.0)
+    prev_close = np.where(close_matrix[0] > 1e-12, close_matrix[0], prev_open)
+    open_matrix = np.where(open_matrix > 1e-12, open_matrix, prev_open[None, :])
+    close_matrix = np.where(close_matrix > 1e-12, close_matrix, prev_close[None, :])
+
+    cash = float(initial_capital)
     records: list[HoldingsRecord] = []
 
     for t in range(t_len):
-        if cash_hold_mode:
-            strategy_returns[t] = 0.0
-            turnovers[t] = 0.0
-            stock_weights_history[t] = 0.0
-            records.append(
-                HoldingsRecord(
-                    date=date_text[t],
-                    symbol="CASH",
-                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
-                    price=1.0,
-                    market_value=float(cash),
-                    holding_ratio=1.0 if cash > 0 else 0.0,
-                    is_cash=True,
-                )
-            )
-            continue
+        day_open = open_matrix[t]
+        day_close = close_matrix[t]
 
-        if price_matrix is not None:
-            current_prices = np.where(price_matrix[t] > 1e-12, price_matrix[t], current_prices)
-
-        day_mask = m[t]
+        day_mask = m[t] & (day_open > 1e-12) & (day_close > 1e-12)
         target_w = np.nan_to_num(w[t], nan=0.0, posinf=0.0, neginf=0.0)
         target_w = np.clip(target_w, 0.0, None)
         target_w[~day_mask] = 0.0
@@ -253,124 +260,63 @@ def run_backtest_integer_shares(
         if total_target > 1.0:
             target_w /= total_target
 
-        equity_before = float(cash + np.dot(shares.astype(np.float64), current_prices))
-        equity_before = max(equity_before, 1e-12)
-
+        equity_before = max(float(cash), 1e-12)
         desired_value = equity_before * target_w
-        safe_prices = np.where(current_prices > 1e-12, current_prices, np.inf)
-        raw_target_shares = desired_value / safe_prices
-        desired_shares = _floor_to_int64(raw_target_shares, non_negative=True)
 
-        # Non-tradable symbols keep existing shares.
-        desired_shares[~day_mask] = shares[~day_mask]
+        lot_notional = day_open * float(lot_size)
+        lot_total_cost = lot_notional * (1.0 + buy_fee_rate)
+        valid_lots = lot_total_cost > 1e-12
 
-        delta = desired_shares - shares
-        sell_qty = np.clip(-delta, 0, None)
-        buy_qty = np.clip(delta, 0, None)
+        target_lots = np.zeros(n_symbols, dtype=np.int64)
+        if np.any(valid_lots):
+            raw_target_lots = np.zeros(n_symbols, dtype=np.float64)
+            raw_target_lots[valid_lots] = desired_value[valid_lots] / lot_total_cost[valid_lots]
+            target_lots = _floor_to_int64(raw_target_lots, non_negative=True)
 
-        sell_notional = float(np.dot(sell_qty.astype(np.float64), current_prices))
-        buy_notional = float(np.dot(buy_qty.astype(np.float64), current_prices))
-
-        available_cash = cash + sell_notional - sell_notional * sell_fee_rate
-        max_affordable_buy = available_cash / (1.0 + buy_fee_rate) if buy_fee_rate >= 0.0 else available_cash
-
-        if buy_notional > max_affordable_buy + 1e-9 and buy_notional > 0.0:
-            scale = max(0.0, max_affordable_buy / buy_notional)
-            scaled_buy_qty = buy_qty.astype(np.float64) * scale
-            buy_qty = _floor_to_int64(scaled_buy_qty, non_negative=True)
-            desired_shares = shares - sell_qty + buy_qty
-            delta = desired_shares - shares
-            sell_qty = np.clip(-delta, 0, None)
-            buy_qty = np.clip(delta, 0, None)
-            sell_notional = float(np.dot(sell_qty.astype(np.float64), current_prices))
-            buy_notional = float(np.dot(buy_qty.astype(np.float64), current_prices))
-
-        # Cash-hold rule: if strategy wants stock exposure but cannot buy even 1 share,
-        # stop trading and keep current cash through the remaining dates.
-        wanted_stock = bool(np.any(target_w > 0.0))
-        has_any_share = bool(np.any(desired_shares > 0))
-        if wanted_stock and not has_any_share:
-            tradable_target = (day_mask & (target_w > 0.0))
-            candidate_prices = current_prices[tradable_target]
-            candidate_prices = candidate_prices[np.isfinite(candidate_prices) & (candidate_prices > 1e-12)]
-            if candidate_prices.size > 0:
-                min_buy_cost = float(candidate_prices.min() * (1.0 + buy_fee_rate))
-                if max_affordable_buy + 1e-12 < min_buy_cost:
-                    strategy_returns[t] = 0.0
-                    turnovers[t] = 0.0
-                    stock_weights_history[t] = 0.0
-                    shares.fill(0)
-                    cash_hold_mode = True
-                    records.append(
-                        HoldingsRecord(
-                            date=date_text[t],
-                            symbol="CASH",
-                            shares=int(_floor_to_int64(cash, non_negative=True).item()),
-                            price=1.0,
-                            market_value=float(cash),
-                            holding_ratio=1.0 if cash > 0 else 0.0,
-                            is_cash=True,
-                        )
-                    )
-                    continue
-
+        shares = target_lots * np.int64(lot_size)
+        buy_notional = float(np.dot(shares.astype(np.float64), day_open))
         buy_fee = buy_fee_rate * buy_notional
+        total_buy_cost = buy_notional + buy_fee
+
+        if total_buy_cost > cash + 1e-9 and buy_notional > 0.0:
+            scale = max(0.0, cash / total_buy_cost)
+            scaled_lots = _floor_to_int64(target_lots.astype(np.float64) * scale, non_negative=True)
+            shares = scaled_lots * np.int64(lot_size)
+            buy_notional = float(np.dot(shares.astype(np.float64), day_open))
+            buy_fee = buy_fee_rate * buy_notional
+            total_buy_cost = buy_notional + buy_fee
+
+        if total_buy_cost > cash + 1e-6:
+            shares.fill(0)
+            buy_notional = 0.0
+            buy_fee = 0.0
+            total_buy_cost = 0.0
+
+        cash_after_buy = cash - total_buy_cost
+
+        sell_notional = float(np.dot(shares.astype(np.float64), day_close))
         sell_fee = sell_fee_rate * sell_notional
-        fee = buy_fee + sell_fee
-        traded_notional = buy_notional + sell_notional
+        cash_end = cash_after_buy + sell_notional - sell_fee
+        cash_end = max(cash_end, 0.0)
 
-        shares = desired_shares
-        cash = cash + sell_notional - sell_fee - buy_notional - buy_fee
-        if cash < 0 and abs(cash) < 1e-7:
-            cash = 0.0
+        open_market_value = shares.astype(np.float64) * day_open
+        stock_weights_history[t] = (open_market_value / equity_before).astype(np.float32)
+        turnovers[t] = float((buy_notional + sell_notional) / equity_before)
+        strategy_returns[t] = np.float32(np.log(max(cash_end, 1e-12) / equity_before))
 
-        stock_market_values = shares.astype(np.float64) * current_prices
-        equity_after_trade = float(cash + stock_market_values.sum())
-        equity_after_trade = max(equity_after_trade, 1e-12)
-
-        stock_weights_history[t] = (stock_market_values / equity_after_trade).astype(np.float32)
-        turnovers[t] = float(traded_notional / equity_before)
-
-        cash_ratio = float(cash / equity_after_trade)
-        day_rows: list[HoldingsRecord] = []
-        day_rows.append(
+        records.append(
             HoldingsRecord(
                 date=date_text[t],
                 symbol="CASH",
-                shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                shares=int(_floor_to_int64(cash_end, non_negative=True).item()),
                 price=1.0,
-                market_value=float(cash),
-                holding_ratio=cash_ratio,
+                market_value=float(cash_end),
+                holding_ratio=1.0 if cash_end > 0.0 else 0.0,
                 is_cash=True,
             )
         )
-        nonzero = np.flatnonzero(shares > 0)
-        for idx in nonzero.tolist():
-            mv = float(stock_market_values[idx])
-            day_rows.append(
-                HoldingsRecord(
-                    date=date_text[t],
-                    symbol=symbols[idx],
-                    shares=int(shares[idx]),
-                    price=float(current_prices[idx]),
-                    market_value=mv,
-                    holding_ratio=float(mv / equity_after_trade),
-                    is_cash=False,
-                )
-            )
-        day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
-        records.extend(day_rows)
 
-        if price_matrix is not None and (t + 1) < t_len:
-            next_prices = np.where(price_matrix[t + 1] > 1e-12, price_matrix[t + 1], current_prices)
-        else:
-            next_prices = current_prices * np.exp(r[t])
-            next_prices = np.where(np.isfinite(next_prices) & (next_prices > 1e-12), next_prices, current_prices)
-        equity_end = float(cash + np.dot(shares.astype(np.float64), next_prices))
-        equity_end = max(equity_end, 1e-12)
-
-        strategy_returns[t] = np.float32(np.log(equity_end / equity_before))
-        current_prices = next_prices
+        cash = cash_end
 
     return (
         BacktestResult(
