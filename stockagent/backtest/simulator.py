@@ -8,6 +8,7 @@ import torch
 
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
+CASH_SYMBOL_NAMES = {"CASH", "現金"}
 
 
 def _clip_to_int64_storage_bounds(values: np.ndarray | float, *, non_negative: bool = False) -> np.ndarray:
@@ -26,6 +27,12 @@ def _floor_to_int64(values: np.ndarray | float, *, non_negative: bool = False) -
     """Floor and cast to int64 after clipping strictly to int64 storage bounds."""
     clipped = _clip_to_int64_storage_bounds(values, non_negative=non_negative)
     return np.floor(clipped).astype(np.int64)
+
+
+def _build_cash_symbol_mask(symbols: list[str]) -> np.ndarray:
+    """Return a boolean mask for symbols that represent cash and must not be traded."""
+    normalized = [str(symbol).strip().upper() for symbol in symbols]
+    return np.array([name in CASH_SYMBOL_NAMES for name in normalized], dtype=bool)
 
 
 @dataclass(slots=True)
@@ -67,6 +74,9 @@ class HoldingsRecord:
     market_value: float
     holding_ratio: float
     is_cash: bool
+    traded_notional: float = 0.0
+    buy_fee: float = 0.0
+    sell_fee: float = 0.0
 
 
 def _vectorized_backtest(
@@ -74,9 +84,20 @@ def _vectorized_backtest(
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
     fee_per_side: float,
+    cash_symbol_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     weights_history = np.asarray(weights, dtype=np.float32).copy()
     weights_history[~tradable_mask.astype(bool)] = 0.0
+
+    if cash_symbol_mask is None:
+        cash_mask = np.zeros(weights_history.shape[1], dtype=bool)
+    else:
+        cash_mask = np.asarray(cash_symbol_mask, dtype=bool)
+        if cash_mask.shape != (weights_history.shape[1],):
+            raise ValueError(
+                "cash_symbol_mask shape must match num_symbols: "
+                f"expected {(weights_history.shape[1],)}, got {cash_mask.shape}"
+            )
 
     weight_sums = weights_history.sum(axis=1, keepdims=True)
     nonzero = weight_sums.squeeze(1) > 0
@@ -86,7 +107,10 @@ def _vectorized_backtest(
         np.zeros((1, weights_history.shape[1]), dtype=np.float32),
         weights_history[:-1],
     ], axis=0)
-    turnovers = np.abs(weights_history - prev).sum(axis=1).astype(np.float32)
+    delta = np.abs(weights_history - prev)
+    if np.any(cash_mask):
+        delta[:, cash_mask] = 0.0
+    turnovers = delta.sum(axis=1).astype(np.float32)
 
     gross = np.einsum("ts,ts->t", weights_history, future_returns, dtype=np.float32)
     strategy_returns = gross - fee_per_side * turnovers
@@ -98,6 +122,7 @@ def _vectorized_backtest_torch(
     future_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
     fee_per_side: float,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # ✅ FIXED: Simplified and more numerically stable weight normalization
     weights_history = weights.float().clone()
@@ -114,7 +139,17 @@ def _vectorized_backtest_torch(
         [torch.zeros_like(weights_history[:1]), weights_history[:-1]],
         dim=0,
     )
-    turnovers = (weights_history - prev).abs().sum(dim=1)
+    delta = (weights_history - prev).abs()
+    if cash_symbol_mask is not None:
+        cash_mask = cash_symbol_mask.to(device=delta.device, dtype=torch.bool)
+        if cash_mask.ndim != 1 or cash_mask.numel() != delta.size(1):
+            raise ValueError(
+                "cash_symbol_mask shape must match num_symbols: "
+                f"expected ({delta.size(1)},), got {tuple(cash_mask.shape)}"
+            )
+        if bool(cash_mask.any().item()):
+            delta = delta.masked_fill(cash_mask.unsqueeze(0), 0.0)
+    turnovers = delta.sum(dim=1)
 
     # Step 4: Compute strategy returns
     gross = (weights_history * future_returns.float()).sum(dim=1)
@@ -128,6 +163,7 @@ def run_backtest(
     tradable_mask: np.ndarray,
     benchmark_returns: np.ndarray,
     fee_per_side: float,
+    cash_symbol_mask: np.ndarray | None = None,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
@@ -135,6 +171,7 @@ def run_backtest(
         future_returns,
         tradable_mask,
         fee_per_side,
+        cash_symbol_mask,
     )
 
     return BacktestResult(
@@ -151,6 +188,7 @@ def run_backtest_torch(
     tradable_mask: torch.Tensor,
     benchmark_returns: torch.Tensor,
     fee_per_side: float,
+    cash_symbol_mask: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
@@ -158,6 +196,7 @@ def run_backtest_torch(
         future_returns,
         tradable_mask,
         fee_per_side,
+        cash_symbol_mask,
     )
 
     return BacktestResultTensor(
@@ -202,6 +241,7 @@ def run_backtest_integer_shares(
 
     if symbols is None:
         symbols = [f"SYM_{idx:04d}" for idx in range(n_symbols)]
+    cash_symbol_mask = _build_cash_symbol_mask(symbols)
     if dates is None:
         date_text = [f"t{idx:04d}" for idx in range(t_len)]
     else:
@@ -251,7 +291,7 @@ def run_backtest_integer_shares(
         day_open = open_matrix[t]
         day_close = close_matrix[t]
 
-        day_mask = m[t] & (day_open > 1e-12) & (day_close > 1e-12)
+        day_mask = m[t] & (day_open > 1e-12) & (day_close > 1e-12) & (~cash_symbol_mask)
         target_w = np.nan_to_num(w[t], nan=0.0, posinf=0.0, neginf=0.0)
         target_w = np.clip(target_w, 0.0, None)
         target_w[~day_mask] = 0.0
@@ -274,6 +314,8 @@ def run_backtest_integer_shares(
             target_lots = _floor_to_int64(raw_target_lots, non_negative=True)
 
         shares = target_lots * np.int64(lot_size)
+        if np.any(cash_symbol_mask):
+            shares[cash_symbol_mask] = 0
         buy_notional = float(np.dot(shares.astype(np.float64), day_open))
         buy_fee = buy_fee_rate * buy_notional
         total_buy_cost = buy_notional + buy_fee
@@ -282,6 +324,8 @@ def run_backtest_integer_shares(
             scale = max(0.0, cash / total_buy_cost)
             scaled_lots = _floor_to_int64(target_lots.astype(np.float64) * scale, non_negative=True)
             shares = scaled_lots * np.int64(lot_size)
+            if np.any(cash_symbol_mask):
+                shares[cash_symbol_mask] = 0
             buy_notional = float(np.dot(shares.astype(np.float64), day_open))
             buy_fee = buy_fee_rate * buy_notional
             total_buy_cost = buy_notional + buy_fee
@@ -313,8 +357,36 @@ def run_backtest_integer_shares(
                 market_value=float(cash_end),
                 holding_ratio=1.0 if cash_end > 0.0 else 0.0,
                 is_cash=True,
+                traded_notional=0.0,
+                buy_fee=0.0,
+                sell_fee=0.0,
             )
         )
+
+        # Record intraday traded symbols so holdings.csv reflects actual buy/sell activity.
+        traded_idx = np.flatnonzero(shares > 0)
+        if traded_idx.size > 0:
+            denom = max(equity_before, 1e-12)
+            for idx in traded_idx.tolist():
+                buy_notional_i = float(shares[idx] * day_open[idx])
+                sell_notional_i = float(shares[idx] * day_close[idx])
+                buy_fee_i = float(buy_fee_rate * buy_notional_i)
+                sell_fee_i = float(sell_fee_rate * sell_notional_i)
+                open_value_i = float(open_market_value[idx])
+                records.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol=symbols[idx],
+                        shares=int(shares[idx]),
+                        price=float(day_open[idx]),
+                        market_value=open_value_i,
+                        holding_ratio=float(open_value_i / denom),
+                        is_cash=False,
+                        traded_notional=float(buy_notional_i + sell_notional_i),
+                        buy_fee=buy_fee_i,
+                        sell_fee=sell_fee_i,
+                    )
+                )
 
         cash = cash_end
 

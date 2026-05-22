@@ -33,7 +33,7 @@ trading:
 
 training:
   backend: pytorch
-  target: next_1d_rank
+  target: daily_return
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   enable_torch_compile: true
@@ -41,7 +41,7 @@ training:
   batch_size: 2048
   batch_size_train: 2048
   batch_size_eval: 2048
-  epochs: 1000
+  epochs: 100
   learning_rate: 0.001
   hidden_dim: 512
   hidden_layers: 2

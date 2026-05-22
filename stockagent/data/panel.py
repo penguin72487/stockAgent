@@ -18,7 +18,8 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume", "next_open"]
-PANEL_CACHE_VERSION = 9
+PANEL_CACHE_VERSION = 10
+CASH_SYMBOL_NAMES = {"CASH", "現金"}
 
 
 @dataclass(slots=True)
@@ -53,6 +54,10 @@ def _safe_log_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     np.log(out, out=out, where=valid)
     out[~valid] = np.nan
     return pd.Series(out, index=numerator.index)
+
+
+def _is_cash_symbol_name(symbol: str) -> bool:
+    return str(symbol).strip().upper() in CASH_SYMBOL_NAMES
 
 
 def _load_symbol_frame(path: Path) -> pd.DataFrame:
@@ -163,9 +168,14 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
     tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
     alive_mask[row_idx, sym_idx] = frame_all["close_raw"].notna().to_numpy(dtype=bool, copy=False)
 
-    valid_ret_mask = np.isfinite(returns_1d)
-    n_valid = valid_ret_mask.sum(axis=1)
-    sum_ret = np.nansum(np.where(valid_ret_mask, returns_1d, 0.0), axis=1)
+    cash_symbol_mask = np.array([_is_cash_symbol_name(symbol) for symbol in symbols], dtype=bool)
+
+    # Benchmark: equal-weight "buy all tradable stocks daily" without fees.
+    benchmark_mask = tradable_mask & np.isfinite(returns_1d)
+    if np.any(cash_symbol_mask):
+        benchmark_mask[:, cash_symbol_mask] = False
+    n_valid = benchmark_mask.sum(axis=1)
+    sum_ret = np.nansum(np.where(benchmark_mask, returns_1d, 0.0), axis=1)
     benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
     np.divide(
         sum_ret,

@@ -37,6 +37,7 @@ def sharpe_aware_loss(
     fee_per_side: float = 0.0,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
+    cash_symbol_mask: Tensor | None = None,
 ) -> Tensor:
     """Improved Sharpe-aware loss with numerically stable gradient flow."""
     mask_f = tradable_mask.to(dtype=weights.dtype)
@@ -58,7 +59,17 @@ def sharpe_aware_loss(
         [normalized_weights.new_zeros(1, normalized_weights.size(1)), normalized_weights[:-1]],
         dim=0,
     )
-    turnover = (normalized_weights - prev_weights).abs().sum(dim=1)
+    delta = (normalized_weights - prev_weights).abs()
+    if cash_symbol_mask is not None:
+        cash_mask = cash_symbol_mask.to(device=weights.device, dtype=torch.bool)
+        if cash_mask.ndim != 1 or cash_mask.numel() != delta.size(1):
+            raise ValueError(
+                "cash_symbol_mask shape must match num_symbols: "
+                f"expected ({delta.size(1)},), got {tuple(cash_mask.shape)}"
+            )
+        if bool(cash_mask.any().item()):
+            delta = delta.masked_fill(cash_mask.unsqueeze(0), 0.0)
+    turnover = delta.sum(dim=1)
     turnover_cost = ((turnover * sample_mask_f).sum() * fee_per_side) / valid_count
 
     # ✅ FIXED: Improved Sharpe with stable gradients
