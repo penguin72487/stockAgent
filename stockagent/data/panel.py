@@ -16,10 +16,11 @@ except Exception:  # pragma: no cover - optional GPU dependency
     cudf = None
 
 
-RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
+RESERVED_COLUMNS = {"date", "symbol", "return_1d", "benchmark_return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "adjclose", "Trading_Volume", "next_open"]
-PANEL_CACHE_VERSION = 11
+PANEL_CACHE_VERSION = 13
 CASH_SYMBOL_NAMES = {"CASH", "現金"}
+MAX_ABS_DAILY_LOG_RETURN = 1.0
 
 
 @dataclass(slots=True)
@@ -93,6 +94,7 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame["Trading_Volume"] = volume_num.shift(1).astype(np.float32)
     frame["next_open"] = open_num.astype(np.float32)
 
+    # Strategy target: same-day adjusted intraday log return.
     # Back-calculate adjusted open from same-day adjustment factor, then
     # compute same-day log return on adjusted prices.
     adj_factor = np.full(len(frame), np.nan, dtype=np.float64)
@@ -102,12 +104,21 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     np.divide(adjclose_arr, close_arr, out=adj_factor, where=valid_factor)
     adj_open_arr = open_num.to_numpy(dtype=np.float64, copy=False) * adj_factor
     frame["return_1d"] = _safe_log_ratio(pd.Series(adjclose_arr, index=frame.index), pd.Series(adj_open_arr, index=frame.index))
+    extreme_return = frame["return_1d"].abs().gt(MAX_ABS_DAILY_LOG_RETURN)
+    frame.loc[extreme_return, "return_1d"] = np.nan
+
+    # Baseline benchmark: adjusted close-to-close log return.
+    frame["benchmark_return_1d"] = _safe_log_ratio(
+        pd.Series(adjclose_arr, index=frame.index),
+        pd.Series(adjclose_arr, index=frame.index).shift(1),
+    )
 
     volume = volume_num
     frame["tradable"] = (
         frame["open_raw"].gt(0)
         & frame["close_raw"].gt(0)
         & pd.Series(volume).fillna(0).gt(0)
+        & (~extreme_return)
     )
 
     return frame
@@ -150,9 +161,16 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     valid_ret = (adjclose_num > 0) & (adj_open > 0)
     ret_ratio = (adjclose_num / adj_open).where(valid_ret)
     gdf["return_1d"] = np.log(ret_ratio)
+    extreme_return = gdf["return_1d"].abs() > MAX_ABS_DAILY_LOG_RETURN
+    gdf.loc[extreme_return, "return_1d"] = np.nan
+
+    prev_adjclose = adjclose_num.shift(1)
+    valid_bench = (adjclose_num > 0) & (prev_adjclose > 0)
+    bench_ratio = (adjclose_num / prev_adjclose).where(valid_bench)
+    gdf["benchmark_return_1d"] = np.log(bench_ratio)
 
     vol = volume_num.fillna(0)
-    gdf["tradable"] = (gdf["open_raw"] > 0) & (gdf["close_raw"] > 0) & (vol > 0)
+    gdf["tradable"] = (gdf["open_raw"] > 0) & (gdf["close_raw"] > 0) & (vol > 0) & (~extreme_return)
 
     return gdf.to_pandas()
 
@@ -191,11 +209,15 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
     cash_symbol_mask = np.array([_is_cash_symbol_name(symbol) for symbol in symbols], dtype=bool)
 
     # Benchmark: equal-weight "buy all tradable stocks daily" without fees.
-    benchmark_mask = tradable_mask & np.isfinite(returns_1d)
+    benchmark_returns_1d = frame_all["benchmark_return_1d"].to_numpy(dtype=np.float32, copy=False)
+    benchmark_values = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    benchmark_values[row_idx, sym_idx] = benchmark_returns_1d
+
+    benchmark_mask = np.isfinite(benchmark_values)
     if np.any(cash_symbol_mask):
         benchmark_mask[:, cash_symbol_mask] = False
     n_valid = benchmark_mask.sum(axis=1)
-    sum_ret = np.nansum(np.where(benchmark_mask, returns_1d, 0.0), axis=1)
+    sum_ret = np.nansum(np.where(benchmark_mask, benchmark_values, 0.0), axis=1)
     benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
     np.divide(
         sum_ret,

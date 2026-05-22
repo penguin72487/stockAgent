@@ -26,6 +26,7 @@ class CrossSectionalMLP(nn.Module):
         num_symbols: int,
         hidden_dim: int,
         dropout: float,
+        long_only: bool = True,
         embedding_dim: int = 64,
         hidden_layers: int = 2,
     ) -> None:
@@ -33,6 +34,7 @@ class CrossSectionalMLP(nn.Module):
         self.num_symbols = num_symbols
         self.embedding_dim = embedding_dim
         self.lookback = lookback
+        self.long_only = bool(long_only)
         self.hidden_layers = max(0, int(hidden_layers))
         
         # Feature embedding: compress F features to embedding_dim
@@ -116,11 +118,24 @@ class CrossSectionalMLP(nn.Module):
 
             # Portfolio scoring
             logits = self.portfolio_head(x).squeeze(-1).view(B, S)  # [B, S]
-        
-        # Apply softmax with mask
+
+        if self.long_only:
+            if tradable_mask is not None:
+                weights = _masked_softmax(logits, tradable_mask)
+            else:
+                weights = torch.softmax(logits, dim=1)
+            return weights
+
         if tradable_mask is not None:
-            weights = _masked_softmax(logits, tradable_mask)
+            mask_bool = tradable_mask.bool()
+            mask_f = tradable_mask.to(dtype=logits.dtype)
+            masked_logits = logits.masked_fill(~mask_bool, 0.0)
+            valid_count = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+            centered_logits = masked_logits - (masked_logits.sum(dim=1, keepdim=True) / valid_count)
+            signed_scores = torch.tanh(centered_logits) * mask_f
         else:
-            weights = torch.softmax(logits, dim=1)
-        
-        return weights
+            centered_logits = logits - logits.mean(dim=1, keepdim=True)
+            signed_scores = torch.tanh(centered_logits)
+
+        exposure = signed_scores.abs().sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return signed_scores / exposure

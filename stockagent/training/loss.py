@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from stockagent.backtest.simulator import run_backtest_torch
+
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
     mask_f = mask.to(dtype=predictions.dtype)
@@ -35,56 +37,53 @@ def sharpe_aware_loss(
     tradable_mask: Tensor,
     sample_mask: Tensor | None = None,
     fee_per_side: float = 0.0,
+    buy_fee_rate: float | None = None,
+    sell_fee_rate: float | None = None,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
     cash_symbol_mask: Tensor | None = None,
 ) -> Tensor:
-    """Improved Sharpe-aware loss with numerically stable gradient flow."""
+    """Sharpe-aware loss built from the same continuous backtest path used in evaluation."""
+    if buy_fee_rate is None:
+        buy_fee_rate = fee_per_side
+    if sell_fee_rate is None:
+        sell_fee_rate = fee_per_side
+
     mask_f = tradable_mask.to(dtype=weights.dtype)
     if sample_mask is None:
         sample_mask_f = torch.ones(weights.size(0), device=weights.device, dtype=weights.dtype)
     else:
         sample_mask_f = sample_mask.to(device=weights.device, dtype=weights.dtype)
 
-    masked_weights = weights * mask_f
-    weight_sum = masked_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    normalized_weights = masked_weights / weight_sum
-
     returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
-    gross_returns = (normalized_weights * returns).sum(dim=1)
+    benchmark = torch.zeros(weights.size(0), device=weights.device, dtype=weights.dtype)
+    backtest = run_backtest_torch(
+        weights=weights,
+        future_returns=returns,
+        tradable_mask=tradable_mask,
+        benchmark_returns=benchmark,
+        fee_per_side=fee_per_side,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        cash_symbol_mask=cash_symbol_mask,
+    )
+
+    net_returns = backtest.strategy_returns.to(dtype=weights.dtype)
+    turnovers = backtest.turnovers.to(dtype=weights.dtype)
     valid_count = sample_mask_f.sum().clamp_min(1.0)
 
-    # Turnover cost
-    prev_weights = torch.cat(
-        [normalized_weights.new_zeros(1, normalized_weights.size(1)), normalized_weights[:-1]],
-        dim=0,
-    )
-    delta = (normalized_weights - prev_weights).abs()
-    if cash_symbol_mask is not None:
-        cash_mask = cash_symbol_mask.to(device=weights.device, dtype=torch.bool)
-        if cash_mask.ndim != 1 or cash_mask.numel() != delta.size(1):
-            raise ValueError(
-                "cash_symbol_mask shape must match num_symbols: "
-                f"expected ({delta.size(1)},), got {tuple(cash_mask.shape)}"
-            )
-        if bool(cash_mask.any().item()):
-            delta = delta.masked_fill(cash_mask.unsqueeze(0), 0.0)
-    turnover = delta.sum(dim=1)
-    turnover_cost = ((turnover * sample_mask_f).sum() * fee_per_side) / valid_count
+    turnover_penalty = ((turnovers * sample_mask_f).sum()) / valid_count
 
-    # ✅ FIXED: Improved Sharpe with stable gradients
-    # Epsilon is added inside the square root to prevent gradient explosion
-    masked_returns = gross_returns * sample_mask_f
+    masked_returns = net_returns * sample_mask_f
     mean_return = masked_returns.sum() / valid_count
-    centered = (gross_returns - mean_return) * sample_mask_f
+    centered = (net_returns - mean_return) * sample_mask_f
     variance = (centered ** 2).sum() / valid_count
-    
+
     eps = 1e-8
-    std_return = torch.sqrt(variance + eps)  # Epsilon inside sqrt for stable gradients
+    std_return = torch.sqrt(variance + eps)
     annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights.dtype))
-    
+
     sharpe = mean_return / std_return * annualizer
-    
-    # Composite loss
-    loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_cost
+
+    loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_penalty
     return loss
