@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    rule_name = str(config.trading.backtest_rule).strip().lower().replace("-", "_")
+    return_mode = "intraday" if rule_name == "day_trade" else "adjclose_cc"
     if config.environment.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA was requested in config (environment.device=cuda), "
@@ -33,7 +35,8 @@ def main() -> None:
     panel = build_panel(
         config.data.parquet_root,
         use_rapids=config.data.use_rapids,
-        include_next_open_feature=(str(config.trading.backtest_rule).strip().lower().replace("-", "_") != "basic"),
+        include_next_open_feature=(rule_name != "basic"),
+        target_return_mode=return_mode,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

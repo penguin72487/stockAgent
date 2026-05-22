@@ -41,6 +41,15 @@ def _fee_with_floor(notional: float, rate: float, minimum_fee: float) -> float:
     return float(max(notional * rate, minimum_fee))
 
 
+def _fees_per_order(notional_vec: np.ndarray, rate: float, minimum_fee: float) -> np.ndarray:
+    notional = np.asarray(notional_vec, dtype=np.float64)
+    fees = np.zeros_like(notional, dtype=np.float64)
+    active = notional > 0.0
+    if np.any(active):
+        fees[active] = np.maximum(notional[active] * rate, float(minimum_fee))
+    return fees
+
+
 @dataclass(slots=True)
 class BacktestResult:
     """Container for a single backtest simulation run."""
@@ -567,6 +576,7 @@ def _simulate_basic_backtest(
     stock_weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
     records: list[HoldingsRecord] = []
     prev_day_equity = float(initial_capital)
+    lot_size = max(int(spec.lot_size), 1)
 
     for t in range(t_len):
         close_price = close_matrix[t]
@@ -588,18 +598,54 @@ def _simulate_basic_backtest(
         if np.any(valid):
             raw_shares = np.zeros(n_symbols, dtype=np.float64)
             raw_shares[valid] = desired_value[valid] / close_price[valid]
-            target_shares = _floor_to_int64(raw_shares, non_negative=True)
+            target_shares = _floor_to_int64(raw_shares / lot_size, non_negative=True) * lot_size
+
+        # Basic rule: non-tradable symbols cannot be forcibly rebalanced.
+        target_shares[~day_mask] = positions[~day_mask]
 
         delta_shares = target_shares - positions
-        buy_shares = np.maximum(delta_shares, 0)
-        sell_shares = np.maximum(-delta_shares, 0)
-        buy_notional = float(np.dot(buy_shares.astype(np.float64), close_price))
-        sell_notional = float(np.dot(sell_shares.astype(np.float64), close_price))
-        buy_fee = _fee_with_floor(buy_notional, spec.buy_fee_rate, spec.min_fee_per_side)
-        sell_fee = _fee_with_floor(sell_notional, spec.sell_fee_rate, spec.min_fee_per_side)
+        buy_shares = np.maximum(delta_shares, 0).astype(np.int64)
+        sell_shares = np.maximum(-delta_shares, 0).astype(np.int64)
 
-        cash = cash - buy_notional - buy_fee + sell_notional - sell_fee
-        positions = target_shares
+        sell_notional_vec = sell_shares.astype(np.float64) * close_price
+        sell_fee_vec = _fees_per_order(sell_notional_vec, spec.sell_fee_rate, spec.min_fee_per_side)
+        sell_notional = float(sell_notional_vec.sum())
+        sell_fee = float(sell_fee_vec.sum())
+        cash_after_sell = cash + sell_notional - sell_fee
+
+        # No financing: cap buys to what can be paid in cash after sell execution.
+        desired_buy = buy_shares.copy()
+        if desired_buy.any():
+            def _is_affordable(candidate_buy: np.ndarray) -> bool:
+                candidate_notional = candidate_buy.astype(np.float64) * close_price
+                candidate_fee = _fees_per_order(candidate_notional, spec.buy_fee_rate, spec.min_fee_per_side)
+                total_cost = float(candidate_notional.sum() + candidate_fee.sum())
+                return total_cost <= cash_after_sell + 1e-9
+
+            if not _is_affordable(desired_buy):
+                lo, hi = 0.0, 1.0
+                for _ in range(28):
+                    mid = (lo + hi) * 0.5
+                    candidate = _floor_to_int64(desired_buy.astype(np.float64) * mid, non_negative=True)
+                    candidate = (candidate // lot_size) * lot_size
+                    if _is_affordable(candidate):
+                        lo = mid
+                    else:
+                        hi = mid
+                buy_shares = _floor_to_int64(desired_buy.astype(np.float64) * lo, non_negative=True)
+                buy_shares = ((buy_shares // lot_size) * lot_size).astype(np.int64)
+
+        buy_notional_vec = buy_shares.astype(np.float64) * close_price
+        buy_fee_vec = _fees_per_order(buy_notional_vec, spec.buy_fee_rate, spec.min_fee_per_side)
+        buy_notional = float(buy_notional_vec.sum())
+        buy_fee = float(buy_fee_vec.sum())
+
+        cash = cash_after_sell - buy_notional - buy_fee
+        if cash < 0.0:
+            cash = 0.0
+
+        positions = positions - sell_shares + buy_shares
+        delta_shares = buy_shares - sell_shares
         market_value = positions.astype(np.float64) * close_price
         nav_end = max(float(cash + market_value.sum()), 1e-12)
 
@@ -625,9 +671,9 @@ def _simulate_basic_backtest(
             denom = max(nav_end, 1e-12)
             for idx in traded_idx.tolist():
                 shares_i = int(delta_shares[idx])
-                notional_i = float(abs(shares_i) * close_price[idx])
-                buy_fee_i = float(_fee_with_floor(notional_i, spec.buy_fee_rate, spec.min_fee_per_side)) if shares_i > 0 else 0.0
-                sell_fee_i = float(_fee_with_floor(notional_i, spec.sell_fee_rate, spec.min_fee_per_side)) if shares_i < 0 else 0.0
+                notional_i = float((buy_notional_vec[idx] + sell_notional_vec[idx]))
+                buy_fee_i = float(buy_fee_vec[idx])
+                sell_fee_i = float(sell_fee_vec[idx])
                 records.append(
                     HoldingsRecord(
                         date=date_text[t],
