@@ -5,6 +5,7 @@ from pathlib import Path
 import hashlib
 import pickle
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -16,8 +17,8 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
-LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 7
+LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume", "next_open"]
+PANEL_CACHE_VERSION = 9
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class PanelData:
     tradable_mask: np.ndarray
     alive_mask: np.ndarray
     benchmark_returns: np.ndarray
+    open_prices: np.ndarray
     close_prices: np.ndarray
 
     @property
@@ -59,20 +61,37 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = path.name.replace("_features.parquet", "")
-    frame["close_raw"] = frame["close"].astype(np.float32)
-
-    frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
-
-    volume = frame["Trading_Volume"] if "Trading_Volume" in frame.columns else pd.Series(0.0, index=frame.index)
-    frame["tradable"] = frame["close"].notna() & pd.Series(volume).fillna(0).gt(0)
-
-    for col in ["open", "max", "min", "close"]:
-        if col in frame.columns:
-            frame[col] = _safe_log_ratio(frame[col], frame[col].shift(1))
-
+    open_num = pd.to_numeric(frame["open"], errors="coerce")
+    max_num = pd.to_numeric(frame["max"], errors="coerce")
+    min_num = pd.to_numeric(frame["min"], errors="coerce")
+    close_num = pd.to_numeric(frame["close"], errors="coerce")
     if "Trading_Volume" in frame.columns:
-        vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
-        frame["Trading_Volume"] = _safe_log_ratio(vol, vol.shift(1))
+        volume_num = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+    else:
+        volume_num = pd.Series(0.0, index=frame.index, dtype=np.float64)
+
+    frame["open_raw"] = open_num.astype(np.float32)
+    frame["close_raw"] = close_num.astype(np.float32)
+
+    # User-defined feature timing:
+    # - open/max/min/close/Trading_Volume use previous-day values at row t
+    # - next_open is today's open used as execution buy price
+    frame["open"] = open_num.shift(1).astype(np.float32)
+    frame["max"] = max_num.shift(1).astype(np.float32)
+    frame["min"] = min_num.shift(1).astype(np.float32)
+    frame["close"] = close_num.shift(1).astype(np.float32)
+    frame["Trading_Volume"] = volume_num.shift(1).astype(np.float32)
+    frame["next_open"] = open_num.astype(np.float32)
+
+    # Day-trading target: same-day open->close log return.
+    frame["return_1d"] = _safe_log_ratio(close_num, open_num)
+
+    volume = volume_num
+    frame["tradable"] = (
+        frame["open_raw"].gt(0)
+        & frame["close_raw"].gt(0)
+        & pd.Series(volume).fillna(0).gt(0)
+    )
 
     return frame
 
@@ -85,32 +104,30 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     gdf["date"] = cudf.to_datetime(gdf["date"])
     gdf = gdf.sort_values("date").reset_index(drop=True)
     gdf["symbol"] = path.name.replace("_features.parquet", "")
-    gdf["close_raw"] = gdf["close"].astype("float32")
+    open_num = gdf["open"].astype("float64")
+    max_num = gdf["max"].astype("float64")
+    min_num = gdf["min"].astype("float64")
+    close_num = gdf["close"].astype("float64")
+    if "Trading_Volume" in gdf.columns:
+        volume_num = gdf["Trading_Volume"].astype("float64")
+    else:
+        volume_num = cudf.Series(0.0, index=gdf.index, dtype="float64")
 
-    nxt_close = gdf["close"].shift(-1)
-    valid_ret = (nxt_close > 0) & (gdf["close"] > 0)
-    ret_ratio = (nxt_close / gdf["close"]).where(valid_ret)
+    gdf["open_raw"] = open_num.astype("float32")
+    gdf["close_raw"] = close_num.astype("float32")
+    gdf["open"] = open_num.shift(1).astype("float32")
+    gdf["max"] = max_num.shift(1).astype("float32")
+    gdf["min"] = min_num.shift(1).astype("float32")
+    gdf["close"] = close_num.shift(1).astype("float32")
+    gdf["Trading_Volume"] = volume_num.shift(1).astype("float32")
+    gdf["next_open"] = open_num.astype("float32")
+
+    valid_ret = (close_num > 0) & (open_num > 0)
+    ret_ratio = (close_num / open_num).where(valid_ret)
     gdf["return_1d"] = np.log(ret_ratio)
 
-    if "Trading_Volume" in gdf.columns:
-        vol = gdf["Trading_Volume"].fillna(0)
-    else:
-        vol = 0
-    gdf["tradable"] = gdf["close"].notnull() & (vol > 0)
-
-    for col in ["open", "max", "min", "close"]:
-        if col in gdf.columns:
-            prev = gdf[col].shift(1)
-            valid = (gdf[col] > 0) & (prev > 0)
-            ratio = (gdf[col] / prev).where(valid)
-            gdf[col] = np.log(ratio)
-
-    if "Trading_Volume" in gdf.columns:
-        vol = gdf["Trading_Volume"].astype("float64")
-        prev_vol = vol.shift(1)
-        valid_vol = (vol > 0) & (prev_vol > 0)
-        vol_ratio = (vol / prev_vol).where(valid_vol)
-        gdf["Trading_Volume"] = np.log(vol_ratio)
+    vol = volume_num.fillna(0)
+    gdf["tradable"] = (gdf["open_raw"] > 0) & (gdf["close_raw"] > 0) & (vol > 0)
 
     return gdf.to_pandas()
 
@@ -125,6 +142,7 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
 
     features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    open_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
@@ -136,22 +154,24 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
     row_idx = frame_all["date"].map(date_index).to_numpy(dtype=np.int64)
     sym_idx = frame_all["symbol"].map(symbol_index).to_numpy(dtype=np.int64)
 
-    for feat_idx, col in enumerate(feature_columns):
-        features[row_idx, sym_idx, feat_idx] = frame_all[col].to_numpy(dtype=np.float32, copy=False)
+    feature_values = frame_all[feature_columns].to_numpy(dtype=np.float32, copy=False)
+    features[row_idx, sym_idx, :] = feature_values
 
     returns_1d[row_idx, sym_idx] = frame_all["return_1d"].to_numpy(dtype=np.float32, copy=False)
+    open_prices[row_idx, sym_idx] = frame_all["next_open"].to_numpy(dtype=np.float32, copy=False)
     close_prices[row_idx, sym_idx] = frame_all["close_raw"].to_numpy(dtype=np.float32, copy=False)
     tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
-    alive_mask[row_idx, sym_idx] = frame_all["close"].notna().to_numpy(dtype=bool, copy=False)
+    alive_mask[row_idx, sym_idx] = frame_all["close_raw"].notna().to_numpy(dtype=bool, copy=False)
 
-    n_tradable = tradable_mask.sum(axis=1)
-    sum_ret = np.nansum(np.where(tradable_mask, returns_1d, 0.0), axis=1)
+    valid_ret_mask = np.isfinite(returns_1d)
+    n_valid = valid_ret_mask.sum(axis=1)
+    sum_ret = np.nansum(np.where(valid_ret_mask, returns_1d, 0.0), axis=1)
     benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
     np.divide(
         sum_ret,
-        n_tradable,
+        n_valid,
         out=benchmark_returns,
-        where=n_tradable > 0,
+        where=n_valid > 0,
     )
 
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
@@ -165,6 +185,7 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
         tradable_mask=tradable_mask,
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
+        open_prices=open_prices,
         close_prices=close_prices,
     )
 
@@ -176,9 +197,47 @@ def _get_feature_columns(frame: pd.DataFrame) -> list[str]:
         for column in LOG_RETURN_FEATURE_COLUMNS
         if column in numeric_columns and column not in RESERVED_COLUMNS
     ]
-    if not feature_columns:
-        raise ValueError("No log-return feature columns found in symbol frame")
+    if len(feature_columns) != len(LOG_RETURN_FEATURE_COLUMNS):
+        raise ValueError(
+            "Missing log-return feature columns in symbol frame: "
+            f"expected={LOG_RETURN_FEATURE_COLUMNS}, got={feature_columns}"
+        )
     return feature_columns
+
+
+def _resolve_panel_workers() -> int:
+    env_workers = os.environ.get("STOCKAGENT_PANEL_WORKERS")
+    if env_workers is not None:
+        try:
+            workers = int(env_workers)
+            return max(1, workers)
+        except ValueError:
+            pass
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(16, cpu_count))
+
+
+def _load_symbol_frames_parallel(parquet_paths: list[Path]) -> tuple[list[pd.DataFrame], list[Path]]:
+    workers = _resolve_panel_workers()
+    symbol_frames: list[pd.DataFrame] = []
+    valid_paths: list[Path] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_load_symbol_frame, path): path for path in parquet_paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                frame = future.result()
+                if len(frame) == 0:
+                    raise ValueError(f"Symbol file is empty: {path.name}")
+                symbol_frames.append(frame)
+                valid_paths.append(path)
+            except Exception as exc:
+                print(f"[panel] SKIP {path.name}: {exc}")
+
+    ordered = sorted(zip(valid_paths, symbol_frames), key=lambda item: item[0].name)
+    ordered_paths = [item[0] for item in ordered]
+    ordered_frames = [item[1] for item in ordered]
+    return ordered_frames, ordered_paths
 
 
 def _panel_cache_path(parquet_root: str | Path) -> Path:
@@ -210,6 +269,7 @@ def _save_panel_cache(cache_path: Path, meta_path: Path, panel: PanelData, sourc
         tradable_mask=panel.tradable_mask,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
+        open_prices=panel.open_prices,
         close_prices=panel.close_prices,
     )
     
@@ -234,6 +294,7 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         tradable_mask=cached["tradable_mask"],
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
+        open_prices=cached["open_prices"],
         close_prices=cached["close_prices"],
     )
 
@@ -316,17 +377,7 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
         except Exception as exc:
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
     
-    symbol_frames: list[pd.DataFrame] = []
-    valid_paths: list[Path] = []
-    for path in parquet_paths:
-        try:
-            frame = _load_symbol_frame(path)
-            if len(frame) == 0:
-                raise ValueError(f"Symbol file is empty: {path.name}")
-            symbol_frames.append(frame)
-            valid_paths.append(path)
-        except Exception as exc:
-            print(f"[panel] SKIP {path.name}: {exc}")
+    symbol_frames, valid_paths = _load_symbol_frames_parallel(parquet_paths)
 
     if not symbol_frames:
         raise RuntimeError("No valid parquet files could be loaded.")

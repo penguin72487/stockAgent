@@ -28,6 +28,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.future_log_returns_t = torch.from_numpy(returns)
         self.tradable_mask_t = torch.from_numpy(tradable)
         self.benchmark_t = torch.from_numpy(panel.benchmark_returns.astype(np.float32, copy=False))
+        self._cached_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def __len__(self) -> int:
         return int(self.valid_indices.size)
@@ -41,6 +42,25 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "tradable_mask": self.tradable_mask_t[date_idx],
             "benchmark": self.benchmark_t[date_idx],
         }
+
+    def to_tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._cached_tensors is not None:
+            return self._cached_tensors
+
+        valid_indices = torch.as_tensor(self.valid_indices, dtype=torch.long)
+        if self.lookback == 1:
+            x = self.features_t[valid_indices].unsqueeze(1)
+        else:
+            starts = valid_indices - self.lookback + 1
+            offsets = torch.arange(self.lookback, dtype=torch.long)
+            window_indices = starts.unsqueeze(1) + offsets.unsqueeze(0)
+            x = self.features_t[window_indices]
+
+        returns = self.future_log_returns_t[valid_indices]
+        masks = self.tradable_mask_t[valid_indices]
+        bench = self.benchmark_t[valid_indices]
+        self._cached_tensors = (x, returns, masks, bench)
+        return self._cached_tensors
 
 
 def collate_batch(samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:

@@ -261,15 +261,7 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
 
 
 def _dataset_to_tensors(dataset: CrossSectionalDataset) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
-    if dataset.lookback == 1:
-        x = dataset.features_t[valid_indices].unsqueeze(1)
-    else:
-        x = torch.stack([dataset[i]["x"] for i in range(len(dataset))], dim=0)
-    returns = dataset.future_log_returns_t[valid_indices]
-    masks = dataset.tradable_mask_t[valid_indices]
-    bench = dataset.benchmark_t[valid_indices]
-    return x, returns, masks, bench
+    return dataset.to_tensors()
 
 
 def _prepare_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
@@ -366,10 +358,16 @@ def _evaluate_tensor_batch(
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
-    weights_chunks: list[torch.Tensor] = []
-    returns_chunks: list[torch.Tensor] = []
-    masks_chunks: list[torch.Tensor] = []
-    benchmark_chunks: list[torch.Tensor] = []
+    total_rows = int(x.size(0))
+    if total_rows == 0:
+        raise RuntimeError("Cannot evaluate empty tensor split.")
+
+    num_symbols = int(x.size(2))
+    weights_t = torch.empty((total_rows, num_symbols), dtype=torch.float32, device=device)
+    returns_t = torch.empty((total_rows, num_symbols), dtype=torch.float32, device=device)
+    masks_t = torch.empty((total_rows, num_symbols), dtype=torch.bool, device=device)
+    bench_t = torch.empty((total_rows,), dtype=torch.float32, device=device)
+
     with torch.inference_mode():
         for start in range(0, x.size(0), chunk_rows):
             end = min(start + chunk_rows, x.size(0))
@@ -380,18 +378,13 @@ def _evaluate_tensor_batch(
             with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
-            weights_chunks.append(weights_chunk.float())
-            returns_chunks.append(returns_chunk.float())
-            masks_chunks.append(mask_chunk)
-            benchmark_chunks.append(bench_chunk.float())
+            weights_t[start:end].copy_(weights_chunk.float())
+            returns_t[start:end].copy_(returns_chunk.float())
+            masks_t[start:end].copy_(mask_chunk)
+            bench_t[start:end].copy_(bench_chunk.float())
 
-        weights = torch.cat(weights_chunks, dim=0)
-        future_log_returns_t = torch.cat(returns_chunks, dim=0)
-        tradable_mask_t = torch.cat(masks_chunks, dim=0)
-        benchmark_t = torch.cat(benchmark_chunks, dim=0)
-
-        backtest = run_backtest_torch(weights, future_log_returns_t, tradable_mask_t, benchmark_t, fee_per_side)
-        ic = ic_summary(compute_ic_series_torch(weights, future_log_returns_t, tradable_mask_t).detach().cpu().numpy())
+        backtest = run_backtest_torch(weights_t, returns_t, masks_t, bench_t, fee_per_side)
+        ic = ic_summary(compute_ic_series_torch(weights_t, returns_t, masks_t).detach().cpu().numpy())
         metrics = _compute_metrics_from_tensors(
             backtest.strategy_returns,
             backtest.benchmark_returns,
@@ -596,7 +589,20 @@ def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
     os.environ.setdefault("CC", cc)
     os.environ.setdefault("CXX", cxx)
 
-    return True, f"CC={cc}, CXX={cxx}"
+    # Strict aggressive mode requirement: require enough SMs for max-autotune GEMM.
+    try:
+        props = torch.cuda.get_device_properties(device)
+        sm_count = int(getattr(props, "multi_processor_count", 0))
+    except Exception:
+        sm_count = 0
+    min_required_sms = 66
+    if sm_count < min_required_sms:
+        return (
+            False,
+            f"insufficient SMs for strict max-autotune GEMM (have {sm_count}, require >= {min_required_sms})",
+        )
+
+    return True, f"CC={cc}, CXX={cxx}, SMs={sm_count}"
 
 
 def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
@@ -633,6 +639,20 @@ def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | No
             mib = 1024**2
             return total_mb * mib, used_mb * mib, free_mb * mib
     return None
+
+
+def _build_adamw(model: nn.Module, lr: float, weight_decay: float, device: torch.device) -> torch.optim.Optimizer:
+    kwargs: dict[str, object] = {
+        "lr": lr,
+        "weight_decay": weight_decay,
+    }
+    if device.type == "cuda":
+        kwargs["foreach"] = True
+        try:
+            return torch.optim.AdamW(model.parameters(), fused=True, **kwargs)
+        except Exception:
+            pass
+    return torch.optim.AdamW(model.parameters(), **kwargs)
 
 
 def find_optimal_batch_size(
@@ -695,7 +715,7 @@ def find_optimal_batch_size(
     best_used_bytes = 0
 
     # Include optimizer-state allocation (Adam moments) in peak memory estimation.
-    temp_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    temp_optimizer = _build_adamw(model, lr=1e-3, weight_decay=0.0, device=device)
 
     def _measure_candidate(batch_size: int) -> tuple[bool, int]:
         torch.cuda.reset_peak_memory_stats()
@@ -1210,10 +1230,17 @@ def run_training(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(True)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
         try:
             import torch._inductor.config as inductor_config  # type: ignore
 
-            inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+            # Aggressive path: allow cudagraph on dynamic graphs when possible.
+            inductor_config.triton.cudagraph_skip_dynamic_graphs = False
             inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
         except Exception:
             pass
@@ -1408,10 +1435,11 @@ def run_training(
         ).to(device)
         compiled_train_model: nn.Module = model
 
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
+        optimizer = _build_adamw(
+            model,
             lr=config.training.learning_rate,
             weight_decay=config.training.weight_decay,
+            device=device,
         )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
 
@@ -1462,16 +1490,21 @@ def run_training(
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
-        if config.training.enable_torch_compile and hasattr(torch, "compile"):
+        if config.training.enable_torch_compile:
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("Aggressive compile mode requested, but torch.compile is unavailable in this runtime.")
+
             can_compile, reason = _can_enable_torch_compile(device)
-            if can_compile:
-                try:
-                    compiled_train_model = torch.compile(model, mode="max-autotune-no-cudagraphs")
-                    print(f"[Train {train_years}] torch.compile enabled (mode=max-autotune-no-cudagraphs, {reason})")
-                except Exception as e:
-                    print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
-            else:
-                print(f"[Train {train_years}] torch.compile skipped: {reason}")
+            if not can_compile:
+                raise RuntimeError(f"Aggressive compile mode requested, but compile precheck failed: {reason}")
+
+            try:
+                compiled_train_model = torch.compile(model, mode="max-autotune")
+                print(f"[Train {train_years}] torch.compile enabled (mode=max-autotune, {reason})")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Aggressive compile mode requested and compile failed. No eager fallback is allowed. Root cause: {e}"
+                ) from e
 
         epoch_pbar = tqdm(
             range(start_epoch, config.training.epochs + 1),
@@ -1635,6 +1668,7 @@ def run_training(
             )
 
             test_dates = panel.dates[context["test_ds"].valid_indices]
+            test_open_prices = panel.open_prices[context["test_ds"].valid_indices]
             test_close_prices = panel.close_prices[context["test_ds"].valid_indices]
             test_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt_t.weights_history.detach().cpu().numpy(),
@@ -1643,7 +1677,9 @@ def run_training(
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
                 buy_fee_rate=0.001425,
-                sell_fee_rate=0.004425,
+                sell_fee_rate=0.002925,
+                lot_size=1000,
+                open_prices=test_open_prices,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
