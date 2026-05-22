@@ -25,25 +25,30 @@ walk_forward:
   require_future_test_year: false
 
 trading:
+  # 目前此 baseline 使用 basic 規則
+  # basic 規則買股票使用當日 close 價格成交
   frequency: daily
+  backtest_rule: basic
   fee_per_side: 0.0
   buy_fee_rate: 0.001425
   sell_fee_rate: 0.002925
   long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true
+  lot_size: 1000
+  min_fee_per_side: 20.0
 
-# model:
-#   name: mlp
-#   config_path: models/mlp.yaml
+model:
+  name: mlp
+  config_path: models/mlp.yaml
 
 # model:
 #   name: temporal_cross_asset
 #   config_path: models/temporal_cross_asset.yaml
 
-model:
-  name: portfolio_transformer
-  config_path: models/portfolio_transformer.yaml
+# model:
+#   name: portfolio_transformer
+#   config_path: models/portfolio_transformer.yaml
 
 training:
   backend: pytorch
@@ -52,7 +57,7 @@ training:
   non_blocking_transfer: true
   enable_torch_compile: true
   torch_compile_mode: reduce-overhead
-  compile_max_autotune_gemm: "on"   # auto | on | off
+  compile_max_autotune_gemm: "off"   # auto | on | off
   compile_autotune_min_sms: 66
   batch_size: 2048
   batch_size_train: 2048
