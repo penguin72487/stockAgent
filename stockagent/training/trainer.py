@@ -366,6 +366,7 @@ def _evaluate_tensor_batch(
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
+    cpu_device = torch.device("cpu")
     weights_chunks: list[torch.Tensor] = []
     returns_chunks: list[torch.Tensor] = []
     masks_chunks: list[torch.Tensor] = []
@@ -380,10 +381,11 @@ def _evaluate_tensor_batch(
             with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
-            weights_chunks.append(weights_chunk.float())
-            returns_chunks.append(returns_chunk.float())
-            masks_chunks.append(mask_chunk)
-            benchmark_chunks.append(bench_chunk.float())
+            # Keep chunking memory-bounded by offloading each chunk immediately.
+            weights_chunks.append(weights_chunk.float().to(device=cpu_device, non_blocking=False))
+            returns_chunks.append(returns_chunk.float().to(device=cpu_device, non_blocking=False))
+            masks_chunks.append(mask_chunk.to(device=cpu_device, non_blocking=False))
+            benchmark_chunks.append(bench_chunk.float().to(device=cpu_device, non_blocking=False))
 
         weights = torch.cat(weights_chunks, dim=0)
         future_log_returns_t = torch.cat(returns_chunks, dim=0)
@@ -1473,6 +1475,13 @@ def run_training(
             else:
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")
 
+        train_loader: DataLoader | None = None
+        if config.training.num_workers > 0:
+            train_loader = _build_loader(train_ds, train_batch_size, True, config, device)
+            print(f"[Train {train_years}] training mode=dataloader (num_workers={config.training.num_workers})")
+        else:
+            print(f"[Train {train_years}] training mode=tensor (num_workers={config.training.num_workers})")
+
         epoch_pbar = tqdm(
             range(start_epoch, config.training.epochs + 1),
             desc=f"Train {train_years} Epochs",
@@ -1481,22 +1490,36 @@ def run_training(
         )
         val_backtest: BacktestResultTensor | None = None
         for epoch in epoch_pbar:
-            train_loss = _train_epoch_tensor(
-                compiled_train_model,
-                train_x,
-                train_returns,
-                train_masks,
-                train_sample_mask,
-                optimizer,
-                scaler,
-                batch_size=train_batch_size,
-                device=device,
-                amp_dtype=amp_dtype,
-                non_blocking=non_blocking,
-                fee_per_side=config.trading.fee_per_side,
-                gamma_sharpe=config.evaluation.gamma_sharpe,
-                gamma_turnover=config.evaluation.gamma_turnover,
-            )
+            if train_loader is not None:
+                train_loss = _train_epoch(
+                    compiled_train_model,
+                    train_loader,
+                    optimizer,
+                    scaler,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.fee_per_side,
+                    config.evaluation.gamma_sharpe,
+                    config.evaluation.gamma_turnover,
+                )
+            else:
+                train_loss = _train_epoch_tensor(
+                    compiled_train_model,
+                    train_x,
+                    train_returns,
+                    train_masks,
+                    train_sample_mask,
+                    optimizer,
+                    scaler,
+                    batch_size=train_batch_size,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    non_blocking=non_blocking,
+                    fee_per_side=config.trading.fee_per_side,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                )
 
             val_backtest, _, _ = _evaluate_tensor_batch(
                 model,
@@ -1515,8 +1538,14 @@ def run_training(
             for index, (fold_id, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
-                val_returns_slice = combined_val_returns[start:end].to(device=device, non_blocking=non_blocking)
-                val_masks_slice = combined_val_masks[start:end].to(device=device, non_blocking=non_blocking)
+                val_returns_slice = combined_val_returns[start:end].to(
+                    device=val_backtest.weights_history.device,
+                    non_blocking=False,
+                )
+                val_masks_slice = combined_val_masks[start:end].to(
+                    device=val_backtest.weights_history.device,
+                    non_blocking=False,
+                )
                 val_loss_tensor = sharpe_aware_loss(
                     val_backtest.weights_history[start:end],
                     val_returns_slice,
@@ -1624,8 +1653,8 @@ def run_training(
             val_ic = ic_summary(
                 compute_ic_series_torch(
                     val_backtest.weights_history[start:end],
-                    combined_val_returns[start:end].to(device=device, non_blocking=non_blocking),
-                    combined_val_masks[start:end].to(device=device, non_blocking=non_blocking),
+                    combined_val_returns[start:end].to(device=val_backtest.weights_history.device, non_blocking=False),
+                    combined_val_masks[start:end].to(device=val_backtest.weights_history.device, non_blocking=False),
                 ).cpu().numpy()
             )
             val_met = _compute_metrics_from_tensors(

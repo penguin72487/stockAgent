@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from stockagent.backtest.simulator import run_backtest_torch
+
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
     mask_f = mask.to(dtype=predictions.dtype)
@@ -38,42 +40,37 @@ def sharpe_aware_loss(
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
 ) -> Tensor:
-    """Improved Sharpe-aware loss with numerically stable gradient flow."""
-    mask_f = tradable_mask.to(dtype=weights.dtype)
-    if sample_mask is None:
-        sample_mask_f = torch.ones(weights.size(0), device=weights.device, dtype=weights.dtype)
-    else:
-        sample_mask_f = sample_mask.to(device=weights.device, dtype=weights.dtype)
-
-    masked_weights = weights * mask_f
-    weight_sum = masked_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    normalized_weights = masked_weights / weight_sum
-
+    """Sharpe-aware loss driven by the same backtest kernel used in evaluation."""
     returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
-    gross_returns = (normalized_weights * returns).sum(dim=1)
-    valid_count = sample_mask_f.sum().clamp_min(1.0)
+    tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
+    benchmark_zeros = torch.zeros(weights.size(0), device=weights.device, dtype=returns.dtype)
 
-    # Turnover cost
-    prev_weights = torch.cat(
-        [normalized_weights.new_zeros(1, normalized_weights.size(1)), normalized_weights[:-1]],
-        dim=0,
+    backtest = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        benchmark_zeros,
+        fee_per_side,
     )
-    turnover = (normalized_weights - prev_weights).abs().sum(dim=1)
-    turnover_cost = ((turnover * sample_mask_f).sum() * fee_per_side) / valid_count
 
-    # ✅ FIXED: Improved Sharpe with stable gradients
-    # Epsilon is added inside the square root to prevent gradient explosion
-    masked_returns = gross_returns * sample_mask_f
-    mean_return = masked_returns.sum() / valid_count
-    centered = (gross_returns - mean_return) * sample_mask_f
-    variance = (centered ** 2).sum() / valid_count
-    
-    eps = 1e-8
-    std_return = torch.sqrt(variance + eps)  # Epsilon inside sqrt for stable gradients
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights.dtype))
-    
+    if sample_mask is None:
+        valid_mask = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
+    else:
+        valid_mask = sample_mask.to(device=weights.device, dtype=torch.bool)
+
+    valid_returns = backtest.strategy_returns[valid_mask]
+    if valid_returns.numel() == 0:
+        return weights.sum() * 0.0
+
+    mean_return = valid_returns.mean()
+    variance = (valid_returns - mean_return).pow(2).mean()
+    std_return = torch.sqrt(variance + 1e-8)
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=valid_returns.dtype))
     sharpe = mean_return / std_return * annualizer
-    
-    # Composite loss
-    loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_cost
+
+    # Keep turnover regularization, but source it from the same backtest path.
+    valid_turnovers = backtest.turnovers[valid_mask]
+    turnover_penalty = valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(())
+
+    loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_penalty
     return loss
