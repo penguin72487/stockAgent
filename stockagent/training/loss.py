@@ -95,8 +95,8 @@ def sharpe_aware_loss(
     buy_turnover_sum = buy_turnover.sum(dim=1)
     sell_turnover_sum = sell_turnover.sum(dim=1)
 
-    buy_fee = buy_fee_rate * buy_turnover_sum
-    sell_fee = sell_fee_rate * sell_turnover_sum
+    buy_fee_components = buy_fee_rate * buy_turnover
+    sell_fee_components = sell_fee_rate * sell_turnover
 
     if min_fee_per_side > 0.0:
         fee_floor = torch.as_tensor(
@@ -104,8 +104,19 @@ def sharpe_aware_loss(
             device=weights.device,
             dtype=weights_f.dtype,
         )
-        buy_fee = torch.where(buy_turnover_sum > 0, torch.maximum(buy_fee, fee_floor), buy_fee)
-        sell_fee = torch.where(sell_turnover_sum > 0, torch.maximum(sell_fee, fee_floor), sell_fee)
+        buy_fee_components = torch.where(
+            buy_turnover > 0,
+            torch.maximum(buy_fee_components, fee_floor),
+            buy_fee_components,
+        )
+        sell_fee_components = torch.where(
+            sell_turnover > 0,
+            torch.maximum(sell_fee_components, fee_floor),
+            sell_fee_components,
+        )
+
+    buy_fee = buy_fee_components.sum(dim=1)
+    sell_fee = sell_fee_components.sum(dim=1)
 
     net_returns = gross - buy_fee - sell_fee
 

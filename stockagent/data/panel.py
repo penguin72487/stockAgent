@@ -82,6 +82,7 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
 
     frame["open_raw"] = open_num.astype(np.float32)
     frame["close_raw"] = close_num.astype(np.float32)
+    frame["adjclose_raw"] = adjclose_num.astype(np.float32)
 
     # User-defined feature timing:
     # - open/max/min/close/adjclose/Trading_Volume use previous-day values at row t
@@ -103,9 +104,18 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     valid_factor = np.isfinite(close_arr) & np.isfinite(adjclose_arr) & (close_arr > 0.0)
     np.divide(adjclose_arr, close_arr, out=adj_factor, where=valid_factor)
     adj_open_arr = open_num.to_numpy(dtype=np.float64, copy=False) * adj_factor
-    frame["return_1d"] = _safe_log_ratio(pd.Series(adjclose_arr, index=frame.index), pd.Series(adj_open_arr, index=frame.index))
-    extreme_return = frame["return_1d"].abs().gt(MAX_ABS_DAILY_LOG_RETURN)
-    frame.loc[extreme_return, "return_1d"] = np.nan
+    frame["return_intraday_1d"] = _safe_log_ratio(
+        pd.Series(adjclose_arr, index=frame.index),
+        pd.Series(adj_open_arr, index=frame.index),
+    )
+    extreme_return = frame["return_intraday_1d"].abs().gt(MAX_ABS_DAILY_LOG_RETURN)
+    frame.loc[extreme_return, "return_intraday_1d"] = np.nan
+
+    # Close-to-close adjusted return used by basic/overnight rules.
+    frame["return_adjclose_cc_1d"] = _safe_log_ratio(
+        pd.Series(adjclose_arr, index=frame.index),
+        pd.Series(adjclose_arr, index=frame.index).shift(1),
+    )
 
     # Baseline benchmark: adjusted close-to-close log return.
     frame["benchmark_return_1d"] = _safe_log_ratio(
@@ -147,6 +157,7 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
 
     gdf["open_raw"] = open_num.astype("float32")
     gdf["close_raw"] = close_num.astype("float32")
+    gdf["adjclose_raw"] = adjclose_num.astype("float32")
     gdf["open"] = open_num.shift(1).astype("float32")
     gdf["max"] = max_num.shift(1).astype("float32")
     gdf["min"] = min_num.shift(1).astype("float32")
@@ -160,9 +171,14 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     adj_open = open_num * adj_factor
     valid_ret = (adjclose_num > 0) & (adj_open > 0)
     ret_ratio = (adjclose_num / adj_open).where(valid_ret)
-    gdf["return_1d"] = np.log(ret_ratio)
-    extreme_return = gdf["return_1d"].abs() > MAX_ABS_DAILY_LOG_RETURN
-    gdf.loc[extreme_return, "return_1d"] = np.nan
+    gdf["return_intraday_1d"] = np.log(ret_ratio)
+    extreme_return = gdf["return_intraday_1d"].abs() > MAX_ABS_DAILY_LOG_RETURN
+    gdf.loc[extreme_return, "return_intraday_1d"] = np.nan
+
+    prev_adjclose_for_cc = adjclose_num.shift(1)
+    valid_cc = (adjclose_num > 0) & (prev_adjclose_for_cc > 0)
+    cc_ratio = (adjclose_num / prev_adjclose_for_cc).where(valid_cc)
+    gdf["return_adjclose_cc_1d"] = np.log(cc_ratio)
 
     prev_adjclose = adjclose_num.shift(1)
     valid_bench = (adjclose_num > 0) & (prev_adjclose > 0)
@@ -180,7 +196,11 @@ def _build_panel_from_frame(
     symbols: list[str],
     *,
     include_next_open_feature: bool,
+    target_return_mode: str,
 ) -> PanelData:
+    mode = str(target_return_mode).strip().lower()
+    if mode not in {"intraday", "adjclose_cc"}:
+        raise ValueError(f"Unsupported target_return_mode: {target_return_mode!r}")
     feature_columns = _get_feature_columns(frame_all, include_next_open_feature=include_next_open_feature)
 
     all_dates = sorted(frame_all["date"].dropna().unique().tolist())
@@ -205,9 +225,12 @@ def _build_panel_from_frame(
     feature_values = frame_all[feature_columns].to_numpy(dtype=np.float32, copy=False)
     features[row_idx, sym_idx, :] = feature_values
 
-    returns_1d[row_idx, sym_idx] = frame_all["return_1d"].to_numpy(dtype=np.float32, copy=False)
+    return_col = "return_intraday_1d" if mode == "intraday" else "return_adjclose_cc_1d"
+    close_col = "close_raw" if mode == "intraday" else "adjclose_raw"
+
+    returns_1d[row_idx, sym_idx] = frame_all[return_col].to_numpy(dtype=np.float32, copy=False)
     open_prices[row_idx, sym_idx] = frame_all["next_open"].to_numpy(dtype=np.float32, copy=False)
-    close_prices[row_idx, sym_idx] = frame_all["close_raw"].to_numpy(dtype=np.float32, copy=False)
+    close_prices[row_idx, sym_idx] = frame_all[close_col].to_numpy(dtype=np.float32, copy=False)
     tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
     alive_mask[row_idx, sym_idx] = frame_all["close_raw"].notna().to_numpy(dtype=bool, copy=False)
 
@@ -325,6 +348,7 @@ def _save_panel_cache(
     source_hash: str,
     *,
     include_next_open_feature: bool,
+    target_return_mode: str,
 ) -> None:
     np.savez_compressed(
         cache_path,
@@ -346,6 +370,7 @@ def _save_panel_cache(
         'num_dates': panel.num_dates,
         'num_symbols': panel.num_symbols,
         'include_next_open_feature': bool(include_next_open_feature),
+        'target_return_mode': str(target_return_mode),
     }
     with open(meta_path, 'wb') as f:
         pickle.dump(meta, f)
@@ -377,6 +402,7 @@ def _check_cache_valid(
     parquet_paths: list[Path],
     *,
     include_next_open_feature: bool,
+    target_return_mode: str,
 ) -> bool:
     """Check if cache is valid based on source hash and mtime."""
     if not meta_path.exists():
@@ -391,7 +417,8 @@ def _check_cache_valid(
         cache_valid = (
             meta.get('source_hash') == expected_hash and 
             meta.get('version') == PANEL_CACHE_VERSION and
-            bool(meta.get('include_next_open_feature', True)) == bool(include_next_open_feature)
+            bool(meta.get('include_next_open_feature', True)) == bool(include_next_open_feature) and
+            str(meta.get('target_return_mode', 'intraday')) == str(target_return_mode)
         )
         
         if cache_valid:
@@ -413,6 +440,7 @@ def build_panel(
     use_rapids: bool = True,
     *,
     include_next_open_feature: bool = True,
+    target_return_mode: str = "intraday",
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob("*_features.parquet"))
@@ -423,7 +451,12 @@ def build_panel(
     meta_path = _cache_meta_path(parquet_root)
     
     # Check cache validity
-    if _check_cache_valid(meta_path, parquet_paths, include_next_open_feature=include_next_open_feature):
+    if _check_cache_valid(
+        meta_path,
+        parquet_paths,
+        include_next_open_feature=include_next_open_feature,
+        target_return_mode=target_return_mode,
+    ):
         print(f"[panel] loading cache (valid): {cache_path}")
         panel = _load_panel_cache(cache_path)
         _print_feature_overview(panel)
@@ -451,6 +484,7 @@ def build_panel(
                     frame_all_cudf,
                     symbols_cudf,
                     include_next_open_feature=include_next_open_feature,
+                    target_return_mode=target_return_mode,
                 )
                 source_hash = _compute_source_hash(parquet_paths)
                 _save_panel_cache(
@@ -459,6 +493,7 @@ def build_panel(
                     panel,
                     source_hash,
                     include_next_open_feature=include_next_open_feature,
+                    target_return_mode=target_return_mode,
                 )
                 print(f"[panel] cache saved: {cache_path} (cuDF path)")
                 _print_feature_overview(panel)
@@ -477,6 +512,7 @@ def build_panel(
         frame_all,
         symbols,
         include_next_open_feature=include_next_open_feature,
+        target_return_mode=target_return_mode,
     )
     
     source_hash = _compute_source_hash(parquet_paths)
@@ -486,6 +522,7 @@ def build_panel(
         panel,
         source_hash,
         include_next_open_feature=include_next_open_feature,
+        target_return_mode=target_return_mode,
     )
     print(f"[panel] cache saved: {cache_path}")
     _print_feature_overview(panel)
