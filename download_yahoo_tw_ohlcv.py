@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -26,7 +27,7 @@ ISIN_SOURCES = {
     "otc": ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO"),
 }
 CODE_NAME_PATTERN = re.compile(r"^(?P<code>\d{4,6}[A-Z]{0,2})[\s\u3000]+(?P<name>.+)$")
-OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
+OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 PROBE_STATUSES = {"historical_found", "no_history", "failed"}
 ASSET_CFICODE_PREFIXES = ("ES", "CE")
 
@@ -67,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download Taiwan stock OHLCV history from Yahoo Finance into parquet files.",
     )
-    parser.add_argument("--output-dir", default="data_yahoo_tw_ohlcv", help="Directory to write parquet files.")
+    parser.add_argument("--output-dir", default="data_parquet", help="Directory to write parquet files.")
     parser.add_argument("--start-date", default="2000-01-01", help="Inclusive start date in YYYY-MM-DD.")
     parser.add_argument(
         "--end-date",
@@ -77,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(12, max(4, os.cpu_count() or 4)),
+        default=max(1, os.cpu_count() or 1),
         help="Maximum parallel Yahoo requests.",
     )
     parser.add_argument("--retries", type=int, default=2, help="Retries per symbol when Yahoo temporarily fails.")
@@ -273,7 +274,12 @@ def run_historical_probe(
                 executor.submit(_probe_symbol_january, symbol, start_year, end_year, retries): symbol
                 for symbol in pending
             }
-            for future in tqdm(as_completed(future_map), total=len(future_map), desc="Probe Jan history"):
+            for future in tqdm(
+                as_completed(future_map),
+                total=len(future_map),
+                desc="Probe Jan history",
+                file=sys.stdout,
+            ):
                 symbol, status, jan_hits, message = future.result()
                 row = {
                     "yahoo_symbol": symbol,
@@ -363,23 +369,28 @@ def _normalize_history(frame: pd.DataFrame) -> pd.DataFrame:
         "High": "max",
         "Low": "min",
         "Close": "close",
+        "Adj Close": "adjclose",
         "Volume": "Trading_Volume",
     }
-    missing = [column for column in rename_map if column not in frame.columns]
+    missing = [column for column in ["Open", "High", "Low", "Close", "Volume"] if column not in frame.columns]
     if missing:
         raise ValueError(f"Yahoo response missing expected columns: {missing}")
 
-    normalized = frame.rename(columns=rename_map)[list(rename_map.values())].copy()
+    normalized = frame.rename(columns=rename_map).copy()
+    if "adjclose" not in normalized.columns:
+        normalized["adjclose"] = normalized["close"]
+    normalized = normalized[list(rename_map.values())].copy()
     normalized = normalized.reset_index().rename(columns={normalized.index.name or "Date": "date"})
     if "date" not in normalized.columns:
         normalized = normalized.rename(columns={normalized.columns[0]: "date"})
 
     normalized["date"] = pd.to_datetime(normalized["date"], utc=True).dt.tz_localize(None)
-    for column in ["open", "max", "min", "close"]:
+    for column in ["open", "max", "min", "close", "adjclose"]:
         normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     normalized["Trading_Volume"] = pd.to_numeric(normalized["Trading_Volume"], errors="coerce")
 
     normalized = normalized.dropna(subset=["date", "open", "max", "min", "close"])
+    normalized["adjclose"] = normalized["adjclose"].fillna(normalized["close"])
     normalized["Trading_Volume"] = normalized["Trading_Volume"].fillna(0).astype("int64")
     normalized = normalized.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     return normalized[OUTPUT_COLUMNS].reset_index(drop=True)
@@ -391,6 +402,8 @@ def _load_existing_history(path: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     existing = existing.copy()
+    if "adjclose" not in existing.columns:
+        existing["adjclose"] = existing.get("close")
     existing["date"] = pd.to_datetime(existing["date"], utc=True).dt.tz_localize(None)
     return existing[OUTPUT_COLUMNS].sort_values("date").drop_duplicates(subset=["date"], keep="last")
 
@@ -503,6 +516,9 @@ def _fill_symbol_by_calendar(path: Path, calendar: pd.DatetimeIndex) -> FillResu
     prev_close = reindexed["close"].ffill()
     for column in ["open", "max", "min", "close"]:
         reindexed.loc[inserted_rows, column] = prev_close.loc[inserted_rows]
+    prev_adjclose = reindexed["adjclose"].ffill()
+    reindexed.loc[inserted_rows, "adjclose"] = prev_adjclose.loc[inserted_rows]
+    reindexed["adjclose"] = reindexed["adjclose"].fillna(reindexed["close"])
 
     reindexed.loc[inserted_rows, "Trading_Volume"] = 0
     reindexed["Trading_Volume"] = pd.to_numeric(reindexed["Trading_Volume"], errors="coerce").fillna(0).astype("int64")
@@ -549,7 +565,7 @@ def fill_missing_dates(
         )
 
         pass_results: list[FillResult] = []
-        for path in tqdm(parquet_paths, desc=f"Fill missing dates (pass {pass_id})"):
+        for path in tqdm(parquet_paths, desc=f"Fill missing dates (pass {pass_id})", file=sys.stdout):
             pass_results.append(_fill_symbol_by_calendar(path, market_calendar))
 
         pass_filled_rows = sum(result.filled_rows for result in pass_results)
@@ -770,7 +786,12 @@ def main() -> None:
             ): record
             for record in symbols
         }
-        for future in tqdm(as_completed(future_map), total=len(future_map), desc="Yahoo Finance"):
+        for future in tqdm(
+            as_completed(future_map),
+            total=len(future_map),
+            desc="Yahoo Finance",
+            file=sys.stdout,
+        ):
             results.append(future.result())
 
     results.sort(key=lambda item: item.code)
