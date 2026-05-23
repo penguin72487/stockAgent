@@ -188,6 +188,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 data_parquet/*
+data_yahoo/*
 artifacts/*
 *.7z
 artifacts_test/*

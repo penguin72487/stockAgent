@@ -53,6 +53,17 @@ def _safe_log_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return pd.Series(out, index=numerator.index)
 
 
+def _compute_tradable_from_frame(frame: pd.DataFrame) -> pd.Series:
+    close_is_valid = frame["close"].notna()
+    if "Trading_Volume" not in frame.columns:
+        return close_is_valid
+
+    volume = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+    has_positive_volume = volume.fillna(0).gt(0)
+    volume_missing = volume.isna()
+    return close_is_valid & (has_positive_volume | volume_missing)
+
+
 def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame = pd.read_parquet(path).copy()
     if not pd.api.types.is_datetime64_any_dtype(frame["date"]):
@@ -63,8 +74,7 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
 
     frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
 
-    volume = frame["Trading_Volume"] if "Trading_Volume" in frame.columns else pd.Series(0.0, index=frame.index)
-    frame["tradable"] = frame["close"].notna() & pd.Series(volume).fillna(0).gt(0)
+    frame["tradable"] = _compute_tradable_from_frame(frame)
 
     for col in ["open", "max", "min", "close"]:
         if col in frame.columns:
@@ -93,10 +103,10 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     gdf["return_1d"] = np.log(ret_ratio)
 
     if "Trading_Volume" in gdf.columns:
-        vol = gdf["Trading_Volume"].fillna(0)
+        vol = gdf["Trading_Volume"]
+        gdf["tradable"] = gdf["close"].notnull() & ((vol.fillna(0) > 0) | vol.isnull())
     else:
-        vol = 0
-    gdf["tradable"] = gdf["close"].notnull() & (vol > 0)
+        gdf["tradable"] = gdf["close"].notnull()
 
     for col in ["open", "max", "min", "close"]:
         if col in gdf.columns:
