@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shutil
 import subprocess
@@ -16,14 +15,6 @@ from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-# ✅ OPTIMIZATION: Configure logging for training monitoring
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S',
-)
-logger = logging.getLogger(__name__)
 
 from stockagent.backtest.report import (
     compute_metrics,
@@ -366,11 +357,29 @@ def _evaluate_tensor_batch(
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
-    cpu_device = torch.device("cpu")
     weights_chunks: list[torch.Tensor] = []
-    returns_chunks: list[torch.Tensor] = []
-    masks_chunks: list[torch.Tensor] = []
+    strategy_chunks: list[torch.Tensor] = []
     benchmark_chunks: list[torch.Tensor] = []
+    turnover_chunks: list[torch.Tensor] = []
+
+    n_rows = 0
+    sum_r = 0.0
+    sumsq_r = 0.0
+    sum_b = 0.0
+    sumsq_b = 0.0
+    sum_turnover = 0.0
+    hit_count = 0.0
+
+    ic_count = 0
+    ic_sum = 0.0
+    ic_sumsq = 0.0
+    ic_pos = 0.0
+
+    # Online max drawdown in log space.
+    cum_log = torch.tensor(0.0, device=device, dtype=torch.float64)
+    running_max_log = torch.tensor(0.0, device=device, dtype=torch.float64)
+    min_dd = torch.tensor(0.0, device=device, dtype=torch.float64)
+
     with torch.inference_mode():
         for start in range(0, x.size(0), chunk_rows):
             end = min(start + chunk_rows, x.size(0))
@@ -381,24 +390,103 @@ def _evaluate_tensor_batch(
             with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
-            # Keep chunking memory-bounded by offloading each chunk immediately.
-            weights_chunks.append(weights_chunk.float().to(device=cpu_device, non_blocking=False))
-            returns_chunks.append(returns_chunk.float().to(device=cpu_device, non_blocking=False))
-            masks_chunks.append(mask_chunk.to(device=cpu_device, non_blocking=False))
-            benchmark_chunks.append(bench_chunk.float().to(device=cpu_device, non_blocking=False))
+            backtest_chunk = run_backtest_torch(weights_chunk, returns_chunk, mask_chunk, bench_chunk, fee_per_side)
+            ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
+
+            weights_chunks.append(backtest_chunk.weights_history)
+            strategy_chunks.append(backtest_chunk.strategy_returns)
+            benchmark_chunks.append(backtest_chunk.benchmark_returns)
+            turnover_chunks.append(backtest_chunk.turnovers)
+
+            r = torch.nan_to_num(backtest_chunk.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+            b = torch.nan_to_num(backtest_chunk.benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+            t = torch.nan_to_num(backtest_chunk.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+
+            n_rows += int(r.numel())
+            sum_r += float(r.sum().item())
+            sumsq_r += float((r * r).sum().item())
+            sum_b += float(b.sum().item())
+            sumsq_b += float((b * b).sum().item())
+            sum_turnover += float(t.sum().item())
+            hit_count += float((r > 0).to(torch.float64).sum().item())
+
+            cum_log_chunk = torch.cumsum(r, dim=0) + cum_log
+            running_max_chunk = torch.maximum(torch.cummax(cum_log_chunk, dim=0).values, running_max_log)
+            dd_chunk = torch.expm1(torch.clamp(cum_log_chunk - running_max_chunk, min=-745.0, max=0.0))
+            min_dd = torch.minimum(min_dd, dd_chunk.min())
+            cum_log = cum_log_chunk[-1]
+            running_max_log = running_max_chunk[-1]
+
+            ic_clean = ic_chunk[torch.isfinite(ic_chunk)]
+            if ic_clean.numel() > 0:
+                ic_clean64 = ic_clean.to(torch.float64)
+                ic_count += int(ic_clean64.numel())
+                ic_sum += float(ic_clean64.sum().item())
+                ic_sumsq += float((ic_clean64 * ic_clean64).sum().item())
+                ic_pos += float((ic_clean64 > 0).to(torch.float64).sum().item())
 
         weights = torch.cat(weights_chunks, dim=0)
-        future_log_returns_t = torch.cat(returns_chunks, dim=0)
-        tradable_mask_t = torch.cat(masks_chunks, dim=0)
-        benchmark_t = torch.cat(benchmark_chunks, dim=0)
-
-        backtest = run_backtest_torch(weights, future_log_returns_t, tradable_mask_t, benchmark_t, fee_per_side)
-        ic = ic_summary(compute_ic_series_torch(weights, future_log_returns_t, tradable_mask_t).detach().cpu().numpy())
-        metrics = _compute_metrics_from_tensors(
-            backtest.strategy_returns,
-            backtest.benchmark_returns,
-            backtest.turnovers,
+        strategy_returns = torch.cat(strategy_chunks, dim=0)
+        benchmark_returns = torch.cat(benchmark_chunks, dim=0)
+        turnovers = torch.cat(turnover_chunks, dim=0)
+        backtest = BacktestResultTensor(
+            strategy_returns=strategy_returns,
+            benchmark_returns=benchmark_returns,
+            turnovers=turnovers,
+            weights_history=weights,
         )
+
+        if n_rows <= 0:
+            metrics = {
+                "cumulative_return": 0.0,
+                "annualized_return": 0.0,
+                "sharpe": 0.0,
+                "baseline_sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "turnover": 0.0,
+                "daily_hit_rate": 0.0,
+                "excess_return_vs_universe_average": 0.0,
+                "cumulative_benchmark": 0.0,
+            }
+        else:
+            n = float(n_rows)
+            mean_r = sum_r / n
+            mean_b = sum_b / n
+            var_r = max(0.0, sumsq_r / n - mean_r * mean_r)
+            var_b = max(0.0, sumsq_b / n - mean_b * mean_b)
+            std_r = var_r ** 0.5
+            std_b = var_b ** 0.5
+            cum_r = float(torch.expm1(torch.tensor(sum_r, dtype=torch.float64)).item())
+            cum_b = float(torch.expm1(torch.tensor(sum_b, dtype=torch.float64)).item())
+            ann_r = float(torch.expm1(torch.tensor(mean_r * 252.0, dtype=torch.float64)).item())
+            sharpe = float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0
+            baseline_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
+
+            metrics = {
+                "cumulative_return": cum_r,
+                "annualized_return": ann_r,
+                "sharpe": sharpe,
+                "baseline_sharpe": baseline_sharpe,
+                "max_drawdown": float(min_dd.item()),
+                "turnover": sum_turnover / n,
+                "daily_hit_rate": hit_count / n,
+                "excess_return_vs_universe_average": cum_r - cum_b,
+                "cumulative_benchmark": cum_b,
+            }
+
+        if ic_count <= 0:
+            ic = {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
+        else:
+            ic_n = float(ic_count)
+            ic_mean = ic_sum / ic_n
+            ic_var = max(0.0, ic_sumsq / ic_n - ic_mean * ic_mean)
+            ic_std = (ic_var ** 0.5) + 1e-8
+            ic = {
+                "ic_mean": ic_mean,
+                "ic_std": ic_std,
+                "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
+                "ic_positive_ratio": ic_pos / ic_n,
+            }
     return backtest, ic, metrics
 
 
@@ -942,19 +1030,12 @@ def _train_epoch(
                 weights,
                 batch["future_log_returns"],
                 batch["tradable_mask"],
-                fee_per_side,
+                fee_per_side=fee_per_side,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
         
         scaler.scale(loss).backward()
-        
-        # ✅ OPTIMIZATION: Monitor gradient norms for training stability
-        grad_norm = 0.0
-        for param in model.parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.data.norm(2).item() ** 2
-        grad_norm = grad_norm ** 0.5
         
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -963,15 +1044,6 @@ def _train_epoch(
         
         total_loss += float(loss.detach().cpu())
         steps += 1
-        
-        # ✅ OPTIMIZATION: Log VRAM usage every 10 steps
-        if steps % 10 == 0 and device.type == "cuda":
-            vram_gb = torch.cuda.memory_allocated(device) / 1e9
-            vram_reserved_gb = torch.cuda.memory_reserved(device) / 1e9
-            logger.info(
-                f"Step {steps} | Loss {loss:.6f} | GradNorm {grad_norm:.4f} | "
-                f"VRAM {vram_gb:.2f}GB/{vram_reserved_gb:.2f}GB"
-            )
     
     return total_loss / max(steps, 1)
 
