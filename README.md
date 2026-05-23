@@ -49,6 +49,8 @@ Multi-asset Taiwan stock trading research workspace.
 - Repair mode checks each symbol file for existence, latest date, and required schema columns (`date/open/max/min/close/adjclose`); missing/broken/stale/schema-mismatch symbols are repaired automatically.
 - Repair outputs include top-level `repair_summary.json` and per-asset `repair_report.csv`.
 - Adjust overlap with `--repair-overlap-days` (default `7`) to re-fetch a small trailing window before the local last date.
+- If Yahoo returns `possibly delisted; no timezone found`, that ticker is automatically appended to per-asset `yahoo_blacklist.txt` and skipped in later runs.
+- Successfully downloaded Yahoo tickers are persisted into per-asset `yahoo_whitelist.txt`.
 
 ## Environment
 
