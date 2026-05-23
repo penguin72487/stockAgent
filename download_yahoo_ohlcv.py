@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import io
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -48,6 +51,7 @@ CRYPTO_SYMBOL_PATTERN = re.compile(r"^[a-z]{2,8}$")
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose"}
+BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
 DEFAULT_SYMBOLS: dict[str, list[tuple[str, str, str]]] = {
     "us_stocks": [
         ("AAPL", "Apple", "AAPL"),
@@ -218,6 +222,104 @@ class RepairCheck:
     message: str | None = None
 
 
+def _blacklist_file_path(output_dir: Path) -> Path:
+    return output_dir / "yahoo_blacklist.txt"
+
+
+def _whitelist_file_path(output_dir: Path) -> Path:
+    return output_dir / "yahoo_whitelist.txt"
+
+
+def _load_blacklist(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    symbols: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            value = line.strip().upper()
+            if not value or value.startswith("#"):
+                continue
+            symbols.add(value)
+    return symbols
+
+
+def _load_whitelist(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    symbols: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            value = line.strip().upper()
+            if not value or value.startswith("#"):
+                continue
+            symbols.add(value)
+    return symbols
+
+
+def _append_blacklist_symbol(path: Path, symbol: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{symbol}\n")
+
+
+def _append_whitelist_symbol(path: Path, symbol: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{symbol}\n")
+
+
+def _blacklist_symbol(
+    symbol: str,
+    blacklist_symbols: set[str] | None,
+    blacklist_path: Path | None,
+    blacklist_lock: threading.Lock | None,
+) -> None:
+    if blacklist_symbols is None or blacklist_path is None:
+        return
+
+    normalized = symbol.strip().upper()
+    if not normalized:
+        return
+
+    if blacklist_lock is None:
+        if normalized in blacklist_symbols:
+            return
+        blacklist_symbols.add(normalized)
+        _append_blacklist_symbol(blacklist_path, normalized)
+
+
+def _whitelist_symbol(
+    symbol: str,
+    whitelist_symbols: set[str] | None,
+    whitelist_path: Path | None,
+    whitelist_lock: threading.Lock | None,
+) -> None:
+    if whitelist_symbols is None or whitelist_path is None:
+        return
+
+    normalized = symbol.strip().upper()
+    if not normalized:
+        return
+
+    if whitelist_lock is None:
+        if normalized in whitelist_symbols:
+            return
+        whitelist_symbols.add(normalized)
+        _append_whitelist_symbol(whitelist_path, normalized)
+        return
+
+    with whitelist_lock:
+        if normalized in whitelist_symbols:
+            return
+        whitelist_symbols.add(normalized)
+        _append_whitelist_symbol(whitelist_path, normalized)
+        return
+
+    with blacklist_lock:
+        if normalized in blacklist_symbols:
+            return
+        blacklist_symbols.add(normalized)
+        _append_blacklist_symbol(blacklist_path, normalized)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Yahoo Finance OHLCV data into asset-specific parquet directories.")
     parser.add_argument(
@@ -267,7 +369,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--alpha-vantage-api-key",
-        default=os.environ.get("ALPHAVANTAGE_API_KEY", ""),
+        default=os.environ.get("ALPHAVANTAGE_API_KEY", "9IXWNBG0V9S16NPI"),
         help="Alpha Vantage API key for US delisted listing status (or set ALPHAVANTAGE_API_KEY env).",
     )
     parser.add_argument(
@@ -641,11 +743,29 @@ def _download_symbol(
     retries: int,
     refresh: bool,
     merge_existing: bool = False,
+    blacklist_symbols: set[str] | None = None,
+    blacklist_path: Path | None = None,
+    blacklist_lock: threading.Lock | None = None,
+    whitelist_symbols: set[str] | None = None,
+    whitelist_path: Path | None = None,
+    whitelist_lock: threading.Lock | None = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     candidate_symbols = [symbol for symbol in YAHOO_SYMBOL_SPLIT_PATTERN.split(record.yahoo_symbol.strip()) if symbol]
     if not candidate_symbols:
         candidate_symbols = [record.yahoo_symbol.strip()]
+    candidates_to_try = [symbol for symbol in candidate_symbols if (blacklist_symbols is None or symbol.upper() not in blacklist_symbols)]
+    if not candidates_to_try:
+        return DownloadResult(
+            asset_class=asset_class,
+            code=record.code,
+            yahoo_symbol=record.yahoo_symbol,
+            market=record.market,
+            status="blacklisted_skip",
+            rows=0,
+            output_path=str(output_path) if output_path.exists() else None,
+            message="All candidate Yahoo symbols are in blacklist.",
+        )
     if output_path.exists() and not refresh:
         if merge_existing:
             pass
@@ -685,21 +805,29 @@ def _download_symbol(
 
     period_end_exclusive = (_parse_date(end_date) + timedelta(days=1)).strftime("%Y-%m-%d")
     last_error: str | None = None
-    for candidate_symbol in candidate_symbols:
+    for candidate_symbol in candidates_to_try:
         for attempt in range(retries + 1):
             try:
-                frame = yf.download(
-                    tickers=candidate_symbol,
-                    start=start_date,
-                    end=period_end_exclusive,
-                    interval="1d",
-                    auto_adjust=False,
-                    actions=True,
-                    progress=False,
-                    threads=False,
-                    timeout=20,
-                )
+                std_capture = io.StringIO()
+                err_capture = io.StringIO()
+                with contextlib.redirect_stdout(std_capture), contextlib.redirect_stderr(err_capture):
+                    frame = yf.download(
+                        tickers=candidate_symbol,
+                        start=start_date,
+                        end=period_end_exclusive,
+                        interval="1d",
+                        auto_adjust=False,
+                        actions=True,
+                        progress=False,
+                        threads=False,
+                        timeout=20,
+                    )
                 normalized = _normalize_download_frame(frame)
+                captured = f"{std_capture.getvalue()}\n{err_capture.getvalue()}".lower()
+                if BLACKLIST_TRIGGER_TEXT in captured:
+                    _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
+                    last_error = f"{candidate_symbol}: {BLACKLIST_TRIGGER_TEXT}"
+                    break
                 if normalized.empty:
                     last_error = f"{candidate_symbol}: Yahoo returned no rows."
                     break
@@ -715,6 +843,7 @@ def _download_symbol(
                     normalized = normalized.reset_index(drop=True)
 
                 normalized.to_parquet(output_path, index=False)
+                _whitelist_symbol(candidate_symbol, whitelist_symbols, whitelist_path, whitelist_lock)
                 return DownloadResult(
                     asset_class=asset_class,
                     code=record.code,
@@ -726,6 +855,9 @@ def _download_symbol(
                 )
             except Exception as exc:
                 last_error = f"{candidate_symbol}: {exc}"
+                if BLACKLIST_TRIGGER_TEXT in str(exc).lower():
+                    _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
+                    break
                 if attempt < retries:
                     time.sleep(0.8 * (attempt + 1))
 
@@ -888,6 +1020,12 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
 def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str, int]:
     output_dir = _resolve_asset_output_dir(args, asset_class)
     output_dir.mkdir(parents=True, exist_ok=True)
+    blacklist_path = _blacklist_file_path(output_dir)
+    whitelist_path = _whitelist_file_path(output_dir)
+    blacklist_symbols = _load_blacklist(blacklist_path)
+    whitelist_symbols = _load_whitelist(whitelist_path)
+    blacklist_lock = threading.Lock()
+    whitelist_lock = threading.Lock()
 
     records = _resolve_symbols(asset_class, args)
     if not records:
@@ -920,6 +1058,12 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
                     args.retries,
                     True,
                     check.merge_existing,
+                    blacklist_symbols,
+                    blacklist_path,
+                    blacklist_lock,
+                    whitelist_symbols,
+                    whitelist_path,
+                    whitelist_lock,
                 ): check
                 for check in pending
             }
@@ -973,6 +1117,12 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
 def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str, int]:
     output_dir = _resolve_asset_output_dir(args, asset_class)
     output_dir.mkdir(parents=True, exist_ok=True)
+    blacklist_path = _blacklist_file_path(output_dir)
+    whitelist_path = _whitelist_file_path(output_dir)
+    blacklist_symbols = _load_blacklist(blacklist_path)
+    whitelist_symbols = _load_whitelist(whitelist_path)
+    blacklist_lock = threading.Lock()
+    whitelist_lock = threading.Lock()
 
     records = _resolve_symbols(asset_class, args)
     if not records:
@@ -992,6 +1142,12 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
                 args.retries,
                 args.refresh,
                 False,
+                blacklist_symbols,
+                blacklist_path,
+                blacklist_lock,
+                whitelist_symbols,
+                whitelist_path,
+                whitelist_lock,
             ): record
             for record in records
         }
