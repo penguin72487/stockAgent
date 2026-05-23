@@ -1560,6 +1560,15 @@ def run_training(
             leave=True,
             dynamic_ncols=True,
         )
+        early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
+        early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
+        no_improve_epochs = 0
+        if early_stop_patience > 0:
+            print(
+                f"[Train {train_years}] early stopping enabled: "
+                f"patience={early_stop_patience} epochs "
+                f"(ratio={early_stop_ratio:.2f})"
+            )
         val_backtest: BacktestResultTensor | None = None
         for epoch in epoch_pbar:
             if train_loader is not None:
@@ -1607,6 +1616,7 @@ def run_training(
             )
 
             val_losses: list[float] = []
+            any_fold_improved = False
             for index, (fold_id, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
@@ -1629,6 +1639,7 @@ def run_training(
                 val_loss = float(val_loss_tensor.detach().cpu())
                 val_losses.append(val_loss)
                 if val_loss < float(context["best_val_loss"]):
+                    any_fold_improved = True
                     context["best_val_loss"] = val_loss
                     _save_fold_checkpoint(
                         context["checkpoint_best_path"],
@@ -1660,13 +1671,27 @@ def run_training(
             )
 
             if val_losses:
+                if any_fold_improved:
+                    no_improve_epochs = 0
+                else:
+                    no_improve_epochs += 1
+
                 epoch_pbar.set_postfix(
                     {
                         "train_loss": f"{train_loss:.6f}",
                         "val_mean": f"{float(np.mean(val_losses)):.6f}",
                         "best_val": f"{min(float(c['best_val_loss']) for c in fold_contexts.values()):.6f}",
+                        "no_improve": no_improve_epochs,
                     }
                 )
+
+                if early_stop_patience > 0 and no_improve_epochs > early_stop_patience:
+                    print(
+                        f"[Train {train_years}] early stop at epoch {epoch}: "
+                        f"no improvement for {no_improve_epochs} epochs "
+                        f"(patience={early_stop_patience})"
+                    )
+                    break
 
         # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
         # the epoch loop does not run; compute validation backtest once for reporting.

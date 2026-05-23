@@ -60,6 +60,7 @@ class TrainingConfig:
     vram_safety_margin_gb: float = 1.0
     target_vram_fraction: float = 1
     epochs: int = 1000
+    early_stopping_no_improve_ratio: float = 0.2
     learning_rate: float = 1e-3
     hidden_dim: int = 1024
     hidden_layers: int = 2
@@ -108,6 +109,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("vram_safety_margin_gb", 1.0)
     training.setdefault("target_vram_fraction", 0.85)
     training.setdefault("epochs", 10)
+    training.setdefault("early_stopping_no_improve_ratio", 0.2)
     training.setdefault("learning_rate", 1e-3)
     training.setdefault("hidden_dim", 128)
     training.setdefault("hidden_layers", 2)

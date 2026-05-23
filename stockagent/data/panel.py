@@ -125,7 +125,36 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     return gdf.to_pandas()
 
 
-def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> PanelData:
+def _resolve_benchmark_index(symbols: list[str], benchmark_name: str) -> int | None:
+    key = (benchmark_name or "").strip()
+    if not key:
+        return None
+
+    if key.lower() in {"universe_average_return", "universe_average", "universe", "average"}:
+        return None
+
+    normalized = key.upper().replace("-", "").replace("_", "")
+    alias_candidates = [normalized]
+    if not normalized.endswith("USD"):
+        alias_candidates.append(f"{normalized}USD")
+
+    symbol_to_idx = {symbol.upper(): idx for idx, symbol in enumerate(symbols)}
+    for candidate in alias_candidates:
+        if candidate in symbol_to_idx:
+            return symbol_to_idx[candidate]
+
+    known = ", ".join(symbols[:10])
+    raise ValueError(
+        f"benchmark_name={benchmark_name!r} not found in panel symbols. "
+        f"Try one of: universe_average_return, BTC, BTCUSD (sample symbols: {known}...)"
+    )
+
+
+def _build_panel_from_frame(
+    frame_all: pd.DataFrame,
+    symbols: list[str],
+    benchmark_name: str = "universe_average_return",
+) -> PanelData:
     feature_columns = _get_feature_columns(frame_all)
 
     all_dates = sorted(frame_all["date"].dropna().unique().tolist())
@@ -154,16 +183,25 @@ def _build_panel_from_frame(frame_all: pd.DataFrame, symbols: list[str]) -> Pane
     tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
     alive_mask[row_idx, sym_idx] = frame_all["close"].notna().to_numpy(dtype=bool, copy=False)
 
-    valid_returns = np.isfinite(returns_1d)
-    n_valid = valid_returns.sum(axis=1)
-    sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
-    benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
-    np.divide(
-        sum_ret,
-        n_valid,
-        out=benchmark_returns,
-        where=n_valid > 0,
-    )
+    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
+    if benchmark_symbol_index is None:
+        valid_returns = np.isfinite(returns_1d)
+        n_valid = valid_returns.sum(axis=1)
+        sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
+        benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
+        np.divide(
+            sum_ret,
+            n_valid,
+            out=benchmark_returns,
+            where=n_valid > 0,
+        )
+    else:
+        benchmark_returns = np.nan_to_num(
+            returns_1d[:, benchmark_symbol_index],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
 
     features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -292,7 +330,11 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path], backend_key: 
         return False
 
 
-def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
+def build_panel(
+    parquet_root: str | Path,
+    use_rapids: bool = True,
+    benchmark_name: str = "universe_average_return",
+) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob("*_features.parquet"))
     if not parquet_paths:
@@ -303,7 +345,7 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
 
     env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
     use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
-    backend_key = "cudf" if use_cudf else "pandas"
+    backend_key = f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}"
     
     # Check cache validity
     if _check_cache_valid(meta_path, parquet_paths, backend_key):
@@ -327,7 +369,11 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
             if symbol_frames_cudf:
                 symbols_cudf = [path.name.replace("_features.parquet", "") for path in valid_paths_cudf]
                 frame_all_cudf = pd.concat(symbol_frames_cudf, ignore_index=True)
-                panel = _build_panel_from_frame(frame_all_cudf, symbols_cudf)
+                panel = _build_panel_from_frame(
+                    frame_all_cudf,
+                    symbols_cudf,
+                    benchmark_name=benchmark_name,
+                )
                 source_hash = _compute_source_hash(parquet_paths)
                 _save_panel_cache(cache_path, meta_path, panel, source_hash, backend_key)
                 print(f"[panel] cache saved: {cache_path} (cuDF path)")
@@ -335,7 +381,7 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
                 return panel
         except Exception as exc:
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
-            backend_key = "pandas"
+            backend_key = f"pandas|benchmark={benchmark_name}"
     
     symbol_frames: list[pd.DataFrame] = []
     valid_paths: list[Path] = []
@@ -354,7 +400,7 @@ def build_panel(parquet_root: str | Path, use_rapids: bool = True) -> PanelData:
 
     symbols = [path.name.replace("_features.parquet", "") for path in valid_paths]
     frame_all = pd.concat(symbol_frames, ignore_index=True)
-    panel = _build_panel_from_frame(frame_all, symbols)
+    panel = _build_panel_from_frame(frame_all, symbols, benchmark_name=benchmark_name)
     
     source_hash = _compute_source_hash(parquet_paths)
     _save_panel_cache(cache_path, meta_path, panel, source_hash, backend_key)

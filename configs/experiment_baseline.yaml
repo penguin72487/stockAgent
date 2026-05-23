@@ -12,8 +12,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_parquet
-  benchmark_name: universe_average_return
+  parquet_root: data_yahoo/us_stocks
+  benchmark_name: SPY
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -42,6 +42,7 @@ training:
   batch_size_train: 2048
   batch_size_eval: 2048
   epochs: 1000
+  early_stopping_no_improve_ratio: 0.2
   learning_rate: 0.001
   hidden_dim: 1024
   hidden_layers: 1
@@ -56,7 +57,7 @@ training:
   target_vram_fraction: 1
 
 evaluation:
-  primary_baseline: universe_average_return
+  primary_baseline: BTC
   metrics:
     - cumulative_return
     - annualized_return
