@@ -23,7 +23,7 @@ class DataConfig:
     benchmark_required: bool
     benchmark_source: str
     universe_mode: str
-    use_rapids: bool = True
+    use_rapids: bool = False
 
 
 @dataclass(slots=True)
@@ -122,7 +122,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     evaluation.setdefault("gamma_turnover", 0.0)
 
     data = raw.setdefault("data", {})
-    data.setdefault("use_rapids", True)
+    data.setdefault("use_rapids", False)
     return raw
 
 

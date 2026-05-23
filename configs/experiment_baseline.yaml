@@ -17,7 +17,7 @@ data:
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
-  use_rapids: true
+  use_rapids: false
 
 walk_forward:
   min_train_years: 1
