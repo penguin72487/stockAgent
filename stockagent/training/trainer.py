@@ -36,7 +36,7 @@ from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
-from stockagent.models.mlp import CrossSectionalMLP
+from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.loss import sharpe_aware_loss
 
@@ -1311,22 +1311,20 @@ def run_training(
             margin_bytes = int(config.training.vram_safety_margin_gb * (1024 ** 3))
             effective_budget_bytes = max(0, budget_bytes - margin_bytes)
 
-            estimation_model = CrossSectionalMLP(
+            estimation_model = build_model(
+                config=config,
                 lookback=config.training.lookback,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
-                hidden_dim=config.training.hidden_dim,
-                dropout=config.training.dropout,
-                hidden_layers=config.training.hidden_layers,
-                long_only=config.trading.long_only,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             eval_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=False)
+            estimation_hidden_dim = model_hidden_dim_hint(config)
             train_sample_bytes = _estimate_sample_bytes(
                 lookback=config.training.lookback,
                 num_symbols=panel.num_symbols,
                 num_features=len(panel.feature_names),
-                hidden_dim=config.training.hidden_dim,
+                hidden_dim=estimation_hidden_dim,
                 amp_dtype=amp_dtype,
                 training_mode=True,
             )
@@ -1334,19 +1332,16 @@ def run_training(
                 lookback=config.training.lookback,
                 num_symbols=panel.num_symbols,
                 num_features=len(panel.feature_names),
-                hidden_dim=config.training.hidden_dim,
+                hidden_dim=estimation_hidden_dim,
                 amp_dtype=amp_dtype,
                 training_mode=False,
             )
 
-            temp_model = CrossSectionalMLP(
+            temp_model = build_model(
+                config=config,
                 lookback=config.training.lookback,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
-                hidden_dim=config.training.hidden_dim,
-                dropout=config.training.dropout,
-                hidden_layers=config.training.hidden_layers,
-                long_only=config.trading.long_only,
             ).to(device)
 
             print(f"[Train {train_years}] searching optimal train batch size...")
@@ -1439,14 +1434,11 @@ def run_training(
         for length in val_lengths:
             val_offsets.append(val_offsets[-1] + length)
 
-        model = CrossSectionalMLP(
+        model = build_model(
+            config=config,
             lookback=config.training.lookback,
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
-            hidden_dim=config.training.hidden_dim,
-            dropout=config.training.dropout,
-            hidden_layers=config.training.hidden_layers,
-            long_only=config.trading.long_only,
         ).to(device)
 
         if config.training.warm_start_from_previous_fold and warm_start_checkpoint_path is not None and warm_start_checkpoint_path.exists():
