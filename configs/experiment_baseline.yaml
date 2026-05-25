@@ -12,8 +12,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/us_stocks
-  benchmark_name: SPY
+  parquet_root: data_forex_frankfurter
+  benchmark_name: JPYUSD
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -40,6 +40,7 @@ training:
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   enable_torch_compile: true
+  warm_start_from_previous_fold: false
   lookback: 1
   batch_size: 2048
   batch_size_train: 2048
@@ -60,7 +61,7 @@ training:
   target_vram_fraction: 1
 
 evaluation:
-  primary_baseline: BTC
+  primary_baseline: JPYUSD
   metrics:
     - cumulative_return
     - annualized_return

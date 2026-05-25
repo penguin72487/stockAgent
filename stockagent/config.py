@@ -52,6 +52,7 @@ class TrainingConfig:
     batch_mode: str
     non_blocking_transfer: bool
     enable_torch_compile: bool = False
+    warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
     lookback: int = 1
     batch_size: int = 32
@@ -107,6 +108,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
     training.setdefault("enable_torch_compile", False)
+    training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
     training.setdefault("vram_budget_gb", 8.0)
     training.setdefault("vram_safety_margin_gb", 1.0)
