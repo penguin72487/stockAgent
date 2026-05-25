@@ -54,28 +54,14 @@ class FoldResult:
 
 
 @dataclass(slots=True)
-class PredictionBufferPool:
-    weights: torch.Tensor | None = None
-    returns: torch.Tensor | None = None
-    masks: torch.Tensor | None = None
-    bench: torch.Tensor | None = None
-    capacity_rows: int = 0
-    capacity_symbols: int = 0
-
-    def ensure(self, rows: int, symbols: int) -> None:
-        if (
-            self.weights is not None
-            and rows <= self.capacity_rows
-            and symbols <= self.capacity_symbols
-        ):
-            return
-
-        self.capacity_rows = max(rows, self.capacity_rows)
-        self.capacity_symbols = max(symbols, self.capacity_symbols)
-        self.weights = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.float32)
-        self.returns = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.float32)
-        self.masks = torch.empty((self.capacity_rows, self.capacity_symbols), dtype=torch.bool)
-        self.bench = torch.empty((self.capacity_rows,), dtype=torch.float32)
+class FoldRuntimeContext:
+    fold: WalkForwardFold
+    fold_dir: Path
+    val_ds: CrossSectionalDataset
+    test_ds: CrossSectionalDataset
+    checkpoint_last_path: Path
+    checkpoint_best_path: Path
+    best_val_loss: float = float("inf")
 
 
 def _fold_dir(output_path: Path, fold_id: int) -> Path:
@@ -353,7 +339,8 @@ def _evaluate_tensor_batch(
     device: torch.device,
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
@@ -390,7 +377,14 @@ def _evaluate_tensor_batch(
             with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, mask_chunk)
 
-            backtest_chunk = run_backtest_torch(weights_chunk, returns_chunk, mask_chunk, bench_chunk, fee_per_side)
+            backtest_chunk = run_backtest_torch(
+                weights_chunk,
+                returns_chunk,
+                mask_chunk,
+                bench_chunk,
+                buy_fee_rate,
+                sell_fee_rate,
+            )
             ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
 
             weights_chunks.append(backtest_chunk.weights_history)
@@ -553,8 +547,6 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
     all_turnovers: list[np.ndarray] = []
     all_weights: list[np.ndarray] = []
     all_dates: list[np.ndarray] = []
-    first_year_fold_ids: list[int] = []
-    first_year_labels: list[int] = []
     all_first_year_dates: list[np.ndarray] = []
     all_first_year_strategy_log: list[np.ndarray] = []
     all_first_year_baseline_log: list[np.ndarray] = []
@@ -811,7 +803,8 @@ def find_optimal_batch_size(
                     logits,
                     local_batch["future_log_returns"],
                     local_batch["tradable_mask"],
-                    fee_per_side=0.0,
+                    buy_fee_rate=0.0,
+                    sell_fee_rate=0.0,
                 )
 
             loss.backward()
@@ -1012,7 +1005,8 @@ def _train_epoch(
     device: torch.device,
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     gamma_sharpe: float,
     gamma_turnover: float,
 ) -> float:
@@ -1030,7 +1024,8 @@ def _train_epoch(
                 weights,
                 batch["future_log_returns"],
                 batch["tradable_mask"],
-                fee_per_side=fee_per_side,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
@@ -1060,7 +1055,8 @@ def _train_epoch_tensor(
     device: torch.device,
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     gamma_sharpe: float,
     gamma_turnover: float,
 ) -> float:
@@ -1090,7 +1086,8 @@ def _train_epoch_tensor(
                 batch_ret,
                 batch_mask,
                 sample_mask=batch_sample_mask,
-                fee_per_side=fee_per_side,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
@@ -1105,114 +1102,6 @@ def _train_epoch_tensor(
         steps += 1
 
     return total_loss / max(steps, 1)
-
-
-def _eval_val_loss(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-    non_blocking: bool,
-    fee_per_side: float,
-    gamma_sharpe: float,
-    gamma_turnover: float,
-) -> float:
-    model.eval()
-    losses: list[float] = []
-    with torch.inference_mode():
-        for batch in loader:
-            batch = _move_batch(batch, device, non_blocking)
-            with _autocast_context(device, amp_dtype):
-                weights = model(batch["x"], batch["tradable_mask"])
-                loss = sharpe_aware_loss(
-                    weights, 
-                    batch["future_log_returns"], 
-                    batch["tradable_mask"], 
-                    fee_per_side=fee_per_side,
-                    gamma_sharpe=gamma_sharpe,
-                    gamma_turnover=gamma_turnover,
-                )
-            losses.append(float(loss.detach().cpu()))
-    return float(np.mean(losses)) if losses else float("inf")
-
-
-def _collect_predictions(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-    non_blocking: bool,
-    buffers: PredictionBufferPool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Collect all (weights, future_log_returns, tradable_mask, benchmark) from a loader."""
-    model.eval()
-    total_rows = len(loader.dataset)
-    all_weights: torch.Tensor | None = None
-    all_log_ret: torch.Tensor | None = None
-    all_masks: torch.Tensor | None = None
-    all_bench: torch.Tensor | None = None
-    cursor = 0
-
-    with torch.inference_mode():
-        for batch in loader:
-            batch = _move_batch(batch, device, non_blocking)
-            with _autocast_context(device, amp_dtype):
-                weights = model(batch["x"], batch["tradable_mask"])
-            weights_cpu = weights.float().cpu()
-            returns_cpu = batch["future_log_returns"].float().cpu()
-            masks_cpu = batch["tradable_mask"].cpu()
-            bench_cpu = batch["benchmark"].float().cpu()
-
-            if all_weights is None:
-                num_symbols = weights_cpu.size(1)
-                buffers.ensure(total_rows, num_symbols)
-                if buffers.weights is None or buffers.returns is None or buffers.masks is None or buffers.bench is None:
-                    raise RuntimeError("Failed to initialize prediction buffers.")
-                all_weights = buffers.weights[:total_rows, :num_symbols]
-                all_log_ret = buffers.returns[:total_rows, :num_symbols]
-                all_masks = buffers.masks[:total_rows, :num_symbols]
-                all_bench = buffers.bench[:total_rows]
-
-            batch_size = weights_cpu.size(0)
-            end = cursor + batch_size
-            all_weights[cursor:end] = weights_cpu
-            all_log_ret[cursor:end] = returns_cpu
-            all_masks[cursor:end] = masks_cpu
-            all_bench[cursor:end] = bench_cpu
-            cursor = end
-
-    if all_weights is None or all_log_ret is None or all_masks is None or all_bench is None:
-        raise RuntimeError("Prediction collection produced no batches.")
-
-    return (
-        all_weights,
-        all_log_ret,
-        all_masks,
-        all_bench,
-    )
-
-
-def _evaluate_split_torch(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-    non_blocking: bool,
-    fee_per_side: float,
-    buffers: PredictionBufferPool,
-) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
-    weights, log_ret, masks, bench = _collect_predictions(
-        model,
-        loader,
-        device,
-        amp_dtype,
-        non_blocking,
-        buffers,
-    )
-    backtest = run_backtest_torch(weights, log_ret, masks, bench, fee_per_side)
-    ic = ic_summary(compute_ic_series_torch(weights, log_ret, masks).cpu().numpy())
-    metrics = compute_metrics(backtest.to_numpy())
-    return backtest, ic, metrics
 
 
 def _compute_metrics_from_tensors(
@@ -1308,7 +1197,6 @@ def run_training(
     output_path.mkdir(parents=True, exist_ok=True)
 
     results_by_fold: dict[int, FoldResult] = {}
-    buffer_pool = PredictionBufferPool()
     fold_list = list(folds)
 
     if resume:
@@ -1416,7 +1304,7 @@ def run_training(
             pin_memory=(device.type == "cuda" and non_blocking),
         )
 
-        fold_contexts: dict[int, dict[str, object]] = {}
+        fold_contexts: dict[int, FoldRuntimeContext] = {}
         for fold in pending_folds:
             print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
             val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
@@ -1437,26 +1325,25 @@ def run_training(
             checkpoint_last_path = _checkpoint_path(fold_dir)
             checkpoint_best_path = _best_checkpoint_path(fold_dir)
 
-            fold_contexts[fold.fold_id] = {
-                "fold": fold,
-                "fold_dir": fold_dir,
-                "val_ds": val_ds,
-                "test_ds": test_ds,
-                "val_loader": _build_loader(val_ds, val_batch_size, False, config, device),
-                "test_loader": _build_loader(test_ds, test_batch_size, False, config, device),
-                "checkpoint_last_path": checkpoint_last_path,
-                "checkpoint_best_path": checkpoint_best_path,
-                "best_val_loss": float("inf"),
-            }
+            fold_contexts[fold.fold_id] = FoldRuntimeContext(
+                fold=fold,
+                fold_dir=fold_dir,
+                val_ds=val_ds,
+                test_ds=test_ds,
+                checkpoint_last_path=checkpoint_last_path,
+                checkpoint_best_path=checkpoint_best_path,
+            )
 
             if resume and checkpoint_best_path.exists():
                 checkpoint = _load_checkpoint(checkpoint_best_path)
-                fold_contexts[fold.fold_id]["best_val_loss"] = float(checkpoint.get("best_val_loss", float("inf")))
+                fold_contexts[fold.fold_id].best_val_loss = float(
+                    checkpoint.get("best_val_loss", float("inf"))
+                )
 
         if not fold_contexts:
             continue
 
-        val_datasets = [context["val_ds"] for context in fold_contexts.values()]
+        val_datasets = [context.val_ds for context in fold_contexts.values()]
         combined_val_x, combined_val_returns, combined_val_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
             val_datasets,  # type: ignore[arg-type]
         )
@@ -1580,7 +1467,8 @@ def run_training(
                     device,
                     amp_dtype,
                     non_blocking,
-                    config.trading.fee_per_side,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
                     config.evaluation.gamma_sharpe,
                     config.evaluation.gamma_turnover,
                 )
@@ -1597,7 +1485,8 @@ def run_training(
                     device=device,
                     amp_dtype=amp_dtype,
                     non_blocking=non_blocking,
-                    fee_per_side=config.trading.fee_per_side,
+                    buy_fee_rate=config.trading.buy_fee_rate,
+                    sell_fee_rate=config.trading.sell_fee_rate,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 )
@@ -1611,13 +1500,14 @@ def run_training(
                 device,
                 amp_dtype,
                 non_blocking,
-                config.trading.fee_per_side,
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
                 chunk_rows=eval_chunk_rows,
             )
 
             val_losses: list[float] = []
             any_fold_improved = False
-            for index, (fold_id, context) in enumerate(fold_contexts.items()):
+            for index, (_, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
                 val_returns_slice = combined_val_returns[start:end].to(
@@ -1632,18 +1522,19 @@ def run_training(
                     val_backtest.weights_history[start:end],
                     val_returns_slice,
                     val_masks_slice,
-                    fee_per_side=config.trading.fee_per_side,
+                    buy_fee_rate=config.trading.buy_fee_rate,
+                    sell_fee_rate=config.trading.sell_fee_rate,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 )
                 val_loss = float(val_loss_tensor.detach().cpu())
                 val_losses.append(val_loss)
-                if val_loss < float(context["best_val_loss"]):
+                if val_loss < context.best_val_loss:
                     any_fold_improved = True
-                    context["best_val_loss"] = val_loss
+                    context.best_val_loss = val_loss
                     _save_fold_checkpoint(
-                        context["checkpoint_best_path"],
-                        fold=context["fold"],
+                        context.checkpoint_best_path,
+                        fold=context.fold,
                         epoch=epoch,
                         best_val_loss=val_loss,
                         model=model,
@@ -1652,10 +1543,10 @@ def run_training(
                     )
 
                 _save_fold_checkpoint(
-                    context["checkpoint_last_path"],
-                    fold=context["fold"],
+                    context.checkpoint_last_path,
+                    fold=context.fold,
                     epoch=epoch,
-                    best_val_loss=float(context["best_val_loss"]),
+                    best_val_loss=context.best_val_loss,
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
@@ -1680,7 +1571,7 @@ def run_training(
                     {
                         "train_loss": f"{train_loss:.6f}",
                         "val_mean": f"{float(np.mean(val_losses)):.6f}",
-                        "best_val": f"{min(float(c['best_val_loss']) for c in fold_contexts.values()):.6f}",
+                        "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
                         "no_improve": no_improve_epochs,
                     }
                 )
@@ -1705,24 +1596,25 @@ def run_training(
                 device,
                 amp_dtype,
                 non_blocking,
-                config.trading.fee_per_side,
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
                 chunk_rows=eval_chunk_rows,
             )
         if val_backtest is None:
             raise RuntimeError("Validation backtest is unavailable in eval stage.")
 
-        for index, (fold_id, context) in enumerate(fold_contexts.items()):
-            fold = context["fold"]
-            fold_dir = context["fold_dir"]
-            best_checkpoint_path = context["checkpoint_best_path"]
+        for index, (_, context) in enumerate(fold_contexts.items()):
+            fold = context.fold
+            fold_dir = context.fold_dir
+            best_checkpoint_path = context.checkpoint_best_path
             if best_checkpoint_path.exists():
                 checkpoint = _load_checkpoint(best_checkpoint_path)
                 _load_state_dict(model, checkpoint["model_state_dict"])
-                best_val_loss = float(checkpoint.get("best_val_loss", context["best_val_loss"]))
+                best_val_loss = float(checkpoint.get("best_val_loss", context.best_val_loss))
             else:
-                best_val_loss = float(context["best_val_loss"])
+                best_val_loss = context.best_val_loss
 
-            test_x, test_returns, test_masks, test_bench = _dataset_to_tensors(context["test_ds"])
+            test_x, test_returns, test_masks, test_bench = _dataset_to_tensors(context.test_ds)
             test_x, test_returns, test_masks, test_bench = _prepare_split_tensors(
                 test_x,
                 test_returns,
@@ -1740,7 +1632,8 @@ def run_training(
                 device,
                 amp_dtype,
                 non_blocking,
-                config.trading.fee_per_side,
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
                 chunk_rows=eval_chunk_rows,
             )
 
@@ -1760,16 +1653,16 @@ def run_training(
                 val_backtest.turnovers[start:end],
             )
 
-            test_dates = panel.dates[context["test_ds"].valid_indices]
-            test_close_prices = panel.close_prices[context["test_ds"].valid_indices]
+            test_dates = panel.dates[context.test_ds.valid_indices]
+            test_close_prices = panel.close_prices[context.test_ds.valid_indices]
             test_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt_t.weights_history.detach().cpu().numpy(),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
-                buy_fee_rate=0.001425,
-                sell_fee_rate=0.004425,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,

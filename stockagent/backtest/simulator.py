@@ -73,7 +73,8 @@ def _vectorized_backtest(
     weights: np.ndarray,
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     weights_history = np.asarray(weights, dtype=np.float32).copy()
     weights_history[~tradable_mask.astype(bool)] = 0.0
@@ -86,10 +87,13 @@ def _vectorized_backtest(
         np.zeros((1, weights_history.shape[1]), dtype=np.float32),
         weights_history[:-1],
     ], axis=0)
-    turnovers = np.abs(weights_history - prev).sum(axis=1).astype(np.float32)
+    deltas = weights_history - prev
+    buy_turnovers = np.clip(deltas, 0.0, None).sum(axis=1).astype(np.float32)
+    sell_turnovers = np.clip(-deltas, 0.0, None).sum(axis=1).astype(np.float32)
+    turnovers = (buy_turnovers + sell_turnovers).astype(np.float32)
 
     gross = np.einsum("ts,ts->t", weights_history, future_returns, dtype=np.float32)
-    strategy_returns = gross - fee_per_side * turnovers
+    strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
     return strategy_returns.astype(np.float32), turnovers, weights_history
 
 
@@ -97,7 +101,8 @@ def _vectorized_backtest_torch(
     weights: torch.Tensor,
     future_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # ✅ FIXED: Simplified and more numerically stable weight normalization
     weights_history = weights.float().clone()
@@ -114,11 +119,14 @@ def _vectorized_backtest_torch(
         [torch.zeros_like(weights_history[:1]), weights_history[:-1]],
         dim=0,
     )
-    turnovers = (weights_history - prev).abs().sum(dim=1)
+    deltas = weights_history - prev
+    buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
+    sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
+    turnovers = buy_turnovers + sell_turnovers
 
     # Step 4: Compute strategy returns
     gross = (weights_history * future_returns.float()).sum(dim=1)
-    strategy_returns = gross - fee_per_side * turnovers
+    strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
     return strategy_returns.float(), turnovers.float(), weights_history.float()
 
 
@@ -127,14 +135,16 @@ def run_backtest(
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
     benchmark_returns: np.ndarray,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
         weights,
         future_returns,
         tradable_mask,
-        fee_per_side,
+        buy_fee_rate,
+        sell_fee_rate,
     )
 
     return BacktestResult(
@@ -150,14 +160,16 @@ def run_backtest_torch(
     future_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
     benchmark_returns: torch.Tensor,
-    fee_per_side: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
         weights,
         future_returns,
         tradable_mask,
-        fee_per_side,
+        buy_fee_rate,
+        sell_fee_rate,
     )
 
     return BacktestResultTensor(

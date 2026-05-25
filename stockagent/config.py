@@ -36,7 +36,8 @@ class WalkForwardConfig:
 @dataclass(slots=True)
 class TradingConfig:
     frequency: str
-    fee_per_side: float
+    buy_fee_rate: float
+    sell_fee_rate: float
     long_only: bool
     cash_allowed: bool
     use_all_tradable_symbols: bool
@@ -125,6 +126,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
+
+    trading = raw.setdefault("trading", {})
+    fee_per_side_raw = trading.get("fee_per_side", None)
+    buy_fee_raw = trading.get("buy_fee_rate", None)
+    sell_fee_raw = trading.get("sell_fee_rate", None)
+
+    if buy_fee_raw is None and sell_fee_raw is None:
+        fee = float(fee_per_side_raw or 0.0)
+        trading["buy_fee_rate"] = fee
+        trading["sell_fee_rate"] = fee
+    else:
+        trading["buy_fee_rate"] = float(buy_fee_raw if buy_fee_raw is not None else fee_per_side_raw or 0.0)
+        trading["sell_fee_rate"] = float(sell_fee_raw if sell_fee_raw is not None else fee_per_side_raw or 0.0)
+
+    # Legacy key is accepted as input but removed from the normalized config payload.
+    trading.pop("fee_per_side", None)
     return raw
 
 

@@ -11,14 +11,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(self, panel: PanelData, date_indices: np.ndarray, lookback: int) -> None:
         self.lookback = lookback
         self.date_indices = np.array(sorted(date_indices.tolist()), dtype=np.int64)
+        if self.date_indices.size == 0:
+            raise ValueError("Fold has no dates after split filtering.")
+
         # Keep only indices that have a full lookback window inside this fold.
         fold_start_idx = int(self.date_indices[0])
         min_valid_idx = fold_start_idx + lookback - 1
-        self.valid_indices = self.date_indices[self.date_indices > min_valid_idx]  # Use > instead of >=
-        
-        # ✅ OPTIMIZATION: Error checking for insufficient data
+        self.valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
+
         if len(self.valid_indices) == 0:
-            raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback + 1} dates.")
+            raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback} dates.")
 
         returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)

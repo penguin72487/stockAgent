@@ -12,8 +12,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/us_stocks
-  benchmark_name: SPY
+  parquet_root: data_forex_frankfurter
+  benchmark_name: EURUSD
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -26,7 +26,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  fee_per_side: 0.001
+  buy_fee_rate: 0.0001
+  sell_fee_rate: 0.0001
   long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true
