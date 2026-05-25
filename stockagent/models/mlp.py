@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModel
 
 
 def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -18,7 +17,7 @@ def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Te
 
 
 class CrossSectionalMLP(nn.Module):
-    """Optimized MLP with feature embedding + conditional Transformer (flash-attn)."""
+    """Cross-sectional MLP for portfolio weights."""
     def __init__(
         self,
         lookback: int,
@@ -37,41 +36,8 @@ class CrossSectionalMLP(nn.Module):
         self.hidden_layers = max(0, int(hidden_layers))
         self.long_only = bool(long_only)
         
-        # Feature embedding: compress F features to embedding_dim
-        self.feature_embedding = nn.Linear(num_features, embedding_dim)
-        
-        # ✅ OPTIMIZATION: Conditional architecture based on lookback
-        # Transformer is only useful when lookback > 1 (multiple timesteps)
-        if lookback > 1:
-            # Use transformers with flash-attn (with fallback to eager if flash-attn unavailable)
-            config = AutoConfig.from_pretrained(
-                "bert-base-uncased",
-                hidden_size=embedding_dim,
-                num_hidden_layers=2,
-                num_attention_heads=8,
-                intermediate_size=256,
-                hidden_dropout_prob=dropout,
-                attention_probs_dropout_prob=dropout,
-                max_position_embeddings=lookback + 10,
-            )
-            
-            # Try to use flash_attention_2, fallback to eager
-            try:
-                config.attn_implementation = "flash_attention_2"
-                self.transformer = AutoModel.from_config(config, add_pooling_layer=False, trust_remote_code=True)
-            except Exception:
-                config.attn_implementation = "eager"
-                self.transformer = AutoModel.from_config(config, add_pooling_layer=False, trust_remote_code=True)
-            
-            self.use_transformer = True
-        else:
-            # For lookback=1, use simple MLP instead of Transformer
-            self.mlp_projection = nn.Sequential(
-                nn.Linear(embedding_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            )
-            self.use_transformer = False
+        # Flatten each symbol's lookback window and compress it to embedding_dim.
+        self.feature_embedding = nn.Linear(lookback * num_features, embedding_dim)
         
         # Portfolio scoring head with configurable hidden depth.
         head_layers: list[nn.Module] = []
@@ -101,23 +67,10 @@ class CrossSectionalMLP(nn.Module):
         Returns:
             weights: [B, S]
         """
-        if not self.use_transformer:
-            x = x[:, 0, :, :]  # [B, S, F]
-            x = self.feature_embedding(x)  # [B, S, embedding_dim]
-            logits = self.portfolio_head(x).squeeze(-1)  # [B, S]
-        else:
-            B, lookback, S, F = x.shape
-            x = x.permute(0, 2, 1, 3).flatten(0, 1)  # [B*S, lookback, F]
-
-            # Feature embedding
-            x = self.feature_embedding(x)  # [B*S, lookback, embedding_dim]
-
-            # Transformer (flash-attn v2 for speed and memory efficiency)
-            output = self.transformer(inputs_embeds=x, return_dict=True)
-            x = output.last_hidden_state[:, -1, :]  # [B*S, embedding_dim]
-
-            # Portfolio scoring
-            logits = self.portfolio_head(x).squeeze(-1).view(B, S)  # [B, S]
+        B, lookback, S, F = x.shape
+        x = x.permute(0, 2, 1, 3).reshape(B, S, lookback * F)  # [B, S, lookback*F]
+        x = self.feature_embedding(x)  # [B, S, embedding_dim]
+        logits = self.portfolio_head(x).squeeze(-1)  # [B, S]
         
         if self.long_only:
             # Long-only: non-negative weights that sum to 1 over tradable symbols.

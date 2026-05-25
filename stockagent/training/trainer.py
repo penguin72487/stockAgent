@@ -1285,10 +1285,15 @@ def run_training(
     for fold in fold_list:
         grouped_folds.setdefault(_group_key(fold.train_years), []).append(fold)
 
+    warm_start_checkpoint_path: Path | None = None
+
     for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
         train_years = list(train_years_key)
+        group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
         if not pending_folds:
+            if config.training.warm_start_from_previous_fold and group_checkpoint_path.exists():
+                warm_start_checkpoint_path = group_checkpoint_path
             print(f"[Train {train_years}] already completed, skipping")
             continue
 
@@ -1443,6 +1448,13 @@ def run_training(
             hidden_layers=config.training.hidden_layers,
             long_only=config.trading.long_only,
         ).to(device)
+
+        if config.training.warm_start_from_previous_fold and warm_start_checkpoint_path is not None and warm_start_checkpoint_path.exists():
+            warm_start_checkpoint = _load_checkpoint(warm_start_checkpoint_path)
+            if "model_state_dict" in warm_start_checkpoint:
+                _load_state_dict(model, warm_start_checkpoint["model_state_dict"])
+                print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
+
         compiled_train_model: nn.Module = model
 
         optimizer = torch.optim.AdamW(
@@ -1452,7 +1464,6 @@ def run_training(
         )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
 
-        group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
         start_epoch = 1
         if resume and group_checkpoint_path.exists():
             checkpoint = _load_checkpoint(group_checkpoint_path)
@@ -1547,6 +1558,7 @@ def run_training(
         early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
         early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
         no_improve_epochs = 0
+        last_epoch = start_epoch - 1
         if early_stop_patience > 0:
             print(
                 f"[Train {train_years}] early stopping enabled: "
@@ -1555,6 +1567,7 @@ def run_training(
             )
         val_backtest: BacktestResultTensor | None = None
         for epoch in epoch_pbar:
+            last_epoch = epoch
             if train_loader is not None:
                 train_loss = _train_epoch(
                     compiled_train_model,
@@ -1812,5 +1825,17 @@ def run_training(
             _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+
+        _save_group_checkpoint(
+            group_checkpoint_path,
+            train_years=train_years,
+            epoch=last_epoch,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+        )
+
+        if config.training.warm_start_from_previous_fold:
+            warm_start_checkpoint_path = group_checkpoint_path
 
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

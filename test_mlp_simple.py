@@ -9,7 +9,7 @@ print(f"Device: {device}")
 
 # Create model
 model = CrossSectionalMLP(
-    lookback=1,
+    lookback=5,
     num_features=12,
     num_symbols=724,
     hidden_dim=1024,
@@ -20,7 +20,7 @@ model = model.to(device)
 print("Model created and moved to device")
 
 # Create test batch
-B, lookback, S, F = 4, 1, 724, 12
+B, lookback, S, F = 4, 5, 724, 12
 x = torch.randn(B, lookback, S, F, device=device)
 tradable_mask = torch.randint(0, 2, (B, S), dtype=torch.bool, device=device)
 
