@@ -12,12 +12,13 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_forex_frankfurter
-  benchmark_name: EURUSD
+  parquet_root: data_yahoo/us_stocks
+  benchmark_name: SPY
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
+  usd_only_trading_pairs: false
 
 walk_forward:
   min_train_years: 1
@@ -28,7 +29,8 @@ trading:
   frequency: daily
   buy_fee_rate: 0.0001
   sell_fee_rate: 0.0001
-  long_only: true
+  max_turnover_ratio: 100.0
+  long_only: false
   cash_allowed: true
   use_all_tradable_symbols: true
 
@@ -46,9 +48,9 @@ training:
   early_stopping_no_improve_ratio: 0.2
   learning_rate: 0.001
   hidden_dim: 1024
-  hidden_layers: 1
+  hidden_layers: 2
   dropout: 0.1
-  num_workers: 16
+  num_workers: 28
   weight_decay: 0.00001
   loss_type: sharpe
   min_batch_size: 32
