@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -47,6 +47,7 @@ TWSE_CODE_NAME_PATTERN = re.compile(r"^(?P<code>\d{4,6}[A-Z]{0,2})[\s\u3000]+(?P
 TW_GENERIC_CODE_PATTERN = re.compile(r"\b(\d{4,6}[A-Z]{0,2})\b")
 US_VALID_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 FOREX_YAHOO_SYMBOL_PATTERN = re.compile(r"\b([A-Z]{6}=X)\b")
+FOREX_TICKER_PATTERN = re.compile(r"^[A-Z]{6}=X$")
 CRYPTO_SYMBOL_PATTERN = re.compile(r"^[a-z]{2,8}$")
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
@@ -189,6 +190,20 @@ DEFAULT_SYMBOLS: dict[str, list[tuple[str, str, str]]] = {
         ("USDKRW", "US Dollar / South Korean Won", "USDKRW=X"),
     ],
 }
+
+# Expanded offline fallback used when web discovery is rate-limited.
+FOREX_EXPANDED_FALLBACK_YAHOO_SYMBOLS: tuple[str, ...] = (
+    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X", "USDJPY=X", "USDCHF=X", "USDCAD=X",
+    "EURJPY=X", "EURGBP=X", "EURCHF=X", "EURAUD=X", "EURNZD=X", "EURCAD=X", "EURSEK=X", "EURNOK=X",
+    "GBPJPY=X", "GBPCHF=X", "GBPAUD=X", "GBPCAD=X", "GBPNZD=X", "GBPSEK=X", "GBPNOK=X",
+    "AUDJPY=X", "AUDNZD=X", "AUDCAD=X", "AUDCHF=X", "AUDSGD=X",
+    "NZDJPY=X", "NZDCAD=X", "NZDCHF=X", "NZDSGD=X",
+    "CADJPY=X", "CADCHF=X", "CHFJPY=X",
+    "USDSEK=X", "USDNOK=X", "USDDKK=X", "USDPLN=X", "USDHUF=X", "USDCZK=X",
+    "USDHKD=X", "USDSGD=X", "USDTHB=X", "USDMYR=X", "USDIDR=X", "USDPHP=X", "USDTWD=X",
+    "USDZAR=X", "USDMXN=X", "USDBRL=X", "USDCLP=X", "USDCOP=X", "USDPEN=X",
+    "USDTRY=X", "USDINR=X", "USDKRW=X", "USDCNH=X", "USDCNY=X",
+)
 
 
 @dataclass(slots=True)
@@ -648,14 +663,29 @@ def _load_crypto_symbols_from_coingecko() -> list[SymbolRecord]:
     return records
 
 
-def _load_forex_symbols_from_yahoo_page() -> list[SymbolRecord]:
-    text = _http_get_text(YAHOO_CURRENCIES_URL)
-    matches = sorted(set(FOREX_YAHOO_SYMBOL_PATTERN.findall(text)))
-    records: list[SymbolRecord] = []
-    for yahoo_symbol in matches:
-        code = yahoo_symbol.replace("=X", "")
-        records.append(SymbolRecord(code=code, name=code, market="forex", yahoo_symbol=yahoo_symbol))
-    return records
+def _load_forex_symbols_from_yahoo_page(max_retries: int = 3) -> list[SymbolRecord]:
+    last_error: Exception | None = None
+    for attempt in range(max(1, max_retries)):
+        try:
+            text = _http_get_text(YAHOO_CURRENCIES_URL)
+            matches = sorted(set(FOREX_YAHOO_SYMBOL_PATTERN.findall(text)))
+            records: list[SymbolRecord] = []
+            for yahoo_symbol in matches:
+                code = yahoo_symbol.replace("=X", "")
+                records.append(SymbolRecord(code=code, name=code, market="forex", yahoo_symbol=yahoo_symbol))
+            if records:
+                return records
+            last_error = RuntimeError("Yahoo currencies page returned no forex symbols.")
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(1.2 * (attempt + 1))
+                continue
+            break
+
+    if last_error is None:
+        raise RuntimeError("Failed to load forex symbols from Yahoo currencies page.")
+    raise RuntimeError(str(last_error))
 
 
 def _load_symbols_from_file(asset_class: str, file_path: str) -> list[SymbolRecord]:
@@ -666,6 +696,53 @@ def _load_symbols_from_file(asset_class: str, file_path: str) -> list[SymbolReco
             if not value or value.startswith("#"):
                 continue
             records.append(_record_from_input(asset_class, value))
+    return records
+
+
+def _load_cached_symbols_from_manifest(manifest_path: Path, asset_class: str) -> list[SymbolRecord]:
+    if not manifest_path.exists():
+        return []
+
+    try:
+        frame = pd.read_csv(manifest_path, dtype=str).fillna("")
+    except Exception:
+        return []
+
+    if "yahoo_symbol" not in frame.columns:
+        return []
+
+    records: list[SymbolRecord] = []
+    for row in frame.itertuples(index=False):
+        yahoo_symbol = str(getattr(row, "yahoo_symbol", "")).strip().upper()
+        if not FOREX_TICKER_PATTERN.match(yahoo_symbol):
+            continue
+        code = str(getattr(row, "code", "")).strip().upper() or yahoo_symbol.replace("=X", "")
+        name = str(getattr(row, "name", code)).strip() or code
+        market = str(getattr(row, "market", asset_class)).strip() or asset_class
+        records.append(SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol))
+    return records
+
+
+def _load_cached_symbols_from_whitelist(whitelist_path: Path, asset_class: str) -> list[SymbolRecord]:
+    if not whitelist_path.exists():
+        return []
+
+    records: list[SymbolRecord] = []
+    with whitelist_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            yahoo_symbol = line.strip().upper()
+            if not FOREX_TICKER_PATTERN.match(yahoo_symbol):
+                continue
+            code = yahoo_symbol.replace("=X", "")
+            records.append(SymbolRecord(code=code, name=code, market=asset_class, yahoo_symbol=yahoo_symbol))
+    return records
+
+
+def _load_forex_expanded_fallback() -> list[SymbolRecord]:
+    records: list[SymbolRecord] = []
+    for yahoo_symbol in FOREX_EXPANDED_FALLBACK_YAHOO_SYMBOLS:
+        code = yahoo_symbol.replace("=X", "")
+        records.append(SymbolRecord(code=code, name=code, market="forex", yahoo_symbol=yahoo_symbol))
     return records
 
 
@@ -707,14 +784,23 @@ def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolR
         except Exception as exc:
             print(f"[symbols] fallback to static crypto list: {exc}")
     elif asset_class == "forex":
+        output_dir = _resolve_asset_output_dir(args, asset_class)
         records = [
             SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
             for code, name, yahoo_symbol in DEFAULT_SYMBOLS[asset_class]
         ]
+
+        records.extend(_load_cached_symbols_from_manifest(output_dir / "symbols.csv", asset_class))
+        records.extend(_load_cached_symbols_from_whitelist(_whitelist_file_path(output_dir), asset_class))
+
+        used_web_symbols = False
         try:
             records.extend(_load_forex_symbols_from_yahoo_page())
+            used_web_symbols = True
         except Exception as exc:
             print(f"[symbols] fallback to static forex list: {exc}")
+        if not used_web_symbols:
+            records.extend(_load_forex_expanded_fallback())
     else:
         records = [
             SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
@@ -754,6 +840,17 @@ def _download_symbol(
     candidate_symbols = [symbol for symbol in YAHOO_SYMBOL_SPLIT_PATTERN.split(record.yahoo_symbol.strip()) if symbol]
     if not candidate_symbols:
         candidate_symbols = [record.yahoo_symbol.strip()]
+
+    if asset_class == "forex":
+        forex_candidates = [symbol.upper() for symbol in candidate_symbols if FOREX_TICKER_PATTERN.match(symbol.upper())]
+        for symbol in forex_candidates:
+            pair = symbol.replace("=X", "")
+            if len(pair) != 6:
+                continue
+            inverse = f"{pair[3:]}{pair[:3]}=X"
+            if inverse not in candidate_symbols:
+                candidate_symbols.append(inverse)
+
     candidates_to_try = [symbol for symbol in candidate_symbols if (blacklist_symbols is None or symbol.upper() not in blacklist_symbols)]
     if not candidates_to_try:
         return DownloadResult(

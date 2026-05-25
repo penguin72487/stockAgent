@@ -193,3 +193,5 @@ artifacts/*
 *.7z
 artifacts_test/*
 artifacts_smoke/*
+data_forex_frankfurter/*
+data_forex_frankfurter_all/*

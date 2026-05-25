@@ -36,7 +36,8 @@ def sharpe_aware_loss(
     future_log_returns: Tensor,
     tradable_mask: Tensor,
     sample_mask: Tensor | None = None,
-    fee_per_side: float = 0.0,
+    buy_fee_rate: float = 0.0,
+    sell_fee_rate: float = 0.0,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
 ) -> Tensor:
@@ -50,7 +51,8 @@ def sharpe_aware_loss(
         returns,
         tradable,
         benchmark_zeros,
-        fee_per_side,
+        buy_fee_rate,
+        sell_fee_rate,
     )
 
     if sample_mask is None:

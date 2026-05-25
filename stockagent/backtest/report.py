@@ -5,8 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 from stockagent.backtest.simulator import BacktestResult
+
+
+_PLOT_LOG_MIN = -745.0
+_PLOT_LOG_MAX = 600.0
 
 
 def _safe_expm1(log_sum: float) -> float:
@@ -23,7 +28,38 @@ def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
     cum_log = np.cumsum(clean)
     # Keep plotting range finite to avoid matplotlib overflow warnings.
-    return np.exp(np.clip(cum_log, -745.0, 80.0))
+    return np.exp(np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LOG_MAX))
+
+
+def _configure_log_y_axis(ax: plt.Axes, *series: np.ndarray) -> None:
+    """Configure a stable log-scale Y axis for very wide equity ranges."""
+    positive = [
+        np.asarray(values, dtype=np.float64)[np.asarray(values, dtype=np.float64) > 0.0]
+        for values in series
+    ]
+    positive = [values[np.isfinite(values)] for values in positive if values.size]
+    if not positive:
+        return
+
+    all_positive = np.concatenate(positive)
+    y_min = float(all_positive.min(initial=1.0))
+    y_max = float(all_positive.max(initial=1.0))
+    if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min <= 0.0 or y_max <= 0.0:
+        return
+
+    ax.set_yscale("log")
+    ax.set_ylim(y_min, y_max)
+
+    min_exp = int(np.floor(np.log10(y_min)))
+    max_exp = int(np.ceil(np.log10(y_max)))
+    span = max_exp - min_exp
+    step = max(1, int(np.ceil(span / 12)))
+    exponents = np.arange(min_exp, max_exp + 1, step, dtype=np.int32)
+    ticks = np.power(10.0, exponents.astype(np.float64))
+
+    ax.yaxis.set_major_locator(mticker.FixedLocator(ticks))
+    ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation(base=10.0))
+    ax.yaxis.set_minor_locator(mticker.NullLocator())
 
 
 def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
@@ -31,7 +67,7 @@ def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
     clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
     cum_log = np.cumsum(clean)
     running_max_log = np.maximum.accumulate(cum_log)
-    dd = np.expm1(np.clip(cum_log - running_max_log, -745.0, 0.0))
+    dd = np.expm1(np.clip(cum_log - running_max_log, _PLOT_LOG_MIN, 0.0))
     return float(dd.min(initial=0.0))
 
 
@@ -308,7 +344,7 @@ def plot_equity_curve_log(
     ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
-    ax.set_yscale("log")
+    _configure_log_y_axis(ax, strategy_equity, benchmark_equity)
     ax.set_title("Strategy vs Benchmark Equity Curve (Log Scale)")
     ax.legend()
     ax.grid(True, alpha=0.3, which="both")
@@ -356,7 +392,7 @@ def plot_fold_first_year_returns(
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
     ax.set_title("Walkforward First-Test-Year Daily Cumulative NAV (All Folds)")
-    ax.set_yscale("log")
+    _configure_log_y_axis(ax, strat_nav, base_nav)
     ax.axhline(y=1.0, color="black", linewidth=0.8)
     ax.grid(True, alpha=0.3, which="both")
     ax.legend()

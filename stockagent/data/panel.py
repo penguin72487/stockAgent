@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - optional GPU dependency
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
 PANEL_CACHE_VERSION = 8
+FEATURE_FILE_SUFFIX = "_features.parquet"
 
 
 @dataclass(slots=True)
@@ -39,6 +40,10 @@ class PanelData:
     @property
     def num_symbols(self) -> int:
         return int(self.features.shape[1])
+
+
+def _symbol_name_from_path(path: Path) -> str:
+    return path.name.removesuffix(FEATURE_FILE_SUFFIX)
 
 
 def _safe_log_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -69,7 +74,7 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     if not pd.api.types.is_datetime64_any_dtype(frame["date"]):
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
-    frame["symbol"] = path.name.replace("_features.parquet", "")
+    frame["symbol"] = _symbol_name_from_path(path)
     frame["close_raw"] = frame["close"].astype(np.float32)
 
     frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
@@ -94,7 +99,7 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     gdf = cudf.read_parquet(path)
     gdf["date"] = cudf.to_datetime(gdf["date"])
     gdf = gdf.sort_values("date").reset_index(drop=True)
-    gdf["symbol"] = path.name.replace("_features.parquet", "")
+    gdf["symbol"] = _symbol_name_from_path(path)
     gdf["close_raw"] = gdf["close"].astype("float32")
 
     nxt_close = gdf["close"].shift(-1)
@@ -275,7 +280,7 @@ def _save_panel_cache(
         'num_dates': panel.num_dates,
         'num_symbols': panel.num_symbols,
     }
-    with open(meta_path, 'wb') as f:
+    with meta_path.open('wb') as f:
         pickle.dump(meta, f)
 
 
@@ -305,7 +310,7 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path], backend_key: 
         return False
     
     try:
-        with open(meta_path, 'rb') as f:
+        with meta_path.open('rb') as f:
             meta = pickle.load(f)
         
         # ✅ OPTIMIZATION: Check both version and source hash for cache validity
@@ -336,7 +341,7 @@ def build_panel(
     benchmark_name: str = "universe_average_return",
 ) -> PanelData:
     parquet_root = Path(parquet_root)
-    parquet_paths = sorted(parquet_root.glob("*_features.parquet"))
+    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
 
@@ -367,7 +372,7 @@ def build_panel(
                 valid_paths_cudf.append(path)
 
             if symbol_frames_cudf:
-                symbols_cudf = [path.name.replace("_features.parquet", "") for path in valid_paths_cudf]
+                symbols_cudf = [_symbol_name_from_path(path) for path in valid_paths_cudf]
                 frame_all_cudf = pd.concat(symbol_frames_cudf, ignore_index=True)
                 panel = _build_panel_from_frame(
                     frame_all_cudf,
@@ -398,7 +403,7 @@ def build_panel(
     if not symbol_frames:
         raise RuntimeError("No valid parquet files could be loaded.")
 
-    symbols = [path.name.replace("_features.parquet", "") for path in valid_paths]
+    symbols = [_symbol_name_from_path(path) for path in valid_paths]
     frame_all = pd.concat(symbol_frames, ignore_index=True)
     panel = _build_panel_from_frame(frame_all, symbols, benchmark_name=benchmark_name)
     
