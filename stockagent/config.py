@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +46,30 @@ class TradingConfig:
 
 
 @dataclass(slots=True)
+class MLPModelConfig:
+    hidden_dim: int = 1024
+    hidden_layers: int = 2
+    embedding_dim: int = 64
+    dropout: float = 0.1
+
+
+@dataclass(slots=True)
+class FTTransformerModelConfig:
+    d_token: int = 64
+    n_layers: int = 2
+    n_heads: int = 4
+    ffn_dim: int = 256
+    dropout: float = 0.1
+    use_cls_token: bool = True
+
+
+@dataclass(slots=True)
 class TrainingConfig:
     backend: str
     target: str
     batch_mode: str
     non_blocking_transfer: bool
+    model_name: str
     enable_torch_compile: bool = False
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
@@ -66,13 +85,12 @@ class TrainingConfig:
     epochs: int = 1000
     early_stopping_no_improve_ratio: float = 0.2
     learning_rate: float = 1e-3
-    hidden_dim: int = 1024
-    hidden_layers: int = 2
-    dropout: float = 0.1
     top_k: int = 20
     num_workers: int = 0
     weight_decay: float = 1e-5
     loss_type: str = "mse"  # "mse" or "sharpe"
+    mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
+    ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
 
 
 @dataclass(slots=True)
@@ -116,13 +134,45 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("epochs", 10)
     training.setdefault("early_stopping_no_improve_ratio", 0.2)
     training.setdefault("learning_rate", 1e-3)
-    training.setdefault("hidden_dim", 128)
-    training.setdefault("hidden_layers", 2)
-    training.setdefault("dropout", 0.1)
+    training.setdefault("model_name", "mlp")
     training.setdefault("top_k", 20)
     training.setdefault("num_workers", 0)
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("loss_type", "mse")
+
+    # Model-specific blocks.
+    legacy_hidden_dim = training.get("hidden_dim", 128)
+    legacy_hidden_layers = training.get("hidden_layers", 2)
+    legacy_embedding_dim = training.get("embedding_dim", 64)
+    legacy_transformer_layers = training.get("transformer_layers", 2)
+    legacy_transformer_heads = training.get("transformer_heads", 4)
+    legacy_transformer_ffn_dim = training.get("transformer_ffn_dim", 256)
+    legacy_transformer_use_cls_token = training.get("transformer_use_cls_token", True)
+    legacy_dropout = training.get("dropout", 0.1)
+
+    mlp = training.setdefault("mlp", {})
+    mlp.setdefault("hidden_dim", legacy_hidden_dim)
+    mlp.setdefault("hidden_layers", legacy_hidden_layers)
+    mlp.setdefault("embedding_dim", legacy_embedding_dim)
+    mlp.setdefault("dropout", legacy_dropout)
+
+    ft_transformer = training.setdefault("ft_transformer", {})
+    ft_transformer.setdefault("d_token", legacy_embedding_dim)
+    ft_transformer.setdefault("n_layers", legacy_transformer_layers)
+    ft_transformer.setdefault("n_heads", legacy_transformer_heads)
+    ft_transformer.setdefault("ffn_dim", legacy_transformer_ffn_dim)
+    ft_transformer.setdefault("dropout", legacy_dropout)
+    ft_transformer.setdefault("use_cls_token", legacy_transformer_use_cls_token)
+
+    # Remove legacy flat model keys from normalized payload.
+    training.pop("hidden_dim", None)
+    training.pop("hidden_layers", None)
+    training.pop("embedding_dim", None)
+    training.pop("transformer_layers", None)
+    training.pop("transformer_heads", None)
+    training.pop("transformer_ffn_dim", None)
+    training.pop("transformer_use_cls_token", None)
+    training.pop("dropout", None)
 
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)
@@ -156,12 +206,40 @@ def load_config(path: str | Path) -> ExperimentConfig:
         raw = yaml.safe_load(handle)
 
     raw = _merge_defaults(raw)
+    training_raw = raw["training"]
     return ExperimentConfig(
         experiment_name=raw["experiment_name"],
         environment=EnvironmentConfig(**raw["environment"]),
         data=DataConfig(**raw["data"]),
         walk_forward=WalkForwardConfig(**raw["walk_forward"]),
         trading=TradingConfig(**raw["trading"]),
-        training=TrainingConfig(**raw["training"]),
+        training=TrainingConfig(
+            backend=training_raw["backend"],
+            target=training_raw["target"],
+            batch_mode=training_raw["batch_mode"],
+            non_blocking_transfer=training_raw["non_blocking_transfer"],
+            model_name=training_raw["model_name"],
+            enable_torch_compile=training_raw["enable_torch_compile"],
+            warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
+            chunk_rows=training_raw["chunk_rows"],
+            lookback=training_raw["lookback"],
+            batch_size=training_raw["batch_size"],
+            batch_size_train=training_raw["batch_size_train"],
+            batch_size_eval=training_raw["batch_size_eval"],
+            min_batch_size=training_raw["min_batch_size"],
+            auto_batch_size=training_raw["auto_batch_size"],
+            vram_budget_gb=training_raw["vram_budget_gb"],
+            vram_safety_margin_gb=training_raw["vram_safety_margin_gb"],
+            target_vram_fraction=training_raw["target_vram_fraction"],
+            epochs=training_raw["epochs"],
+            early_stopping_no_improve_ratio=training_raw["early_stopping_no_improve_ratio"],
+            learning_rate=training_raw["learning_rate"],
+            top_k=training_raw["top_k"],
+            num_workers=training_raw["num_workers"],
+            weight_decay=training_raw["weight_decay"],
+            loss_type=training_raw["loss_type"],
+            mlp=MLPModelConfig(**training_raw["mlp"]),
+            ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),
+        ),
         evaluation=EvaluationConfig(**raw["evaluation"]),
     )

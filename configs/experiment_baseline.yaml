@@ -39,6 +39,7 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
+  model_name: ft_transformer
   enable_torch_compile: true
   warm_start_from_previous_fold: false
   lookback: 1
@@ -48,9 +49,6 @@ training:
   epochs: 1000
   early_stopping_no_improve_ratio: 0.2
   learning_rate: 0.001
-  hidden_dim: 1024
-  hidden_layers: 2
-  dropout: 0.1
   num_workers: 28
   weight_decay: 0.00001
   loss_type: sharpe
@@ -59,9 +57,21 @@ training:
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
   target_vram_fraction: 1
+  mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    embedding_dim: 64
+    dropout: 0.1
+  ft_transformer:
+    d_token: 64
+    n_layers: 2
+    n_heads: 4
+    ffn_dim: 256
+    dropout: 0.1
+    use_cls_token: true
 
 evaluation:
-  primary_baseline: JPYUSD
+  primary_baseline: BTC
   metrics:
     - cumulative_return
     - annualized_return
