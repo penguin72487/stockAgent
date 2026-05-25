@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -59,7 +60,6 @@ class FoldRuntimeContext:
     fold_dir: Path
     val_ds: CrossSectionalDataset
     test_ds: CrossSectionalDataset
-    checkpoint_last_path: Path
     checkpoint_best_path: Path
     best_val_loss: float = float("inf")
 
@@ -187,6 +187,65 @@ def _save_group_checkpoint(
         },
         checkpoint_path,
     )
+
+
+def _benchmark_input_pipeline_throughput(
+    *,
+    train_ds: CrossSectionalDataset,
+    train_x: torch.Tensor,
+    train_returns: torch.Tensor,
+    train_masks: torch.Tensor,
+    train_batch_size: int,
+    config: ExperimentConfig,
+    device: torch.device,
+    non_blocking: bool,
+    max_steps: int = 20,
+) -> tuple[float, float]:
+    """Return (dataloader_samples_per_sec, tensor_samples_per_sec) for quick A/B selection."""
+    if max_steps <= 0:
+        return 0.0, 0.0
+
+    def _sync_if_cuda() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    dataloader_sps = 0.0
+    if config.training.num_workers > 0:
+        loader = _build_loader(train_ds, train_batch_size, True, config, device)
+        steps = 0
+        samples = 0
+        start_t = time.perf_counter()
+        for batch in loader:
+            moved = _move_batch(batch, device, non_blocking)
+            samples += int(moved["x"].size(0))
+            steps += 1
+            if steps >= max_steps:
+                break
+        _sync_if_cuda()
+        elapsed = max(time.perf_counter() - start_t, 1e-6)
+        dataloader_sps = samples / elapsed
+
+    total_rows = int(train_x.size(0))
+    if total_rows == 0:
+        return dataloader_sps, 0.0
+
+    tensor_steps = min(max_steps, max(1, total_rows // train_batch_size))
+    samples = 0
+    start_t = time.perf_counter()
+    for idx in range(tensor_steps):
+        start = idx * train_batch_size
+        end = min(start + train_batch_size, total_rows)
+        batch_x = train_x[start:end].to(device=device, non_blocking=non_blocking)
+        batch_ret = train_returns[start:end].to(device=device, non_blocking=non_blocking)
+        batch_mask = train_masks[start:end].to(device=device, non_blocking=non_blocking)
+        samples += int(batch_x.size(0))
+        # Ensure slices are actually materialized on device before timing stops.
+        _ = (batch_x, batch_ret, batch_mask)
+    _sync_if_cuda()
+    elapsed = max(time.perf_counter() - start_t, 1e-6)
+    tensor_sps = samples / elapsed
+
+    return dataloader_sps, tensor_sps
 
 
 def _save_backtest_artifact(output_path: Path, result: BacktestResult, dates: np.ndarray) -> None:
@@ -339,8 +398,10 @@ def _evaluate_tensor_batch(
     device: torch.device,
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
+    long_only: bool,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    max_turnover_ratio: float,
     chunk_rows: int,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
@@ -384,6 +445,8 @@ def _evaluate_tensor_batch(
                 bench_chunk,
                 buy_fee_rate,
                 sell_fee_rate,
+                long_only=long_only,
+                max_turnover_ratio=max_turnover_ratio,
             )
             ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
 
@@ -722,6 +785,7 @@ def find_optimal_batch_size(
     sample_loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype | None,
+    long_only: bool,
     target_vram_fraction: float = 0.85,
     vram_budget_gb: float = 12.0,
     vram_safety_margin_gb: float = 1.0,
@@ -803,8 +867,10 @@ def find_optimal_batch_size(
                     logits,
                     local_batch["future_log_returns"],
                     local_batch["tradable_mask"],
+                    long_only=long_only,
                     buy_fee_rate=0.0,
                     sell_fee_rate=0.0,
+                    max_turnover_ratio=0.0,
                 )
 
             loss.backward()
@@ -909,7 +975,7 @@ def _build_loader(
     device: torch.device,
     drop_last: bool = False,
 ) -> DataLoader:
-    workers = config.training.num_workers
+    workers = max(1, os.cpu_count() or 1)
     loader_kwargs: dict = {
         "dataset": dataset,
         "batch_size": batch_size,
@@ -1005,8 +1071,10 @@ def _train_epoch(
     device: torch.device,
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
+    long_only: bool,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    max_turnover_ratio: float,
     gamma_sharpe: float,
     gamma_turnover: float,
 ) -> float:
@@ -1024,8 +1092,10 @@ def _train_epoch(
                 weights,
                 batch["future_log_returns"],
                 batch["tradable_mask"],
+                long_only=long_only,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
+                max_turnover_ratio=max_turnover_ratio,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
@@ -1055,8 +1125,10 @@ def _train_epoch_tensor(
     device: torch.device,
     amp_dtype: torch.dtype | None,
     non_blocking: bool,
+    long_only: bool,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    max_turnover_ratio: float,
     gamma_sharpe: float,
     gamma_turnover: float,
 ) -> float:
@@ -1086,8 +1158,10 @@ def _train_epoch_tensor(
                 batch_ret,
                 batch_mask,
                 sample_mask=batch_sample_mask,
+                long_only=long_only,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
+                max_turnover_ratio=max_turnover_ratio,
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
@@ -1239,6 +1313,7 @@ def run_training(
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
                 hidden_layers=config.training.hidden_layers,
+                long_only=config.trading.long_only,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             eval_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=False)
@@ -1266,6 +1341,7 @@ def run_training(
                 hidden_dim=config.training.hidden_dim,
                 dropout=config.training.dropout,
                 hidden_layers=config.training.hidden_layers,
+                long_only=config.trading.long_only,
             ).to(device)
 
             print(f"[Train {train_years}] searching optimal train batch size...")
@@ -1275,6 +1351,7 @@ def run_training(
                 sample_loader=temp_train_loader,
                 device=device,
                 amp_dtype=amp_dtype,
+                long_only=config.trading.long_only,
                 target_vram_fraction=config.training.target_vram_fraction,
                 vram_budget_gb=config.training.vram_budget_gb,
                 vram_safety_margin_gb=config.training.vram_safety_margin_gb,
@@ -1322,7 +1399,6 @@ def run_training(
 
             fold_dir = _fold_dir(output_path, fold.fold_id)
             fold_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_last_path = _checkpoint_path(fold_dir)
             checkpoint_best_path = _best_checkpoint_path(fold_dir)
 
             fold_contexts[fold.fold_id] = FoldRuntimeContext(
@@ -1330,7 +1406,6 @@ def run_training(
                 fold_dir=fold_dir,
                 val_ds=val_ds,
                 test_ds=test_ds,
-                checkpoint_last_path=checkpoint_last_path,
                 checkpoint_best_path=checkpoint_best_path,
             )
 
@@ -1366,6 +1441,7 @@ def run_training(
             hidden_dim=config.training.hidden_dim,
             dropout=config.training.dropout,
             hidden_layers=config.training.hidden_layers,
+            long_only=config.trading.long_only,
         ).to(device)
         compiled_train_model: nn.Module = model
 
@@ -1435,9 +1511,30 @@ def run_training(
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")
 
         train_loader: DataLoader | None = None
-        if config.training.num_workers > 0:
+        use_dataloader = config.training.num_workers > 0
+        if use_dataloader:
+            dl_sps, tensor_sps = _benchmark_input_pipeline_throughput(
+                train_ds=train_ds,
+                train_x=train_x,
+                train_returns=train_returns,
+                train_masks=train_masks,
+                train_batch_size=train_batch_size,
+                config=config,
+                device=device,
+                non_blocking=non_blocking,
+                max_steps=20,
+            )
+            print(
+                f"[Train {train_years}] input pipeline A/B: "
+                f"dataloader={dl_sps:,.0f} samples/s vs tensor={tensor_sps:,.0f} samples/s"
+            )
+            # Prefer tensor mode unless dataloader is clearly faster.
+            use_dataloader = dl_sps > (tensor_sps * 1.05)
+
+        if use_dataloader:
             train_loader = _build_loader(train_ds, train_batch_size, True, config, device)
-            print(f"[Train {train_years}] training mode=dataloader (num_workers={config.training.num_workers})")
+            effective_workers = max(1, os.cpu_count() or 1)
+            print(f"[Train {train_years}] training mode=dataloader (num_workers={effective_workers}, from os.cpu_count)")
         else:
             print(f"[Train {train_years}] training mode=tensor (num_workers={config.training.num_workers})")
 
@@ -1467,8 +1564,10 @@ def run_training(
                     device,
                     amp_dtype,
                     non_blocking,
+                    config.trading.long_only,
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
                     config.evaluation.gamma_sharpe,
                     config.evaluation.gamma_turnover,
                 )
@@ -1485,8 +1584,10 @@ def run_training(
                     device=device,
                     amp_dtype=amp_dtype,
                     non_blocking=non_blocking,
+                    long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
+                    max_turnover_ratio=config.trading.max_turnover_ratio,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 )
@@ -1500,30 +1601,34 @@ def run_training(
                 device,
                 amp_dtype,
                 non_blocking,
+                config.trading.long_only,
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
+                config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
             )
 
             val_losses: list[float] = []
             any_fold_improved = False
+            val_returns_device = combined_val_returns.to(
+                device=val_backtest.weights_history.device,
+                non_blocking=False,
+            )
+            val_masks_device = combined_val_masks.to(
+                device=val_backtest.weights_history.device,
+                non_blocking=False,
+            )
             for index, (_, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
-                val_returns_slice = combined_val_returns[start:end].to(
-                    device=val_backtest.weights_history.device,
-                    non_blocking=False,
-                )
-                val_masks_slice = combined_val_masks[start:end].to(
-                    device=val_backtest.weights_history.device,
-                    non_blocking=False,
-                )
                 val_loss_tensor = sharpe_aware_loss(
                     val_backtest.weights_history[start:end],
-                    val_returns_slice,
-                    val_masks_slice,
+                    val_returns_device[start:end],
+                    val_masks_device[start:end],
+                    long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
+                    max_turnover_ratio=config.trading.max_turnover_ratio,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 )
@@ -1542,24 +1647,15 @@ def run_training(
                         scaler=scaler,
                     )
 
-                _save_fold_checkpoint(
-                    context.checkpoint_last_path,
-                    fold=context.fold,
+            if any_fold_improved:
+                _save_group_checkpoint(
+                    group_checkpoint_path,
+                    train_years=train_years,
                     epoch=epoch,
-                    best_val_loss=context.best_val_loss,
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
                 )
-
-            _save_group_checkpoint(
-                group_checkpoint_path,
-                train_years=train_years,
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-            )
 
             if val_losses:
                 if any_fold_improved:
@@ -1596,12 +1692,23 @@ def run_training(
                 device,
                 amp_dtype,
                 non_blocking,
+                config.trading.long_only,
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
+                config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
             )
         if val_backtest is None:
             raise RuntimeError("Validation backtest is unavailable in eval stage.")
+
+        val_returns_device = combined_val_returns.to(
+            device=val_backtest.weights_history.device,
+            non_blocking=False,
+        )
+        val_masks_device = combined_val_masks.to(
+            device=val_backtest.weights_history.device,
+            non_blocking=False,
+        )
 
         for index, (_, context) in enumerate(fold_contexts.items()):
             fold = context.fold
@@ -1632,8 +1739,10 @@ def run_training(
                 device,
                 amp_dtype,
                 non_blocking,
+                config.trading.long_only,
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
+                config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
             )
 
@@ -1643,8 +1752,8 @@ def run_training(
             val_ic = ic_summary(
                 compute_ic_series_torch(
                     val_backtest.weights_history[start:end],
-                    combined_val_returns[start:end].to(device=val_backtest.weights_history.device, non_blocking=False),
-                    combined_val_masks[start:end].to(device=val_backtest.weights_history.device, non_blocking=False),
+                    val_returns_device[start:end],
+                    val_masks_device[start:end],
                 ).cpu().numpy()
             )
             val_met = _compute_metrics_from_tensors(
@@ -1663,6 +1772,8 @@ def run_training(
                 initial_capital=1_000_000.0,
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
+                long_only=config.trading.long_only,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,

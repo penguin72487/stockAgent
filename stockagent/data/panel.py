@@ -46,6 +46,10 @@ def _symbol_name_from_path(path: Path) -> str:
     return path.name.removesuffix(FEATURE_FILE_SUFFIX)
 
 
+def _is_usd_trading_pair(path: Path) -> bool:
+    return _symbol_name_from_path(path).upper().endswith("USD")
+
+
 def _safe_log_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     """Compute log(numerator / denominator) only where both values are finite and > 0."""
     num = pd.to_numeric(numerator, errors="coerce").to_numpy(dtype=np.float64, copy=False)
@@ -339,18 +343,24 @@ def build_panel(
     parquet_root: str | Path,
     use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
+    usd_only_trading_pairs: bool = False,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
 
+    if usd_only_trading_pairs:
+        parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
+        if not parquet_paths:
+            raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
+
     cache_path = _panel_cache_path(parquet_root)
     meta_path = _cache_meta_path(parquet_root)
 
     env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
     use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
-    backend_key = f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}"
+    backend_key = f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|usd_only={usd_only_trading_pairs}"
     
     # Check cache validity
     if _check_cache_valid(meta_path, parquet_paths, backend_key):

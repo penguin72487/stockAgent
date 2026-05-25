@@ -24,6 +24,7 @@ class DataConfig:
     benchmark_source: str
     universe_mode: str
     use_rapids: bool = False
+    usd_only_trading_pairs: bool = False
 
 
 @dataclass(slots=True)
@@ -41,6 +42,7 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     use_all_tradable_symbols: bool
+    max_turnover_ratio: float = 0.0
 
 
 @dataclass(slots=True)
@@ -126,8 +128,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
+    data.setdefault("usd_only_trading_pairs", False)
 
     trading = raw.setdefault("trading", {})
+    trading.setdefault("max_turnover_ratio", 0.0)
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)

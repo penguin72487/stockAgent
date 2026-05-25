@@ -34,6 +34,7 @@ def main() -> None:
         config.data.parquet_root,
         use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
+        usd_only_trading_pairs=config.data.usd_only_trading_pairs,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

@@ -28,6 +28,46 @@ def _floor_to_int64(values: np.ndarray | float, *, non_negative: bool = False) -
     return np.floor(clipped).astype(np.int64)
 
 
+def _trunc_to_int64(values: np.ndarray | float) -> np.ndarray:
+    """Truncate toward zero and cast to int64 within safe storage bounds."""
+    clipped = _clip_to_int64_storage_bounds(values, non_negative=False)
+    return np.trunc(clipped).astype(np.int64)
+
+
+def _apply_turnover_cap_numpy(
+    prev_weights: np.ndarray,
+    target_weights: np.ndarray,
+    max_turnover_ratio: float,
+) -> np.ndarray:
+    if max_turnover_ratio <= 0.0:
+        return target_weights
+
+    deltas = target_weights - prev_weights
+    turnovers = np.abs(deltas).sum(axis=1, keepdims=True).astype(np.float32)
+    cap = np.float32(max_turnover_ratio)
+    scale = np.ones_like(turnovers, dtype=np.float32)
+    np.divide(cap, turnovers, out=scale, where=turnovers > cap)
+    scale = np.clip(scale, 0.0, 1.0)
+    return (prev_weights + deltas * scale).astype(np.float32)
+
+
+def _apply_turnover_cap_torch(
+    prev_weights: torch.Tensor,
+    target_weights: torch.Tensor,
+    max_turnover_ratio: float,
+) -> torch.Tensor:
+    if max_turnover_ratio <= 0.0:
+        return target_weights
+
+    deltas = target_weights - prev_weights
+    turnovers = deltas.abs().sum(dim=1, keepdim=True)
+    cap = torch.as_tensor(max_turnover_ratio, device=turnovers.device, dtype=turnovers.dtype)
+    scale = torch.ones_like(turnovers)
+    scale = torch.where(turnovers > cap, cap / turnovers.clamp_min(1e-12), scale)
+    scale = scale.clamp_(0.0, 1.0)
+    return (prev_weights + deltas * scale).float()
+
+
 @dataclass(slots=True)
 class BacktestResult:
     """Container for a single backtest simulation run."""
@@ -75,19 +115,30 @@ def _vectorized_backtest(
     tradable_mask: np.ndarray,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    long_only: bool = True,
+    max_turnover_ratio: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     weights_history = np.asarray(weights, dtype=np.float32).copy()
     weights_history[~tradable_mask.astype(bool)] = 0.0
 
-    weight_sums = weights_history.sum(axis=1, keepdims=True)
-    nonzero = weight_sums.squeeze(1) > 0
-    weights_history[nonzero] /= weight_sums[nonzero]
+    if long_only:
+        weights_history = np.clip(weights_history, 0.0, None)
+        weight_sums = weights_history.sum(axis=1, keepdims=True)
+        nonzero = weight_sums.squeeze(1) > 0
+        weights_history[nonzero] /= weight_sums[nonzero]
+    else:
+        gross_sums = np.abs(weights_history).sum(axis=1, keepdims=True)
+        nonzero = gross_sums.squeeze(1) > 0
+        weights_history[nonzero] /= gross_sums[nonzero]
 
     prev = np.concatenate([
         np.zeros((1, weights_history.shape[1]), dtype=np.float32),
         weights_history[:-1],
     ], axis=0)
     deltas = weights_history - prev
+    if max_turnover_ratio > 0.0:
+        weights_history = _apply_turnover_cap_numpy(prev, weights_history, max_turnover_ratio)
+        deltas = weights_history - prev
     buy_turnovers = np.clip(deltas, 0.0, None).sum(axis=1).astype(np.float32)
     sell_turnovers = np.clip(-deltas, 0.0, None).sum(axis=1).astype(np.float32)
     turnovers = (buy_turnovers + sell_turnovers).astype(np.float32)
@@ -103,28 +154,33 @@ def _vectorized_backtest_torch(
     tradable_mask: torch.Tensor,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    long_only: bool = True,
+    max_turnover_ratio: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # ✅ FIXED: Simplified and more numerically stable weight normalization
     weights_history = weights.float().clone()
-    
-    # Step 1: Mask non-tradable symbols
+
     weights_history = weights_history.masked_fill(~tradable_mask.bool(), 0.0)
-    
-    # Step 2: Normalize weights (simplified logic)
-    weight_sums = weights_history.sum(dim=1, keepdim=True).clamp_min(1e-12)
-    weights_history = weights_history / weight_sums  # Direct broadcast normalization
-    
-    # Step 3: Compute turnover
+
+    if long_only:
+        weights_history = weights_history.clamp_min(0.0)
+        weight_sums = weights_history.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        weights_history = weights_history / weight_sums
+    else:
+        gross_sums = weights_history.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
+        weights_history = weights_history / gross_sums
+
     prev = torch.cat(
         [torch.zeros_like(weights_history[:1]), weights_history[:-1]],
         dim=0,
     )
     deltas = weights_history - prev
+    if max_turnover_ratio > 0.0:
+        weights_history = _apply_turnover_cap_torch(prev, weights_history, max_turnover_ratio)
+        deltas = weights_history - prev
     buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
     sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
     turnovers = buy_turnovers + sell_turnovers
 
-    # Step 4: Compute strategy returns
     gross = (weights_history * future_returns.float()).sum(dim=1)
     strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
     return strategy_returns.float(), turnovers.float(), weights_history.float()
@@ -137,6 +193,8 @@ def run_backtest(
     benchmark_returns: np.ndarray,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    long_only: bool = True,
+    max_turnover_ratio: float = 0.0,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
@@ -145,6 +203,8 @@ def run_backtest(
         tradable_mask,
         buy_fee_rate,
         sell_fee_rate,
+        long_only=long_only,
+        max_turnover_ratio=max_turnover_ratio,
     )
 
     return BacktestResult(
@@ -162,6 +222,8 @@ def run_backtest_torch(
     benchmark_returns: torch.Tensor,
     buy_fee_rate: float,
     sell_fee_rate: float,
+    long_only: bool = True,
+    max_turnover_ratio: float = 0.0,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
@@ -170,6 +232,8 @@ def run_backtest_torch(
         tradable_mask,
         buy_fee_rate,
         sell_fee_rate,
+        long_only=long_only,
+        max_turnover_ratio=max_turnover_ratio,
     )
 
     return BacktestResultTensor(
@@ -189,6 +253,8 @@ def run_backtest_integer_shares(
     initial_capital: float = 1_000_000.0,
     buy_fee_rate: float = 0.001425,
     sell_fee_rate: float = 0.004425,
+    long_only: bool = True,
+    max_turnover_ratio: float = 0.0,
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
@@ -258,12 +324,17 @@ def run_backtest_integer_shares(
 
         day_mask = m[t]
         target_w = np.nan_to_num(w[t], nan=0.0, posinf=0.0, neginf=0.0)
-        target_w = np.clip(target_w, 0.0, None)
         target_w[~day_mask] = 0.0
 
-        total_target = float(target_w.sum())
-        if total_target > 1.0:
-            target_w /= total_target
+        if long_only:
+            target_w = np.clip(target_w, 0.0, None)
+            total_target = float(target_w.sum())
+            if total_target > 1.0:
+                target_w /= total_target
+        else:
+            gross_target = float(np.abs(target_w).sum())
+            if gross_target > 1.0:
+                target_w /= gross_target
 
         equity_before = float(cash + np.dot(shares.astype(np.float64), current_prices))
         equity_before = max(equity_before, 1e-12)
@@ -271,12 +342,20 @@ def run_backtest_integer_shares(
         desired_value = equity_before * target_w
         safe_prices = np.where(current_prices > 1e-12, current_prices, np.inf)
         raw_target_shares = desired_value / safe_prices
-        desired_shares = _floor_to_int64(raw_target_shares, non_negative=True)
+        desired_shares = _floor_to_int64(raw_target_shares, non_negative=True) if long_only else _trunc_to_int64(raw_target_shares)
 
         # Non-tradable symbols keep existing shares.
         desired_shares[~day_mask] = shares[~day_mask]
 
         delta = desired_shares - shares
+        if max_turnover_ratio > 0.0:
+            traded_notional_before_cap = float(np.dot(np.abs(delta).astype(np.float64), current_prices))
+            max_traded_notional = float(equity_before * max_turnover_ratio)
+            if traded_notional_before_cap > max_traded_notional + 1e-9 and traded_notional_before_cap > 0.0:
+                scale = max(0.0, max_traded_notional / traded_notional_before_cap)
+                scaled_delta = np.sign(delta.astype(np.float64)) * np.floor(np.abs(delta.astype(np.float64)) * scale)
+                desired_shares = shares + scaled_delta.astype(np.int64)
+                delta = desired_shares - shares
         sell_qty = np.clip(-delta, 0, None)
         buy_qty = np.clip(delta, 0, None)
 
@@ -299,32 +378,33 @@ def run_backtest_integer_shares(
 
         # Cash-hold rule: if strategy wants stock exposure but cannot buy even 1 share,
         # stop trading and keep current cash through the remaining dates.
-        wanted_stock = bool(np.any(target_w > 0.0))
-        has_any_share = bool(np.any(desired_shares > 0))
-        if wanted_stock and not has_any_share:
-            tradable_target = (day_mask & (target_w > 0.0))
-            candidate_prices = current_prices[tradable_target]
-            candidate_prices = candidate_prices[np.isfinite(candidate_prices) & (candidate_prices > 1e-12)]
-            if candidate_prices.size > 0:
-                min_buy_cost = float(candidate_prices.min() * (1.0 + buy_fee_rate))
-                if max_affordable_buy + 1e-12 < min_buy_cost:
-                    strategy_returns[t] = 0.0
-                    turnovers[t] = 0.0
-                    stock_weights_history[t] = 0.0
-                    shares.fill(0)
-                    cash_hold_mode = True
-                    records.append(
-                        HoldingsRecord(
-                            date=date_text[t],
-                            symbol="CASH",
-                            shares=int(_floor_to_int64(cash, non_negative=True).item()),
-                            price=1.0,
-                            market_value=float(cash),
-                            holding_ratio=1.0 if cash > 0 else 0.0,
-                            is_cash=True,
+        if long_only:
+            wanted_stock = bool(np.any(target_w > 0.0))
+            has_any_share = bool(np.any(desired_shares > 0))
+            if wanted_stock and not has_any_share:
+                tradable_target = (day_mask & (target_w > 0.0))
+                candidate_prices = current_prices[tradable_target]
+                candidate_prices = candidate_prices[np.isfinite(candidate_prices) & (candidate_prices > 1e-12)]
+                if candidate_prices.size > 0:
+                    min_buy_cost = float(candidate_prices.min() * (1.0 + buy_fee_rate))
+                    if max_affordable_buy + 1e-12 < min_buy_cost:
+                        strategy_returns[t] = 0.0
+                        turnovers[t] = 0.0
+                        stock_weights_history[t] = 0.0
+                        shares.fill(0)
+                        cash_hold_mode = True
+                        records.append(
+                            HoldingsRecord(
+                                date=date_text[t],
+                                symbol="CASH",
+                                shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                                price=1.0,
+                                market_value=float(cash),
+                                holding_ratio=1.0 if cash > 0 else 0.0,
+                                is_cash=True,
+                            )
                         )
-                    )
-                    continue
+                        continue
 
         buy_fee = buy_fee_rate * buy_notional
         sell_fee = sell_fee_rate * sell_notional
@@ -356,7 +436,7 @@ def run_backtest_integer_shares(
                 is_cash=True,
             )
         )
-        nonzero = np.flatnonzero(shares > 0)
+        nonzero = np.flatnonzero(shares != 0)
         for idx in nonzero.tolist():
             mv = float(stock_market_values[idx])
             day_rows.append(
