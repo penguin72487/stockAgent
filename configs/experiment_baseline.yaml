@@ -3,21 +3,26 @@ experiment_name: tw-stock-expanding-walkforward
 runner:
   output_dir: artifacts
   require_cuda: true
+  mode: train
+  resume: true
+  post_train_infer: true
 
 environment:
   conda_env: fintech
   device: cuda
   use_tensor_cores: true
-  amp_dtype: tf32
+  amp_dtype: bf16
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_forex_frankfurter
-  benchmark_name: EURUSD
+  parquet_root: data_yahoo/tw_stocks
+  benchmark_name: "2330"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
+  usd_only_trading_pairs: false
+  tw_limit_up_down_guard: true
 
 walk_forward:
   min_train_years: 1
@@ -26,8 +31,9 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0001
-  sell_fee_rate: 0.0001
+  buy_fee_rate: 0.001425
+  sell_fee_rate: 0.004425
+  max_turnover_ratio: 100.0
   long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true
@@ -37,7 +43,10 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
+  model_name: tabular_resnet
   enable_torch_compile: true
+  warm_start_from_previous_fold: false
+  chunk_rows: 0
   lookback: 1
   batch_size: 2048
   batch_size_train: 2048
@@ -45,6 +54,7 @@ training:
   epochs: 1000
   early_stopping_no_improve_ratio: 0.2
   learning_rate: 0.001
+  top_k: 20
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
@@ -56,9 +66,49 @@ training:
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
   target_vram_fraction: 1
+  mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    embedding_dim: 64
+    dropout: 0.1
+  ft_transformer:
+    d_token: 64
+    n_layers: 2
+    n_heads: 4
+    ffn_dim: 256
+    dropout: 0.1
+    use_cls_token: true
+  tabular_resnet:
+    embedding_dim: 128
+    hidden_dim: 256
+    n_blocks: 4
+    dropout: 0.1
+  lightgbm:
+    use_gpu: true
+    gpu_device_id: 0
+    n_estimators: 300
+    num_leaves: 63
+    max_depth: -1
+    learning_rate: 0.05
+    subsample: 0.9
+    colsample_bytree: 0.9
+    reg_lambda: 1.0
+    n_jobs: -1
+    random_state: 42
+  xgboost:
+    use_gpu: true
+    gpu_device_id: 0
+    n_estimators: 300
+    max_depth: 8
+    learning_rate: 0.05
+    subsample: 0.9
+    colsample_bytree: 0.9
+    reg_lambda: 1.0
+    n_jobs: -1
+    random_state: 42
 
 evaluation:
-  primary_baseline: BTC
+  primary_baseline: "2330"
   metrics:
     - cumulative_return
     - annualized_return

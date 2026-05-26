@@ -24,11 +24,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
 
         returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
         tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
+        # If panel does not provide TW-specific masks, fall back to tradable mask.
+        can_buy = panel.can_buy_mask if panel.can_buy_mask is not None else tradable
+        can_sell = panel.can_sell_mask if panel.can_sell_mask is not None else tradable
 
         # Cache tensors once to avoid per-item numpy copies.
         self.features_t = torch.from_numpy(panel.features)
         self.future_log_returns_t = torch.from_numpy(returns)
         self.tradable_mask_t = torch.from_numpy(tradable)
+        self.can_buy_mask_t = torch.from_numpy(can_buy)
+        self.can_sell_mask_t = torch.from_numpy(can_sell)
         self.benchmark_t = torch.from_numpy(panel.benchmark_returns.astype(np.float32, copy=False))
 
     def __len__(self) -> int:
@@ -41,6 +46,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "x": self.features_t[start_idx : date_idx + 1],
             "future_log_returns": self.future_log_returns_t[date_idx],
             "tradable_mask": self.tradable_mask_t[date_idx],
+            "can_buy_mask": self.can_buy_mask_t[date_idx],
+            "can_sell_mask": self.can_sell_mask_t[date_idx],
             "benchmark": self.benchmark_t[date_idx],
         }
 
@@ -50,5 +57,7 @@ def collate_batch(samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Ten
         "x": torch.stack([s["x"] for s in samples]),
         "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
         "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
+        "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
+        "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
         "benchmark": torch.stack([s["benchmark"] for s in samples]),
     }
