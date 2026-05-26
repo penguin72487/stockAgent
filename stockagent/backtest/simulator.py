@@ -113,6 +113,8 @@ def _vectorized_backtest(
     weights: np.ndarray,
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
+    can_buy_mask: np.ndarray | None,
+    can_sell_mask: np.ndarray | None,
     buy_fee_rate: float,
     sell_fee_rate: float,
     long_only: bool = True,
@@ -136,6 +138,21 @@ def _vectorized_backtest(
         weights_history[:-1],
     ], axis=0)
     deltas = weights_history - prev
+    buy_mask = tradable_mask.astype(bool) if can_buy_mask is None else can_buy_mask.astype(bool)
+    sell_mask = tradable_mask.astype(bool) if can_sell_mask is None else can_sell_mask.astype(bool)
+    deltas = np.where((deltas > 0.0) & ~buy_mask, 0.0, deltas)
+    deltas = np.where((deltas < 0.0) & ~sell_mask, 0.0, deltas)
+    if long_only:
+        sell_deltas = np.clip(deltas, None, 0.0)
+        base_after_sells = prev + sell_deltas
+        buy_deltas = np.clip(deltas, 0.0, None)
+        buy_sum = buy_deltas.sum(axis=1, keepdims=True)
+        buy_capacity = np.clip(1.0 - base_after_sells.sum(axis=1, keepdims=True), 0.0, None)
+        buy_scale = np.ones_like(buy_sum, dtype=np.float32)
+        np.divide(buy_capacity, buy_sum, out=buy_scale, where=buy_sum > buy_capacity)
+        buy_scale = np.clip(buy_scale, 0.0, 1.0)
+        deltas = sell_deltas + buy_deltas * buy_scale
+    weights_history = (prev + deltas).astype(np.float32)
     if max_turnover_ratio > 0.0:
         weights_history = _apply_turnover_cap_numpy(prev, weights_history, max_turnover_ratio)
         deltas = weights_history - prev
@@ -152,6 +169,8 @@ def _vectorized_backtest_torch(
     weights: torch.Tensor,
     future_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor | None,
+    can_sell_mask: torch.Tensor | None,
     buy_fee_rate: float,
     sell_fee_rate: float,
     long_only: bool = True,
@@ -174,6 +193,21 @@ def _vectorized_backtest_torch(
         dim=0,
     )
     deltas = weights_history - prev
+    buy_mask = tradable_mask.bool() if can_buy_mask is None else can_buy_mask.bool()
+    sell_mask = tradable_mask.bool() if can_sell_mask is None else can_sell_mask.bool()
+    deltas = torch.where((deltas > 0.0) & ~buy_mask, torch.zeros_like(deltas), deltas)
+    deltas = torch.where((deltas < 0.0) & ~sell_mask, torch.zeros_like(deltas), deltas)
+    if long_only:
+        sell_deltas = deltas.clamp_max(0.0)
+        base_after_sells = prev + sell_deltas
+        buy_deltas = deltas.clamp_min(0.0)
+        buy_sum = buy_deltas.sum(dim=1, keepdim=True)
+        buy_capacity = (1.0 - base_after_sells.sum(dim=1, keepdim=True)).clamp_min(0.0)
+        buy_scale = torch.ones_like(buy_sum)
+        buy_scale = torch.where(buy_sum > buy_capacity, buy_capacity / buy_sum.clamp_min(1e-12), buy_scale)
+        buy_scale = buy_scale.clamp(0.0, 1.0)
+        deltas = sell_deltas + buy_deltas * buy_scale
+    weights_history = (prev + deltas).float()
     if max_turnover_ratio > 0.0:
         weights_history = _apply_turnover_cap_torch(prev, weights_history, max_turnover_ratio)
         deltas = weights_history - prev
@@ -195,12 +229,16 @@ def run_backtest(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    can_buy_mask: np.ndarray | None = None,
+    can_sell_mask: np.ndarray | None = None,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
         weights,
         future_returns,
         tradable_mask,
+        can_buy_mask,
+        can_sell_mask,
         buy_fee_rate,
         sell_fee_rate,
         long_only=long_only,
@@ -224,12 +262,16 @@ def run_backtest_torch(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    can_buy_mask: torch.Tensor | None = None,
+    can_sell_mask: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
         weights,
         future_returns,
         tradable_mask,
+        can_buy_mask,
+        can_sell_mask,
         buy_fee_rate,
         sell_fee_rate,
         long_only=long_only,
@@ -249,6 +291,8 @@ def run_backtest_integer_shares(
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
     benchmark_returns: np.ndarray,
+    can_buy_mask: np.ndarray | None = None,
+    can_sell_mask: np.ndarray | None = None,
     *,
     initial_capital: float = 1_000_000.0,
     buy_fee_rate: float = 0.001425,
@@ -270,6 +314,8 @@ def run_backtest_integer_shares(
     w = np.asarray(weights, dtype=np.float64)
     r = np.nan_to_num(np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     m = np.asarray(tradable_mask, dtype=bool)
+    buy_m = m if can_buy_mask is None else np.asarray(can_buy_mask, dtype=bool)
+    sell_m = m if can_sell_mask is None else np.asarray(can_sell_mask, dtype=bool)
     b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
     t_len, n_symbols = w.shape
@@ -346,6 +392,12 @@ def run_backtest_integer_shares(
 
         # Non-tradable symbols keep existing shares.
         desired_shares[~day_mask] = shares[~day_mask]
+
+        can_buy_day = buy_m[t]
+        can_sell_day = sell_m[t]
+        delta = desired_shares - shares
+        desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
+        desired_shares[(delta < 0) & ~can_sell_day] = shares[(delta < 0) & ~can_sell_day]
 
         delta = desired_shares - shares
         if max_turnover_ratio > 0.0:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import time
@@ -62,6 +63,15 @@ class FoldRuntimeContext:
     test_ds: CrossSectionalDataset
     checkpoint_best_path: Path
     best_val_loss: float = float("inf")
+
+
+def _normalized_model_name(model_name: str) -> str:
+    return model_name.strip().lower().replace("-", "_")
+
+
+def _is_tree_model_name(model_name: str) -> bool:
+    normalized = _normalized_model_name(model_name)
+    return normalized in {"lightgbm", "lgbm", "xgboost", "xgb"}
 
 
 def _fold_dir(output_path: Path, fold_id: int) -> Path:
@@ -296,7 +306,9 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
     return result, dates
 
 
-def _dataset_to_tensors(dataset: CrossSectionalDataset) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _dataset_to_tensors(
+    dataset: CrossSectionalDataset,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
     if dataset.lookback == 1:
         x = dataset.features_t[valid_indices].unsqueeze(1)
@@ -304,8 +316,10 @@ def _dataset_to_tensors(dataset: CrossSectionalDataset) -> tuple[torch.Tensor, t
         x = torch.stack([dataset[i]["x"] for i in range(len(dataset))], dim=0)
     returns = dataset.future_log_returns_t[valid_indices]
     masks = dataset.tradable_mask_t[valid_indices]
+    can_buy_masks = dataset.can_buy_mask_t[valid_indices]
+    can_sell_masks = dataset.can_sell_mask_t[valid_indices]
     bench = dataset.benchmark_t[valid_indices]
-    return x, returns, masks, bench
+    return x, returns, masks, can_buy_masks, can_sell_masks, bench
 
 
 def _prepare_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
@@ -319,15 +333,19 @@ def _prepare_split_tensors(
     x: torch.Tensor,
     returns: torch.Tensor,
     masks: torch.Tensor,
+    can_buy_masks: torch.Tensor,
+    can_sell_masks: torch.Tensor,
     bench: torch.Tensor,
     device: torch.device,
     non_blocking: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     pin_memory = device.type == "cuda" and non_blocking
     return (
         _prepare_host_tensor(x, pin_memory),
         _prepare_host_tensor(returns, pin_memory),
         _prepare_host_tensor(masks, pin_memory),
+        _prepare_host_tensor(can_buy_masks, pin_memory),
+        _prepare_host_tensor(can_sell_masks, pin_memory),
         _prepare_host_tensor(bench, pin_memory),
     )
 
@@ -346,44 +364,54 @@ def _pad_training_tensors(
     x: torch.Tensor,
     returns: torch.Tensor,
     masks: torch.Tensor,
+    can_buy_masks: torch.Tensor,
+    can_sell_masks: torch.Tensor,
     batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_rows = int(x.size(0))
     if total_rows == 0:
-        return x, returns, masks, torch.empty((0,), dtype=torch.bool)
+        return x, returns, masks, can_buy_masks, can_sell_masks, torch.empty((0,), dtype=torch.bool)
 
     padded_rows = ((total_rows + batch_size - 1) // batch_size) * batch_size
     sample_mask = torch.ones(total_rows, dtype=torch.bool)
     if padded_rows == total_rows:
-        return x, returns, masks, sample_mask
+        return x, returns, masks, can_buy_masks, can_sell_masks, sample_mask
 
     return (
         _pad_rows(x, padded_rows, 0),
         _pad_rows(returns, padded_rows, 0.0),
         _pad_rows(masks, padded_rows, False),
+        _pad_rows(can_buy_masks, padded_rows, False),
+        _pad_rows(can_sell_masks, padded_rows, False),
         _pad_rows(sample_mask, padded_rows, False),
     )
 
 
 def _combine_datasets_to_tensors(
     datasets: list[CrossSectionalDataset],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
     xs: list[torch.Tensor] = []
     returns: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
+    can_buy_masks: list[torch.Tensor] = []
+    can_sell_masks: list[torch.Tensor] = []
     bench: list[torch.Tensor] = []
     lengths: list[int] = []
     for dataset in datasets:
-        x, y, m, b = _dataset_to_tensors(dataset)
+        x, y, m, mb, ms, b = _dataset_to_tensors(dataset)
         xs.append(x)
         returns.append(y)
         masks.append(m)
+        can_buy_masks.append(mb)
+        can_sell_masks.append(ms)
         bench.append(b)
         lengths.append(int(x.size(0)))
     return (
         torch.cat(xs, dim=0),
         torch.cat(returns, dim=0),
         torch.cat(masks, dim=0),
+        torch.cat(can_buy_masks, dim=0),
+        torch.cat(can_sell_masks, dim=0),
         torch.cat(bench, dim=0),
         lengths,
     )
@@ -394,6 +422,8 @@ def _evaluate_tensor_batch(
     x: torch.Tensor,
     future_log_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
     benchmark: torch.Tensor,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -403,6 +433,7 @@ def _evaluate_tensor_batch(
     sell_fee_rate: float,
     max_turnover_ratio: float,
     chunk_rows: int,
+    compute_ic: bool = True,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     weights_chunks: list[torch.Tensor] = []
@@ -434,9 +465,11 @@ def _evaluate_tensor_batch(
             x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
             returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
             mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
+            buy_mask_chunk = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
+            sell_mask_chunk = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
             bench_chunk = benchmark[start:end].to(device=device, non_blocking=non_blocking)
             with _autocast_context(device, amp_dtype):
-                weights_chunk = model(x_chunk, mask_chunk)
+                weights_chunk = model(x_chunk, buy_mask_chunk)
 
             backtest_chunk = run_backtest_torch(
                 weights_chunk,
@@ -447,8 +480,11 @@ def _evaluate_tensor_batch(
                 sell_fee_rate,
                 long_only=long_only,
                 max_turnover_ratio=max_turnover_ratio,
+                can_buy_mask=buy_mask_chunk,
+                can_sell_mask=sell_mask_chunk,
             )
-            ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
+            if compute_ic:
+                ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
 
             weights_chunks.append(backtest_chunk.weights_history)
             strategy_chunks.append(backtest_chunk.strategy_returns)
@@ -474,13 +510,14 @@ def _evaluate_tensor_batch(
             cum_log = cum_log_chunk[-1]
             running_max_log = running_max_chunk[-1]
 
-            ic_clean = ic_chunk[torch.isfinite(ic_chunk)]
-            if ic_clean.numel() > 0:
-                ic_clean64 = ic_clean.to(torch.float64)
-                ic_count += int(ic_clean64.numel())
-                ic_sum += float(ic_clean64.sum().item())
-                ic_sumsq += float((ic_clean64 * ic_clean64).sum().item())
-                ic_pos += float((ic_clean64 > 0).to(torch.float64).sum().item())
+            if compute_ic:
+                ic_clean = ic_chunk[torch.isfinite(ic_chunk)]
+                if ic_clean.numel() > 0:
+                    ic_clean64 = ic_clean.to(torch.float64)
+                    ic_count += int(ic_clean64.numel())
+                    ic_sum += float(ic_clean64.sum().item())
+                    ic_sumsq += float((ic_clean64 * ic_clean64).sum().item())
+                    ic_pos += float((ic_clean64 > 0).to(torch.float64).sum().item())
 
         weights = torch.cat(weights_chunks, dim=0)
         strategy_returns = torch.cat(strategy_chunks, dim=0)
@@ -698,6 +735,14 @@ def _autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
     if device.type != "cuda" or amp_dtype is None:
         return nullcontext()
     return autocast(device_type="cuda", enabled=True, dtype=amp_dtype)
+
+
+def _is_compile_backward_shape_error(exc: RuntimeError) -> bool:
+    msg = str(exc)
+    return (
+        "CompiledFunctionBackward returned an invalid gradient" in msg
+        and "expected shape compatible" in msg
+    )
 
 
 def _resolve_host_compilers() -> tuple[str | None, str | None]:
@@ -1087,11 +1132,12 @@ def _train_epoch(
         optimizer.zero_grad(set_to_none=True)
         
         with _autocast_context(device, amp_dtype):
-            weights = model(batch["x"], batch["tradable_mask"])
+            weights = model(batch["x"], batch["can_buy_mask"])
             loss = sharpe_aware_loss(
                 weights,
                 batch["future_log_returns"],
-                batch["tradable_mask"],
+                batch["can_buy_mask"],
+                can_sell_mask=batch["can_sell_mask"],
                 long_only=long_only,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
@@ -1118,6 +1164,8 @@ def _train_epoch_tensor(
     x: torch.Tensor,
     future_log_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
     sample_mask: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -1148,15 +1196,18 @@ def _train_epoch_tensor(
         batch_x = x[start:end].to(device=device, non_blocking=non_blocking)
         batch_ret = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
         batch_mask = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
+        batch_buy_mask = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
+        batch_sell_mask = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_sample_mask = sample_mask[start:end].to(device=device, non_blocking=non_blocking)
 
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
-            weights = model(batch_x, batch_mask)
+            weights = model(batch_x, batch_buy_mask)
             loss = sharpe_aware_loss(
                 weights,
                 batch_ret,
-                batch_mask,
+                batch_buy_mask,
+                can_sell_mask=batch_sell_mask,
                 sample_mask=batch_sample_mask,
                 long_only=long_only,
                 buy_fee_rate=buy_fee_rate,
@@ -1232,6 +1283,536 @@ def _compute_metrics_from_tensors(
     }
 
 
+def _run_training_tree_models(
+    panel: PanelData,
+    folds: Iterable[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+    resume: bool = True,
+) -> list[FoldResult]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    results_by_fold: dict[int, FoldResult] = {}
+    fold_list = list(folds)
+
+    if resume:
+        for fold in fold_list:
+            completed = _load_completed_fold_result(output_path, fold.fold_id)
+            if completed is not None:
+                results_by_fold[fold.fold_id] = completed
+        if results_by_fold:
+            _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+
+    grouped_folds: dict[tuple[int, ...], list[WalkForwardFold]] = {}
+    for fold in fold_list:
+        grouped_folds.setdefault(_group_key(fold.train_years), []).append(fold)
+
+    device = torch.device("cpu")
+    amp_dtype: torch.dtype | None = None
+    non_blocking = False
+    eval_chunk_rows = 2048
+
+    for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
+        train_years = list(train_years_key)
+        pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
+        if not pending_folds:
+            print(f"[Train {train_years}] already completed, skipping")
+            continue
+
+        print(f"\n{'='*80}")
+        print(f"[Train {train_years}] tree model={config.training.model_name} folds={len(group_folds)} pending={len(pending_folds)}")
+        print(f"{'='*80}")
+
+        train_reference = group_folds[0]
+        train_ds = CrossSectionalDataset(panel, train_reference.train_indices, config.training.lookback)
+        train_x, train_returns, train_masks, _, _, _ = _dataset_to_tensors(train_ds)
+
+        model = build_model(
+            config=config,
+            lookback=config.training.lookback,
+            num_features=len(panel.feature_names),
+            num_symbols=panel.num_symbols,
+        )
+        if not hasattr(model, "fit"):
+            raise TypeError(f"Tree training path expects model.fit(), got {type(model).__name__}")
+
+        print(f"[Train {train_years}] fitting tree model on {int(train_x.size(0))} dates x {panel.num_symbols} symbols")
+        model.fit(train_x, train_returns, train_masks)  # type: ignore[attr-defined]
+
+        for fold in pending_folds:
+            print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
+            val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
+            test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+            if len(test_ds) == 0:
+                print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+                continue
+
+            fold_dir = _fold_dir(output_path, fold.fold_id)
+            fold_dir.mkdir(parents=True, exist_ok=True)
+
+            val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+            val_bt_t, val_ic, _ = _evaluate_tensor_batch(
+                model,
+                val_x,
+                val_returns,
+                val_masks,
+                val_buy_masks,
+                val_sell_masks,
+                val_bench,
+                device,
+                amp_dtype,
+                non_blocking,
+                config.trading.long_only,
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
+                config.trading.max_turnover_ratio,
+                chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
+            )
+            val_loss = float(
+                sharpe_aware_loss(
+                    val_bt_t.weights_history,
+                    val_returns,
+                    val_buy_masks,
+                    can_sell_mask=val_sell_masks,
+                    long_only=config.trading.long_only,
+                    buy_fee_rate=config.trading.buy_fee_rate,
+                    sell_fee_rate=config.trading.sell_fee_rate,
+                    max_turnover_ratio=config.trading.max_turnover_ratio,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                ).detach().cpu()
+            )
+            val_met = _compute_metrics_from_tensors(
+                val_bt_t.strategy_returns,
+                val_bt_t.benchmark_returns,
+                val_bt_t.turnovers,
+            )
+
+            test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+            test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+                model,
+                test_x,
+                test_returns,
+                test_masks,
+                test_buy_masks,
+                test_sell_masks,
+                test_bench,
+                device,
+                amp_dtype,
+                non_blocking,
+                config.trading.long_only,
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
+                config.trading.max_turnover_ratio,
+                chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
+            )
+
+            test_dates = panel.dates[test_ds.valid_indices]
+            test_close_prices = panel.close_prices[test_ds.valid_indices]
+            test_bt, holdings_records = run_backtest_integer_shares(
+                weights=test_bt_t.weights_history.detach().cpu().numpy(),
+                future_returns=test_returns.detach().cpu().numpy(),
+                tradable_mask=test_masks.detach().cpu().numpy(),
+                can_buy_mask=test_buy_masks.detach().cpu().numpy(),
+                can_sell_mask=test_sell_masks.detach().cpu().numpy(),
+                benchmark_returns=test_bench.detach().cpu().numpy(),
+                initial_capital=1_000_000.0,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                long_only=config.trading.long_only,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                close_prices=test_close_prices,
+                symbols=panel.symbols,
+                dates=test_dates,
+            )
+            test_met = compute_metrics(test_bt)
+
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+
+            fold_result = FoldResult(
+                fold_id=fold.fold_id,
+                train_years=fold.train_years,
+                val_years=fold.val_years,
+                test_years=fold.test_years,
+                best_val_loss=val_loss,
+                val_ic=val_ic,
+                val_metrics=val_met,
+                test_ic=test_ic,
+                test_metrics=test_met,
+            )
+            results_by_fold[fold.fold_id] = fold_result
+
+            with _model_path(fold_dir).open("wb") as model_file:
+                pickle.dump(model, model_file)
+            with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
+                json.dump(asdict(fold_result), f, indent=2)
+
+            _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+            report = generate_annual_report(test_bt, test_dates)
+            print("\n" + report)
+            with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
+                f.write(report)
+
+            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+            _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+
+            _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+
+    return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]
+
+
+def _run_inference_tree_models(
+    panel: PanelData,
+    folds: Iterable[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+) -> list[FoldResult]:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    results_by_fold: dict[int, FoldResult] = {}
+    fold_list = sorted(list(folds), key=lambda item: item.fold_id)
+
+    device = torch.device("cpu")
+    amp_dtype: torch.dtype | None = None
+    non_blocking = False
+
+    print(f"[inference] tree model={config.training.model_name} folds={len(fold_list)}")
+    for fold in tqdm(fold_list, desc="Inference folds", unit="fold"):
+        fold_dir = _fold_dir(output_path, fold.fold_id)
+        model_path = _model_path(fold_dir)
+        if not model_path.exists():
+            print(f"[Fold {fold.fold_id}] skip: missing model file {model_path.name}")
+            continue
+
+        with model_path.open("rb") as model_file:
+            model = pickle.load(model_file)
+
+        val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
+        test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+        if len(test_ds) == 0:
+            print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+            continue
+
+        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+        val_chunk_rows = max(1, min(2048, int(val_x.size(0))))
+        val_bt_t, val_ic, _ = _evaluate_tensor_batch(
+            model,
+            val_x,
+            val_returns,
+            val_masks,
+            val_buy_masks,
+            val_sell_masks,
+            val_bench,
+            device,
+            amp_dtype,
+            non_blocking,
+            config.trading.long_only,
+            config.trading.buy_fee_rate,
+            config.trading.sell_fee_rate,
+            config.trading.max_turnover_ratio,
+            chunk_rows=val_chunk_rows,
+        )
+        val_loss = float(
+            sharpe_aware_loss(
+                val_bt_t.weights_history,
+                val_returns,
+                val_buy_masks,
+                can_sell_mask=val_sell_masks,
+                long_only=config.trading.long_only,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gamma_sharpe=config.evaluation.gamma_sharpe,
+                gamma_turnover=config.evaluation.gamma_turnover,
+            ).detach().cpu()
+        )
+        val_met = _compute_metrics_from_tensors(
+            val_bt_t.strategy_returns,
+            val_bt_t.benchmark_returns,
+            val_bt_t.turnovers,
+        )
+
+        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+        test_chunk_rows = max(1, min(2048, int(test_x.size(0))))
+        test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+            model,
+            test_x,
+            test_returns,
+            test_masks,
+            test_buy_masks,
+            test_sell_masks,
+            test_bench,
+            device,
+            amp_dtype,
+            non_blocking,
+            config.trading.long_only,
+            config.trading.buy_fee_rate,
+            config.trading.sell_fee_rate,
+            config.trading.max_turnover_ratio,
+            chunk_rows=test_chunk_rows,
+        )
+
+        test_dates = panel.dates[test_ds.valid_indices]
+        test_close_prices = panel.close_prices[test_ds.valid_indices]
+        test_bt, holdings_records = run_backtest_integer_shares(
+            weights=test_bt_t.weights_history.detach().cpu().numpy(),
+            future_returns=test_returns.detach().cpu().numpy(),
+            tradable_mask=test_masks.detach().cpu().numpy(),
+            can_buy_mask=test_buy_masks.detach().cpu().numpy(),
+            can_sell_mask=test_sell_masks.detach().cpu().numpy(),
+            benchmark_returns=test_bench.detach().cpu().numpy(),
+            initial_capital=1_000_000.0,
+            buy_fee_rate=config.trading.buy_fee_rate,
+            sell_fee_rate=config.trading.sell_fee_rate,
+            long_only=config.trading.long_only,
+            max_turnover_ratio=config.trading.max_turnover_ratio,
+            close_prices=test_close_prices,
+            symbols=panel.symbols,
+            dates=test_dates,
+        )
+        test_met = compute_metrics(test_bt)
+
+        fold_result = FoldResult(
+            fold_id=fold.fold_id,
+            train_years=fold.train_years,
+            val_years=fold.val_years,
+            test_years=fold.test_years,
+            best_val_loss=val_loss,
+            val_ic=val_ic,
+            val_metrics=val_met,
+            test_ic=test_ic,
+            test_metrics=test_met,
+        )
+        results_by_fold[fold.fold_id] = fold_result
+
+        with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
+            json.dump(asdict(fold_result), f, indent=2)
+
+        _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+        report = generate_annual_report(test_bt, test_dates)
+        with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
+            f.write(report)
+
+        plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+        plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+        _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+
+    if results_by_fold:
+        _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+
+    return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]
+
+
+def _run_inference_neural_models(
+    panel: PanelData,
+    folds: Iterable[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+) -> list[FoldResult]:
+    device = _resolve_device(config)
+    non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
+    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    results_by_fold: dict[int, FoldResult] = {}
+    fold_list = sorted(list(folds), key=lambda item: item.fold_id)
+
+    print(f"[inference] model={config.training.model_name} folds={len(fold_list)} device={device}")
+    for fold in tqdm(fold_list, desc="Inference folds", unit="fold"):
+        fold_dir = _fold_dir(output_path, fold.fold_id)
+        model_file = _model_path(fold_dir)
+        best_checkpoint_file = _best_checkpoint_path(fold_dir)
+
+        model_state_dict: dict | None = None
+        best_val_loss = float("inf")
+
+        if model_file.exists():
+            model_state_dict = torch.load(model_file, map_location="cpu")
+        elif best_checkpoint_file.exists():
+            checkpoint = _load_checkpoint(best_checkpoint_file)
+            model_state_dict = checkpoint.get("model_state_dict")
+            best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        else:
+            print(f"[Fold {fold.fold_id}] skip: missing {model_file.name} and {best_checkpoint_file.name}")
+            continue
+
+        if not isinstance(model_state_dict, dict):
+            print(f"[Fold {fold.fold_id}] skip: invalid model state format")
+            continue
+
+        model = build_model(
+            config=config,
+            lookback=config.training.lookback,
+            num_features=len(panel.feature_names),
+            num_symbols=panel.num_symbols,
+        ).to(device)
+        _load_state_dict(model, model_state_dict)
+
+        val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
+        test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+        if len(test_ds) == 0:
+            print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+            continue
+
+        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _prepare_split_tensors(
+            val_x,
+            val_returns,
+            val_masks,
+            val_buy_masks,
+            val_sell_masks,
+            val_bench,
+            device,
+            non_blocking,
+        )
+        val_chunk_rows = max(1, min(2048, int(val_x.size(0))))
+        if config.training.chunk_rows > 0:
+            val_chunk_rows = max(1, min(config.training.chunk_rows, int(val_x.size(0))))
+
+        val_bt_t, val_ic, _ = _evaluate_tensor_batch(
+            model,
+            val_x,
+            val_returns,
+            val_masks,
+            val_buy_masks,
+            val_sell_masks,
+            val_bench,
+            device,
+            amp_dtype,
+            non_blocking,
+            config.trading.long_only,
+            config.trading.buy_fee_rate,
+            config.trading.sell_fee_rate,
+            config.trading.max_turnover_ratio,
+            chunk_rows=val_chunk_rows,
+        )
+
+        if not np.isfinite(best_val_loss):
+            best_val_loss = float(
+                sharpe_aware_loss(
+                    val_bt_t.weights_history,
+                    val_returns,
+                    val_masks,
+                    can_sell_mask=val_sell_masks,
+                    long_only=config.trading.long_only,
+                    buy_fee_rate=config.trading.buy_fee_rate,
+                    sell_fee_rate=config.trading.sell_fee_rate,
+                    max_turnover_ratio=config.trading.max_turnover_ratio,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                ).detach().cpu()
+            )
+
+        val_met = _compute_metrics_from_tensors(
+            val_bt_t.strategy_returns,
+            val_bt_t.benchmark_returns,
+            val_bt_t.turnovers,
+        )
+
+        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _prepare_split_tensors(
+            test_x,
+            test_returns,
+            test_masks,
+            test_buy_masks,
+            test_sell_masks,
+            test_bench,
+            device,
+            non_blocking,
+        )
+        test_chunk_rows = max(1, min(2048, int(test_x.size(0))))
+        if config.training.chunk_rows > 0:
+            test_chunk_rows = max(1, min(config.training.chunk_rows, int(test_x.size(0))))
+
+        test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+            model,
+            test_x,
+            test_returns,
+            test_masks,
+            test_buy_masks,
+            test_sell_masks,
+            test_bench,
+            device,
+            amp_dtype,
+            non_blocking,
+            config.trading.long_only,
+            config.trading.buy_fee_rate,
+            config.trading.sell_fee_rate,
+            config.trading.max_turnover_ratio,
+            chunk_rows=test_chunk_rows,
+        )
+
+        test_dates = panel.dates[test_ds.valid_indices]
+        test_close_prices = panel.close_prices[test_ds.valid_indices]
+        test_bt, holdings_records = run_backtest_integer_shares(
+            weights=test_bt_t.weights_history.detach().cpu().numpy(),
+            future_returns=test_returns.detach().cpu().numpy(),
+            tradable_mask=test_masks.detach().cpu().numpy(),
+            can_buy_mask=test_buy_masks.detach().cpu().numpy(),
+            can_sell_mask=test_sell_masks.detach().cpu().numpy(),
+            benchmark_returns=test_bench.detach().cpu().numpy(),
+            initial_capital=1_000_000.0,
+            buy_fee_rate=config.trading.buy_fee_rate,
+            sell_fee_rate=config.trading.sell_fee_rate,
+            long_only=config.trading.long_only,
+            max_turnover_ratio=config.trading.max_turnover_ratio,
+            close_prices=test_close_prices,
+            symbols=panel.symbols,
+            dates=test_dates,
+        )
+        test_met = compute_metrics(test_bt)
+
+        fold_result = FoldResult(
+            fold_id=fold.fold_id,
+            train_years=fold.train_years,
+            val_years=fold.val_years,
+            test_years=fold.test_years,
+            best_val_loss=best_val_loss,
+            val_ic=val_ic,
+            val_metrics=val_met,
+            test_ic=test_ic,
+            test_metrics=test_met,
+        )
+        results_by_fold[fold.fold_id] = fold_result
+
+        with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
+            json.dump(asdict(fold_result), f, indent=2)
+
+        _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+        report = generate_annual_report(test_bt, test_dates)
+        with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
+            f.write(report)
+
+        plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+        plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+        _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+
+    if results_by_fold:
+        _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+
+    return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]
+
+
+def run_inference(
+    panel: PanelData,
+    folds: Iterable[WalkForwardFold],
+    config: ExperimentConfig,
+    output_dir: str | Path,
+) -> list[FoldResult]:
+    if _is_tree_model_name(config.training.model_name):
+        return _run_inference_tree_models(panel, folds, config, output_dir)
+    return _run_inference_neural_models(panel, folds, config, output_dir)
+
+
 def run_training(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -1239,6 +1820,9 @@ def run_training(
     output_dir: str | Path,
     resume: bool = True,
 ) -> list[FoldResult]:
+    if _is_tree_model_name(config.training.model_name):
+        return _run_training_tree_models(panel, folds, config, output_dir, resume=resume)
+
     device = _resolve_device(config)
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
@@ -1361,17 +1945,21 @@ def run_training(
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
 
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
-        train_x, train_returns, train_masks, _ = _dataset_to_tensors(train_ds)
-        train_x, train_returns, train_masks, train_sample_mask = _pad_training_tensors(
+        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, _ = _dataset_to_tensors(train_ds)
+        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_sample_mask = _pad_training_tensors(
             train_x,
             train_returns,
             train_masks,
+            train_buy_masks,
+            train_sell_masks,
             train_batch_size,
         )
-        train_x, train_returns, train_masks, _ = _prepare_split_tensors(
+        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, _ = _prepare_split_tensors(
             train_x,
             train_returns,
             train_masks,
+            train_buy_masks,
+            train_sell_masks,
             torch.empty(0),
             device,
             non_blocking,
@@ -1419,13 +2007,15 @@ def run_training(
             continue
 
         val_datasets = [context.val_ds for context in fold_contexts.values()]
-        combined_val_x, combined_val_returns, combined_val_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
+        combined_val_x, combined_val_returns, combined_val_masks, combined_val_buy_masks, combined_val_sell_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
             val_datasets,  # type: ignore[arg-type]
         )
-        combined_val_x, combined_val_returns, combined_val_masks, combined_val_bench = _prepare_split_tensors(
+        combined_val_x, combined_val_returns, combined_val_masks, combined_val_buy_masks, combined_val_sell_masks, combined_val_bench = _prepare_split_tensors(
             combined_val_x,
             combined_val_returns,
             combined_val_masks,
+            combined_val_buy_masks,
+            combined_val_sell_masks,
             combined_val_bench,
             device,
             non_blocking,
@@ -1558,11 +2148,11 @@ def run_training(
                 f"(ratio={early_stop_ratio:.2f})"
             )
         val_backtest: BacktestResultTensor | None = None
-        for epoch in epoch_pbar:
-            last_epoch = epoch
+
+        def _run_one_train_epoch(train_model: nn.Module) -> float:
             if train_loader is not None:
-                train_loss = _train_epoch(
-                    compiled_train_model,
+                return _train_epoch(
+                    train_model,
                     train_loader,
                     optimizer,
                     scaler,
@@ -1576,32 +2166,53 @@ def run_training(
                     config.evaluation.gamma_sharpe,
                     config.evaluation.gamma_turnover,
                 )
-            else:
-                train_loss = _train_epoch_tensor(
-                    compiled_train_model,
-                    train_x,
-                    train_returns,
-                    train_masks,
-                    train_sample_mask,
-                    optimizer,
-                    scaler,
-                    batch_size=train_batch_size,
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    non_blocking=non_blocking,
-                    long_only=config.trading.long_only,
-                    buy_fee_rate=config.trading.buy_fee_rate,
-                    sell_fee_rate=config.trading.sell_fee_rate,
-                    max_turnover_ratio=config.trading.max_turnover_ratio,
-                    gamma_sharpe=config.evaluation.gamma_sharpe,
-                    gamma_turnover=config.evaluation.gamma_turnover,
-                )
+            return _train_epoch_tensor(
+                train_model,
+                train_x,
+                train_returns,
+                train_masks,
+                train_buy_masks,
+                train_sell_masks,
+                train_sample_mask,
+                optimizer,
+                scaler,
+                batch_size=train_batch_size,
+                device=device,
+                amp_dtype=amp_dtype,
+                non_blocking=non_blocking,
+                long_only=config.trading.long_only,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gamma_sharpe=config.evaluation.gamma_sharpe,
+                gamma_turnover=config.evaluation.gamma_turnover,
+            )
+
+        for epoch in epoch_pbar:
+            last_epoch = epoch
+            try:
+                train_loss = _run_one_train_epoch(compiled_train_model)
+            except RuntimeError as exc:
+                if compiled_train_model is not model and _is_compile_backward_shape_error(exc):
+                    print(
+                        "[runtime] torch.compile backward shape mismatch detected; "
+                        "falling back to eager mode for stability"
+                    )
+                    compiled_train_model = model
+                    optimizer.zero_grad(set_to_none=True)
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    train_loss = _run_one_train_epoch(compiled_train_model)
+                else:
+                    raise
 
             val_backtest, _, _ = _evaluate_tensor_batch(
                 model,
                 combined_val_x,
                 combined_val_returns,
                 combined_val_masks,
+                combined_val_buy_masks,
+                combined_val_sell_masks,
                 combined_val_bench,
                 device,
                 amp_dtype,
@@ -1611,6 +2222,7 @@ def run_training(
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
+                compute_ic=False,
             )
 
             val_losses: list[float] = []
@@ -1623,6 +2235,10 @@ def run_training(
                 device=val_backtest.weights_history.device,
                 non_blocking=False,
             )
+            val_sell_masks_device = combined_val_sell_masks.to(
+                device=val_backtest.weights_history.device,
+                non_blocking=False,
+            )
             for index, (_, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
@@ -1630,6 +2246,7 @@ def run_training(
                     val_backtest.weights_history[start:end],
                     val_returns_device[start:end],
                     val_masks_device[start:end],
+                    can_sell_mask=val_sell_masks_device[start:end],
                     long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
@@ -1693,6 +2310,8 @@ def run_training(
                 combined_val_x,
                 combined_val_returns,
                 combined_val_masks,
+                combined_val_buy_masks,
+                combined_val_sell_masks,
                 combined_val_bench,
                 device,
                 amp_dtype,
@@ -1726,11 +2345,13 @@ def run_training(
             else:
                 best_val_loss = context.best_val_loss
 
-            test_x, test_returns, test_masks, test_bench = _dataset_to_tensors(context.test_ds)
-            test_x, test_returns, test_masks, test_bench = _prepare_split_tensors(
+            test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(context.test_ds)
+            test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _prepare_split_tensors(
                 test_x,
                 test_returns,
                 test_masks,
+                test_buy_masks,
+                test_sell_masks,
                 test_bench,
                 device,
                 non_blocking,
@@ -1740,6 +2361,8 @@ def run_training(
                 test_x,
                 test_returns,
                 test_masks,
+                test_buy_masks,
+                test_sell_masks,
                 test_bench,
                 device,
                 amp_dtype,
@@ -1773,6 +2396,8 @@ def run_training(
                 weights=test_bt_t.weights_history.detach().cpu().numpy(),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
+                can_buy_mask=test_buy_masks.detach().cpu().numpy(),
+                can_sell_mask=test_sell_masks.detach().cpu().numpy(),
                 benchmark_returns=test_bench.detach().cpu().numpy(),
                 initial_capital=1_000_000.0,
                 buy_fee_rate=config.trading.buy_fee_rate,

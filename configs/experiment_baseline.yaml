@@ -13,12 +13,11 @@ environment:
 
 data:
   parquet_root: data_forex_frankfurter
-  benchmark_name: JPYUSD
+  benchmark_name: EURUSD
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
-  usd_only_trading_pairs: false
 
 walk_forward:
   min_train_years: 1
@@ -29,8 +28,7 @@ trading:
   frequency: daily
   buy_fee_rate: 0.0001
   sell_fee_rate: 0.0001
-  max_turnover_ratio: 100.0
-  long_only: false
+  long_only: true
   cash_allowed: true
   use_all_tradable_symbols: true
 
@@ -39,9 +37,7 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  model_name: ft_transformer
   enable_torch_compile: true
-  warm_start_from_previous_fold: false
   lookback: 1
   batch_size: 2048
   batch_size_train: 2048
@@ -49,7 +45,10 @@ training:
   epochs: 1000
   early_stopping_no_improve_ratio: 0.2
   learning_rate: 0.001
-  num_workers: 28
+  hidden_dim: 1024
+  hidden_layers: 1
+  dropout: 0.1
+  num_workers: 16
   weight_decay: 0.00001
   loss_type: sharpe
   min_batch_size: 32
@@ -57,18 +56,6 @@ training:
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
   target_vram_fraction: 1
-  mlp:
-    hidden_dim: 1024
-    hidden_layers: 2
-    embedding_dim: 64
-    dropout: 0.1
-  ft_transformer:
-    d_token: 64
-    n_layers: 2
-    n_heads: 4
-    ffn_dim: 256
-    dropout: 0.1
-    use_cls_token: true
 
 evaluation:
   primary_baseline: BTC

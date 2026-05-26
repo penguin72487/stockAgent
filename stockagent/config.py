@@ -25,6 +25,7 @@ class DataConfig:
     universe_mode: str
     use_rapids: bool = False
     usd_only_trading_pairs: bool = False
+    tw_limit_up_down_guard: bool = False
 
 
 @dataclass(slots=True)
@@ -64,6 +65,43 @@ class FTTransformerModelConfig:
 
 
 @dataclass(slots=True)
+class TabularResNetModelConfig:
+    embedding_dim: int = 128
+    hidden_dim: int = 256
+    n_blocks: int = 4
+    dropout: float = 0.1
+
+
+@dataclass(slots=True)
+class LightGBMModelConfig:
+    use_gpu: bool = True
+    gpu_device_id: int = 0
+    n_estimators: int = 300
+    num_leaves: int = 63
+    max_depth: int = -1
+    learning_rate: float = 0.05
+    subsample: float = 0.9
+    colsample_bytree: float = 0.9
+    reg_lambda: float = 1.0
+    n_jobs: int = -1
+    random_state: int = 42
+
+
+@dataclass(slots=True)
+class XGBoostModelConfig:
+    use_gpu: bool = True
+    gpu_device_id: int = 0
+    n_estimators: int = 300
+    max_depth: int = 8
+    learning_rate: float = 0.05
+    subsample: float = 0.9
+    colsample_bytree: float = 0.9
+    reg_lambda: float = 1.0
+    n_jobs: int = -1
+    random_state: int = 42
+
+
+@dataclass(slots=True)
 class TrainingConfig:
     backend: str
     target: str
@@ -91,6 +129,9 @@ class TrainingConfig:
     loss_type: str = "mse"  # "mse" or "sharpe"
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
+    tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)
+    lightgbm: LightGBMModelConfig = field(default_factory=LightGBMModelConfig)
+    xgboost: XGBoostModelConfig = field(default_factory=XGBoostModelConfig)
 
 
 @dataclass(slots=True)
@@ -164,6 +205,37 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     ft_transformer.setdefault("dropout", legacy_dropout)
     ft_transformer.setdefault("use_cls_token", legacy_transformer_use_cls_token)
 
+    tabular_resnet = training.setdefault("tabular_resnet", {})
+    tabular_resnet.setdefault("embedding_dim", max(64, int(legacy_embedding_dim)))
+    tabular_resnet.setdefault("hidden_dim", max(128, int(legacy_hidden_dim)))
+    tabular_resnet.setdefault("n_blocks", 4)
+    tabular_resnet.setdefault("dropout", legacy_dropout)
+
+    lightgbm = training.setdefault("lightgbm", {})
+    lightgbm.setdefault("use_gpu", True)
+    lightgbm.setdefault("gpu_device_id", 0)
+    lightgbm.setdefault("n_estimators", 300)
+    lightgbm.setdefault("num_leaves", 63)
+    lightgbm.setdefault("max_depth", -1)
+    lightgbm.setdefault("learning_rate", 0.05)
+    lightgbm.setdefault("subsample", 0.9)
+    lightgbm.setdefault("colsample_bytree", 0.9)
+    lightgbm.setdefault("reg_lambda", 1.0)
+    lightgbm.setdefault("n_jobs", -1)
+    lightgbm.setdefault("random_state", 42)
+
+    xgboost = training.setdefault("xgboost", {})
+    xgboost.setdefault("use_gpu", True)
+    xgboost.setdefault("gpu_device_id", 0)
+    xgboost.setdefault("n_estimators", 300)
+    xgboost.setdefault("max_depth", 8)
+    xgboost.setdefault("learning_rate", 0.05)
+    xgboost.setdefault("subsample", 0.9)
+    xgboost.setdefault("colsample_bytree", 0.9)
+    xgboost.setdefault("reg_lambda", 1.0)
+    xgboost.setdefault("n_jobs", -1)
+    xgboost.setdefault("random_state", 42)
+
     # Remove legacy flat model keys from normalized payload.
     training.pop("hidden_dim", None)
     training.pop("hidden_layers", None)
@@ -181,6 +253,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
     data.setdefault("usd_only_trading_pairs", False)
+    data.setdefault("tw_limit_up_down_guard", False)
 
     trading = raw.setdefault("trading", {})
     trading.setdefault("max_turnover_ratio", 0.0)
@@ -240,6 +313,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             loss_type=training_raw["loss_type"],
             mlp=MLPModelConfig(**training_raw["mlp"]),
             ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),
+            tabular_resnet=TabularResNetModelConfig(**training_raw["tabular_resnet"]),
+            lightgbm=LightGBMModelConfig(**training_raw["lightgbm"]),
+            xgboost=XGBoostModelConfig(**training_raw["xgboost"]),
         ),
         evaluation=EvaluationConfig(**raw["evaluation"]),
     )

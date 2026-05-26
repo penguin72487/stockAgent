@@ -231,6 +231,7 @@ class RepairCheck:
     record: SymbolRecord
     status: str
     output_path: Path
+    first_date: str | None
     last_date: str | None
     repair_start_date: str | None
     merge_existing: bool = True
@@ -425,6 +426,7 @@ def _normalize_download_frame(frame: pd.DataFrame) -> pd.DataFrame:
         columns={
             "Date": "date",
             "Datetime": "date",
+            "index": "date",
             "Open": "open",
             "High": "max",
             "Low": "min",
@@ -927,6 +929,9 @@ def _download_symbol(
                     break
                 if normalized.empty:
                     last_error = f"{candidate_symbol}: Yahoo returned no rows."
+                    if attempt < retries:
+                        time.sleep(0.8 * (attempt + 1))
+                        continue
                     break
 
                 if existing_frame is not None and not existing_frame.empty:
@@ -1010,19 +1015,31 @@ def _resolve_asset_output_dir(args: argparse.Namespace, asset_class: str) -> Pat
     return Path(args.output_root) / asset_class
 
 
-def _load_existing_file_info(output_path: Path) -> tuple[str | None, str | None, set[str]]:
+def _load_existing_file_info(output_path: Path) -> tuple[str | None, str | None, str | None, set[str]]:
     if not output_path.exists():
-        return None, "missing", set()
+        return None, None, "missing", set()
     try:
         frame = pd.read_parquet(output_path)
     except Exception as exc:
-        return None, f"read_error: {exc}", set()
+        return None, None, f"read_error: {exc}", set()
     if frame.empty or "date" not in frame.columns:
-        return None, "empty", set(frame.columns)
+        return None, None, "empty", set(frame.columns)
     dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
     if dates.empty:
-        return None, "no_valid_date", set(frame.columns)
-    return dates.max().date().isoformat(), None, set(frame.columns)
+        return None, None, "no_valid_date", set(frame.columns)
+    return dates.min().date().isoformat(), dates.max().date().isoformat(), None, set(frame.columns)
+
+
+def _summarize_repair_coverage(checks: list[RepairCheck], target_end: str) -> tuple[str | None, str | None, int | None, int]:
+    first_dates = [_parse_date(check.first_date).date() for check in checks if check.first_date]
+    last_dates = [_parse_date(check.last_date).date() for check in checks if check.last_date]
+    if not first_dates or not last_dates:
+        return None, None, None, 0
+
+    oldest = min(first_dates)
+    newest = max(last_dates)
+    lag_days = (_parse_date(target_end).date() - newest).days
+    return oldest.isoformat(), newest.isoformat(), lag_days, len(last_dates)
 
 
 def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: list[SymbolRecord], output_dir: Path) -> list[RepairCheck]:
@@ -1033,13 +1050,14 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
 
     for record in records:
         output_path = output_dir / f"{record.code}_features.parquet"
-        last_date, error, columns = _load_existing_file_info(output_path)
+        first_date, last_date, error, columns = _load_existing_file_info(output_path)
         if error == "missing":
             checks.append(
                 RepairCheck(
                     record=record,
                     status="missing",
                     output_path=output_path,
+                    first_date=None,
                     last_date=None,
                     repair_start_date=args.start_date,
                     merge_existing=False,
@@ -1052,6 +1070,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                     record=record,
                     status="broken",
                     output_path=output_path,
+                    first_date=None,
                     last_date=None,
                     repair_start_date=args.start_date,
                     merge_existing=False,
@@ -1065,6 +1084,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                     record=record,
                     status="empty",
                     output_path=output_path,
+                    first_date=None,
                     last_date=None,
                     repair_start_date=args.start_date,
                     merge_existing=False,
@@ -1079,6 +1099,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                     record=record,
                     status="schema_mismatch",
                     output_path=output_path,
+                    first_date=first_date,
                     last_date=last_date,
                     repair_start_date=args.start_date,
                     merge_existing=False,
@@ -1094,6 +1115,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                     record=record,
                     status="current",
                     output_path=output_path,
+                    first_date=first_date,
                     last_date=last_date,
                     repair_start_date=None,
                 )
@@ -1106,6 +1128,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                 record=record,
                 status="stale",
                 output_path=output_path,
+                first_date=first_date,
                 last_date=last_date,
                 repair_start_date=repair_start_dt.isoformat(),
                 merge_existing=True,
@@ -1140,6 +1163,15 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         f"missing={status_counts.get('missing', 0)} stale={status_counts.get('stale', 0)} "
         f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)}"
     )
+    target_end = args.end_date or _today_str()
+    oldest_date, newest_date, lag_days, tracked = _summarize_repair_coverage(checks, target_end)
+    if oldest_date and newest_date and lag_days is not None:
+        print(
+            f"[repair] asset={asset_class} local_range={oldest_date}..{newest_date} "
+            f"latest_lag_days={lag_days} tracked={tracked}"
+        )
+    else:
+        print(f"[repair] asset={asset_class} local_range=n/a tracked=0")
 
     results: list[DownloadResult] = []
     if pending:
@@ -1189,7 +1221,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     with repair_report_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["code", "yahoo_symbol", "precheck_status", "last_date", "repair_start_date", "output_path", "message"],
+            fieldnames=["code", "yahoo_symbol", "precheck_status", "first_date", "last_date", "repair_start_date", "output_path", "message"],
         )
         writer.writeheader()
         for check in checks:
@@ -1198,12 +1230,21 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
                     "code": check.record.code,
                     "yahoo_symbol": check.record.yahoo_symbol,
                     "precheck_status": check.status,
+                    "first_date": check.first_date,
                     "last_date": check.last_date,
                     "repair_start_date": check.repair_start_date,
                     "output_path": str(check.output_path),
                     "message": check.message,
                 }
             )
+
+    post_checks = _resolve_repair_plan(asset_class, args, records, output_dir)
+    post_oldest, post_newest, post_lag_days, post_tracked = _summarize_repair_coverage(post_checks, target_end)
+    if post_oldest and post_newest and post_lag_days is not None:
+        print(
+            f"[repair] asset={asset_class} post_repair_range={post_oldest}..{post_newest} "
+            f"latest_lag_days={post_lag_days} tracked={post_tracked}"
+        )
 
     final_counts = dict(status_counts)
     for result in results:
