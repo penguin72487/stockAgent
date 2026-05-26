@@ -8,6 +8,15 @@ import yaml
 
 
 @dataclass(slots=True)
+class RunnerConfig:
+    output_dir: str = "artifacts"
+    require_cuda: bool = True
+    mode: str = "train"
+    resume: bool = True
+    post_train_infer: bool = True
+
+
+@dataclass(slots=True)
 class EnvironmentConfig:
     conda_env: str
     device: str
@@ -145,6 +154,7 @@ class EvaluationConfig:
 @dataclass(slots=True)
 class ExperimentConfig:
     experiment_name: str
+    runner: RunnerConfig
     environment: EnvironmentConfig
     data: DataConfig
     walk_forward: WalkForwardConfig
@@ -154,6 +164,13 @@ class ExperimentConfig:
 
 
 def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
+    runner = raw.setdefault("runner", {})
+    runner.setdefault("output_dir", "artifacts")
+    runner.setdefault("require_cuda", True)
+    runner.setdefault("mode", "train")
+    runner.setdefault("resume", True)
+    runner.setdefault("post_train_infer", True)
+
     walk_forward = raw.setdefault("walk_forward", {})
     walk_forward.setdefault("min_train_years", 1)
     walk_forward.setdefault("val_years", 1)
@@ -282,6 +299,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     training_raw = raw["training"]
     return ExperimentConfig(
         experiment_name=raw["experiment_name"],
+        runner=RunnerConfig(**raw["runner"]),
         environment=EnvironmentConfig(**raw["environment"]),
         data=DataConfig(**raw["data"]),
         walk_forward=WalkForwardConfig(**raw["walk_forward"]),

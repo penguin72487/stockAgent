@@ -35,6 +35,7 @@ def sharpe_aware_loss(
     weights: Tensor,
     future_log_returns: Tensor,
     tradable_mask: Tensor,
+    can_buy_mask: Tensor | None = None,
     can_sell_mask: Tensor | None = None,
     sample_mask: Tensor | None = None,
     long_only: bool = True,
@@ -47,6 +48,11 @@ def sharpe_aware_loss(
     """Sharpe-aware loss driven by the same backtest kernel used in evaluation."""
     returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
+    can_buy = (
+        can_buy_mask.to(dtype=torch.bool, device=weights.device)
+        if can_buy_mask is not None
+        else tradable
+    )
     benchmark_zeros = torch.zeros(weights.size(0), device=weights.device, dtype=returns.dtype)
 
     backtest = run_backtest_torch(
@@ -58,7 +64,7 @@ def sharpe_aware_loss(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
-        can_buy_mask=tradable,
+        can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
     )
 

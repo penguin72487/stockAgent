@@ -907,11 +907,13 @@ def find_optimal_batch_size(
 
         try:
             with _autocast_context(device, amp_dtype):
-                logits = model(local_batch["x"], local_batch["tradable_mask"])
+                logits = model(local_batch["x"], local_batch["can_buy_mask"])
                 loss = sharpe_aware_loss(
                     logits,
                     local_batch["future_log_returns"],
                     local_batch["tradable_mask"],
+                    can_buy_mask=local_batch["can_buy_mask"],
+                    can_sell_mask=local_batch["can_sell_mask"],
                     long_only=long_only,
                     buy_fee_rate=0.0,
                     sell_fee_rate=0.0,
@@ -1136,7 +1138,8 @@ def _train_epoch(
             loss = sharpe_aware_loss(
                 weights,
                 batch["future_log_returns"],
-                batch["can_buy_mask"],
+                batch["tradable_mask"],
+                can_buy_mask=batch["can_buy_mask"],
                 can_sell_mask=batch["can_sell_mask"],
                 long_only=long_only,
                 buy_fee_rate=buy_fee_rate,
@@ -1206,7 +1209,8 @@ def _train_epoch_tensor(
             loss = sharpe_aware_loss(
                 weights,
                 batch_ret,
-                batch_buy_mask,
+                batch_mask,
+                can_buy_mask=batch_buy_mask,
                 can_sell_mask=batch_sell_mask,
                 sample_mask=batch_sample_mask,
                 long_only=long_only,
@@ -1373,7 +1377,8 @@ def _run_training_tree_models(
                 sharpe_aware_loss(
                     val_bt_t.weights_history,
                     val_returns,
-                    val_buy_masks,
+                    val_masks,
+                    can_buy_mask=val_buy_masks,
                     can_sell_mask=val_sell_masks,
                     long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
@@ -1521,7 +1526,8 @@ def _run_inference_tree_models(
             sharpe_aware_loss(
                 val_bt_t.weights_history,
                 val_returns,
-                val_buy_masks,
+                val_masks,
+                can_buy_mask=val_buy_masks,
                 can_sell_mask=val_sell_masks,
                 long_only=config.trading.long_only,
                 buy_fee_rate=config.trading.buy_fee_rate,
@@ -1701,6 +1707,7 @@ def _run_inference_neural_models(
                     val_bt_t.weights_history,
                     val_returns,
                     val_masks,
+                    can_buy_mask=val_buy_masks,
                     can_sell_mask=val_sell_masks,
                     long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
@@ -2235,6 +2242,10 @@ def run_training(
                 device=val_backtest.weights_history.device,
                 non_blocking=False,
             )
+            val_buy_masks_device = combined_val_buy_masks.to(
+                device=val_backtest.weights_history.device,
+                non_blocking=False,
+            )
             val_sell_masks_device = combined_val_sell_masks.to(
                 device=val_backtest.weights_history.device,
                 non_blocking=False,
@@ -2246,6 +2257,7 @@ def run_training(
                     val_backtest.weights_history[start:end],
                     val_returns_device[start:end],
                     val_masks_device[start:end],
+                    can_buy_mask=val_buy_masks_device[start:end],
                     can_sell_mask=val_sell_masks_device[start:end],
                     long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
