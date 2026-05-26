@@ -35,6 +35,7 @@ def sharpe_aware_loss(
     weights: Tensor,
     future_log_returns: Tensor,
     tradable_mask: Tensor,
+    can_sell_mask: Tensor | None = None,
     sample_mask: Tensor | None = None,
     long_only: bool = True,
     buy_fee_rate: float = 0.0,
@@ -57,6 +58,8 @@ def sharpe_aware_loss(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        can_buy_mask=tradable,
+        can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
     )
 
     if sample_mask is None:

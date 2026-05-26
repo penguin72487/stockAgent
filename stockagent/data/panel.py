@@ -16,9 +16,32 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
-LOG_RETURN_FEATURE_COLUMNS = ["open", "max", "min", "close", "Trading_Volume"]
-PANEL_CACHE_VERSION = 8
+LOG_RETURN_FEATURE_COLUMNS = [
+    "open",
+    "max",
+    "min",
+    "close",
+    "Trading_Volume",
+    "intraday_return_co",
+    "overnight_gap_oc",
+    "intraday_range",
+    "body_ratio",
+    "clv",
+    "upper_shadow",
+    "lower_shadow",
+    "delta_intraday_return_co",
+    "delta_intraday_range",
+    "delta_clv",
+    "delta_body_ratio",
+    "gap_cont",
+    "signed_vol",
+    "effort",
+    "vol_impact",
+    "gap_vol",
+]
+PANEL_CACHE_VERSION = 9
 FEATURE_FILE_SUFFIX = "_features.parquet"
+EPSILON = 1e-8
 
 
 @dataclass(slots=True)
@@ -32,6 +55,8 @@ class PanelData:
     alive_mask: np.ndarray
     benchmark_returns: np.ndarray
     close_prices: np.ndarray
+    can_buy_mask: np.ndarray | None = None
+    can_sell_mask: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -73,6 +98,54 @@ def _compute_tradable_from_frame(frame: pd.DataFrame) -> pd.Series:
     return close_is_valid & (has_positive_volume | volume_missing)
 
 
+def _compute_tw_limit_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Return (can_buy, can_sell) masks under TW 10% daily limit assumptions.
+
+    Rule:
+    - limit-up day: cannot buy, can sell
+    - limit-down day: can buy, cannot sell
+    """
+    tradable = frame["tradable"].astype(bool)
+    close_raw = pd.to_numeric(frame.get("close_raw"), errors="coerce")
+    prev_close_raw = close_raw.shift(1)
+    ratio = close_raw / prev_close_raw
+
+    # Use a small tolerance because source data can include rounding noise.
+    is_limit_up = ratio.ge(1.099) & prev_close_raw.gt(0)
+    is_limit_down = ratio.le(0.901) & prev_close_raw.gt(0)
+
+    can_buy = tradable & ~is_limit_up.fillna(False)
+    can_sell = tradable & ~is_limit_down.fillna(False)
+    return can_buy, can_sell
+
+
+def _add_derived_features(frame: pd.DataFrame) -> pd.DataFrame:
+    open_px = pd.to_numeric(frame.get("open"), errors="coerce")
+    high_px = pd.to_numeric(frame.get("max"), errors="coerce")
+    low_px = pd.to_numeric(frame.get("min"), errors="coerce")
+    close_px = pd.to_numeric(frame.get("close"), errors="coerce")
+
+    frame["intraday_return_co"] = _safe_log_ratio(close_px, open_px)
+    frame["overnight_gap_oc"] = _safe_log_ratio(open_px, close_px.shift(1))
+    frame["intraday_range"] = _safe_log_ratio(high_px, low_px)
+
+    spread = (high_px - low_px).clip(lower=0.0)
+    denom = spread + EPSILON
+
+    frame["body_ratio"] = (close_px - open_px).abs() / denom
+    frame["clv"] = (close_px - low_px) / denom
+    frame["upper_shadow"] = (high_px - np.maximum(open_px, close_px)) / denom
+    frame["lower_shadow"] = (np.minimum(open_px, close_px) - low_px) / denom
+
+    frame["delta_intraday_return_co"] = frame["intraday_return_co"] - frame["intraday_return_co"].shift(1)
+    frame["delta_intraday_range"] = frame["intraday_range"] - frame["intraday_range"].shift(1)
+    frame["delta_clv"] = frame["clv"] - frame["clv"].shift(1)
+    frame["delta_body_ratio"] = frame["body_ratio"] - frame["body_ratio"].shift(1)
+    frame["gap_cont"] = frame["overnight_gap_oc"] * frame["intraday_return_co"]
+
+    return frame
+
+
 def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame = pd.read_parquet(path).copy()
     if not pd.api.types.is_datetime64_any_dtype(frame["date"]):
@@ -80,6 +153,8 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = _symbol_name_from_path(path)
     frame["close_raw"] = frame["close"].astype(np.float32)
+
+    frame = _add_derived_features(frame)
 
     frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
 
@@ -92,6 +167,15 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     if "Trading_Volume" in frame.columns:
         vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
         frame["Trading_Volume"] = _safe_log_ratio(vol, vol.shift(1))
+
+        volume_log_delta = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+        signed_intraday = np.sign(pd.to_numeric(frame["intraday_return_co"], errors="coerce"))
+        abs_volume_log_delta = volume_log_delta.abs()
+
+        frame["signed_vol"] = signed_intraday * volume_log_delta
+        frame["effort"] = frame["intraday_return_co"].abs() / (abs_volume_log_delta + EPSILON)
+        frame["vol_impact"] = frame["intraday_range"] / (abs_volume_log_delta + EPSILON)
+        frame["gap_vol"] = frame["overnight_gap_oc"] * volume_log_delta
 
     return frame
 
@@ -131,11 +215,24 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
         vol_ratio = (vol / prev_vol).where(valid_vol)
         gdf["Trading_Volume"] = np.log(vol_ratio)
 
-    return gdf.to_pandas()
+    frame = gdf.to_pandas()
+    frame = _add_derived_features(frame)
+
+    if "Trading_Volume" in frame.columns:
+        volume_log_delta = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+        signed_intraday = np.sign(pd.to_numeric(frame["intraday_return_co"], errors="coerce"))
+        abs_volume_log_delta = volume_log_delta.abs()
+
+        frame["signed_vol"] = signed_intraday * volume_log_delta
+        frame["effort"] = frame["intraday_return_co"].abs() / (abs_volume_log_delta + EPSILON)
+        frame["vol_impact"] = frame["intraday_range"] / (abs_volume_log_delta + EPSILON)
+        frame["gap_vol"] = frame["overnight_gap_oc"] * volume_log_delta
+
+    return frame
 
 
 def _resolve_benchmark_index(symbols: list[str], benchmark_name: str) -> int | None:
-    key = (benchmark_name or "").strip()
+    key = (str(benchmark_name) if benchmark_name is not None else "").strip()
     if not key:
         return None
 
@@ -175,6 +272,8 @@ def _build_panel_from_frame(
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    can_buy_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
 
     date_index = {date: idx for idx, date in enumerate(all_dates)}
@@ -190,6 +289,14 @@ def _build_panel_from_frame(
     returns_1d[row_idx, sym_idx] = frame_all["return_1d"].to_numpy(dtype=np.float32, copy=False)
     close_prices[row_idx, sym_idx] = frame_all["close_raw"].to_numpy(dtype=np.float32, copy=False)
     tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
+    if "can_buy" in frame_all.columns:
+        can_buy_mask[row_idx, sym_idx] = frame_all["can_buy"].to_numpy(dtype=bool, copy=False)
+    else:
+        can_buy_mask[row_idx, sym_idx] = tradable_mask[row_idx, sym_idx]
+    if "can_sell" in frame_all.columns:
+        can_sell_mask[row_idx, sym_idx] = frame_all["can_sell"].to_numpy(dtype=bool, copy=False)
+    else:
+        can_sell_mask[row_idx, sym_idx] = tradable_mask[row_idx, sym_idx]
     alive_mask[row_idx, sym_idx] = frame_all["close"].notna().to_numpy(dtype=bool, copy=False)
 
     benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
@@ -221,6 +328,8 @@ def _build_panel_from_frame(
         features=features,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
+        can_buy_mask=can_buy_mask,
+        can_sell_mask=can_sell_mask,
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
@@ -272,6 +381,8 @@ def _save_panel_cache(
         features=panel.features,
         returns_1d=panel.returns_1d,
         tradable_mask=panel.tradable_mask,
+        can_buy_mask=panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask,
+        can_sell_mask=panel.can_sell_mask if panel.can_sell_mask is not None else panel.tradable_mask,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
@@ -290,13 +401,19 @@ def _save_panel_cache(
 
 def _load_panel_cache(cache_path: Path) -> PanelData:
     cached = np.load(cache_path, allow_pickle=True)
+    cached_keys = set(cached.files)
+    tradable_mask = cached["tradable_mask"]
+    can_buy_mask = cached["can_buy_mask"] if "can_buy_mask" in cached_keys else tradable_mask
+    can_sell_mask = cached["can_sell_mask"] if "can_sell_mask" in cached_keys else tradable_mask
     return PanelData(
         dates=cached["dates"],
         symbols=cached["symbols"].tolist(),
         feature_names=cached["feature_names"].tolist(),
         features=cached["features"],
         returns_1d=cached["returns_1d"],
-        tradable_mask=cached["tradable_mask"],
+        tradable_mask=tradable_mask,
+        can_buy_mask=can_buy_mask,
+        can_sell_mask=can_sell_mask,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
         close_prices=cached["close_prices"],
@@ -344,6 +461,7 @@ def build_panel(
     use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
+    tw_limit_up_down_guard: bool = False,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -360,7 +478,10 @@ def build_panel(
 
     env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
     use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
-    backend_key = f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|usd_only={usd_only_trading_pairs}"
+    backend_key = (
+        f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|"
+        f"usd_only={usd_only_trading_pairs}|tw_limit_guard={tw_limit_up_down_guard}"
+    )
     
     # Check cache validity
     if _check_cache_valid(meta_path, parquet_paths, backend_key):
@@ -378,6 +499,13 @@ def build_panel(
                 frame = _load_symbol_frame_cudf(path)
                 if len(frame) == 0:
                     continue
+                if tw_limit_up_down_guard:
+                    can_buy, can_sell = _compute_tw_limit_masks(frame)
+                    frame["can_buy"] = can_buy
+                    frame["can_sell"] = can_sell
+                else:
+                    frame["can_buy"] = frame["tradable"].astype(bool)
+                    frame["can_sell"] = frame["tradable"].astype(bool)
                 symbol_frames_cudf.append(frame)
                 valid_paths_cudf.append(path)
 
@@ -396,7 +524,10 @@ def build_panel(
                 return panel
         except Exception as exc:
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
-            backend_key = f"pandas|benchmark={benchmark_name}"
+            backend_key = (
+                f"pandas|benchmark={benchmark_name}|"
+                f"usd_only={usd_only_trading_pairs}|tw_limit_guard={tw_limit_up_down_guard}"
+            )
     
     symbol_frames: list[pd.DataFrame] = []
     valid_paths: list[Path] = []
@@ -405,6 +536,13 @@ def build_panel(
             frame = _load_symbol_frame(path)
             if len(frame) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
+            if tw_limit_up_down_guard:
+                can_buy, can_sell = _compute_tw_limit_masks(frame)
+                frame["can_buy"] = can_buy
+                frame["can_sell"] = can_sell
+            else:
+                frame["can_buy"] = frame["tradable"].astype(bool)
+                frame["can_sell"] = frame["tradable"].astype(bool)
             symbol_frames.append(frame)
             valid_paths.append(path)
         except Exception as exc:
