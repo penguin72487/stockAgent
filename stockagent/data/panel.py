@@ -39,7 +39,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "vol_impact",
     "gap_vol",
 ]
-PANEL_CACHE_VERSION = 12
+PANEL_CACHE_VERSION = 13
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
 
@@ -61,6 +61,19 @@ def _round_tw_price_series(series: pd.Series) -> pd.Series:
     """Normalize TW stock prices to 2 decimals using half-up rounding."""
     numeric = pd.to_numeric(series, errors="coerce")
     return pd.Series(_round_half_up(numeric, decimals=2), index=series.index)
+
+
+def _price_decimals_for_path(path: Path) -> int:
+    """Return market-specific price precision: TW=2, others=8 decimals."""
+    parts = {part.lower() for part in path.parts}
+    symbol = _symbol_name_from_path(path)
+    is_tw_market = "tw_stocks" in parts or symbol.isdigit()
+    return 2 if is_tw_market else 8
+
+
+def _round_price_series(series: pd.Series, decimals: int) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    return pd.Series(_round_half_up(numeric, decimals=decimals), index=series.index)
 
 
 @dataclass(slots=True)
@@ -200,6 +213,10 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = _symbol_name_from_path(path)
+    price_decimals = _price_decimals_for_path(path)
+    for col in ["open", "max", "min", "close"]:
+        if col in frame.columns:
+            frame[col] = _round_price_series(frame[col], decimals=price_decimals)
     frame["close_raw"] = pd.to_numeric(frame["close"], errors="coerce").astype(np.float32)
 
     frame = _add_derived_features(frame)
@@ -236,9 +253,10 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     gdf["date"] = cudf.to_datetime(gdf["date"])
     gdf = gdf.sort_values("date").reset_index(drop=True)
     gdf["symbol"] = _symbol_name_from_path(path)
+    price_decimals = _price_decimals_for_path(path)
     for col in ["open", "max", "min", "close"]:
         if col in gdf.columns:
-            gdf[col] = gdf[col].round(2)
+            gdf[col] = gdf[col].round(price_decimals)
     gdf["close_raw"] = gdf["close"].astype("float32")
 
     nxt_close = gdf["close"].shift(-1)
