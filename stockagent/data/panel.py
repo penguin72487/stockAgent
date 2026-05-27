@@ -39,7 +39,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "vol_impact",
     "gap_vol",
 ]
-PANEL_CACHE_VERSION = 11
+PANEL_CACHE_VERSION = 12
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
 
@@ -200,10 +200,7 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = _symbol_name_from_path(path)
-    for col in ["open", "max", "min", "close"]:
-        if col in frame.columns:
-            frame[col] = _round_tw_price_series(frame[col])
-    frame["close_raw"] = _round_tw_price_series(frame["close"]).astype(np.float32)
+    frame["close_raw"] = pd.to_numeric(frame["close"], errors="coerce").astype(np.float32)
 
     frame = _add_derived_features(frame)
 
