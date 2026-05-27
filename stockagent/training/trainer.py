@@ -1173,7 +1173,7 @@ def _build_loader(
     device: torch.device,
     drop_last: bool = False,
 ) -> DataLoader:
-    workers = max(1, os.cpu_count() or 1)
+    workers = max(0, int(config.training.num_workers))
     loader_kwargs: dict = {
         "dataset": dataset,
         "batch_size": batch_size,
@@ -1969,16 +1969,9 @@ def _run_inference_neural_models(
 
         if not np.isfinite(best_val_loss):
             best_val_loss = float(
-                sharpe_aware_loss(
-                    val_bt_t.weights_history,
-                    val_returns,
-                    val_masks,
-                    can_buy_mask=val_buy_masks,
-                    can_sell_mask=val_sell_masks,
-                    long_only=config.trading.long_only,
-                    buy_fee_rate=config.trading.buy_fee_rate,
-                    sell_fee_rate=config.trading.sell_fee_rate,
-                    max_turnover_ratio=config.trading.max_turnover_ratio,
+                _loss_from_backtest_series(
+                    val_bt_t.strategy_returns,
+                    val_bt_t.turnovers,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 ).detach().cpu()
@@ -2378,7 +2371,13 @@ def run_training(
             if list(checkpoint.get("train_years", [])) == train_years:
                 _load_state_dict(model, checkpoint["model_state_dict"])
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                scaler_state = checkpoint.get("scaler_state_dict")
+                if scaler_state:
+                    try:
+                        scaler.load_state_dict(scaler_state)
+                    except RuntimeError as exc:
+                        # A checkpoint may come from a run where GradScaler was disabled.
+                        print(f"[Train {train_years}] skip scaler resume: {exc}")
                 if scheduler is not None:
                     scheduler_state = checkpoint.get("scheduler_state_dict")
                     if scheduler_state:
@@ -2435,6 +2434,7 @@ def run_training(
             if can_compile:
                 try:
                     compile_start = time.perf_counter()
+                    print(f"[Train {train_years}] compile warmup may take extra time at epoch 0")
                     compiled_train_model = torch.compile(model, mode="reduce-overhead", dynamic=False)
                     compile_source = "auto(sharpe)" if (auto_compile_sharpe and not config.training.enable_torch_compile) else "config"
                     print(
@@ -2490,8 +2490,8 @@ def run_training(
                 device,
                 drop_last=False,
             )
-            effective_workers = max(1, os.cpu_count() or 1)
-            print(f"[Train {train_years}] training mode=dataloader (num_workers={effective_workers}, from os.cpu_count)")
+            effective_workers = max(0, int(config.training.num_workers))
+            print(f"[Train {train_years}] training mode=dataloader (num_workers={effective_workers}, from config)")
         else:
             print(f"[Train {train_years}] training mode=tensor (num_workers={config.training.num_workers})")
 
