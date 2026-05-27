@@ -35,10 +35,15 @@ Multi-asset Taiwan stock trading research workspace.
 - U.S. delisted symbols can be included from Alpha Vantage `LISTING_STATUS` when `ALPHAVANTAGE_API_KEY` (or `--alpha-vantage-api-key`) is provided.
 - Crypto symbols are loaded from CoinGecko `/coins/list` and mapped to Yahoo format `${SYMBOL}-USD`.
 - Forex symbols are loaded from Yahoo Finance currencies page tickers (with static fallback when rate-limited).
+- Pepperstone-style FX universe is available via `configs/forex_pepperstone_pairs.txt` and can be downloaded to `data_yahoo/forex_pepperstone/`.
 - Use `python download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
 - Use `python download_yahoo_ohlcv.py --asset us_stocks` to download only the expanded U.S. stock universe.
 - Use `python download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
 - Use `python download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
+- Use `python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
+- Use `python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.
+- Use `python downloader/download_pepperstone.py` to download grouped Pepperstone-style data to `data_peperstone/24hTrading`, `data_peperstone/commodites`, `data_peperstone/crypto`, and `data_peperstone/fores`.
+- Use `python downloader/download_pepperstone.py --groups crypto fores` to download only selected groups.
 - Each asset folder includes `symbols.csv`, `download_report.csv`, and `download_summary.json` alongside `*_features.parquet` files.
 - Parquet output includes at least `date`, `open`, `max`, `min`, `close`, `adjclose`, `Trading_Volume`, and also preserves extra Yahoo columns when available (for example `Dividends`, `Stock Splits`).
 - Override the default universe with `--symbols` or `--symbols-file`, for example `python download_yahoo_ohlcv.py --asset forex --symbols EURUSD GBPUSD USDJPY`.
@@ -51,6 +56,13 @@ Multi-asset Taiwan stock trading research workspace.
 - Adjust overlap with `--repair-overlap-days` (default `7`) to re-fetch a small trailing window before the local last date.
 - If Yahoo returns `possibly delisted; no timezone found`, that ticker is automatically appended to per-asset `yahoo_blacklist.txt` and skipped in later runs.
 - Successfully downloaded Yahoo tickers are persisted into per-asset `yahoo_whitelist.txt`.
+
+### Daily All-Market Update
+
+- Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
+- The script runs Yahoo all-asset repair (`tw_stocks`, `us_stocks`, `crypto`, `forex`), then Frankfurter forex incremental update to `data_yahoo/forex`, then Pepperstone grouped repair.
+- Set `RUN_PEPPERSTONE_GROUPS=0` to skip Pepperstone groups when you only want Yahoo+Frankfurter.
+- Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
 
 ## Environment
 

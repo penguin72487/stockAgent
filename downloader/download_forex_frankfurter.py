@@ -51,6 +51,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8, help="Concurrent workers")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
     parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Append only missing dates for existing parquet files (best for daily updates)",
+    )
+    parser.add_argument(
+        "--skip-manifest",
+        action="store_true",
+        help="Do not overwrite output_dir/symbols.csv",
+    )
     return parser.parse_args()
 
 
@@ -128,9 +138,39 @@ def _download_pair(
     output_dir: Path,
     timeout: int,
     refresh: bool,
+    incremental: bool,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    if output_path.exists() and not refresh:
+    existing_frame: pd.DataFrame | None = None
+    existing_rows = 0
+    fetch_start_date = start_date
+
+    if output_path.exists() and incremental:
+        try:
+            existing_frame = pd.read_parquet(output_path)
+            existing_rows = int(len(existing_frame))
+            if "date" in existing_frame.columns and not existing_frame.empty:
+                existing_dates = pd.to_datetime(existing_frame["date"], errors="coerce").dropna()
+                if not existing_dates.empty:
+                    next_date = (existing_dates.max() + pd.Timedelta(days=1)).date().isoformat()
+                    fetch_start_date = max(start_date, next_date)
+            if pd.Timestamp(fetch_start_date) > pd.Timestamp(end_date):
+                return DownloadResult(
+                    code=record.code,
+                    status="up_to_date",
+                    rows=existing_rows,
+                    output_path=str(output_path),
+                )
+        except Exception as exc:
+            return DownloadResult(
+                code=record.code,
+                status="failed_existing_read",
+                rows=0,
+                output_path=str(output_path),
+                message=str(exc),
+            )
+
+    if output_path.exists() and not refresh and not incremental:
         try:
             rows = len(pd.read_parquet(output_path))
             return DownloadResult(code=record.code, status="skipped_existing", rows=int(rows), output_path=str(output_path))
@@ -143,7 +183,7 @@ def _download_pair(
                 message=str(exc),
             )
 
-    url = f"{API_BASE}/{start_date}..{end_date}?from={record.base}&to={record.quote}"
+    url = f"{API_BASE}/{fetch_start_date}..{end_date}?from={record.base}&to={record.quote}"
     try:
         payload = _get_json(url, timeout)
         rates = payload.get("rates", {})
@@ -175,13 +215,29 @@ def _download_pair(
 
         frame = pd.DataFrame(rows)
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.tz_localize(None)
-        start_ts = pd.Timestamp(start_date)
+        start_ts = pd.Timestamp(fetch_start_date)
         end_ts = pd.Timestamp(end_date)
         frame = frame[(frame["date"] >= start_ts) & (frame["date"] <= end_ts)]
         frame = frame.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
         frame = frame.reset_index(drop=True)
         if frame.empty:
             return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points after date filtering")
+
+        if incremental and existing_frame is not None:
+            if "date" in existing_frame.columns:
+                existing_frame = existing_frame.copy()
+                existing_frame["date"] = pd.to_datetime(existing_frame["date"], errors="coerce").dt.tz_localize(None)
+                existing_frame = existing_frame.dropna(subset=["date"])
+            merged = pd.concat([existing_frame, frame], ignore_index=True)
+            merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+            merged.to_parquet(output_path, index=False)
+            return DownloadResult(
+                code=record.code,
+                status="updated_incremental",
+                rows=int(len(merged)),
+                output_path=str(output_path),
+            )
+
         frame.to_parquet(output_path, index=False)
         return DownloadResult(code=record.code, status="updated", rows=int(len(frame)), output_path=str(output_path))
     except Exception as exc:
@@ -190,6 +246,9 @@ def _download_pair(
 
 def main() -> None:
     args = parse_args()
+    if args.refresh and args.incremental:
+        raise RuntimeError("--refresh and --incremental cannot be used together")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,8 +267,9 @@ def main() -> None:
     if not records:
         raise RuntimeError("No valid forex pairs resolved for Frankfurter")
 
-    manifest = pd.DataFrame([asdict(item) for item in records])
-    manifest.to_csv(output_dir / "symbols.csv", index=False)
+    if not args.skip_manifest:
+        manifest = pd.DataFrame([asdict(item) for item in records])
+        manifest.to_csv(output_dir / "symbols.csv", index=False)
 
     results: list[DownloadResult] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
@@ -222,6 +282,7 @@ def main() -> None:
                 output_dir,
                 args.timeout,
                 args.refresh,
+                args.incremental,
             ): record
             for record in records
         }

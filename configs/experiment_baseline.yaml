@@ -16,13 +16,13 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/forex
-  benchmark_name: "JPYUSD"
+  parquet_root: data_yahoo/crypto
+  benchmark_name: "BTCUSD"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
-  usd_only_trading_pairs: true
+  usd_only_trading_pairs: false
   tw_limit_up_down_guard: false
 
 walk_forward:
@@ -32,8 +32,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0001
-  sell_fee_rate: 0.0001
+  buy_fee_rate: 0.00055
+  sell_fee_rate: 0.00055
   max_turnover_ratio: 100.0
   long_only: false
   cash_allowed: true
@@ -80,7 +80,7 @@ training:
   weight_decay: 0.00001
   grad_clip_norm: 0.0
   loss_type: sharpe
-  min_batch_size: 32
+  min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
