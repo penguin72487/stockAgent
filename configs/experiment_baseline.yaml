@@ -16,14 +16,14 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/tw_stocks
-  benchmark_name: "2330"
+  parquet_root: data_yahoo/forex
+  benchmark_name: "JPYUSD"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
-  usd_only_trading_pairs: false
-  tw_limit_up_down_guard: true
+  usd_only_trading_pairs: true
+  tw_limit_up_down_guard: false
 
 walk_forward:
   min_train_years: 1
@@ -32,8 +32,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.001425
-  sell_fee_rate: 0.004425
+  buy_fee_rate: 0.0001
+  sell_fee_rate: 0.0001
   max_turnover_ratio: 100.0
   long_only: false
   cash_allowed: true

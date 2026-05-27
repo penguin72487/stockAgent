@@ -1969,9 +1969,16 @@ def _run_inference_neural_models(
 
         if not np.isfinite(best_val_loss):
             best_val_loss = float(
-                _loss_from_backtest_series(
-                    val_bt_t.strategy_returns,
-                    val_bt_t.turnovers,
+                sharpe_aware_loss(
+                    val_bt_t.weights_history,
+                    val_returns,
+                    val_masks,
+                    can_buy_mask=val_buy_masks,
+                    can_sell_mask=val_sell_masks,
+                    long_only=config.trading.long_only,
+                    buy_fee_rate=config.trading.buy_fee_rate,
+                    sell_fee_rate=config.trading.sell_fee_rate,
+                    max_turnover_ratio=config.trading.max_turnover_ratio,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 ).detach().cpu()
