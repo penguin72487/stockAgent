@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -8,6 +9,7 @@ import subprocess
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Iterable
 
@@ -30,6 +32,7 @@ from stockagent.backtest.simulator import (
     BacktestResult,
     BacktestResultTensor,
     HoldingsRecord,
+    get_backtest_compile_stats,
     run_backtest_integer_shares,
     run_backtest_torch,
 )
@@ -63,6 +66,84 @@ class FoldRuntimeContext:
     test_ds: CrossSectionalDataset
     checkpoint_best_path: Path
     best_val_loss: float = float("inf")
+
+
+@dataclass(slots=True)
+class TimingBreakdown:
+    total_s: float = 0.0
+    fetch_s: float = 0.0
+    transfer_s: float = 0.0
+    forward_s: float = 0.0
+    backward_s: float = 0.0
+    grad_s: float = 0.0
+    clip_s: float = 0.0
+    step_s: float = 0.0
+    backtest_s: float = 0.0
+    ic_s: float = 0.0
+    metrics_s: float = 0.0
+    save_s: float = 0.0
+    plot_s: float = 0.0
+    batches: int = 0
+
+
+def _log_timing(label: str, timing: TimingBreakdown) -> None:
+    parts = [f"[profile] {label}: total={timing.total_s:.3f}s"]
+    if timing.batches:
+        parts.append(f"batches={timing.batches}")
+    for name in ("fetch_s", "transfer_s", "forward_s", "backward_s", "grad_s", "clip_s", "step_s", "backtest_s", "ic_s", "metrics_s", "save_s", "plot_s"):
+        value = getattr(timing, name)
+        if value > 0:
+            parts.append(f"{name[:-2]}={value:.3f}s")
+    print(" ".join(parts))
+
+
+def _maybe_sync_cuda(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _maybe_cudagraph_step_begin() -> None:
+    compiler_mod = getattr(torch, "compiler", None)
+    if compiler_mod is None:
+        return
+    marker = getattr(compiler_mod, "cudagraph_mark_step_begin", None)
+    if marker is None:
+        return
+    try:
+        marker()
+    except Exception:
+        return
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _loss_from_backtest_series(
+    strategy_returns: torch.Tensor,
+    turnovers: torch.Tensor,
+    gamma_sharpe: float,
+    gamma_turnover: float,
+    sample_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if sample_mask is None:
+        valid_returns = strategy_returns
+        valid_turnovers = turnovers
+    else:
+        valid_mask = sample_mask.to(device=strategy_returns.device, dtype=torch.bool)
+        valid_returns = strategy_returns[valid_mask]
+        valid_turnovers = turnovers[valid_mask]
+
+    if valid_returns.numel() == 0:
+        return strategy_returns.sum() * 0.0
+
+    mean_return = valid_returns.mean()
+    variance = (valid_returns - mean_return).pow(2).mean()
+    std_return = torch.sqrt(variance + 1e-8)
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype))
+    sharpe = mean_return / std_return * annualizer
+    turnover_penalty = valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(())
+    return -gamma_sharpe * sharpe + gamma_turnover * turnover_penalty
 
 
 def _normalized_model_name(model_name: str) -> str:
@@ -185,8 +266,10 @@ def _save_group_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
 ) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    scheduler_state = scheduler.state_dict() if scheduler is not None else None
     torch.save(
         {
             "train_years": train_years,
@@ -194,9 +277,54 @@ def _save_group_checkpoint(
             "model_state_dict": _state_dict_for_save(model),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
+            "scheduler_state_dict": scheduler_state,
         },
         checkpoint_path,
     )
+
+
+def _create_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: ExperimentConfig,
+) -> tuple[torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None, str, bool]:
+    if not bool(getattr(config.training, "enable_lr_scheduler", True)):
+        return None, "disabled", False
+
+    name = str(getattr(config.training, "lr_scheduler", "none") or "none").strip().lower().replace("-", "_")
+    if name in {"", "none", "off", "false", "disabled"}:
+        return None, "none", False
+
+    if name == "cosine":
+        t_max = int(config.training.lr_scheduler_t_max)
+        if t_max <= 0:
+            t_max = max(1, int(config.training.epochs))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=float(config.training.lr_scheduler_eta_min),
+        )
+        return scheduler, "cosine", False
+
+    if name == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=max(1, int(config.training.lr_scheduler_step_size)),
+            gamma=float(config.training.lr_scheduler_gamma),
+        )
+        return scheduler, "step", False
+
+    if name in {"plateau", "reduce_on_plateau", "reduce_lr_on_plateau"}:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(config.training.lr_scheduler_gamma),
+            patience=max(1, int(config.training.lr_scheduler_patience)),
+            threshold=float(config.training.lr_scheduler_threshold),
+        )
+        return scheduler, "plateau", True
+
+    print(f"[train] unknown lr_scheduler='{config.training.lr_scheduler}', disabled")
+    return None, "none", False
 
 
 def _benchmark_input_pipeline_throughput(
@@ -209,6 +337,7 @@ def _benchmark_input_pipeline_throughput(
     config: ExperimentConfig,
     device: torch.device,
     non_blocking: bool,
+    drop_last: bool = False,
     max_steps: int = 20,
 ) -> tuple[float, float]:
     """Return (dataloader_samples_per_sec, tensor_samples_per_sec) for quick A/B selection."""
@@ -221,7 +350,7 @@ def _benchmark_input_pipeline_throughput(
 
     dataloader_sps = 0.0
     if config.training.num_workers > 0:
-        loader = _build_loader(train_ds, train_batch_size, True, config, device)
+        loader = _build_loader(train_ds, train_batch_size, True, config, device, drop_last=drop_last)
         steps = 0
         samples = 0
         start_t = time.perf_counter()
@@ -434,6 +563,7 @@ def _evaluate_tensor_batch(
     max_turnover_ratio: float,
     chunk_rows: int,
     compute_ic: bool = True,
+    profile_timing: bool = False,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     weights_chunks: list[torch.Tensor] = []
@@ -459,18 +589,29 @@ def _evaluate_tensor_batch(
     running_max_log = torch.tensor(0.0, device=device, dtype=torch.float64)
     min_dd = torch.tensor(0.0, device=device, dtype=torch.float64)
 
+    timing = TimingBreakdown()
+    overall_start = time.perf_counter()
+
     with torch.inference_mode():
         for start in range(0, x.size(0), chunk_rows):
             end = min(start + chunk_rows, x.size(0))
+            chunk_start = time.perf_counter()
             x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
             returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
             mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
             buy_mask_chunk = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
             sell_mask_chunk = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
             bench_chunk = benchmark[start:end].to(device=device, non_blocking=non_blocking)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.transfer_s += time.perf_counter() - chunk_start
+
+            forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 weights_chunk = model(x_chunk, buy_mask_chunk)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.forward_s += time.perf_counter() - forward_start
 
+            backtest_start = time.perf_counter()
             backtest_chunk = run_backtest_torch(
                 weights_chunk,
                 returns_chunk,
@@ -483,8 +624,14 @@ def _evaluate_tensor_batch(
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
             )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.backtest_s += time.perf_counter() - backtest_start
+
             if compute_ic:
+                ic_start = time.perf_counter()
                 ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.ic_s += time.perf_counter() - ic_start
 
             weights_chunks.append(backtest_chunk.weights_history)
             strategy_chunks.append(backtest_chunk.strategy_returns)
@@ -581,6 +728,10 @@ def _evaluate_tensor_batch(
                 "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
                 "ic_positive_ratio": ic_pos / ic_n,
             }
+    timing.total_s = time.perf_counter() - overall_start
+    timing.batches = int(max(1, (x.size(0) + chunk_rows - 1) // chunk_rows))
+    if profile_timing:
+        _log_timing("eval", timing)
     return backtest, ic, metrics
 
 
@@ -1030,7 +1181,7 @@ def _build_loader(
         "num_workers": workers,
         "pin_memory": (device.type == "cuda"),
         "drop_last": drop_last,
-        "collate_fn": collate_batch,
+        "collate_fn": partial(collate_batch, batch_size=batch_size),
     }
     if workers > 0:
         loader_kwargs["persistent_workers"] = True
@@ -1112,6 +1263,7 @@ def _split_batch_size(dataset_size: int, cap: int) -> int:
 
 def _train_epoch(
     model: nn.Module,
+    loss_fn: Callable[..., torch.Tensor],
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -1124,23 +1276,44 @@ def _train_epoch(
     max_turnover_ratio: float,
     gamma_sharpe: float,
     gamma_turnover: float,
-) -> float:
+    grad_clip_norm: float,
+    profile_timing: bool = False,
+) -> tuple[float, TimingBreakdown]:
     model.train()
-    total_loss = 0.0
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
-    
-    for batch in loader:
+
+    timing = TimingBreakdown()
+    total_start = time.perf_counter()
+    loader_iter = iter(loader)
+
+    while True:
+        fetch_start = time.perf_counter()
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            break
+        _maybe_sync_cuda(device, profile_timing)
+        timing.fetch_s += time.perf_counter() - fetch_start
+
+        transfer_start = time.perf_counter()
         batch = _move_batch(batch, device, non_blocking)
+        _maybe_sync_cuda(device, profile_timing)
+        timing.transfer_s += time.perf_counter() - transfer_start
+
+        _maybe_cudagraph_step_begin()
         optimizer.zero_grad(set_to_none=True)
-        
+
+        forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             weights = model(batch["x"], batch["can_buy_mask"])
-            loss = sharpe_aware_loss(
+            loss = loss_fn(
                 weights,
                 batch["future_log_returns"],
                 batch["tradable_mask"],
                 can_buy_mask=batch["can_buy_mask"],
                 can_sell_mask=batch["can_sell_mask"],
+                sample_mask=batch.get("sample_mask"),
                 long_only=long_only,
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
@@ -1148,22 +1321,62 @@ def _train_epoch(
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
-        
-        scaler.scale(loss).backward()
-        
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        
-        total_loss += float(loss.detach().cpu())
+        _maybe_sync_cuda(device, profile_timing)
+        timing.forward_s += time.perf_counter() - forward_start
+
+        backward_start = time.perf_counter()
+        if scaler.is_enabled():
+            grad_start = time.perf_counter()
+            scaler.scale(loss).backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+
+            if grad_clip_norm > 0.0:
+                clip_start = time.perf_counter()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.clip_s += time.perf_counter() - clip_start
+
+            step_start = time.perf_counter()
+            scaler.step(optimizer)
+            scaler.update()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+        else:
+            grad_start = time.perf_counter()
+            loss.backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+
+            if grad_clip_norm > 0.0:
+                clip_start = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.clip_s += time.perf_counter() - clip_start
+
+            step_start = time.perf_counter()
+            optimizer.step()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backward_s += time.perf_counter() - backward_start
+
+        total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
         steps += 1
-    
-    return total_loss / max(steps, 1)
+
+    timing.total_s = time.perf_counter() - total_start
+    timing.batches = steps
+    if steps == 0:
+        return 0.0, timing
+    mean_loss = float((total_loss_t / steps).detach().cpu())
+    return mean_loss, timing
 
 
 def _train_epoch_tensor(
     model: nn.Module,
+    loss_fn: Callable[..., torch.Tensor],
     x: torch.Tensor,
     future_log_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
@@ -1182,31 +1395,44 @@ def _train_epoch_tensor(
     max_turnover_ratio: float,
     gamma_sharpe: float,
     gamma_turnover: float,
-) -> float:
+    grad_clip_norm: float,
+    profile_timing: bool = False,
+) -> tuple[float, TimingBreakdown]:
     model.train()
     total_rows = int(x.size(0))
     if total_rows == 0:
-        return 0.0
+        return 0.0, TimingBreakdown()
 
     num_batches = total_rows // batch_size
     batch_order = torch.randperm(num_batches).tolist()
-    total_loss = 0.0
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
+    timing = TimingBreakdown()
+    total_start = time.perf_counter()
 
     for batch_idx in batch_order:
+        batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
+        _maybe_sync_cuda(device, profile_timing)
+        timing.fetch_s += time.perf_counter() - batch_start
+
+        transfer_start = time.perf_counter()
         batch_x = x[start:end].to(device=device, non_blocking=non_blocking)
         batch_ret = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
         batch_mask = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_buy_mask = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_sell_mask = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_sample_mask = sample_mask[start:end].to(device=device, non_blocking=non_blocking)
+        _maybe_sync_cuda(device, profile_timing)
+        timing.transfer_s += time.perf_counter() - transfer_start
 
+        _maybe_cudagraph_step_begin()
         optimizer.zero_grad(set_to_none=True)
+        forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             weights = model(batch_x, batch_buy_mask)
-            loss = sharpe_aware_loss(
+            loss = loss_fn(
                 weights,
                 batch_ret,
                 batch_mask,
@@ -1220,17 +1446,57 @@ def _train_epoch_tensor(
                 gamma_sharpe=gamma_sharpe,
                 gamma_turnover=gamma_turnover,
             )
+        _maybe_sync_cuda(device, profile_timing)
+        timing.forward_s += time.perf_counter() - forward_start
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        backward_start = time.perf_counter()
+        if scaler.is_enabled():
+            grad_start = time.perf_counter()
+            scaler.scale(loss).backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
 
-        total_loss += float(loss.detach().cpu())
+            if grad_clip_norm > 0.0:
+                clip_start = time.perf_counter()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.clip_s += time.perf_counter() - clip_start
+
+            step_start = time.perf_counter()
+            scaler.step(optimizer)
+            scaler.update()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+        else:
+            grad_start = time.perf_counter()
+            loss.backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+
+            if grad_clip_norm > 0.0:
+                clip_start = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.clip_s += time.perf_counter() - clip_start
+
+            step_start = time.perf_counter()
+            optimizer.step()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backward_s += time.perf_counter() - backward_start
+
+        total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
         steps += 1
 
-    return total_loss / max(steps, 1)
+    timing.total_s = time.perf_counter() - total_start
+    timing.batches = steps
+    if steps == 0:
+        return 0.0, timing
+    mean_loss = float((total_loss_t / steps).detach().cpu())
+    return mean_loss, timing
 
 
 def _compute_metrics_from_tensors(
@@ -1826,6 +2092,7 @@ def run_training(
     config: ExperimentConfig,
     output_dir: str | Path,
     resume: bool = True,
+    profile_timing: bool = False,
 ) -> list[FoldResult]:
     if _is_tree_model_name(config.training.model_name):
         return _run_training_tree_models(panel, folds, config, output_dir, resume=resume)
@@ -1839,10 +2106,21 @@ def run_training(
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         try:
+            # Keep compile/cudagraph enabled while suppressing verbose artifact logs.
+            torch._logging.set_logs(
+                perf_hints=False,
+                cudagraphs=False,
+                autotuning=False,
+            )
+        except Exception:
+            pass
+        try:
             import torch._inductor.config as inductor_config  # type: ignore
 
-            inductor_config.triton.cudagraph_skip_dynamic_graphs = True
-            inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
+            inductor_config.triton.cudagraph_skip_dynamic_graphs = False
+            inductor_config.triton.cudagraph_dynamic_shape_warn_limit = 0
+            logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
+            logging.getLogger("torch._inductor.scheduler").setLevel(logging.ERROR)
         except Exception:
             pass
     print(
@@ -1857,6 +2135,8 @@ def run_training(
             f"allow_tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
             f"allow_tf32_cudnn={torch.backends.cudnn.allow_tf32}"
         )
+    if profile_timing:
+        print("[profile] timing mode enabled")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1952,6 +2232,7 @@ def run_training(
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
 
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
+        train_setup_start = time.perf_counter()
         train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, _ = _dataset_to_tensors(train_ds)
         train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_sample_mask = _pad_training_tensors(
             train_x,
@@ -1975,6 +2256,11 @@ def run_training(
             train_sample_mask,
             pin_memory=(device.type == "cuda" and non_blocking),
         )
+        if profile_timing:
+            _log_timing(
+                f"Train {train_years} setup.train_tensors",
+                TimingBreakdown(total_s=time.perf_counter() - train_setup_start),
+            )
 
         fold_contexts: dict[int, FoldRuntimeContext] = {}
         for fold in pending_folds:
@@ -2014,6 +2300,7 @@ def run_training(
             continue
 
         val_datasets = [context.val_ds for context in fold_contexts.values()]
+        val_setup_start = time.perf_counter()
         combined_val_x, combined_val_returns, combined_val_masks, combined_val_buy_masks, combined_val_sell_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
             val_datasets,  # type: ignore[arg-type]
         )
@@ -2030,13 +2317,24 @@ def run_training(
         val_offsets: list[int] = [0]
         for length in val_lengths:
             val_offsets.append(val_offsets[-1] + length)
+        if profile_timing:
+            _log_timing(
+                f"Train {train_years} setup.val_tensors",
+                TimingBreakdown(total_s=time.perf_counter() - val_setup_start),
+            )
 
+        model_build_start = time.perf_counter()
         model = build_model(
             config=config,
             lookback=config.training.lookback,
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
         ).to(device)
+        if profile_timing:
+            _log_timing(
+                f"Train {train_years} setup.model_build",
+                TimingBreakdown(total_s=time.perf_counter() - model_build_start),
+            )
 
         if config.training.warm_start_from_previous_fold and warm_start_checkpoint_path is not None and warm_start_checkpoint_path.exists():
             warm_start_checkpoint = _load_checkpoint(warm_start_checkpoint_path)
@@ -2045,13 +2343,34 @@ def run_training(
                 print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
+        compiled_loss_fn: Callable[..., torch.Tensor] = sharpe_aware_loss
 
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-        )
+        if device.type == "cuda":
+            try:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=config.training.learning_rate,
+                    weight_decay=config.training.weight_decay,
+                    fused=True,
+                )
+                print(f"[Train {train_years}] optimizer=AdamW(fused=True)")
+            except TypeError:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=config.training.learning_rate,
+                    weight_decay=config.training.weight_decay,
+                )
+                print(f"[Train {train_years}] optimizer=AdamW(fused=False, unsupported by this torch build)")
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=config.training.learning_rate,
+                weight_decay=config.training.weight_decay,
+            )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
+        scheduler, scheduler_name, scheduler_requires_metric = _create_lr_scheduler(optimizer, config)
+        if scheduler is not None:
+            print(f"[Train {train_years}] lr_scheduler={scheduler_name}")
 
         start_epoch = 1
         if resume and group_checkpoint_path.exists():
@@ -2060,6 +2379,10 @@ def run_training(
                 _load_state_dict(model, checkpoint["model_state_dict"])
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                if scheduler is not None:
+                    scheduler_state = checkpoint.get("scheduler_state_dict")
+                    if scheduler_state:
+                        scheduler.load_state_dict(scheduler_state)
                 start_epoch = int(checkpoint.get("epoch", 0)) + 1
                 print(f"[Train {train_years}] resumed from epoch {start_epoch}")
 
@@ -2099,12 +2422,39 @@ def run_training(
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
-        if config.training.enable_torch_compile and hasattr(torch, "compile"):
+        auto_compile_sharpe = (
+            str(config.training.loss_type).strip().lower() == "sharpe"
+            and device.type == "cuda"
+            and not profile_timing
+            and _env_truthy("STOCKAGENT_AUTO_TORCH_COMPILE_SHARPE", "1")
+        )
+        should_enable_compile = (config.training.enable_torch_compile or auto_compile_sharpe) and hasattr(torch, "compile")
+
+        if should_enable_compile:
             can_compile, reason = _can_enable_torch_compile(device)
             if can_compile:
                 try:
-                    compiled_train_model = torch.compile(model, mode="max-autotune-no-cudagraphs")
-                    print(f"[Train {train_years}] torch.compile enabled (mode=max-autotune-no-cudagraphs, {reason})")
+                    compile_start = time.perf_counter()
+                    compiled_train_model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+                    compile_source = "auto(sharpe)" if (auto_compile_sharpe and not config.training.enable_torch_compile) else "config"
+                    print(
+                        f"[Train {train_years}] torch.compile enabled "
+                        f"(mode=reduce-overhead, dynamic=False, source={compile_source}, {reason})"
+                    )
+
+                    compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", "1" if auto_compile_sharpe else "0")
+                    if compile_loss:
+                        try:
+                            compiled_loss_fn = torch.compile(sharpe_aware_loss, mode="reduce-overhead", dynamic=False)
+                            print(f"[Train {train_years}] torch.compile loss enabled (mode=reduce-overhead, dynamic=False)")
+                        except Exception as e:
+                            compiled_loss_fn = sharpe_aware_loss
+                            print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
+                    if profile_timing:
+                        _log_timing(
+                            f"Train {train_years} setup.torch_compile",
+                            TimingBreakdown(total_s=time.perf_counter() - compile_start),
+                        )
                 except Exception as e:
                     print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
@@ -2132,20 +2482,23 @@ def run_training(
             use_dataloader = dl_sps > (tensor_sps * 1.05)
 
         if use_dataloader:
-            train_loader = _build_loader(train_ds, train_batch_size, True, config, device)
+            train_loader = _build_loader(
+                train_ds,
+                train_batch_size,
+                True,
+                config,
+                device,
+                drop_last=False,
+            )
             effective_workers = max(1, os.cpu_count() or 1)
             print(f"[Train {train_years}] training mode=dataloader (num_workers={effective_workers}, from os.cpu_count)")
         else:
             print(f"[Train {train_years}] training mode=tensor (num_workers={config.training.num_workers})")
 
-        epoch_pbar = tqdm(
-            range(start_epoch, config.training.epochs + 1),
-            desc=f"Train {train_years} Epochs",
-            leave=True,
-            dynamic_ncols=True,
-        )
         early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
         early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
+        val_interval = max(1, int(config.training.val_interval_epochs))
+        print(f"[Train {train_years}] validation interval={val_interval} epoch(s)")
         no_improve_epochs = 0
         last_epoch = start_epoch - 1
         if early_stop_patience > 0:
@@ -2154,12 +2507,21 @@ def run_training(
                 f"patience={early_stop_patience} epochs "
                 f"(ratio={early_stop_ratio:.2f})"
             )
+        print(f"Train {train_years}")
+        epoch_pbar = tqdm(
+            range(start_epoch, config.training.epochs + 1),
+            desc=" Epochs",
+            leave=True,
+            dynamic_ncols=True,
+        )
         val_backtest: BacktestResultTensor | None = None
+        get_backtest_compile_stats(reset=True)
 
-        def _run_one_train_epoch(train_model: nn.Module) -> float:
+        def _run_one_train_epoch(train_model: nn.Module) -> tuple[float, TimingBreakdown]:
             if train_loader is not None:
                 return _train_epoch(
                     train_model,
+                    compiled_loss_fn,
                     train_loader,
                     optimizer,
                     scaler,
@@ -2172,9 +2534,12 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.evaluation.gamma_sharpe,
                     config.evaluation.gamma_turnover,
+                    config.training.grad_clip_norm,
+                    profile_timing=profile_timing,
                 )
             return _train_epoch_tensor(
                 train_model,
+                compiled_loss_fn,
                 train_x,
                 train_returns,
                 train_masks,
@@ -2193,26 +2558,46 @@ def run_training(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
+                grad_clip_norm=config.training.grad_clip_norm,
+                profile_timing=profile_timing,
             )
 
         for epoch in epoch_pbar:
             last_epoch = epoch
-            try:
-                train_loss = _run_one_train_epoch(compiled_train_model)
-            except RuntimeError as exc:
-                if compiled_train_model is not model and _is_compile_backward_shape_error(exc):
-                    print(
-                        "[runtime] torch.compile backward shape mismatch detected; "
-                        "falling back to eager mode for stability"
-                    )
-                    compiled_train_model = model
-                    optimizer.zero_grad(set_to_none=True)
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                    train_loss = _run_one_train_epoch(compiled_train_model)
-                else:
-                    raise
+            train_loss, train_timing = _run_one_train_epoch(compiled_train_model)
 
+            should_validate = (
+                epoch == start_epoch
+                or (epoch % val_interval == 0)
+                or (epoch == config.training.epochs)
+            )
+            if not should_validate:
+                if scheduler is not None and not scheduler_requires_metric:
+                    scheduler.step()
+                bt_stats_after = get_backtest_compile_stats()
+                bt_nonhit_total = (
+                    bt_stats_after["misses"]
+                    + bt_stats_after["failures"]
+                    + bt_stats_after["disabled"]
+                )
+                epoch_pbar.set_postfix(
+                    {
+                        "train_loss": f"{train_loss:.6f}",
+                        "val_mean": "-",
+                        "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
+                        "no_improve": no_improve_epochs,
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "bt_nonhit": bt_nonhit_total,
+                    }
+                )
+                if profile_timing:
+                    _log_timing(
+                        f"Train {train_years} epoch {epoch} (train-only)",
+                        train_timing,
+                    )
+                continue
+
+            val_eval_start = time.perf_counter()
             val_backtest, _, _ = _evaluate_tensor_batch(
                 model,
                 combined_val_x,
@@ -2230,39 +2615,19 @@ def run_training(
                 config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
                 compute_ic=False,
+                profile_timing=profile_timing,
             )
+            val_eval_total = time.perf_counter() - val_eval_start
 
             val_losses: list[float] = []
             any_fold_improved = False
-            val_returns_device = combined_val_returns.to(
-                device=val_backtest.weights_history.device,
-                non_blocking=False,
-            )
-            val_masks_device = combined_val_masks.to(
-                device=val_backtest.weights_history.device,
-                non_blocking=False,
-            )
-            val_buy_masks_device = combined_val_buy_masks.to(
-                device=val_backtest.weights_history.device,
-                non_blocking=False,
-            )
-            val_sell_masks_device = combined_val_sell_masks.to(
-                device=val_backtest.weights_history.device,
-                non_blocking=False,
-            )
+            val_loss_start = time.perf_counter()
             for index, (_, context) in enumerate(fold_contexts.items()):
                 start = val_offsets[index]
                 end = val_offsets[index + 1]
-                val_loss_tensor = sharpe_aware_loss(
-                    val_backtest.weights_history[start:end],
-                    val_returns_device[start:end],
-                    val_masks_device[start:end],
-                    can_buy_mask=val_buy_masks_device[start:end],
-                    can_sell_mask=val_sell_masks_device[start:end],
-                    long_only=config.trading.long_only,
-                    buy_fee_rate=config.trading.buy_fee_rate,
-                    sell_fee_rate=config.trading.sell_fee_rate,
-                    max_turnover_ratio=config.trading.max_turnover_ratio,
+                val_loss_tensor = _loss_from_backtest_series(
+                    val_backtest.strategy_returns[start:end],
+                    val_backtest.turnovers[start:end],
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_turnover=config.evaluation.gamma_turnover,
                 )
@@ -2281,7 +2646,10 @@ def run_training(
                         scaler=scaler,
                     )
 
+            val_loss_total = time.perf_counter() - val_loss_start
+
             if any_fold_improved:
+                group_ckpt_start = time.perf_counter()
                 _save_group_checkpoint(
                     group_checkpoint_path,
                     train_years=train_years,
@@ -2290,6 +2658,9 @@ def run_training(
                     optimizer=optimizer,
                     scaler=scaler,
                 )
+                group_ckpt_total = time.perf_counter() - group_ckpt_start
+            else:
+                group_ckpt_total = 0.0
 
             if val_losses:
                 if any_fold_improved:
@@ -2297,14 +2668,48 @@ def run_training(
                 else:
                     no_improve_epochs += 1
 
+                if scheduler is not None:
+                    if scheduler_requires_metric:
+                        scheduler.step(float(np.mean(val_losses)))
+                    else:
+                        scheduler.step()
+
+                bt_stats_after = get_backtest_compile_stats()
+                bt_nonhit_total = (
+                    bt_stats_after["misses"]
+                    + bt_stats_after["failures"]
+                    + bt_stats_after["disabled"]
+                )
+
                 epoch_pbar.set_postfix(
                     {
                         "train_loss": f"{train_loss:.6f}",
                         "val_mean": f"{float(np.mean(val_losses)):.6f}",
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
                         "no_improve": no_improve_epochs,
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "bt_nonhit": bt_nonhit_total,
                     }
                 )
+
+                if profile_timing:
+                    _log_timing(
+                        f"Train {train_years} epoch {epoch}",
+                        TimingBreakdown(
+                            total_s=train_timing.total_s + val_eval_total + val_loss_total + group_ckpt_total,
+                            fetch_s=train_timing.fetch_s,
+                            transfer_s=train_timing.transfer_s,
+                            forward_s=train_timing.forward_s,
+                            backward_s=train_timing.backward_s,
+                            grad_s=train_timing.grad_s,
+                            clip_s=train_timing.clip_s,
+                            step_s=train_timing.step_s,
+                            backtest_s=val_eval_total,
+                            metrics_s=val_loss_total,
+                            save_s=group_ckpt_total,
+                            batches=train_timing.batches,
+                        ),
+                    )
 
                 if early_stop_patience > 0 and no_improve_epochs > early_stop_patience:
                     print(
@@ -2317,6 +2722,7 @@ def run_training(
         # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
         # the epoch loop does not run; compute validation backtest once for reporting.
         if val_backtest is None:
+            eval_only_start = time.perf_counter()
             val_backtest, _, _ = _evaluate_tensor_batch(
                 model,
                 combined_val_x,
@@ -2333,7 +2739,13 @@ def run_training(
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
+                profile_timing=profile_timing,
             )
+            if profile_timing:
+                _log_timing(
+                    f"Train {train_years} final.val_eval_only",
+                    TimingBreakdown(total_s=time.perf_counter() - eval_only_start),
+                )
         if val_backtest is None:
             raise RuntimeError("Validation backtest is unavailable in eval stage.")
 
@@ -2368,6 +2780,7 @@ def run_training(
                 device,
                 non_blocking,
             )
+            test_eval_start = time.perf_counter()
             test_bt_t, test_ic, _ = _evaluate_tensor_batch(
                 model,
                 test_x,
@@ -2384,11 +2797,14 @@ def run_training(
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
                 chunk_rows=eval_chunk_rows,
+                profile_timing=profile_timing,
             )
+            test_eval_total = time.perf_counter() - test_eval_start
 
             start = val_offsets[index]
             end = val_offsets[index + 1]
 
+            test_report_start = time.perf_counter()
             val_ic = ic_summary(
                 compute_ic_series_torch(
                     val_backtest.weights_history[start:end],
@@ -2421,9 +2837,19 @@ def run_training(
                 dates=test_dates,
             )
             test_met = compute_metrics(test_bt)
+            test_report_total = time.perf_counter() - test_report_start
 
             print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
             print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            if profile_timing:
+                _log_timing(
+                    f"Train {train_years} fold {fold.fold_id} test_stage",
+                    TimingBreakdown(
+                        total_s=test_eval_total + test_report_total,
+                        backtest_s=test_eval_total,
+                        metrics_s=test_report_total,
+                    ),
+                )
 
             fold_result = FoldResult(
                 fold_id=fold.fold_id,
@@ -2438,6 +2864,7 @@ def run_training(
             )
             results_by_fold[fold.fold_id] = fold_result
 
+            save_start = time.perf_counter()
             torch.save(_state_dict_for_save(model), _model_path(fold_dir))
             with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
                 json.dump(asdict(fold_result), f, indent=2)
@@ -2448,12 +2875,23 @@ def run_training(
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
 
+            plot_start = time.perf_counter()
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
             _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+            plot_total = time.perf_counter() - plot_start
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+            if profile_timing:
+                _log_timing(
+                    f"Train {train_years} fold {fold.fold_id} save_plot",
+                    TimingBreakdown(
+                        total_s=time.perf_counter() - save_start,
+                        save_s=plot_start - save_start,
+                        plot_s=plot_total,
+                    ),
+                )
 
         _save_group_checkpoint(
             group_checkpoint_path,
@@ -2462,6 +2900,7 @@ def run_training(
             model=model,
             optimizer=optimizer,
             scaler=scaler,
+            scheduler=scheduler,
         )
 
         if config.training.warm_start_from_previous_fold:

@@ -14,6 +14,7 @@ class RunnerConfig:
     mode: str = "train"
     resume: bool = True
     post_train_infer: bool = True
+    start_fold: int | None = None
 
 
 @dataclass(slots=True)
@@ -118,8 +119,19 @@ class TrainingConfig:
     non_blocking_transfer: bool
     model_name: str
     enable_torch_compile: bool = False
+    auto_torch_compile_sharpe: bool = True
+    compile_loss: bool | None = None
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
+    train_symbol_subsample_ratio: float = 1.0
+    detach_prev_state: bool = True
+    prefer_fp16: bool = True
+    backtest_autotune: bool = True
+    backtest_compile: bool = True
+    backtest_verbose: bool = False
+    backtest_checkpoint_chunk_rows: int = 0
+    runtime_shape_check: bool = False
+    allow_dynamic_symbols: bool = True
     lookback: int = 1
     batch_size: int = 32
     batch_size_train: int = 32
@@ -131,10 +143,20 @@ class TrainingConfig:
     target_vram_fraction: float = 1
     epochs: int = 1000
     early_stopping_no_improve_ratio: float = 0.2
+    val_interval_epochs: int = 1
     learning_rate: float = 1e-3
+    enable_lr_scheduler: bool = True
+    lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
+    lr_scheduler_t_max: int = 0
+    lr_scheduler_eta_min: float = 1e-5
+    lr_scheduler_step_size: int = 50
+    lr_scheduler_gamma: float = 0.5
+    lr_scheduler_patience: int = 5
+    lr_scheduler_threshold: float = 1e-4
     top_k: int = 20
     num_workers: int = 0
     weight_decay: float = 1e-5
+    grad_clip_norm: float = 1.0
     loss_type: str = "mse"  # "mse" or "sharpe"
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
@@ -170,6 +192,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     runner.setdefault("mode", "train")
     runner.setdefault("resume", True)
     runner.setdefault("post_train_infer", True)
+    runner.setdefault("start_fold", None)
 
     walk_forward = raw.setdefault("walk_forward", {})
     walk_forward.setdefault("min_train_years", 1)
@@ -184,18 +207,39 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
     training.setdefault("enable_torch_compile", False)
+    training.setdefault("auto_torch_compile_sharpe", True)
+    training.setdefault("compile_loss", None)
     training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
+    training.setdefault("train_symbol_subsample_ratio", 1.0)
+    training.setdefault("detach_prev_state", True)
+    training.setdefault("prefer_fp16", True)
+    training.setdefault("backtest_autotune", True)
+    training.setdefault("backtest_compile", True)
+    training.setdefault("backtest_verbose", False)
+    training.setdefault("backtest_checkpoint_chunk_rows", 0)
+    training.setdefault("runtime_shape_check", False)
+    training.setdefault("allow_dynamic_symbols", True)
     training.setdefault("vram_budget_gb", 8.0)
     training.setdefault("vram_safety_margin_gb", 1.0)
     training.setdefault("target_vram_fraction", 0.85)
     training.setdefault("epochs", 10)
     training.setdefault("early_stopping_no_improve_ratio", 0.2)
+    training.setdefault("val_interval_epochs", 1)
     training.setdefault("learning_rate", 1e-3)
+    training.setdefault("enable_lr_scheduler", True)
+    training.setdefault("lr_scheduler", "none")
+    training.setdefault("lr_scheduler_t_max", 0)
+    training.setdefault("lr_scheduler_eta_min", 1e-5)
+    training.setdefault("lr_scheduler_step_size", 50)
+    training.setdefault("lr_scheduler_gamma", 0.5)
+    training.setdefault("lr_scheduler_patience", 5)
+    training.setdefault("lr_scheduler_threshold", 1e-4)
     training.setdefault("model_name", "mlp")
     training.setdefault("top_k", 20)
     training.setdefault("num_workers", 0)
     training.setdefault("weight_decay", 1e-5)
+    training.setdefault("grad_clip_norm", 1.0)
     training.setdefault("loss_type", "mse")
 
     # Model-specific blocks.
@@ -311,8 +355,19 @@ def load_config(path: str | Path) -> ExperimentConfig:
             non_blocking_transfer=training_raw["non_blocking_transfer"],
             model_name=training_raw["model_name"],
             enable_torch_compile=training_raw["enable_torch_compile"],
+            auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
+            compile_loss=training_raw["compile_loss"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
+            train_symbol_subsample_ratio=training_raw["train_symbol_subsample_ratio"],
+            detach_prev_state=training_raw["detach_prev_state"],
+            prefer_fp16=training_raw["prefer_fp16"],
+            backtest_autotune=training_raw["backtest_autotune"],
+            backtest_compile=training_raw["backtest_compile"],
+            backtest_verbose=training_raw["backtest_verbose"],
+            backtest_checkpoint_chunk_rows=training_raw["backtest_checkpoint_chunk_rows"],
+            runtime_shape_check=training_raw["runtime_shape_check"],
+            allow_dynamic_symbols=training_raw["allow_dynamic_symbols"],
             lookback=training_raw["lookback"],
             batch_size=training_raw["batch_size"],
             batch_size_train=training_raw["batch_size_train"],
@@ -324,10 +379,20 @@ def load_config(path: str | Path) -> ExperimentConfig:
             target_vram_fraction=training_raw["target_vram_fraction"],
             epochs=training_raw["epochs"],
             early_stopping_no_improve_ratio=training_raw["early_stopping_no_improve_ratio"],
+            val_interval_epochs=training_raw["val_interval_epochs"],
             learning_rate=training_raw["learning_rate"],
+            enable_lr_scheduler=training_raw["enable_lr_scheduler"],
+            lr_scheduler=training_raw["lr_scheduler"],
+            lr_scheduler_t_max=training_raw["lr_scheduler_t_max"],
+            lr_scheduler_eta_min=training_raw["lr_scheduler_eta_min"],
+            lr_scheduler_step_size=training_raw["lr_scheduler_step_size"],
+            lr_scheduler_gamma=training_raw["lr_scheduler_gamma"],
+            lr_scheduler_patience=training_raw["lr_scheduler_patience"],
+            lr_scheduler_threshold=training_raw["lr_scheduler_threshold"],
             top_k=training_raw["top_k"],
             num_workers=training_raw["num_workers"],
             weight_decay=training_raw["weight_decay"],
+            grad_clip_norm=training_raw["grad_clip_norm"],
             loss_type=training_raw["loss_type"],
             mlp=MLPModelConfig(**training_raw["mlp"]),
             ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),

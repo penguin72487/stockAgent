@@ -1,13 +1,42 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 import torch
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
 
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
+SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
+
+_SCAN_CHUNK_CACHE: dict[tuple, int] = {}
+_SCAN_COMPILED_CACHE: dict[
+    tuple,
+    Callable[
+        ...,
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+    ],
+] = {}
+_SCAN_COMPILE_FAILED: set[tuple] = set()
+_SCAN_COMPILE_STATS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "failures": 0,
+    "disabled": 0,
+}
 
 
 def _clip_to_int64_storage_bounds(values: np.ndarray | float, *, non_negative: bool = False) -> np.ndarray:
@@ -65,7 +94,282 @@ def _apply_turnover_cap_torch(
     scale = torch.ones_like(turnovers)
     scale = torch.where(turnovers > cap, cap / turnovers.clamp_min(1e-12), scale)
     scale = scale.clamp_(0.0, 1.0)
-    return (prev_weights + deltas * scale).float()
+    return prev_weights + deltas * scale
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _autotune_enabled() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_AUTOTUNE", "1")
+
+
+def _compile_enabled() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_COMPILE", "1")
+
+
+def _compile_verbose() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_VERBOSE", "0")
+
+
+def _checkpoint_chunk_rows() -> int:
+    return max(0, _env_int("STOCKAGENT_BACKTEST_CHECKPOINT_CHUNK_ROWS", 0))
+
+
+def get_backtest_compile_stats(reset: bool = False) -> dict[str, int]:
+    stats = dict(_SCAN_COMPILE_STATS)
+    if reset:
+        for key in _SCAN_COMPILE_STATS:
+            _SCAN_COMPILE_STATS[key] = 0
+    return stats
+
+
+def _configure_inductor_cudagraphs() -> None:
+    try:
+        import torch._inductor.config as inductor_config  # type: ignore
+
+        # Keep cudagraph enabled without forcing dynamic-shape partition warnings.
+        inductor_config.triton.cudagraph_skip_dynamic_graphs = False
+        inductor_config.triton.cudagraph_dynamic_shape_warn_limit = 0
+        logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
+        logging.getLogger("torch._inductor.scheduler").setLevel(logging.ERROR)
+    except Exception:
+        pass
+
+
+def _mark_static_shape(tensor: torch.Tensor | None, dims: list[int] | None = None) -> None:
+    if tensor is None:
+        return
+    mark_static = getattr(torch._dynamo, "mark_static", None)
+    if mark_static is None:
+        return
+    try:
+        if dims is None:
+            dims = list(range(tensor.dim()))
+        mark_static(tensor, dims)
+    except Exception:
+        return
+
+
+def _supported_scan_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        return dtype
+    return torch.float32
+
+
+def _scan_chunk_key(
+    weights: torch.Tensor,
+    long_only: bool,
+    max_turnover_ratio: float,
+) -> tuple:
+    return (
+        str(weights.device),
+        int(weights.size(0)),
+        int(weights.size(1)),
+        str(weights.dtype),
+        bool(long_only),
+        float(max_turnover_ratio > 0.0),
+    )
+
+
+def _scan_compile_key(
+    weights: torch.Tensor,
+    long_only: bool,
+    max_turnover_ratio: float,
+    scan_chunk_size: int,
+    record_weights_history: bool,
+) -> tuple:
+    return (
+        str(weights.device),
+        int(weights.size(1)),
+        str(weights.dtype),
+        bool(long_only),
+        float(max_turnover_ratio),
+        int(scan_chunk_size),
+        bool(record_weights_history),
+    )
+
+
+def _scan_runner_factory(
+    *,
+    long_only: bool,
+    max_turnover_ratio: float,
+    scan_chunk_size: int,
+    record_weights_history: bool,
+):
+    def _runner(
+        weights: torch.Tensor,
+        future_returns: torch.Tensor,
+        tradable_mask: torch.Tensor,
+        can_buy_mask: torch.Tensor | None,
+        can_sell_mask: torch.Tensor | None,
+        prev_init: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if long_only:
+            return _vectorized_backtest_torch_scan_long_only(
+                weights,
+                future_returns,
+                tradable_mask,
+                can_buy_mask,
+                can_sell_mask,
+                prev_init=prev_init,
+                max_turnover_ratio=max_turnover_ratio,
+                scan_chunk_size=scan_chunk_size,
+                record_weights_history=record_weights_history,
+            )
+        return _vectorized_backtest_torch_scan_long_short(
+            weights,
+            future_returns,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            prev_init=prev_init,
+            max_turnover_ratio=max_turnover_ratio,
+            scan_chunk_size=scan_chunk_size,
+            record_weights_history=record_weights_history,
+        )
+
+    return _runner
+
+
+def _autotune_scan_chunk_size(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor | None,
+    can_sell_mask: torch.Tensor | None,
+    long_only: bool,
+    max_turnover_ratio: float,
+) -> int:
+    key = _scan_chunk_key(weights, long_only, max_turnover_ratio)
+    cached = _SCAN_CHUNK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if not _autotune_enabled():
+        _SCAN_CHUNK_CACHE[key] = 256
+        return 256
+
+    # Keep warmup bounded to avoid large startup overhead.
+    probe_rows = max(1, min(int(weights.size(0)), 1024))
+    w_probe = weights[:probe_rows]
+    r_probe = future_returns[:probe_rows]
+    t_probe = tradable_mask[:probe_rows]
+    buy_probe = can_buy_mask[:probe_rows] if can_buy_mask is not None else None
+    sell_probe = can_sell_mask[:probe_rows] if can_sell_mask is not None else None
+    prev_probe = torch.zeros_like(w_probe[0])
+
+    candidates = [c for c in SCAN_CHUNK_CANDIDATES if c <= probe_rows]
+    if not candidates:
+        candidates = [max(1, probe_rows)]
+
+    def _measure(chunk_size: int) -> float:
+        runner = _scan_runner_factory(
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            scan_chunk_size=chunk_size,
+            record_weights_history=True,
+        )
+        with torch.inference_mode():
+            _ = runner(w_probe, r_probe, t_probe, buy_probe, sell_probe, prev_probe)
+            if weights.device.type == "cuda":
+                torch.cuda.synchronize(weights.device)
+            start = time.perf_counter()
+            _ = runner(w_probe, r_probe, t_probe, buy_probe, sell_probe, prev_probe)
+            if weights.device.type == "cuda":
+                torch.cuda.synchronize(weights.device)
+            return time.perf_counter() - start
+
+    best_chunk = candidates[0]
+    best_time = float("inf")
+    for chunk in candidates:
+        elapsed = _measure(chunk)
+        if elapsed < best_time:
+            best_time = elapsed
+            best_chunk = chunk
+
+    _SCAN_CHUNK_CACHE[key] = best_chunk
+    if _compile_verbose():
+        print(
+            "[backtest autotune] scan_chunk_size="
+            f"{best_chunk} selected for shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, turnover_cap={max_turnover_ratio > 0.0})"
+        )
+    return best_chunk
+
+
+try:
+    _autotune_scan_chunk_size = torch._dynamo.disable(_autotune_scan_chunk_size)  # type: ignore[assignment]
+except Exception:
+    pass
+
+
+def _resolve_scan_runner(
+    weights: torch.Tensor,
+    *,
+    long_only: bool,
+    max_turnover_ratio: float,
+    scan_chunk_size: int,
+    record_weights_history: bool,
+):
+    base_runner = _scan_runner_factory(
+        long_only=long_only,
+        max_turnover_ratio=max_turnover_ratio,
+        scan_chunk_size=scan_chunk_size,
+        record_weights_history=record_weights_history,
+    )
+
+    if not _compile_enabled() or weights.device.type != "cuda" or not hasattr(torch, "compile"):
+        return base_runner
+
+    key = _scan_compile_key(weights, long_only, max_turnover_ratio, scan_chunk_size, record_weights_history)
+    if key in _SCAN_COMPILE_FAILED:
+        _SCAN_COMPILE_STATS["disabled"] += 1
+        if _compile_verbose():
+            print(
+                "[backtest compile] disabled after previous failure for "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+            )
+        return base_runner
+
+    cached = _SCAN_COMPILED_CACHE.get(key)
+    if cached is not None:
+        _SCAN_COMPILE_STATS["hits"] += 1
+        if _compile_verbose():
+            print(
+                "[backtest compile] cache hit for "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+            )
+        return cached
+
+    try:
+        _SCAN_COMPILE_STATS["misses"] += 1
+        # Keep symbol axis static while allowing varying time/batch length.
+        _mark_static_shape(weights, [1])
+        if _compile_verbose():
+            print(
+                "[backtest compile] compiling fixed-shape runner for "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+            )
+        _configure_inductor_cudagraphs()
+        compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=True)
+        _SCAN_COMPILED_CACHE[key] = compiled
+        return compiled
+    except Exception:
+        _SCAN_COMPILE_FAILED.add(key)
+        _SCAN_COMPILE_STATS["failures"] += 1
+        print(
+            "[backtest compile] compile failed, falling back to eager for "
+            f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+        )
+        return base_runner
 
 
 @dataclass(slots=True)
@@ -85,7 +389,7 @@ class BacktestResultTensor:
     strategy_returns: torch.Tensor   # [T]
     benchmark_returns: torch.Tensor  # [T]
     turnovers: torch.Tensor          # [T]
-    weights_history: torch.Tensor    # [T, S]
+    weights_history: torch.Tensor    # [T, S], may be empty when caller disables history recording.
 
     def to_numpy(self) -> BacktestResult:
         return BacktestResult(
@@ -120,49 +424,234 @@ def _vectorized_backtest(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    weights_history = np.asarray(weights, dtype=np.float32).copy()
-    weights_history[~tradable_mask.astype(bool)] = 0.0
+    target_weights = np.asarray(weights, dtype=np.float32).copy()
+    tradable = tradable_mask.astype(bool)
+    buy_mask = tradable if can_buy_mask is None else can_buy_mask.astype(bool)
+    sell_mask = tradable if can_sell_mask is None else can_sell_mask.astype(bool)
 
     if long_only:
-        weights_history = np.clip(weights_history, 0.0, None)
-        weight_sums = weights_history.sum(axis=1, keepdims=True)
+        target_weights = np.clip(target_weights, 0.0, None)
+        weight_sums = target_weights.sum(axis=1, keepdims=True)
         nonzero = weight_sums.squeeze(1) > 0
-        weights_history[nonzero] /= weight_sums[nonzero]
+        target_weights[nonzero] /= weight_sums[nonzero]
     else:
-        gross_sums = np.abs(weights_history).sum(axis=1, keepdims=True)
+        gross_sums = np.abs(target_weights).sum(axis=1, keepdims=True)
         nonzero = gross_sums.squeeze(1) > 0
-        weights_history[nonzero] /= gross_sums[nonzero]
+        target_weights[nonzero] /= gross_sums[nonzero]
 
-    prev = np.concatenate([
-        np.zeros((1, weights_history.shape[1]), dtype=np.float32),
-        weights_history[:-1],
-    ], axis=0)
-    deltas = weights_history - prev
-    buy_mask = tradable_mask.astype(bool) if can_buy_mask is None else can_buy_mask.astype(bool)
-    sell_mask = tradable_mask.astype(bool) if can_sell_mask is None else can_sell_mask.astype(bool)
-    deltas = np.where((deltas > 0.0) & ~buy_mask, 0.0, deltas)
-    deltas = np.where((deltas < 0.0) & ~sell_mask, 0.0, deltas)
-    if long_only:
-        sell_deltas = np.clip(deltas, None, 0.0)
-        base_after_sells = prev + sell_deltas
-        buy_deltas = np.clip(deltas, 0.0, None)
-        buy_sum = buy_deltas.sum(axis=1, keepdims=True)
-        buy_capacity = np.clip(1.0 - base_after_sells.sum(axis=1, keepdims=True), 0.0, None)
-        buy_scale = np.ones_like(buy_sum, dtype=np.float32)
-        np.divide(buy_capacity, buy_sum, out=buy_scale, where=buy_sum > buy_capacity)
-        buy_scale = np.clip(buy_scale, 0.0, 1.0)
-        deltas = sell_deltas + buy_deltas * buy_scale
-    weights_history = (prev + deltas).astype(np.float32)
-    if max_turnover_ratio > 0.0:
-        weights_history = _apply_turnover_cap_numpy(prev, weights_history, max_turnover_ratio)
-        deltas = weights_history - prev
-    buy_turnovers = np.clip(deltas, 0.0, None).sum(axis=1).astype(np.float32)
-    sell_turnovers = np.clip(-deltas, 0.0, None).sum(axis=1).astype(np.float32)
+    t_len, n_symbols = target_weights.shape
+    weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
+    buy_turnovers = np.zeros((t_len,), dtype=np.float32)
+    sell_turnovers = np.zeros((t_len,), dtype=np.float32)
+
+    prev = np.zeros((n_symbols,), dtype=np.float32)
+    for t in range(t_len):
+        target_t = target_weights[t].copy()
+        tradable_t = tradable[t]
+        # If symbol is not tradable today, keep previous holdings instead of forcing liquidation.
+        target_t[~tradable_t] = prev[~tradable_t]
+
+        delta = target_t - prev
+        buy_t = buy_mask[t]
+        sell_t = sell_mask[t]
+        delta[(delta > 0.0) & ~buy_t] = 0.0
+        delta[(delta < 0.0) & ~sell_t] = 0.0
+
+        if long_only:
+            sell_deltas = np.clip(delta, None, 0.0)
+            base_after_sells = prev + sell_deltas
+            buy_deltas = np.clip(delta, 0.0, None)
+            buy_sum = float(buy_deltas.sum(dtype=np.float32))
+            buy_capacity = max(0.0, 1.0 - float(base_after_sells.sum(dtype=np.float32)))
+            if buy_sum > buy_capacity and buy_sum > 0.0:
+                buy_deltas *= np.float32(buy_capacity / buy_sum)
+            delta = sell_deltas + buy_deltas
+
+        next_weights = prev + delta
+        if max_turnover_ratio > 0.0:
+            next_weights = _apply_turnover_cap_numpy(prev[None, :], next_weights[None, :], max_turnover_ratio)[0]
+            delta = next_weights - prev
+
+        weights_history[t] = next_weights.astype(np.float32, copy=False)
+        buy_turnovers[t] = np.clip(delta, 0.0, None).sum(dtype=np.float32)
+        sell_turnovers[t] = np.clip(-delta, 0.0, None).sum(dtype=np.float32)
+        prev = next_weights.astype(np.float32, copy=False)
+
     turnovers = (buy_turnovers + sell_turnovers).astype(np.float32)
-
     gross = np.einsum("ts,ts->t", weights_history, future_returns, dtype=np.float32)
     strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
     return strategy_returns.astype(np.float32), turnovers, weights_history
+
+
+def _vectorized_backtest_torch_scan_long_only(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor | None,
+    can_sell_mask: torch.Tensor | None,
+    prev_init: torch.Tensor | None = None,
+    max_turnover_ratio: float = 0.0,
+    scan_chunk_size: int = 256,
+    record_weights_history: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    future_returns_t = future_returns.to(dtype=weights.dtype)
+    target_weights = weights
+    tradable = tradable_mask
+    buy_mask = tradable if can_buy_mask is None else can_buy_mask
+    sell_mask = tradable if can_sell_mask is None else can_sell_mask
+
+    t_len, n_symbols = target_weights.shape
+    dtype = target_weights.dtype
+    device = target_weights.device
+    prev = prev_init.to(device=device, dtype=dtype) if prev_init is not None else torch.zeros_like(target_weights[0])
+    weights_history = (
+        torch.empty((t_len, n_symbols), device=device, dtype=dtype)
+        if record_weights_history
+        else torch.empty((0, n_symbols), device=device, dtype=dtype)
+    )
+    buy_turnovers = torch.empty((t_len,), device=device, dtype=dtype)
+    sell_turnovers = torch.empty((t_len,), device=device, dtype=dtype)
+    gross_returns = torch.empty((t_len,), device=device, dtype=dtype)
+    cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
+    chunk_size = max(1, int(scan_chunk_size))
+    one = torch.ones((), device=device, dtype=dtype)
+
+    for start in range(0, t_len, chunk_size):
+        end = min(start + chunk_size, t_len)
+        target_chunk = target_weights[start:end]
+        tradable_chunk = tradable[start:end]
+        buy_chunk = buy_mask[start:end]
+        sell_chunk = sell_mask[start:end]
+
+        for offset in range(end - start):
+            idx = start + offset
+            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+
+            delta = target_t - prev
+            buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
+            sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
+            base_after_sells = prev + sell_delta
+            buy_sum = buy_delta.sum()
+            buy_capacity = (one - base_after_sells.sum()).clamp_min(0.0)
+            buy_scale = torch.minimum(
+                torch.ones_like(buy_sum),
+                buy_capacity / buy_sum.clamp_min(1e-12),
+            )
+            delta = sell_delta + buy_delta * buy_scale
+
+            next_weights = prev + delta
+            if max_turnover_ratio > 0.0:
+                turnover = delta.abs().sum()
+                turnover_scale = torch.minimum(
+                    torch.ones_like(turnover),
+                    cap / turnover.clamp_min(1e-12),
+                )
+                next_weights = prev + delta * turnover_scale
+                delta = next_weights - prev
+
+            if record_weights_history:
+                weights_history[idx] = next_weights
+            buy_turnovers[idx] = delta.clamp_min(0.0).sum()
+            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum()
+            gross_returns[idx] = (next_weights * future_returns_t[idx]).sum()
+            prev = next_weights
+
+    turnovers = buy_turnovers + sell_turnovers
+    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev
+
+
+def _vectorized_backtest_torch_scan_long_short(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor | None,
+    can_sell_mask: torch.Tensor | None,
+    prev_init: torch.Tensor | None = None,
+    max_turnover_ratio: float = 0.0,
+    scan_chunk_size: int = 256,
+    record_weights_history: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    future_returns_t = future_returns.to(dtype=weights.dtype)
+
+    target_weights = weights
+    tradable = tradable_mask
+    buy_mask = tradable if can_buy_mask is None else can_buy_mask
+    sell_mask = tradable if can_sell_mask is None else can_sell_mask
+
+    t_len, n_symbols = target_weights.shape
+    dtype = target_weights.dtype
+    device = target_weights.device
+    prev = prev_init.to(device=device, dtype=dtype) if prev_init is not None else torch.zeros_like(target_weights[0])
+    weights_history = (
+        torch.empty((t_len, n_symbols), device=device, dtype=dtype)
+        if record_weights_history
+        else torch.empty((0, n_symbols), device=device, dtype=dtype)
+    )
+    buy_turnovers = torch.empty((t_len,), device=device, dtype=dtype)
+    sell_turnovers = torch.empty((t_len,), device=device, dtype=dtype)
+    gross_returns = torch.empty((t_len,), device=device, dtype=dtype)
+    cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
+    chunk_size = max(1, int(scan_chunk_size))
+
+    for start in range(0, t_len, chunk_size):
+        end = min(start + chunk_size, t_len)
+        target_chunk = target_weights[start:end]
+        tradable_chunk = tradable[start:end]
+        buy_chunk = buy_mask[start:end]
+        sell_chunk = sell_mask[start:end]
+
+        for offset in range(end - start):
+            idx = start + offset
+            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+
+            delta = target_t - prev
+            buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
+            sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
+            delta = sell_delta + buy_delta
+
+            next_weights = prev + delta
+            if max_turnover_ratio > 0.0:
+                turnover = delta.abs().sum()
+                turnover_scale = torch.minimum(
+                    torch.ones_like(turnover),
+                    cap / turnover.clamp_min(1e-12),
+                )
+                next_weights = prev + delta * turnover_scale
+                delta = next_weights - prev
+
+            if record_weights_history:
+                weights_history[idx] = next_weights
+            buy_turnovers[idx] = delta.clamp_min(0.0).sum()
+            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum()
+            gross_returns[idx] = (next_weights * future_returns_t[idx]).sum()
+            prev = next_weights
+
+    turnovers = buy_turnovers + sell_turnovers
+    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev
+
+
+def _prepare_scan_inputs(
+    weights: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor | None,
+    can_sell_mask: torch.Tensor | None,
+    long_only: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    compute_dtype = _supported_scan_dtype(weights.dtype)
+    target_weights = weights.to(dtype=compute_dtype)
+    tradable = tradable_mask.bool()
+    buy_mask = tradable if can_buy_mask is None else can_buy_mask.bool()
+    sell_mask = tradable if can_sell_mask is None else can_sell_mask.bool()
+
+    if long_only:
+        target_weights = target_weights.clamp_min(0.0)
+        weight_sums = target_weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        target_weights = target_weights / weight_sums
+    else:
+        gross_sums = target_weights.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
+        target_weights = target_weights / gross_sums
+
+    return target_weights, tradable, buy_mask, sell_mask
 
 
 def _vectorized_backtest_torch(
@@ -175,49 +664,115 @@ def _vectorized_backtest_torch(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    scan_chunk_size: int | None = None,
+    return_weights_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    weights_history = weights.float().clone()
-
-    weights_history = weights_history.masked_fill(~tradable_mask.bool(), 0.0)
-
-    if long_only:
-        weights_history = weights_history.clamp_min(0.0)
-        weight_sums = weights_history.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        weights_history = weights_history / weight_sums
-    else:
-        gross_sums = weights_history.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
-        weights_history = weights_history / gross_sums
-
-    prev = torch.cat(
-        [torch.zeros_like(weights_history[:1]), weights_history[:-1]],
-        dim=0,
+    prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
+        weights,
+        tradable_mask,
+        can_buy_mask,
+        can_sell_mask,
+        long_only,
     )
-    deltas = weights_history - prev
-    buy_mask = tradable_mask.bool() if can_buy_mask is None else can_buy_mask.bool()
-    sell_mask = tradable_mask.bool() if can_sell_mask is None else can_sell_mask.bool()
-    deltas = torch.where((deltas > 0.0) & ~buy_mask, torch.zeros_like(deltas), deltas)
-    deltas = torch.where((deltas < 0.0) & ~sell_mask, torch.zeros_like(deltas), deltas)
-    if long_only:
-        sell_deltas = deltas.clamp_max(0.0)
-        base_after_sells = prev + sell_deltas
-        buy_deltas = deltas.clamp_min(0.0)
-        buy_sum = buy_deltas.sum(dim=1, keepdim=True)
-        buy_capacity = (1.0 - base_after_sells.sum(dim=1, keepdim=True)).clamp_min(0.0)
-        buy_scale = torch.ones_like(buy_sum)
-        buy_scale = torch.where(buy_sum > buy_capacity, buy_capacity / buy_sum.clamp_min(1e-12), buy_scale)
-        buy_scale = buy_scale.clamp(0.0, 1.0)
-        deltas = sell_deltas + buy_deltas * buy_scale
-    weights_history = (prev + deltas).float()
-    if max_turnover_ratio > 0.0:
-        weights_history = _apply_turnover_cap_torch(prev, weights_history, max_turnover_ratio)
-        deltas = weights_history - prev
-    buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
-    sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
-    turnovers = buy_turnovers + sell_turnovers
 
-    gross = (weights_history * future_returns.float()).sum(dim=1)
-    strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
-    return strategy_returns.float(), turnovers.float(), weights_history.float()
+    resolved_chunk = (
+        int(scan_chunk_size)
+        if scan_chunk_size is not None and int(scan_chunk_size) > 0
+        else _autotune_scan_chunk_size(
+            prepped_weights,
+            future_returns,
+            prepped_tradable,
+            prepped_buy,
+            prepped_sell,
+            long_only,
+            max_turnover_ratio,
+        )
+    )
+    prev_init = torch.zeros_like(prepped_weights[0])
+
+    checkpoint_rows = _checkpoint_chunk_rows()
+    use_checkpoint = (
+        checkpoint_rows > 0
+        and torch.is_grad_enabled()
+        and prepped_weights.requires_grad
+    )
+
+    if use_checkpoint:
+        # Checkpoint recomputation and cudagraph-captured compiled functions can
+        # conflict in backward. Use eager runner for this path to keep training stable.
+        runner = _scan_runner_factory(
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            scan_chunk_size=resolved_chunk,
+            record_weights_history=return_weights_history,
+        )
+    else:
+        runner = _resolve_scan_runner(
+            prepped_weights,
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            scan_chunk_size=resolved_chunk,
+            record_weights_history=return_weights_history,
+        )
+
+    if not use_checkpoint:
+        turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, _ = runner(
+            prepped_weights,
+            future_returns,
+            prepped_tradable,
+            prepped_buy,
+            prepped_sell,
+            prev_init,
+        )
+    else:
+        chunk_rows = max(1, int(checkpoint_rows))
+        turnovers_chunks: list[torch.Tensor] = []
+        buy_chunks: list[torch.Tensor] = []
+        sell_chunks: list[torch.Tensor] = []
+        gross_chunks: list[torch.Tensor] = []
+        weights_chunks: list[torch.Tensor] = [] if return_weights_history else []
+        prev = prev_init
+
+        for start in range(0, int(prepped_weights.size(0)), chunk_rows):
+            end = min(start + chunk_rows, int(prepped_weights.size(0)))
+            w_chunk = prepped_weights[start:end]
+            r_chunk = future_returns[start:end]
+            t_chunk = prepped_tradable[start:end]
+            b_chunk = prepped_buy[start:end]
+            s_chunk = prepped_sell[start:end]
+
+            chunk_out = checkpoint_fn(
+                runner,
+                w_chunk,
+                r_chunk,
+                t_chunk,
+                b_chunk,
+                s_chunk,
+                prev,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+            t_out, b_out, s_out, g_out, w_out, last_w = chunk_out
+            turnovers_chunks.append(t_out)
+            buy_chunks.append(b_out)
+            sell_chunks.append(s_out)
+            gross_chunks.append(g_out)
+            if return_weights_history:
+                weights_chunks.append(w_out)
+            prev = last_w
+
+        turnovers = torch.cat(turnovers_chunks, dim=0)
+        buy_turnovers = torch.cat(buy_chunks, dim=0)
+        sell_turnovers = torch.cat(sell_chunks, dim=0)
+        gross_returns = torch.cat(gross_chunks, dim=0)
+        if return_weights_history:
+            weights_history = torch.cat(weights_chunks, dim=0)
+        else:
+            weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+
+    returns_dtype = prepped_weights.dtype
+    strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+    return strategy_returns.to(returns_dtype), turnovers.to(returns_dtype), weights_history.to(returns_dtype)
 
 
 def run_backtest(
@@ -264,6 +819,8 @@ def run_backtest_torch(
     max_turnover_ratio: float = 0.0,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
+    scan_chunk_size: int | None = None,
+    return_weights_history: bool = True,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
@@ -276,11 +833,13 @@ def run_backtest_torch(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        scan_chunk_size=scan_chunk_size,
+        return_weights_history=return_weights_history,
     )
 
     return BacktestResultTensor(
         strategy_returns=strategy_returns,
-        benchmark_returns=benchmark_returns.float(),
+        benchmark_returns=benchmark_returns.to(dtype=weights_history.dtype),
         turnovers=turnovers,
         weights_history=weights_history,
     )
