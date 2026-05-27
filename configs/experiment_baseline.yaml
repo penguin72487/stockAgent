@@ -16,8 +16,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/crypto
-  benchmark_name: "BTCUSD"
+  parquet_root: data_okx
+  benchmark_name: "BTCUSDTSWAP"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -32,8 +32,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.00055
-  sell_fee_rate: 0.00055
+  buy_fee_rate: 0.0005
+  sell_fee_rate: 0.0005
   max_turnover_ratio: 100.0
   long_only: false
   cash_allowed: true
@@ -67,7 +67,7 @@ training:
   early_stopping_no_improve_ratio: 0.2
   val_interval_epochs: 1
   learning_rate: 0.001
-  enable_lr_scheduler: false
+  enable_lr_scheduler: true
   lr_scheduler: plateau
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 10
@@ -99,9 +99,9 @@ training:
     use_cls_token: true
   tabular_resnet:
     embedding_dim: 128
-    hidden_dim: 256
-    n_blocks: 4
-    dropout: 0.1
+    hidden_dim: 128
+    n_blocks: 2
+    dropout: 0.4
   lightgbm:
     use_gpu: true
     gpu_device_id: 0
