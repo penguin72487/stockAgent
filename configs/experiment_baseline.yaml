@@ -45,16 +45,16 @@ training:
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   model_name: tabular_resnet
-  enable_torch_compile: true
-  auto_torch_compile_sharpe: true
+  enable_torch_compile: false
+  auto_torch_compile_sharpe: false
   compile_loss: null
   warm_start_from_previous_fold: true
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: true
-  backtest_autotune: true
-  backtest_compile: true
+  backtest_autotune: false
+  backtest_compile: false
   backtest_verbose: false
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
@@ -64,7 +64,7 @@ training:
   batch_size_train: 2048
   batch_size_eval: 2048
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.001
+  early_stopping_no_improve_ratio: 0.2
   val_interval_epochs: 1
   learning_rate: 0.001
   enable_lr_scheduler: false
@@ -76,7 +76,7 @@ training:
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
-  num_workers: 16
+  num_workers: 0
   weight_decay: 0.00001
   grad_clip_norm: 0.0
   loss_type: sharpe
