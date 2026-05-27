@@ -48,6 +48,9 @@ Multi-asset Taiwan stock trading research workspace.
 - Use `python downloader/download_okx_perp_daily.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
 - Use `python downloader/download_okx_perp_daily.py --mode daily-update` for daily incremental updates (only missing dates).
 - Use `python downloader/download_okx_perp_daily.py --mode full --refresh` when you need a full re-download.
+- Use `python downloader/download_bybit_perp_daily.py --output-dir data_bybit` to download Bybit perpetual daily bars.
+- Use `python downloader/download_bybit_perp_daily.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
+- Use `python downloader/download_bybit_perp_daily.py --mode daily-update` for daily incremental updates (only missing dates).
 - Each asset folder includes `symbols.csv`, `download_report.csv`, and `download_summary.json` alongside `*_features.parquet` files.
 - Parquet output includes at least `date`, `open`, `max`, `min`, `close`, `adjclose`, `Trading_Volume`, and also preserves extra Yahoo columns when available (for example `Dividends`, `Stock Splits`).
 - Override the default universe with `--symbols` or `--symbols-file`, for example `python download_yahoo_ohlcv.py --asset forex --symbols EURUSD GBPUSD USDJPY`.
