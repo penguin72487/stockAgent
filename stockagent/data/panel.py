@@ -39,9 +39,28 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "vol_impact",
     "gap_vol",
 ]
-PANEL_CACHE_VERSION = 9
+PANEL_CACHE_VERSION = 11
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
+
+
+def _round_half_up(values: np.ndarray | pd.Series, decimals: int = 2) -> np.ndarray:
+    """Round with half-up semantics (0.5 always rounds away from zero)."""
+    arr = np.asarray(values, dtype=np.float64)
+    factor = float(10**decimals)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(arr)
+    pos = valid & (arr >= 0.0)
+    neg = valid & (arr < 0.0)
+    out[pos] = np.floor(arr[pos] * factor + 0.5) / factor
+    out[neg] = np.ceil(arr[neg] * factor - 0.5) / factor
+    return out
+
+
+def _round_tw_price_series(series: pd.Series) -> pd.Series:
+    """Normalize TW stock prices to 2 decimals using half-up rounding."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    return pd.Series(_round_half_up(numeric, decimals=2), index=series.index)
 
 
 @dataclass(slots=True)
@@ -98,6 +117,33 @@ def _compute_tradable_from_frame(frame: pd.DataFrame) -> pd.Series:
     return close_is_valid & (has_positive_volume | volume_missing)
 
 
+def _tw_tick_size(price: np.ndarray) -> np.ndarray:
+    """TWSE tick size by price bucket (vectorized)."""
+    p = np.asarray(price, dtype=np.float64)
+    tick = np.full(p.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(p) & (p > 0.0)
+    tick[valid] = 5.0
+    tick[valid & (p < 1000.0)] = 1.0
+    tick[valid & (p < 500.0)] = 0.5
+    tick[valid & (p < 100.0)] = 0.1
+    tick[valid & (p < 50.0)] = 0.05
+    tick[valid & (p < 10.0)] = 0.01
+    return tick
+
+
+def _tw_limit_price(prev_close: pd.Series, ratio: float) -> pd.Series:
+    """Compute TW daily limit price with floor-to-tick rule from theoretical price."""
+    prev = pd.to_numeric(prev_close, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    theoretical = prev * ratio
+    tick = _tw_tick_size(theoretical)
+
+    out = np.full(theoretical.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(theoretical) & np.isfinite(tick) & (tick > 0.0)
+    # Small epsilon avoids floating-point edge cases around exact tick boundaries.
+    out[valid] = np.floor((theoretical[valid] / tick[valid]) + 1e-12) * tick[valid]
+    return pd.Series(_round_half_up(out, decimals=2), index=prev_close.index)
+
+
 def _compute_tw_limit_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """Return (can_buy, can_sell) masks under TW 10% daily limit assumptions.
 
@@ -106,13 +152,15 @@ def _compute_tw_limit_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     - limit-down day: can buy, cannot sell
     """
     tradable = frame["tradable"].astype(bool)
-    close_raw = pd.to_numeric(frame.get("close_raw"), errors="coerce")
+    close_raw = _round_tw_price_series(frame.get("close_raw"))
     prev_close_raw = close_raw.shift(1)
-    ratio = close_raw / prev_close_raw
 
-    # Use a small tolerance because source data can include rounding noise.
-    is_limit_up = ratio.ge(1.099) & prev_close_raw.gt(0)
-    is_limit_down = ratio.le(0.901) & prev_close_raw.gt(0)
+    limit_up_price = _tw_limit_price(prev_close_raw, 1.10)
+    limit_down_price = _tw_limit_price(prev_close_raw, 0.90)
+
+    # Use small price tolerance to absorb source rounding noise.
+    is_limit_up = close_raw.ge(limit_up_price - 1e-9) & prev_close_raw.gt(0)
+    is_limit_down = close_raw.le(limit_down_price + 1e-9) & prev_close_raw.gt(0)
 
     can_buy = tradable & ~is_limit_up.fillna(False)
     can_sell = tradable & ~is_limit_down.fillna(False)
@@ -152,7 +200,10 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
     frame["symbol"] = _symbol_name_from_path(path)
-    frame["close_raw"] = frame["close"].astype(np.float32)
+    for col in ["open", "max", "min", "close"]:
+        if col in frame.columns:
+            frame[col] = _round_tw_price_series(frame[col])
+    frame["close_raw"] = _round_tw_price_series(frame["close"]).astype(np.float32)
 
     frame = _add_derived_features(frame)
 
@@ -188,6 +239,9 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     gdf["date"] = cudf.to_datetime(gdf["date"])
     gdf = gdf.sort_values("date").reset_index(drop=True)
     gdf["symbol"] = _symbol_name_from_path(path)
+    for col in ["open", "max", "min", "close"]:
+        if col in gdf.columns:
+            gdf[col] = gdf[col].round(2)
     gdf["close_raw"] = gdf["close"].astype("float32")
 
     nxt_close = gdf["close"].shift(-1)
@@ -476,8 +530,7 @@ def build_panel(
     cache_path = _panel_cache_path(parquet_root)
     meta_path = _cache_meta_path(parquet_root)
 
-    env_rapids = os.environ.get("STOCKAGENT_USE_CUDF")
-    use_cudf = ((env_rapids == "1") if env_rapids is not None else use_rapids) and cudf is not None
+    use_cudf = bool(use_rapids) and cudf is not None
     backend_key = (
         f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tw_limit_guard={tw_limit_up_down_guard}"

@@ -77,6 +77,8 @@ def build_model(
             n_blocks=tab_cfg.n_blocks,
             dropout=tab_cfg.dropout,
             long_only=config.trading.long_only,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
 
     if model_name in {"lightgbm", "lgbm"}:

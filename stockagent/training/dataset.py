@@ -52,12 +52,35 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         }
 
 
-def collate_batch(samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+def collate_batch(
+    samples: list[dict[str, torch.Tensor]],
+    batch_size: int | None = None,
+) -> dict[str, torch.Tensor]:
+    if batch_size is None or len(samples) >= batch_size:
+        return {
+            "x": torch.stack([s["x"] for s in samples]),
+            "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
+            "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
+            "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
+            "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
+            "benchmark": torch.stack([s["benchmark"] for s in samples]),
+            "sample_mask": torch.ones(len(samples), dtype=torch.bool),
+        }
+
+    pad_count = batch_size - len(samples)
+    template = samples[0]
+
+    def _pad_tensor_list(name: str) -> torch.Tensor:
+        values = [s[name] for s in samples]
+        padding = [torch.zeros_like(template[name]) for _ in range(pad_count)]
+        return torch.stack(values + padding)
+
     return {
-        "x": torch.stack([s["x"] for s in samples]),
-        "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
-        "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
-        "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
-        "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
-        "benchmark": torch.stack([s["benchmark"] for s in samples]),
+        "x": _pad_tensor_list("x"),
+        "future_log_returns": _pad_tensor_list("future_log_returns"),
+        "tradable_mask": _pad_tensor_list("tradable_mask"),
+        "can_buy_mask": _pad_tensor_list("can_buy_mask"),
+        "can_sell_mask": _pad_tensor_list("can_sell_mask"),
+        "benchmark": _pad_tensor_list("benchmark"),
+        "sample_mask": torch.tensor([True] * len(samples) + [False] * pad_count, dtype=torch.bool),
     }

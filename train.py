@@ -35,6 +35,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override config.runner.post_train_infer after training",
     )
+    parser.add_argument(
+        "--profile-timing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print detailed timing breakdowns for train/val/test stages",
+    )
+    parser.add_argument(
+        "--start-fold",
+        type=int,
+        default=None,
+        help="Start from this fold id (inclusive), e.g. --start-fold 7",
+    )
     return parser.parse_args()
 
 
@@ -46,6 +58,7 @@ def main() -> None:
     mode = args.mode if args.mode is not None else config.runner.mode
     resume = args.resume if args.resume is not None else config.runner.resume
     post_train_infer = args.post_train_infer if args.post_train_infer is not None else config.runner.post_train_infer
+    start_fold = args.start_fold if args.start_fold is not None else config.runner.start_fold
 
     if config.runner.require_cuda and not torch.cuda.is_available():
         raise RuntimeError(
@@ -70,10 +83,22 @@ def main() -> None:
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
+    if start_fold is not None:
+        if start_fold < 1:
+            raise ValueError(f"start_fold must be >= 1, got {start_fold}")
+        total_folds = len(folds)
+        folds = [fold for fold in folds if fold.fold_id >= start_fold]
+        if not folds:
+            raise ValueError(
+                f"start_fold={start_fold} is out of range (total folds: {total_folds})"
+            )
+        print(
+            f"[runner] start_fold={start_fold}: selected {len(folds)}/{total_folds} folds"
+        )
     if mode == "infer":
         results = run_inference(panel, folds, config, output_dir)
     else:
-        results = run_training(panel, folds, config, output_dir, resume=resume)
+        results = run_training(panel, folds, config, output_dir, resume=resume, profile_timing=args.profile_timing)
         if post_train_infer:
             print("[post-train] running inference+plot pass on saved models...")
             results = run_inference(panel, folds, config, output_dir)

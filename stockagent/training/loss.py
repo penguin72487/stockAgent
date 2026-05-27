@@ -66,6 +66,7 @@ def sharpe_aware_loss(
         max_turnover_ratio=max_turnover_ratio,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
+        return_weights_history=False,
     )
 
     if sample_mask is None:
@@ -84,8 +85,9 @@ def sharpe_aware_loss(
     sharpe = mean_return / std_return * annualizer
 
     # Keep turnover regularization, but source it from the same backtest path.
+    if gamma_turnover == 0.0:
+        return -gamma_sharpe * sharpe
+
     valid_turnovers = backtest.turnovers[valid_mask]
     turnover_penalty = valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(())
-
-    loss = -gamma_sharpe * sharpe + gamma_turnover * turnover_penalty
-    return loss
+    return -gamma_sharpe * sharpe + gamma_turnover * turnover_penalty

@@ -6,6 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: true
+  start_fold: 1
 
 environment:
   conda_env: fintech
@@ -34,7 +35,7 @@ trading:
   buy_fee_rate: 0.001425
   sell_fee_rate: 0.004425
   max_turnover_ratio: 100.0
-  long_only: true
+  long_only: false
   cash_allowed: true
   use_all_tradable_symbols: true
 
@@ -45,21 +46,39 @@ training:
   non_blocking_transfer: true
   model_name: tabular_resnet
   enable_torch_compile: true
-  warm_start_from_previous_fold: false
+  auto_torch_compile_sharpe: true
+  compile_loss: null
+  warm_start_from_previous_fold: true
   chunk_rows: 0
+  train_symbol_subsample_ratio: 1.0
+  detach_prev_state: true
+  prefer_fp16: true
+  backtest_autotune: true
+  backtest_compile: true
+  backtest_verbose: false
+  backtest_checkpoint_chunk_rows: 0
+  runtime_shape_check: false
+  allow_dynamic_symbols: true
   lookback: 1
   batch_size: 2048
   batch_size_train: 2048
   batch_size_eval: 2048
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.2
+  early_stopping_no_improve_ratio: 0.001
+  val_interval_epochs: 1
   learning_rate: 0.001
+  enable_lr_scheduler: false
+  lr_scheduler: plateau
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_patience: 10
+  lr_scheduler_threshold: 0.0005
   top_k: 20
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
   num_workers: 16
   weight_decay: 0.00001
+  grad_clip_norm: 0.0
   loss_type: sharpe
   min_batch_size: 32
   auto_batch_size: true
@@ -89,7 +108,7 @@ training:
     n_estimators: 300
     num_leaves: 63
     max_depth: -1
-    learning_rate: 0.05
+    learning_rate: 1
     subsample: 0.9
     colsample_bytree: 0.9
     reg_lambda: 1.0
