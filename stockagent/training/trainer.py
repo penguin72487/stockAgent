@@ -26,6 +26,7 @@ from stockagent.backtest.report import (
     plot_annual_performance,
     plot_equity_curve,
     plot_equity_curve_log,
+    plot_first_test_year_only,
     plot_fold_first_year_returns,
 )
 from stockagent.backtest.simulator import (
@@ -42,7 +43,7 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
-from stockagent.training.loss import sharpe_aware_loss
+from stockagent.training.loss import risk_aware_loss
 
 
 @dataclass(slots=True)
@@ -121,29 +122,81 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 def _loss_from_backtest_series(
     strategy_returns: torch.Tensor,
+    benchmark_returns: torch.Tensor,
     turnovers: torch.Tensor,
     gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
     gamma_turnover: float,
+    objective: str = "sharpe",
     sample_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if sample_mask is None:
         valid_returns = strategy_returns
+        valid_benchmark = benchmark_returns
         valid_turnovers = turnovers
     else:
         valid_mask = sample_mask.to(device=strategy_returns.device, dtype=torch.bool)
         valid_returns = strategy_returns[valid_mask]
+        valid_benchmark = benchmark_returns[valid_mask]
         valid_turnovers = turnovers[valid_mask]
 
     if valid_returns.numel() == 0:
         return strategy_returns.sum() * 0.0
 
-    mean_return = valid_returns.mean()
-    variance = (valid_returns - mean_return).pow(2).mean()
-    std_return = torch.sqrt(variance + 1e-8)
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype))
-    sharpe = mean_return / std_return * annualizer
+    objective_norm = objective.strip().lower()
+    if objective_norm in {"excess_cvar_drawdown", "cvar", "cvar_drawdown", "excess_cvar"}:
+        excess_returns = valid_returns - valid_benchmark
+        mean_excess = excess_returns.mean()
+
+        alpha = min(max(float(cvar_alpha), 1e-6), 1.0 - 1e-6)
+        losses = -excess_returns
+        var_alpha = torch.quantile(losses, alpha)
+        tail_excess = torch.relu(losses - var_alpha)
+        cvar = var_alpha + tail_excess.mean() / (1.0 - alpha)
+
+        rel_log_equity = torch.cumsum(excess_returns, dim=0)
+        rel_equity = torch.exp(torch.clamp(rel_log_equity, -60.0, 60.0))
+        running_max = torch.cummax(rel_equity, dim=0).values
+        drawdowns = 1.0 - rel_equity / running_max.clamp_min(1e-12)
+        mdd = drawdowns.max() if drawdowns.numel() > 0 else mean_excess.new_zeros(())
+        drawdown_penalty = torch.nn.functional.softplus((mdd - float(drawdown_target)) * 20.0) / 20.0
+
+        objective_value = (
+            -gamma_excess * mean_excess
+            + gamma_cvar * cvar
+            + gamma_drawdown * drawdown_penalty
+        )
+    else:
+        mean_return = valid_returns.mean()
+        annualizer = torch.sqrt(torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype))
+        if objective_norm == "sortino":
+            downside = torch.minimum(valid_returns, torch.zeros_like(valid_returns))
+            downside_dev = torch.sqrt(downside.pow(2).mean() + 1e-8)
+            risk_ratio = mean_return / downside_dev * annualizer
+        else:
+            variance = (valid_returns - mean_return).pow(2).mean()
+            std_return = torch.sqrt(variance + 1e-8)
+            risk_ratio = mean_return / std_return * annualizer
+        objective_value = -gamma_sharpe * risk_ratio
+
+    if gamma_turnover == 0.0:
+        return objective_value
+
     turnover_penalty = valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(())
-    return -gamma_sharpe * sharpe + gamma_turnover * turnover_penalty
+    return objective_value + gamma_turnover * turnover_penalty
+
+
+def _normalize_risk_objective(loss_type: str) -> str:
+    objective = str(loss_type).strip().lower()
+    if objective in {"sharpe", "sortino", "excess_cvar_drawdown", "cvar", "cvar_drawdown", "excess_cvar"}:
+        if objective in {"cvar", "cvar_drawdown", "excess_cvar"}:
+            return "excess_cvar_drawdown"
+        return objective
+    return "sharpe"
 
 
 def _normalized_model_name(model_name: str) -> str:
@@ -495,16 +548,17 @@ def _pad_training_tensors(
     masks: torch.Tensor,
     can_buy_masks: torch.Tensor,
     can_sell_masks: torch.Tensor,
+    benchmark: torch.Tensor,
     batch_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_rows = int(x.size(0))
     if total_rows == 0:
-        return x, returns, masks, can_buy_masks, can_sell_masks, torch.empty((0,), dtype=torch.bool)
+        return x, returns, masks, can_buy_masks, can_sell_masks, benchmark, torch.empty((0,), dtype=torch.bool)
 
     padded_rows = ((total_rows + batch_size - 1) // batch_size) * batch_size
     sample_mask = torch.ones(total_rows, dtype=torch.bool)
     if padded_rows == total_rows:
-        return x, returns, masks, can_buy_masks, can_sell_masks, sample_mask
+        return x, returns, masks, can_buy_masks, can_sell_masks, benchmark, sample_mask
 
     return (
         _pad_rows(x, padded_rows, 0),
@@ -512,6 +566,7 @@ def _pad_training_tensors(
         _pad_rows(masks, padded_rows, False),
         _pad_rows(can_buy_masks, padded_rows, False),
         _pad_rows(can_sell_masks, padded_rows, False),
+        _pad_rows(benchmark, padded_rows, 0.0),
         _pad_rows(sample_mask, padded_rows, False),
     )
 
@@ -561,6 +616,7 @@ def _evaluate_tensor_batch(
     buy_fee_rate: float,
     sell_fee_rate: float,
     max_turnover_ratio: float,
+    gross_leverage: float,
     chunk_rows: int,
     compute_ic: bool = True,
     profile_timing: bool = False,
@@ -621,6 +677,7 @@ def _evaluate_tensor_batch(
                 sell_fee_rate,
                 long_only=long_only,
                 max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
             )
@@ -793,6 +850,10 @@ def _auto_chunk_rows(
 def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
     _write_summary(results, output_path)
 
+    stale_combined_log_plot = output_path / "walkforward_equity_curve_log.png"
+    if stale_combined_log_plot.exists():
+        stale_combined_log_plot.unlink()
+
     all_strategy_returns: list[np.ndarray] = []
     all_benchmark_returns: list[np.ndarray] = []
     all_turnovers: list[np.ndarray] = []
@@ -826,26 +887,18 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
     if not all_dates:
         return
 
-    combined_backtest = BacktestResult(
-        strategy_returns=np.concatenate(all_strategy_returns, axis=0),
-        benchmark_returns=np.concatenate(all_benchmark_returns, axis=0),
-        turnovers=np.concatenate(all_turnovers, axis=0),
-        weights_history=np.concatenate(all_weights, axis=0),
-    )
-    combined_dates = np.concatenate(all_dates, axis=0)
-
-    plot_equity_curve_log(
-        combined_backtest,
-        combined_dates,
-        output_path / "walkforward_equity_curve_log.png",
-    )
-
     if all_first_year_dates:
         plot_fold_first_year_returns(
             all_first_year_dates,
             all_first_year_strategy_log,
             all_first_year_baseline_log,
             output_path / "walkforward_first_year_cumulative_returns.png",
+        )
+        plot_first_test_year_only(
+            all_first_year_dates[0],
+            all_first_year_strategy_log[0],
+            all_first_year_baseline_log[0],
+            output_path / "walkforward_first_test_year_only.png",
         )
 
 
@@ -1042,6 +1095,7 @@ def find_optimal_batch_size(
     def _measure_candidate(batch_size: int) -> tuple[bool, int]:
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
+        baseline_reserved = torch.cuda.memory_reserved(device)
 
         temp_loader = DataLoader(
             sample_loader.dataset,
@@ -1059,7 +1113,7 @@ def find_optimal_batch_size(
         try:
             with _autocast_context(device, amp_dtype):
                 logits = model(local_batch["x"], local_batch["can_buy_mask"])
-                loss = sharpe_aware_loss(
+                loss = risk_aware_loss(
                     logits,
                     local_batch["future_log_returns"],
                     local_batch["tradable_mask"],
@@ -1069,17 +1123,16 @@ def find_optimal_batch_size(
                     buy_fee_rate=0.0,
                     sell_fee_rate=0.0,
                     max_turnover_ratio=0.0,
+                    objective="sharpe",
                 )
 
             loss.backward()
             temp_optimizer.step()
             temp_optimizer.zero_grad(set_to_none=True)
-            used_memory = torch.cuda.max_memory_reserved()
-
-            smi_after = _query_nvidia_smi_free_bytes(device_index)
-            if smi_after is not None:
-                _, smi_used_after, _ = smi_after
-                used_memory = max(used_memory, int(smi_used_after))
+            peak_reserved = torch.cuda.max_memory_reserved()
+            # Compare candidate-induced memory increase against target_bytes.
+            # target_bytes represents usable headroom, not absolute global used VRAM.
+            used_memory = max(0, int(peak_reserved) - int(baseline_reserved))
 
             ok = used_memory <= target_bytes
             return ok, int(used_memory)
@@ -1274,8 +1327,15 @@ def _train_epoch(
     buy_fee_rate: float,
     sell_fee_rate: float,
     max_turnover_ratio: float,
+    gross_leverage: float,
     gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
     gamma_turnover: float,
+    objective: str,
     grad_clip_norm: float,
     profile_timing: bool = False,
 ) -> tuple[float, TimingBreakdown]:
@@ -1311,6 +1371,7 @@ def _train_epoch(
                 weights,
                 batch["future_log_returns"],
                 batch["tradable_mask"],
+                benchmark_returns=batch.get("benchmark"),
                 can_buy_mask=batch["can_buy_mask"],
                 can_sell_mask=batch["can_sell_mask"],
                 sample_mask=batch.get("sample_mask"),
@@ -1318,9 +1379,19 @@ def _train_epoch(
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
                 max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
                 gamma_sharpe=gamma_sharpe,
+                gamma_excess=gamma_excess,
+                gamma_cvar=gamma_cvar,
+                cvar_alpha=cvar_alpha,
+                gamma_drawdown=gamma_drawdown,
+                drawdown_target=drawdown_target,
                 gamma_turnover=gamma_turnover,
+                objective=objective,
             )
+        if not torch.isfinite(loss).all():
+            optimizer.zero_grad(set_to_none=True)
+            continue
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -1382,6 +1453,7 @@ def _train_epoch_tensor(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor,
     can_sell_mask: torch.Tensor,
+    benchmark: torch.Tensor,
     sample_mask: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -1393,8 +1465,15 @@ def _train_epoch_tensor(
     buy_fee_rate: float,
     sell_fee_rate: float,
     max_turnover_ratio: float,
+    gross_leverage: float,
     gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
     gamma_turnover: float,
+    objective: str,
     grad_clip_norm: float,
     profile_timing: bool = False,
 ) -> tuple[float, TimingBreakdown]:
@@ -1423,6 +1502,7 @@ def _train_epoch_tensor(
         batch_mask = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_buy_mask = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_sell_mask = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
+        batch_bench = benchmark[start:end].to(device=device, non_blocking=non_blocking)
         batch_sample_mask = sample_mask[start:end].to(device=device, non_blocking=non_blocking)
         _maybe_sync_cuda(device, profile_timing)
         timing.transfer_s += time.perf_counter() - transfer_start
@@ -1436,6 +1516,7 @@ def _train_epoch_tensor(
                 weights,
                 batch_ret,
                 batch_mask,
+                benchmark_returns=batch_bench,
                 can_buy_mask=batch_buy_mask,
                 can_sell_mask=batch_sell_mask,
                 sample_mask=batch_sample_mask,
@@ -1443,9 +1524,19 @@ def _train_epoch_tensor(
                 buy_fee_rate=buy_fee_rate,
                 sell_fee_rate=sell_fee_rate,
                 max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
                 gamma_sharpe=gamma_sharpe,
+                gamma_excess=gamma_excess,
+                gamma_cvar=gamma_cvar,
+                cvar_alpha=cvar_alpha,
+                gamma_drawdown=gamma_drawdown,
+                drawdown_target=drawdown_target,
                 gamma_turnover=gamma_turnover,
+                objective=objective,
             )
+        if not torch.isfinite(loss).all():
+            optimizer.zero_grad(set_to_none=True)
+            continue
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -1515,6 +1606,8 @@ def _compute_metrics_from_tensors(
             "annualized_return": 0.0,
             "sharpe": 0.0,
             "baseline_sharpe": 0.0,
+            "sortino": 0.0,
+            "baseline_sortino": 0.0,
             "max_drawdown": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
@@ -1534,6 +1627,12 @@ def _compute_metrics_from_tensors(
     ann_r = float(torch.expm1(avg * 252.0).item())
     sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
     baseline_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
+    downside = torch.minimum(r, torch.zeros_like(r))
+    downside_b = torch.minimum(b, torch.zeros_like(b))
+    downside_dev = torch.sqrt((downside.pow(2)).mean())
+    downside_dev_b = torch.sqrt((downside_b.pow(2)).mean())
+    sortino = float((avg / downside_dev * np.sqrt(252.0)).item()) if float(downside_dev.item()) > 0 else 0.0
+    baseline_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
 
     equity = torch.exp(torch.cumsum(r, dim=0))
     running_max = torch.cummax(equity, dim=0).values
@@ -1545,6 +1644,8 @@ def _compute_metrics_from_tensors(
         "annualized_return": ann_r,
         "sharpe": sharpe,
         "baseline_sharpe": baseline_sharpe,
+        "sortino": sortino,
+        "baseline_sortino": baseline_sortino,
         "max_drawdown": max_dd,
         "turnover": float(t.mean().item()) if t.numel() else 0.0,
         "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),
@@ -1582,6 +1683,7 @@ def _run_training_tree_models(
     amp_dtype: torch.dtype | None = None
     non_blocking = False
     eval_chunk_rows = 2048
+    loss_objective = _normalize_risk_objective(config.training.loss_type)
 
     for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
         train_years = list(train_years_key)
@@ -1637,21 +1739,30 @@ def _run_training_tree_models(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
+                config.trading.gross_leverage,
                 chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
             )
             val_loss = float(
-                sharpe_aware_loss(
+                risk_aware_loss(
                     val_bt_t.weights_history,
                     val_returns,
                     val_masks,
+                    benchmark_returns=val_bench,
                     can_buy_mask=val_buy_masks,
                     can_sell_mask=val_sell_masks,
                     long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
                     max_turnover_ratio=config.trading.max_turnover_ratio,
+                    gross_leverage=config.trading.gross_leverage,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_excess=config.evaluation.gamma_excess,
+                    gamma_cvar=config.evaluation.gamma_cvar,
+                    cvar_alpha=config.evaluation.cvar_alpha,
+                    gamma_drawdown=config.evaluation.gamma_drawdown,
+                    drawdown_target=config.evaluation.drawdown_target,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    objective=loss_objective,
                 ).detach().cpu()
             )
             val_met = _compute_metrics_from_tensors(
@@ -1676,6 +1787,7 @@ def _run_training_tree_models(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
+                config.trading.gross_leverage,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
             )
 
@@ -1693,14 +1805,17 @@ def _run_training_tree_models(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
             )
             test_met = compute_metrics(test_bt)
 
-            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            val_objective_metric = float(val_met.get(loss_objective, float("nan")))
+            test_objective_metric = float(test_met.get(loss_objective, float("nan")))
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
 
             fold_result = FoldResult(
                 fold_id=fold.fold_id,
@@ -1729,6 +1844,9 @@ def _run_training_tree_models(
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+            plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+            plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
             _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -1751,6 +1869,7 @@ def _run_inference_tree_models(
     device = torch.device("cpu")
     amp_dtype: torch.dtype | None = None
     non_blocking = False
+    loss_objective = _normalize_risk_objective(config.training.loss_type)
 
     print(f"[inference] tree model={config.training.model_name} folds={len(fold_list)}")
     for fold in tqdm(fold_list, desc="Inference folds", unit="fold"):
@@ -1786,21 +1905,30 @@ def _run_inference_tree_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
+            config.trading.gross_leverage,
             chunk_rows=val_chunk_rows,
         )
         val_loss = float(
-            sharpe_aware_loss(
+            risk_aware_loss(
                 val_bt_t.weights_history,
                 val_returns,
                 val_masks,
+                benchmark_returns=val_bench,
                 can_buy_mask=val_buy_masks,
                 can_sell_mask=val_sell_masks,
                 long_only=config.trading.long_only,
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
+                gamma_excess=config.evaluation.gamma_excess,
+                gamma_cvar=config.evaluation.gamma_cvar,
+                cvar_alpha=config.evaluation.cvar_alpha,
+                gamma_drawdown=config.evaluation.gamma_drawdown,
+                drawdown_target=config.evaluation.drawdown_target,
                 gamma_turnover=config.evaluation.gamma_turnover,
+                objective=loss_objective,
             ).detach().cpu()
         )
         val_met = _compute_metrics_from_tensors(
@@ -1826,6 +1954,7 @@ def _run_inference_tree_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
+            config.trading.gross_leverage,
             chunk_rows=test_chunk_rows,
         )
 
@@ -1843,6 +1972,7 @@ def _run_inference_tree_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
+            gross_leverage=config.trading.gross_leverage,
             close_prices=test_close_prices,
             symbols=panel.symbols,
             dates=test_dates,
@@ -1873,6 +2003,9 @@ def _run_inference_tree_models(
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
         plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+        plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+        plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
         _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 
     if results_by_fold:
@@ -1890,6 +2023,7 @@ def _run_inference_neural_models(
     device = _resolve_device(config)
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    loss_objective = _normalize_risk_objective(config.training.loss_type)
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -1964,23 +2098,32 @@ def _run_inference_neural_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
+            config.trading.gross_leverage,
             chunk_rows=val_chunk_rows,
         )
 
         if not np.isfinite(best_val_loss):
             best_val_loss = float(
-                sharpe_aware_loss(
+                risk_aware_loss(
                     val_bt_t.weights_history,
                     val_returns,
                     val_masks,
+                    benchmark_returns=val_bench,
                     can_buy_mask=val_buy_masks,
                     can_sell_mask=val_sell_masks,
                     long_only=config.trading.long_only,
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
                     max_turnover_ratio=config.trading.max_turnover_ratio,
+                    gross_leverage=config.trading.gross_leverage,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_excess=config.evaluation.gamma_excess,
+                    gamma_cvar=config.evaluation.gamma_cvar,
+                    cvar_alpha=config.evaluation.cvar_alpha,
+                    gamma_drawdown=config.evaluation.gamma_drawdown,
+                    drawdown_target=config.evaluation.drawdown_target,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    objective=loss_objective,
                 ).detach().cpu()
             )
 
@@ -2020,6 +2163,7 @@ def _run_inference_neural_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
+            config.trading.gross_leverage,
             chunk_rows=test_chunk_rows,
         )
 
@@ -2037,6 +2181,7 @@ def _run_inference_neural_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
+            gross_leverage=config.trading.gross_leverage,
             close_prices=test_close_prices,
             symbols=panel.symbols,
             dates=test_dates,
@@ -2067,6 +2212,9 @@ def _run_inference_neural_models(
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
         plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+        plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+        plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
         _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
 
     if results_by_fold:
@@ -2142,6 +2290,7 @@ def run_training(
     output_path.mkdir(parents=True, exist_ok=True)
 
     results_by_fold: dict[int, FoldResult] = {}
+    loss_objective = _normalize_risk_objective(config.training.loss_type)
     fold_list = list(folds)
 
     if resume:
@@ -2233,22 +2382,23 @@ def run_training(
 
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
         train_setup_start = time.perf_counter()
-        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, _ = _dataset_to_tensors(train_ds)
-        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_sample_mask = _pad_training_tensors(
+        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark = _dataset_to_tensors(train_ds)
+        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark, train_sample_mask = _pad_training_tensors(
             train_x,
             train_returns,
             train_masks,
             train_buy_masks,
             train_sell_masks,
+            train_benchmark,
             train_batch_size,
         )
-        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, _ = _prepare_split_tensors(
+        train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark = _prepare_split_tensors(
             train_x,
             train_returns,
             train_masks,
             train_buy_masks,
             train_sell_masks,
-            torch.empty(0),
+            train_benchmark,
             device,
             non_blocking,
         )
@@ -2343,7 +2493,7 @@ def run_training(
                 print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
-        compiled_loss_fn: Callable[..., torch.Tensor] = sharpe_aware_loss
+        compiled_loss_fn: Callable[..., torch.Tensor] = risk_aware_loss
 
         if device.type == "cuda":
             try:
@@ -2428,13 +2578,13 @@ def run_training(
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
-        auto_compile_sharpe = (
-            str(config.training.loss_type).strip().lower() == "sharpe"
+        auto_compile_risk = (
+            loss_objective in {"sharpe", "sortino"}
             and device.type == "cuda"
             and not profile_timing
             and _env_truthy("STOCKAGENT_AUTO_TORCH_COMPILE_SHARPE", "1")
         )
-        should_enable_compile = (config.training.enable_torch_compile or auto_compile_sharpe) and hasattr(torch, "compile")
+        should_enable_compile = (config.training.enable_torch_compile or auto_compile_risk) and hasattr(torch, "compile")
 
         if should_enable_compile:
             can_compile, reason = _can_enable_torch_compile(device)
@@ -2443,19 +2593,19 @@ def run_training(
                     compile_start = time.perf_counter()
                     print(f"[Train {train_years}] compile warmup may take extra time at epoch 0")
                     compiled_train_model = torch.compile(model, mode="reduce-overhead", dynamic=False)
-                    compile_source = "auto(sharpe)" if (auto_compile_sharpe and not config.training.enable_torch_compile) else "config"
+                    compile_source = f"auto({loss_objective})" if (auto_compile_risk and not config.training.enable_torch_compile) else "config"
                     print(
                         f"[Train {train_years}] torch.compile enabled "
                         f"(mode=reduce-overhead, dynamic=False, source={compile_source}, {reason})"
                     )
 
-                    compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", "1" if auto_compile_sharpe else "0")
+                    compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", "1" if auto_compile_risk else "0")
                     if compile_loss:
                         try:
-                            compiled_loss_fn = torch.compile(sharpe_aware_loss, mode="reduce-overhead", dynamic=False)
+                            compiled_loss_fn = torch.compile(risk_aware_loss, mode="reduce-overhead", dynamic=False)
                             print(f"[Train {train_years}] torch.compile loss enabled (mode=reduce-overhead, dynamic=False)")
                         except Exception as e:
-                            compiled_loss_fn = sharpe_aware_loss
+                            compiled_loss_fn = risk_aware_loss
                             print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
                     if profile_timing:
                         _log_timing(
@@ -2539,8 +2689,15 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
+                    config.trading.gross_leverage,
                     config.evaluation.gamma_sharpe,
+                    config.evaluation.gamma_excess,
+                    config.evaluation.gamma_cvar,
+                    config.evaluation.cvar_alpha,
+                    config.evaluation.gamma_drawdown,
+                    config.evaluation.drawdown_target,
                     config.evaluation.gamma_turnover,
+                    loss_objective,
                     config.training.grad_clip_norm,
                     profile_timing=profile_timing,
                 )
@@ -2552,6 +2709,7 @@ def run_training(
                 train_masks,
                 train_buy_masks,
                 train_sell_masks,
+                train_benchmark,
                 train_sample_mask,
                 optimizer,
                 scaler,
@@ -2563,8 +2721,15 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
+                gamma_excess=config.evaluation.gamma_excess,
+                gamma_cvar=config.evaluation.gamma_cvar,
+                cvar_alpha=config.evaluation.cvar_alpha,
+                gamma_drawdown=config.evaluation.gamma_drawdown,
+                drawdown_target=config.evaluation.drawdown_target,
                 gamma_turnover=config.evaluation.gamma_turnover,
+                objective=loss_objective,
                 grad_clip_norm=config.training.grad_clip_norm,
                 profile_timing=profile_timing,
             )
@@ -2620,6 +2785,7 @@ def run_training(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
+                config.trading.gross_leverage,
                 chunk_rows=eval_chunk_rows,
                 compute_ic=False,
                 profile_timing=profile_timing,
@@ -2634,9 +2800,16 @@ def run_training(
                 end = val_offsets[index + 1]
                 val_loss_tensor = _loss_from_backtest_series(
                     val_backtest.strategy_returns[start:end],
+                    val_backtest.benchmark_returns[start:end],
                     val_backtest.turnovers[start:end],
                     gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_excess=config.evaluation.gamma_excess,
+                    gamma_cvar=config.evaluation.gamma_cvar,
+                    cvar_alpha=config.evaluation.cvar_alpha,
+                    gamma_drawdown=config.evaluation.gamma_drawdown,
+                    drawdown_target=config.evaluation.drawdown_target,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    objective=loss_objective,
                 )
                 val_loss = float(val_loss_tensor.detach().cpu())
                 val_losses.append(val_loss)
@@ -2745,6 +2918,7 @@ def run_training(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
+                config.trading.gross_leverage,
                 chunk_rows=eval_chunk_rows,
                 profile_timing=profile_timing,
             )
@@ -2803,6 +2977,7 @@ def run_training(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
+                config.trading.gross_leverage,
                 chunk_rows=eval_chunk_rows,
                 profile_timing=profile_timing,
             )
@@ -2839,6 +3014,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
@@ -2846,8 +3022,10 @@ def run_training(
             test_met = compute_metrics(test_bt)
             test_report_total = time.perf_counter() - test_report_start
 
-            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  sharpe={val_met['sharpe']:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  sharpe={test_met['sharpe']:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            val_objective_metric = float(val_met.get(loss_objective, float("nan")))
+            test_objective_metric = float(test_met.get(loss_objective, float("nan")))
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
             if profile_timing:
                 _log_timing(
                     f"Train {train_years} fold {fold.fold_id} test_stage",
@@ -2886,6 +3064,9 @@ def run_training(
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
+            plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+            plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
             _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
             plot_total = time.perf_counter() - plot_start
 

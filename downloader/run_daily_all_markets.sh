@@ -19,6 +19,10 @@ FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
 RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-1}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
+RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
+OKX_WORKERS="${OKX_WORKERS:-4}"
+BYBIT_WORKERS="${BYBIT_WORKERS:-4}"
+BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
 
 run_step() {
   local name="$1"
@@ -30,9 +34,9 @@ run_step() {
 
 echo "[daily] date=${TODAY} root=${ROOT_DIR}"
 
-run_step yahoo_all_repair \
+run_step yahoo_all_daily_update \
   "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py \
-  --mode repair \
+  --mode daily-update \
   --asset all \
   --end-date "$TODAY" \
   --workers "$WORKERS" \
@@ -43,28 +47,46 @@ run_step yahoo_all_repair \
 if [[ -f "$FRANKFURTER_SYMBOLS_FILE" ]]; then
   run_step frankfurter_forex_incremental \
     "$PYTHON_BIN" downloader/download_forex_frankfurter.py \
+    --mode daily-update \
     --output-dir data_yahoo/forex \
     --symbols-file "$FRANKFURTER_SYMBOLS_FILE" \
     --end-date "$TODAY" \
     --workers "$WORKERS" \
     --timeout "$FRANKFURTER_TIMEOUT" \
-    --incremental \
     --skip-manifest
 else
   echo "[daily] skip=frankfurter_forex_incremental reason=missing_symbols_file file=${FRANKFURTER_SYMBOLS_FILE}" >&2
 fi
 
 if [[ "$RUN_PEPPERSTONE_GROUPS" == "1" ]]; then
-  run_step pepperstone_groups_repair \
+  run_step pepperstone_groups_daily_update \
     "$PYTHON_BIN" downloader/download_pepperstone.py \
-    --mode repair \
+    --mode daily-update \
     --groups all \
     --end-date "$TODAY" \
     --workers "$PEPPERSTONE_WORKERS" \
     --retries "$RETRIES" \
     --repair-overlap-days "$REPAIR_OVERLAP_DAYS"
 else
-  echo "[daily] skip=pepperstone_groups_repair reason=RUN_PEPPERSTONE_GROUPS=${RUN_PEPPERSTONE_GROUPS}"
+  echo "[daily] skip=pepperstone_groups_daily_update reason=RUN_PEPPERSTONE_GROUPS=${RUN_PEPPERSTONE_GROUPS}"
+fi
+
+if [[ "$RUN_CEX_PERP" == "1" ]]; then
+  run_step okx_perp_daily_update \
+    "$PYTHON_BIN" downloader/download_okx_perp_daily.py \
+    --mode daily-update \
+    --end-date "$TODAY" \
+    --workers "$OKX_WORKERS"
+
+  read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
+  run_step bybit_perp_daily_update \
+    "$PYTHON_BIN" downloader/download_bybit_perp_daily.py \
+    --mode daily-update \
+    --end-date "$TODAY" \
+    --workers "$BYBIT_WORKERS" \
+    --categories "${bybit_categories[@]}"
+else
+  echo "[daily] skip=cex_perp_daily_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
 fi
 
 echo "[daily] all markets completed"
