@@ -3,17 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-
-def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-    if mask is None:
-        return torch.softmax(logits, dim=1)
-
-    mask_bool = mask.bool()
-    mask_f = mask.to(dtype=logits.dtype)
-    masked_logits = logits.masked_fill(~mask_bool, torch.finfo(logits.dtype).min)
-    weights = torch.softmax(masked_logits, dim=1) * mask_f
-    normalizer = weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    return weights / normalizer
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax
 
 
 class CrossSectionalMLP(nn.Module):
@@ -75,19 +65,10 @@ class CrossSectionalMLP(nn.Module):
         if self.long_only:
             # Long-only: non-negative weights that sum to 1 over tradable symbols.
             if tradable_mask is not None:
-                weights = _masked_softmax(logits, tradable_mask)
+                weights = masked_softmax(logits, tradable_mask)
             else:
                 weights = torch.softmax(logits, dim=1)
         else:
-            # Long-short: center scores cross-sectionally and normalize by gross exposure.
-            if tradable_mask is not None:
-                mask_f = tradable_mask.to(dtype=logits.dtype)
-                denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-                mean_logits = (logits * mask_f).sum(dim=1, keepdim=True) / denom
-                centered = (logits - mean_logits) * mask_f
-            else:
-                centered = logits - logits.mean(dim=1, keepdim=True)
-            gross = centered.abs().sum(dim=1, keepdim=True).clamp_min(1e-8)
-            weights = centered / gross
+            weights = dual_branch_softmax(logits, tradable_mask)
         
         return weights

@@ -62,6 +62,42 @@ def test_limit_masks() -> None:
     assert bool(can_sell.iloc[2]) is False
 
 
+def test_limit_masks_ex_dividend_reference_price() -> None:
+    # Day 1 has ex-dividend cash=1.0. Reference should be prev_close - dividend.
+    # prev_close=35.1 -> reference=34.1 -> limit_up=37.5, so close=37.5 is limit-up.
+    frame = pd.DataFrame(
+        {
+            "tradable": [True, True],
+            "close_raw": [35.1, 37.5],
+            "Dividends": [0.0, 1.0],
+            "Stock Splits": [0.0, 0.0],
+        }
+    )
+
+    can_buy, can_sell = _compute_tw_limit_masks(frame)
+
+    assert bool(can_buy.iloc[1]) is False
+    assert bool(can_sell.iloc[1]) is True
+
+
+def test_limit_masks_split_reference_price() -> None:
+    # Day 1 has 2-for-1 split. Reference should be prev_close / 2.
+    # prev_close=100 -> reference=50 -> limit_up=55.0, so close=55.0 is limit-up.
+    frame = pd.DataFrame(
+        {
+            "tradable": [True, True],
+            "close_raw": [100.0, 55.0],
+            "Dividends": [0.0, 0.0],
+            "Stock Splits": [0.0, 2.0],
+        }
+    )
+
+    can_buy, can_sell = _compute_tw_limit_masks(frame)
+
+    assert bool(can_buy.iloc[1]) is False
+    assert bool(can_sell.iloc[1]) is True
+
+
 def test_no_buy_on_limit_up_day() -> None:
     weights = np.array([[0.5], [1.0], [1.0]], dtype=np.float32)
     future_returns = np.zeros_like(weights)
@@ -128,11 +164,46 @@ def test_no_sell_on_limit_down_day() -> None:
     assert shares["2024-01-02"] == 10, "should not decrease shares on limit-down day"
 
 
+def test_tw_holdings_price_has_no_float_tail() -> None:
+    weights = np.array([[1.0]], dtype=np.float32)
+    future_returns = np.zeros_like(weights)
+    tradable = np.ones_like(weights, dtype=bool)
+    can_buy = np.ones_like(weights, dtype=bool)
+    can_sell = np.ones_like(weights, dtype=bool)
+    benchmark = np.zeros((weights.shape[0],), dtype=np.float32)
+
+    # Mimic float32 tail value seen in raw parquet/csv pipelines.
+    close_prices = np.array([[21.399999618530273]], dtype=np.float32)
+    dates = np.array(["2024-01-01"], dtype="datetime64[D]")
+
+    _, records = run_backtest_integer_shares(
+        weights=weights,
+        future_returns=future_returns,
+        tradable_mask=tradable,
+        benchmark_returns=benchmark,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        initial_capital=1000.0,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        close_prices=close_prices,
+        symbols=["3516"],
+        dates=dates,
+    )
+
+    stock_rows = [row for row in records if (not row.is_cash and row.symbol == "3516")]
+    assert len(stock_rows) == 1
+    assert stock_rows[0].price == 21.4
+
+
 def main() -> None:
     test_limit_price_examples()
     test_limit_masks()
+    test_limit_masks_ex_dividend_reference_price()
+    test_limit_masks_split_reference_price()
     test_no_buy_on_limit_up_day()
     test_no_sell_on_limit_down_day()
+    test_tw_holdings_price_has_no_float_tail()
     print("All TW limit rule tests passed.")
 
 

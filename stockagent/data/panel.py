@@ -157,6 +157,29 @@ def _tw_limit_price(prev_close: pd.Series, ratio: float) -> pd.Series:
     return pd.Series(_round_half_up(out, decimals=2), index=prev_close.index)
 
 
+def _tw_reference_price_for_limits(frame: pd.DataFrame, prev_close_raw: pd.Series) -> pd.Series:
+    """Compute TW daily reference price used for limit-up/down checks.
+
+    Base rule uses previous close, then applies ex-right/ex-dividend adjustments
+    when source columns are available:
+    - Dividends: subtract cash dividend on ex-dividend day.
+    - Stock Splits: divide by split ratio on ex-right day.
+    """
+    reference = pd.to_numeric(prev_close_raw, errors="coerce").astype(np.float64)
+
+    if "Dividends" in frame.columns:
+        dividends = pd.to_numeric(frame["Dividends"], errors="coerce").fillna(0.0)
+        reference = reference - dividends
+
+    if "Stock Splits" in frame.columns:
+        split_ratio = pd.to_numeric(frame["Stock Splits"], errors="coerce")
+        valid_split = split_ratio.notna() & split_ratio.gt(0.0) & split_ratio.ne(1.0)
+        reference = reference.where(~valid_split, reference / split_ratio)
+
+    reference = reference.where(reference.gt(0.0))
+    return pd.Series(_round_half_up(reference, decimals=2), index=prev_close_raw.index)
+
+
 def _compute_tw_limit_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """Return (can_buy, can_sell) masks under TW 10% daily limit assumptions.
 
@@ -167,13 +190,14 @@ def _compute_tw_limit_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     tradable = frame["tradable"].astype(bool)
     close_raw = _round_tw_price_series(frame.get("close_raw"))
     prev_close_raw = close_raw.shift(1)
+    reference_price = _tw_reference_price_for_limits(frame, prev_close_raw)
 
-    limit_up_price = _tw_limit_price(prev_close_raw, 1.10)
-    limit_down_price = _tw_limit_price(prev_close_raw, 0.90)
+    limit_up_price = _tw_limit_price(reference_price, 1.10)
+    limit_down_price = _tw_limit_price(reference_price, 0.90)
 
     # Use small price tolerance to absorb source rounding noise.
-    is_limit_up = close_raw.ge(limit_up_price - 1e-9) & prev_close_raw.gt(0)
-    is_limit_down = close_raw.le(limit_down_price + 1e-9) & prev_close_raw.gt(0)
+    is_limit_up = close_raw.ge(limit_up_price - 1e-9) & reference_price.gt(0)
+    is_limit_down = close_raw.le(limit_down_price + 1e-9) & reference_price.gt(0)
 
     can_buy = tradable & ~is_limit_up.fillna(False)
     can_sell = tradable & ~is_limit_down.fillna(False)
@@ -494,9 +518,9 @@ def _print_feature_overview(panel: PanelData) -> None:
     print(f"[panel] features ({len(panel.feature_names)}): {feature_list}")
 
 
-def _check_cache_valid(meta_path: Path, parquet_paths: list[Path], backend_key: str) -> bool:
+def _check_cache_valid(cache_path: Path, meta_path: Path, parquet_paths: list[Path], backend_key: str) -> bool:
     """Check if cache is valid based on source hash and mtime."""
-    if not meta_path.exists():
+    if (not cache_path.exists()) or (not meta_path.exists()):
         return False
     
     try:
@@ -513,7 +537,7 @@ def _check_cache_valid(meta_path: Path, parquet_paths: list[Path], backend_key: 
         
         if cache_valid:
             # Also verify that cache file itself is newer than source files
-            cache_mtime = meta_path.stat().st_mtime
+            cache_mtime = cache_path.stat().st_mtime
             source_mtimes = [p.stat().st_mtime for p in parquet_paths]
             if cache_mtime < max(source_mtimes):
                 # Cache is older than source files, invalidate
@@ -530,7 +554,8 @@ def build_panel(
     use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
-    tw_limit_up_down_guard: bool = False,
+    buy_tradable_mode: str = "tradable",
+    sell_tradable_mode: str = "tradable",
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -546,13 +571,25 @@ def build_panel(
     meta_path = _cache_meta_path(parquet_root)
 
     use_cudf = bool(use_rapids) and cudf is not None
+    buy_tradable_mode = str(buy_tradable_mode).strip().lower()
+    sell_tradable_mode = str(sell_tradable_mode).strip().lower()
+    valid_tradable_modes = {"tradable", "tw_limit_guard"}
+    if buy_tradable_mode not in valid_tradable_modes:
+        raise ValueError(
+            f"buy_tradable_mode must be one of {sorted(valid_tradable_modes)}, got {buy_tradable_mode!r}"
+        )
+    if sell_tradable_mode not in valid_tradable_modes:
+        raise ValueError(
+            f"sell_tradable_mode must be one of {sorted(valid_tradable_modes)}, got {sell_tradable_mode!r}"
+        )
+
     backend_key = (
         f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|"
-        f"usd_only={usd_only_trading_pairs}|tw_limit_guard={tw_limit_up_down_guard}"
+        f"usd_only={usd_only_trading_pairs}|buy_mode={buy_tradable_mode}|sell_mode={sell_tradable_mode}"
     )
     
     # Check cache validity
-    if _check_cache_valid(meta_path, parquet_paths, backend_key):
+    if _check_cache_valid(cache_path, meta_path, parquet_paths, backend_key):
         print(f"[panel] loading cache (valid): {cache_path}")
         panel = _load_panel_cache(cache_path)
         _print_feature_overview(panel)
@@ -567,10 +604,12 @@ def build_panel(
                 frame = _load_symbol_frame_cudf(path)
                 if len(frame) == 0:
                     continue
-                if tw_limit_up_down_guard:
-                    can_buy, can_sell = _compute_tw_limit_masks(frame)
-                    frame["can_buy"] = can_buy
-                    frame["can_sell"] = can_sell
+                use_tw_limit_buy = buy_tradable_mode == "tw_limit_guard"
+                use_tw_limit_sell = sell_tradable_mode == "tw_limit_guard"
+                if use_tw_limit_buy or use_tw_limit_sell:
+                    can_buy_limit, can_sell_limit = _compute_tw_limit_masks(frame)
+                    frame["can_buy"] = can_buy_limit if use_tw_limit_buy else frame["tradable"].astype(bool)
+                    frame["can_sell"] = can_sell_limit if use_tw_limit_sell else frame["tradable"].astype(bool)
                 else:
                     frame["can_buy"] = frame["tradable"].astype(bool)
                     frame["can_sell"] = frame["tradable"].astype(bool)
@@ -594,7 +633,7 @@ def build_panel(
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
             backend_key = (
                 f"pandas|benchmark={benchmark_name}|"
-                f"usd_only={usd_only_trading_pairs}|tw_limit_guard={tw_limit_up_down_guard}"
+                f"usd_only={usd_only_trading_pairs}|buy_mode={buy_tradable_mode}|sell_mode={sell_tradable_mode}"
             )
     
     symbol_frames: list[pd.DataFrame] = []
@@ -604,10 +643,12 @@ def build_panel(
             frame = _load_symbol_frame(path)
             if len(frame) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
-            if tw_limit_up_down_guard:
-                can_buy, can_sell = _compute_tw_limit_masks(frame)
-                frame["can_buy"] = can_buy
-                frame["can_sell"] = can_sell
+            use_tw_limit_buy = buy_tradable_mode == "tw_limit_guard"
+            use_tw_limit_sell = sell_tradable_mode == "tw_limit_guard"
+            if use_tw_limit_buy or use_tw_limit_sell:
+                can_buy_limit, can_sell_limit = _compute_tw_limit_masks(frame)
+                frame["can_buy"] = can_buy_limit if use_tw_limit_buy else frame["tradable"].astype(bool)
+                frame["can_sell"] = can_sell_limit if use_tw_limit_sell else frame["tradable"].astype(bool)
             else:
                 frame["can_buy"] = frame["tradable"].astype(bool)
                 frame["can_sell"] = frame["tradable"].astype(bool)

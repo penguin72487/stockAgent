@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: true
-  start_fold: 25
+  start_fold: 1
 
 environment:
   conda_env: fintech
@@ -24,7 +24,8 @@ data:
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
-  tw_limit_up_down_guard: true
+  buy_tradable_mode: tw_limit_guard
+  sell_tradable_mode: tw_limit_guard
 
 walk_forward:
   min_train_years: 1
@@ -36,10 +37,9 @@ trading:
   buy_fee_rate: 0.001425
   sell_fee_rate: 0.004425
   max_turnover_ratio: 100.0
-  gross_leverage: 2.0
+  gross_leverage: 1.0
   long_only: false
   cash_allowed: true
-  use_all_tradable_symbols: true
 
 training:
   backend: pytorch
