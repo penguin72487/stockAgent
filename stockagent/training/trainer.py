@@ -7,6 +7,7 @@ import pickle
 import shutil
 import subprocess
 import time
+import gc
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -131,6 +132,14 @@ def _loss_from_backtest_series(
     gamma_drawdown: float,
     drawdown_target: float,
     gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
     objective: str = "sharpe",
     sample_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -148,7 +157,15 @@ def _loss_from_backtest_series(
         return strategy_returns.sum() * 0.0
 
     objective_norm = objective.strip().lower()
-    if objective_norm in {"excess_cvar_drawdown", "cvar", "cvar_drawdown", "excess_cvar"}:
+    if objective_norm in {
+        "excess_cvar_drawdown",
+        "cvar",
+        "cvar_drawdown",
+        "excess_cvar",
+        "outperformance_risk_budget",
+        "outperformance_budget",
+        "outperformance_first",
+    }:
         excess_returns = valid_returns - valid_benchmark
         mean_excess = excess_returns.mean()
 
@@ -165,11 +182,28 @@ def _loss_from_backtest_series(
         mdd = drawdowns.max() if drawdowns.numel() > 0 else mean_excess.new_zeros(())
         drawdown_penalty = torch.nn.functional.softplus((mdd - float(drawdown_target)) * 20.0) / 20.0
 
-        objective_value = (
-            -gamma_excess * mean_excess
-            + gamma_cvar * cvar
-            + gamma_drawdown * drawdown_penalty
-        )
+        if objective_norm in {"outperformance_risk_budget", "outperformance_budget", "outperformance_first"}:
+            underperformance = torch.relu(float(excess_target) - excess_returns).mean()
+            turnover_mean = valid_turnovers.mean() if valid_turnovers.numel() > 0 else mean_excess.new_zeros(())
+            cvar_budget_penalty = torch.relu(cvar - float(cvar_budget))
+            drawdown_budget_penalty = torch.relu(mdd - float(drawdown_budget))
+            turnover_budget_penalty = torch.relu(turnover_mean - float(turnover_budget))
+
+            objective_value = (
+                -gamma_excess * mean_excess
+                + gamma_underperformance * underperformance
+                + gamma_cvar_budget * cvar_budget_penalty
+                + gamma_drawdown_budget * drawdown_budget_penalty
+                + gamma_turnover_budget * turnover_budget_penalty
+                + gamma_cvar * cvar
+                + gamma_drawdown * drawdown_penalty
+            )
+        else:
+            objective_value = (
+                -gamma_excess * mean_excess
+                + gamma_cvar * cvar
+                + gamma_drawdown * drawdown_penalty
+            )
     else:
         mean_return = valid_returns.mean()
         annualizer = torch.sqrt(torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype))
@@ -192,11 +226,29 @@ def _loss_from_backtest_series(
 
 def _normalize_risk_objective(loss_type: str) -> str:
     objective = str(loss_type).strip().lower()
-    if objective in {"sharpe", "sortino", "excess_cvar_drawdown", "cvar", "cvar_drawdown", "excess_cvar"}:
+    if objective in {
+        "sharpe",
+        "sortino",
+        "excess_cvar_drawdown",
+        "cvar",
+        "cvar_drawdown",
+        "excess_cvar",
+        "outperformance_risk_budget",
+        "outperformance_budget",
+        "outperformance_first",
+    }:
         if objective in {"cvar", "cvar_drawdown", "excess_cvar"}:
             return "excess_cvar_drawdown"
+        if objective in {"outperformance_budget", "outperformance_first"}:
+            return "outperformance_risk_budget"
         return objective
     return "sharpe"
+
+
+def _objective_metric_key(objective: str) -> str:
+    if objective in {"outperformance_risk_budget", "excess_cvar_drawdown"}:
+        return "excess_return_vs_universe_average"
+    return objective
 
 
 def _normalized_model_name(model_name: str) -> str:
@@ -1029,6 +1081,21 @@ def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | No
     return None
 
 
+def _release_cuda_memory(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:
+        pass
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def find_optimal_batch_size(
     model: nn.Module,
     sample_loader: DataLoader,
@@ -1335,6 +1402,14 @@ def _train_epoch(
     gamma_drawdown: float,
     drawdown_target: float,
     gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
     objective: str,
     grad_clip_norm: float,
     profile_timing: bool = False,
@@ -1387,6 +1462,14 @@ def _train_epoch(
                 gamma_drawdown=gamma_drawdown,
                 drawdown_target=drawdown_target,
                 gamma_turnover=gamma_turnover,
+                gamma_underperformance=gamma_underperformance,
+                excess_target=excess_target,
+                cvar_budget=cvar_budget,
+                drawdown_budget=drawdown_budget,
+                turnover_budget=turnover_budget,
+                gamma_cvar_budget=gamma_cvar_budget,
+                gamma_drawdown_budget=gamma_drawdown_budget,
+                gamma_turnover_budget=gamma_turnover_budget,
                 objective=objective,
             )
         if not torch.isfinite(loss).all():
@@ -1473,6 +1556,14 @@ def _train_epoch_tensor(
     gamma_drawdown: float,
     drawdown_target: float,
     gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
     objective: str,
     grad_clip_norm: float,
     profile_timing: bool = False,
@@ -1532,6 +1623,14 @@ def _train_epoch_tensor(
                 gamma_drawdown=gamma_drawdown,
                 drawdown_target=drawdown_target,
                 gamma_turnover=gamma_turnover,
+                gamma_underperformance=gamma_underperformance,
+                excess_target=excess_target,
+                cvar_budget=cvar_budget,
+                drawdown_budget=drawdown_budget,
+                turnover_budget=turnover_budget,
+                gamma_cvar_budget=gamma_cvar_budget,
+                gamma_drawdown_budget=gamma_drawdown_budget,
+                gamma_turnover_budget=gamma_turnover_budget,
                 objective=objective,
             )
         if not torch.isfinite(loss).all():
@@ -1762,6 +1861,14 @@ def _run_training_tree_models(
                     gamma_drawdown=config.evaluation.gamma_drawdown,
                     drawdown_target=config.evaluation.drawdown_target,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    gamma_underperformance=config.evaluation.gamma_underperformance,
+                    excess_target=config.evaluation.excess_target,
+                    cvar_budget=config.evaluation.cvar_budget,
+                    drawdown_budget=config.evaluation.drawdown_budget,
+                    turnover_budget=config.evaluation.turnover_budget,
+                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                     objective=loss_objective,
                 ).detach().cpu()
             )
@@ -1812,8 +1919,9 @@ def _run_training_tree_models(
             )
             test_met = compute_metrics(test_bt)
 
-            val_objective_metric = float(val_met.get(loss_objective, float("nan")))
-            test_objective_metric = float(test_met.get(loss_objective, float("nan")))
+            objective_key = _objective_metric_key(loss_objective)
+            val_objective_metric = float(val_met.get(objective_key, float("nan")))
+            test_objective_metric = float(test_met.get(objective_key, float("nan")))
             print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
             print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
 
@@ -1928,6 +2036,14 @@ def _run_inference_tree_models(
                 gamma_drawdown=config.evaluation.gamma_drawdown,
                 drawdown_target=config.evaluation.drawdown_target,
                 gamma_turnover=config.evaluation.gamma_turnover,
+                gamma_underperformance=config.evaluation.gamma_underperformance,
+                excess_target=config.evaluation.excess_target,
+                cvar_budget=config.evaluation.cvar_budget,
+                drawdown_budget=config.evaluation.drawdown_budget,
+                turnover_budget=config.evaluation.turnover_budget,
+                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                 objective=loss_objective,
             ).detach().cpu()
         )
@@ -2123,6 +2239,14 @@ def _run_inference_neural_models(
                     gamma_drawdown=config.evaluation.gamma_drawdown,
                     drawdown_target=config.evaluation.drawdown_target,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    gamma_underperformance=config.evaluation.gamma_underperformance,
+                    excess_target=config.evaluation.excess_target,
+                    cvar_budget=config.evaluation.cvar_budget,
+                    drawdown_budget=config.evaluation.drawdown_budget,
+                    turnover_budget=config.evaluation.turnover_budget,
+                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                     objective=loss_objective,
                 ).detach().cpu()
             )
@@ -2311,6 +2435,11 @@ def run_training(
         train_years = list(train_years_key)
         group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
+
+        # Ensure each train-group starts from a clean CUDA allocator state.
+        if device.type == "cuda":
+            _release_cuda_memory(device)
+
         if not pending_folds:
             if config.training.warm_start_from_previous_fold and group_checkpoint_path.exists():
                 warm_start_checkpoint_path = group_checkpoint_path
@@ -2377,6 +2506,10 @@ def run_training(
                 vram_safety_margin_gb=config.training.vram_safety_margin_gb,
             )
             train_batch_size = max(min_batch_size, train_batch_size)
+            del temp_train_loader
+            del temp_model
+            del estimation_model
+            _release_cuda_memory(device)
         else:
             train_batch_size = _split_batch_size(len(train_ds), config.training.batch_size_train)
 
@@ -2447,6 +2580,15 @@ def run_training(
                 )
 
         if not fold_contexts:
+            train_x = None
+            train_returns = None
+            train_masks = None
+            train_buy_masks = None
+            train_sell_masks = None
+            train_benchmark = None
+            train_sample_mask = None
+            if device.type == "cuda":
+                _release_cuda_memory(device)
             continue
 
         val_datasets = [context.val_ds for context in fold_contexts.values()]
@@ -2697,6 +2839,14 @@ def run_training(
                     config.evaluation.gamma_drawdown,
                     config.evaluation.drawdown_target,
                     config.evaluation.gamma_turnover,
+                    config.evaluation.gamma_underperformance,
+                    config.evaluation.excess_target,
+                    config.evaluation.cvar_budget,
+                    config.evaluation.drawdown_budget,
+                    config.evaluation.turnover_budget,
+                    config.evaluation.gamma_cvar_budget,
+                    config.evaluation.gamma_drawdown_budget,
+                    config.evaluation.gamma_turnover_budget,
                     loss_objective,
                     config.training.grad_clip_norm,
                     profile_timing=profile_timing,
@@ -2729,6 +2879,14 @@ def run_training(
                 gamma_drawdown=config.evaluation.gamma_drawdown,
                 drawdown_target=config.evaluation.drawdown_target,
                 gamma_turnover=config.evaluation.gamma_turnover,
+                gamma_underperformance=config.evaluation.gamma_underperformance,
+                excess_target=config.evaluation.excess_target,
+                cvar_budget=config.evaluation.cvar_budget,
+                drawdown_budget=config.evaluation.drawdown_budget,
+                turnover_budget=config.evaluation.turnover_budget,
+                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                 objective=loss_objective,
                 grad_clip_norm=config.training.grad_clip_norm,
                 profile_timing=profile_timing,
@@ -2809,6 +2967,14 @@ def run_training(
                     gamma_drawdown=config.evaluation.gamma_drawdown,
                     drawdown_target=config.evaluation.drawdown_target,
                     gamma_turnover=config.evaluation.gamma_turnover,
+                    gamma_underperformance=config.evaluation.gamma_underperformance,
+                    excess_target=config.evaluation.excess_target,
+                    cvar_budget=config.evaluation.cvar_budget,
+                    drawdown_budget=config.evaluation.drawdown_budget,
+                    turnover_budget=config.evaluation.turnover_budget,
+                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                     objective=loss_objective,
                 )
                 val_loss = float(val_loss_tensor.detach().cpu())
@@ -3022,8 +3188,9 @@ def run_training(
             test_met = compute_metrics(test_bt)
             test_report_total = time.perf_counter() - test_report_start
 
-            val_objective_metric = float(val_met.get(loss_objective, float("nan")))
-            test_objective_metric = float(test_met.get(loss_objective, float("nan")))
+            objective_key = _objective_metric_key(loss_objective)
+            val_objective_metric = float(val_met.get(objective_key, float("nan")))
+            test_objective_metric = float(test_met.get(objective_key, float("nan")))
             print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
             print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
             if profile_timing:
@@ -3093,5 +3260,29 @@ def run_training(
 
         if config.training.warm_start_from_previous_fold:
             warm_start_checkpoint_path = group_checkpoint_path
+
+        # Drop large per-group tensors/models so next group's batch-search sees true free VRAM.
+        train_x = None
+        train_returns = None
+        train_masks = None
+        train_buy_masks = None
+        train_sell_masks = None
+        train_benchmark = None
+        train_sample_mask = None
+        combined_val_x = None
+        combined_val_returns = None
+        combined_val_masks = None
+        combined_val_buy_masks = None
+        combined_val_sell_masks = None
+        combined_val_bench = None
+        val_returns_device = None
+        val_masks_device = None
+        model = None
+        compiled_train_model = None
+        optimizer = None
+        scaler = None
+        scheduler = None
+        if device.type == "cuda":
+            _release_cuda_memory(device)
 
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-from datetime import date
 from pathlib import Path
+
+from common import resolve_end_date
 
 GROUP_CONFIG = {
     "24hTrading": {"asset": "forex", "symbols": "configs/pepperstone_24hTrading_symbols.txt"},
@@ -47,13 +48,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_end_date(value: str) -> str:
-    text = value.strip().lower()
-    if text in {"today", "now"}:
-        return date.today().isoformat()
-    return value.strip()
-
-
 def _resolve_groups(values: list[str]) -> list[str]:
     if not values or "all" in values:
         return list(GROUP_CONFIG.keys())
@@ -80,7 +74,7 @@ def _run_group(repo_root: Path, args: argparse.Namespace, group: str) -> None:
         "--start-date",
         args.start_date,
         "--end-date",
-        _resolve_end_date(args.end_date),
+        resolve_end_date(args.end_date),
         "--output-dir",
         str(output_dir),
         "--workers",

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import contextlib
 import csv
 import io
 import json
+import multiprocessing as mp
 import os
 import re
+import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +23,11 @@ from urllib.request import urlopen
 import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
+
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional runtime dependency guard
+    pq = None
 
 
 ASSET_CLASSES = ("tw_stocks", "us_stocks", "crypto", "forex")
@@ -53,6 +61,7 @@ OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose"}
 BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
+YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
 DEFAULT_SYMBOLS: dict[str, list[tuple[str, str, str]]] = {
     "us_stocks": [
         ("AAPL", "Apple", "AAPL"),
@@ -300,6 +309,26 @@ def _blacklist_symbol(
             return
         blacklist_symbols.add(normalized)
         _append_blacklist_symbol(blacklist_path, normalized)
+        return
+
+    with blacklist_lock:
+        if normalized in blacklist_symbols:
+            return
+        blacklist_symbols.add(normalized)
+        _append_blacklist_symbol(blacklist_path, normalized)
+
+
+def _blacklist_record_symbols(
+    raw_symbols: str,
+    blacklist_symbols: set[str] | None,
+    blacklist_path: Path | None,
+    blacklist_lock: threading.Lock | None,
+) -> None:
+    candidates = [symbol for symbol in YAHOO_SYMBOL_SPLIT_PATTERN.split(raw_symbols.strip()) if symbol]
+    if not candidates:
+        candidates = [raw_symbols.strip()]
+    for symbol in candidates:
+        _blacklist_symbol(symbol, blacklist_symbols, blacklist_path, blacklist_lock)
 
 
 def _whitelist_symbol(
@@ -328,12 +357,6 @@ def _whitelist_symbol(
         whitelist_symbols.add(normalized)
         _append_whitelist_symbol(whitelist_path, normalized)
         return
-
-    with blacklist_lock:
-        if normalized in blacklist_symbols:
-            return
-        blacklist_symbols.add(normalized)
-        _append_blacklist_symbol(blacklist_path, normalized)
 
 
 def parse_args() -> argparse.Namespace:
@@ -398,6 +421,27 @@ def parse_args() -> argparse.Namespace:
         default=7,
         help="In repair mode, re-download this many overlap days before the local last date before merging.",
     )
+    parser.add_argument(
+        "--precheck-file-timeout-seconds",
+        type=int,
+        default=20,
+        help="Max seconds to inspect one parquet during precheck; 0 disables timeout.",
+    )
+    parser.add_argument(
+        "--repair-symbol-timeout-seconds",
+        type=int,
+        default=90,
+        help="Max seconds to wait for one symbol's repair download; 0 disables per-symbol timeout.",
+    )
+    parser.add_argument(
+        "--daily-stale-max-lag-days",
+        type=int,
+        default=14,
+        help=(
+            "Only for --mode daily-update: skip symbols whose local last date lags target end date "
+            "by more than this many days. Set 0 to disable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -407,6 +451,95 @@ def _parse_date(value: str) -> datetime:
 
 def _today_str() -> str:
     return date.today().isoformat()
+
+
+class PrecheckTimeoutError(TimeoutError):
+    pass
+
+
+def _precheck_worker_main(conn) -> None:
+    try:
+        while True:
+            payload = conn.recv()
+            if payload is None:
+                break
+
+            output_path = Path(payload)
+            try:
+                result = _load_existing_file_info(output_path)
+                conn.send(("ok", result))
+            except Exception as exc:
+                conn.send(("err", str(exc)))
+    finally:
+        conn.close()
+
+
+class PrecheckLoader:
+    def __init__(self) -> None:
+        # Use spawn unconditionally to avoid fork-from-thread deadlocks when asset_workers > 1.
+        self._ctx = mp.get_context("spawn")
+        self._parent_conn = None
+        self._process = None
+        self._start()
+
+    def _start(self) -> None:
+        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        process = self._ctx.Process(target=_precheck_worker_main, args=(child_conn,), daemon=True)
+        process.start()
+        child_conn.close()
+        self._parent_conn = parent_conn
+        self._process = process
+
+    def _restart(self) -> None:
+        self.close()
+        self._start()
+
+    def load_with_timeout(self, output_path: Path, timeout_seconds: int) -> tuple[str | None, str | None, str | None, set[str]]:
+        if timeout_seconds <= 0:
+            return _load_existing_file_info(output_path)
+
+        if self._process is None or not self._process.is_alive():
+            self._restart()
+
+        assert self._parent_conn is not None
+        try:
+            self._parent_conn.send(str(output_path))
+        except Exception:
+            self._restart()
+            assert self._parent_conn is not None
+            self._parent_conn.send(str(output_path))
+        if not self._parent_conn.poll(timeout_seconds):
+            self._restart()
+            raise PrecheckTimeoutError(f"precheck timed out after {timeout_seconds}s")
+
+        try:
+            status, payload = self._parent_conn.recv()
+        except Exception:
+            self._restart()
+            raise RuntimeError("precheck worker pipe broken; worker restarted")
+        if status == "ok":
+            first_date, last_date, error, columns = payload
+            return first_date, last_date, error, set(columns)
+
+        raise RuntimeError(str(payload))
+
+    def close(self) -> None:
+        if self._parent_conn is not None:
+            try:
+                self._parent_conn.send(None)
+            except Exception:
+                pass
+            try:
+                self._parent_conn.close()
+            except Exception:
+                pass
+            self._parent_conn = None
+
+        if self._process is not None:
+            if self._process.is_alive():
+                self._process.terminate()
+            self._process.join(timeout=1)
+            self._process = None
 
 
 def _normalize_download_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -476,6 +609,20 @@ def _http_get_text(url: str, timeout: int = 30) -> str:
 def _http_get_json(url: str, timeout: int = 30) -> object:
     text = _http_get_text(url, timeout=timeout)
     return json.loads(text)
+
+
+def _fetch_with_hard_timeout(fn, *args, timeout: int = 60, **kwargs):
+    """Run fn in a daemon thread; raise concurrent.futures.TimeoutError if it takes longer than timeout seconds.
+
+    Unlike urlopen(timeout=N), this is a true wall-clock timeout that covers DNS resolution,
+    TCP handshake, and any other blocking operation inside fn.
+    The worker thread is abandoned (not waited on) so we never block on shutdown.
+    """
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(fn, *args, **kwargs).result(timeout=timeout)
+    finally:
+        ex.shutdown(wait=False)
 
 
 def _extract_tw_codes_from_tables(url: str) -> set[str]:
@@ -588,13 +735,13 @@ def _load_tw_symbols_from_exchange() -> list[SymbolRecord]:
     return records
 
 
-def _load_us_symbols_from_web() -> list[SymbolRecord]:
+def _load_us_symbols_from_web(timeout: int = 60) -> list[SymbolRecord]:
     records: list[SymbolRecord] = []
     seen: set[str] = set()
 
     nasdaq_url, other_url = US_SYMBOL_SOURCES
-    nasdaq = pd.read_csv(nasdaq_url, sep="|", dtype=str, engine="python")
-    other = pd.read_csv(other_url, sep="|", dtype=str, engine="python")
+    nasdaq = pd.read_csv(io.StringIO(_http_get_text(nasdaq_url, timeout=timeout)), sep="|", dtype=str, engine="python")
+    other = pd.read_csv(io.StringIO(_http_get_text(other_url, timeout=timeout)), sep="|", dtype=str, engine="python")
 
     for frame, symbol_col, name_col, test_issue_col in (
         (nasdaq, "Symbol", "Security Name", "Test Issue"),
@@ -625,13 +772,13 @@ def _load_us_symbols_from_web() -> list[SymbolRecord]:
     return records
 
 
-def _load_us_delisted_from_alpha_vantage(api_key: str) -> list[SymbolRecord]:
+def _load_us_delisted_from_alpha_vantage(api_key: str, timeout: int = 60) -> list[SymbolRecord]:
     if not api_key:
         return []
 
     query = urlencode({"function": "LISTING_STATUS", "state": "delisted", "apikey": api_key})
     url = f"{ALPHA_VANTAGE_LISTING_STATUS_URL}?{query}"
-    frame = pd.read_csv(url, dtype=str)
+    frame = pd.read_csv(io.StringIO(_http_get_text(url, timeout=timeout)), dtype=str)
     if "symbol" not in frame.columns:
         return []
 
@@ -752,67 +899,154 @@ def _load_forex_expanded_fallback() -> list[SymbolRecord]:
     return records
 
 
-def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolRecord]:
-    if args.symbols_file:
-        records = _load_symbols_from_file(asset_class, args.symbols_file)
-    elif args.symbols:
-        records = [_record_from_input(asset_class, symbol) for symbol in args.symbols]
-    elif asset_class == "tw_stocks":
-        records = _load_tw_symbols_from_local_manifest()
-        if not records:
-            records = _load_tw_symbols_from_exchange()
-        if args.include_tw_delisted:
-            try:
-                records.extend(_load_tw_delisted_symbols())
-            except Exception as exc:
-                print(f"[symbols] failed to load tw delisted list: {exc}")
-    elif asset_class == "us_stocks":
-        records = [
-            SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
-            for code, name, yahoo_symbol in DEFAULT_SYMBOLS[asset_class]
-        ]
-        try:
-            records.extend(_load_us_symbols_from_web())
-        except Exception as exc:
-            print(f"[symbols] fallback to static us_stocks list: {exc}")
-        if args.include_us_delisted:
-            try:
-                records.extend(_load_us_delisted_from_alpha_vantage(args.alpha_vantage_api_key))
-            except Exception as exc:
-                print(f"[symbols] failed to load us delisted list: {exc}")
-    elif asset_class == "crypto":
-        records = [
-            SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
-            for code, name, yahoo_symbol in DEFAULT_SYMBOLS[asset_class]
-        ]
-        try:
-            records.extend(_load_crypto_symbols_from_coingecko())
-        except Exception as exc:
-            print(f"[symbols] fallback to static crypto list: {exc}")
-    elif asset_class == "forex":
-        output_dir = _resolve_asset_output_dir(args, asset_class)
-        records = [
-            SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
-            for code, name, yahoo_symbol in DEFAULT_SYMBOLS[asset_class]
-        ]
+def _load_local_tracked_records(asset_class: str, output_dir: Path, cached: list[SymbolRecord]) -> list[SymbolRecord]:
+    """For daily-update, prefer symbols that are already tracked locally.
 
-        records.extend(_load_cached_symbols_from_manifest(output_dir / "symbols.csv", asset_class))
-        records.extend(_load_cached_symbols_from_whitelist(_whitelist_file_path(output_dir), asset_class))
+    This avoids reprocessing huge historical universes from stale manifests.
+    """
+    by_code = {record.code: record for record in cached}
+    records: list[SymbolRecord] = []
+    seen_codes: set[str] = set()
 
-        used_web_symbols = False
+    for output_path in output_dir.glob("*_features.parquet"):
+        suffix = "_features.parquet"
+        if not output_path.name.endswith(suffix):
+            continue
+        code = output_path.name[: -len(suffix)].strip().upper()
+        if not code or code in seen_codes:
+            continue
+        cached_record = by_code.get(code)
+        if cached_record is not None:
+            records.append(cached_record)
+            seen_codes.add(code)
+
+    whitelist_symbols = _load_whitelist(_whitelist_file_path(output_dir))
+    for yahoo_symbol in sorted(whitelist_symbols):
         try:
-            records.extend(_load_forex_symbols_from_yahoo_page())
-            used_web_symbols = True
-        except Exception as exc:
-            print(f"[symbols] fallback to static forex list: {exc}")
-        if not used_web_symbols:
-            records.extend(_load_forex_expanded_fallback())
-    else:
-        records = [
-            SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
-            for code, name, yahoo_symbol in DEFAULT_SYMBOLS[asset_class]
-        ]
+            record = _record_from_input(asset_class, yahoo_symbol)
+        except Exception:
+            continue
+        if record.code in seen_codes:
+            continue
+        cached_record = by_code.get(record.code)
+        records.append(cached_record if cached_record is not None else record)
+        seen_codes.add(record.code)
 
+    return records
+
+
+def _records_from_defaults(asset_class: str) -> list[SymbolRecord]:
+    default_items = DEFAULT_SYMBOLS.get(asset_class)
+    if not default_items:
+        return []
+    return [
+        SymbolRecord(code=code, name=name, market=asset_class, yahoo_symbol=yahoo_symbol)
+        for code, name, yahoo_symbol in default_items
+    ]
+
+
+def _resolve_cached_manifest(output_dir: Path, asset_class: str) -> list[SymbolRecord]:
+    return _load_symbols_from_manifest_csv(output_dir / "symbols.csv", asset_class)
+
+
+def _use_daily_update_cache_if_available(
+    asset_class: str,
+    args: argparse.Namespace,
+    cached: list[SymbolRecord],
+) -> list[SymbolRecord] | None:
+    is_daily_update = getattr(args, "mode", "") == "daily-update"
+    if cached and is_daily_update:
+        print(f"[symbols] daily-update: cached manifest {asset_class} ({len(cached)} symbols, skipping HTTP)")
+        return cached
+    return None
+
+
+def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
+    cached_daily = _use_daily_update_cache_if_available("tw_stocks", args, cached)
+    if cached_daily is not None:
+        return cached_daily
+
+    records = _load_tw_symbols_from_local_manifest()
+    if not records:
+        try:
+            records = _fetch_with_hard_timeout(_load_tw_symbols_from_exchange, timeout=60)
+        except Exception as exc:
+            print(f"[symbols] failed to load tw symbols from exchange: {exc}")
+            records = cached or []
+
+    if args.include_tw_delisted:
+        try:
+            records.extend(_fetch_with_hard_timeout(_load_tw_delisted_symbols, timeout=60))
+        except Exception as exc:
+            print(f"[symbols] failed to load tw delisted list: {exc}")
+    return records
+
+
+def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
+    cached_daily = _use_daily_update_cache_if_available("us_stocks", args, cached)
+    if cached_daily is not None:
+        return cached_daily
+
+    records = _records_from_defaults("us_stocks")
+    try:
+        records.extend(_fetch_with_hard_timeout(_load_us_symbols_from_web, timeout=60))
+    except Exception as exc:
+        print(f"[symbols] fallback to static us_stocks list: {exc}")
+        if cached:
+            print(f"[symbols] using cached manifest as fallback ({len(cached)} symbols)")
+            records = cached
+
+    if args.include_us_delisted:
+        try:
+            records.extend(
+                _fetch_with_hard_timeout(
+                    _load_us_delisted_from_alpha_vantage,
+                    args.alpha_vantage_api_key,
+                    timeout=60,
+                )
+            )
+        except Exception as exc:
+            print(f"[symbols] failed to load us delisted list: {exc}")
+    return records
+
+
+def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
+    cached_daily = _use_daily_update_cache_if_available("crypto", args, cached)
+    if cached_daily is not None:
+        return cached_daily
+
+    records = _records_from_defaults("crypto")
+    try:
+        records.extend(_fetch_with_hard_timeout(_load_crypto_symbols_from_coingecko, timeout=60))
+    except Exception as exc:
+        print(f"[symbols] fallback to static crypto list: {exc}")
+        if cached:
+            print(f"[symbols] using cached manifest as fallback ({len(cached)} symbols)")
+            records = cached
+    return records
+
+
+def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: list[SymbolRecord]) -> list[SymbolRecord]:
+    cached_daily = _use_daily_update_cache_if_available("forex", args, cached)
+    if cached_daily is not None:
+        return cached_daily
+
+    records = _records_from_defaults("forex")
+    records.extend(_load_cached_symbols_from_manifest(output_dir / "symbols.csv", "forex"))
+    records.extend(_load_cached_symbols_from_whitelist(_whitelist_file_path(output_dir), "forex"))
+
+    used_web_symbols = False
+    try:
+        records.extend(_fetch_with_hard_timeout(_load_forex_symbols_from_yahoo_page, timeout=60))
+        used_web_symbols = True
+    except Exception as exc:
+        print(f"[symbols] fallback to static forex list: {exc}")
+    if not used_web_symbols:
+        records.extend(_load_forex_expanded_fallback())
+    return records
+
+
+def _dedupe_records_by_code(records: list[SymbolRecord]) -> list[SymbolRecord]:
     seen_codes: set[str] = set()
     deduped: list[SymbolRecord] = []
     for record in records:
@@ -820,6 +1054,44 @@ def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolR
             continue
         seen_codes.add(record.code)
         deduped.append(record)
+    return deduped
+
+
+def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolRecord]:
+    if args.symbols_file:
+        records = _load_symbols_from_file(asset_class, args.symbols_file)
+    elif args.symbols:
+        records = [_record_from_input(asset_class, symbol) for symbol in args.symbols]
+    else:
+        output_dir = _resolve_asset_output_dir(args, asset_class)
+        cached = _resolve_cached_manifest(output_dir, asset_class)
+        is_daily_update = getattr(args, "mode", "") == "daily-update"
+
+        if is_daily_update:
+            tracked_records = _load_local_tracked_records(asset_class, output_dir, cached)
+            if tracked_records:
+                tracked_records.extend(_records_from_defaults(asset_class))
+                deduped = _dedupe_records_by_code(tracked_records)
+                print(
+                    f"[symbols] daily-update: local tracked {asset_class} "
+                    f"({len(deduped)} symbols, parquet+whitelist+defaults)"
+                )
+                if args.limit is not None:
+                    deduped = deduped[: args.limit]
+                return deduped
+
+        if asset_class == "tw_stocks":
+            records = _resolve_tw_symbols(args, cached)
+        elif asset_class == "us_stocks":
+            records = _resolve_us_symbols(args, cached)
+        elif asset_class == "crypto":
+            records = _resolve_crypto_symbols(args, cached)
+        elif asset_class == "forex":
+            records = _resolve_forex_symbols(args, output_dir, cached)
+        else:
+            records = _records_from_defaults(asset_class)
+
+    deduped = _dedupe_records_by_code(records)
 
     if args.limit is not None:
         deduped = deduped[: args.limit]
@@ -913,8 +1185,9 @@ def _download_symbol(
             try:
                 std_capture = io.StringIO()
                 err_capture = io.StringIO()
-                with contextlib.redirect_stdout(std_capture), contextlib.redirect_stderr(err_capture):
-                    frame = yf.download(
+
+                def _download_frame() -> pd.DataFrame:
+                    return yf.download(
                         tickers=candidate_symbol,
                         start=start_date,
                         end=period_end_exclusive,
@@ -924,6 +1197,13 @@ def _download_symbol(
                         progress=False,
                         threads=False,
                         timeout=20,
+                    )
+
+                with contextlib.redirect_stdout(std_capture), contextlib.redirect_stderr(err_capture):
+                    # Guard yfinance against indefinite socket/DNS stalls.
+                    frame = _fetch_with_hard_timeout(
+                        _download_frame,
+                        timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
                     )
                 normalized = _normalize_download_frame(frame)
                 captured = f"{std_capture.getvalue()}\n{err_capture.getvalue()}".lower()
@@ -985,6 +1265,29 @@ def _write_symbol_manifest(output_dir: Path, records: list[SymbolRecord]) -> Non
     frame.to_csv(manifest_path, index=False)
 
 
+def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> list[SymbolRecord]:
+    """Read a symbols.csv written by _write_symbol_manifest(). No pattern filter; works for all asset classes."""
+    if not manifest_path.exists():
+        return []
+    try:
+        frame = pd.read_csv(manifest_path, dtype=str).fillna("")
+    except Exception:
+        return []
+    required = {"code", "name", "market", "yahoo_symbol"}
+    if not required.issubset(frame.columns):
+        return []
+    records: list[SymbolRecord] = []
+    for row in frame.itertuples(index=False):
+        code = str(getattr(row, "code", "")).strip().upper()
+        yahoo_symbol = str(getattr(row, "yahoo_symbol", "")).strip().upper()
+        if not code or not yahoo_symbol:
+            continue
+        name = str(getattr(row, "name", code)).strip() or code
+        market = str(getattr(row, "market", asset_class)).strip() or asset_class
+        records.append(SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol))
+    return records
+
+
 def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[DownloadResult]) -> None:
     report_path = output_dir / "download_report.csv"
     with report_path.open("w", encoding="utf-8", newline="") as handle:
@@ -1022,16 +1325,40 @@ def _resolve_asset_output_dir(args: argparse.Namespace, asset_class: str) -> Pat
 def _load_existing_file_info(output_path: Path) -> tuple[str | None, str | None, str | None, set[str]]:
     if not output_path.exists():
         return None, None, "missing", set()
-    try:
-        frame = pd.read_parquet(output_path)
-    except Exception as exc:
-        return None, None, f"read_error: {exc}", set()
-    if frame.empty or "date" not in frame.columns:
-        return None, None, "empty", set(frame.columns)
-    dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+    columns: set[str] = set()
+    date_values: pd.Series | None = None
+
+    if pq is not None:
+        try:
+            schema = pq.read_schema(output_path)
+            columns = set(schema.names)
+        except Exception as exc:
+            return None, None, f"schema_error: {exc}", set()
+
+        if "date" not in columns:
+            return None, None, "empty", columns
+
+        try:
+            date_frame = pd.read_parquet(output_path, columns=["date"])
+        except Exception as exc:
+            return None, None, f"read_error: {exc}", columns
+        if date_frame.empty:
+            return None, None, "empty", columns
+        date_values = date_frame["date"]
+    else:
+        try:
+            frame = pd.read_parquet(output_path)
+        except Exception as exc:
+            return None, None, f"read_error: {exc}", set()
+        columns = set(frame.columns)
+        if frame.empty or "date" not in columns:
+            return None, None, "empty", columns
+        date_values = frame["date"]
+
+    dates = pd.to_datetime(date_values, errors="coerce").dropna()
     if dates.empty:
-        return None, None, "no_valid_date", set(frame.columns)
-    return dates.min().date().isoformat(), dates.max().date().isoformat(), None, set(frame.columns)
+        return None, None, "no_valid_date", columns
+    return dates.min().date().isoformat(), dates.max().date().isoformat(), None, columns
 
 
 def _summarize_repair_coverage(checks: list[RepairCheck], target_end: str) -> tuple[str | None, str | None, int | None, int]:
@@ -1046,99 +1373,261 @@ def _summarize_repair_coverage(checks: list[RepairCheck], target_end: str) -> tu
     return oldest.isoformat(), newest.isoformat(), lag_days, len(last_dates)
 
 
+def _summarize_post_repair_coverage(
+    checks: list[RepairCheck],
+    results: list[DownloadResult],
+    target_end: str,
+) -> tuple[str | None, str | None, int | None, int]:
+    """Compute post-repair coverage from in-memory data without re-reading disk."""
+    # Build a map of code -> last_date for successfully repaired symbols.
+    repair_end_date = target_end  # repaired files go up to the requested end date.
+    repaired_codes: set[str] = {
+        r.code for r in results if r.status in {"repaired", "schema_repaired"}
+    }
+
+    first_dates: list[date] = []
+    last_dates: list[date] = []
+    for check in checks:
+        if check.status == "broken" or check.first_date is None:
+            continue
+        first_dates.append(_parse_date(check.first_date).date())
+        if check.record.code in repaired_codes:
+            last_dates.append(_parse_date(repair_end_date).date())
+        elif check.last_date:
+            last_dates.append(_parse_date(check.last_date).date())
+
+    if not first_dates or not last_dates:
+        return None, None, None, 0
+
+    oldest = min(first_dates)
+    newest = max(last_dates)
+    lag_days = (_parse_date(target_end).date() - newest).days
+    return oldest.isoformat(), newest.isoformat(), lag_days, len(last_dates)
+
+
 def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: list[SymbolRecord], output_dir: Path) -> list[RepairCheck]:
     checks: list[RepairCheck] = []
     target_end = args.end_date or _today_str()
     target_end_dt = _parse_date(target_end).date()
     overlap = max(1, args.repair_overlap_days)
+    precheck_loader = PrecheckLoader() if args.precheck_file_timeout_seconds > 0 else None
+    blacklist_path = _blacklist_file_path(output_dir)
+    blacklist_symbols = _load_blacklist(blacklist_path)
+    blacklist_lock = threading.Lock()
 
-    for record in records:
-        output_path = output_dir / f"{record.code}_features.parquet"
-        first_date, last_date, error, columns = _load_existing_file_info(output_path)
-        if error == "missing":
-            checks.append(
-                RepairCheck(
-                    record=record,
-                    status="missing",
-                    output_path=output_path,
-                    first_date=None,
-                    last_date=None,
-                    repair_start_date=args.start_date,
-                    merge_existing=False,
+    progress = tqdm(records, desc=f"precheck:{asset_class}", unit="symbol")
+    try:
+        for record in progress:
+            progress.set_postfix_str(record.code, refresh=False)
+            output_path = output_dir / f"{record.code}_features.parquet"
+            try:
+                if precheck_loader is not None:
+                    first_date, last_date, error, columns = precheck_loader.load_with_timeout(
+                        output_path,
+                        args.precheck_file_timeout_seconds,
+                    )
+                else:
+                    first_date, last_date, error, columns = _load_existing_file_info(output_path)
+            except PrecheckTimeoutError as exc:
+                _blacklist_record_symbols(record.yahoo_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="broken",
+                        output_path=output_path,
+                        first_date=None,
+                        last_date=None,
+                        repair_start_date=args.start_date,
+                        merge_existing=False,
+                        message=str(exc),
+                    )
                 )
-            )
-            continue
-        if error is not None:
-            checks.append(
-                RepairCheck(
-                    record=record,
-                    status="broken",
-                    output_path=output_path,
-                    first_date=None,
-                    last_date=None,
-                    repair_start_date=args.start_date,
-                    merge_existing=False,
-                    message=error,
+                continue
+            except Exception as exc:
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="broken",
+                        output_path=output_path,
+                        first_date=None,
+                        last_date=None,
+                        repair_start_date=args.start_date,
+                        merge_existing=False,
+                        message=str(exc),
+                    )
                 )
-            )
-            continue
-        if last_date is None:
-            checks.append(
-                RepairCheck(
-                    record=record,
-                    status="empty",
-                    output_path=output_path,
-                    first_date=None,
-                    last_date=None,
-                    repair_start_date=args.start_date,
-                    merge_existing=False,
+                continue
+            if error == "missing":
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="missing",
+                        output_path=output_path,
+                        first_date=None,
+                        last_date=None,
+                        repair_start_date=args.start_date,
+                        merge_existing=False,
+                    )
                 )
-            )
-            continue
+                continue
+            if error is not None:
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="broken",
+                        output_path=output_path,
+                        first_date=None,
+                        last_date=None,
+                        repair_start_date=args.start_date,
+                        merge_existing=False,
+                        message=error,
+                    )
+                )
+                continue
+            if last_date is None:
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="empty",
+                        output_path=output_path,
+                        first_date=None,
+                        last_date=None,
+                        repair_start_date=args.start_date,
+                        merge_existing=False,
+                    )
+                )
+                continue
 
-        missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
-        if missing_required:
+            missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
+            if missing_required:
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="schema_mismatch",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=args.start_date,
+                        merge_existing=False,
+                        message=f"missing_required_columns={','.join(missing_required)}",
+                    )
+                )
+                continue
+
+            local_last_dt = _parse_date(last_date).date()
+            if args.mode == "daily-update" and args.daily_stale_max_lag_days > 0:
+                lag_days = (target_end_dt - local_last_dt).days
+                if lag_days > args.daily_stale_max_lag_days:
+                    checks.append(
+                        RepairCheck(
+                            record=record,
+                            status="lagging_skip",
+                            output_path=output_path,
+                            first_date=first_date,
+                            last_date=last_date,
+                            repair_start_date=None,
+                            merge_existing=False,
+                            message=(
+                                f"lag_days={lag_days} exceeds daily_stale_max_lag_days="
+                                f"{args.daily_stale_max_lag_days}"
+                            ),
+                        )
+                    )
+                    continue
+
+            if local_last_dt >= target_end_dt:
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="current",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=None,
+                    )
+                )
+                continue
+
+            repair_start_dt = max(_parse_date(args.start_date).date(), local_last_dt - timedelta(days=overlap))
             checks.append(
                 RepairCheck(
                     record=record,
-                    status="schema_mismatch",
+                    status="stale",
                     output_path=output_path,
                     first_date=first_date,
                     last_date=last_date,
-                    repair_start_date=args.start_date,
-                    merge_existing=False,
-                    message=f"missing_required_columns={','.join(missing_required)}",
+                    repair_start_date=repair_start_dt.isoformat(),
+                    merge_existing=True,
                 )
             )
-            continue
-
-        local_last_dt = _parse_date(last_date).date()
-        if local_last_dt >= target_end_dt:
-            checks.append(
-                RepairCheck(
-                    record=record,
-                    status="current",
-                    output_path=output_path,
-                    first_date=first_date,
-                    last_date=last_date,
-                    repair_start_date=None,
-                )
-            )
-            continue
-
-        repair_start_dt = max(_parse_date(args.start_date).date(), local_last_dt - timedelta(days=overlap))
-        checks.append(
-            RepairCheck(
-                record=record,
-                status="stale",
-                output_path=output_path,
-                first_date=first_date,
-                last_date=last_date,
-                repair_start_date=repair_start_dt.isoformat(),
-                merge_existing=True,
-            )
-        )
+    finally:
+        progress.close()
+        if precheck_loader is not None:
+            precheck_loader.close()
     return checks
+
+
+def _run_parallel_symbol_downloads(
+    asset_class: str,
+    args: argparse.Namespace,
+    output_dir: Path,
+    tasks: list[tuple[SymbolRecord, str, bool, bool, object]],
+    progress_desc: str,
+    blacklist_symbols: set[str],
+    blacklist_path: Path,
+    blacklist_lock: threading.Lock,
+    whitelist_symbols: set[str],
+    whitelist_path: Path,
+    whitelist_lock: threading.Lock,
+    symbol_timeout_seconds: int | None = None,
+    timeout_handler: Callable[[SymbolRecord, object, int | None], DownloadResult] | None = None,
+    result_transformer: Callable[[DownloadResult, object], DownloadResult] | None = None,
+) -> list[DownloadResult]:
+    if not tasks:
+        return []
+
+    results: list[DownloadResult] = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+        futures = {
+            executor.submit(
+                _download_symbol,
+                asset_class,
+                record,
+                output_dir,
+                start_date,
+                args.end_date,
+                args.retries,
+                refresh,
+                merge_existing,
+                blacklist_symbols,
+                blacklist_path,
+                blacklist_lock,
+                whitelist_symbols,
+                whitelist_path,
+                whitelist_lock,
+            ): (record, meta)
+            for record, start_date, refresh, merge_existing, meta in tasks
+        }
+
+        progress = tqdm(total=len(futures), desc=progress_desc, unit="symbol")
+        try:
+            for future in as_completed(futures, timeout=None):
+                record, meta = futures[future]
+                try:
+                    result = future.result(timeout=symbol_timeout_seconds)
+                except TimeoutError:
+                    if timeout_handler is None:
+                        raise
+                    result = timeout_handler(record, meta, symbol_timeout_seconds)
+
+                if result_transformer is not None:
+                    result = result_transformer(result, meta)
+                results.append(result)
+                progress.update(1)
+        finally:
+            progress.close()
+
+    return results
 
 
 def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str, int]:
@@ -1165,7 +1654,8 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     print(
         f"[repair] asset={asset_class} current={status_counts.get('current', 0)} "
         f"missing={status_counts.get('missing', 0)} stale={status_counts.get('stale', 0)} "
-        f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)}"
+        f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)} "
+        f"lagging_skip={status_counts.get('lagging_skip', 0)}"
     )
     target_end = args.end_date or _today_str()
     oldest_date, newest_date, lag_days, tracked = _summarize_repair_coverage(checks, target_end)
@@ -1177,47 +1667,55 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     else:
         print(f"[repair] asset={asset_class} local_range=n/a tracked=0")
 
-    results: list[DownloadResult] = []
-    if pending:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-            futures = {
-                executor.submit(
-                    _download_symbol,
-                    asset_class,
-                    check.record,
-                    output_dir,
-                    check.repair_start_date,
-                    args.end_date,
-                    args.retries,
-                    True,
-                    check.merge_existing,
-                    blacklist_symbols,
-                    blacklist_path,
-                    blacklist_lock,
-                    whitelist_symbols,
-                    whitelist_path,
-                    whitelist_lock,
-                ): check
-                for check in pending
-            }
-            progress = tqdm(total=len(futures), desc=f"repair:{asset_class}", unit="symbol")
-            try:
-                for future in as_completed(futures):
-                    result = future.result()
-                    check = futures[future]
-                    if result.status == "updated":
-                        if check.status == "schema_mismatch":
-                            result.status = "schema_repaired"
-                        else:
-                            result.status = "repaired"
-                    elif result.status == "empty":
-                        result.status = "still_stale"
-                        if check.last_date:
-                            result.message = f"No newer rows returned; local last date remains {check.last_date}"
-                    results.append(result)
-                    progress.update(1)
-            finally:
-                progress.close()
+    def _repair_timeout_result(record: SymbolRecord, meta: object, timeout_seconds: int | None) -> DownloadResult:
+        check = meta
+        assert isinstance(check, RepairCheck)
+        return DownloadResult(
+            asset_class=asset_class,
+            code=record.code,
+            yahoo_symbol=record.yahoo_symbol,
+            market=record.market,
+            status="failed",
+            rows=0,
+            output_path=None,
+            message=f"repair timed out after {timeout_seconds}s",
+        )
+
+    def _repair_result_transform(result: DownloadResult, meta: object) -> DownloadResult:
+        check = meta
+        assert isinstance(check, RepairCheck)
+        if result.status == "updated":
+            if check.status == "schema_mismatch":
+                result.status = "schema_repaired"
+            else:
+                result.status = "repaired"
+        elif result.status == "empty":
+            result.status = "still_stale"
+            if check.last_date:
+                result.message = f"No newer rows returned; local last date remains {check.last_date}"
+        return result
+
+    repair_tasks = [
+        (check.record, check.repair_start_date, True, check.merge_existing, check)
+        for check in pending
+        if check.repair_start_date is not None
+    ]
+    results = _run_parallel_symbol_downloads(
+        asset_class=asset_class,
+        args=args,
+        output_dir=output_dir,
+        tasks=repair_tasks,
+        progress_desc=f"repair:{asset_class}",
+        blacklist_symbols=blacklist_symbols,
+        blacklist_path=blacklist_path,
+        blacklist_lock=blacklist_lock,
+        whitelist_symbols=whitelist_symbols,
+        whitelist_path=whitelist_path,
+        whitelist_lock=whitelist_lock,
+        symbol_timeout_seconds=args.repair_symbol_timeout_seconds or None,
+        timeout_handler=_repair_timeout_result,
+        result_transformer=_repair_result_transform,
+    )
 
     if results:
         _write_download_artifacts(output_dir, asset_class, results)
@@ -1242,8 +1740,10 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
                 }
             )
 
-    post_checks = _resolve_repair_plan(asset_class, args, records, output_dir)
-    post_oldest, post_newest, post_lag_days, post_tracked = _summarize_repair_coverage(post_checks, target_end)
+    # Post-repair coverage: compute entirely from in-memory data; no second disk scan.
+    post_oldest, post_newest, post_lag_days, post_tracked = _summarize_post_repair_coverage(
+        checks, results, target_end
+    )
     if post_oldest and post_newest and post_lag_days is not None:
         print(
             f"[repair] asset={asset_class} post_repair_range={post_oldest}..{post_newest} "
@@ -1271,35 +1771,20 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
     _write_symbol_manifest(output_dir, records)
-    results: list[DownloadResult] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = {
-            executor.submit(
-                _download_symbol,
-                asset_class,
-                record,
-                output_dir,
-                args.start_date,
-                args.end_date,
-                args.retries,
-                args.refresh,
-                False,
-                blacklist_symbols,
-                blacklist_path,
-                blacklist_lock,
-                whitelist_symbols,
-                whitelist_path,
-                whitelist_lock,
-            ): record
-            for record in records
-        }
-        progress = tqdm(total=len(futures), desc=f"download:{asset_class}", unit="symbol")
-        try:
-            for future in as_completed(futures):
-                results.append(future.result())
-                progress.update(1)
-        finally:
-            progress.close()
+    download_tasks = [(record, args.start_date, args.refresh, False, None) for record in records]
+    results = _run_parallel_symbol_downloads(
+        asset_class=asset_class,
+        args=args,
+        output_dir=output_dir,
+        tasks=download_tasks,
+        progress_desc=f"download:{asset_class}",
+        blacklist_symbols=blacklist_symbols,
+        blacklist_path=blacklist_path,
+        blacklist_lock=blacklist_lock,
+        whitelist_symbols=whitelist_symbols,
+        whitelist_path=whitelist_path,
+        whitelist_lock=whitelist_lock,
+    )
 
     results.sort(key=lambda item: item.code)
     _write_download_artifacts(output_dir, asset_class, results)
@@ -1321,21 +1806,30 @@ def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dic
 
 
 def main() -> None:
+    # Cap all socket operations (including DNS via getaddrinfo on supported platforms)
+    # so any single blocking call can't hang the process indefinitely.
+    socket.setdefaulttimeout(30)
     args = parse_args()
     asset_classes = list(ASSET_CLASSES) if args.asset == "all" else [args.asset]
     summaries: dict[str, dict[str, int]] = {}
 
     asset_workers = max(1, int(args.asset_workers))
-    if len(asset_classes) == 1 or asset_workers == 1:
-        for asset_class in asset_classes:
-            key, counts = _run_one_asset(asset_class, args)
-            summaries[key] = counts
-    else:
-        with ThreadPoolExecutor(max_workers=min(asset_workers, len(asset_classes))) as executor:
-            futures = {executor.submit(_run_one_asset, asset_class, args): asset_class for asset_class in asset_classes}
-            for future in as_completed(futures):
-                key, counts = future.result()
+    asset_progress = tqdm(total=len(asset_classes), desc=f"{args.mode}:assets", unit="asset")
+    try:
+        if len(asset_classes) == 1 or asset_workers == 1:
+            for asset_class in asset_classes:
+                key, counts = _run_one_asset(asset_class, args)
                 summaries[key] = counts
+                asset_progress.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=min(asset_workers, len(asset_classes))) as executor:
+                futures = {executor.submit(_run_one_asset, asset_class, args): asset_class for asset_class in asset_classes}
+                for future in as_completed(futures):
+                    key, counts = future.result()
+                    summaries[key] = counts
+                    asset_progress.update(1)
+    finally:
+        asset_progress.close()
 
     if args.mode == "download":
         summary_name = "download_summary.json"

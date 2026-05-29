@@ -4,9 +4,8 @@ import argparse
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,6 +13,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
+
+from common import resolve_end_date, run_parallel_tasks
 
 
 BASE_URL = "https://api.bybit.com"
@@ -96,13 +97,6 @@ def _resolve_categories(values: list[str]) -> list[str]:
     if not unique:
         raise ValueError("No valid categories. Use: linear inverse or all.")
     return unique
-
-
-def _resolve_end_date(value: str) -> str:
-    text = value.strip().lower()
-    if text in {"today", "now"}:
-        return date.today().isoformat()
-    return value.strip()
 
 
 def _date_to_ms(date_str: str, *, end_of_day: bool) -> int:
@@ -444,7 +438,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
 
     start_date = args.start_date.strip()
-    end_date = _resolve_end_date(args.end_date)
+    end_date = resolve_end_date(args.end_date)
     start_ms = _date_to_ms(start_date, end_of_day=False)
     end_ms = _date_to_ms(end_date, end_of_day=True)
 
@@ -462,42 +456,37 @@ def main() -> None:
     symbols_path = output_dir / "symbols.csv"
     pd.DataFrame([asdict(s) for s in symbols]).to_csv(symbols_path, index=False)
 
-    results: list[DownloadResult] = []
-    max_workers = max(1, int(args.workers))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _download_symbol_daily,
-                client,
-                record,
-                output_dir,
-                start_ms,
-                end_ms,
-                args.mode,
-                args.refresh,
-            ): record
-            for record in symbols
-        }
-        for future in as_completed(futures):
-            record = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = DownloadResult(
-                    asset_class="crypto_bybit_perp",
-                    code=record.code,
-                    bybit_symbol=record.bybit_symbol,
-                    market=record.market,
-                    status="failed",
-                    rows=0,
-                    output_path=None,
-                    message=str(exc),
-                )
-            results.append(result)
-            print(
-                f"[bybit] {result.status:>15} {result.bybit_symbol:<20} rows={result.rows} "
-                f"msg={result.message or '-'}"
-            )
+    def _worker(record: SymbolRecord) -> DownloadResult:
+        return _download_symbol_daily(
+            client,
+            record,
+            output_dir,
+            start_ms,
+            end_ms,
+            args.mode,
+            args.refresh,
+        )
+
+    def _on_error(record: SymbolRecord, exc: Exception) -> DownloadResult:
+        return DownloadResult(
+            asset_class="crypto_bybit_perp",
+            code=record.code,
+            bybit_symbol=record.bybit_symbol,
+            market=record.market,
+            status="failed",
+            rows=0,
+            output_path=None,
+            message=str(exc),
+        )
+
+    results = run_parallel_tasks(
+        symbols,
+        _worker,
+        max_workers=args.workers,
+        desc="download:bybit",
+        unit="symbol",
+        on_error=_on_error,
+    )
 
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
