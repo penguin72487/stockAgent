@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
-from datetime import date
 from pathlib import Path
+
+from common import resolve_end_date
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,13 +38,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_end_date(value: str) -> str:
-    text = value.strip().lower()
-    if text in {"today", "now"}:
-        return date.today().isoformat()
-    return value.strip()
-
-
 def main() -> None:
     args = parse_args()
 
@@ -65,7 +59,7 @@ def main() -> None:
         "--start-date",
         args.start_date,
         "--end-date",
-        _resolve_end_date(args.end_date),
+        resolve_end_date(args.end_date),
         "--output-dir",
         str(output_dir),
         "--workers",

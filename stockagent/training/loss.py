@@ -114,6 +114,30 @@ def _compute_risk_ratio(valid_returns: Tensor, objective: str) -> Tensor:
     return mean_return / std_return * annualizer
 
 
+def _compute_excess_risk_terms(
+    valid_returns: Tensor,
+    valid_benchmark: Tensor,
+    cvar_alpha: float,
+    drawdown_target: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    excess_returns = valid_returns - valid_benchmark
+    mean_excess = excess_returns.mean()
+
+    alpha = min(max(float(cvar_alpha), 1e-6), 1.0 - 1e-6)
+    losses = -excess_returns
+    var_alpha = torch.quantile(losses, alpha)
+    tail_excess = torch.relu(losses - var_alpha)
+    cvar = var_alpha + tail_excess.mean() / (1.0 - alpha)
+
+    rel_log_equity = torch.cumsum(excess_returns, dim=0)
+    rel_equity = torch.exp(torch.clamp(rel_log_equity, -60.0, 60.0))
+    running_max = torch.cummax(rel_equity, dim=0).values
+    drawdowns = 1.0 - rel_equity / running_max.clamp_min(1e-12)
+    mdd = drawdowns.max() if drawdowns.numel() > 0 else mean_excess.new_zeros(())
+    drawdown_penalty = F.softplus((mdd - float(drawdown_target)) * 20.0) / 20.0
+    return excess_returns, mean_excess, cvar, mdd, drawdown_penalty
+
+
 def risk_aware_loss(
     weights: Tensor,
     future_log_returns: Tensor,
@@ -134,6 +158,14 @@ def risk_aware_loss(
     gamma_drawdown: float = 0.0,
     drawdown_target: float = 0.2,
     gamma_turnover: float = 0.1,
+    gamma_underperformance: float = 1.0,
+    excess_target: float = 0.0,
+    cvar_budget: float = 0.03,
+    drawdown_budget: float = 0.2,
+    turnover_budget: float = 0.3,
+    gamma_cvar_budget: float = 1.0,
+    gamma_drawdown_budget: float = 1.0,
+    gamma_turnover_budget: float = 0.0,
     objective: str = "sharpe",
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
@@ -183,32 +215,49 @@ def risk_aware_loss(
         return weights.sum() * 0.0
 
     objective_norm = objective.strip().lower()
-    if objective_norm in {"excess_cvar_drawdown", "cvar", "cvar_drawdown", "excess_cvar"}:
+    if objective_norm in {
+        "excess_cvar_drawdown",
+        "cvar",
+        "cvar_drawdown",
+        "excess_cvar",
+        "outperformance_risk_budget",
+        "outperformance_budget",
+        "outperformance_first",
+    }:
         valid_benchmark = backtest.benchmark_returns[valid_mask]
         valid_benchmark = torch.nan_to_num(valid_benchmark, nan=0.0, posinf=0.0, neginf=0.0)
-        excess_returns = valid_returns - valid_benchmark
-
-        mean_excess = excess_returns.mean()
-
-        alpha = float(cvar_alpha)
-        alpha = min(max(alpha, 1e-6), 1.0 - 1e-6)
-        losses = -excess_returns
-        var_alpha = torch.quantile(losses, alpha)
-        tail_excess = torch.relu(losses - var_alpha)
-        cvar = var_alpha + tail_excess.mean() / (1.0 - alpha)
-
-        rel_log_equity = torch.cumsum(excess_returns, dim=0)
-        rel_equity = torch.exp(torch.clamp(rel_log_equity, -60.0, 60.0))
-        running_max = torch.cummax(rel_equity, dim=0).values
-        drawdowns = 1.0 - rel_equity / running_max.clamp_min(1e-12)
-        mdd = drawdowns.max() if drawdowns.numel() > 0 else mean_excess.new_zeros(())
-        drawdown_penalty = F.softplus((mdd - float(drawdown_target)) * 20.0) / 20.0
-
-        objective_value = (
-            -gamma_excess * mean_excess
-            + gamma_cvar * cvar
-            + gamma_drawdown * drawdown_penalty
+        _, mean_excess, cvar, mdd, drawdown_penalty = _compute_excess_risk_terms(
+            valid_returns,
+            valid_benchmark,
+            cvar_alpha=cvar_alpha,
+            drawdown_target=drawdown_target,
         )
+
+        if objective_norm in {"outperformance_risk_budget", "outperformance_budget", "outperformance_first"}:
+            underperformance = torch.relu(float(excess_target) - (valid_returns - valid_benchmark)).mean()
+            turnover_mean = backtest.turnovers[valid_mask]
+            turnover_mean = torch.nan_to_num(turnover_mean, nan=0.0, posinf=0.0, neginf=0.0)
+            turnover_mean = turnover_mean.mean() if turnover_mean.numel() > 0 else mean_excess.new_zeros(())
+
+            cvar_budget_penalty = torch.relu(cvar - float(cvar_budget))
+            drawdown_budget_penalty = torch.relu(mdd - float(drawdown_budget))
+            turnover_budget_penalty = torch.relu(turnover_mean - float(turnover_budget))
+
+            objective_value = (
+                -gamma_excess * mean_excess
+                + gamma_underperformance * underperformance
+                + gamma_cvar_budget * cvar_budget_penalty
+                + gamma_drawdown_budget * drawdown_budget_penalty
+                + gamma_turnover_budget * turnover_budget_penalty
+                + gamma_cvar * cvar
+                + gamma_drawdown * drawdown_penalty
+            )
+        else:
+            objective_value = (
+                -gamma_excess * mean_excess
+                + gamma_cvar * cvar
+                + gamma_drawdown * drawdown_penalty
+            )
     else:
         risk_ratio = _compute_risk_ratio(valid_returns, objective)
         objective_value = -gamma_sharpe * risk_ratio

@@ -554,8 +554,9 @@ def build_panel(
     use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
-    buy_tradable_mode: str = "tradable",
-    sell_tradable_mode: str = "tradable",
+    tradable_mode: str = "tradable",
+    buy_tradable_mode: str | None = None,
+    sell_tradable_mode: str | None = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -571,21 +572,25 @@ def build_panel(
     meta_path = _cache_meta_path(parquet_root)
 
     use_cudf = bool(use_rapids) and cudf is not None
-    buy_tradable_mode = str(buy_tradable_mode).strip().lower()
-    sell_tradable_mode = str(sell_tradable_mode).strip().lower()
+    if buy_tradable_mode is not None or sell_tradable_mode is not None:
+        buy_mode = str(buy_tradable_mode if buy_tradable_mode is not None else tradable_mode).strip().lower()
+        sell_mode = str(sell_tradable_mode if sell_tradable_mode is not None else tradable_mode).strip().lower()
+        if buy_mode != sell_mode:
+            raise ValueError(
+                "buy_tradable_mode and sell_tradable_mode must be identical when provided"
+            )
+        tradable_mode = buy_mode
+
+    tradable_mode = str(tradable_mode).strip().lower()
     valid_tradable_modes = {"tradable", "tw_limit_guard"}
-    if buy_tradable_mode not in valid_tradable_modes:
+    if tradable_mode not in valid_tradable_modes:
         raise ValueError(
-            f"buy_tradable_mode must be one of {sorted(valid_tradable_modes)}, got {buy_tradable_mode!r}"
-        )
-    if sell_tradable_mode not in valid_tradable_modes:
-        raise ValueError(
-            f"sell_tradable_mode must be one of {sorted(valid_tradable_modes)}, got {sell_tradable_mode!r}"
+            f"tradable_mode must be one of {sorted(valid_tradable_modes)}, got {tradable_mode!r}"
         )
 
     backend_key = (
         f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|"
-        f"usd_only={usd_only_trading_pairs}|buy_mode={buy_tradable_mode}|sell_mode={sell_tradable_mode}"
+        f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}"
     )
     
     # Check cache validity
@@ -604,12 +609,11 @@ def build_panel(
                 frame = _load_symbol_frame_cudf(path)
                 if len(frame) == 0:
                     continue
-                use_tw_limit_buy = buy_tradable_mode == "tw_limit_guard"
-                use_tw_limit_sell = sell_tradable_mode == "tw_limit_guard"
-                if use_tw_limit_buy or use_tw_limit_sell:
+                use_tw_limit_guard = tradable_mode == "tw_limit_guard"
+                if use_tw_limit_guard:
                     can_buy_limit, can_sell_limit = _compute_tw_limit_masks(frame)
-                    frame["can_buy"] = can_buy_limit if use_tw_limit_buy else frame["tradable"].astype(bool)
-                    frame["can_sell"] = can_sell_limit if use_tw_limit_sell else frame["tradable"].astype(bool)
+                    frame["can_buy"] = can_buy_limit
+                    frame["can_sell"] = can_sell_limit
                 else:
                     frame["can_buy"] = frame["tradable"].astype(bool)
                     frame["can_sell"] = frame["tradable"].astype(bool)
@@ -633,7 +637,7 @@ def build_panel(
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
             backend_key = (
                 f"pandas|benchmark={benchmark_name}|"
-                f"usd_only={usd_only_trading_pairs}|buy_mode={buy_tradable_mode}|sell_mode={sell_tradable_mode}"
+                f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}"
             )
     
     symbol_frames: list[pd.DataFrame] = []
@@ -643,12 +647,11 @@ def build_panel(
             frame = _load_symbol_frame(path)
             if len(frame) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
-            use_tw_limit_buy = buy_tradable_mode == "tw_limit_guard"
-            use_tw_limit_sell = sell_tradable_mode == "tw_limit_guard"
-            if use_tw_limit_buy or use_tw_limit_sell:
+            use_tw_limit_guard = tradable_mode == "tw_limit_guard"
+            if use_tw_limit_guard:
                 can_buy_limit, can_sell_limit = _compute_tw_limit_masks(frame)
-                frame["can_buy"] = can_buy_limit if use_tw_limit_buy else frame["tradable"].astype(bool)
-                frame["can_sell"] = can_sell_limit if use_tw_limit_sell else frame["tradable"].astype(bool)
+                frame["can_buy"] = can_buy_limit
+                frame["can_sell"] = can_sell_limit
             else:
                 frame["can_buy"] = frame["tradable"].astype(bool)
                 frame["can_sell"] = frame["tradable"].astype(bool)

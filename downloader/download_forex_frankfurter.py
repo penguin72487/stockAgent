@@ -3,22 +3,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import requests
-from tqdm import tqdm
+
+from common import resolve_end_date, run_parallel_tasks
 
 API_BASE = "https://api.frankfurter.app"
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
-
-
-def _today_str() -> str:
-    return date.today().isoformat()
-
 
 @dataclass(slots=True)
 class SymbolRecord:
@@ -262,8 +256,7 @@ def main() -> None:
 
     supported = _load_supported_currencies(args.timeout)
     api_latest = _resolve_api_end_date(args.timeout)
-    requested_end_raw = str(args.end_date).strip().lower()
-    requested_end = _today_str() if requested_end_raw in {"today", "now"} else str(args.end_date).strip()
+    requested_end = resolve_end_date(str(args.end_date))
     applied_end = min(requested_end, api_latest)
 
     if args.symbols_file:
@@ -279,28 +272,24 @@ def main() -> None:
         manifest = pd.DataFrame([asdict(item) for item in records])
         manifest.to_csv(output_dir / "symbols.csv", index=False)
 
-    results: list[DownloadResult] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = {
-            executor.submit(
-                _download_pair,
-                record,
-                args.start_date,
-                applied_end,
-                output_dir,
-                args.timeout,
-                args.refresh,
-                incremental_mode,
-            ): record
-            for record in records
-        }
-        progress = tqdm(total=len(futures), desc="download:forex:frankfurter", unit="symbol")
-        try:
-            for future in as_completed(futures):
-                results.append(future.result())
-                progress.update(1)
-        finally:
-            progress.close()
+    def _worker(record: SymbolRecord) -> DownloadResult:
+        return _download_pair(
+            record,
+            args.start_date,
+            applied_end,
+            output_dir,
+            args.timeout,
+            args.refresh,
+            incremental_mode,
+        )
+
+    results = run_parallel_tasks(
+        records,
+        _worker,
+        max_workers=args.workers,
+        desc="download:forex:frankfurter",
+        unit="symbol",
+    )
 
     results.sort(key=lambda item: item.code)
 

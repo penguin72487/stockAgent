@@ -35,8 +35,7 @@ class DataConfig:
     universe_mode: str
     use_rapids: bool = False
     usd_only_trading_pairs: bool = False
-    buy_tradable_mode: str = "tradable"
-    sell_tradable_mode: str = "tradable"
+    tradable_mode: str = "tradable"
 
 
 @dataclass(slots=True)
@@ -179,7 +178,7 @@ class TrainingConfig:
     num_workers: int = 0
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
-    loss_type: str = "mse"  # "mse", "sharpe", "sortino", or "excess_cvar_drawdown"
+    loss_type: str = "mse"  # "mse", "sharpe", "sortino", "excess_cvar_drawdown", or "outperformance_risk_budget"
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
     tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)
@@ -200,6 +199,14 @@ class EvaluationConfig:
     gamma_drawdown: float = 0.0
     drawdown_target: float = 0.2
     gamma_turnover: float = 0.0
+    gamma_underperformance: float = 1.0
+    excess_target: float = 0.0
+    cvar_budget: float = 0.03
+    drawdown_budget: float = 0.2
+    turnover_budget: float = 0.3
+    gamma_cvar_budget: float = 1.0
+    gamma_drawdown_budget: float = 1.0
+    gamma_turnover_budget: float = 0.0
 
 
 @dataclass(slots=True)
@@ -361,6 +368,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     evaluation.setdefault("gamma_drawdown", 0.0)
     evaluation.setdefault("drawdown_target", 0.2)
     evaluation.setdefault("gamma_turnover", 0.0)
+    evaluation.setdefault("gamma_underperformance", 1.0)
+    evaluation.setdefault("excess_target", 0.0)
+    evaluation.setdefault("cvar_budget", 0.03)
+    evaluation.setdefault("drawdown_budget", 0.2)
+    evaluation.setdefault("turnover_budget", 0.3)
+    evaluation.setdefault("gamma_cvar_budget", 1.0)
+    evaluation.setdefault("gamma_drawdown_budget", 1.0)
+    evaluation.setdefault("gamma_turnover_budget", 0.0)
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
@@ -375,26 +390,37 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     legacy_tw_guard = bool(data.pop("tw_limit_up_down_guard", False))
     trading.pop("use_all_tradable_symbols", None)
 
-    if "buy_tradable_mode" not in data:
-        if legacy_tw_guard:
-            data["buy_tradable_mode"] = "tw_limit_guard"
-        else:
-            data["buy_tradable_mode"] = "tradable"
+    raw_tradable_mode = data.get("tradable_mode", None)
+    raw_buy_mode = data.pop("buy_tradable_mode", None)
+    raw_sell_mode = data.pop("sell_tradable_mode", None)
 
-    if "sell_tradable_mode" not in data:
-        if legacy_tw_guard:
-            data["sell_tradable_mode"] = "tw_limit_guard"
-        else:
-            data["sell_tradable_mode"] = "tradable"
+    if raw_tradable_mode is not None:
+        data["tradable_mode"] = raw_tradable_mode
+    elif raw_buy_mode is not None and raw_sell_mode is not None:
+        buy_mode_normalized = str(raw_buy_mode).strip().lower()
+        sell_mode_normalized = str(raw_sell_mode).strip().lower()
+        if buy_mode_normalized != sell_mode_normalized:
+            raise ValueError(
+                "data.buy_tradable_mode and data.sell_tradable_mode must be identical; "
+                f"got {raw_buy_mode!r} and {raw_sell_mode!r}"
+            )
+        data["tradable_mode"] = buy_mode_normalized
+    elif raw_buy_mode is not None:
+        data["tradable_mode"] = raw_buy_mode
+    elif raw_sell_mode is not None:
+        data["tradable_mode"] = raw_sell_mode
+    elif legacy_tw_guard:
+        data["tradable_mode"] = "tw_limit_guard"
+    else:
+        data["tradable_mode"] = "tradable"
 
     valid_tradable_modes = {"tradable", "tw_limit_guard"}
-    for key in ("buy_tradable_mode", "sell_tradable_mode"):
-        mode = str(data.get(key, "")).strip().lower()
-        if mode not in valid_tradable_modes:
-            raise ValueError(
-                f"data.{key} must be one of {sorted(valid_tradable_modes)}, got {data.get(key)!r}"
-            )
-        data[key] = mode
+    mode = str(data.get("tradable_mode", "")).strip().lower()
+    if mode not in valid_tradable_modes:
+        raise ValueError(
+            f"data.tradable_mode must be one of {sorted(valid_tradable_modes)}, got {data.get('tradable_mode')!r}"
+        )
+    data["tradable_mode"] = mode
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))

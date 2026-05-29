@@ -24,8 +24,7 @@ data:
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
-  buy_tradable_mode: tw_limit_guard
-  sell_tradable_mode: tw_limit_guard
+  tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -81,7 +80,7 @@ training:
   num_workers: 0
   weight_decay: 0.00001
   grad_clip_norm: 1.0
-  loss_type: excess_cvar_drawdown
+  loss_type: outperformance_risk_budget
   min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
@@ -160,3 +159,11 @@ evaluation:
   gamma_drawdown: 0.5
   drawdown_target: 0.2
   gamma_turnover: 0.0
+  gamma_underperformance: 2.0
+  excess_target: 0.0
+  cvar_budget: 0.03
+  drawdown_budget: 0.18
+  turnover_budget: 0.35
+  gamma_cvar_budget: 2.0
+  gamma_drawdown_budget: 2.5
+  gamma_turnover_budget: 0.5
