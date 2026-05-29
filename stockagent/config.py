@@ -35,7 +35,8 @@ class DataConfig:
     universe_mode: str
     use_rapids: bool = False
     usd_only_trading_pairs: bool = False
-    tw_limit_up_down_guard: bool = False
+    buy_tradable_mode: str = "tradable"
+    sell_tradable_mode: str = "tradable"
 
 
 @dataclass(slots=True)
@@ -52,7 +53,6 @@ class TradingConfig:
     sell_fee_rate: float
     long_only: bool
     cash_allowed: bool
-    use_all_tradable_symbols: bool
     max_turnover_ratio: float = 0.0
     gross_leverage: float = 1.0
 
@@ -365,11 +365,39 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
     data.setdefault("usd_only_trading_pairs", False)
-    data.setdefault("tw_limit_up_down_guard", False)
 
     trading = raw.setdefault("trading", {})
+
+    # Legacy migration:
+    # - data.tw_limit_up_down_guard=true  -> buy/sell use TW limit guard
+    # - trading.use_all_tradable_symbols was previously not wired at runtime,
+    #   so we keep historical behavior by deriving modes from tw_limit_up_down_guard.
+    legacy_tw_guard = bool(data.pop("tw_limit_up_down_guard", False))
+    trading.pop("use_all_tradable_symbols", None)
+
+    if "buy_tradable_mode" not in data:
+        if legacy_tw_guard:
+            data["buy_tradable_mode"] = "tw_limit_guard"
+        else:
+            data["buy_tradable_mode"] = "tradable"
+
+    if "sell_tradable_mode" not in data:
+        if legacy_tw_guard:
+            data["sell_tradable_mode"] = "tw_limit_guard"
+        else:
+            data["sell_tradable_mode"] = "tradable"
+
+    valid_tradable_modes = {"tradable", "tw_limit_guard"}
+    for key in ("buy_tradable_mode", "sell_tradable_mode"):
+        mode = str(data.get(key, "")).strip().lower()
+        if mode not in valid_tradable_modes:
+            raise ValueError(
+                f"data.{key} must be one of {sorted(valid_tradable_modes)}, got {data.get(key)!r}"
+            )
+        data[key] = mode
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
+    trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)

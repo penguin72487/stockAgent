@@ -85,7 +85,8 @@ def main() -> None:
         use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
-        tw_limit_up_down_guard=config.data.tw_limit_up_down_guard,
+        buy_tradable_mode=config.data.buy_tradable_mode,
+        sell_tradable_mode=config.data.sell_tradable_mode,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

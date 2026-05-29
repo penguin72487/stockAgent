@@ -5,18 +5,7 @@ import os
 import torch
 from torch import nn
 
-
-def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-    if mask is None:
-        return torch.softmax(logits, dim=1)
-
-    mask_bool = mask.bool()
-    mask_f = mask.to(dtype=logits.dtype)
-    masked_logits = logits.masked_fill(~mask_bool, torch.finfo(logits.dtype).min)
-    weights = torch.softmax(masked_logits, dim=1) * mask_f
-    normalizer = weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    return weights / normalizer
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax
 
 
 class _ResBlock(nn.Module):
@@ -122,15 +111,5 @@ class CrossSectionalTemporalTabularResNet(nn.Module):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
 
         if self.long_only:
-            return _masked_softmax(logits, tradable_mask)
-
-        if tradable_mask is not None:
-            mask_f = tradable_mask.to(dtype=logits.dtype)
-            denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-            mean_logits = (logits * mask_f).sum(dim=1, keepdim=True) / denom
-            centered = (logits - mean_logits) * mask_f
-        else:
-            centered = logits - logits.mean(dim=1, keepdim=True)
-        centered = torch.nan_to_num(centered, nan=0.0, posinf=0.0, neginf=0.0)
-        gross = centered.abs().sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return centered / gross
+            return masked_softmax(logits, tradable_mask)
+        return dual_branch_softmax(logits, tradable_mask)

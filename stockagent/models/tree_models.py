@@ -8,17 +8,7 @@ import pandas as pd
 import torch
 from torch import nn
 
-
-def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-    if mask is None:
-        return torch.softmax(logits, dim=1)
-
-    mask_bool = mask.bool()
-    mask_f = mask.to(dtype=logits.dtype)
-    masked_logits = logits.masked_fill(~mask_bool, torch.finfo(logits.dtype).min)
-    weights = torch.softmax(masked_logits, dim=1) * mask_f
-    normalizer = weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    return weights / normalizer
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax
 
 
 @dataclass(slots=True)
@@ -111,17 +101,8 @@ class _CrossSectionalTreeBase(nn.Module):
         logits = torch.from_numpy(logits_np).to(device=x.device, dtype=x.dtype)
 
         if self.long_only:
-            return _masked_softmax(logits, tradable_mask)
-
-        if tradable_mask is not None:
-            mask_f = tradable_mask.to(dtype=logits.dtype)
-            denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
-            mean_logits = (logits * mask_f).sum(dim=1, keepdim=True) / denom
-            centered = (logits - mean_logits) * mask_f
-        else:
-            centered = logits - logits.mean(dim=1, keepdim=True)
-        gross = centered.abs().sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return centered / gross
+            return masked_softmax(logits, tradable_mask)
+        return dual_branch_softmax(logits, tradable_mask)
 
 
 class CrossSectionalLightGBM(_CrossSectionalTreeBase):
