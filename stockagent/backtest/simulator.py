@@ -423,6 +423,7 @@ def _vectorized_backtest(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     target_weights = np.asarray(weights, dtype=np.float32).copy()
     tradable = tradable_mask.astype(bool)
@@ -438,6 +439,7 @@ def _vectorized_backtest(
         gross_sums = np.abs(target_weights).sum(axis=1, keepdims=True)
         nonzero = gross_sums.squeeze(1) > 0
         target_weights[nonzero] /= gross_sums[nonzero]
+    target_weights *= np.float32(max(0.0, float(gross_leverage)))
 
     t_len, n_symbols = target_weights.shape
     weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
@@ -636,6 +638,7 @@ def _prepare_scan_inputs(
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
     long_only: bool,
+    gross_leverage: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_dtype = _supported_scan_dtype(weights.dtype)
     target_weights = weights.to(dtype=compute_dtype)
@@ -651,6 +654,9 @@ def _prepare_scan_inputs(
         gross_sums = target_weights.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
         target_weights = target_weights / gross_sums
 
+    leverage = torch.as_tensor(max(0.0, float(gross_leverage)), device=target_weights.device, dtype=target_weights.dtype)
+    target_weights = target_weights * leverage
+
     return target_weights, tradable, buy_mask, sell_mask
 
 
@@ -664,6 +670,7 @@ def _vectorized_backtest_torch(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -673,6 +680,7 @@ def _vectorized_backtest_torch(
         can_buy_mask,
         can_sell_mask,
         long_only,
+        gross_leverage,
     )
 
     resolved_chunk = (
@@ -784,6 +792,7 @@ def run_backtest(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
 ) -> BacktestResult:
@@ -798,6 +807,7 @@ def run_backtest(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        gross_leverage=gross_leverage,
     )
 
     return BacktestResult(
@@ -817,6 +827,7 @@ def run_backtest_torch(
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
@@ -833,6 +844,7 @@ def run_backtest_torch(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        gross_leverage=gross_leverage,
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
     )
@@ -858,6 +870,7 @@ def run_backtest_integer_shares(
     sell_fee_rate: float = 0.004425,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
@@ -905,6 +918,7 @@ def run_backtest_integer_shares(
     cash_hold_mode = False
 
     records: list[HoldingsRecord] = []
+    gross_leverage = max(0.0, float(gross_leverage))
 
     for t in range(t_len):
         if cash_hold_mode:
@@ -934,12 +948,12 @@ def run_backtest_integer_shares(
         if long_only:
             target_w = np.clip(target_w, 0.0, None)
             total_target = float(target_w.sum())
-            if total_target > 1.0:
-                target_w /= total_target
+            if total_target > 0.0:
+                target_w = (target_w / total_target) * gross_leverage
         else:
             gross_target = float(np.abs(target_w).sum())
-            if gross_target > 1.0:
-                target_w /= gross_target
+            if gross_target > 0.0:
+                target_w = (target_w / gross_target) * gross_leverage
 
         equity_before = float(cash + np.dot(shares.astype(np.float64), current_prices))
         equity_before = max(equity_before, 1e-12)

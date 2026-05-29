@@ -6,6 +6,8 @@ from stockagent.config import ExperimentConfig
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
 from stockagent.models.mlp import CrossSectionalMLP
 from stockagent.models.tabular_resnet import CrossSectionalTabularResNet
+from stockagent.models.tcn_hybrid_tabular_resnet import CrossSectionalTCNHybridTabularResNet
+from stockagent.models.temporal_tabular_resnet import CrossSectionalTemporalTabularResNet
 from stockagent.models.tree_models import CrossSectionalLightGBM, CrossSectionalXGBoost
 
 
@@ -22,6 +24,10 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.ft_transformer.ffn_dim)
     if model_name in {"tabular_resnet", "tabresnet", "resnet"}:
         return int(config.training.tabular_resnet.hidden_dim)
+    if model_name in {"tcn_hybrid_tabular_resnet", "tcn_hybrid", "tcn_tabresnet"}:
+        return int(config.training.tcn_hybrid_tabular_resnet.embedding_dim)
+    if model_name in {"temporal_tabular_resnet", "temporal_resnet", "temporal_tabresnet"}:
+        return int(config.training.temporal_tabular_resnet.hidden_dim)
     if model_name in {"lightgbm", "lgbm"}:
         return 128
     if model_name in {"xgboost", "xgb"}:
@@ -81,6 +87,41 @@ def build_model(
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
 
+    if model_name in {"tcn_hybrid_tabular_resnet", "tcn_hybrid", "tcn_tabresnet"}:
+        tcn_cfg = config.training.tcn_hybrid_tabular_resnet
+        return CrossSectionalTCNHybridTabularResNet(
+            lookback=lookback,
+            num_features=num_features,
+            num_symbols=num_symbols,
+            embedding_dim=tcn_cfg.embedding_dim,
+            encoder_hidden_dim=tcn_cfg.encoder_hidden_dim,
+            encoder_blocks=tcn_cfg.encoder_blocks,
+            tcn_blocks=tcn_cfg.tcn_blocks,
+            tcn_kernel_size=tcn_cfg.tcn_kernel_size,
+            dropout=tcn_cfg.dropout,
+            long_only=config.trading.long_only,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+        )
+
+    if model_name in {"temporal_tabular_resnet", "temporal_resnet", "temporal_tabresnet"}:
+        ttab_cfg = config.training.temporal_tabular_resnet
+        return CrossSectionalTemporalTabularResNet(
+            lookback=lookback,
+            num_features=num_features,
+            num_symbols=num_symbols,
+            temporal_hidden_dim=ttab_cfg.temporal_hidden_dim,
+            temporal_layers=ttab_cfg.temporal_layers,
+            temporal_dropout=ttab_cfg.temporal_dropout,
+            embedding_dim=ttab_cfg.embedding_dim,
+            hidden_dim=ttab_cfg.hidden_dim,
+            n_blocks=ttab_cfg.n_blocks,
+            dropout=ttab_cfg.dropout,
+            long_only=config.trading.long_only,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+        )
+
     if model_name in {"lightgbm", "lgbm"}:
         lgbm_cfg = config.training.lightgbm
         return CrossSectionalLightGBM(
@@ -123,5 +164,5 @@ def build_model(
     raise ValueError(
         "Unsupported training.model_name='"
         f"{config.training.model_name}'. "
-        "Supported values: mlp, ft_transformer, tabular_resnet, lightgbm, xgboost"
+        "Supported values: mlp, ft_transformer, tabular_resnet, tcn_hybrid_tabular_resnet, temporal_tabular_resnet, lightgbm, xgboost"
     )

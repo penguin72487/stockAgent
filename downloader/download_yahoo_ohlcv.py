@@ -340,9 +340,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Yahoo Finance OHLCV data into asset-specific parquet directories.")
     parser.add_argument(
         "--mode",
-        choices=["download", "repair"],
+        choices=["download", "repair", "daily-update"],
         default="download",
-        help="download: grab the configured universe; repair: check existing parquet files and refill missing/stale data.",
+        help=(
+            "download: grab the configured universe; "
+            "repair: check existing parquet files and refill missing/stale data; "
+            "daily-update: incremental daily refresh (same behavior as repair)."
+        ),
     )
     parser.add_argument(
         "--asset",
@@ -1308,7 +1312,7 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
 
 def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dict[str, int]]:
     print(f"[{args.mode}] asset={asset_class} start={args.start_date} end={args.end_date}")
-    if args.mode == "repair":
+    if args.mode in {"repair", "daily-update"}:
         counts = _repair_asset_class(asset_class, args)
     else:
         counts = _download_asset_class(asset_class, args)
@@ -1333,7 +1337,12 @@ def main() -> None:
                 key, counts = future.result()
                 summaries[key] = counts
 
-    summary_name = "repair_summary.json" if args.mode == "repair" else "download_summary.json"
+    if args.mode == "download":
+        summary_name = "download_summary.json"
+    elif args.mode == "repair":
+        summary_name = "repair_summary.json"
+    else:
+        summary_name = "daily_update_summary.json"
     summary_path = Path(args.output_root) / summary_name
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")

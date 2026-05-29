@@ -119,6 +119,9 @@ def main() -> None:
         json.dump([asdict(result) for result in results], handle, indent=2)
 
     for result in results:
+        configured_gross_leverage = float(config.trading.gross_leverage)
+        leveraged_sharpe = float(result.test_metrics.get("sharpe", 0.0))
+        leveraged_sortino = float(result.test_metrics.get("sortino", 0.0))
         print(
             json.dumps(
                 {
@@ -127,6 +130,9 @@ def main() -> None:
                     "val_years": result.val_years,
                     "test_years": result.test_years,
                     "best_val_loss": result.best_val_loss,
+                    "configured_gross_leverage": configured_gross_leverage,
+                    "leveraged_sharpe": leveraged_sharpe,
+                    "leveraged_sortino": leveraged_sortino,
                     "test_metrics": result.test_metrics,
                 },
                 ensure_ascii=False,

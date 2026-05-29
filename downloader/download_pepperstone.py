@@ -18,7 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download Pepperstone grouped data to data_peperstone/{24hTrading,commodites,crypto,fores}."
     )
-    parser.add_argument("--mode", choices=["download", "repair"], default="download")
+    parser.add_argument(
+        "--mode",
+        choices=["download", "repair", "daily-update"],
+        default="download",
+        help="download: full fetch; repair/daily-update: incremental refill for stale or missing files.",
+    )
     parser.add_argument("--output-root", default="data_peperstone", help="Root output folder.")
     parser.add_argument("--start-date", default="2000-01-01", help="Inclusive start date YYYY-MM-DD")
     parser.add_argument("--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'")

@@ -13,9 +13,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["download", "repair"],
+        choices=["download", "repair", "daily-update"],
         default="download",
-        help="download: fetch full history; repair: refill missing/stale local files.",
+        help="download: fetch full history; repair/daily-update: refill missing/stale local files incrementally.",
     )
     parser.add_argument("--start-date", default="2000-01-01", help="Inclusive start date in YYYY-MM-DD.")
     parser.add_argument("--end-date", default="today", help="Inclusive end date in YYYY-MM-DD, or 'today'.")

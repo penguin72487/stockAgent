@@ -54,6 +54,7 @@ class TradingConfig:
     cash_allowed: bool
     use_all_tradable_symbols: bool
     max_turnover_ratio: float = 0.0
+    gross_leverage: float = 1.0
 
 
 @dataclass(slots=True)
@@ -79,6 +80,27 @@ class TabularResNetModelConfig:
     embedding_dim: int = 128
     hidden_dim: int = 256
     n_blocks: int = 4
+    dropout: float = 0.1
+
+
+@dataclass(slots=True)
+class TemporalTabularResNetModelConfig:
+    temporal_hidden_dim: int = 128
+    temporal_layers: int = 1
+    temporal_dropout: float = 0.1
+    embedding_dim: int = 128
+    hidden_dim: int = 256
+    n_blocks: int = 4
+    dropout: float = 0.1
+
+
+@dataclass(slots=True)
+class TCNHybridTabularResNetModelConfig:
+    embedding_dim: int = 128
+    encoder_hidden_dim: int = 256
+    encoder_blocks: int = 2
+    tcn_blocks: int = 3
+    tcn_kernel_size: int = 3
     dropout: float = 0.1
 
 
@@ -157,10 +179,12 @@ class TrainingConfig:
     num_workers: int = 0
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
-    loss_type: str = "mse"  # "mse" or "sharpe"
+    loss_type: str = "mse"  # "mse", "sharpe", "sortino", or "excess_cvar_drawdown"
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
     tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)
+    tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
+    temporal_tabular_resnet: TemporalTabularResNetModelConfig = field(default_factory=TemporalTabularResNetModelConfig)
     lightgbm: LightGBMModelConfig = field(default_factory=LightGBMModelConfig)
     xgboost: XGBoostModelConfig = field(default_factory=XGBoostModelConfig)
 
@@ -170,6 +194,11 @@ class EvaluationConfig:
     primary_baseline: str
     metrics: list[str]
     gamma_sharpe: float = 1.0
+    gamma_excess: float = 1.0
+    gamma_cvar: float = 1.0
+    cvar_alpha: float = 0.95
+    gamma_drawdown: float = 0.0
+    drawdown_target: float = 0.2
     gamma_turnover: float = 0.0
 
 
@@ -272,6 +301,23 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     tabular_resnet.setdefault("n_blocks", 4)
     tabular_resnet.setdefault("dropout", legacy_dropout)
 
+    tcn_hybrid_tabular_resnet = training.setdefault("tcn_hybrid_tabular_resnet", {})
+    tcn_hybrid_tabular_resnet.setdefault("embedding_dim", max(64, int(legacy_embedding_dim)))
+    tcn_hybrid_tabular_resnet.setdefault("encoder_hidden_dim", max(128, int(legacy_hidden_dim)))
+    tcn_hybrid_tabular_resnet.setdefault("encoder_blocks", 2)
+    tcn_hybrid_tabular_resnet.setdefault("tcn_blocks", 3)
+    tcn_hybrid_tabular_resnet.setdefault("tcn_kernel_size", 3)
+    tcn_hybrid_tabular_resnet.setdefault("dropout", legacy_dropout)
+
+    temporal_tabular_resnet = training.setdefault("temporal_tabular_resnet", {})
+    temporal_tabular_resnet.setdefault("temporal_hidden_dim", max(64, int(legacy_embedding_dim)))
+    temporal_tabular_resnet.setdefault("temporal_layers", 1)
+    temporal_tabular_resnet.setdefault("temporal_dropout", legacy_dropout)
+    temporal_tabular_resnet.setdefault("embedding_dim", max(64, int(legacy_embedding_dim)))
+    temporal_tabular_resnet.setdefault("hidden_dim", max(128, int(legacy_hidden_dim)))
+    temporal_tabular_resnet.setdefault("n_blocks", 4)
+    temporal_tabular_resnet.setdefault("dropout", legacy_dropout)
+
     lightgbm = training.setdefault("lightgbm", {})
     lightgbm.setdefault("use_gpu", True)
     lightgbm.setdefault("gpu_device_id", 0)
@@ -309,6 +355,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     evaluation = raw.setdefault("evaluation", {})
     evaluation.setdefault("gamma_sharpe", 1.0)
+    evaluation.setdefault("gamma_excess", 1.0)
+    evaluation.setdefault("gamma_cvar", 1.0)
+    evaluation.setdefault("cvar_alpha", 0.95)
+    evaluation.setdefault("gamma_drawdown", 0.0)
+    evaluation.setdefault("drawdown_target", 0.2)
     evaluation.setdefault("gamma_turnover", 0.0)
 
     data = raw.setdefault("data", {})
@@ -318,6 +369,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     trading = raw.setdefault("trading", {})
     trading.setdefault("max_turnover_ratio", 0.0)
+    trading.setdefault("gross_leverage", 1.0)
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
@@ -397,6 +449,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             mlp=MLPModelConfig(**training_raw["mlp"]),
             ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),
             tabular_resnet=TabularResNetModelConfig(**training_raw["tabular_resnet"]),
+            tcn_hybrid_tabular_resnet=TCNHybridTabularResNetModelConfig(**training_raw["tcn_hybrid_tabular_resnet"]),
+            temporal_tabular_resnet=TemporalTabularResNetModelConfig(**training_raw["temporal_tabular_resnet"]),
             lightgbm=LightGBMModelConfig(**training_raw["lightgbm"]),
             xgboost=XGBoostModelConfig(**training_raw["xgboost"]),
         ),

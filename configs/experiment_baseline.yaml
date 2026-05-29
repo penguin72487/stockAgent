@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: true
-  start_fold: 1
+  start_fold: 25
 
 environment:
   conda_env: fintech
@@ -16,14 +16,15 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_bybit
-  benchmark_name: "BTCUSDT"
+  parquet_root: data_yahoo/tw_stocks
+  # benchmark_name: "BTCUSDTSWAP"
+  benchmark_name: "universe_average"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
-  tw_limit_up_down_guard: false
+  tw_limit_up_down_guard: true
 
 walk_forward:
   min_train_years: 1
@@ -32,9 +33,10 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.00055
-  sell_fee_rate: 0.00055
+  buy_fee_rate: 0.001425
+  sell_fee_rate: 0.004425
   max_turnover_ratio: 100.0
+  gross_leverage: 2.0
   long_only: false
   cash_allowed: true
   use_all_tradable_symbols: true
@@ -48,7 +50,7 @@ training:
   enable_torch_compile: false
   auto_torch_compile_sharpe: false
   compile_loss: null
-  warm_start_from_previous_fold: true
+  warm_start_from_previous_fold: false
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
@@ -78,8 +80,8 @@ training:
   dropout: 0.1
   num_workers: 0
   weight_decay: 0.00001
-  grad_clip_norm: 0.0
-  loss_type: sharpe
+  grad_clip_norm: 1.0
+  loss_type: excess_cvar_drawdown
   min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
@@ -98,6 +100,21 @@ training:
     dropout: 0.1
     use_cls_token: true
   tabular_resnet:
+    embedding_dim: 128
+    hidden_dim: 256
+    n_blocks: 4
+    dropout: 0.1
+  tcn_hybrid_tabular_resnet:
+    embedding_dim: 64
+    encoder_hidden_dim: 128
+    encoder_blocks: 2
+    tcn_blocks: 2
+    tcn_kernel_size: 3
+    dropout: 0.3
+  temporal_tabular_resnet:
+    temporal_hidden_dim: 128
+    temporal_layers: 1
+    temporal_dropout: 0.3
     embedding_dim: 128
     hidden_dim: 256
     n_blocks: 4
@@ -132,8 +149,14 @@ evaluation:
     - cumulative_return
     - annualized_return
     - sharpe
+    - sortino
     - max_drawdown
     - turnover
     - excess_return_vs_universe_average
   gamma_sharpe: 1.0
+  gamma_excess: 1.0
+  gamma_cvar: 1.0
+  cvar_alpha: 0.95
+  gamma_drawdown: 0.5
+  drawdown_target: 0.2
   gamma_turnover: 0.0

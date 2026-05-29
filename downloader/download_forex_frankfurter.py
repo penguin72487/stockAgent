@@ -40,6 +40,12 @@ class DownloadResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download forex OHLC-like data from Frankfurter (ECB rates).")
+    parser.add_argument(
+        "--mode",
+        choices=["daily-update", "full"],
+        default="daily-update",
+        help="daily-update: append only missing dates; full: skip existing unless --refresh.",
+    )
     parser.add_argument("--start-date", default="2000-01-01", help="Inclusive start date (YYYY-MM-DD)")
     parser.add_argument(
         "--end-date",
@@ -54,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--incremental",
         action="store_true",
-        help="Append only missing dates for existing parquet files (best for daily updates)",
+        help="Deprecated compatibility flag. Same as --mode daily-update.",
     )
     parser.add_argument(
         "--skip-manifest",
@@ -246,8 +252,10 @@ def _download_pair(
 
 def main() -> None:
     args = parse_args()
-    if args.refresh and args.incremental:
-        raise RuntimeError("--refresh and --incremental cannot be used together")
+    incremental_mode = args.incremental or args.mode == "daily-update"
+
+    if args.refresh and incremental_mode:
+        raise RuntimeError("--refresh cannot be combined with daily incremental mode (--mode daily-update or --incremental)")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -282,7 +290,7 @@ def main() -> None:
                 output_dir,
                 args.timeout,
                 args.refresh,
-                args.incremental,
+                incremental_mode,
             ): record
             for record in records
         }
@@ -310,6 +318,7 @@ def main() -> None:
 
     summary = {
         "provider": "frankfurter",
+        "mode": "daily-update" if incremental_mode else "full",
         "requested_start_date": args.start_date,
         "requested_end_date": requested_end,
         "provider_end_date": api_latest,
