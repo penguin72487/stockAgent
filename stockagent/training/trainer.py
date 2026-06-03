@@ -6,16 +6,18 @@ import os
 import pickle
 import shutil
 import subprocess
+import sys
 import time
 import gc
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import torch
+from torch.profiler import ProfilerActivity, profile
 from torch import nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -76,9 +78,13 @@ class TimingBreakdown:
     fetch_s: float = 0.0
     transfer_s: float = 0.0
     forward_s: float = 0.0
+    model_forward_s: float = 0.0
+    factor_aug_s: float = 0.0
+    loss_s: float = 0.0
     backward_s: float = 0.0
     grad_s: float = 0.0
     clip_s: float = 0.0
+    finite_check_s: float = 0.0
     step_s: float = 0.0
     backtest_s: float = 0.0
     ic_s: float = 0.0
@@ -92,7 +98,24 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
     parts = [f"[profile] {label}: total={timing.total_s:.3f}s"]
     if timing.batches:
         parts.append(f"batches={timing.batches}")
-    for name in ("fetch_s", "transfer_s", "forward_s", "backward_s", "grad_s", "clip_s", "step_s", "backtest_s", "ic_s", "metrics_s", "save_s", "plot_s"):
+    for name in (
+        "fetch_s",
+        "transfer_s",
+        "forward_s",
+        "model_forward_s",
+        "factor_aug_s",
+        "loss_s",
+        "backward_s",
+        "grad_s",
+        "clip_s",
+        "finite_check_s",
+        "step_s",
+        "backtest_s",
+        "ic_s",
+        "metrics_s",
+        "save_s",
+        "plot_s",
+    ):
         value = getattr(timing, name)
         if value > 0:
             parts.append(f"{name[:-2]}={value:.3f}s")
@@ -119,6 +142,160 @@ def _maybe_cudagraph_step_begin() -> None:
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def _should_profile_train_step() -> bool:
+    return _env_truthy("STOCKAGENT_TORCH_PROFILER", "0")
+
+
+def _profile_trace_dir() -> Path:
+    raw = os.environ.get("STOCKAGENT_TORCH_PROFILER_DIR", "artifacts/profiler")
+    path = Path(raw)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _extract_weights_and_aux(model_output: torch.Tensor | dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+    if isinstance(model_output, dict):
+        if "weights" not in model_output:
+            raise ValueError("Model output dict must include 'weights'")
+        weights = model_output["weights"]
+        return weights, model_output
+    return model_output, None
+
+
+def _print_backward_top10(prof_obj: profile) -> None:
+    try:
+        events = list(prof_obj.key_averages())
+    except Exception:
+        return
+    backward_events = [
+        evt
+        for evt in events
+        if ("backward" in evt.key.lower()) or ("grad" in evt.key.lower())
+    ]
+    backward_events.sort(key=lambda evt: float(getattr(evt, "self_cuda_time_total", 0.0)), reverse=True)
+    top = backward_events[:10]
+    if not top:
+        print("[torch.profiler] backward top10: no backward-tagged CUDA ops found")
+        return
+    print("[torch.profiler] backward top10 (self_cuda_time_total):")
+    for idx, evt in enumerate(top, start=1):
+        cuda_us = float(getattr(evt, "self_cuda_time_total", 0.0))
+        print(f"  {idx:02d}. {evt.key}: {cuda_us/1000.0:.3f} ms")
+
+
+def _profile_single_train_step(
+    *,
+    model: nn.Module,
+    loss_fn,
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
+    gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
+    objective: str,
+    rank_ic_weight: float = 0.20,
+    direction_weight: float = 0.05,
+    volatility_regime_weight: float = 0.05,
+    concentration_weight: float = 0.005,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
+    fold_id: int = 0,
+) -> None:
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+
+    model.zero_grad(set_to_none=True)
+    with profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as prof_obj:
+        with _autocast_context(device, amp_dtype):
+            model_output = model(batch["x"], batch["tradable_mask"])
+            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            loss = loss_fn(
+                weights,
+                batch["future_log_returns"],
+                batch["tradable_mask"],
+                benchmark_returns=batch.get("benchmark"),
+                can_buy_mask=batch["can_buy_mask"],
+                can_sell_mask=batch["can_sell_mask"],
+                sample_mask=batch.get("sample_mask"),
+                long_only=long_only,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
+                gamma_sharpe=gamma_sharpe,
+                gamma_excess=gamma_excess,
+                gamma_cvar=gamma_cvar,
+                cvar_alpha=cvar_alpha,
+                gamma_drawdown=gamma_drawdown,
+                drawdown_target=drawdown_target,
+                gamma_turnover=gamma_turnover,
+                gamma_underperformance=gamma_underperformance,
+                excess_target=excess_target,
+                cvar_budget=cvar_budget,
+                drawdown_budget=drawdown_budget,
+                turnover_budget=turnover_budget,
+                gamma_cvar_budget=gamma_cvar_budget,
+                gamma_drawdown_budget=gamma_drawdown_budget,
+                gamma_turnover_budget=gamma_turnover_budget,
+                objective=objective,
+                aux_outputs=aux_outputs,
+                rank_ic_weight=rank_ic_weight,
+                direction_weight=direction_weight,
+                volatility_regime_weight=volatility_regime_weight,
+                concentration_weight=concentration_weight,
+                regime_up_threshold=regime_up_threshold,
+                regime_down_threshold=regime_down_threshold,
+            )
+        if torch.isfinite(loss).all():
+            loss.backward()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    model.zero_grad(set_to_none=True)
+
+    trace_path = _profile_trace_dir() / f"train_step_fold_{fold_id:02d}_{int(time.time())}.json"
+    try:
+        prof_obj.export_chrome_trace(str(trace_path))
+        print(f"[torch.profiler] chrome trace exported: {trace_path}")
+    except Exception as e:
+        print(f"[torch.profiler] failed to export chrome trace: {e}")
+
+    print("[torch.profiler] top10 CUDA ops (self_cuda_time_total):")
+    try:
+        print(prof_obj.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
+    except Exception as e:
+        print(f"[torch.profiler] failed to print CUDA top10: {e}")
+    _print_backward_top10(prof_obj)
 
 
 def _loss_from_backtest_series(
@@ -229,6 +406,10 @@ def _normalize_risk_objective(loss_type: str) -> str:
     if objective in {
         "sharpe",
         "sortino",
+        "rank",
+        "rank_ic",
+        "ic",
+        "multitask_rank_ic",
         "excess_cvar_drawdown",
         "cvar",
         "cvar_drawdown",
@@ -236,7 +417,20 @@ def _normalize_risk_objective(loss_type: str) -> str:
         "outperformance_risk_budget",
         "outperformance_budget",
         "outperformance_first",
+        "factor_generalization",
+        "factor",
+        "factor_ic",
+        "characteristic_factor",
+        "portfolio_autoencoder",
+        "bottleneck_portfolio_autoencoder",
+        "autoencoder_portfolio",
     }:
+        if objective in {"bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
+            return "portfolio_autoencoder"
+        if objective in {"factor", "factor_ic", "characteristic_factor"}:
+            return "factor_generalization"
+        if objective in {"rank", "ic", "multitask_rank_ic"}:
+            return "rank_ic"
         if objective in {"cvar", "cvar_drawdown", "excess_cvar"}:
             return "excess_cvar_drawdown"
         if objective in {"outperformance_budget", "outperformance_first"}:
@@ -245,10 +439,221 @@ def _normalize_risk_objective(loss_type: str) -> str:
     return "sharpe"
 
 
+def _evaluate_rank_ic_multitask_loss(
+    model: nn.Module,
+    x: torch.Tensor,
+    future_log_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    benchmark_returns: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    chunk_rows: int,
+    *,
+    objective: str = "rank_ic",
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
+    gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
+    rank_ic_weight: float,
+    direction_weight: float,
+    volatility_regime_weight: float,
+    concentration_weight: float,
+    regime_up_threshold: float,
+    regime_down_threshold: float,
+    factor_loss_kwargs: dict[str, Any] | None = None,
+) -> tuple[float, float | None]:
+    model.eval()
+    total_loss = 0.0
+    total_rows = 0
+    ic_sum = 0.0
+    ic_count = 0
+
+    with torch.inference_mode():
+        for start in range(0, x.size(0), chunk_rows):
+            end = min(start + chunk_rows, x.size(0))
+
+            x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
+            returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
+            mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
+            buy_chunk = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
+            sell_chunk = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
+            bench_chunk = benchmark_returns[start:end].to(device=device, non_blocking=non_blocking)
+
+            with _autocast_context(device, amp_dtype):
+                model_output = model(x_chunk, mask_chunk)
+                weights_chunk, aux_outputs = _extract_weights_and_aux(model_output)
+                loss_t = risk_aware_loss(
+                    weights_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    benchmark_returns=bench_chunk,
+                    can_buy_mask=buy_chunk,
+                    can_sell_mask=sell_chunk,
+                    long_only=long_only,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
+                    max_turnover_ratio=max_turnover_ratio,
+                    gross_leverage=gross_leverage,
+                    gamma_sharpe=gamma_sharpe,
+                    gamma_excess=gamma_excess,
+                    gamma_cvar=gamma_cvar,
+                    cvar_alpha=cvar_alpha,
+                    gamma_drawdown=gamma_drawdown,
+                    drawdown_target=drawdown_target,
+                    gamma_turnover=gamma_turnover,
+                    gamma_underperformance=gamma_underperformance,
+                    excess_target=excess_target,
+                    cvar_budget=cvar_budget,
+                    drawdown_budget=drawdown_budget,
+                    turnover_budget=turnover_budget,
+                    gamma_cvar_budget=gamma_cvar_budget,
+                    gamma_drawdown_budget=gamma_drawdown_budget,
+                    gamma_turnover_budget=gamma_turnover_budget,
+                    objective=objective,
+                    aux_outputs=aux_outputs,
+                    rank_ic_weight=rank_ic_weight,
+                    direction_weight=direction_weight,
+                    volatility_regime_weight=volatility_regime_weight,
+                    concentration_weight=concentration_weight,
+                    regime_up_threshold=regime_up_threshold,
+                    regime_down_threshold=regime_down_threshold,
+                    **(factor_loss_kwargs or {}),
+                )
+
+            rows = end - start
+            total_rows += rows
+            total_loss += float(loss_t.detach().cpu()) * float(rows)
+
+            rank_scores = aux_outputs.get("rank_logits") if aux_outputs else weights_chunk
+            ic_series = compute_ic_series_torch(rank_scores, returns_chunk, mask_chunk)
+            ic_clean = ic_series[torch.isfinite(ic_series)]
+            if int(ic_clean.numel()) > 0:
+                ic_sum += float(ic_clean.sum().item())
+                ic_count += int(ic_clean.numel())
+
+    mean_loss = total_loss / float(max(1, total_rows))
+    mean_ic = (ic_sum / float(ic_count)) if ic_count > 0 else None
+    return mean_loss, mean_ic
+
+
 def _objective_metric_key(objective: str) -> str:
+    if objective == "rank_ic":
+        return "rank_ic"
+    if objective == "factor_generalization":
+        return "factor_generalization"
+    if objective == "portfolio_autoencoder":
+        return "sharpe"
     if objective in {"outperformance_risk_budget", "excess_cvar_drawdown"}:
         return "excess_return_vs_universe_average"
     return objective
+
+
+def _factor_loss_kwargs(config: ExperimentConfig) -> dict[str, Any]:
+    cfg = config.training.factor_generalization_loss
+    return {
+        "factor_slope_tstat_weight": cfg.slope_tstat_weight,
+        "factor_rank_ic_weight": cfg.rank_ic_weight,
+        "factor_sharpe_weight": cfg.factor_sharpe_weight,
+        "factor_block_stability_weight": cfg.block_stability_weight,
+        "factor_regime_stability_weight": cfg.regime_stability_weight,
+        "factor_consistency_weight": cfg.consistency_weight,
+        "factor_net_exposure_weight": cfg.net_exposure_weight,
+        "factor_gross_exposure_weight": cfg.gross_exposure_weight,
+        "factor_concentration_weight": cfg.concentration_weight,
+        "factor_turnover_weight": cfg.turnover_weight,
+        "factor_score_l2_weight": cfg.score_l2_weight,
+        "factor_temperature": cfg.factor_temperature,
+        "factor_block_count": cfg.block_count,
+        "factor_worst_fraction": cfg.worst_fraction,
+    }
+
+
+def _portfolio_autoencoder_loss_kwargs(config: ExperimentConfig) -> dict[str, Any]:
+    cfg = config.training.portfolio_autoencoder_loss
+    return {
+        "autoencoder_cost_rate": cfg.cost_rate,
+        "autoencoder_lambda_turnover": cfg.lambda_turnover,
+        "autoencoder_lambda_concentration": cfg.lambda_concentration,
+        "autoencoder_lambda_latent": cfg.lambda_latent,
+    }
+
+
+def _factor_augmentation_kwargs(config: ExperimentConfig, objective: str) -> dict[str, float]:
+    if objective != "factor_generalization":
+        return {}
+    cfg = config.training.factor_generalization_loss
+    if float(cfg.consistency_weight) <= 0.0:
+        return {}
+    return {
+        "feature_dropout": float(cfg.augmentation_feature_dropout),
+        "stock_dropout": float(cfg.augmentation_stock_dropout),
+        "time_dropout": float(cfg.augmentation_time_dropout),
+        "noise_std": float(cfg.augmentation_noise_std),
+    }
+
+
+def _augment_factor_inputs(x: torch.Tensor, aug_kwargs: dict[str, float]) -> torch.Tensor:
+    if not aug_kwargs:
+        return x
+    x_aug = x
+    feature_dropout = min(max(float(aug_kwargs.get("feature_dropout", 0.0)), 0.0), 0.95)
+    stock_dropout = min(max(float(aug_kwargs.get("stock_dropout", 0.0)), 0.0), 0.95)
+    time_dropout = min(max(float(aug_kwargs.get("time_dropout", 0.0)), 0.0), 0.95)
+    noise_std = max(0.0, float(aug_kwargs.get("noise_std", 0.0)))
+
+    if noise_std > 0.0:
+        x_aug = x_aug + torch.randn_like(x_aug) * noise_std
+    if feature_dropout > 0.0:
+        keep = (torch.rand(x.size(0), 1, 1, x.size(3), device=x.device) >= feature_dropout).to(dtype=x.dtype)
+        x_aug = x_aug * keep / max(1.0 - feature_dropout, 1e-6)
+    if stock_dropout > 0.0:
+        keep = (torch.rand(x.size(0), 1, x.size(2), 1, device=x.device) >= stock_dropout).to(dtype=x.dtype)
+        x_aug = x_aug * keep
+    if time_dropout > 0.0 and x.size(1) > 1:
+        keep = (torch.rand(x.size(0), x.size(1), 1, 1, device=x.device) >= time_dropout).to(dtype=x.dtype)
+        keep[:, -1:, :, :] = 1.0
+        x_aug = x_aug * keep
+    return x_aug
+
+
+def _attach_factor_augmented_scores(
+    *,
+    model: nn.Module,
+    aux_outputs: dict[str, torch.Tensor] | None,
+    x: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    aug_kwargs: dict[str, float],
+) -> dict[str, torch.Tensor] | None:
+    if not aug_kwargs:
+        return aux_outputs
+    x_aug = _augment_factor_inputs(x, aug_kwargs)
+    aug_output = model(x_aug, tradable_mask)
+    aug_weights, aug_aux = _extract_weights_and_aux(aug_output)
+    aug_scores = aug_weights
+    if aug_aux is not None:
+        aug_scores = aug_aux.get("rank_logits", aug_aux.get("score_logits", aug_weights))
+    merged: dict[str, torch.Tensor] = dict(aux_outputs or {})
+    merged["aug_score_logits"] = aug_scores
+    return merged
 
 
 def _normalized_model_name(model_name: str) -> str:
@@ -300,6 +705,210 @@ def _group_checkpoint_path(output_path: Path, train_years: list[int]) -> Path:
     return _group_dir(output_path, train_years) / "checkpoint_last.pt"
 
 
+def _group_curve_path(output_path: Path, train_years: list[int]) -> Path:
+    return _group_dir(output_path, train_years) / "epoch_curve.jsonl"
+
+
+def _trim_group_curve(path: Path, start_epoch: int) -> None:
+    if not path.exists() or start_epoch <= 1:
+        return
+    kept: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            epoch = int(payload.get("epoch", 0))
+            if epoch < start_epoch:
+                kept.append(line)
+    with path.open("w", encoding="utf-8") as handle:
+        for line in kept:
+            handle.write(line + "\n")
+
+
+def _append_group_curve(path: Path, payload: dict[str, float | int | None]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _epoch_curve_plot_script() -> Path:
+    return Path(__file__).resolve().parents[2] / "plot_epoch_curves.py"
+
+
+def _epoch_curve_plot_paths(curve_path: Path, interval: int) -> tuple[Path, Path]:
+    sample_interval = max(1, int(interval))
+    return (
+        curve_path.parent / f"epoch_curve_every{sample_interval}.png",
+        curve_path.parent / f"epoch_timing_every{sample_interval}.png",
+    )
+
+
+def _epoch_curve_plot_command(curve_path: Path, interval: int) -> list[str]:
+    output_path, timing_output_path = _epoch_curve_plot_paths(curve_path, interval)
+    return [
+        sys.executable,
+        str(_epoch_curve_plot_script()),
+        "--curve-file",
+        str(curve_path),
+        "--interval",
+        str(max(1, int(interval))),
+        "--output",
+        str(output_path),
+        "--timing-output",
+        str(timing_output_path),
+    ]
+
+
+def _run_epoch_curve_plot_once(curve_path: Path, interval: int) -> None:
+    script_path = _epoch_curve_plot_script()
+    if not script_path.exists():
+        return
+    proc = subprocess.run(
+        _epoch_curve_plot_command(curve_path, interval),
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip()[-1000:]
+        print(f"[curve plot] failed for {curve_path}: {stderr_tail}")
+
+
+class _AsyncEpochCurvePlotter:
+    """Update epoch loss/timing plots without blocking the training loop."""
+
+    def __init__(self, curve_path: Path, interval: int, async_enabled: bool) -> None:
+        self.curve_path = curve_path
+        self.interval = max(1, int(interval))
+        self.async_enabled = bool(async_enabled)
+        self._proc: subprocess.Popen[str] | None = None
+        self._pending = False
+
+    def request(self) -> None:
+        if not self.curve_path.exists():
+            return
+        if not self.async_enabled:
+            _run_epoch_curve_plot_once(self.curve_path, self.interval)
+            return
+        self._reap_finished()
+        if self._proc is None:
+            self._launch()
+        else:
+            self._pending = True
+
+    def flush(self) -> None:
+        if not self.async_enabled:
+            return
+        self._reap_finished()
+        if self._proc is not None:
+            _, stderr = self._proc.communicate()
+            if self._proc.returncode not in (0, None):
+                print(f"[curve plot] failed for {self.curve_path}: {(stderr or '').strip()[-1000:]}")
+            self._proc = None
+        if self._pending:
+            self._pending = False
+            _run_epoch_curve_plot_once(self.curve_path, self.interval)
+
+    def _launch(self) -> None:
+        script_path = _epoch_curve_plot_script()
+        if not script_path.exists():
+            return
+        self._proc = subprocess.Popen(
+            _epoch_curve_plot_command(self.curve_path, self.interval),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _reap_finished(self) -> None:
+        if self._proc is None:
+            return
+        return_code = self._proc.poll()
+        if return_code is None:
+            return
+        _, stderr = self._proc.communicate()
+        if return_code != 0:
+            print(f"[curve plot] failed for {self.curve_path}: {(stderr or '').strip()[-1000:]}")
+        self._proc = None
+        if self._pending:
+            self._pending = False
+            self._launch()
+
+
+def _timing_curve_payload(
+    *,
+    train_timing: TimingBreakdown,
+    val_eval_s: float = 0.0,
+    val_loss_s: float = 0.0,
+    val_metrics_s: float | None = None,
+    test_curve_s: float = 0.0,
+    fold_checkpoint_save_s: float = 0.0,
+    group_checkpoint_save_s: float = 0.0,
+    checkpoint_save_s: float = 0.0,
+    scheduler_s: float = 0.0,
+    progress_update_s: float = 0.0,
+    epoch_wall_s: float | None = None,
+    timing_synchronized: bool = False,
+) -> dict[str, float | int]:
+    batches = max(1, int(train_timing.batches))
+
+    def _avg_ms(value_s: float) -> float:
+        return float(value_s) * 1000.0 / float(batches)
+
+    val_metrics_value = float(val_loss_s if val_metrics_s is None else val_metrics_s)
+    checkpoint_total_s = (
+        float(checkpoint_save_s)
+        + float(fold_checkpoint_save_s)
+        + float(group_checkpoint_save_s)
+    )
+    measured_total_s = (
+        float(train_timing.total_s)
+        + float(val_eval_s)
+        + val_metrics_value
+        + float(test_curve_s)
+        + checkpoint_total_s
+        + float(scheduler_s)
+        + float(progress_update_s)
+    )
+    epoch_total_s = float(epoch_wall_s) if epoch_wall_s is not None else measured_total_s
+    unattributed_s = max(0.0, epoch_total_s - measured_total_s)
+    return {
+        "train_batches": int(train_timing.batches),
+        "timing_synchronized": int(bool(timing_synchronized)),
+        "train_total_s": float(train_timing.total_s),
+        "train_total_ms_per_batch": _avg_ms(train_timing.total_s),
+        "train_fetch_ms_per_batch": _avg_ms(train_timing.fetch_s),
+        "train_transfer_ms_per_batch": _avg_ms(train_timing.transfer_s),
+        "train_forward_ms_per_batch": _avg_ms(train_timing.forward_s),
+        "train_model_forward_ms_per_batch": _avg_ms(train_timing.model_forward_s),
+        "train_factor_aug_ms_per_batch": _avg_ms(train_timing.factor_aug_s),
+        "train_loss_ms_per_batch": _avg_ms(train_timing.loss_s),
+        "train_backward_total_ms_per_batch": _avg_ms(train_timing.backward_s),
+        "train_grad_ms_per_batch": _avg_ms(train_timing.grad_s),
+        "train_clip_ms_per_batch": _avg_ms(train_timing.clip_s),
+        "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
+        "train_step_ms_per_batch": _avg_ms(train_timing.step_s),
+        "val_eval_s": float(val_eval_s),
+        "val_loss_s": float(val_loss_s),
+        "val_metrics_s": val_metrics_value,
+        "test_curve_s": float(test_curve_s),
+        "fold_checkpoint_save_s": float(fold_checkpoint_save_s),
+        "group_checkpoint_save_s": float(group_checkpoint_save_s),
+        "checkpoint_save_s": checkpoint_total_s,
+        "scheduler_s": float(scheduler_s),
+        "progress_update_s": float(progress_update_s),
+        "epoch_wall_s": epoch_total_s,
+        "epoch_unattributed_s": unattributed_s,
+        "epoch_total_s": epoch_total_s,
+    }
+
+
 def _summary_path(output_path: Path) -> Path:
     return output_path / "summary.json"
 
@@ -325,6 +934,29 @@ def _state_dict_for_save(model: nn.Module) -> dict[str, torch.Tensor]:
     return _unwrap_model(model).state_dict()
 
 
+def _model_parameters_are_finite(model: nn.Module) -> bool:
+    for param in _unwrap_model(model).parameters():
+        if not torch.isfinite(param.detach()).all():
+            return False
+    return True
+
+
+def _model_gradients_are_finite(model: nn.Module) -> bool:
+    for param in _unwrap_model(model).parameters():
+        if param.grad is not None and not torch.isfinite(param.grad.detach()).all():
+            return False
+    return True
+
+
+def _should_check_finite(step: int, interval_steps: int) -> bool:
+    interval = int(interval_steps)
+    return interval > 0 and int(step) % interval == 0
+
+
+def _tensor_is_finite(value: torch.Tensor) -> bool:
+    return bool(torch.isfinite(value.detach()).all().item())
+
+
 def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
     cleaned_state_dict = {
         key.removeprefix("_orig_mod."): value for key, value in state_dict.items()
@@ -341,22 +973,24 @@ def _save_fold_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
+    include_optimizer: bool = False,
 ) -> None:
+    if not _model_parameters_are_finite(model):
+        raise RuntimeError(f"Refusing to save non-finite model checkpoint: {checkpoint_path}")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "fold_id": fold.fold_id,
-            "epoch": epoch,
-            "train_years": fold.train_years,
-            "val_years": fold.val_years,
-            "test_years": fold.test_years,
-            "best_val_loss": best_val_loss,
-            "model_state_dict": _state_dict_for_save(model),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-        },
-        checkpoint_path,
-    )
+    payload: dict[str, Any] = {
+        "fold_id": fold.fold_id,
+        "epoch": epoch,
+        "train_years": fold.train_years,
+        "val_years": fold.val_years,
+        "test_years": fold.test_years,
+        "best_val_loss": best_val_loss,
+        "model_state_dict": _state_dict_for_save(model),
+    }
+    if include_optimizer:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+        payload["scaler_state_dict"] = scaler.state_dict()
+    torch.save(payload, checkpoint_path)
 
 
 def _load_checkpoint(checkpoint_path: Path) -> dict:
@@ -373,6 +1007,8 @@ def _save_group_checkpoint(
     scaler: GradScaler,
     scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
 ) -> None:
+    if not _model_parameters_are_finite(model):
+        raise RuntimeError(f"Refusing to save non-finite model checkpoint: {checkpoint_path}")
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     scheduler_state = scheduler.state_dict() if scheduler is not None else None
     torch.save(
@@ -528,6 +1164,40 @@ def _save_holdings_csv(
     df.to_csv(output_path, index=False)
 
 
+def _save_daily_portfolio_returns_csv(
+    output_path: Path,
+    dates: np.ndarray,
+    strategy_returns: np.ndarray,
+    benchmark_returns: np.ndarray,
+    turnovers: np.ndarray,
+) -> None:
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": np.asarray(dates),
+            "portfolio_return": np.asarray(strategy_returns, dtype=np.float64),
+            "benchmark_return": np.asarray(benchmark_returns, dtype=np.float64),
+            "turnover": np.asarray(turnovers, dtype=np.float64),
+        }
+    )
+    df.to_csv(output_path, index=False)
+
+
+def _save_daily_weights_csv(
+    output_path: Path,
+    dates: np.ndarray,
+    symbols: list[str],
+    weights_history: np.ndarray,
+) -> None:
+    import pandas as pd
+
+    weights = np.asarray(weights_history, dtype=np.float64)
+    df = pd.DataFrame(weights, columns=list(symbols))
+    df.insert(0, "date", np.asarray(dates))
+    df.to_csv(output_path, index=False)
+
+
 def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarray]:
     data = np.load(output_path)
     result = BacktestResult(
@@ -559,8 +1229,72 @@ def _dataset_to_tensors(
 def _prepare_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
     prepared = tensor.contiguous()
     if pin_memory and prepared.device.type == "cpu" and not prepared.is_pinned():
-        prepared = prepared.pin_memory()
+        tensor_bytes = _tensor_nbytes(prepared)
+        if tensor_bytes > 2 * 1024**3:
+            print(
+                f"[pin_memory] skipped for large tensor shape={tuple(prepared.shape)} "
+                f"size={tensor_bytes/1024**3:.1f}GB"
+            )
+            return prepared
+        try:
+            prepared = prepared.pin_memory()
+        except torch.AcceleratorError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            print(
+                f"[pin_memory] skipped for tensor shape={tuple(prepared.shape)} "
+                f"size={tensor_bytes/1024**3:.1f}GB: CUDA OOM"
+            )
     return prepared
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _maybe_cache_tensors_on_device(
+    *,
+    name: str,
+    tensors: tuple[torch.Tensor, ...],
+    device: torch.device,
+    enabled: bool,
+    target_fraction: float,
+    safety_margin_gb: float,
+) -> tuple[torch.Tensor, ...]:
+    if not enabled or device.type != "cuda":
+        return tensors
+    if all(tensor.device.type == "cuda" for tensor in tensors):
+        return tensors
+
+    required_bytes = sum(_tensor_nbytes(tensor) for tensor in tensors if tensor.device.type != "cuda")
+    free_mem, total_mem = torch.cuda.mem_get_info(device)
+    margin_bytes = int(max(0.0, float(safety_margin_gb)) * 1024**3)
+    usable_bytes = int(max(0, int(free_mem) - margin_bytes) * max(0.0, float(target_fraction)))
+    if required_bytes > usable_bytes:
+        print(
+            f"[gpu cache] skipped {name}: need={required_bytes/1024**3:.2f}GB "
+            f"usable={usable_bytes/1024**3:.2f}GB "
+            f"(free={free_mem/1024**3:.2f}GB total={total_mem/1024**3:.2f}GB)"
+        )
+        return tensors
+
+    moved: list[torch.Tensor] = []
+    try:
+        for tensor in tensors:
+            moved.append(tensor if tensor.device.type == "cuda" else tensor.to(device=device, non_blocking=True))
+        torch.cuda.synchronize(device)
+        print(
+            f"[gpu cache] cached {name} on {device}: size={required_bytes/1024**3:.2f}GB "
+            f"(free_before={free_mem/1024**3:.2f}GB)"
+        )
+        return tuple(moved)
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower():
+            raise
+        print(f"[gpu cache] skipped {name}: CUDA OOM during cache attempt")
+        del moved
+        _release_cuda_memory(device)
+        return tensors
 
 
 def _prepare_split_tensors(
@@ -672,6 +1406,7 @@ def _evaluate_tensor_batch(
     chunk_rows: int,
     compute_ic: bool = True,
     profile_timing: bool = False,
+    progress_label: str | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     weights_chunks: list[torch.Tensor] = []
@@ -699,10 +1434,16 @@ def _evaluate_tensor_batch(
 
     timing = TimingBreakdown()
     overall_start = time.perf_counter()
+    total_chunks = int(max(1, (int(x.size(0)) + int(chunk_rows) - 1) // int(chunk_rows)))
+    if progress_label:
+        _progress(f"{progress_label}: start eval rows={int(x.size(0))} chunk_rows={int(chunk_rows)} chunks={total_chunks}")
 
     with torch.inference_mode():
-        for start in range(0, x.size(0), chunk_rows):
+        for chunk_idx, start in enumerate(range(0, x.size(0), chunk_rows), start=1):
             end = min(start + chunk_rows, x.size(0))
+            _maybe_cudagraph_step_begin()
+            if progress_label:
+                _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} transfer rows=[{start},{end})")
             chunk_start = time.perf_counter()
             x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
             returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
@@ -713,12 +1454,19 @@ def _evaluate_tensor_batch(
             _maybe_sync_cuda(device, profile_timing)
             timing.transfer_s += time.perf_counter() - chunk_start
 
+            if progress_label:
+                _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} forward model")
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
-                weights_chunk = model(x_chunk, buy_mask_chunk)
+                model_output_chunk = model(x_chunk, mask_chunk)
+                weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
-            timing.forward_s += time.perf_counter() - forward_start
+            chunk_forward_elapsed = time.perf_counter() - forward_start
+            timing.forward_s += chunk_forward_elapsed
+            timing.model_forward_s += chunk_forward_elapsed
 
+            if progress_label:
+                _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} backtest")
             backtest_start = time.perf_counter()
             backtest_chunk = run_backtest_torch(
                 weights_chunk,
@@ -737,15 +1485,17 @@ def _evaluate_tensor_batch(
             timing.backtest_s += time.perf_counter() - backtest_start
 
             if compute_ic:
+                if progress_label:
+                    _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} compute IC")
                 ic_start = time.perf_counter()
                 ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
 
-            weights_chunks.append(backtest_chunk.weights_history)
-            strategy_chunks.append(backtest_chunk.strategy_returns)
-            benchmark_chunks.append(backtest_chunk.benchmark_returns)
-            turnover_chunks.append(backtest_chunk.turnovers)
+            weights_chunks.append(backtest_chunk.weights_history.clone())
+            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
+            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
+            turnover_chunks.append(backtest_chunk.turnovers.clone())
 
             r = torch.nan_to_num(backtest_chunk.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
             b = torch.nan_to_num(backtest_chunk.benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
@@ -774,6 +1524,12 @@ def _evaluate_tensor_batch(
                     ic_sum += float(ic_clean64.sum().item())
                     ic_sumsq += float((ic_clean64 * ic_clean64).sum().item())
                     ic_pos += float((ic_clean64 > 0).to(torch.float64).sum().item())
+            if progress_label:
+                _progress(
+                    f"{progress_label}: chunk {chunk_idx}/{total_chunks} done "
+                    f"(transfer={timing.transfer_s:.1f}s forward={timing.forward_s:.1f}s "
+                    f"backtest={timing.backtest_s:.1f}s ic={timing.ic_s:.1f}s)"
+                )
 
         weights = torch.cat(weights_chunks, dim=0)
         strategy_returns = torch.cat(strategy_chunks, dim=0)
@@ -839,6 +1595,8 @@ def _evaluate_tensor_batch(
             }
     timing.total_s = time.perf_counter() - overall_start
     timing.batches = int(max(1, (x.size(0) + chunk_rows - 1) // chunk_rows))
+    if progress_label:
+        _progress(f"{progress_label}: eval done total={timing.total_s:.1f}s chunks={timing.batches}")
     if profile_timing:
         _log_timing("eval", timing)
     return backtest, ic, metrics
@@ -879,13 +1637,15 @@ def _auto_chunk_rows(
     # Measure per-row incremental VRAM cost on a tiny probe, then size chunk
     # from currently free VRAM. This avoids OOM-driven probing.
     probe_rows = max(1, min(32, total_rows))
+    _progress(f"[eval chunk auto] probing rows={probe_rows}/{total_rows} to estimate eval VRAM")
     torch.cuda.reset_peak_memory_stats(device)
     base_alloc = torch.cuda.memory_allocated(device)
     with torch.inference_mode():
         x_probe = x[:probe_rows].to(device=device, non_blocking=True)
         mask_probe = tradable_mask[:probe_rows].to(device=device, non_blocking=True)
         with _autocast_context(device, amp_dtype):
-            _ = model(x_probe, mask_probe)
+            probe_output = model(x_probe, mask_probe)
+            _, _ = _extract_weights_and_aux(probe_output)
     torch.cuda.synchronize(device)
     peak_alloc = torch.cuda.max_memory_allocated(device)
 
@@ -895,8 +1655,14 @@ def _auto_chunk_rows(
     # Keep headroom for allocator/workspace fluctuations.
     usable_bytes = int(usable_pool_bytes * target_vram_fraction * 0.9)
     estimated_rows = usable_bytes // bytes_per_row
+    chunk_rows = max(1, min(total_rows, int(estimated_rows)))
+    _progress(
+        f"[eval chunk auto] peak_increment={incremental_bytes/1024**2:.1f}MiB "
+        f"bytes_per_row={bytes_per_row/1024**2:.2f}MiB usable={usable_bytes/1024**3:.2f}GB "
+        f"chunk_rows={chunk_rows}"
+    )
 
-    return max(1, min(total_rows, int(estimated_rows)))
+    return chunk_rows
 
 
 def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
@@ -1179,7 +1945,8 @@ def find_optimal_batch_size(
 
         try:
             with _autocast_context(device, amp_dtype):
-                logits = model(local_batch["x"], local_batch["can_buy_mask"])
+                model_output = model(local_batch["x"], local_batch["tradable_mask"])
+                logits, _ = _extract_weights_and_aux(model_output)
                 loss = risk_aware_loss(
                     logits,
                     local_batch["future_log_returns"],
@@ -1360,6 +2127,63 @@ def _estimate_sample_bytes(
     return int(input_bytes + target_bytes + tradable_mask_bytes + benchmark_bytes + activation_bytes)
 
 
+def _estimate_cstpm_sample_bytes(config: ExperimentConfig, panel: PanelData, amp_dtype: torch.dtype | None) -> tuple[int, str]:
+    cstpm = config.training.cross_sectional_temporal_portfolio_model
+    lookback = int(config.training.lookback)
+    num_symbols = int(panel.num_symbols)
+    num_features = int(len(panel.feature_names))
+    candidate_top_m = min(max(1, int(getattr(cstpm, "candidate_k", getattr(cstpm, "candidate_top_m", 64)))), num_symbols)
+    scorer_hidden = int(getattr(cstpm, "scorer_hidden", cstpm.stock_hidden_dim))
+    scorer_blocks = int(getattr(cstpm, "scorer_blocks", cstpm.stock_n_blocks))
+    d_model = int(getattr(cstpm, "d_model", cstpm.cross_hidden_dim))
+    heads = int(getattr(cstpm, "heads", cstpm.cross_heads))
+    layers = int(getattr(cstpm, "layers", cstpm.cross_layers))
+    amp_bytes = _amp_bytes(amp_dtype)
+    fp32_bytes = 4
+
+    input_bytes = lookback * num_symbols * num_features * fp32_bytes
+    target_bytes = num_symbols * fp32_bytes
+    mask_bytes = num_symbols * 3
+    benchmark_bytes = fp32_bytes
+
+    # New CSTPM runs an all-stock tabular ResNet scorer, then limits cross-asset
+    # attention to hard candidates. Memory is therefore O(S) for the scorer plus
+    # O(M^2) for the reranker, where M=candidate_top_m.
+    stock_hidden_slots = 12 + 8 * max(1, scorer_blocks)
+    stock_hidden_bytes = (
+        num_symbols
+        * scorer_hidden
+        * amp_bytes
+        * stock_hidden_slots
+    )
+
+    stock_embedding_bytes = num_symbols * d_model * amp_bytes * 6
+    candidate_bytes = candidate_top_m * (d_model + d_model) * amp_bytes * 8
+    cross_bytes = candidate_top_m * d_model * amp_bytes * 12
+    cross_attn_bytes = max(1, layers) * max(1, heads) * candidate_top_m * candidate_top_m * amp_bytes * 4
+
+    total = int(
+        input_bytes
+        + target_bytes
+        + mask_bytes
+        + benchmark_bytes
+        + stock_hidden_bytes
+        + stock_embedding_bytes
+        + candidate_bytes
+        + cross_bytes
+        + cross_attn_bytes
+    )
+    detail = (
+        f"cstpm_formula input={input_bytes/1024**2:.1f}MiB "
+        f"stock_hidden={stock_hidden_bytes/1024**3:.2f}GiB "
+        f"candidate={candidate_bytes/1024**2:.1f}MiB "
+        f"cross={cross_bytes/1024**3:.2f}GiB "
+        f"attn={cross_attn_bytes/1024**2:.1f}MiB "
+        f"slots={stock_hidden_slots} candidates={candidate_top_m}"
+    )
+    return total, detail
+
+
 def _budget_batch_size(
     *,
     dataset_size: int,
@@ -1375,6 +2199,37 @@ def _budget_batch_size(
     else:
         by_budget = max(1, available_bytes // sample_bytes)
     return max(1, min(dataset_size, requested_cap, max(min_batch_size, int(by_budget))))
+
+
+def _usable_vram_bytes(
+    *,
+    device: torch.device,
+    budget_gb: float,
+    safety_margin_gb: float,
+    target_fraction: float,
+) -> tuple[int, str]:
+    margin_bytes = int(max(0.0, safety_margin_gb) * 1024**3)
+    budget_bytes = int(max(0.0, budget_gb) * 1024**3)
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+
+    smi = _query_nvidia_smi_free_bytes(device_index)
+    if smi is not None:
+        smi_total, smi_used, smi_free = smi
+        hard_cap_bytes = max(1, min(budget_bytes, smi_total) - margin_bytes)
+        free_cap_bytes = int(max(0, smi_free - margin_bytes) * float(target_fraction))
+        usable = max(1, min(hard_cap_bytes, free_cap_bytes))
+        source = (
+            f"nvidia-smi total={smi_total/1024**3:.1f}GB "
+            f"used={smi_used/1024**3:.1f}GB free={smi_free/1024**3:.1f}GB"
+        )
+    else:
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        hard_cap_bytes = max(1, min(budget_bytes, int(total_mem)) - margin_bytes)
+        free_cap_bytes = int(max(0, int(free_mem) - margin_bytes) * float(target_fraction))
+        usable = max(1, min(hard_cap_bytes, free_cap_bytes))
+        source = f"torch.mem_get_info total={total_mem/1024**3:.1f}GB free={free_mem/1024**3:.1f}GB"
+
+    return usable, source
 
 
 def _split_batch_size(dataset_size: int, cap: int) -> int:
@@ -1412,7 +2267,16 @@ def _train_epoch(
     gamma_turnover_budget: float,
     objective: str,
     grad_clip_norm: float,
+    finite_check_interval_steps: int = 0,
+    rank_ic_weight: float = 0.20,
+    direction_weight: float = 0.05,
+    volatility_regime_weight: float = 0.05,
+    concentration_weight: float = 0.005,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
+    factor_aug_kwargs: dict[str, float] | None = None,
     profile_timing: bool = False,
+    progress_label: str | None = None,
 ) -> tuple[float, TimingBreakdown]:
     model.train()
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -1421,6 +2285,9 @@ def _train_epoch(
     timing = TimingBreakdown()
     total_start = time.perf_counter()
     loader_iter = iter(loader)
+    total_batches = int(len(loader)) if hasattr(loader, "__len__") else 0
+    if progress_label:
+        _progress(f"{progress_label}: train epoch start mode=dataloader batches={total_batches}")
 
     while True:
         fetch_start = time.perf_counter()
@@ -1428,6 +2295,10 @@ def _train_epoch(
             batch = next(loader_iter)
         except StopIteration:
             break
+        batch_no = steps + 1
+        if progress_label:
+            suffix = f"/{total_batches}" if total_batches else ""
+            _progress(f"{progress_label}: batch {batch_no}{suffix} fetched; transfer to {device}")
         _maybe_sync_cuda(device, profile_timing)
         timing.fetch_s += time.perf_counter() - fetch_start
 
@@ -1439,9 +2310,28 @@ def _train_epoch(
         _maybe_cudagraph_step_begin()
         optimizer.zero_grad(set_to_none=True)
 
+        if progress_label:
+            _progress(f"{progress_label}: batch {batch_no}{suffix} forward + {objective} loss")
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
-            weights = model(batch["x"], batch["can_buy_mask"])
+            model_forward_start = time.perf_counter()
+            model_output = model(batch["x"], batch["tradable_mask"])
+            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.model_forward_s += time.perf_counter() - model_forward_start
+
+            factor_aug_start = time.perf_counter()
+            aux_outputs = _attach_factor_augmented_scores(
+                model=model,
+                aux_outputs=aux_outputs,
+                x=batch["x"],
+                tradable_mask=batch["tradable_mask"],
+                aug_kwargs=factor_aug_kwargs or {},
+            )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.factor_aug_s += time.perf_counter() - factor_aug_start
+
+            loss_start = time.perf_counter()
             loss = loss_fn(
                 weights,
                 batch["future_log_returns"],
@@ -1471,14 +2361,32 @@ def _train_epoch(
                 gamma_drawdown_budget=gamma_drawdown_budget,
                 gamma_turnover_budget=gamma_turnover_budget,
                 objective=objective,
+                aux_outputs=aux_outputs,
+                rank_ic_weight=rank_ic_weight,
+                direction_weight=direction_weight,
+                volatility_regime_weight=volatility_regime_weight,
+                concentration_weight=concentration_weight,
+                regime_up_threshold=regime_up_threshold,
+                regime_down_threshold=regime_down_threshold,
             )
-        if not torch.isfinite(loss).all():
-            optimizer.zero_grad(set_to_none=True)
-            continue
+            _maybe_sync_cuda(device, profile_timing)
+            timing.loss_s += time.perf_counter() - loss_start
+        should_check_finite = _should_check_finite(batch_no, finite_check_interval_steps)
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            loss_is_finite = _tensor_is_finite(loss)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not loss_is_finite:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite loss")
+                optimizer.zero_grad(set_to_none=True)
+                continue
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
         backward_start = time.perf_counter()
+        if progress_label:
+            _progress(f"{progress_label}: batch {batch_no}{suffix} backward")
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             scaler.scale(loss).backward()
@@ -1486,12 +2394,28 @@ def _train_epoch(
             timing.grad_s += time.perf_counter() - grad_start
 
             if grad_clip_norm > 0.0:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
                 clip_start = time.perf_counter()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.clip_s += time.perf_counter() - clip_start
 
+            if should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            else:
+                gradients_are_finite = True
+            if not gradients_are_finite:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite gradients")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            if progress_label:
+                _progress(f"{progress_label}: batch {batch_no}{suffix} optimizer step")
             step_start = time.perf_counter()
             scaler.step(optimizer)
             scaler.update()
@@ -1504,24 +2428,54 @@ def _train_epoch(
             timing.grad_s += time.perf_counter() - grad_start
 
             if grad_clip_norm > 0.0:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
                 clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.clip_s += time.perf_counter() - clip_start
 
+            if should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            else:
+                gradients_are_finite = True
+            if not gradients_are_finite:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite gradients")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            if progress_label:
+                _progress(f"{progress_label}: batch {batch_no}{suffix} optimizer step")
             step_start = time.perf_counter()
             optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            parameters_are_finite = _model_parameters_are_finite(model)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not parameters_are_finite:
+                raise RuntimeError("Model parameters became non-finite after optimizer step")
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
 
         total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
         steps += 1
+        if progress_label:
+            _progress(
+                f"{progress_label}: batch {batch_no}{suffix} done "
+                f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
+            )
 
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
+    if progress_label:
+        _progress(f"{progress_label}: train epoch done steps={steps} total={timing.total_s:.1f}s")
     if steps == 0:
         return 0.0, timing
     mean_loss = float((total_loss_t / steps).detach().cpu())
@@ -1566,7 +2520,16 @@ def _train_epoch_tensor(
     gamma_turnover_budget: float,
     objective: str,
     grad_clip_norm: float,
+    finite_check_interval_steps: int = 0,
+    rank_ic_weight: float = 0.20,
+    direction_weight: float = 0.05,
+    volatility_regime_weight: float = 0.05,
+    concentration_weight: float = 0.005,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
+    factor_aug_kwargs: dict[str, float] | None = None,
     profile_timing: bool = False,
+    progress_label: str | None = None,
 ) -> tuple[float, TimingBreakdown]:
     model.train()
     total_rows = int(x.size(0))
@@ -1579,14 +2542,23 @@ def _train_epoch_tensor(
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
+    if progress_label:
+        _progress(
+            f"{progress_label}: train epoch start mode=tensor rows={total_rows} "
+            f"batch_size={batch_size} batches={num_batches} objective={objective}"
+        )
 
-    for batch_idx in batch_order:
+    for step_idx, batch_idx in enumerate(batch_order, start=1):
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
+        if progress_label:
+            _progress(f"{progress_label}: batch {step_idx}/{num_batches} select rows=[{start},{end})")
         _maybe_sync_cuda(device, profile_timing)
         timing.fetch_s += time.perf_counter() - batch_start
 
+        if progress_label:
+            _progress(f"{progress_label}: batch {step_idx}/{num_batches} transfer to {device}")
         transfer_start = time.perf_counter()
         batch_x = x[start:end].to(device=device, non_blocking=non_blocking)
         batch_ret = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
@@ -1600,9 +2572,28 @@ def _train_epoch_tensor(
 
         _maybe_cudagraph_step_begin()
         optimizer.zero_grad(set_to_none=True)
+        if progress_label:
+            _progress(f"{progress_label}: batch {step_idx}/{num_batches} forward model + {objective} loss")
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
-            weights = model(batch_x, batch_buy_mask)
+            model_forward_start = time.perf_counter()
+            model_output = model(batch_x, batch_mask)
+            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.model_forward_s += time.perf_counter() - model_forward_start
+
+            factor_aug_start = time.perf_counter()
+            aux_outputs = _attach_factor_augmented_scores(
+                model=model,
+                aux_outputs=aux_outputs,
+                x=batch_x,
+                tradable_mask=batch_mask,
+                aug_kwargs=factor_aug_kwargs or {},
+            )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.factor_aug_s += time.perf_counter() - factor_aug_start
+
+            loss_start = time.perf_counter()
             loss = loss_fn(
                 weights,
                 batch_ret,
@@ -1632,14 +2623,32 @@ def _train_epoch_tensor(
                 gamma_drawdown_budget=gamma_drawdown_budget,
                 gamma_turnover_budget=gamma_turnover_budget,
                 objective=objective,
+                aux_outputs=aux_outputs,
+                rank_ic_weight=rank_ic_weight,
+                direction_weight=direction_weight,
+                volatility_regime_weight=volatility_regime_weight,
+                concentration_weight=concentration_weight,
+                regime_up_threshold=regime_up_threshold,
+                regime_down_threshold=regime_down_threshold,
             )
-        if not torch.isfinite(loss).all():
-            optimizer.zero_grad(set_to_none=True)
-            continue
+            _maybe_sync_cuda(device, profile_timing)
+            timing.loss_s += time.perf_counter() - loss_start
+        should_check_finite = _should_check_finite(step_idx, finite_check_interval_steps)
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            loss_is_finite = _tensor_is_finite(loss)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not loss_is_finite:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite loss")
+                optimizer.zero_grad(set_to_none=True)
+                continue
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
         backward_start = time.perf_counter()
+        if progress_label:
+            _progress(f"{progress_label}: batch {step_idx}/{num_batches} backward")
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             scaler.scale(loss).backward()
@@ -1647,12 +2656,28 @@ def _train_epoch_tensor(
             timing.grad_s += time.perf_counter() - grad_start
 
             if grad_clip_norm > 0.0:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
                 clip_start = time.perf_counter()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.clip_s += time.perf_counter() - clip_start
 
+            if should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            else:
+                gradients_are_finite = True
+            if not gradients_are_finite:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite gradients")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            if progress_label:
+                _progress(f"{progress_label}: batch {step_idx}/{num_batches} optimizer step")
             step_start = time.perf_counter()
             scaler.step(optimizer)
             scaler.update()
@@ -1665,24 +2690,54 @@ def _train_epoch_tensor(
             timing.grad_s += time.perf_counter() - grad_start
 
             if grad_clip_norm > 0.0:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
                 clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.clip_s += time.perf_counter() - clip_start
 
+            if should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            else:
+                gradients_are_finite = True
+            if not gradients_are_finite:
+                if progress_label:
+                    _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite gradients")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            if progress_label:
+                _progress(f"{progress_label}: batch {step_idx}/{num_batches} optimizer step")
             step_start = time.perf_counter()
             optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            parameters_are_finite = _model_parameters_are_finite(model)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not parameters_are_finite:
+                raise RuntimeError("Model parameters became non-finite after optimizer step")
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
 
         total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
         steps += 1
+        if progress_label:
+            _progress(
+                f"{progress_label}: batch {step_idx}/{num_batches} done "
+                f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
+            )
 
     timing.total_s = time.perf_counter() - total_start
     timing.batches = steps
+    if progress_label:
+        _progress(f"{progress_label}: train epoch done steps={steps} total={timing.total_s:.1f}s")
     if steps == 0:
         return 0.0, timing
     mean_loss = float((total_loss_t / steps).detach().cpu())
@@ -1703,11 +2758,13 @@ def _compute_metrics_from_tensors(
         return {
             "cumulative_return": 0.0,
             "annualized_return": 0.0,
+            "cagr": 0.0,
             "sharpe": 0.0,
             "baseline_sharpe": 0.0,
             "sortino": 0.0,
             "baseline_sortino": 0.0,
             "max_drawdown": 0.0,
+            "calmar": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
             "excess_return_vs_universe_average": 0.0,
@@ -1737,15 +2794,18 @@ def _compute_metrics_from_tensors(
     running_max = torch.cummax(equity, dim=0).values
     dd = equity / running_max.clamp_min(1e-12) - 1.0
     max_dd = float(dd.min().item()) if dd.numel() else 0.0
+    calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
 
     return {
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
+        "cagr": ann_r,
         "sharpe": sharpe,
         "baseline_sharpe": baseline_sharpe,
         "sortino": sortino,
         "baseline_sortino": baseline_sortino,
         "max_drawdown": max_dd,
+        "calmar": calmar,
         "turnover": float(t.mean().item()) if t.numel() else 0.0,
         "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),
         "excess_return_vs_universe_average": cum_r - cum_b,
@@ -1944,6 +3004,14 @@ def _run_training_tree_models(
                 json.dump(asdict(fold_result), f, indent=2)
 
             _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+            _save_daily_portfolio_returns_csv(
+                fold_dir / "daily_portfolio_returns.csv",
+                test_dates,
+                test_bt.strategy_returns,
+                test_bt.benchmark_returns,
+                test_bt.turnovers,
+            )
+            _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
             report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
@@ -2112,6 +3180,14 @@ def _run_inference_tree_models(
             json.dump(asdict(fold_result), f, indent=2)
 
         _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+        _save_daily_portfolio_returns_csv(
+            fold_dir / "daily_portfolio_returns.csv",
+            test_dates,
+            test_bt.strategy_returns,
+            test_bt.benchmark_returns,
+            test_bt.turnovers,
+        )
+        _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
@@ -2329,6 +3405,14 @@ def _run_inference_neural_models(
             json.dump(asdict(fold_result), f, indent=2)
 
         _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+        _save_daily_portfolio_returns_csv(
+            fold_dir / "daily_portfolio_returns.csv",
+            test_dates,
+            test_bt.strategy_returns,
+            test_bt.benchmark_returns,
+            test_bt.turnovers,
+        )
+        _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
@@ -2415,6 +3499,10 @@ def run_training(
 
     results_by_fold: dict[int, FoldResult] = {}
     loss_objective = _normalize_risk_objective(config.training.loss_type)
+    factor_loss_kwargs = _factor_loss_kwargs(config)
+    portfolio_autoencoder_loss_kwargs = _portfolio_autoencoder_loss_kwargs(config)
+    risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
+    factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
 
     if resume:
@@ -2434,6 +3522,7 @@ def run_training(
     for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
         train_years = list(train_years_key)
         group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
+        group_curve_path = _group_curve_path(output_path, train_years)
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
 
         # Ensure each train-group starts from a clean CUDA allocator state.
@@ -2456,10 +3545,6 @@ def run_training(
         train_batch_used_bytes = 0
 
         if config.training.auto_batch_size and device.type == "cuda":
-            budget_bytes = int(config.training.vram_budget_gb * (1024 ** 3))
-            margin_bytes = int(config.training.vram_safety_margin_gb * (1024 ** 3))
-            effective_budget_bytes = max(0, budget_bytes - margin_bytes)
-
             estimation_model = build_model(
                 config=config,
                 lookback=config.training.lookback,
@@ -2467,47 +3552,47 @@ def run_training(
                 num_symbols=panel.num_symbols,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
-            eval_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=False)
-            estimation_hidden_dim = model_hidden_dim_hint(config)
-            train_sample_bytes = _estimate_sample_bytes(
-                lookback=config.training.lookback,
-                num_symbols=panel.num_symbols,
-                num_features=len(panel.feature_names),
-                hidden_dim=estimation_hidden_dim,
-                amp_dtype=amp_dtype,
-                training_mode=True,
-            )
-            eval_sample_bytes = _estimate_sample_bytes(
-                lookback=config.training.lookback,
-                num_symbols=panel.num_symbols,
-                num_features=len(panel.feature_names),
-                hidden_dim=estimation_hidden_dim,
-                amp_dtype=amp_dtype,
-                training_mode=False,
-            )
+            model_name = str(config.training.model_name).strip().lower()
+            if model_name in {"cross_sectional_temporal_portfolio_model", "portfolio_multitask", "cstpm"}:
+                train_sample_bytes, sample_detail = _estimate_cstpm_sample_bytes(config, panel, amp_dtype)
+            else:
+                estimation_hidden_dim = model_hidden_dim_hint(config)
+                train_sample_bytes = _estimate_sample_bytes(
+                    lookback=config.training.lookback,
+                    num_symbols=panel.num_symbols,
+                    num_features=len(panel.feature_names),
+                    hidden_dim=estimation_hidden_dim,
+                    amp_dtype=amp_dtype,
+                    training_mode=True,
+                )
+                sample_detail = "generic_formula"
 
-            temp_model = build_model(
-                config=config,
-                lookback=config.training.lookback,
-                num_features=len(panel.feature_names),
-                num_symbols=panel.num_symbols,
-            ).to(device)
-
-            print(f"[Train {train_years}] searching optimal train batch size...")
-            temp_train_loader = _build_loader(train_ds, 1, False, config, device)
-            train_batch_size, train_batch_used_bytes = find_optimal_batch_size(
-                model=temp_model,
-                sample_loader=temp_train_loader,
+            usable_vram_bytes, mem_source = _usable_vram_bytes(
                 device=device,
-                amp_dtype=amp_dtype,
-                long_only=config.trading.long_only,
-                target_vram_fraction=config.training.target_vram_fraction,
-                vram_budget_gb=config.training.vram_budget_gb,
-                vram_safety_margin_gb=config.training.vram_safety_margin_gb,
+                budget_gb=config.training.vram_budget_gb,
+                safety_margin_gb=config.training.vram_safety_margin_gb,
+                target_fraction=config.training.target_vram_fraction,
             )
-            train_batch_size = max(min_batch_size, train_batch_size)
-            del temp_train_loader
-            del temp_model
+            # Keep substantial headroom for CUDA workspaces, allocator
+            # fragmentation, validation chunks, and Adam optimizer transients.
+            estimated_budget_bytes = int(usable_vram_bytes * 0.70)
+            train_batch_size = _budget_batch_size(
+                dataset_size=len(train_ds),
+                requested_cap=max(1, int(config.training.batch_size_train)),
+                budget_bytes=estimated_budget_bytes,
+                static_bytes=train_static_bytes,
+                sample_bytes=train_sample_bytes,
+                min_batch_size=min_batch_size,
+            )
+            train_batch_used_bytes = train_static_bytes + train_batch_size * train_sample_bytes
+            print(
+                f"[Train {train_years}] calculated train batch_size={train_batch_size} "
+                f"(est_used={train_batch_used_bytes/1024**3:.1f}GB, "
+                f"est_budget={estimated_budget_bytes/1024**3:.1f}GB, "
+                f"usable={usable_vram_bytes/1024**3:.1f}GB, "
+                f"sample={train_sample_bytes/1024**3:.2f}GB, "
+                f"static={train_static_bytes/1024**3:.2f}GB, {sample_detail}, {mem_source})"
+            )
             del estimation_model
             _release_cuda_memory(device)
         else:
@@ -2515,7 +3600,9 @@ def run_training(
 
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
         train_setup_start = time.perf_counter()
+        _progress(f"[Train {train_years}] setup train tensors: materialize dataset -> tensors")
         train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark = _dataset_to_tensors(train_ds)
+        _progress(f"[Train {train_years}] setup train tensors: pad to batch_size={train_batch_size}")
         train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark, train_sample_mask = _pad_training_tensors(
             train_x,
             train_returns,
@@ -2525,6 +3612,7 @@ def run_training(
             train_benchmark,
             train_batch_size,
         )
+        _progress(f"[Train {train_years}] setup train tensors: prepare host/device memory")
         train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark = _prepare_split_tensors(
             train_x,
             train_returns,
@@ -2593,6 +3681,7 @@ def run_training(
 
         val_datasets = [context.val_ds for context in fold_contexts.values()]
         val_setup_start = time.perf_counter()
+        _progress(f"[Train {train_years}] setup validation tensors")
         combined_val_x, combined_val_returns, combined_val_masks, combined_val_buy_masks, combined_val_sell_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
             val_datasets,  # type: ignore[arg-type]
         )
@@ -2615,7 +3704,33 @@ def run_training(
                 TimingBreakdown(total_s=time.perf_counter() - val_setup_start),
             )
 
+        test_datasets = [context.test_ds for context in fold_contexts.values()]
+        test_setup_start = time.perf_counter()
+        _progress(f"[Train {train_years}] setup test tensors")
+        combined_test_x, combined_test_returns, combined_test_masks, combined_test_buy_masks, combined_test_sell_masks, combined_test_bench, test_lengths = _combine_datasets_to_tensors(
+            test_datasets,  # type: ignore[arg-type]
+        )
+        combined_test_x, combined_test_returns, combined_test_masks, combined_test_buy_masks, combined_test_sell_masks, combined_test_bench = _prepare_split_tensors(
+            combined_test_x,
+            combined_test_returns,
+            combined_test_masks,
+            combined_test_buy_masks,
+            combined_test_sell_masks,
+            combined_test_bench,
+            device,
+            non_blocking,
+        )
+        test_offsets: list[int] = [0]
+        for length in test_lengths:
+            test_offsets.append(test_offsets[-1] + length)
+        if profile_timing:
+            _log_timing(
+                f"Train {train_years} setup.test_tensors",
+                TimingBreakdown(total_s=time.perf_counter() - test_setup_start),
+            )
+
         model_build_start = time.perf_counter()
+        _progress(f"[Train {train_years}] build model")
         model = build_model(
             config=config,
             lookback=config.training.lookback,
@@ -2635,7 +3750,7 @@ def run_training(
                 print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
-        compiled_loss_fn: Callable[..., torch.Tensor] = risk_aware_loss
+        compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
 
         if device.type == "cuda":
             try:
@@ -2686,6 +3801,17 @@ def run_training(
 
         if start_epoch > config.training.epochs:
             print(f"[Train {train_years}] checkpoint already reached epoch {config.training.epochs}; evaluating only")
+
+        _trim_group_curve(group_curve_path, start_epoch)
+        curve_plotter = _AsyncEpochCurvePlotter(
+            group_curve_path,
+            interval=int(config.training.curve_plot_interval),
+            async_enabled=bool(config.training.curve_plot_async),
+        )
+
+        def _record_epoch_curve(payload: dict[str, float | int | None]) -> None:
+            _append_group_curve(group_curve_path, payload)
+            curve_plotter.request()
 
         if config.training.chunk_rows > 0:
             eval_chunk_rows = min(config.training.chunk_rows, int(combined_val_x.size(0)))
@@ -2744,10 +3870,14 @@ def run_training(
                     compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", "1" if auto_compile_risk else "0")
                     if compile_loss:
                         try:
-                            compiled_loss_fn = torch.compile(risk_aware_loss, mode="reduce-overhead", dynamic=False)
+                            compiled_loss_fn = torch.compile(
+                                partial(risk_aware_loss, **risk_loss_kwargs),
+                                mode="reduce-overhead",
+                                dynamic=False,
+                            )
                             print(f"[Train {train_years}] torch.compile loss enabled (mode=reduce-overhead, dynamic=False)")
                         except Exception as e:
-                            compiled_loss_fn = risk_aware_loss
+                            compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                             print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
                     if profile_timing:
                         _log_timing(
@@ -2794,6 +3924,136 @@ def run_training(
         else:
             print(f"[Train {train_years}] training mode=tensor (num_workers={config.training.num_workers})")
 
+        if train_loader is None:
+            (
+                train_x,
+                train_returns,
+                train_masks,
+                train_buy_masks,
+                train_sell_masks,
+                train_benchmark,
+                train_sample_mask,
+            ) = _maybe_cache_tensors_on_device(
+                name=f"train tensors {train_years}",
+                tensors=(
+                    train_x,
+                    train_returns,
+                    train_masks,
+                    train_buy_masks,
+                    train_sell_masks,
+                    train_benchmark,
+                    train_sample_mask,
+                ),
+                device=device,
+                enabled=bool(config.training.cache_train_tensors_on_gpu),
+                target_fraction=float(config.training.target_vram_fraction),
+                safety_margin_gb=float(config.training.vram_safety_margin_gb),
+            )
+
+        (
+            combined_val_x,
+            combined_val_returns,
+            combined_val_masks,
+            combined_val_buy_masks,
+            combined_val_sell_masks,
+            combined_val_bench,
+        ) = _maybe_cache_tensors_on_device(
+            name=f"validation tensors {train_years}",
+            tensors=(
+                combined_val_x,
+                combined_val_returns,
+                combined_val_masks,
+                combined_val_buy_masks,
+                combined_val_sell_masks,
+                combined_val_bench,
+            ),
+            device=device,
+            enabled=bool(config.training.cache_eval_tensors_on_gpu),
+            target_fraction=float(config.training.target_vram_fraction),
+            safety_margin_gb=float(config.training.vram_safety_margin_gb),
+        )
+        (
+            combined_test_x,
+            combined_test_returns,
+            combined_test_masks,
+            combined_test_buy_masks,
+            combined_test_sell_masks,
+            combined_test_bench,
+        ) = _maybe_cache_tensors_on_device(
+            name=f"test tensors {train_years}",
+            tensors=(
+                combined_test_x,
+                combined_test_returns,
+                combined_test_masks,
+                combined_test_buy_masks,
+                combined_test_sell_masks,
+                combined_test_bench,
+            ),
+            device=device,
+            enabled=bool(config.training.cache_eval_tensors_on_gpu),
+            target_fraction=float(config.training.target_vram_fraction),
+            safety_margin_gb=float(config.training.vram_safety_margin_gb),
+        )
+
+        if _should_profile_train_step():
+            profile_batch: dict[str, torch.Tensor] | None = None
+            try:
+                if train_loader is not None:
+                    raw_batch = next(iter(train_loader))
+                    profile_batch = _move_batch(raw_batch, device, non_blocking)
+                else:
+                    slice_end = min(train_batch_size, int(train_x.size(0)))
+                    if slice_end > 0:
+                        profile_batch = {
+                            "x": train_x[:slice_end].to(device=device, non_blocking=non_blocking),
+                            "future_log_returns": train_returns[:slice_end].to(device=device, non_blocking=non_blocking),
+                            "tradable_mask": train_masks[:slice_end].to(device=device, non_blocking=non_blocking),
+                            "can_buy_mask": train_buy_masks[:slice_end].to(device=device, non_blocking=non_blocking),
+                            "can_sell_mask": train_sell_masks[:slice_end].to(device=device, non_blocking=non_blocking),
+                        }
+                        if train_benchmark is not None:
+                            profile_batch["benchmark"] = train_benchmark[:slice_end].to(device=device, non_blocking=non_blocking)
+                        if train_sample_mask is not None:
+                            profile_batch["sample_mask"] = train_sample_mask[:slice_end].to(device=device, non_blocking=non_blocking)
+                if profile_batch is not None:
+                    _profile_single_train_step(
+                        model=compiled_train_model,
+                        loss_fn=compiled_loss_fn,
+                        batch=profile_batch,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        long_only=config.trading.long_only,
+                        buy_fee_rate=config.trading.buy_fee_rate,
+                        sell_fee_rate=config.trading.sell_fee_rate,
+                        max_turnover_ratio=config.trading.max_turnover_ratio,
+                        gross_leverage=config.trading.gross_leverage,
+                        gamma_sharpe=config.evaluation.gamma_sharpe,
+                        gamma_excess=config.evaluation.gamma_excess,
+                        gamma_cvar=config.evaluation.gamma_cvar,
+                        cvar_alpha=config.evaluation.cvar_alpha,
+                        gamma_drawdown=config.evaluation.gamma_drawdown,
+                        drawdown_target=config.evaluation.drawdown_target,
+                        gamma_turnover=config.evaluation.gamma_turnover,
+                        gamma_underperformance=config.evaluation.gamma_underperformance,
+                        excess_target=config.evaluation.excess_target,
+                        cvar_budget=config.evaluation.cvar_budget,
+                        drawdown_budget=config.evaluation.drawdown_budget,
+                        turnover_budget=config.evaluation.turnover_budget,
+                        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                        objective=loss_objective,
+                        rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                        direction_weight=config.training.multitask_loss.direction_weight,
+                        volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                        concentration_weight=config.training.multitask_loss.concentration_weight,
+                        regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                        regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                        fold_id=fold.fold_id,
+                    )
+            except Exception as e:
+                print(f"[torch.profiler] single-step profiling failed: {e}")
+
         early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
         early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
         val_interval = max(1, int(config.training.val_interval_epochs))
@@ -2814,6 +4074,7 @@ def run_training(
             dynamic_ncols=True,
         )
         val_backtest: BacktestResultTensor | None = None
+        test_mean_best_by_val: float | None = None
         get_backtest_compile_stats(reset=True)
 
         def _run_one_train_epoch(train_model: nn.Module) -> tuple[float, TimingBreakdown]:
@@ -2849,6 +4110,14 @@ def run_training(
                     config.evaluation.gamma_turnover_budget,
                     loss_objective,
                     config.training.grad_clip_norm,
+                    finite_check_interval_steps=config.training.finite_check_interval_steps,
+                    rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                    direction_weight=config.training.multitask_loss.direction_weight,
+                    volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                    concentration_weight=config.training.multitask_loss.concentration_weight,
+                    regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                    regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                    factor_aug_kwargs=factor_aug_kwargs,
                     profile_timing=profile_timing,
                 )
             return _train_epoch_tensor(
@@ -2889,10 +4158,19 @@ def run_training(
                 gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                 objective=loss_objective,
                 grad_clip_norm=config.training.grad_clip_norm,
+                finite_check_interval_steps=config.training.finite_check_interval_steps,
+                rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                direction_weight=config.training.multitask_loss.direction_weight,
+                volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                concentration_weight=config.training.multitask_loss.concentration_weight,
+                regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                factor_aug_kwargs=factor_aug_kwargs,
                 profile_timing=profile_timing,
             )
 
         for epoch in epoch_pbar:
+            epoch_start = time.perf_counter()
             last_epoch = epoch
             train_loss, train_timing = _run_one_train_epoch(compiled_train_model)
 
@@ -2902,8 +4180,12 @@ def run_training(
                 or (epoch == config.training.epochs)
             )
             if not should_validate:
+                scheduler_total = 0.0
                 if scheduler is not None and not scheduler_requires_metric:
+                    scheduler_start = time.perf_counter()
                     scheduler.step()
+                    scheduler_total = time.perf_counter() - scheduler_start
+                progress_update_start = time.perf_counter()
                 bt_stats_after = get_backtest_compile_stats()
                 bt_nonhit_total = (
                     bt_stats_after["misses"]
@@ -2912,7 +4194,7 @@ def run_training(
                 )
                 epoch_pbar.set_postfix(
                     {
-                        "train_loss": f"{train_loss:.6f}",
+                        "train_loss": f"{train_loss:.8f}",
                         "val_mean": "-",
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
                         "no_improve": no_improve_epochs,
@@ -2920,79 +4202,284 @@ def run_training(
                         "bt_nonhit": bt_nonhit_total,
                     }
                 )
+                progress_update_total = time.perf_counter() - progress_update_start
                 if profile_timing:
                     _log_timing(
                         f"Train {train_years} epoch {epoch} (train-only)",
                         train_timing,
                     )
+                _record_epoch_curve(
+                    {
+                        "epoch": int(epoch),
+                        "train_loss": float(train_loss),
+                        "val_mean": None,
+                        "test_mean": test_mean_best_by_val,
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                        **_timing_curve_payload(
+                            train_timing=train_timing,
+                            scheduler_s=scheduler_total,
+                            progress_update_s=progress_update_total,
+                            epoch_wall_s=time.perf_counter() - epoch_start,
+                            timing_synchronized=(device.type != "cuda" or profile_timing),
+                        ),
+                    },
+                )
                 continue
 
-            val_eval_start = time.perf_counter()
-            val_backtest, _, _ = _evaluate_tensor_batch(
-                model,
-                combined_val_x,
-                combined_val_returns,
-                combined_val_masks,
-                combined_val_buy_masks,
-                combined_val_sell_masks,
-                combined_val_bench,
-                device,
-                amp_dtype,
-                non_blocking,
-                config.trading.long_only,
-                config.trading.buy_fee_rate,
-                config.trading.sell_fee_rate,
-                config.trading.max_turnover_ratio,
-                config.trading.gross_leverage,
-                chunk_rows=eval_chunk_rows,
-                compute_ic=False,
-                profile_timing=profile_timing,
-            )
-            val_eval_total = time.perf_counter() - val_eval_start
-
             val_losses: list[float] = []
+            val_ics: list[float] = []
             any_fold_improved = False
-            val_loss_start = time.perf_counter()
-            for index, (_, context) in enumerate(fold_contexts.items()):
-                start = val_offsets[index]
-                end = val_offsets[index + 1]
-                val_loss_tensor = _loss_from_backtest_series(
-                    val_backtest.strategy_returns[start:end],
-                    val_backtest.benchmark_returns[start:end],
-                    val_backtest.turnovers[start:end],
-                    gamma_sharpe=config.evaluation.gamma_sharpe,
-                    gamma_excess=config.evaluation.gamma_excess,
-                    gamma_cvar=config.evaluation.gamma_cvar,
-                    cvar_alpha=config.evaluation.cvar_alpha,
-                    gamma_drawdown=config.evaluation.gamma_drawdown,
-                    drawdown_target=config.evaluation.drawdown_target,
-                    gamma_turnover=config.evaluation.gamma_turnover,
-                    gamma_underperformance=config.evaluation.gamma_underperformance,
-                    excess_target=config.evaluation.excess_target,
-                    cvar_budget=config.evaluation.cvar_budget,
-                    drawdown_budget=config.evaluation.drawdown_budget,
-                    turnover_budget=config.evaluation.turnover_budget,
-                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                    objective=loss_objective,
-                )
-                val_loss = float(val_loss_tensor.detach().cpu())
-                val_losses.append(val_loss)
-                if val_loss < context.best_val_loss:
-                    any_fold_improved = True
-                    context.best_val_loss = val_loss
-                    _save_fold_checkpoint(
-                        context.checkpoint_best_path,
-                        fold=context.fold,
-                        epoch=epoch,
-                        best_val_loss=val_loss,
-                        model=model,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                    )
+            fold_ckpt_total = 0.0
+            group_ckpt_total = 0.0
+            scheduler_total = 0.0
+            progress_update_total = 0.0
+            if loss_objective in {"rank_ic", "factor_generalization", "portfolio_autoencoder"}:
+                val_eval_start = time.perf_counter()
+                model.eval()
+                with torch.inference_mode():
+                    for index, (_, context) in enumerate(fold_contexts.items()):
+                        start = val_offsets[index]
+                        end = val_offsets[index + 1]
 
-            val_loss_total = time.perf_counter() - val_loss_start
+                        val_loss, val_ic = _evaluate_rank_ic_multitask_loss(
+                            model,
+                            combined_val_x[start:end],
+                            combined_val_returns[start:end],
+                            combined_val_masks[start:end],
+                            combined_val_buy_masks[start:end],
+                            combined_val_sell_masks[start:end],
+                            combined_val_bench[start:end],
+                            device,
+                            amp_dtype,
+                            non_blocking,
+                            chunk_rows=eval_chunk_rows,
+                            objective=loss_objective,
+                            long_only=config.trading.long_only,
+                            buy_fee_rate=config.trading.buy_fee_rate,
+                            sell_fee_rate=config.trading.sell_fee_rate,
+                            max_turnover_ratio=config.trading.max_turnover_ratio,
+                            gross_leverage=config.trading.gross_leverage,
+                            gamma_sharpe=config.evaluation.gamma_sharpe,
+                            gamma_excess=config.evaluation.gamma_excess,
+                            gamma_cvar=config.evaluation.gamma_cvar,
+                            cvar_alpha=config.evaluation.cvar_alpha,
+                            gamma_drawdown=config.evaluation.gamma_drawdown,
+                            drawdown_target=config.evaluation.drawdown_target,
+                            gamma_turnover=config.evaluation.gamma_turnover,
+                            gamma_underperformance=config.evaluation.gamma_underperformance,
+                            excess_target=config.evaluation.excess_target,
+                            cvar_budget=config.evaluation.cvar_budget,
+                            drawdown_budget=config.evaluation.drawdown_budget,
+                            turnover_budget=config.evaluation.turnover_budget,
+                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                            rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                            direction_weight=config.training.multitask_loss.direction_weight,
+                            volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                            concentration_weight=config.training.multitask_loss.concentration_weight,
+                            regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                            regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                            factor_loss_kwargs=risk_loss_kwargs,
+                        )
+                        val_losses.append(val_loss)
+                        if val_ic is not None:
+                            val_ics.append(val_ic)
+
+                        if val_loss < context.best_val_loss:
+                            any_fold_improved = True
+                            context.best_val_loss = val_loss
+                            fold_ckpt_start = time.perf_counter()
+                            _save_fold_checkpoint(
+                                context.checkpoint_best_path,
+                                fold=context.fold,
+                                epoch=epoch,
+                                best_val_loss=val_loss,
+                                model=model,
+                                optimizer=optimizer,
+                                scaler=scaler,
+                            )
+                            fold_ckpt_total += time.perf_counter() - fold_ckpt_start
+                val_eval_total = max(0.0, time.perf_counter() - val_eval_start - fold_ckpt_total)
+                val_loss_total = 0.0
+            else:
+                val_eval_start = time.perf_counter()
+                val_backtest, _, _ = _evaluate_tensor_batch(
+                    model,
+                    combined_val_x,
+                    combined_val_returns,
+                    combined_val_masks,
+                    combined_val_buy_masks,
+                    combined_val_sell_masks,
+                    combined_val_bench,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.long_only,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
+                    config.trading.gross_leverage,
+                    chunk_rows=eval_chunk_rows,
+                    compute_ic=False,
+                    profile_timing=profile_timing,
+                )
+                val_eval_total = time.perf_counter() - val_eval_start
+
+                val_loss_start = time.perf_counter()
+                for index, (_, context) in enumerate(fold_contexts.items()):
+                    start = val_offsets[index]
+                    end = val_offsets[index + 1]
+                    val_loss_tensor = _loss_from_backtest_series(
+                        val_backtest.strategy_returns[start:end],
+                        val_backtest.benchmark_returns[start:end],
+                        val_backtest.turnovers[start:end],
+                        gamma_sharpe=config.evaluation.gamma_sharpe,
+                        gamma_excess=config.evaluation.gamma_excess,
+                        gamma_cvar=config.evaluation.gamma_cvar,
+                        cvar_alpha=config.evaluation.cvar_alpha,
+                        gamma_drawdown=config.evaluation.gamma_drawdown,
+                        drawdown_target=config.evaluation.drawdown_target,
+                        gamma_turnover=config.evaluation.gamma_turnover,
+                        gamma_underperformance=config.evaluation.gamma_underperformance,
+                        excess_target=config.evaluation.excess_target,
+                        cvar_budget=config.evaluation.cvar_budget,
+                        drawdown_budget=config.evaluation.drawdown_budget,
+                        turnover_budget=config.evaluation.turnover_budget,
+                        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                        objective=loss_objective,
+                    )
+                    val_loss = float(val_loss_tensor.detach().cpu())
+                    val_losses.append(val_loss)
+                    if val_loss < context.best_val_loss:
+                        any_fold_improved = True
+                        context.best_val_loss = val_loss
+                        fold_ckpt_start = time.perf_counter()
+                        _save_fold_checkpoint(
+                            context.checkpoint_best_path,
+                            fold=context.fold,
+                            epoch=epoch,
+                            best_val_loss=val_loss,
+                            model=model,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                        )
+                        fold_ckpt_total += time.perf_counter() - fold_ckpt_start
+
+                val_loss_total = max(0.0, time.perf_counter() - val_loss_start - fold_ckpt_total)
+
+            val_mean_loss = float(np.mean(val_losses)) if val_losses else float("nan")
+            curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 100)))
+            should_compute_test_mean = (
+                epoch == start_epoch
+                or (epoch % curve_test_interval == 0)
+                or (epoch == config.training.epochs)
+            )
+            sampled_test_mean: float | None = None
+            curve_test_total = 0.0
+            if should_compute_test_mean:
+                curve_test_start = time.perf_counter()
+                test_losses_epoch: list[float] = []
+                if loss_objective in {"rank_ic", "factor_generalization", "portfolio_autoencoder"}:
+                    model.eval()
+                    with torch.inference_mode():
+                        for index in range(len(test_offsets) - 1):
+                            start = test_offsets[index]
+                            end = test_offsets[index + 1]
+                            test_loss, _ = _evaluate_rank_ic_multitask_loss(
+                                model,
+                                combined_test_x[start:end],
+                                combined_test_returns[start:end],
+                                combined_test_masks[start:end],
+                                combined_test_buy_masks[start:end],
+                                combined_test_sell_masks[start:end],
+                                combined_test_bench[start:end],
+                                device,
+                                amp_dtype,
+                                non_blocking,
+                                chunk_rows=eval_chunk_rows,
+                                objective=loss_objective,
+                                long_only=config.trading.long_only,
+                                buy_fee_rate=config.trading.buy_fee_rate,
+                                sell_fee_rate=config.trading.sell_fee_rate,
+                                max_turnover_ratio=config.trading.max_turnover_ratio,
+                                gross_leverage=config.trading.gross_leverage,
+                                gamma_sharpe=config.evaluation.gamma_sharpe,
+                                gamma_excess=config.evaluation.gamma_excess,
+                                gamma_cvar=config.evaluation.gamma_cvar,
+                                cvar_alpha=config.evaluation.cvar_alpha,
+                                gamma_drawdown=config.evaluation.gamma_drawdown,
+                                drawdown_target=config.evaluation.drawdown_target,
+                                gamma_turnover=config.evaluation.gamma_turnover,
+                                gamma_underperformance=config.evaluation.gamma_underperformance,
+                                excess_target=config.evaluation.excess_target,
+                                cvar_budget=config.evaluation.cvar_budget,
+                                drawdown_budget=config.evaluation.drawdown_budget,
+                                turnover_budget=config.evaluation.turnover_budget,
+                                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                                rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                                direction_weight=config.training.multitask_loss.direction_weight,
+                                volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                                concentration_weight=config.training.multitask_loss.concentration_weight,
+                                regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                                regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                                factor_loss_kwargs=risk_loss_kwargs,
+                            )
+                            test_losses_epoch.append(test_loss)
+                else:
+                    test_backtest_epoch, _, _ = _evaluate_tensor_batch(
+                        model,
+                        combined_test_x,
+                        combined_test_returns,
+                        combined_test_masks,
+                        combined_test_buy_masks,
+                        combined_test_sell_masks,
+                        combined_test_bench,
+                        device,
+                        amp_dtype,
+                        non_blocking,
+                        config.trading.long_only,
+                        config.trading.buy_fee_rate,
+                        config.trading.sell_fee_rate,
+                        config.trading.max_turnover_ratio,
+                        config.trading.gross_leverage,
+                        chunk_rows=eval_chunk_rows,
+                        compute_ic=False,
+                        profile_timing=False,
+                    )
+                    for index in range(len(test_offsets) - 1):
+                        start = test_offsets[index]
+                        end = test_offsets[index + 1]
+                        test_loss_t = _loss_from_backtest_series(
+                            test_backtest_epoch.strategy_returns[start:end],
+                            test_backtest_epoch.benchmark_returns[start:end],
+                            test_backtest_epoch.turnovers[start:end],
+                            gamma_sharpe=config.evaluation.gamma_sharpe,
+                            gamma_excess=config.evaluation.gamma_excess,
+                            gamma_cvar=config.evaluation.gamma_cvar,
+                            cvar_alpha=config.evaluation.cvar_alpha,
+                            gamma_drawdown=config.evaluation.gamma_drawdown,
+                            drawdown_target=config.evaluation.drawdown_target,
+                            gamma_turnover=config.evaluation.gamma_turnover,
+                            gamma_underperformance=config.evaluation.gamma_underperformance,
+                            excess_target=config.evaluation.excess_target,
+                            cvar_budget=config.evaluation.cvar_budget,
+                            drawdown_budget=config.evaluation.drawdown_budget,
+                            turnover_budget=config.evaluation.turnover_budget,
+                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                            objective=loss_objective,
+                        )
+                        test_loss = float(test_loss_t.detach().cpu())
+                        test_losses_epoch.append(test_loss)
+                sampled_test_mean = float(np.mean(test_losses_epoch)) if test_losses_epoch else None
+                test_mean_best_by_val = sampled_test_mean
+                curve_test_total = time.perf_counter() - curve_test_start
 
             if any_fold_improved:
                 group_ckpt_start = time.perf_counter()
@@ -3015,11 +4502,14 @@ def run_training(
                     no_improve_epochs += 1
 
                 if scheduler is not None:
+                    scheduler_start = time.perf_counter()
                     if scheduler_requires_metric:
                         scheduler.step(float(np.mean(val_losses)))
                     else:
                         scheduler.step()
+                    scheduler_total = time.perf_counter() - scheduler_start
 
+                progress_update_start = time.perf_counter()
                 bt_stats_after = get_backtest_compile_stats()
                 bt_nonhit_total = (
                     bt_stats_after["misses"]
@@ -3029,33 +4519,70 @@ def run_training(
 
                 epoch_pbar.set_postfix(
                     {
-                        "train_loss": f"{train_loss:.6f}",
-                        "val_mean": f"{float(np.mean(val_losses)):.6f}",
-                        "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
+                        "train_loss": f"{train_loss:.8f}",
+                        "val_mean": f"{val_mean_loss:.8f}",
+                        "val_ic": f"{float(np.mean(val_ics)):.6f}" if val_ics else "-",
+                        "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.8f}",
                         "no_improve": no_improve_epochs,
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                         "bt_nonhit": bt_nonhit_total,
                     }
                 )
+                progress_update_total = time.perf_counter() - progress_update_start
 
                 if profile_timing:
                     _log_timing(
                         f"Train {train_years} epoch {epoch}",
                         TimingBreakdown(
-                            total_s=train_timing.total_s + val_eval_total + val_loss_total + group_ckpt_total,
+                            total_s=(
+                                train_timing.total_s
+                                + val_eval_total
+                                + val_loss_total
+                                + curve_test_total
+                                + fold_ckpt_total
+                                + group_ckpt_total
+                                + scheduler_total
+                                + progress_update_total
+                            ),
                             fetch_s=train_timing.fetch_s,
                             transfer_s=train_timing.transfer_s,
                             forward_s=train_timing.forward_s,
+                            model_forward_s=train_timing.model_forward_s,
+                            factor_aug_s=train_timing.factor_aug_s,
+                            loss_s=train_timing.loss_s,
                             backward_s=train_timing.backward_s,
                             grad_s=train_timing.grad_s,
                             clip_s=train_timing.clip_s,
+                            finite_check_s=train_timing.finite_check_s,
                             step_s=train_timing.step_s,
                             backtest_s=val_eval_total,
                             metrics_s=val_loss_total,
-                            save_s=group_ckpt_total,
+                            save_s=fold_ckpt_total + group_ckpt_total,
                             batches=train_timing.batches,
                         ),
                     )
+
+                _record_epoch_curve(
+                    {
+                        "epoch": int(epoch),
+                        "train_loss": float(train_loss),
+                        "val_mean": val_mean_loss,
+                        "test_mean": test_mean_best_by_val,
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                        **_timing_curve_payload(
+                            train_timing=train_timing,
+                            val_eval_s=val_eval_total,
+                            val_loss_s=val_loss_total,
+                            test_curve_s=curve_test_total,
+                            fold_checkpoint_save_s=fold_ckpt_total,
+                            group_checkpoint_save_s=group_ckpt_total,
+                            scheduler_s=scheduler_total,
+                            progress_update_s=progress_update_total,
+                            epoch_wall_s=time.perf_counter() - epoch_start,
+                            timing_synchronized=(device.type != "cuda" or profile_timing),
+                        ),
+                    },
+                )
 
                 if early_stop_patience > 0 and no_improve_epochs > early_stop_patience:
                     print(
@@ -3064,6 +4591,8 @@ def run_training(
                         f"(patience={early_stop_patience})"
                     )
                     break
+
+        curve_plotter.flush()
 
         # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
         # the epoch loop does not run; compute validation backtest once for reporting.
@@ -3087,6 +4616,7 @@ def run_training(
                 config.trading.gross_leverage,
                 chunk_rows=eval_chunk_rows,
                 profile_timing=profile_timing,
+                progress_label=f"[Train {train_years} final-val]",
             )
             if profile_timing:
                 _log_timing(
@@ -3146,6 +4676,7 @@ def run_training(
                 config.trading.gross_leverage,
                 chunk_rows=eval_chunk_rows,
                 profile_timing=profile_timing,
+                progress_label=f"[Fold {fold.fold_id} final-test]",
             )
             test_eval_total = time.perf_counter() - test_eval_start
 
@@ -3222,6 +4753,14 @@ def run_training(
                 json.dump(asdict(fold_result), f, indent=2)
 
             _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+            _save_daily_portfolio_returns_csv(
+                fold_dir / "daily_portfolio_returns.csv",
+                test_dates,
+                test_bt.strategy_returns,
+                test_bt.benchmark_returns,
+                test_bt.turnovers,
+            )
+            _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
             report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
@@ -3275,6 +4814,12 @@ def run_training(
         combined_val_buy_masks = None
         combined_val_sell_masks = None
         combined_val_bench = None
+        combined_test_x = None
+        combined_test_returns = None
+        combined_test_masks = None
+        combined_test_buy_masks = None
+        combined_test_sell_masks = None
+        combined_test_bench = None
         val_returns_device = None
         val_masks_device = None
         model = None

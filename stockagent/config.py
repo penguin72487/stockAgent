@@ -104,6 +104,128 @@ class TCNHybridTabularResNetModelConfig:
 
 
 @dataclass(slots=True)
+class MultiStockTCNModelConfig:
+    hidden_channels: int = 64
+    embedding_dim: int = 64
+    tcn_blocks: int = 4
+    tcn_kernel_size: int = 3
+    head_hidden_dim: int = 64
+    head_layers: int = 1
+    dropout: float = 0.1
+    tcn_conv_mode: str = "separable"
+    conv_layers_per_block: int = 1
+    norm_type: str = "none"
+    sanitize_inputs: bool = False
+
+
+@dataclass(slots=True)
+class EfficientTCNTabularSetPortfolioModelConfig:
+    temporal_enabled: bool = True
+    temporal_dim: int = 16
+    temporal_hidden_channels: int = 32
+    temporal_dilations: list[int] = field(default_factory=lambda: [1, 2])
+    temporal_kernel_size: int = 3
+    tabular_dim: int = 64
+    tabular_hidden_dim: int = 128
+    tabular_blocks: int = 2
+    model_dim: int = 64
+    set_enabled: bool = True
+    num_inducing_points: int = 16
+    num_heads: int = 4
+    ffn_mult: int = 2
+    head_hidden_dim: int = 64
+    head_layers: int = 1
+    dropout: float = 0.1
+    residual_scale: float = 0.5
+    default_temperature: float = 1.0
+    portfolio_mode: str = "auto"
+    return_aux: bool = True
+
+
+@dataclass(slots=True)
+class BottleneckPortfolioAutoencoderConfig:
+    d_model: int = 128
+    z_dim: int = 32
+    temporal_type: str = "gru"
+    temporal_layers: int = 1
+    asset_encoder_type: str = "transformer"
+    asset_encoder_layers: int = 2
+    n_heads: int = 4
+    num_inducing_points: int = 32
+    ffn_mult: int = 2
+    dropout: float = 0.1
+    long_short: bool = True
+    noise_std: float = 0.01
+    return_aux: bool = True
+
+
+@dataclass(slots=True)
+class CrossSectionalTemporalPortfolioModelConfig:
+    stock_embedding_dim: int = 128
+    stock_hidden_dim: int = 128
+    stock_n_blocks: int = 2
+    temporal_hidden_dim: int = 128
+    temporal_blocks: int = 2
+    temporal_kernel_size: int = 3
+    cross_hidden_dim: int = 128
+    cross_heads: int = 4
+    cross_layers: int = 2
+    dropout: float = 0.1
+    regime_classes: int = 3
+    candidate_top_m: int = 64
+    portfolio_top_k: int = 10
+    candidate_k: int = 64
+    trade_k: int = 10
+    scorer: str = "tabular_resnet"
+    scorer_hidden: int = 128
+    scorer_blocks: int = 2
+    reranker: str = "set_transformer"
+    d_model: int = 128
+    heads: int = 4
+    layers: int = 2
+
+
+@dataclass(slots=True)
+class MultitaskLossConfig:
+    rank_ic_weight: float = 0.20
+    direction_weight: float = 0.05
+    volatility_regime_weight: float = 0.05
+    concentration_weight: float = 0.005
+    regime_up_threshold: float = 0.002
+    regime_down_threshold: float = -0.002
+
+
+@dataclass(slots=True)
+class FactorGeneralizationLossConfig:
+    slope_tstat_weight: float = 1.0
+    rank_ic_weight: float = 0.5
+    factor_sharpe_weight: float = 0.25
+    block_stability_weight: float = 0.20
+    regime_stability_weight: float = 0.20
+    consistency_weight: float = 0.05
+    net_exposure_weight: float = 0.05
+    gross_exposure_weight: float = 0.02
+    concentration_weight: float = 0.02
+    turnover_weight: float = 0.02
+    score_l2_weight: float = 0.001
+    factor_temperature: float = 1.0
+    block_count: int = 4
+    worst_fraction: float = 0.25
+    augmentation_feature_dropout: float = 0.10
+    augmentation_stock_dropout: float = 0.05
+    augmentation_time_dropout: float = 0.05
+    augmentation_noise_std: float = 0.01
+
+
+@dataclass(slots=True)
+class PortfolioAutoencoderLossConfig:
+    cost_rate: float = 0.001425
+    lambda_turnover: float = 0.1
+    lambda_concentration: float = 0.01
+    lambda_latent: float = 0.001
+
+
+@dataclass(slots=True)
 class LightGBMModelConfig:
     use_gpu: bool = True
     gpu_device_id: int = 0
@@ -165,6 +287,11 @@ class TrainingConfig:
     epochs: int = 1000
     early_stopping_no_improve_ratio: float = 0.2
     val_interval_epochs: int = 1
+    curve_test_interval: int = 100
+    curve_plot_interval: int = 1
+    curve_plot_async: bool = True
+    cache_train_tensors_on_gpu: bool = True
+    cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
     enable_lr_scheduler: bool = True
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
@@ -178,12 +305,22 @@ class TrainingConfig:
     num_workers: int = 0
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
+    finite_check_interval_steps: int = 0
     loss_type: str = "mse"  # "mse", "sharpe", "sortino", "excess_cvar_drawdown", or "outperformance_risk_budget"
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
     tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)
+    multi_stock_tcn: MultiStockTCNModelConfig = field(default_factory=MultiStockTCNModelConfig)
+    efficient_tcn_tabular_set_portfolio: EfficientTCNTabularSetPortfolioModelConfig = field(
+        default_factory=EfficientTCNTabularSetPortfolioModelConfig
+    )
+    bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(default_factory=BottleneckPortfolioAutoencoderConfig)
     tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
     temporal_tabular_resnet: TemporalTabularResNetModelConfig = field(default_factory=TemporalTabularResNetModelConfig)
+    cross_sectional_temporal_portfolio_model: CrossSectionalTemporalPortfolioModelConfig = field(default_factory=CrossSectionalTemporalPortfolioModelConfig)
+    multitask_loss: MultitaskLossConfig = field(default_factory=MultitaskLossConfig)
+    factor_generalization_loss: FactorGeneralizationLossConfig = field(default_factory=FactorGeneralizationLossConfig)
+    portfolio_autoencoder_loss: PortfolioAutoencoderLossConfig = field(default_factory=PortfolioAutoencoderLossConfig)
     lightgbm: LightGBMModelConfig = field(default_factory=LightGBMModelConfig)
     xgboost: XGBoostModelConfig = field(default_factory=XGBoostModelConfig)
 
@@ -262,6 +399,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("epochs", 10)
     training.setdefault("early_stopping_no_improve_ratio", 0.2)
     training.setdefault("val_interval_epochs", 1)
+    training.setdefault("curve_test_interval", 100)
+    training.setdefault("curve_plot_interval", 1)
+    training.setdefault("curve_plot_async", True)
+    training.setdefault("cache_train_tensors_on_gpu", True)
+    training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
     training.setdefault("enable_lr_scheduler", True)
     training.setdefault("lr_scheduler", "none")
@@ -276,6 +418,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("num_workers", 0)
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("grad_clip_norm", 1.0)
+    training.setdefault("finite_check_interval_steps", 0)
     training.setdefault("loss_type", "mse")
 
     # Model-specific blocks.
@@ -308,6 +451,56 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     tabular_resnet.setdefault("n_blocks", 4)
     tabular_resnet.setdefault("dropout", legacy_dropout)
 
+    multi_stock_tcn = training.setdefault("multi_stock_tcn", {})
+    multi_stock_tcn.setdefault("hidden_channels", max(32, int(legacy_embedding_dim)))
+    multi_stock_tcn.setdefault("embedding_dim", max(32, int(legacy_embedding_dim)))
+    multi_stock_tcn.setdefault("tcn_blocks", 4)
+    multi_stock_tcn.setdefault("tcn_kernel_size", 3)
+    multi_stock_tcn.setdefault("head_hidden_dim", max(64, int(legacy_embedding_dim)))
+    multi_stock_tcn.setdefault("head_layers", 1)
+    multi_stock_tcn.setdefault("dropout", legacy_dropout)
+    multi_stock_tcn.setdefault("tcn_conv_mode", "separable")
+    multi_stock_tcn.setdefault("conv_layers_per_block", 1)
+    multi_stock_tcn.setdefault("norm_type", "none")
+    multi_stock_tcn.setdefault("sanitize_inputs", False)
+
+    efficient_tcn_tabular_set_portfolio = training.setdefault("efficient_tcn_tabular_set_portfolio", {})
+    efficient_tcn_tabular_set_portfolio.setdefault("temporal_enabled", True)
+    efficient_tcn_tabular_set_portfolio.setdefault("temporal_dim", 16)
+    efficient_tcn_tabular_set_portfolio.setdefault("temporal_hidden_channels", 32)
+    efficient_tcn_tabular_set_portfolio.setdefault("temporal_dilations", [1, 2])
+    efficient_tcn_tabular_set_portfolio.setdefault("temporal_kernel_size", 3)
+    efficient_tcn_tabular_set_portfolio.setdefault("tabular_dim", 64)
+    efficient_tcn_tabular_set_portfolio.setdefault("tabular_hidden_dim", 128)
+    efficient_tcn_tabular_set_portfolio.setdefault("tabular_blocks", 2)
+    efficient_tcn_tabular_set_portfolio.setdefault("model_dim", 64)
+    efficient_tcn_tabular_set_portfolio.setdefault("set_enabled", True)
+    efficient_tcn_tabular_set_portfolio.setdefault("num_inducing_points", 16)
+    efficient_tcn_tabular_set_portfolio.setdefault("num_heads", 4)
+    efficient_tcn_tabular_set_portfolio.setdefault("ffn_mult", 2)
+    efficient_tcn_tabular_set_portfolio.setdefault("head_hidden_dim", 64)
+    efficient_tcn_tabular_set_portfolio.setdefault("head_layers", 1)
+    efficient_tcn_tabular_set_portfolio.setdefault("dropout", legacy_dropout)
+    efficient_tcn_tabular_set_portfolio.setdefault("residual_scale", 0.5)
+    efficient_tcn_tabular_set_portfolio.setdefault("default_temperature", 1.0)
+    efficient_tcn_tabular_set_portfolio.setdefault("portfolio_mode", "auto")
+    efficient_tcn_tabular_set_portfolio.setdefault("return_aux", True)
+
+    bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
+    bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
+    bottleneck_portfolio_autoencoder.setdefault("z_dim", 32)
+    bottleneck_portfolio_autoencoder.setdefault("temporal_type", "gru")
+    bottleneck_portfolio_autoencoder.setdefault("temporal_layers", 1)
+    bottleneck_portfolio_autoencoder.setdefault("asset_encoder_type", "transformer")
+    bottleneck_portfolio_autoencoder.setdefault("asset_encoder_layers", 2)
+    bottleneck_portfolio_autoencoder.setdefault("n_heads", 4)
+    bottleneck_portfolio_autoencoder.setdefault("num_inducing_points", 32)
+    bottleneck_portfolio_autoencoder.setdefault("ffn_mult", 2)
+    bottleneck_portfolio_autoencoder.setdefault("dropout", legacy_dropout)
+    bottleneck_portfolio_autoencoder.setdefault("long_short", True)
+    bottleneck_portfolio_autoencoder.setdefault("noise_std", 0.01)
+    bottleneck_portfolio_autoencoder.setdefault("return_aux", True)
+
     tcn_hybrid_tabular_resnet = training.setdefault("tcn_hybrid_tabular_resnet", {})
     tcn_hybrid_tabular_resnet.setdefault("embedding_dim", max(64, int(legacy_embedding_dim)))
     tcn_hybrid_tabular_resnet.setdefault("encoder_hidden_dim", max(128, int(legacy_hidden_dim)))
@@ -324,6 +517,64 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     temporal_tabular_resnet.setdefault("hidden_dim", max(128, int(legacy_hidden_dim)))
     temporal_tabular_resnet.setdefault("n_blocks", 4)
     temporal_tabular_resnet.setdefault("dropout", legacy_dropout)
+
+    cross_sectional_temporal_portfolio_model = training.setdefault("cross_sectional_temporal_portfolio_model", {})
+    cross_sectional_temporal_portfolio_model.setdefault("candidate_k", 64)
+    cross_sectional_temporal_portfolio_model.setdefault("trade_k", 10)
+    cross_sectional_temporal_portfolio_model.setdefault("scorer", "tabular_resnet")
+    cross_sectional_temporal_portfolio_model.setdefault("scorer_hidden", 128)
+    cross_sectional_temporal_portfolio_model.setdefault("scorer_blocks", 2)
+    cross_sectional_temporal_portfolio_model.setdefault("reranker", "set_transformer")
+    cross_sectional_temporal_portfolio_model.setdefault("d_model", 128)
+    cross_sectional_temporal_portfolio_model.setdefault("heads", 4)
+    cross_sectional_temporal_portfolio_model.setdefault("layers", 2)
+    cross_sectional_temporal_portfolio_model.setdefault("stock_embedding_dim", int(cross_sectional_temporal_portfolio_model["d_model"]))
+    cross_sectional_temporal_portfolio_model.setdefault("stock_hidden_dim", int(cross_sectional_temporal_portfolio_model["scorer_hidden"]))
+    cross_sectional_temporal_portfolio_model.setdefault("stock_n_blocks", int(cross_sectional_temporal_portfolio_model["scorer_blocks"]))
+    cross_sectional_temporal_portfolio_model.setdefault("temporal_hidden_dim", max(64, int(legacy_embedding_dim)))
+    cross_sectional_temporal_portfolio_model.setdefault("temporal_blocks", 2)
+    cross_sectional_temporal_portfolio_model.setdefault("temporal_kernel_size", 3)
+    cross_sectional_temporal_portfolio_model.setdefault("cross_hidden_dim", int(cross_sectional_temporal_portfolio_model["d_model"]))
+    cross_sectional_temporal_portfolio_model.setdefault("cross_heads", int(cross_sectional_temporal_portfolio_model["heads"]))
+    cross_sectional_temporal_portfolio_model.setdefault("cross_layers", int(cross_sectional_temporal_portfolio_model["layers"]))
+    cross_sectional_temporal_portfolio_model.setdefault("dropout", legacy_dropout)
+    cross_sectional_temporal_portfolio_model.setdefault("regime_classes", 3)
+    cross_sectional_temporal_portfolio_model.setdefault("candidate_top_m", int(cross_sectional_temporal_portfolio_model["candidate_k"]))
+    cross_sectional_temporal_portfolio_model.setdefault("portfolio_top_k", int(cross_sectional_temporal_portfolio_model["trade_k"]))
+
+    multitask_loss = training.setdefault("multitask_loss", {})
+    multitask_loss.setdefault("rank_ic_weight", 0.20)
+    multitask_loss.setdefault("direction_weight", 0.05)
+    multitask_loss.setdefault("volatility_regime_weight", 0.05)
+    multitask_loss.setdefault("concentration_weight", 0.005)
+    multitask_loss.setdefault("regime_up_threshold", 0.002)
+    multitask_loss.setdefault("regime_down_threshold", -0.002)
+
+    factor_generalization_loss = training.setdefault("factor_generalization_loss", {})
+    factor_generalization_loss.setdefault("slope_tstat_weight", 1.0)
+    factor_generalization_loss.setdefault("rank_ic_weight", 0.5)
+    factor_generalization_loss.setdefault("factor_sharpe_weight", 0.25)
+    factor_generalization_loss.setdefault("block_stability_weight", 0.20)
+    factor_generalization_loss.setdefault("regime_stability_weight", 0.20)
+    factor_generalization_loss.setdefault("consistency_weight", 0.05)
+    factor_generalization_loss.setdefault("net_exposure_weight", 0.05)
+    factor_generalization_loss.setdefault("gross_exposure_weight", 0.02)
+    factor_generalization_loss.setdefault("concentration_weight", 0.02)
+    factor_generalization_loss.setdefault("turnover_weight", 0.02)
+    factor_generalization_loss.setdefault("score_l2_weight", 0.001)
+    factor_generalization_loss.setdefault("factor_temperature", 1.0)
+    factor_generalization_loss.setdefault("block_count", 4)
+    factor_generalization_loss.setdefault("worst_fraction", 0.25)
+    factor_generalization_loss.setdefault("augmentation_feature_dropout", 0.10)
+    factor_generalization_loss.setdefault("augmentation_stock_dropout", 0.05)
+    factor_generalization_loss.setdefault("augmentation_time_dropout", 0.05)
+    factor_generalization_loss.setdefault("augmentation_noise_std", 0.01)
+
+    portfolio_autoencoder_loss = training.setdefault("portfolio_autoencoder_loss", {})
+    portfolio_autoencoder_loss.setdefault("cost_rate", 0.001425)
+    portfolio_autoencoder_loss.setdefault("lambda_turnover", 0.1)
+    portfolio_autoencoder_loss.setdefault("lambda_concentration", 0.01)
+    portfolio_autoencoder_loss.setdefault("lambda_latent", 0.001)
 
     lightgbm = training.setdefault("lightgbm", {})
     lightgbm.setdefault("use_gpu", True)
@@ -486,6 +737,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
             epochs=training_raw["epochs"],
             early_stopping_no_improve_ratio=training_raw["early_stopping_no_improve_ratio"],
             val_interval_epochs=training_raw["val_interval_epochs"],
+            curve_test_interval=training_raw["curve_test_interval"],
+            curve_plot_interval=training_raw["curve_plot_interval"],
+            curve_plot_async=training_raw["curve_plot_async"],
+            cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
+            cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],
             enable_lr_scheduler=training_raw["enable_lr_scheduler"],
             lr_scheduler=training_raw["lr_scheduler"],
@@ -499,12 +755,24 @@ def load_config(path: str | Path) -> ExperimentConfig:
             num_workers=training_raw["num_workers"],
             weight_decay=training_raw["weight_decay"],
             grad_clip_norm=training_raw["grad_clip_norm"],
+            finite_check_interval_steps=training_raw["finite_check_interval_steps"],
             loss_type=training_raw["loss_type"],
             mlp=MLPModelConfig(**training_raw["mlp"]),
             ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),
             tabular_resnet=TabularResNetModelConfig(**training_raw["tabular_resnet"]),
+            multi_stock_tcn=MultiStockTCNModelConfig(**training_raw["multi_stock_tcn"]),
+            efficient_tcn_tabular_set_portfolio=EfficientTCNTabularSetPortfolioModelConfig(
+                **training_raw["efficient_tcn_tabular_set_portfolio"]
+            ),
+            bottleneck_portfolio_autoencoder=BottleneckPortfolioAutoencoderConfig(
+                **training_raw["bottleneck_portfolio_autoencoder"]
+            ),
             tcn_hybrid_tabular_resnet=TCNHybridTabularResNetModelConfig(**training_raw["tcn_hybrid_tabular_resnet"]),
             temporal_tabular_resnet=TemporalTabularResNetModelConfig(**training_raw["temporal_tabular_resnet"]),
+            cross_sectional_temporal_portfolio_model=CrossSectionalTemporalPortfolioModelConfig(**training_raw["cross_sectional_temporal_portfolio_model"]),
+            multitask_loss=MultitaskLossConfig(**training_raw["multitask_loss"]),
+            factor_generalization_loss=FactorGeneralizationLossConfig(**training_raw["factor_generalization_loss"]),
+            portfolio_autoencoder_loss=PortfolioAutoencoderLossConfig(**training_raw["portfolio_autoencoder_loss"]),
             lightgbm=LightGBMModelConfig(**training_raw["lightgbm"]),
             xgboost=XGBoostModelConfig(**training_raw["xgboost"]),
         ),

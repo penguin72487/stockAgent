@@ -29,7 +29,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         can_sell = panel.can_sell_mask if panel.can_sell_mask is not None else tradable
 
         # Cache tensors once to avoid per-item numpy copies.
-        self.features_t = torch.from_numpy(panel.features)
+        self.features_t = torch.nan_to_num(
+            torch.from_numpy(panel.features),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         self.future_log_returns_t = torch.from_numpy(returns)
         self.tradable_mask_t = torch.from_numpy(tradable)
         self.can_buy_mask_t = torch.from_numpy(can_buy)

@@ -5,6 +5,16 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.models.normalization import dual_branch_softmax
+
+
+def _rank_from_sorted_indices(sorted_idx: Tensor, dtype: torch.dtype) -> Tensor:
+    """Construct row-wise rank tensor from argsort indices using scatter."""
+    row_rank = torch.arange(sorted_idx.size(1), device=sorted_idx.device, dtype=dtype)
+    row_rank = row_rank.unsqueeze(0).expand_as(sorted_idx)
+    ranks = torch.empty(sorted_idx.shape, device=sorted_idx.device, dtype=dtype)
+    ranks.scatter_(1, sorted_idx, row_rank)
+    return ranks
 
 
 def masked_mse_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
@@ -14,22 +24,345 @@ def masked_mse_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tenso
 
 
 def masked_ic_loss(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
-    ics: list[Tensor] = []
-    for i in range(predictions.size(0)):
-        m = mask[i]
-        if int(m.sum().item()) < 2:
-            continue
-        p = predictions[i][m].float()
-        t = targets[i][m].float()
-        p_rank = p.argsort().argsort().float()
-        t_rank = t.argsort().argsort().float()
-        p_c = p_rank - p_rank.mean()
-        t_c = t_rank - t_rank.mean()
-        denom = (p_c.norm() * t_c.norm()).clamp_min(1e-8)
-        ics.append((p_c * t_c).sum() / denom)
-    if not ics:
-        return predictions.sum() * 0.0
-    return -torch.stack(ics).mean()
+    mask_bool = mask.to(dtype=torch.bool, device=predictions.device)
+    mask_f = mask_bool.to(dtype=torch.float32)
+    valid_count = mask_f.sum(dim=1)
+    valid_rows = (valid_count >= 2).to(dtype=torch.float32)
+
+    pred = torch.nan_to_num(predictions.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    target = torch.nan_to_num(targets.to(device=predictions.device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    rank_fill = target.masked_fill(~mask_bool, float("inf"))
+    rank_sorted_idx = rank_fill.argsort(dim=1)
+    target_rank = _rank_from_sorted_indices(rank_sorted_idx, dtype=pred.dtype)
+
+    count = valid_count.clamp_min(1.0).unsqueeze(1)
+    pred_mean = (pred * mask_f).sum(dim=1, keepdim=True) / count
+    rank_mean = (target_rank * mask_f).sum(dim=1, keepdim=True) / count
+
+    pred_centered = (pred - pred_mean) * mask_f
+    rank_centered = (target_rank - rank_mean) * mask_f
+    denom = torch.sqrt(
+        (pred_centered.pow(2).sum(dim=1) * rank_centered.pow(2).sum(dim=1)).clamp_min(1e-8)
+    )
+    ic = (pred_centered * rank_centered).sum(dim=1) / denom
+    return -(ic * valid_rows).sum() / valid_rows.sum().clamp_min(1.0)
+
+
+def _masked_zscore(values: Tensor, mask: Tensor) -> Tensor:
+    mask_bool = mask.to(dtype=torch.bool, device=values.device)
+    mask_f = mask_bool.to(dtype=values.dtype)
+    count = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
+    clean = torch.nan_to_num(values, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+    mean = (clean * mask_f).sum(dim=1, keepdim=True) / count
+    centered = (clean - mean) * mask_f
+    var = centered.pow(2).sum(dim=1, keepdim=True) / count.clamp_min(2.0)
+    z = centered / torch.sqrt(var + 1e-6)
+    return torch.where(mask_bool, z, torch.zeros_like(z))
+
+
+def _masked_corr_per_row(predictions: Tensor, targets: Tensor, mask: Tensor) -> Tensor:
+    mask_bool = mask.to(dtype=torch.bool, device=predictions.device)
+    mask_f = mask_bool.to(dtype=torch.float32)
+    valid_count = mask_f.sum(dim=1)
+    valid_rows = valid_count >= 2
+
+    pred = torch.nan_to_num(predictions.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    target = torch.nan_to_num(targets.to(device=predictions.device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+    count = valid_count.clamp_min(1.0).unsqueeze(1)
+    pred_mean = (pred * mask_f).sum(dim=1, keepdim=True) / count
+    target_mean = (target * mask_f).sum(dim=1, keepdim=True) / count
+    pred_centered = (pred - pred_mean) * mask_f
+    target_centered = (target - target_mean) * mask_f
+    denom = torch.sqrt(
+        (pred_centered.pow(2).sum(dim=1) * target_centered.pow(2).sum(dim=1)).clamp_min(1e-8)
+    )
+    corr = (pred_centered * target_centered).sum(dim=1) / denom
+    return torch.where(valid_rows, corr, torch.zeros_like(corr))
+
+
+def _fama_macbeth_slope_per_row(scores: Tensor, returns: Tensor, mask: Tensor) -> Tensor:
+    mask_bool = mask.to(dtype=torch.bool, device=scores.device)
+    mask_f = mask_bool.to(dtype=torch.float32)
+    valid_count = mask_f.sum(dim=1)
+    valid_rows = valid_count >= 2
+
+    score = _masked_zscore(scores.float(), mask_bool)
+    ret = torch.nan_to_num(returns.to(device=scores.device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+    count = valid_count.clamp_min(1.0).unsqueeze(1)
+    ret_mean = (ret * mask_f).sum(dim=1, keepdim=True) / count
+    ret_centered = (ret - ret_mean) * mask_f
+    denom = score.pow(2).sum(dim=1).clamp_min(1e-6)
+    beta = (score * ret_centered).sum(dim=1) / denom
+    return torch.where(valid_rows, beta, torch.zeros_like(beta))
+
+
+def _stable_negative_tstat(values: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+    if valid_mask is not None:
+        values = values[valid_mask.to(device=values.device, dtype=torch.bool)]
+    values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if values.numel() == 0:
+        return values.sum() * 0.0
+    mean = values.mean()
+    std = torch.sqrt((values - mean).pow(2).mean() + 1e-8)
+    n_eff = torch.sqrt(values.new_tensor(float(max(1, int(values.numel())))))
+    return -(mean / std) * n_eff
+
+
+def _block_stability_loss(values: Tensor, block_count: int, worst_fraction: float) -> Tensor:
+    values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    n_rows = int(values.numel())
+    if n_rows < 2:
+        return values.sum() * 0.0
+    blocks = max(2, min(max(1, int(block_count)), n_rows))
+    padded_rows = ((n_rows + blocks - 1) // blocks) * blocks
+    if padded_rows > n_rows:
+        pad = values[-1:].expand(padded_rows - n_rows)
+        values = torch.cat([values, pad], dim=0)
+    block_values = values.reshape(blocks, -1).mean(dim=1)
+    mean = block_values.mean()
+    std = torch.sqrt((block_values - mean).pow(2).mean() + 1e-8)
+    k = max(1, int(round(blocks * min(max(float(worst_fraction), 0.0), 1.0))))
+    worst_mean = torch.topk(block_values, k=k, largest=False).values.mean()
+    return -mean + std - worst_mean
+
+
+def _regime_stability_loss(values: Tensor, benchmark: Tensor, down_threshold: float, up_threshold: float) -> Tensor:
+    values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    bench = torch.nan_to_num(benchmark.to(device=values.device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+    masks = (
+        bench <= float(down_threshold),
+        (bench > float(down_threshold)) & (bench < float(up_threshold)),
+        bench >= float(up_threshold),
+    )
+    regime_scores: list[Tensor] = []
+    for regime_mask in masks:
+        if bool(regime_mask.any().detach().cpu()):
+            regime_scores.append(values[regime_mask].mean())
+    if len(regime_scores) < 2:
+        return values.sum() * 0.0
+    stacked = torch.stack(regime_scores)
+    mean = stacked.mean()
+    std = torch.sqrt((stacked - mean).pow(2).mean() + 1e-8)
+    worst = stacked.min()
+    return -mean + std + F.softplus(-worst)
+
+
+def factor_generalization_loss(
+    weights: Tensor,
+    future_log_returns: Tensor,
+    tradable_mask: Tensor,
+    benchmark_returns: Tensor | None = None,
+    can_buy_mask: Tensor | None = None,
+    can_sell_mask: Tensor | None = None,
+    sample_mask: Tensor | None = None,
+    long_only: bool = True,
+    buy_fee_rate: float = 0.0,
+    sell_fee_rate: float = 0.0,
+    max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
+    aux_outputs: dict[str, Tensor] | None = None,
+    slope_tstat_weight: float = 1.0,
+    rank_ic_weight: float = 0.5,
+    factor_sharpe_weight: float = 0.25,
+    block_stability_weight: float = 0.20,
+    regime_stability_weight: float = 0.20,
+    consistency_weight: float = 0.05,
+    net_exposure_weight: float = 0.05,
+    gross_exposure_weight: float = 0.02,
+    concentration_weight: float = 0.02,
+    turnover_weight: float = 0.02,
+    score_l2_weight: float = 0.001,
+    factor_temperature: float = 1.0,
+    block_count: int = 4,
+    worst_fraction: float = 0.25,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
+) -> Tensor:
+    """Train scores as a stable, tradable cross-sectional characteristic factor."""
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    returns = torch.nan_to_num(future_log_returns.to(device=weights.device), nan=0.0, posinf=0.0, neginf=0.0)
+    tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
+    if sample_mask is None:
+        valid_rows = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
+    else:
+        valid_rows = sample_mask.to(device=weights.device, dtype=torch.bool)
+    if not bool(valid_rows.any().detach().cpu()):
+        return weights.sum() * 0.0
+
+    if benchmark_returns is None:
+        tradable_f = tradable.to(dtype=returns.dtype)
+        benchmark = (returns * tradable_f).sum(dim=1) / tradable_f.sum(dim=1).clamp_min(1.0)
+    else:
+        benchmark = torch.nan_to_num(
+            benchmark_returns.to(device=weights.device, dtype=returns.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    scores = weights
+    if aux_outputs:
+        scores = aux_outputs.get("rank_logits", aux_outputs.get("score_logits", weights))
+    scores = scores.to(device=weights.device)
+    scores_z = _masked_zscore(scores.float(), tradable)
+
+    total = returns.new_zeros(())
+    slope = _fama_macbeth_slope_per_row(scores_z, returns, tradable)
+    if float(slope_tstat_weight) > 0.0:
+        total = total + float(slope_tstat_weight) * _stable_negative_tstat(slope, valid_rows)
+
+    if float(rank_ic_weight) > 0.0:
+        rank_ic = _masked_corr_per_row(scores_z, returns, tradable)
+        total = total + float(rank_ic_weight) * _stable_negative_tstat(rank_ic, valid_rows)
+
+    factor_weights = dual_branch_softmax(scores_z / max(float(factor_temperature), 0.05), tradable)
+    can_buy = can_buy_mask.to(dtype=torch.bool, device=weights.device) if can_buy_mask is not None else tradable
+    factor_backtest = run_backtest_torch(
+        factor_weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate,
+        sell_fee_rate,
+        long_only=long_only,
+        max_turnover_ratio=max_turnover_ratio,
+        gross_leverage=gross_leverage,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
+        return_weights_history=False,
+    )
+    factor_returns = torch.nan_to_num(factor_backtest.strategy_returns, nan=0.0, posinf=0.0, neginf=0.0)
+    factor_returns_valid = factor_returns[valid_rows]
+    if factor_returns_valid.numel() > 0 and float(factor_sharpe_weight) > 0.0:
+        total = total + float(factor_sharpe_weight) * _stable_negative_tstat(factor_returns_valid)
+    if factor_returns_valid.numel() > 1 and float(block_stability_weight) > 0.0:
+        total = total + float(block_stability_weight) * _block_stability_loss(
+            factor_returns_valid,
+            block_count=block_count,
+            worst_fraction=worst_fraction,
+        )
+    if factor_returns_valid.numel() > 1 and float(regime_stability_weight) > 0.0:
+        total = total + float(regime_stability_weight) * _regime_stability_loss(
+            factor_returns[valid_rows],
+            benchmark[valid_rows],
+            down_threshold=regime_down_threshold,
+            up_threshold=regime_up_threshold,
+        )
+
+    if aux_outputs and float(consistency_weight) > 0.0:
+        aug_scores = aux_outputs.get("aug_score_logits")
+        if aug_scores is not None:
+            aug_scores_z = _masked_zscore(aug_scores.to(device=weights.device).float(), tradable)
+            consistency = 1.0 - _masked_corr_per_row(scores_z, aug_scores_z, tradable)
+            total = total + float(consistency_weight) * consistency[valid_rows].mean()
+
+    weights_safe = weights.to(dtype=returns.dtype)
+    if float(net_exposure_weight) > 0.0:
+        total = total + float(net_exposure_weight) * weights_safe.sum(dim=1).pow(2)[valid_rows].mean()
+    if float(gross_exposure_weight) > 0.0:
+        gross = weights_safe.abs().sum(dim=1)
+        total = total + float(gross_exposure_weight) * (gross - float(gross_leverage)).pow(2)[valid_rows].mean()
+    if float(concentration_weight) > 0.0:
+        tradable_f = tradable.to(dtype=weights_safe.dtype)
+        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+        concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count)
+        total = total + float(concentration_weight) * concentration[valid_rows].mean()
+    if float(turnover_weight) > 0.0 and weights_safe.size(0) > 1:
+        turnover_proxy = (weights_safe[1:] - weights_safe[:-1]).abs().sum(dim=1)
+        row_mask = valid_rows[1:] & valid_rows[:-1]
+        if bool(row_mask.any().detach().cpu()):
+            total = total + float(turnover_weight) * turnover_proxy[row_mask].mean()
+    if float(score_l2_weight) > 0.0:
+        score_l2 = (scores_z.pow(2) * tradable.to(dtype=scores_z.dtype)).sum(dim=1)
+        denom = tradable.to(dtype=scores_z.dtype).sum(dim=1).clamp_min(1.0)
+        total = total + float(score_l2_weight) * (score_l2 / denom)[valid_rows].mean()
+
+    return total
+
+
+def portfolio_autoencoder_loss(
+    weights: Tensor,
+    future_log_returns: Tensor,
+    tradable_mask: Tensor,
+    benchmark_returns: Tensor | None = None,
+    can_buy_mask: Tensor | None = None,
+    can_sell_mask: Tensor | None = None,
+    sample_mask: Tensor | None = None,
+    long_only: bool = True,
+    buy_fee_rate: float = 0.0,
+    sell_fee_rate: float = 0.0,
+    max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
+    aux_outputs: dict[str, Tensor] | None = None,
+    autoencoder_cost_rate: float = 0.001425,
+    autoencoder_lambda_turnover: float = 0.1,
+    autoencoder_lambda_concentration: float = 0.01,
+    autoencoder_lambda_latent: float = 0.001,
+) -> Tensor:
+    """Portfolio-level Sharpe objective for the bottleneck portfolio autoencoder."""
+    del benchmark_returns, can_buy_mask, can_sell_mask, long_only
+    del buy_fee_rate, sell_fee_rate, max_turnover_ratio, gross_leverage
+
+    weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    returns = torch.nan_to_num(
+        future_log_returns.to(device=weights.device, dtype=weights_safe.dtype),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    tradable = tradable_mask.to(device=weights.device, dtype=torch.bool)
+    weights_safe = weights_safe.masked_fill(~tradable, 0.0)
+
+    if sample_mask is None:
+        valid_rows = torch.ones(weights_safe.size(0), device=weights.device, dtype=torch.bool)
+    else:
+        valid_rows = sample_mask.to(device=weights.device, dtype=torch.bool)
+    valid_f = valid_rows.to(dtype=weights_safe.dtype)
+    valid_count = valid_f.sum().clamp_min(1.0)
+
+    prev_weights = None
+    if aux_outputs:
+        prev_weights = aux_outputs.get("prev_weights")
+        nested_aux = aux_outputs.get("aux")
+        if prev_weights is None and isinstance(nested_aux, dict):
+            prev_weights = nested_aux.get("prev_weights")
+    if prev_weights is None:
+        first_prev = torch.zeros_like(weights_safe[:1])
+        prev_weights = torch.cat([first_prev, weights_safe[:-1].detach()], dim=0)
+    else:
+        prev_weights = torch.nan_to_num(
+            prev_weights.to(device=weights.device, dtype=weights_safe.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    prev_weights = prev_weights.masked_fill(~tradable, 0.0)
+
+    portfolio_return = (weights_safe * returns).sum(dim=1)
+    turnover = (weights_safe - prev_weights).abs().sum(dim=1)
+    net_return = portfolio_return - float(autoencoder_cost_rate) * turnover
+
+    mean_return = (net_return * valid_f).sum() / valid_count
+    centered = (net_return - mean_return) * valid_f
+    std_return = torch.sqrt(centered.pow(2).sum() / valid_count + 1e-8)
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=net_return.dtype))
+    sharpe = mean_return / std_return * annualizer
+
+    total = -sharpe
+    if float(autoencoder_lambda_turnover) > 0.0:
+        total = total + float(autoencoder_lambda_turnover) * (turnover * valid_f).sum() / valid_count
+    if float(autoencoder_lambda_concentration) > 0.0:
+        concentration = weights_safe.pow(2).sum(dim=1)
+        total = total + float(autoencoder_lambda_concentration) * (concentration * valid_f).sum() / valid_count
+    if aux_outputs and float(autoencoder_lambda_latent) > 0.0:
+        latent = aux_outputs.get("latent_z")
+        if latent is None:
+            latent = aux_outputs.get("z")
+        if latent is not None:
+            latent_safe = torch.nan_to_num(latent.to(device=weights.device).float(), nan=0.0, posinf=0.0, neginf=0.0)
+            total = total + float(autoencoder_lambda_latent) * latent_safe.pow(2).mean()
+    return total
 
 
 def sharpe_aware_loss(
@@ -114,6 +447,84 @@ def _compute_risk_ratio(valid_returns: Tensor, objective: str) -> Tensor:
     return mean_return / std_return * annualizer
 
 
+def _fast_portfolio_risk_loss(
+    weights: Tensor,
+    future_log_returns: Tensor,
+    tradable_mask: Tensor,
+    sample_mask: Tensor | None = None,
+    objective: str = "sharpe",
+    buy_fee_rate: float = 0.0,
+    sell_fee_rate: float = 0.0,
+    gamma_sharpe: float = 1.0,
+    gamma_turnover: float = 0.0,
+    concentration_weight: float = 0.0,
+    aux_outputs: dict[str, Tensor] | None = None,
+) -> Tensor:
+    """Vectorized train-time Sharpe/Sortino proxy.
+
+    Validation and final reports still use the full sequential backtest path.
+    This avoids running the expensive backtest kernel inside every training batch
+    for objectives whose core statistic is just a return-series risk ratio.
+    """
+    weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    returns = torch.nan_to_num(
+        future_log_returns.to(device=weights.device, dtype=weights_safe.dtype),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    tradable = tradable_mask.to(device=weights.device, dtype=torch.bool)
+    weights_safe = weights_safe.masked_fill(~tradable, 0.0)
+
+    if sample_mask is None:
+        valid_mask = torch.ones(weights_safe.size(0), device=weights.device, dtype=torch.bool)
+    else:
+        valid_mask = sample_mask.to(device=weights.device, dtype=torch.bool)
+    valid_f = valid_mask.to(dtype=weights_safe.dtype)
+    valid_count = valid_f.sum().clamp_min(1.0)
+
+    prev_weights = None
+    if aux_outputs:
+        prev_weights = aux_outputs.get("prev_weights")
+        nested_aux = aux_outputs.get("aux")
+        if prev_weights is None and isinstance(nested_aux, dict):
+            prev_weights = nested_aux.get("prev_weights")
+    if prev_weights is None:
+        prev_weights = torch.cat([torch.zeros_like(weights_safe[:1]), weights_safe[:-1].detach()], dim=0)
+    else:
+        prev_weights = torch.nan_to_num(
+            prev_weights.to(device=weights.device, dtype=weights_safe.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    prev_weights = prev_weights.masked_fill(~tradable, 0.0)
+
+    turnover = (weights_safe - prev_weights).abs().sum(dim=1)
+    fee_rate = 0.5 * (float(buy_fee_rate) + float(sell_fee_rate))
+    portfolio_returns = (weights_safe * returns).sum(dim=1) - fee_rate * turnover
+
+    mean_return = (portfolio_returns * valid_f).sum() / valid_count
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights_safe.dtype))
+    if objective.strip().lower() == "sortino":
+        downside = torch.minimum(portfolio_returns, torch.zeros_like(portfolio_returns))
+        risk_dev = torch.sqrt((downside.pow(2) * valid_f).sum() / valid_count + 1e-8)
+    else:
+        centered = (portfolio_returns - mean_return) * valid_f
+        risk_dev = torch.sqrt(centered.pow(2).sum() / valid_count + 1e-8)
+    risk_ratio = mean_return / risk_dev * annualizer
+
+    objective_value = -float(gamma_sharpe) * risk_ratio
+    if float(gamma_turnover) > 0.0:
+        objective_value = objective_value + float(gamma_turnover) * (turnover * valid_f).sum() / valid_count
+    if float(concentration_weight) > 0.0:
+        tradable_f = tradable.to(dtype=weights_safe.dtype)
+        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+        concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count)
+        objective_value = objective_value + float(concentration_weight) * (concentration * valid_f).sum() / valid_count
+    return objective_value
+
+
 def _compute_excess_risk_terms(
     valid_returns: Tensor,
     valid_benchmark: Tensor,
@@ -167,11 +578,149 @@ def risk_aware_loss(
     gamma_drawdown_budget: float = 1.0,
     gamma_turnover_budget: float = 0.0,
     objective: str = "sharpe",
+    aux_outputs: dict[str, Tensor] | None = None,
+    rank_ic_weight: float = 1.0,
+    direction_weight: float = 0.05,
+    volatility_regime_weight: float = 0.05,
+    concentration_weight: float = 0.005,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
+    factor_slope_tstat_weight: float = 1.0,
+    factor_rank_ic_weight: float = 0.5,
+    factor_sharpe_weight: float = 0.25,
+    factor_block_stability_weight: float = 0.20,
+    factor_regime_stability_weight: float = 0.20,
+    factor_consistency_weight: float = 0.05,
+    factor_net_exposure_weight: float = 0.05,
+    factor_gross_exposure_weight: float = 0.02,
+    factor_concentration_weight: float = 0.02,
+    factor_turnover_weight: float = 0.02,
+    factor_score_l2_weight: float = 0.001,
+    factor_temperature: float = 1.0,
+    factor_block_count: int = 4,
+    factor_worst_fraction: float = 0.25,
+    autoencoder_cost_rate: float = 0.001425,
+    autoencoder_lambda_turnover: float = 0.1,
+    autoencoder_lambda_concentration: float = 0.01,
+    autoencoder_lambda_latent: float = 0.001,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
+    objective_norm = objective.strip().lower()
+
+    if objective_norm in {"portfolio_autoencoder", "bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
+        return portfolio_autoencoder_loss(
+            weights,
+            returns,
+            tradable,
+            benchmark_returns=benchmark_returns,
+            can_buy_mask=can_buy_mask,
+            can_sell_mask=can_sell_mask,
+            sample_mask=sample_mask,
+            long_only=long_only,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            aux_outputs=aux_outputs,
+            autoencoder_cost_rate=autoencoder_cost_rate,
+            autoencoder_lambda_turnover=autoencoder_lambda_turnover,
+            autoencoder_lambda_concentration=autoencoder_lambda_concentration,
+            autoencoder_lambda_latent=autoencoder_lambda_latent,
+        )
+
+    if objective_norm in {"factor_generalization", "factor", "factor_ic", "characteristic_factor"}:
+        return factor_generalization_loss(
+            weights,
+            returns,
+            tradable,
+            benchmark_returns=benchmark_returns,
+            can_buy_mask=can_buy_mask,
+            can_sell_mask=can_sell_mask,
+            sample_mask=sample_mask,
+            long_only=long_only,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            aux_outputs=aux_outputs,
+            slope_tstat_weight=factor_slope_tstat_weight,
+            rank_ic_weight=factor_rank_ic_weight,
+            factor_sharpe_weight=factor_sharpe_weight,
+            block_stability_weight=factor_block_stability_weight,
+            regime_stability_weight=factor_regime_stability_weight,
+            consistency_weight=factor_consistency_weight,
+            net_exposure_weight=factor_net_exposure_weight,
+            gross_exposure_weight=factor_gross_exposure_weight,
+            concentration_weight=factor_concentration_weight,
+            turnover_weight=factor_turnover_weight,
+            score_l2_weight=factor_score_l2_weight,
+            factor_temperature=factor_temperature,
+            block_count=factor_block_count,
+            worst_fraction=factor_worst_fraction,
+            regime_up_threshold=regime_up_threshold,
+            regime_down_threshold=regime_down_threshold,
+        )
+
+    if objective_norm in {"rank", "rank_ic", "ic", "multitask_rank_ic"}:
+        total_loss = returns.new_zeros(())
+
+        rank_logits = aux_outputs.get("rank_logits") if aux_outputs else weights
+        total_loss = total_loss + float(rank_ic_weight) * masked_ic_loss(rank_logits, returns, tradable)
+
+        if aux_outputs:
+            score_logits = aux_outputs.get("score_logits")
+            if score_logits is not None and float(direction_weight) > 0.0:
+                direction_target = (returns > 0.0).to(dtype=score_logits.dtype)
+                mask_f = tradable.to(dtype=score_logits.dtype)
+                bce = F.binary_cross_entropy_with_logits(score_logits, direction_target, reduction="none")
+                total_loss = total_loss + float(direction_weight) * (bce * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+            volatility_pred = aux_outputs.get("volatility_pred")
+            if volatility_pred is not None and float(volatility_regime_weight) > 0.0:
+                vol_target = returns.abs()
+                mask_f = tradable.to(dtype=volatility_pred.dtype)
+                vol_loss = ((volatility_pred - vol_target).pow(2) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+                total_loss = total_loss + float(volatility_regime_weight) * vol_loss
+
+            regime_logits = aux_outputs.get("regime_logits")
+            if regime_logits is not None and float(volatility_regime_weight) > 0.0:
+                if benchmark_returns is None:
+                    tradable_f = tradable.to(dtype=returns.dtype)
+                    bench_for_regime = (returns * tradable_f).sum(dim=1) / tradable_f.sum(dim=1).clamp_min(1.0)
+                else:
+                    bench_for_regime = torch.nan_to_num(
+                        benchmark_returns.to(device=weights.device, dtype=returns.dtype),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                down_th = float(regime_down_threshold)
+                up_th = float(regime_up_threshold)
+                regime_target = torch.full_like(bench_for_regime, fill_value=1, dtype=torch.long)
+                regime_target = torch.where(bench_for_regime <= down_th, torch.zeros_like(regime_target), regime_target)
+                regime_target = torch.where(bench_for_regime >= up_th, torch.full_like(regime_target, 2), regime_target)
+                total_loss = total_loss + float(volatility_regime_weight) * F.cross_entropy(regime_logits, regime_target)
+
+        return total_loss
+
+    if objective_norm in {"sharpe", "sortino"}:
+        return _fast_portfolio_risk_loss(
+            weights,
+            returns,
+            tradable,
+            sample_mask=sample_mask,
+            objective=objective_norm,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            gamma_sharpe=gamma_sharpe,
+            gamma_turnover=gamma_turnover,
+            concentration_weight=concentration_weight,
+            aux_outputs=aux_outputs,
+        )
+
     can_buy = (
         can_buy_mask.to(dtype=torch.bool, device=weights.device)
         if can_buy_mask is not None
@@ -214,7 +763,6 @@ def risk_aware_loss(
     if valid_returns.numel() == 0:
         return weights.sum() * 0.0
 
-    objective_norm = objective.strip().lower()
     if objective_norm in {
         "excess_cvar_drawdown",
         "cvar",
@@ -263,9 +811,63 @@ def risk_aware_loss(
         objective_value = -gamma_sharpe * risk_ratio
 
     if gamma_turnover == 0.0:
-        return objective_value
+        turnover_term = valid_returns.new_zeros(())
+    else:
+        valid_turnovers = backtest.turnovers[valid_mask]
+        valid_turnovers = torch.nan_to_num(valid_turnovers, nan=0.0, posinf=0.0, neginf=0.0)
+        turnover_term = gamma_turnover * (valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(()))
 
-    valid_turnovers = backtest.turnovers[valid_mask]
-    valid_turnovers = torch.nan_to_num(valid_turnovers, nan=0.0, posinf=0.0, neginf=0.0)
-    turnover_penalty = valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(())
-    return objective_value + gamma_turnover * turnover_penalty
+    total_loss = objective_value + turnover_term
+
+    if concentration_weight > 0.0:
+        weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        tradable_f = tradable.to(dtype=weights_safe.dtype)
+        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+        concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
+        total_loss = total_loss + float(concentration_weight) * concentration
+
+    if not aux_outputs:
+        return total_loss
+
+    aux_loss = valid_returns.new_zeros(())
+
+    score_logits = aux_outputs.get("score_logits")
+    if score_logits is not None and float(direction_weight) > 0.0:
+        direction_target = (returns > 0.0).to(dtype=score_logits.dtype)
+        mask_f = tradable.to(dtype=score_logits.dtype)
+        bce = F.binary_cross_entropy_with_logits(score_logits, direction_target, reduction="none")
+        direction_loss = (bce * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+        aux_loss = aux_loss + float(direction_weight) * direction_loss
+
+    volatility_pred = aux_outputs.get("volatility_pred")
+    regime_logits = aux_outputs.get("regime_logits")
+    vol_regime_loss = valid_returns.new_zeros(())
+    has_vol_regime = False
+
+    if volatility_pred is not None:
+        vol_target = returns.abs()
+        mask_f = tradable.to(dtype=volatility_pred.dtype)
+        vol_loss = ((volatility_pred - vol_target).pow(2) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+        vol_regime_loss = vol_regime_loss + vol_loss
+        has_vol_regime = True
+
+    if regime_logits is not None:
+        if benchmark_returns is None:
+            tradable_f = tradable.to(dtype=returns.dtype)
+            bench_for_regime = (returns * tradable_f).sum(dim=1) / tradable_f.sum(dim=1).clamp_min(1.0)
+        else:
+            bench_for_regime = benchmark.to(dtype=returns.dtype)
+
+        down_th = float(regime_down_threshold)
+        up_th = float(regime_up_threshold)
+        regime_target = torch.full_like(bench_for_regime, fill_value=1, dtype=torch.long)
+        regime_target = torch.where(bench_for_regime <= down_th, torch.zeros_like(regime_target), regime_target)
+        regime_target = torch.where(bench_for_regime >= up_th, torch.full_like(regime_target, 2), regime_target)
+        regime_ce = F.cross_entropy(regime_logits, regime_target)
+        vol_regime_loss = vol_regime_loss + regime_ce
+        has_vol_regime = True
+
+    if has_vol_regime and float(volatility_regime_weight) > 0.0:
+        aux_loss = aux_loss + float(volatility_regime_weight) * vol_regime_loss
+
+    return total_loss + aux_loss

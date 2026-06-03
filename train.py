@@ -14,6 +14,30 @@ from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.training.trainer import run_inference, run_training
 
 
+def _configure_cuda_runtime() -> None:
+    if not torch.cuda.is_available():
+        return
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Keep convolution autotuner on for mostly-stable shapes.
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    for attr in (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        if hasattr(torch.backends.cuda.matmul, attr):
+            setattr(torch.backends.cuda.matmul, attr, True)
+    # Prefer fused attention kernels when available.
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "enable_flash_sdp"):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "enable_math_sdp"):
+        torch.backends.cuda.enable_math_sdp(True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the stockAgent baseline model")
     parser.add_argument("--config", default="configs/experiment_baseline.yaml", help="Path to experiment config")
@@ -54,6 +78,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    _configure_cuda_runtime()
 
     # Keep runtime switches consistent with YAML config.
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if config.training.backtest_autotune else "0"

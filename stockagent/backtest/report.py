@@ -18,8 +18,10 @@ def _format_risk_metrics_text(result: BacktestResult) -> str:
     """Build a compact text block for on-chart risk metrics."""
     met = compute_metrics(result)
     return (
+        f"CAGR: {met['cagr']:.2%}\n"
         f"Sharpe: {met['sharpe']:.3f}\n"
         f"Sortino: {met['sortino']:.3f}\n"
+        f"Calmar: {met['calmar']:.3f}\n"
         f"MDD: {met['max_drawdown']:.2%}"
     )
 
@@ -115,8 +117,8 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
     Returns a dict with:
-        cumulative_return, annualized_return, sharpe, baseline_sharpe, sortino, baseline_sortino, max_drawdown,
-        turnover, daily_hit_rate, excess_return_vs_universe_average,
+        cumulative_return, annualized_return, cagr, sharpe, baseline_sharpe, sortino, baseline_sortino,
+        max_drawdown, calmar, turnover, daily_hit_rate, excess_return_vs_universe_average,
         cumulative_benchmark
     """
     r = np.nan_to_num(result.strategy_returns, nan=0.0)
@@ -141,15 +143,18 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
 
     max_dd = _max_drawdown_from_log_returns(r)
+    calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
 
     return {
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
+        "cagr": ann_r,
         "sharpe": sharpe,
         "baseline_sharpe": baseline_sharpe,
         "sortino": sortino,
         "baseline_sortino": baseline_sortino,
         "max_drawdown": max_dd,
+        "calmar": calmar,
         "turnover": float(result.turnovers.mean()) if result.turnovers.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
         "excess_return_vs_universe_average": cum_r - cum_b,
@@ -200,15 +205,18 @@ def compute_metrics_by_year(
         baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
 
         max_dd = _max_drawdown_from_log_returns(r_year)
+        calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
 
         entry: dict[str, float] = {
             "cumulative_return": cum_r,
             "annualized_return": ann_r,
+            "cagr": ann_r,
             "sharpe": sharpe,
             "baseline_sharpe": baseline_sharpe,
             "sortino": sortino,
             "baseline_sortino": baseline_sortino,
             "max_drawdown": max_dd,
+            "calmar": calmar,
             "turnover": float(turnover_year.mean()),
             "daily_hit_rate": float((r_year > 0).mean()),
             "excess_return_vs_universe_average": cum_r - cum_b,

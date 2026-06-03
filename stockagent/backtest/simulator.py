@@ -10,6 +10,11 @@ import numpy as np
 import torch
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
+from stockagent.backtest.cpp_long_short import (
+    cpp_long_short_enabled,
+    run_long_short_cpp_autograd,
+)
+
 
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
@@ -410,6 +415,42 @@ def _resolve_scan_runner(
         return base_runner
 
 
+def _fallback_scan_runner_after_runtime_failure(
+    *,
+    error: Exception,
+    weights: torch.Tensor,
+    long_only: bool,
+    max_turnover_ratio: float,
+    gross_budget: float,
+    scan_chunk_size: int,
+    record_weights_history: bool,
+):
+    key = _scan_compile_key(
+        weights,
+        long_only,
+        max_turnover_ratio,
+        gross_budget,
+        scan_chunk_size,
+        record_weights_history,
+    )
+    _SCAN_COMPILE_FAILED.add(key)
+    _SCAN_COMPILED_CACHE.pop(key, None)
+    _SCAN_COMPILE_STATS["failures"] += 1
+    print(
+        "[backtest compile] runtime failed, falling back to eager for "
+        f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, "
+        f"dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, "
+        f"record_weights={record_weights_history}): {type(error).__name__}: {str(error)[:300]}"
+    )
+    return _scan_runner_factory(
+        long_only=long_only,
+        max_turnover_ratio=max_turnover_ratio,
+        gross_budget=gross_budget,
+        scan_chunk_size=scan_chunk_size,
+        record_weights_history=record_weights_history,
+    )
+
+
 @dataclass(slots=True)
 class BacktestResult:
     """Container for a single backtest simulation run."""
@@ -757,6 +798,33 @@ def _vectorized_backtest_torch(
     )
     prev_init = torch.zeros_like(prepped_weights[0])
 
+    use_cpp_long_short = (
+        cpp_long_short_enabled()
+        and not long_only
+        and torch.is_grad_enabled()
+        and prepped_weights.requires_grad
+        and prepped_weights.device.type == "cuda"
+    )
+    if use_cpp_long_short:
+        try:
+            strategy_returns, turnovers, weights_history = run_long_short_cpp_autograd(
+                prepped_weights,
+                future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                prepped_tradable,
+                prepped_buy,
+                prepped_sell,
+                buy_fee_rate,
+                sell_fee_rate,
+                max_turnover_ratio,
+                gross_budget,
+            )
+            if not return_weights_history:
+                weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+            return strategy_returns, turnovers, weights_history
+        except Exception as e:
+            if _compile_verbose():
+                print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
+
     checkpoint_rows = _checkpoint_chunk_rows()
     use_checkpoint = (
         checkpoint_rows > 0
@@ -785,14 +853,35 @@ def _vectorized_backtest_torch(
         )
 
     if not use_checkpoint:
-        turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, _ = runner(
-            prepped_weights,
-            future_returns,
-            prepped_tradable,
-            prepped_buy,
-            prepped_sell,
-            prev_init,
-        )
+        try:
+            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, _ = runner(
+                prepped_weights,
+                future_returns,
+                prepped_tradable,
+                prepped_buy,
+                prepped_sell,
+                prev_init,
+            )
+        except Exception as e:
+            if not (_compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")):
+                raise
+            runner = _fallback_scan_runner_after_runtime_failure(
+                error=e,
+                weights=prepped_weights,
+                long_only=long_only,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_budget=gross_budget,
+                scan_chunk_size=resolved_chunk,
+                record_weights_history=return_weights_history,
+            )
+            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, _ = runner(
+                prepped_weights,
+                future_returns,
+                prepped_tradable,
+                prepped_buy,
+                prepped_sell,
+                prev_init,
+            )
     else:
         chunk_rows = max(1, int(checkpoint_rows))
         turnovers_chunks: list[torch.Tensor] = []
