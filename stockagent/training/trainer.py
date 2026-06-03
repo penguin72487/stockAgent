@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import pickle
 import shutil
@@ -89,8 +90,11 @@ class TimingBreakdown:
     backtest_s: float = 0.0
     ic_s: float = 0.0
     metrics_s: float = 0.0
+    concat_s: float = 0.0
     save_s: float = 0.0
     plot_s: float = 0.0
+    sync_s: float = 0.0
+    gc_s: float = 0.0
     batches: int = 0
 
 
@@ -113,8 +117,11 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "backtest_s",
         "ic_s",
         "metrics_s",
+        "concat_s",
         "save_s",
         "plot_s",
+        "sync_s",
+        "gc_s",
     ):
         value = getattr(timing, name)
         if value > 0:
@@ -122,9 +129,44 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
     print(" ".join(parts))
 
 
+def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
+    for name in (
+        "total_s",
+        "fetch_s",
+        "transfer_s",
+        "forward_s",
+        "model_forward_s",
+        "factor_aug_s",
+        "loss_s",
+        "backward_s",
+        "grad_s",
+        "clip_s",
+        "finite_check_s",
+        "step_s",
+        "backtest_s",
+        "ic_s",
+        "metrics_s",
+        "concat_s",
+        "save_s",
+        "plot_s",
+        "sync_s",
+        "gc_s",
+    ):
+        setattr(dst, name, getattr(dst, name) + getattr(src, name))
+    dst.batches += src.batches
+
+
 def _maybe_sync_cuda(device: torch.device, enabled: bool) -> None:
     if enabled and device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _sync_cuda_for_timing(device: torch.device) -> float:
+    if device.type != "cuda":
+        return 0.0
+    start_t = time.perf_counter()
+    torch.cuda.synchronize(device)
+    return time.perf_counter() - start_t
 
 
 def _maybe_cudagraph_step_begin() -> None:
@@ -480,27 +522,35 @@ def _evaluate_rank_ic_multitask_loss(
     regime_up_threshold: float,
     regime_down_threshold: float,
     factor_loss_kwargs: dict[str, Any] | None = None,
-) -> tuple[float, float | None]:
+) -> tuple[float, float | None, TimingBreakdown]:
     model.eval()
-    total_loss = 0.0
     total_rows = 0
-    ic_sum = 0.0
-    ic_count = 0
+    total_loss_t: torch.Tensor | None = None
+    ic_sum_t: torch.Tensor | None = None
+    ic_count_t: torch.Tensor | None = None
+    timing = TimingBreakdown()
+    overall_start = time.perf_counter()
 
     with torch.inference_mode():
         for start in range(0, x.size(0), chunk_rows):
             end = min(start + chunk_rows, x.size(0))
 
+            transfer_start = time.perf_counter()
             x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
             returns_chunk = future_log_returns[start:end].to(device=device, non_blocking=non_blocking)
             mask_chunk = tradable_mask[start:end].to(device=device, non_blocking=non_blocking)
             buy_chunk = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
             sell_chunk = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
             bench_chunk = benchmark_returns[start:end].to(device=device, non_blocking=non_blocking)
+            timing.transfer_s += time.perf_counter() - transfer_start
 
+            forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
+                model_forward_start = time.perf_counter()
                 model_output = model(x_chunk, mask_chunk)
                 weights_chunk, aux_outputs = _extract_weights_and_aux(model_output)
+                timing.model_forward_s += time.perf_counter() - model_forward_start
+                loss_start = time.perf_counter()
                 loss_t = risk_aware_loss(
                     weights_chunk,
                     returns_chunk,
@@ -538,21 +588,40 @@ def _evaluate_rank_ic_multitask_loss(
                     regime_down_threshold=regime_down_threshold,
                     **(factor_loss_kwargs or {}),
                 )
+                timing.loss_s += time.perf_counter() - loss_start
+            timing.forward_s += time.perf_counter() - forward_start
 
             rows = end - start
             total_rows += rows
-            total_loss += float(loss_t.detach().cpu()) * float(rows)
+            metrics_start = time.perf_counter()
+            weighted_loss = loss_t.detach().float() * float(rows)
+            total_loss_t = weighted_loss if total_loss_t is None else total_loss_t + weighted_loss
+            timing.metrics_s += time.perf_counter() - metrics_start
 
+            ic_start = time.perf_counter()
             rank_scores = aux_outputs.get("rank_logits") if aux_outputs else weights_chunk
             ic_series = compute_ic_series_torch(rank_scores, returns_chunk, mask_chunk)
             ic_clean = ic_series[torch.isfinite(ic_series)]
-            if int(ic_clean.numel()) > 0:
-                ic_sum += float(ic_clean.sum().item())
-                ic_count += int(ic_clean.numel())
+            if ic_clean.numel() > 0:
+                ic_sum_chunk = ic_clean.float().sum()
+                ic_count_chunk = ic_clean.new_tensor(float(ic_clean.numel()), dtype=torch.float32)
+                ic_sum_t = ic_sum_chunk if ic_sum_t is None else ic_sum_t + ic_sum_chunk
+                ic_count_t = ic_count_chunk if ic_count_t is None else ic_count_t + ic_count_chunk
+            timing.ic_s += time.perf_counter() - ic_start
 
-    mean_loss = total_loss / float(max(1, total_rows))
-    mean_ic = (ic_sum / float(ic_count)) if ic_count > 0 else None
-    return mean_loss, mean_ic
+    reduce_start = time.perf_counter()
+    if total_loss_t is None:
+        mean_loss = 0.0
+    else:
+        mean_loss = float((total_loss_t / float(max(1, total_rows))).detach().cpu())
+    if ic_sum_t is None or ic_count_t is None:
+        mean_ic = None
+    else:
+        mean_ic = float((ic_sum_t / ic_count_t.clamp_min(1.0)).detach().cpu())
+    timing.metrics_s += time.perf_counter() - reduce_start
+    timing.total_s = time.perf_counter() - overall_start
+    timing.batches = int(max(1, (int(x.size(0)) + int(chunk_rows) - 1) // int(chunk_rows)))
+    return mean_loss, mean_ic, timing
 
 
 def _objective_metric_key(objective: str) -> str:
@@ -844,18 +913,26 @@ class _AsyncEpochCurvePlotter:
 def _timing_curve_payload(
     *,
     train_timing: TimingBreakdown,
+    val_timing: TimingBreakdown | None = None,
+    test_curve_timing: TimingBreakdown | None = None,
     val_eval_s: float = 0.0,
     val_loss_s: float = 0.0,
     val_metrics_s: float | None = None,
     test_curve_s: float = 0.0,
+    test_curve_loss_s: float = 0.0,
     fold_checkpoint_save_s: float = 0.0,
     group_checkpoint_save_s: float = 0.0,
     checkpoint_save_s: float = 0.0,
     scheduler_s: float = 0.0,
     progress_update_s: float = 0.0,
+    curve_record_s: float = 0.0,
+    cuda_sync_s: float = 0.0,
+    gc_s: float = 0.0,
     epoch_wall_s: float | None = None,
     timing_synchronized: bool = False,
 ) -> dict[str, float | int]:
+    val_timing = val_timing or TimingBreakdown()
+    test_curve_timing = test_curve_timing or TimingBreakdown()
     batches = max(1, int(train_timing.batches))
 
     def _avg_ms(value_s: float) -> float:
@@ -875,6 +952,9 @@ def _timing_curve_payload(
         + checkpoint_total_s
         + float(scheduler_s)
         + float(progress_update_s)
+        + float(curve_record_s)
+        + float(cuda_sync_s)
+        + float(gc_s)
     )
     epoch_total_s = float(epoch_wall_s) if epoch_wall_s is not None else measured_total_s
     unattributed_s = max(0.0, epoch_total_s - measured_total_s)
@@ -895,14 +975,34 @@ def _timing_curve_payload(
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
         "train_step_ms_per_batch": _avg_ms(train_timing.step_s),
         "val_eval_s": float(val_eval_s),
+        "val_transfer_s": float(val_timing.transfer_s),
+        "val_forward_s": float(val_timing.forward_s),
+        "val_model_forward_s": float(val_timing.model_forward_s),
+        "val_loss_compute_s": float(val_timing.loss_s),
+        "val_backtest_s": float(val_timing.backtest_s),
+        "val_ic_s": float(val_timing.ic_s),
+        "val_metrics_reduce_s": float(val_timing.metrics_s),
+        "val_concat_s": float(val_timing.concat_s),
         "val_loss_s": float(val_loss_s),
         "val_metrics_s": val_metrics_value,
         "test_curve_s": float(test_curve_s),
+        "test_curve_loss_s": float(test_curve_loss_s),
+        "test_curve_transfer_s": float(test_curve_timing.transfer_s),
+        "test_curve_forward_s": float(test_curve_timing.forward_s),
+        "test_curve_model_forward_s": float(test_curve_timing.model_forward_s),
+        "test_curve_loss_compute_s": float(test_curve_timing.loss_s),
+        "test_curve_backtest_s": float(test_curve_timing.backtest_s),
+        "test_curve_ic_s": float(test_curve_timing.ic_s),
+        "test_curve_metrics_reduce_s": float(test_curve_timing.metrics_s),
+        "test_curve_concat_s": float(test_curve_timing.concat_s),
         "fold_checkpoint_save_s": float(fold_checkpoint_save_s),
         "group_checkpoint_save_s": float(group_checkpoint_save_s),
         "checkpoint_save_s": checkpoint_total_s,
         "scheduler_s": float(scheduler_s),
         "progress_update_s": float(progress_update_s),
+        "curve_record_s": float(curve_record_s),
+        "cuda_sync_s": float(cuda_sync_s),
+        "gc_s": float(gc_s),
         "epoch_wall_s": epoch_total_s,
         "epoch_unattributed_s": unattributed_s,
         "epoch_total_s": epoch_total_s,
@@ -1405,8 +1505,11 @@ def _evaluate_tensor_batch(
     gross_leverage: float,
     chunk_rows: int,
     compute_ic: bool = True,
+    compute_metrics_summary: bool = True,
+    return_weights_history: bool = True,
     profile_timing: bool = False,
     progress_label: str | None = None,
+    timing_out: TimingBreakdown | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     weights_chunks: list[torch.Tensor] = []
@@ -1415,17 +1518,17 @@ def _evaluate_tensor_batch(
     turnover_chunks: list[torch.Tensor] = []
 
     n_rows = 0
-    sum_r = 0.0
-    sumsq_r = 0.0
-    sum_b = 0.0
-    sumsq_b = 0.0
-    sum_turnover = 0.0
-    hit_count = 0.0
+    sum_r_t = torch.zeros((), device=device, dtype=torch.float64)
+    sumsq_r_t = torch.zeros((), device=device, dtype=torch.float64)
+    sum_b_t = torch.zeros((), device=device, dtype=torch.float64)
+    sumsq_b_t = torch.zeros((), device=device, dtype=torch.float64)
+    sum_turnover_t = torch.zeros((), device=device, dtype=torch.float64)
+    hit_count_t = torch.zeros((), device=device, dtype=torch.float64)
 
-    ic_count = 0
-    ic_sum = 0.0
-    ic_sumsq = 0.0
-    ic_pos = 0.0
+    ic_count_t = torch.zeros((), device=device, dtype=torch.float64)
+    ic_sum_t = torch.zeros((), device=device, dtype=torch.float64)
+    ic_sumsq_t = torch.zeros((), device=device, dtype=torch.float64)
+    ic_pos_t = torch.zeros((), device=device, dtype=torch.float64)
 
     # Online max drawdown in log space.
     cum_log = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -1480,6 +1583,7 @@ def _evaluate_tensor_batch(
                 gross_leverage=gross_leverage,
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
+                return_weights_history=return_weights_history,
             )
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_s += time.perf_counter() - backtest_start
@@ -1492,38 +1596,42 @@ def _evaluate_tensor_batch(
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
 
-            weights_chunks.append(backtest_chunk.weights_history.clone())
+            if return_weights_history:
+                weights_chunks.append(backtest_chunk.weights_history.clone())
             strategy_chunks.append(backtest_chunk.strategy_returns.clone())
             benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
             turnover_chunks.append(backtest_chunk.turnovers.clone())
 
-            r = torch.nan_to_num(backtest_chunk.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-            b = torch.nan_to_num(backtest_chunk.benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-            t = torch.nan_to_num(backtest_chunk.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+            if compute_metrics_summary:
+                metrics_start = time.perf_counter()
+                r = torch.nan_to_num(backtest_chunk.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                b = torch.nan_to_num(backtest_chunk.benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                t = torch.nan_to_num(backtest_chunk.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
 
-            n_rows += int(r.numel())
-            sum_r += float(r.sum().item())
-            sumsq_r += float((r * r).sum().item())
-            sum_b += float(b.sum().item())
-            sumsq_b += float((b * b).sum().item())
-            sum_turnover += float(t.sum().item())
-            hit_count += float((r > 0).to(torch.float64).sum().item())
+                n_rows += int(r.numel())
+                sum_r_t = sum_r_t + r.sum()
+                sumsq_r_t = sumsq_r_t + (r * r).sum()
+                sum_b_t = sum_b_t + b.sum()
+                sumsq_b_t = sumsq_b_t + (b * b).sum()
+                sum_turnover_t = sum_turnover_t + t.sum()
+                hit_count_t = hit_count_t + (r > 0).to(torch.float64).sum()
 
-            cum_log_chunk = torch.cumsum(r, dim=0) + cum_log
-            running_max_chunk = torch.maximum(torch.cummax(cum_log_chunk, dim=0).values, running_max_log)
-            dd_chunk = torch.expm1(torch.clamp(cum_log_chunk - running_max_chunk, min=-745.0, max=0.0))
-            min_dd = torch.minimum(min_dd, dd_chunk.min())
-            cum_log = cum_log_chunk[-1]
-            running_max_log = running_max_chunk[-1]
+                cum_log_chunk = torch.cumsum(r, dim=0) + cum_log
+                running_max_chunk = torch.maximum(torch.cummax(cum_log_chunk, dim=0).values, running_max_log)
+                dd_chunk = torch.expm1(torch.clamp(cum_log_chunk - running_max_chunk, min=-745.0, max=0.0))
+                min_dd = torch.minimum(min_dd, dd_chunk.min())
+                cum_log = cum_log_chunk[-1]
+                running_max_log = running_max_chunk[-1]
+                timing.metrics_s += time.perf_counter() - metrics_start
 
             if compute_ic:
-                ic_clean = ic_chunk[torch.isfinite(ic_chunk)]
-                if ic_clean.numel() > 0:
-                    ic_clean64 = ic_clean.to(torch.float64)
-                    ic_count += int(ic_clean64.numel())
-                    ic_sum += float(ic_clean64.sum().item())
-                    ic_sumsq += float((ic_clean64 * ic_clean64).sum().item())
-                    ic_pos += float((ic_clean64 > 0).to(torch.float64).sum().item())
+                ic_finite = torch.isfinite(ic_chunk)
+                ic_clean64 = torch.nan_to_num(ic_chunk, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                ic_mask64 = ic_finite.to(torch.float64)
+                ic_count_t = ic_count_t + ic_mask64.sum()
+                ic_sum_t = ic_sum_t + (ic_clean64 * ic_mask64).sum()
+                ic_sumsq_t = ic_sumsq_t + (ic_clean64 * ic_clean64 * ic_mask64).sum()
+                ic_pos_t = ic_pos_t + ((ic_clean64 > 0).to(torch.float64) * ic_mask64).sum()
             if progress_label:
                 _progress(
                     f"{progress_label}: chunk {chunk_idx}/{total_chunks} done "
@@ -1531,7 +1639,15 @@ def _evaluate_tensor_batch(
                     f"backtest={timing.backtest_s:.1f}s ic={timing.ic_s:.1f}s)"
                 )
 
-        weights = torch.cat(weights_chunks, dim=0)
+        concat_start = time.perf_counter()
+        if return_weights_history:
+            weights = torch.cat(weights_chunks, dim=0)
+        else:
+            weights = torch.empty(
+                (0, int(x.size(2))),
+                device=device,
+                dtype=strategy_chunks[0].dtype if strategy_chunks else torch.float32,
+            )
         strategy_returns = torch.cat(strategy_chunks, dim=0)
         benchmark_returns = torch.cat(benchmark_chunks, dim=0)
         turnovers = torch.cat(turnover_chunks, dim=0)
@@ -1541,8 +1657,12 @@ def _evaluate_tensor_batch(
             turnovers=turnovers,
             weights_history=weights,
         )
+        timing.concat_s += time.perf_counter() - concat_start
 
-        if n_rows <= 0:
+        metrics_start = time.perf_counter()
+        if not compute_metrics_summary:
+            metrics = {}
+        elif n_rows <= 0:
             metrics = {
                 "cumulative_return": 0.0,
                 "annualized_return": 0.0,
@@ -1555,6 +1675,25 @@ def _evaluate_tensor_batch(
                 "cumulative_benchmark": 0.0,
             }
         else:
+            (
+                sum_r,
+                sumsq_r,
+                sum_b,
+                sumsq_b,
+                sum_turnover,
+                hit_count,
+                min_dd_value,
+            ) = torch.stack(
+                [
+                    sum_r_t,
+                    sumsq_r_t,
+                    sum_b_t,
+                    sumsq_b_t,
+                    sum_turnover_t,
+                    hit_count_t,
+                    min_dd,
+                ]
+            ).detach().cpu().tolist()
             n = float(n_rows)
             mean_r = sum_r / n
             mean_b = sum_b / n
@@ -1562,9 +1701,9 @@ def _evaluate_tensor_batch(
             var_b = max(0.0, sumsq_b / n - mean_b * mean_b)
             std_r = var_r ** 0.5
             std_b = var_b ** 0.5
-            cum_r = float(torch.expm1(torch.tensor(sum_r, dtype=torch.float64)).item())
-            cum_b = float(torch.expm1(torch.tensor(sum_b, dtype=torch.float64)).item())
-            ann_r = float(torch.expm1(torch.tensor(mean_r * 252.0, dtype=torch.float64)).item())
+            cum_r = float(math.expm1(sum_r))
+            cum_b = float(math.expm1(sum_b))
+            ann_r = float(math.expm1(mean_r * 252.0))
             sharpe = float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0
             baseline_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
 
@@ -1573,13 +1712,18 @@ def _evaluate_tensor_batch(
                 "annualized_return": ann_r,
                 "sharpe": sharpe,
                 "baseline_sharpe": baseline_sharpe,
-                "max_drawdown": float(min_dd.item()),
+                "max_drawdown": float(min_dd_value),
                 "turnover": sum_turnover / n,
                 "daily_hit_rate": hit_count / n,
                 "excess_return_vs_universe_average": cum_r - cum_b,
                 "cumulative_benchmark": cum_b,
             }
+        timing.metrics_s += time.perf_counter() - metrics_start
 
+        ic_summary_start = time.perf_counter()
+        ic_count, ic_sum, ic_sumsq, ic_pos = torch.stack(
+            [ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t]
+        ).detach().cpu().tolist()
         if ic_count <= 0:
             ic = {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
         else:
@@ -1593,12 +1737,15 @@ def _evaluate_tensor_batch(
                 "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
                 "ic_positive_ratio": ic_pos / ic_n,
             }
+        timing.ic_s += time.perf_counter() - ic_summary_start
     timing.total_s = time.perf_counter() - overall_start
     timing.batches = int(max(1, (x.size(0) + chunk_rows - 1) // chunk_rows))
     if progress_label:
         _progress(f"{progress_label}: eval done total={timing.total_s:.1f}s chunks={timing.batches}")
     if profile_timing:
         _log_timing("eval", timing)
+    if timing_out is not None:
+        _add_timing(timing_out, timing)
     return backtest, ic, metrics
 
 
@@ -2295,6 +2442,7 @@ def _train_epoch(
             batch = next(loader_iter)
         except StopIteration:
             break
+        batch_start = time.perf_counter()
         batch_no = steps + 1
         if progress_label:
             suffix = f"/{total_batches}" if total_batches else ""
@@ -3809,9 +3957,14 @@ def run_training(
             async_enabled=bool(config.training.curve_plot_async),
         )
 
-        def _record_epoch_curve(payload: dict[str, float | int | None]) -> None:
+        def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
+            start_t = time.perf_counter()
             _append_group_curve(group_curve_path, payload)
-            curve_plotter.request()
+            if request_plot:
+                curve_plotter.request()
+            return time.perf_counter() - start_t
+
+        curve_plot_request_interval = max(1, int(config.training.curve_plot_interval))
 
         if config.training.chunk_rows > 0:
             eval_chunk_rows = min(config.training.chunk_rows, int(combined_val_x.size(0)))
@@ -4208,7 +4361,13 @@ def run_training(
                         f"Train {train_years} epoch {epoch} (train-only)",
                         train_timing,
                     )
-                _record_epoch_curve(
+                cuda_sync_total = _sync_cuda_for_timing(device)
+                request_plot = (
+                    epoch == start_epoch
+                    or (epoch % curve_plot_request_interval == 0)
+                    or (epoch == config.training.epochs)
+                )
+                curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
                         "train_loss": float(train_loss),
@@ -4219,11 +4378,18 @@ def run_training(
                             train_timing=train_timing,
                             scheduler_s=scheduler_total,
                             progress_update_s=progress_update_total,
+                            cuda_sync_s=cuda_sync_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(device.type != "cuda" or profile_timing),
                         ),
                     },
+                    request_plot=request_plot,
                 )
+                if profile_timing and curve_record_total > 0.0:
+                    _log_timing(
+                        f"Train {train_years} epoch {epoch} curve_record",
+                        TimingBreakdown(plot_s=curve_record_total, total_s=curve_record_total),
+                    )
                 continue
 
             val_losses: list[float] = []
@@ -4233,6 +4399,11 @@ def run_training(
             group_ckpt_total = 0.0
             scheduler_total = 0.0
             progress_update_total = 0.0
+            curve_record_total = 0.0
+            cuda_sync_total = 0.0
+            gc_total = 0.0
+            val_timing = TimingBreakdown()
+            test_curve_timing = TimingBreakdown()
             if loss_objective in {"rank_ic", "factor_generalization", "portfolio_autoencoder"}:
                 val_eval_start = time.perf_counter()
                 model.eval()
@@ -4241,7 +4412,7 @@ def run_training(
                         start = val_offsets[index]
                         end = val_offsets[index + 1]
 
-                        val_loss, val_ic = _evaluate_rank_ic_multitask_loss(
+                        val_loss, val_ic, val_fold_timing = _evaluate_rank_ic_multitask_loss(
                             model,
                             combined_val_x[start:end],
                             combined_val_returns[start:end],
@@ -4282,6 +4453,7 @@ def run_training(
                             regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                             factor_loss_kwargs=risk_loss_kwargs,
                         )
+                        _add_timing(val_timing, val_fold_timing)
                         val_losses.append(val_loss)
                         if val_ic is not None:
                             val_ics.append(val_ic)
@@ -4304,7 +4476,7 @@ def run_training(
                 val_loss_total = 0.0
             else:
                 val_eval_start = time.perf_counter()
-                val_backtest, _, _ = _evaluate_tensor_batch(
+                val_backtest_epoch, _, _ = _evaluate_tensor_batch(
                     model,
                     combined_val_x,
                     combined_val_returns,
@@ -4322,18 +4494,23 @@ def run_training(
                     config.trading.gross_leverage,
                     chunk_rows=eval_chunk_rows,
                     compute_ic=False,
+                    compute_metrics_summary=False,
+                    return_weights_history=False,
                     profile_timing=profile_timing,
+                    timing_out=val_timing,
                 )
                 val_eval_total = time.perf_counter() - val_eval_start
 
                 val_loss_start = time.perf_counter()
+                val_loss_tensors: list[torch.Tensor] = []
+                val_loss_contexts: list[FoldRuntimeContext] = []
                 for index, (_, context) in enumerate(fold_contexts.items()):
                     start = val_offsets[index]
                     end = val_offsets[index + 1]
                     val_loss_tensor = _loss_from_backtest_series(
-                        val_backtest.strategy_returns[start:end],
-                        val_backtest.benchmark_returns[start:end],
-                        val_backtest.turnovers[start:end],
+                        val_backtest_epoch.strategy_returns[start:end],
+                        val_backtest_epoch.benchmark_returns[start:end],
+                        val_backtest_epoch.turnovers[start:end],
                         gamma_sharpe=config.evaluation.gamma_sharpe,
                         gamma_excess=config.evaluation.gamma_excess,
                         gamma_cvar=config.evaluation.gamma_cvar,
@@ -4351,7 +4528,15 @@ def run_training(
                         gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                         objective=loss_objective,
                     )
-                    val_loss = float(val_loss_tensor.detach().cpu())
+                    val_loss_tensors.append(val_loss_tensor.detach().float())
+                    val_loss_contexts.append(context)
+                val_loss_values = (
+                    torch.stack(val_loss_tensors).cpu().tolist()
+                    if val_loss_tensors
+                    else []
+                )
+                for context, val_loss_raw in zip(val_loss_contexts, val_loss_values, strict=False):
+                    val_loss = float(val_loss_raw)
                     val_losses.append(val_loss)
                     if val_loss < context.best_val_loss:
                         any_fold_improved = True
@@ -4379,6 +4564,7 @@ def run_training(
             )
             sampled_test_mean: float | None = None
             curve_test_total = 0.0
+            test_loss_total = 0.0
             if should_compute_test_mean:
                 curve_test_start = time.perf_counter()
                 test_losses_epoch: list[float] = []
@@ -4388,7 +4574,7 @@ def run_training(
                         for index in range(len(test_offsets) - 1):
                             start = test_offsets[index]
                             end = test_offsets[index + 1]
-                            test_loss, _ = _evaluate_rank_ic_multitask_loss(
+                            test_loss, _, test_fold_timing = _evaluate_rank_ic_multitask_loss(
                                 model,
                                 combined_test_x[start:end],
                                 combined_test_returns[start:end],
@@ -4429,6 +4615,7 @@ def run_training(
                                 regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                                 factor_loss_kwargs=risk_loss_kwargs,
                             )
+                            _add_timing(test_curve_timing, test_fold_timing)
                             test_losses_epoch.append(test_loss)
                 else:
                     test_backtest_epoch, _, _ = _evaluate_tensor_batch(
@@ -4449,8 +4636,13 @@ def run_training(
                         config.trading.gross_leverage,
                         chunk_rows=eval_chunk_rows,
                         compute_ic=False,
+                        compute_metrics_summary=False,
+                        return_weights_history=False,
                         profile_timing=False,
+                        timing_out=test_curve_timing,
                     )
+                    test_loss_start = time.perf_counter()
+                    test_loss_tensors: list[torch.Tensor] = []
                     for index in range(len(test_offsets) - 1):
                         start = test_offsets[index]
                         end = test_offsets[index + 1]
@@ -4475,8 +4667,11 @@ def run_training(
                             gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                             objective=loss_objective,
                         )
-                        test_loss = float(test_loss_t.detach().cpu())
-                        test_losses_epoch.append(test_loss)
+                        test_loss_tensors.append(test_loss_t.detach().float())
+                    if test_loss_tensors:
+                        test_loss_values = torch.stack(test_loss_tensors).cpu().tolist()
+                        test_losses_epoch.extend(float(value) for value in test_loss_values)
+                    test_loss_total = time.perf_counter() - test_loss_start
                 sampled_test_mean = float(np.mean(test_losses_epoch)) if test_losses_epoch else None
                 test_mean_best_by_val = sampled_test_mean
                 curve_test_total = time.perf_counter() - curve_test_start
@@ -4562,7 +4757,13 @@ def run_training(
                         ),
                     )
 
-                _record_epoch_curve(
+                cuda_sync_total = _sync_cuda_for_timing(device)
+                request_plot = (
+                    epoch == start_epoch
+                    or (epoch % curve_plot_request_interval == 0)
+                    or (epoch == config.training.epochs)
+                )
+                curve_record_total = _record_epoch_curve(
                     {
                         "epoch": int(epoch),
                         "train_loss": float(train_loss),
@@ -4571,18 +4772,29 @@ def run_training(
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         **_timing_curve_payload(
                             train_timing=train_timing,
+                            val_timing=val_timing,
+                            test_curve_timing=test_curve_timing,
                             val_eval_s=val_eval_total,
                             val_loss_s=val_loss_total,
                             test_curve_s=curve_test_total,
+                            test_curve_loss_s=test_loss_total,
                             fold_checkpoint_save_s=fold_ckpt_total,
                             group_checkpoint_save_s=group_ckpt_total,
                             scheduler_s=scheduler_total,
                             progress_update_s=progress_update_total,
+                            cuda_sync_s=cuda_sync_total,
+                            gc_s=gc_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(device.type != "cuda" or profile_timing),
                         ),
                     },
+                    request_plot=request_plot,
                 )
+                if profile_timing and curve_record_total > 0.0:
+                    _log_timing(
+                        f"Train {train_years} epoch {epoch} curve_record",
+                        TimingBreakdown(plot_s=curve_record_total, total_s=curve_record_total),
+                    )
 
                 if early_stop_patience > 0 and no_improve_epochs > early_stop_patience:
                     print(
@@ -4592,7 +4804,14 @@ def run_training(
                     )
                     break
 
+        curve_flush_start = time.perf_counter()
         curve_plotter.flush()
+        curve_flush_total = time.perf_counter() - curve_flush_start
+        if profile_timing and curve_flush_total > 0.0:
+            _log_timing(
+                f"Train {train_years} setup.curve_plot_flush",
+                TimingBreakdown(plot_s=curve_flush_total, total_s=curve_flush_total),
+            )
 
         # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
         # the epoch loop does not run; compute validation backtest once for reporting.

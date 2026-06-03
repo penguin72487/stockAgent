@@ -771,8 +771,13 @@ def _vectorized_backtest_torch(
     gross_leverage: float = 1.0,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
+    dense_mask_constraints: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gross_budget = _resolve_exposure_budget(gross_leverage)
+    effective_max_turnover_ratio = float(max_turnover_ratio)
+    max_possible_turnover = 2.0 * gross_budget
+    if effective_max_turnover_ratio >= max_possible_turnover:
+        effective_max_turnover_ratio = 0.0
     prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
         weights,
         tradable_mask,
@@ -781,6 +786,31 @@ def _vectorized_backtest_torch(
         long_only,
         gross_leverage,
     )
+
+    # Fast path: no tradability/side restrictions and no turnover cap.
+    # In this case, each day's realised target equals model target, so we can
+    # compute turnover/returns via pure tensor ops without recurrent scan.
+    use_dense_fast_path = effective_max_turnover_ratio <= 0.0 and bool(dense_mask_constraints)
+    if use_dense_fast_path:
+        returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
+        deltas = torch.empty_like(prepped_weights)
+        deltas[0] = prepped_weights[0]
+        if int(prepped_weights.size(0)) > 1:
+            deltas[1:] = prepped_weights[1:] - prepped_weights[:-1]
+
+        buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
+        sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
+        turnovers = buy_turnovers + sell_turnovers
+        gross_returns = (prepped_weights * returns_t).sum(dim=1)
+        strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+
+        if return_weights_history:
+            weights_history = prepped_weights
+        else:
+            weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+
+        returns_dtype = prepped_weights.dtype
+        return strategy_returns.to(returns_dtype), turnovers.to(returns_dtype), weights_history.to(returns_dtype)
 
     resolved_chunk = (
         int(scan_chunk_size)
@@ -792,7 +822,7 @@ def _vectorized_backtest_torch(
             prepped_buy,
             prepped_sell,
             long_only,
-            max_turnover_ratio,
+            effective_max_turnover_ratio,
             gross_budget,
         )
     )
@@ -801,8 +831,6 @@ def _vectorized_backtest_torch(
     use_cpp_long_short = (
         cpp_long_short_enabled()
         and not long_only
-        and torch.is_grad_enabled()
-        and prepped_weights.requires_grad
         and prepped_weights.device.type == "cuda"
     )
     if use_cpp_long_short:
@@ -815,7 +843,7 @@ def _vectorized_backtest_torch(
                 prepped_sell,
                 buy_fee_rate,
                 sell_fee_rate,
-                max_turnover_ratio,
+                effective_max_turnover_ratio,
                 gross_budget,
             )
             if not return_weights_history:
@@ -837,7 +865,7 @@ def _vectorized_backtest_torch(
         # conflict in backward. Use eager runner for this path to keep training stable.
         runner = _scan_runner_factory(
             long_only=long_only,
-            max_turnover_ratio=max_turnover_ratio,
+            max_turnover_ratio=effective_max_turnover_ratio,
             gross_budget=gross_budget,
             scan_chunk_size=resolved_chunk,
             record_weights_history=return_weights_history,
@@ -846,7 +874,7 @@ def _vectorized_backtest_torch(
         runner = _resolve_scan_runner(
             prepped_weights,
             long_only=long_only,
-            max_turnover_ratio=max_turnover_ratio,
+            max_turnover_ratio=effective_max_turnover_ratio,
             gross_budget=gross_budget,
             scan_chunk_size=resolved_chunk,
             record_weights_history=return_weights_history,
@@ -869,7 +897,7 @@ def _vectorized_backtest_torch(
                 error=e,
                 weights=prepped_weights,
                 long_only=long_only,
-                max_turnover_ratio=max_turnover_ratio,
+                max_turnover_ratio=effective_max_turnover_ratio,
                 gross_budget=gross_budget,
                 scan_chunk_size=resolved_chunk,
                 record_weights_history=return_weights_history,
@@ -982,6 +1010,7 @@ def run_backtest_torch(
     can_sell_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
+    dense_mask_constraints: bool = False,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
@@ -997,6 +1026,7 @@ def run_backtest_torch(
         gross_leverage=gross_leverage,
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
+        dense_mask_constraints=dense_mask_constraints,
     )
 
     return BacktestResultTensor(

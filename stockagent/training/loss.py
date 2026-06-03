@@ -98,9 +98,16 @@ def _fama_macbeth_slope_per_row(scores: Tensor, returns: Tensor, mask: Tensor) -
 
 
 def _stable_negative_tstat(values: Tensor, valid_mask: Tensor | None = None) -> Tensor:
-    if valid_mask is not None:
-        values = values[valid_mask.to(device=values.device, dtype=torch.bool)]
     values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if valid_mask is not None:
+        mask_f = valid_mask.to(device=values.device, dtype=values.dtype)
+        raw_count = mask_f.sum()
+        count = raw_count.clamp_min(1.0)
+        mean = (values * mask_f).sum() / count
+        variance = ((values - mean).pow(2) * mask_f).sum() / count
+        std = torch.sqrt(variance + 1e-8)
+        stat = -(mean / std) * torch.sqrt(count)
+        return torch.where(raw_count > 0.0, stat, values.sum() * 0.0)
     if values.numel() == 0:
         return values.sum() * 0.0
     mean = values.mean()
@@ -130,22 +137,20 @@ def _block_stability_loss(values: Tensor, block_count: int, worst_fraction: floa
 def _regime_stability_loss(values: Tensor, benchmark: Tensor, down_threshold: float, up_threshold: float) -> Tensor:
     values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
     bench = torch.nan_to_num(benchmark.to(device=values.device).float(), nan=0.0, posinf=0.0, neginf=0.0)
-    masks = (
-        bench <= float(down_threshold),
-        (bench > float(down_threshold)) & (bench < float(up_threshold)),
-        bench >= float(up_threshold),
-    )
-    regime_scores: list[Tensor] = []
-    for regime_mask in masks:
-        if bool(regime_mask.any().detach().cpu()):
-            regime_scores.append(values[regime_mask].mean())
-    if len(regime_scores) < 2:
-        return values.sum() * 0.0
-    stacked = torch.stack(regime_scores)
-    mean = stacked.mean()
-    std = torch.sqrt((stacked - mean).pow(2).mean() + 1e-8)
-    worst = stacked.min()
-    return -mean + std + F.softplus(-worst)
+    regime_id = torch.ones_like(bench, dtype=torch.long)
+    regime_id = torch.where(bench <= float(down_threshold), torch.zeros_like(regime_id), regime_id)
+    regime_id = torch.where(bench >= float(up_threshold), torch.full_like(regime_id, 2), regime_id)
+    regime_f = F.one_hot(regime_id, num_classes=3).to(dtype=values.dtype)
+    counts = regime_f.sum(dim=0)
+    means = (regime_f * values.unsqueeze(1)).sum(dim=0) / counts.clamp_min(1.0)
+    present = counts > 0
+    present_f = present.to(dtype=values.dtype)
+    present_count = present_f.sum()
+    mean = (means * present_f).sum() / present_count.clamp_min(1.0)
+    std = torch.sqrt(((means - mean).pow(2) * present_f).sum() / present_count.clamp_min(1.0) + 1e-8)
+    worst = torch.where(present, means, means.new_full(means.shape, float("inf"))).min()
+    loss = -mean + std + F.softplus(-worst)
+    return torch.where(present_count >= 2.0, loss, values.sum() * 0.0)
 
 
 def factor_generalization_loss(
@@ -187,9 +192,8 @@ def factor_generalization_loss(
         valid_rows = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
     else:
         valid_rows = sample_mask.to(device=weights.device, dtype=torch.bool)
-    if not bool(valid_rows.any().detach().cpu()):
-        return weights.sum() * 0.0
-
+    valid_f = valid_rows.to(dtype=returns.dtype)
+    valid_count = valid_f.sum().clamp_min(1.0)
     if benchmark_returns is None:
         tradable_f = tradable.to(dtype=returns.dtype)
         benchmark = (returns * tradable_f).sum(dim=1) / tradable_f.sum(dim=1).clamp_min(1.0)
@@ -255,28 +259,30 @@ def factor_generalization_loss(
         if aug_scores is not None:
             aug_scores_z = _masked_zscore(aug_scores.to(device=weights.device).float(), tradable)
             consistency = 1.0 - _masked_corr_per_row(scores_z, aug_scores_z, tradable)
-            total = total + float(consistency_weight) * consistency[valid_rows].mean()
+            total = total + float(consistency_weight) * (consistency * valid_f).sum() / valid_count
 
     weights_safe = weights.to(dtype=returns.dtype)
     if float(net_exposure_weight) > 0.0:
-        total = total + float(net_exposure_weight) * weights_safe.sum(dim=1).pow(2)[valid_rows].mean()
+        net_exposure = weights_safe.sum(dim=1).pow(2)
+        total = total + float(net_exposure_weight) * (net_exposure * valid_f).sum() / valid_count
     if float(gross_exposure_weight) > 0.0:
         gross = weights_safe.abs().sum(dim=1)
-        total = total + float(gross_exposure_weight) * (gross - float(gross_leverage)).pow(2)[valid_rows].mean()
+        gross_error = (gross - float(gross_leverage)).pow(2)
+        total = total + float(gross_exposure_weight) * (gross_error * valid_f).sum() / valid_count
     if float(concentration_weight) > 0.0:
         tradable_f = tradable.to(dtype=weights_safe.dtype)
         active_count = tradable_f.sum(dim=1).clamp_min(1.0)
         concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count)
-        total = total + float(concentration_weight) * concentration[valid_rows].mean()
+        total = total + float(concentration_weight) * (concentration * valid_f).sum() / valid_count
     if float(turnover_weight) > 0.0 and weights_safe.size(0) > 1:
         turnover_proxy = (weights_safe[1:] - weights_safe[:-1]).abs().sum(dim=1)
         row_mask = valid_rows[1:] & valid_rows[:-1]
-        if bool(row_mask.any().detach().cpu()):
-            total = total + float(turnover_weight) * turnover_proxy[row_mask].mean()
+        row_mask_f = row_mask.to(dtype=turnover_proxy.dtype)
+        total = total + float(turnover_weight) * (turnover_proxy * row_mask_f).sum() / row_mask_f.sum().clamp_min(1.0)
     if float(score_l2_weight) > 0.0:
         score_l2 = (scores_z.pow(2) * tradable.to(dtype=scores_z.dtype)).sum(dim=1)
         denom = tradable.to(dtype=scores_z.dtype).sum(dim=1).clamp_min(1.0)
-        total = total + float(score_l2_weight) * (score_l2 / denom)[valid_rows].mean()
+        total = total + float(score_l2_weight) * ((score_l2 / denom) * valid_f).sum() / valid_count
 
     return total
 

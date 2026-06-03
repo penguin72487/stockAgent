@@ -45,9 +45,9 @@ training:
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   model_name: bottleneck_portfolio_autoencoder
-  enable_torch_compile: false
-  auto_torch_compile_sharpe: false
-  compile_loss: false
+  enable_torch_compile: true
+  auto_torch_compile_sharpe: true
+  compile_loss: true
   warm_start_from_previous_fold: false
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0
@@ -60,11 +60,11 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: true
   lookback: 4
-  batch_size: 128
-  batch_size_train: 64
-  batch_size_eval: 64
-  epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  batch_size: 32
+  batch_size_train: 32
+  batch_size_eval: 32
+  epochs: 10000
+  early_stopping_no_improve_ratio: 1.0
   val_interval_epochs: 1
   curve_test_interval: 1
   curve_plot_interval: 1
@@ -90,7 +90,7 @@ training:
   auto_batch_size: true
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
-  target_vram_fraction: 1
+  target_vram_fraction: 0.9
   mlp:
     hidden_dim: 1024
     hidden_layers: 2
@@ -154,7 +154,7 @@ training:
     dropout: 0.1
     long_short: true
     noise_std: 0.01
-    return_aux: true
+    return_aux: false
   tcn_hybrid_tabular_resnet:
     embedding_dim: 64
     encoder_hidden_dim: 128
