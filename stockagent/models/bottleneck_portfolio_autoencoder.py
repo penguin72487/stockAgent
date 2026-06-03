@@ -250,16 +250,23 @@ class BottleneckPortfolioAutoencoder(nn.Module):
             weights = masked_softmax(masked_scores, mask_bool)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
-        aux = {
-            "encoded": encoded,
-            "z": z,
-            "latent_z": z,
-            "decoded": decoded,
-            "prev_weights": prev_weights,
-        }
         if return_aux is True:
+            aux = {
+                "encoded": encoded,
+                "z": z,
+                "latent_z": z,
+                "decoded": decoded,
+                "prev_weights": prev_weights,
+            }
             return weights, masked_scores, aux
         if return_aux is None and self.return_aux:
+            aux = {
+                "encoded": encoded,
+                "z": z,
+                "latent_z": z,
+                "decoded": decoded,
+                "prev_weights": prev_weights,
+            }
             return {
                 "weights": weights,
                 "scores": masked_scores,

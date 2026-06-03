@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stockagent.backtest.simulator import run_backtest_integer_shares
 from stockagent.data.panel import _compute_tw_limit_masks, _tw_limit_price
@@ -99,7 +103,9 @@ def test_limit_masks_split_reference_price() -> None:
 
 
 def test_no_buy_on_limit_up_day() -> None:
-    weights = np.array([[0.5], [1.0], [1.0]], dtype=np.float32)
+    # With one-symbol long-only backtest, positive weights are normalized to full exposure.
+    # Use 0->1 target transition so day 1 genuinely attempts to buy.
+    weights = np.array([[0.0], [1.0], [1.0]], dtype=np.float32)
     future_returns = np.zeros_like(weights)
     tradable = np.ones_like(weights, dtype=bool)
 
@@ -127,8 +133,9 @@ def test_no_buy_on_limit_up_day() -> None:
     )
 
     shares = _shares_by_date(records, "A")
-    assert shares["2024-01-01"] == 5
-    assert shares["2024-01-02"] == 5, "should not increase shares on limit-up day"
+    assert shares.get("2024-01-01", 0) == 0
+    assert shares.get("2024-01-02", 0) == 0, "should not increase shares on limit-up day"
+    assert shares.get("2024-01-03", 0) == 9, "should buy after limit-up constraint is lifted"
 
 
 def test_no_sell_on_limit_down_day() -> None:
