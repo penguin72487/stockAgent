@@ -1,12 +1,12 @@
-experiment_name: tw-stock-expanding-walkforward
+experiment_name: tw-stock-bottleneck-backtest
 
 runner:
   output_dir: artifacts
   require_cuda: true
   mode: train
   resume: true
-  post_train_infer: true
-  start_fold: 1
+  post_train_infer: false
+  start_fold: 25
 
 environment:
   conda_env: fintech
@@ -17,14 +17,13 @@ environment:
 
 data:
   parquet_root: data_yahoo/tw_stocks
-  # benchmark_name: "BTCUSDTSWAP"
-  benchmark_name: "universe_average"
+  benchmark_name: "2330"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
-  tradable_mode: tradable
+  tradable_mode: tw_limit_guard
 
 walk_forward:
   min_train_years: 1
@@ -45,10 +44,10 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  model_name: tabular_resnet
+  model_name: bottleneck_portfolio_autoencoder
   enable_torch_compile: false
   auto_torch_compile_sharpe: false
-  compile_loss: null
+  compile_loss: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0
@@ -60,27 +59,33 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: true
-  lookback: 1
-  batch_size: 2048
-  batch_size_train: 2048
-  batch_size_eval: 2048
+  lookback: 4
+  batch_size: 128
+  batch_size_train: 64
+  batch_size_eval: 64
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.2
+  early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
-  learning_rate: 0.001
+  curve_test_interval: 1
+  curve_plot_interval: 1
+  curve_plot_async: true
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  learning_rate: 0.0001
   enable_lr_scheduler: false
   lr_scheduler: plateau
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 10
   lr_scheduler_threshold: 0.0005
-  top_k: 20
+  top_k: 10
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
   num_workers: 0
-  weight_decay: 0.00001
-  grad_clip_norm: 1.0
-  loss_type: outperformance_risk_budget
+  weight_decay: 0.001
+  grad_clip_norm: 0.0
+  finite_check_interval_steps: 0
+  loss_type: sortino
   min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
@@ -103,6 +108,53 @@ training:
     hidden_dim: 256
     n_blocks: 4
     dropout: 0.1
+  multi_stock_tcn:
+    hidden_channels: 16
+    embedding_dim: 16
+    tcn_blocks: 4
+    tcn_kernel_size: 3
+    head_hidden_dim: 16
+    head_layers: 1
+    dropout: 0.1
+    tcn_conv_mode: separable
+    conv_layers_per_block: 1
+    norm_type: none
+    sanitize_inputs: false
+  efficient_tcn_tabular_set_portfolio:
+    temporal_enabled: true
+    temporal_dim: 16
+    temporal_hidden_channels: 32
+    temporal_dilations: [1, 2]
+    temporal_kernel_size: 3
+    tabular_dim: 64
+    tabular_hidden_dim: 128
+    tabular_blocks: 2
+    model_dim: 64
+    set_enabled: true
+    num_inducing_points: 16
+    num_heads: 4
+    ffn_mult: 2
+    head_hidden_dim: 64
+    head_layers: 1
+    dropout: 0.1
+    residual_scale: 0.5
+    default_temperature: 1.0
+    portfolio_mode: long_short
+    return_aux: true
+  bottleneck_portfolio_autoencoder:
+    d_model: 64
+    z_dim: 16
+    temporal_type: tcn
+    temporal_layers: 2
+    asset_encoder_type: lite_isab
+    asset_encoder_layers: 1
+    n_heads: 4
+    num_inducing_points: 32
+    ffn_mult: 2
+    dropout: 0.1
+    long_short: true
+    noise_std: 0.01
+    return_aux: true
   tcn_hybrid_tabular_resnet:
     embedding_dim: 64
     encoder_hidden_dim: 128
@@ -118,6 +170,49 @@ training:
     hidden_dim: 256
     n_blocks: 4
     dropout: 0.1
+  cross_sectional_temporal_portfolio_model:
+    candidate_k: 64
+    trade_k: 10
+    scorer: tabular_resnet
+    scorer_hidden: 128
+    scorer_blocks: 2
+    reranker: set_transformer
+    d_model: 128
+    heads: 4
+    layers: 2
+    dropout: 0.15
+    regime_classes: 3
+  multitask_loss:
+    rank_ic_weight: 1.00
+    direction_weight: 0.00
+    volatility_regime_weight: 0.00
+    concentration_weight: 0.00
+    regime_up_threshold: 0.002
+    regime_down_threshold: -0.002
+  factor_generalization_loss:
+    slope_tstat_weight: 1.0
+    rank_ic_weight: 0.5
+    factor_sharpe_weight: 0.25
+    block_stability_weight: 0.20
+    regime_stability_weight: 0.20
+    consistency_weight: 0.05
+    net_exposure_weight: 0.05
+    gross_exposure_weight: 0.02
+    concentration_weight: 0.02
+    turnover_weight: 0.02
+    score_l2_weight: 0.001
+    factor_temperature: 1.0
+    block_count: 4
+    worst_fraction: 0.25
+    augmentation_feature_dropout: 0.10
+    augmentation_stock_dropout: 0.05
+    augmentation_time_dropout: 0.05
+    augmentation_noise_std: 0.01
+  portfolio_autoencoder_loss:
+    cost_rate: 0.001425
+    lambda_turnover: 0.1
+    lambda_concentration: 0.01
+    lambda_latent: 0.001
   lightgbm:
     use_gpu: true
     gpu_device_id: 0
@@ -147,9 +242,11 @@ evaluation:
   metrics:
     - cumulative_return
     - annualized_return
+    - cagr
     - sharpe
     - sortino
     - max_drawdown
+    - calmar
     - turnover
     - excess_return_vs_universe_average
   gamma_sharpe: 1.0
@@ -158,7 +255,7 @@ evaluation:
   cvar_alpha: 0.95
   gamma_drawdown: 0.5
   drawdown_target: 0.2
-  gamma_turnover: 0.0
+  gamma_turnover: 0.005
   gamma_underperformance: 2.0
   excess_target: 0.0
   cvar_budget: 0.03
