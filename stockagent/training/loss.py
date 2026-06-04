@@ -453,84 +453,6 @@ def _compute_risk_ratio(valid_returns: Tensor, objective: str) -> Tensor:
     return mean_return / std_return * annualizer
 
 
-def _fast_portfolio_risk_loss(
-    weights: Tensor,
-    future_log_returns: Tensor,
-    tradable_mask: Tensor,
-    sample_mask: Tensor | None = None,
-    objective: str = "sharpe",
-    buy_fee_rate: float = 0.0,
-    sell_fee_rate: float = 0.0,
-    gamma_sharpe: float = 1.0,
-    gamma_turnover: float = 0.0,
-    concentration_weight: float = 0.0,
-    aux_outputs: dict[str, Tensor] | None = None,
-) -> Tensor:
-    """Vectorized train-time Sharpe/Sortino proxy.
-
-    Validation and final reports still use the full sequential backtest path.
-    This avoids running the expensive backtest kernel inside every training batch
-    for objectives whose core statistic is just a return-series risk ratio.
-    """
-    weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    returns = torch.nan_to_num(
-        future_log_returns.to(device=weights.device, dtype=weights_safe.dtype),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    tradable = tradable_mask.to(device=weights.device, dtype=torch.bool)
-    weights_safe = weights_safe.masked_fill(~tradable, 0.0)
-
-    if sample_mask is None:
-        valid_mask = torch.ones(weights_safe.size(0), device=weights.device, dtype=torch.bool)
-    else:
-        valid_mask = sample_mask.to(device=weights.device, dtype=torch.bool)
-    valid_f = valid_mask.to(dtype=weights_safe.dtype)
-    valid_count = valid_f.sum().clamp_min(1.0)
-
-    prev_weights = None
-    if aux_outputs:
-        prev_weights = aux_outputs.get("prev_weights")
-        nested_aux = aux_outputs.get("aux")
-        if prev_weights is None and isinstance(nested_aux, dict):
-            prev_weights = nested_aux.get("prev_weights")
-    if prev_weights is None:
-        prev_weights = torch.cat([torch.zeros_like(weights_safe[:1]), weights_safe[:-1].detach()], dim=0)
-    else:
-        prev_weights = torch.nan_to_num(
-            prev_weights.to(device=weights.device, dtype=weights_safe.dtype),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-    prev_weights = prev_weights.masked_fill(~tradable, 0.0)
-
-    turnover = (weights_safe - prev_weights).abs().sum(dim=1)
-    fee_rate = 0.5 * (float(buy_fee_rate) + float(sell_fee_rate))
-    portfolio_returns = (weights_safe * returns).sum(dim=1) - fee_rate * turnover
-
-    mean_return = (portfolio_returns * valid_f).sum() / valid_count
-    annualizer = torch.sqrt(torch.as_tensor(252.0, device=weights.device, dtype=weights_safe.dtype))
-    if objective.strip().lower() == "sortino":
-        downside = torch.minimum(portfolio_returns, torch.zeros_like(portfolio_returns))
-        risk_dev = torch.sqrt((downside.pow(2) * valid_f).sum() / valid_count + 1e-8)
-    else:
-        centered = (portfolio_returns - mean_return) * valid_f
-        risk_dev = torch.sqrt(centered.pow(2).sum() / valid_count + 1e-8)
-    risk_ratio = mean_return / risk_dev * annualizer
-
-    objective_value = -float(gamma_sharpe) * risk_ratio
-    if float(gamma_turnover) > 0.0:
-        objective_value = objective_value + float(gamma_turnover) * (turnover * valid_f).sum() / valid_count
-    if float(concentration_weight) > 0.0:
-        tradable_f = tradable.to(dtype=weights_safe.dtype)
-        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-        concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count)
-        objective_value = objective_value + float(concentration_weight) * (concentration * valid_f).sum() / valid_count
-    return objective_value
-
-
 def _compute_excess_risk_terms(
     valid_returns: Tensor,
     valid_benchmark: Tensor,
@@ -670,6 +592,10 @@ def risk_aware_loss(
             regime_down_threshold=regime_down_threshold,
         )
 
+    if objective_norm in {"pure_rank", "rank_only", "score_rank"}:
+        rank_logits = aux_outputs.get("rank_logits") if aux_outputs else weights
+        return float(rank_ic_weight) * masked_ic_loss(rank_logits, returns, tradable)
+
     if objective_norm in {"rank", "rank_ic", "ic", "multitask_rank_ic"}:
         total_loss = returns.new_zeros(())
 
@@ -712,21 +638,6 @@ def risk_aware_loss(
 
         return total_loss
 
-    if objective_norm in {"sharpe", "sortino"}:
-        return _fast_portfolio_risk_loss(
-            weights,
-            returns,
-            tradable,
-            sample_mask=sample_mask,
-            objective=objective_norm,
-            buy_fee_rate=buy_fee_rate,
-            sell_fee_rate=sell_fee_rate,
-            gamma_sharpe=gamma_sharpe,
-            gamma_turnover=gamma_turnover,
-            concentration_weight=concentration_weight,
-            aux_outputs=aux_outputs,
-        )
-
     can_buy = (
         can_buy_mask.to(dtype=torch.bool, device=weights.device)
         if can_buy_mask is not None
@@ -743,6 +654,11 @@ def risk_aware_loss(
             posinf=0.0,
             neginf=0.0,
         )
+    initial_weights = None
+    if aux_outputs:
+        initial_weights = aux_outputs.get("initial_weights")
+        if isinstance(initial_weights, torch.Tensor):
+            initial_weights = initial_weights.detach()
 
     backtest = run_backtest_torch(
         weights,
@@ -757,7 +673,10 @@ def risk_aware_loss(
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
         return_weights_history=False,
+        initial_weights=initial_weights,
     )
+    if aux_outputs is not None and backtest.final_weights is not None:
+        aux_outputs["_final_weights"] = backtest.final_weights.detach()
 
     if sample_mask is None:
         valid_mask = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)

@@ -5,6 +5,8 @@ from stockagent.models.bottleneck_portfolio_autoencoder import BottleneckPortfol
 from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSectionalTemporalPortfolioModel
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
+from stockagent.models.latent_factor_market_token_portfolio import LatentFactorMarketTokenPortfolioModel
+from stockagent.models.low_rank_market_transformer_portfolio import LowRankMarketTransformerPortfolioModel
 from stockagent.models.mlp import CrossSectionalMLP
 from stockagent.models.multi_stock_tcn import CrossSectionalMultiStockTCN
 from stockagent.models.tabular_resnet import CrossSectionalTabularResNet
@@ -18,6 +20,8 @@ __all__ = [
 	"BottleneckPortfolioAutoencoder",
 	"CrossSectionalTemporalPortfolioModel",
 	"EfficientTCNTabularSetPortfolioModel",
+	"LatentFactorMarketTokenPortfolioModel",
+	"LowRankMarketTransformerPortfolioModel",
 	"CrossSectionalFTTransformer",
 	"CrossSectionalMultiStockTCN",
 	"CrossSectionalTabularResNet",

@@ -143,6 +143,53 @@ class EfficientTCNTabularSetPortfolioModelConfig:
 
 
 @dataclass(slots=True)
+class LatentFactorMarketTokenPortfolioModelConfig:
+    temporal_enabled: bool = True
+    temporal_dim: int = 16
+    temporal_hidden_channels: int = 32
+    temporal_dilations: list[int] = field(default_factory=lambda: [1, 2])
+    temporal_kernel_size: int = 3
+    tabular_dim: int = 64
+    tabular_hidden_dim: int = 128
+    tabular_blocks: int = 2
+    stock_embedding_dim: int = 64
+    num_latent_factors: int = 32
+    num_market_tokens: int = 4
+    num_heads: int = 4
+    ffn_mult: int = 2
+    head_hidden_dim: int = 64
+    head_layers: int = 1
+    dropout: float = 0.1
+    residual_scale: float = 0.5
+    default_temperature: float = 1.0
+    portfolio_mode: str = "auto"
+    return_aux: bool = True
+
+
+@dataclass(slots=True)
+class LowRankMarketTransformerPortfolioModelConfig:
+    feature_dim: int = 32
+    temporal_layers: int = 1
+    temporal_heads: int = 2
+    temporal_ffn_dim: int = 64
+    temporal_dropout: float = 0.1
+    temporal_pooling: str = "last"
+    temporal_checkpoint: bool = True
+    stock_embedding_dim: int = 32
+    num_latent_factors: int = 16
+    num_market_tokens: int = 4
+    cross_heads: int = 2
+    cross_ffn_mult: int = 2
+    head_hidden_dim: int = 32
+    head_layers: int = 1
+    dropout: float = 0.1
+    default_temperature: float = 1.0
+    portfolio_mode: str = "auto"
+    return_aux: bool = True
+    return_aux_details: bool = False
+
+
+@dataclass(slots=True)
 class BottleneckPortfolioAutoencoderConfig:
     d_model: int = 128
     z_dim: int = 32
@@ -306,13 +353,19 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
     finite_check_interval_steps: int = 0
-    loss_type: str = "mse"  # "mse", "sharpe", "sortino", "excess_cvar_drawdown", or "outperformance_risk_budget"
+    loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "excess_cvar_drawdown", etc.
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
     tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)
     multi_stock_tcn: MultiStockTCNModelConfig = field(default_factory=MultiStockTCNModelConfig)
     efficient_tcn_tabular_set_portfolio: EfficientTCNTabularSetPortfolioModelConfig = field(
         default_factory=EfficientTCNTabularSetPortfolioModelConfig
+    )
+    latent_factor_market_token_portfolio: LatentFactorMarketTokenPortfolioModelConfig = field(
+        default_factory=LatentFactorMarketTokenPortfolioModelConfig
+    )
+    low_rank_market_transformer_portfolio: LowRankMarketTransformerPortfolioModelConfig = field(
+        default_factory=LowRankMarketTransformerPortfolioModelConfig
     )
     bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(default_factory=BottleneckPortfolioAutoencoderConfig)
     tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
@@ -485,6 +538,49 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     efficient_tcn_tabular_set_portfolio.setdefault("default_temperature", 1.0)
     efficient_tcn_tabular_set_portfolio.setdefault("portfolio_mode", "auto")
     efficient_tcn_tabular_set_portfolio.setdefault("return_aux", True)
+
+    latent_factor_market_token_portfolio = training.setdefault("latent_factor_market_token_portfolio", {})
+    latent_factor_market_token_portfolio.setdefault("temporal_enabled", True)
+    latent_factor_market_token_portfolio.setdefault("temporal_dim", 16)
+    latent_factor_market_token_portfolio.setdefault("temporal_hidden_channels", 32)
+    latent_factor_market_token_portfolio.setdefault("temporal_dilations", [1, 2])
+    latent_factor_market_token_portfolio.setdefault("temporal_kernel_size", 3)
+    latent_factor_market_token_portfolio.setdefault("tabular_dim", 64)
+    latent_factor_market_token_portfolio.setdefault("tabular_hidden_dim", 128)
+    latent_factor_market_token_portfolio.setdefault("tabular_blocks", 2)
+    latent_factor_market_token_portfolio.setdefault("stock_embedding_dim", 64)
+    latent_factor_market_token_portfolio.setdefault("num_latent_factors", 32)
+    latent_factor_market_token_portfolio.setdefault("num_market_tokens", 4)
+    latent_factor_market_token_portfolio.setdefault("num_heads", 4)
+    latent_factor_market_token_portfolio.setdefault("ffn_mult", 2)
+    latent_factor_market_token_portfolio.setdefault("head_hidden_dim", 64)
+    latent_factor_market_token_portfolio.setdefault("head_layers", 1)
+    latent_factor_market_token_portfolio.setdefault("dropout", legacy_dropout)
+    latent_factor_market_token_portfolio.setdefault("residual_scale", 0.5)
+    latent_factor_market_token_portfolio.setdefault("default_temperature", 1.0)
+    latent_factor_market_token_portfolio.setdefault("portfolio_mode", "auto")
+    latent_factor_market_token_portfolio.setdefault("return_aux", True)
+
+    low_rank_market_transformer_portfolio = training.setdefault("low_rank_market_transformer_portfolio", {})
+    low_rank_market_transformer_portfolio.setdefault("feature_dim", 32)
+    low_rank_market_transformer_portfolio.setdefault("temporal_layers", 1)
+    low_rank_market_transformer_portfolio.setdefault("temporal_heads", 2)
+    low_rank_market_transformer_portfolio.setdefault("temporal_ffn_dim", 64)
+    low_rank_market_transformer_portfolio.setdefault("temporal_dropout", legacy_dropout)
+    low_rank_market_transformer_portfolio.setdefault("temporal_pooling", "last")
+    low_rank_market_transformer_portfolio.setdefault("temporal_checkpoint", True)
+    low_rank_market_transformer_portfolio.setdefault("stock_embedding_dim", 32)
+    low_rank_market_transformer_portfolio.setdefault("num_latent_factors", 16)
+    low_rank_market_transformer_portfolio.setdefault("num_market_tokens", 4)
+    low_rank_market_transformer_portfolio.setdefault("cross_heads", 2)
+    low_rank_market_transformer_portfolio.setdefault("cross_ffn_mult", 2)
+    low_rank_market_transformer_portfolio.setdefault("head_hidden_dim", 32)
+    low_rank_market_transformer_portfolio.setdefault("head_layers", 1)
+    low_rank_market_transformer_portfolio.setdefault("dropout", legacy_dropout)
+    low_rank_market_transformer_portfolio.setdefault("default_temperature", 1.0)
+    low_rank_market_transformer_portfolio.setdefault("portfolio_mode", "auto")
+    low_rank_market_transformer_portfolio.setdefault("return_aux", True)
+    low_rank_market_transformer_portfolio.setdefault("return_aux_details", False)
 
     bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
     bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
@@ -763,6 +859,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
             multi_stock_tcn=MultiStockTCNModelConfig(**training_raw["multi_stock_tcn"]),
             efficient_tcn_tabular_set_portfolio=EfficientTCNTabularSetPortfolioModelConfig(
                 **training_raw["efficient_tcn_tabular_set_portfolio"]
+            ),
+            latent_factor_market_token_portfolio=LatentFactorMarketTokenPortfolioModelConfig(
+                **training_raw["latent_factor_market_token_portfolio"]
+            ),
+            low_rank_market_transformer_portfolio=LowRankMarketTransformerPortfolioModelConfig(
+                **training_raw["low_rank_market_transformer_portfolio"]
             ),
             bottleneck_portfolio_autoencoder=BottleneckPortfolioAutoencoderConfig(
                 **training_raw["bottleneck_portfolio_autoencoder"]
