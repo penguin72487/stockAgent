@@ -365,6 +365,14 @@ def _resolve_scan_runner(
     if not _compile_enabled() or weights.device.type != "cuda" or not hasattr(torch, "compile"):
         return base_runner
 
+    # If we're currently being traced by an outer torch.compile (e.g. the compiled
+    # risk_aware_loss), skip creating a nested compiled runner.  The outer compiler
+    # will inline the scan loop into its own unified CUDA graph, which avoids the
+    # "tensor output of CUDAGraphs overwritten by subsequent run" error that arises
+    # when two reduce-overhead / CUDA-graph compiled functions are nested at runtime.
+    if hasattr(torch, "_dynamo") and torch._dynamo.is_compiling():
+        return base_runner
+
     key = _scan_compile_key(
         weights,
         long_only,
@@ -469,6 +477,7 @@ class BacktestResultTensor:
     benchmark_returns: torch.Tensor  # [T]
     turnovers: torch.Tensor          # [T]
     weights_history: torch.Tensor    # [T, S], may be empty when caller disables history recording.
+    final_weights: torch.Tensor | None = None  # [S], realised weights after the final simulated day.
 
     def to_numpy(self) -> BacktestResult:
         return BacktestResult(
@@ -772,7 +781,8 @@ def _vectorized_backtest_torch(
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    initial_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gross_budget = _resolve_exposure_budget(gross_leverage)
     effective_max_turnover_ratio = float(max_turnover_ratio)
     max_possible_turnover = 2.0 * gross_budget
@@ -786,6 +796,16 @@ def _vectorized_backtest_torch(
         long_only,
         gross_leverage,
     )
+    prev_init = (
+        torch.nan_to_num(
+            initial_weights.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if initial_weights is not None
+        else torch.zeros_like(prepped_weights[0])
+    )
 
     # Fast path: no tradability/side restrictions and no turnover cap.
     # In this case, each day's realised target equals model target, so we can
@@ -794,7 +814,7 @@ def _vectorized_backtest_torch(
     if use_dense_fast_path:
         returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
         deltas = torch.empty_like(prepped_weights)
-        deltas[0] = prepped_weights[0]
+        deltas[0] = prepped_weights[0] - prev_init
         if int(prepped_weights.size(0)) > 1:
             deltas[1:] = prepped_weights[1:] - prepped_weights[:-1]
 
@@ -810,7 +830,12 @@ def _vectorized_backtest_torch(
             weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
 
         returns_dtype = prepped_weights.dtype
-        return strategy_returns.to(returns_dtype), turnovers.to(returns_dtype), weights_history.to(returns_dtype)
+        return (
+            strategy_returns.to(returns_dtype),
+            turnovers.to(returns_dtype),
+            weights_history.to(returns_dtype),
+            prepped_weights[-1].to(returns_dtype),
+        )
 
     resolved_chunk = (
         int(scan_chunk_size)
@@ -826,12 +851,11 @@ def _vectorized_backtest_torch(
             gross_budget,
         )
     )
-    prev_init = torch.zeros_like(prepped_weights[0])
-
     use_cpp_long_short = (
         cpp_long_short_enabled()
         and not long_only
         and prepped_weights.device.type == "cuda"
+        and initial_weights is None
     )
     if use_cpp_long_short:
         try:
@@ -846,9 +870,10 @@ def _vectorized_backtest_torch(
                 effective_max_turnover_ratio,
                 gross_budget,
             )
+            final_weights = weights_history[-1]
             if not return_weights_history:
                 weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
-            return strategy_returns, turnovers, weights_history
+            return strategy_returns, turnovers, weights_history, final_weights
         except Exception as e:
             if _compile_verbose():
                 print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
@@ -882,7 +907,7 @@ def _vectorized_backtest_torch(
 
     if not use_checkpoint:
         try:
-            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, _ = runner(
+            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
                 prepped_weights,
                 future_returns,
                 prepped_tradable,
@@ -902,7 +927,7 @@ def _vectorized_backtest_torch(
                 scan_chunk_size=resolved_chunk,
                 record_weights_history=return_weights_history,
             )
-            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, _ = runner(
+            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
                 prepped_weights,
                 future_returns,
                 prepped_tradable,
@@ -955,10 +980,16 @@ def _vectorized_backtest_torch(
             weights_history = torch.cat(weights_chunks, dim=0)
         else:
             weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+        final_weights = prev
 
     returns_dtype = prepped_weights.dtype
     strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
-    return strategy_returns.to(returns_dtype), turnovers.to(returns_dtype), weights_history.to(returns_dtype)
+    return (
+        strategy_returns.to(returns_dtype),
+        turnovers.to(returns_dtype),
+        weights_history.to(returns_dtype),
+        final_weights.to(returns_dtype),
+    )
 
 
 def run_backtest(
@@ -1011,9 +1042,10 @@ def run_backtest_torch(
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
+    initial_weights: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
-    strategy_returns, turnovers, weights_history = _vectorized_backtest_torch(
+    strategy_returns, turnovers, weights_history, final_weights = _vectorized_backtest_torch(
         weights,
         future_returns,
         tradable_mask,
@@ -1027,13 +1059,15 @@ def run_backtest_torch(
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
         dense_mask_constraints=dense_mask_constraints,
+        initial_weights=initial_weights,
     )
 
     return BacktestResultTensor(
         strategy_returns=strategy_returns,
-        benchmark_returns=benchmark_returns.to(device=weights_history.device, dtype=weights_history.dtype),
+        benchmark_returns=benchmark_returns.to(device=strategy_returns.device, dtype=strategy_returns.dtype),
         turnovers=turnovers,
         weights_history=weights_history,
+        final_weights=final_weights,
     )
 
 

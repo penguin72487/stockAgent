@@ -97,6 +97,8 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     train_loss = _to_float_array(rows, "train_loss")
     val_mean = _to_float_array(rows, "val_mean")
     test_mean = _to_float_array(rows, "test_mean")
+    all_loss_values = np.concatenate([train_loss, val_mean, test_mean])
+    finite_loss_values = all_loss_values[np.isfinite(all_loss_values)]
 
     fig, ax = plt.subplots(figsize=(12, 6), dpi=130)
     ax.plot(epochs, train_loss, marker="o", linewidth=1.8, markersize=4, label="train_loss")
@@ -104,7 +106,14 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     ax.plot(epochs, test_mean, marker="^", linewidth=1.8, markersize=4, label="test_mean")
     ax.set_title(f"Loss Curves (sample every {max(1, int(interval))} epochs)")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
+    if finite_loss_values.size == 0:
+        ax.set_ylabel("Loss")
+    elif np.any(finite_loss_values <= 0.0):
+        ax.set_ylabel("Loss (symlog)")
+        ax.set_yscale("symlog", linthresh=1e-3)
+    else:
+        ax.set_ylabel("Loss")
+        ax.set_yscale("log")
     ax.grid(True, alpha=0.25)
     ax.legend()
 
@@ -163,6 +172,7 @@ def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, in
         ("scheduler_s", "scheduler"),
         ("progress_update_s", "progress"),
         ("curve_record_s", "curve record"),
+        ("scalar_sync_s", "scalar sync"),
         ("cuda_sync_s", "cuda sync"),
         ("gc_s", "gc"),
         ("epoch_unattributed_s", "other"),

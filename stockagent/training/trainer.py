@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 import torch
@@ -61,6 +61,7 @@ class FoldResult:
     val_metrics: dict[str, float]
     test_ic: dict[str, float]
     test_metrics: dict[str, float]
+    test_integer_metrics: dict[str, float] | None = None
 
 
 @dataclass(slots=True)
@@ -180,6 +181,52 @@ def _maybe_cudagraph_step_begin() -> None:
         marker()
     except Exception:
         return
+
+
+def _detach_portfolio_state(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.detach().clone(memory_format=torch.contiguous_format)
+
+
+def _is_cudagraph_overwrite_error(exc: RuntimeError) -> bool:
+    msg = str(exc)
+    return "tensor output of CUDAGraphs that has been overwritten" in msg
+
+
+class _CompiledLossFallback:
+    def __init__(
+        self,
+        compiled_fn: Callable[..., torch.Tensor],
+        eager_fn: Callable[..., torch.Tensor],
+        *,
+        label: str,
+    ) -> None:
+        self._compiled_fn = compiled_fn
+        self._eager_fn = eager_fn
+        self._label = label
+        self._disabled = False
+        self._warned = False
+
+    def __call__(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if self._disabled:
+            return self._eager_fn(*args, **kwargs)
+        try:
+            return self._compiled_fn(*args, **kwargs)
+        except RuntimeError as exc:
+            if not _is_cudagraph_overwrite_error(exc):
+                raise
+            self._disabled = True
+            if not self._warned:
+                print(
+                    f"[{self._label}] torch.compile loss hit CUDA Graph state overwrite; "
+                    "falling back to eager tensor loss for this fold"
+                )
+                self._warned = True
+            aux_outputs = kwargs.get("aux_outputs")
+            if isinstance(aux_outputs, dict):
+                aux_outputs.pop("_final_weights", None)
+            return self._eager_fn(*args, **kwargs)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -443,6 +490,182 @@ def _loss_from_backtest_series(
     return objective_value + gamma_turnover * turnover_penalty
 
 
+def _is_return_series_objective(objective: str) -> bool:
+    return objective.strip().lower() in {
+        "sharpe",
+        "sortino",
+        "excess_cvar_drawdown",
+        "cvar",
+        "cvar_drawdown",
+        "excess_cvar",
+        "outperformance_risk_budget",
+        "outperformance_budget",
+        "outperformance_first",
+    }
+
+
+def _loss_from_backtest_result(
+    backtest: BacktestResultTensor,
+    config: ExperimentConfig,
+    objective: str,
+) -> torch.Tensor:
+    return _loss_from_backtest_series(
+        backtest.strategy_returns,
+        backtest.benchmark_returns,
+        backtest.turnovers,
+        gamma_sharpe=config.evaluation.gamma_sharpe,
+        gamma_excess=config.evaluation.gamma_excess,
+        gamma_cvar=config.evaluation.gamma_cvar,
+        cvar_alpha=config.evaluation.cvar_alpha,
+        gamma_drawdown=config.evaluation.gamma_drawdown,
+        drawdown_target=config.evaluation.drawdown_target,
+        gamma_turnover=config.evaluation.gamma_turnover,
+        gamma_underperformance=config.evaluation.gamma_underperformance,
+        excess_target=config.evaluation.excess_target,
+        cvar_budget=config.evaluation.cvar_budget,
+        drawdown_budget=config.evaluation.drawdown_budget,
+        turnover_budget=config.evaluation.turnover_budget,
+        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+        objective=objective,
+    )
+
+
+def _evaluated_backtest_loss(
+    backtest: BacktestResultTensor,
+    future_log_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    benchmark_returns: torch.Tensor,
+    config: ExperimentConfig,
+    objective: str,
+) -> torch.Tensor:
+    if _is_return_series_objective(objective):
+        return _loss_from_backtest_result(backtest, config, objective)
+    return risk_aware_loss(
+        backtest.weights_history,
+        future_log_returns,
+        tradable_mask,
+        benchmark_returns=benchmark_returns,
+        can_buy_mask=can_buy_mask,
+        can_sell_mask=can_sell_mask,
+        long_only=config.trading.long_only,
+        buy_fee_rate=config.trading.buy_fee_rate,
+        sell_fee_rate=config.trading.sell_fee_rate,
+        max_turnover_ratio=config.trading.max_turnover_ratio,
+        gross_leverage=config.trading.gross_leverage,
+        gamma_sharpe=config.evaluation.gamma_sharpe,
+        gamma_excess=config.evaluation.gamma_excess,
+        gamma_cvar=config.evaluation.gamma_cvar,
+        cvar_alpha=config.evaluation.cvar_alpha,
+        gamma_drawdown=config.evaluation.gamma_drawdown,
+        drawdown_target=config.evaluation.drawdown_target,
+        gamma_turnover=config.evaluation.gamma_turnover,
+        gamma_underperformance=config.evaluation.gamma_underperformance,
+        excess_target=config.evaluation.excess_target,
+        cvar_budget=config.evaluation.cvar_budget,
+        drawdown_budget=config.evaluation.drawdown_budget,
+        turnover_budget=config.evaluation.turnover_budget,
+        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+        objective=objective,
+    )
+
+
+def _batched_loss_from_backtest_segments(
+    strategy_returns: torch.Tensor,
+    benchmark_returns: torch.Tensor,
+    turnovers: torch.Tensor,
+    offsets: Sequence[int],
+    gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
+    gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
+    objective: str = "sharpe",
+) -> torch.Tensor:
+    """Compute one validation/test loss per fold without per-fold CPU round trips."""
+    segment_count = max(0, len(offsets) - 1)
+    if segment_count <= 0:
+        return strategy_returns.new_empty((0,), dtype=torch.float32)
+
+    objective_norm = objective.strip().lower()
+    if objective_norm not in {"sharpe", "sortino"}:
+        losses = [
+            _loss_from_backtest_series(
+                strategy_returns[int(offsets[idx]) : int(offsets[idx + 1])],
+                benchmark_returns[int(offsets[idx]) : int(offsets[idx + 1])],
+                turnovers[int(offsets[idx]) : int(offsets[idx + 1])],
+                gamma_sharpe=gamma_sharpe,
+                gamma_excess=gamma_excess,
+                gamma_cvar=gamma_cvar,
+                cvar_alpha=cvar_alpha,
+                gamma_drawdown=gamma_drawdown,
+                drawdown_target=drawdown_target,
+                gamma_turnover=gamma_turnover,
+                gamma_underperformance=gamma_underperformance,
+                excess_target=excess_target,
+                cvar_budget=cvar_budget,
+                drawdown_budget=drawdown_budget,
+                turnover_budget=turnover_budget,
+                gamma_cvar_budget=gamma_cvar_budget,
+                gamma_drawdown_budget=gamma_drawdown_budget,
+                gamma_turnover_budget=gamma_turnover_budget,
+                objective=objective,
+            )
+            for idx in range(segment_count)
+        ]
+        return torch.stack(losses) if losses else strategy_returns.new_empty((0,), dtype=torch.float32)
+
+    lengths_py = [
+        max(0, int(offsets[idx + 1]) - int(offsets[idx]))
+        for idx in range(segment_count)
+    ]
+    max_len = max(lengths_py, default=0)
+    if max_len <= 0:
+        return strategy_returns.new_zeros((segment_count,), dtype=torch.float32)
+
+    device = strategy_returns.device
+    calc_dtype = torch.float32 if strategy_returns.dtype in {torch.float16, torch.bfloat16} else strategy_returns.dtype
+    starts = torch.as_tensor([int(value) for value in offsets[:-1]], device=device, dtype=torch.long)
+    lengths = torch.as_tensor(lengths_py, device=device, dtype=torch.long)
+    rows = torch.arange(max_len, device=device, dtype=torch.long)
+    valid = rows.unsqueeze(0) < lengths.unsqueeze(1)
+    gather_idx = (starts.unsqueeze(1) + rows.unsqueeze(0)).clamp_max(max(0, int(strategy_returns.numel()) - 1))
+
+    valid_f = valid.to(dtype=calc_dtype)
+    count = lengths.to(dtype=calc_dtype).clamp_min(1.0)
+    r = torch.nan_to_num(strategy_returns[gather_idx].to(dtype=calc_dtype), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
+    mean_return = r.sum(dim=1) / count
+    annualizer = torch.sqrt(torch.as_tensor(252.0, device=device, dtype=calc_dtype))
+
+    if objective_norm == "sortino":
+        downside = torch.minimum(r, torch.zeros_like(r))
+        risk_dev = torch.sqrt(downside.pow(2).sum(dim=1) / count + 1e-8)
+    else:
+        centered = (r - mean_return.unsqueeze(1)) * valid_f
+        risk_dev = torch.sqrt(centered.pow(2).sum(dim=1) / count + 1e-8)
+    objective_value = -float(gamma_sharpe) * (mean_return / risk_dev * annualizer)
+
+    if float(gamma_turnover) != 0.0:
+        t = torch.nan_to_num(turnovers[gather_idx].to(dtype=calc_dtype), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
+        objective_value = objective_value + float(gamma_turnover) * (t.sum(dim=1) / count)
+    return torch.where(lengths > 0, objective_value, objective_value.new_zeros(()))
+
+
 def _normalize_risk_objective(loss_type: str) -> str:
     objective = str(loss_type).strip().lower()
     if objective in {
@@ -452,6 +675,9 @@ def _normalize_risk_objective(loss_type: str) -> str:
         "rank_ic",
         "ic",
         "multitask_rank_ic",
+        "pure_rank",
+        "rank_only",
+        "score_rank",
         "excess_cvar_drawdown",
         "cvar",
         "cvar_drawdown",
@@ -473,6 +699,8 @@ def _normalize_risk_objective(loss_type: str) -> str:
             return "factor_generalization"
         if objective in {"rank", "ic", "multitask_rank_ic"}:
             return "rank_ic"
+        if objective in {"rank_only", "score_rank"}:
+            return "pure_rank"
         if objective in {"cvar", "cvar_drawdown", "excess_cvar"}:
             return "excess_cvar_drawdown"
         if objective in {"outperformance_budget", "outperformance_first"}:
@@ -625,7 +853,7 @@ def _evaluate_rank_ic_multitask_loss(
 
 
 def _objective_metric_key(objective: str) -> str:
-    if objective == "rank_ic":
+    if objective in {"rank_ic", "pure_rank"}:
         return "rank_ic"
     if objective == "factor_generalization":
         return "factor_generalization"
@@ -756,6 +984,10 @@ def _model_path(fold_dir: Path) -> Path:
 
 def _backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "test_backtest.npz"
+
+
+def _integer_backtest_path(fold_dir: Path) -> Path:
+    return fold_dir / "test_integer_share_backtest.npz"
 
 
 def _group_key(train_years: list[int]) -> tuple[int, ...]:
@@ -926,6 +1158,7 @@ def _timing_curve_payload(
     scheduler_s: float = 0.0,
     progress_update_s: float = 0.0,
     curve_record_s: float = 0.0,
+    scalar_sync_s: float = 0.0,
     cuda_sync_s: float = 0.0,
     gc_s: float = 0.0,
     epoch_wall_s: float | None = None,
@@ -953,6 +1186,7 @@ def _timing_curve_payload(
         + float(scheduler_s)
         + float(progress_update_s)
         + float(curve_record_s)
+        + float(scalar_sync_s)
         + float(cuda_sync_s)
         + float(gc_s)
     )
@@ -1001,6 +1235,7 @@ def _timing_curve_payload(
         "scheduler_s": float(scheduler_s),
         "progress_update_s": float(progress_update_s),
         "curve_record_s": float(curve_record_s),
+        "scalar_sync_s": float(scalar_sync_s),
         "cuda_sync_s": float(cuda_sync_s),
         "gc_s": float(gc_s),
         "epoch_wall_s": epoch_total_s,
@@ -1298,6 +1533,32 @@ def _save_daily_weights_csv(
     df.to_csv(output_path, index=False)
 
 
+def _save_integer_share_audit_artifacts(
+    fold_dir: Path,
+    result: BacktestResult,
+    dates: np.ndarray,
+    symbols: list[str],
+    holdings: list[HoldingsRecord],
+) -> None:
+    _save_backtest_artifact(_integer_backtest_path(fold_dir), result, dates)
+    _save_daily_portfolio_returns_csv(
+        fold_dir / "integer_share_daily_portfolio_returns.csv",
+        dates,
+        result.strategy_returns,
+        result.benchmark_returns,
+        result.turnovers,
+    )
+    _save_daily_weights_csv(
+        fold_dir / "integer_share_daily_weights.csv",
+        dates,
+        symbols,
+        result.weights_history,
+    )
+    with (fold_dir / "integer_share_annual_report.txt").open("w", encoding="utf-8") as f:
+        f.write(generate_annual_report(result, dates))
+    _save_holdings_csv(fold_dir / "holdings.csv", holdings)
+
+
 def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarray]:
     data = np.load(output_path)
     result = BacktestResult(
@@ -1510,6 +1771,7 @@ def _evaluate_tensor_batch(
     profile_timing: bool = False,
     progress_label: str | None = None,
     timing_out: TimingBreakdown | None = None,
+    reset_at_rows: Sequence[int] | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     weights_chunks: list[torch.Tensor] = []
@@ -1522,6 +1784,8 @@ def _evaluate_tensor_batch(
     sumsq_r_t = torch.zeros((), device=device, dtype=torch.float64)
     sum_b_t = torch.zeros((), device=device, dtype=torch.float64)
     sumsq_b_t = torch.zeros((), device=device, dtype=torch.float64)
+    sum_downside_sq_r_t = torch.zeros((), device=device, dtype=torch.float64)
+    sum_downside_sq_b_t = torch.zeros((), device=device, dtype=torch.float64)
     sum_turnover_t = torch.zeros((), device=device, dtype=torch.float64)
     hit_count_t = torch.zeros((), device=device, dtype=torch.float64)
 
@@ -1537,13 +1801,27 @@ def _evaluate_tensor_batch(
 
     timing = TimingBreakdown()
     overall_start = time.perf_counter()
-    total_chunks = int(max(1, (int(x.size(0)) + int(chunk_rows) - 1) // int(chunk_rows)))
+    total_rows_for_eval = int(x.size(0))
+    reset_points = {0, total_rows_for_eval}
+    if reset_at_rows is not None:
+        reset_points.update(int(value) for value in reset_at_rows if 0 <= int(value) <= total_rows_for_eval)
+    reset_points_sorted = sorted(reset_points)
+    eval_ranges: list[tuple[int, int, bool]] = []
+    for segment_start, segment_end in zip(reset_points_sorted[:-1], reset_points_sorted[1:]):
+        if segment_end <= segment_start:
+            continue
+        for start in range(segment_start, segment_end, chunk_rows):
+            end = min(start + chunk_rows, segment_end)
+            eval_ranges.append((start, end, start == segment_start))
+    total_chunks = max(1, len(eval_ranges))
     if progress_label:
         _progress(f"{progress_label}: start eval rows={int(x.size(0))} chunk_rows={int(chunk_rows)} chunks={total_chunks}")
 
     with torch.inference_mode():
-        for chunk_idx, start in enumerate(range(0, x.size(0), chunk_rows), start=1):
-            end = min(start + chunk_rows, x.size(0))
+        prev_weights: torch.Tensor | None = None
+        for chunk_idx, (start, end, reset_state) in enumerate(eval_ranges, start=1):
+            if reset_state:
+                prev_weights = None
             _maybe_cudagraph_step_begin()
             if progress_label:
                 _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} transfer rows=[{start},{end})")
@@ -1584,7 +1862,9 @@ def _evaluate_tensor_batch(
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
+                initial_weights=prev_weights,
             )
+            prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_s += time.perf_counter() - backtest_start
 
@@ -1597,10 +1877,10 @@ def _evaluate_tensor_batch(
                 timing.ic_s += time.perf_counter() - ic_start
 
             if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history.clone())
-            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
-            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
-            turnover_chunks.append(backtest_chunk.turnovers.clone())
+                weights_chunks.append(backtest_chunk.weights_history)
+            strategy_chunks.append(backtest_chunk.strategy_returns)
+            benchmark_chunks.append(backtest_chunk.benchmark_returns)
+            turnover_chunks.append(backtest_chunk.turnovers)
 
             if compute_metrics_summary:
                 metrics_start = time.perf_counter()
@@ -1613,6 +1893,8 @@ def _evaluate_tensor_batch(
                 sumsq_r_t = sumsq_r_t + (r * r).sum()
                 sum_b_t = sum_b_t + b.sum()
                 sumsq_b_t = sumsq_b_t + (b * b).sum()
+                sum_downside_sq_r_t = sum_downside_sq_r_t + torch.minimum(r, torch.zeros_like(r)).pow(2).sum()
+                sum_downside_sq_b_t = sum_downside_sq_b_t + torch.minimum(b, torch.zeros_like(b)).pow(2).sum()
                 sum_turnover_t = sum_turnover_t + t.sum()
                 hit_count_t = hit_count_t + (r > 0).to(torch.float64).sum()
 
@@ -1666,9 +1948,13 @@ def _evaluate_tensor_batch(
             metrics = {
                 "cumulative_return": 0.0,
                 "annualized_return": 0.0,
+                "cagr": 0.0,
                 "sharpe": 0.0,
                 "baseline_sharpe": 0.0,
+                "sortino": 0.0,
+                "baseline_sortino": 0.0,
                 "max_drawdown": 0.0,
+                "calmar": 0.0,
                 "turnover": 0.0,
                 "daily_hit_rate": 0.0,
                 "excess_return_vs_universe_average": 0.0,
@@ -1680,6 +1966,8 @@ def _evaluate_tensor_batch(
                 sumsq_r,
                 sum_b,
                 sumsq_b,
+                sum_downside_sq_r,
+                sum_downside_sq_b,
                 sum_turnover,
                 hit_count,
                 min_dd_value,
@@ -1689,6 +1977,8 @@ def _evaluate_tensor_batch(
                     sumsq_r_t,
                     sum_b_t,
                     sumsq_b_t,
+                    sum_downside_sq_r_t,
+                    sum_downside_sq_b_t,
                     sum_turnover_t,
                     hit_count_t,
                     min_dd,
@@ -1706,13 +1996,22 @@ def _evaluate_tensor_batch(
             ann_r = float(math.expm1(mean_r * 252.0))
             sharpe = float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0
             baseline_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
+            downside_dev = float((sum_downside_sq_r / n) ** 0.5)
+            downside_dev_b = float((sum_downside_sq_b / n) ** 0.5)
+            sortino = float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0
+            baseline_sortino = float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+            calmar = ann_r / abs(float(min_dd_value)) if float(min_dd_value) < 0.0 else 0.0
 
             metrics = {
                 "cumulative_return": cum_r,
                 "annualized_return": ann_r,
+                "cagr": ann_r,
                 "sharpe": sharpe,
                 "baseline_sharpe": baseline_sharpe,
+                "sortino": sortino,
+                "baseline_sortino": baseline_sortino,
                 "max_drawdown": float(min_dd_value),
+                "calmar": calmar,
                 "turnover": sum_turnover / n,
                 "daily_hit_rate": hit_count / n,
                 "excess_return_vs_universe_average": cum_r - cum_b,
@@ -1721,22 +2020,25 @@ def _evaluate_tensor_batch(
         timing.metrics_s += time.perf_counter() - metrics_start
 
         ic_summary_start = time.perf_counter()
-        ic_count, ic_sum, ic_sumsq, ic_pos = torch.stack(
-            [ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t]
-        ).detach().cpu().tolist()
-        if ic_count <= 0:
-            ic = {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
+        if not compute_ic:
+            ic = {}
         else:
-            ic_n = float(ic_count)
-            ic_mean = ic_sum / ic_n
-            ic_var = max(0.0, ic_sumsq / ic_n - ic_mean * ic_mean)
-            ic_std = (ic_var ** 0.5) + 1e-8
-            ic = {
-                "ic_mean": ic_mean,
-                "ic_std": ic_std,
-                "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
-                "ic_positive_ratio": ic_pos / ic_n,
-            }
+            ic_count, ic_sum, ic_sumsq, ic_pos = torch.stack(
+                [ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t]
+            ).detach().cpu().tolist()
+            if ic_count <= 0:
+                ic = {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
+            else:
+                ic_n = float(ic_count)
+                ic_mean = ic_sum / ic_n
+                ic_var = max(0.0, ic_sumsq / ic_n - ic_mean * ic_mean)
+                ic_std = (ic_var ** 0.5) + 1e-8
+                ic = {
+                    "ic_mean": ic_mean,
+                    "ic_std": ic_std,
+                    "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
+                    "ic_positive_ratio": ic_pos / ic_n,
+                }
         timing.ic_s += time.perf_counter() - ic_summary_start
     timing.total_s = time.perf_counter() - overall_start
     timing.batches = int(max(1, (x.size(0) + chunk_rows - 1) // chunk_rows))
@@ -2424,10 +2726,12 @@ def _train_epoch(
     factor_aug_kwargs: dict[str, float] | None = None,
     profile_timing: bool = False,
     progress_label: str | None = None,
-) -> tuple[float, TimingBreakdown]:
+) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
+    sequential_return_objective = _is_return_series_objective(objective)
+    portfolio_prev_weights: torch.Tensor | None = None
 
     timing = TimingBreakdown()
     total_start = time.perf_counter()
@@ -2479,6 +2783,10 @@ def _train_epoch(
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
+            if sequential_return_objective:
+                aux_outputs = dict(aux_outputs or {})
+                aux_outputs["initial_weights"] = portfolio_prev_weights
+
             loss_start = time.perf_counter()
             loss = loss_fn(
                 weights,
@@ -2529,6 +2837,10 @@ def _train_epoch(
                     _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite loss")
                 optimizer.zero_grad(set_to_none=True)
                 continue
+        if sequential_return_objective and aux_outputs is not None:
+            next_prev = aux_outputs.get("_final_weights")
+            if next_prev is not None:
+                portfolio_prev_weights = _detach_portfolio_state(next_prev)
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -2625,8 +2937,8 @@ def _train_epoch(
     if progress_label:
         _progress(f"{progress_label}: train epoch done steps={steps} total={timing.total_s:.1f}s")
     if steps == 0:
-        return 0.0, timing
-    mean_loss = float((total_loss_t / steps).detach().cpu())
+        return total_loss_t.detach(), timing
+    mean_loss = (total_loss_t / steps).detach()
     return mean_loss, timing
 
 
@@ -2678,14 +2990,16 @@ def _train_epoch_tensor(
     factor_aug_kwargs: dict[str, float] | None = None,
     profile_timing: bool = False,
     progress_label: str | None = None,
-) -> tuple[float, TimingBreakdown]:
+) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     total_rows = int(x.size(0))
     if total_rows == 0:
-        return 0.0, TimingBreakdown()
+        return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
 
     num_batches = total_rows // batch_size
-    batch_order = torch.randperm(num_batches).tolist()
+    sequential_return_objective = _is_return_series_objective(objective)
+    batch_order = list(range(num_batches)) if sequential_return_objective else torch.randperm(num_batches).tolist()
+    portfolio_prev_weights: torch.Tensor | None = None
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
     timing = TimingBreakdown()
@@ -2741,6 +3055,10 @@ def _train_epoch_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
+            if sequential_return_objective:
+                aux_outputs = dict(aux_outputs or {})
+                aux_outputs["initial_weights"] = portfolio_prev_weights
+
             loss_start = time.perf_counter()
             loss = loss_fn(
                 weights,
@@ -2791,6 +3109,10 @@ def _train_epoch_tensor(
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite loss")
                 optimizer.zero_grad(set_to_none=True)
                 continue
+        if sequential_return_objective and aux_outputs is not None:
+            next_prev = aux_outputs.get("_final_weights")
+            if next_prev is not None:
+                portfolio_prev_weights = _detach_portfolio_state(next_prev)
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -2887,8 +3209,8 @@ def _train_epoch_tensor(
     if progress_label:
         _progress(f"{progress_label}: train epoch done steps={steps} total={timing.total_s:.1f}s")
     if steps == 0:
-        return 0.0, timing
-    mean_loss = float((total_loss_t / steps).detach().cpu())
+        return total_loss_t.detach(), timing
+    mean_loss = (total_loss_t / steps).detach()
     return mean_loss, timing
 
 
@@ -3050,34 +3372,15 @@ def _run_training_tree_models(
                 chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
             )
             val_loss = float(
-                risk_aware_loss(
-                    val_bt_t.weights_history,
+                _evaluated_backtest_loss(
+                    val_bt_t,
                     val_returns,
                     val_masks,
-                    benchmark_returns=val_bench,
-                    can_buy_mask=val_buy_masks,
-                    can_sell_mask=val_sell_masks,
-                    long_only=config.trading.long_only,
-                    buy_fee_rate=config.trading.buy_fee_rate,
-                    sell_fee_rate=config.trading.sell_fee_rate,
-                    max_turnover_ratio=config.trading.max_turnover_ratio,
-                    gross_leverage=config.trading.gross_leverage,
-                    gamma_sharpe=config.evaluation.gamma_sharpe,
-                    gamma_excess=config.evaluation.gamma_excess,
-                    gamma_cvar=config.evaluation.gamma_cvar,
-                    cvar_alpha=config.evaluation.cvar_alpha,
-                    gamma_drawdown=config.evaluation.gamma_drawdown,
-                    drawdown_target=config.evaluation.drawdown_target,
-                    gamma_turnover=config.evaluation.gamma_turnover,
-                    gamma_underperformance=config.evaluation.gamma_underperformance,
-                    excess_target=config.evaluation.excess_target,
-                    cvar_budget=config.evaluation.cvar_budget,
-                    drawdown_budget=config.evaluation.drawdown_budget,
-                    turnover_budget=config.evaluation.turnover_budget,
-                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                    objective=loss_objective,
+                    val_buy_masks,
+                    val_sell_masks,
+                    val_bench,
+                    config,
+                    loss_objective,
                 ).detach().cpu()
             )
             val_met = _compute_metrics_from_tensors(
@@ -3108,7 +3411,13 @@ def _run_training_tree_models(
 
             test_dates = panel.dates[test_ds.valid_indices]
             test_close_prices = panel.close_prices[test_ds.valid_indices]
-            test_bt, holdings_records = run_backtest_integer_shares(
+            test_met = _compute_metrics_from_tensors(
+                test_bt_t.strategy_returns,
+                test_bt_t.benchmark_returns,
+                test_bt_t.turnovers,
+            )
+            test_bt = test_bt_t.to_numpy()
+            test_integer_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt_t.weights_history.detach().cpu().numpy(),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
@@ -3125,7 +3434,7 @@ def _run_training_tree_models(
                 symbols=panel.symbols,
                 dates=test_dates,
             )
-            test_met = compute_metrics(test_bt)
+            test_integer_met = compute_metrics(test_integer_bt)
 
             objective_key = _objective_metric_key(loss_objective)
             val_objective_metric = float(val_met.get(objective_key, float("nan")))
@@ -3143,6 +3452,7 @@ def _run_training_tree_models(
                 val_metrics=val_met,
                 test_ic=test_ic,
                 test_metrics=test_met,
+                test_integer_metrics=test_integer_met,
             )
             results_by_fold[fold.fold_id] = fold_result
 
@@ -3171,7 +3481,13 @@ def _run_training_tree_models(
             plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
-            _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+            _save_integer_share_audit_artifacts(
+                fold_dir,
+                test_integer_bt,
+                test_dates,
+                panel.symbols,
+                holdings_records,
+            )
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
 
@@ -3233,34 +3549,15 @@ def _run_inference_tree_models(
             chunk_rows=val_chunk_rows,
         )
         val_loss = float(
-            risk_aware_loss(
-                val_bt_t.weights_history,
+            _evaluated_backtest_loss(
+                val_bt_t,
                 val_returns,
                 val_masks,
-                benchmark_returns=val_bench,
-                can_buy_mask=val_buy_masks,
-                can_sell_mask=val_sell_masks,
-                long_only=config.trading.long_only,
-                buy_fee_rate=config.trading.buy_fee_rate,
-                sell_fee_rate=config.trading.sell_fee_rate,
-                max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
-                gamma_sharpe=config.evaluation.gamma_sharpe,
-                gamma_excess=config.evaluation.gamma_excess,
-                gamma_cvar=config.evaluation.gamma_cvar,
-                cvar_alpha=config.evaluation.cvar_alpha,
-                gamma_drawdown=config.evaluation.gamma_drawdown,
-                drawdown_target=config.evaluation.drawdown_target,
-                gamma_turnover=config.evaluation.gamma_turnover,
-                gamma_underperformance=config.evaluation.gamma_underperformance,
-                excess_target=config.evaluation.excess_target,
-                cvar_budget=config.evaluation.cvar_budget,
-                drawdown_budget=config.evaluation.drawdown_budget,
-                turnover_budget=config.evaluation.turnover_budget,
-                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                objective=loss_objective,
+                val_buy_masks,
+                val_sell_masks,
+                val_bench,
+                config,
+                loss_objective,
             ).detach().cpu()
         )
         val_met = _compute_metrics_from_tensors(
@@ -3292,7 +3589,13 @@ def _run_inference_tree_models(
 
         test_dates = panel.dates[test_ds.valid_indices]
         test_close_prices = panel.close_prices[test_ds.valid_indices]
-        test_bt, holdings_records = run_backtest_integer_shares(
+        test_met = _compute_metrics_from_tensors(
+            test_bt_t.strategy_returns,
+            test_bt_t.benchmark_returns,
+            test_bt_t.turnovers,
+        )
+        test_bt = test_bt_t.to_numpy()
+        test_integer_bt, holdings_records = run_backtest_integer_shares(
             weights=test_bt_t.weights_history.detach().cpu().numpy(),
             future_returns=test_returns.detach().cpu().numpy(),
             tradable_mask=test_masks.detach().cpu().numpy(),
@@ -3309,7 +3612,7 @@ def _run_inference_tree_models(
             symbols=panel.symbols,
             dates=test_dates,
         )
-        test_met = compute_metrics(test_bt)
+        test_integer_met = compute_metrics(test_integer_bt)
 
         fold_result = FoldResult(
             fold_id=fold.fold_id,
@@ -3321,6 +3624,7 @@ def _run_inference_tree_models(
             val_metrics=val_met,
             test_ic=test_ic,
             test_metrics=test_met,
+            test_integer_metrics=test_integer_met,
         )
         results_by_fold[fold.fold_id] = fold_result
 
@@ -3346,7 +3650,13 @@ def _run_inference_tree_models(
         plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
         plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
-        _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+        _save_integer_share_audit_artifacts(
+            fold_dir,
+            test_integer_bt,
+            test_dates,
+            panel.symbols,
+            holdings_records,
+        )
 
     if results_by_fold:
         _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -3444,34 +3754,15 @@ def _run_inference_neural_models(
 
         if not np.isfinite(best_val_loss):
             best_val_loss = float(
-                risk_aware_loss(
-                    val_bt_t.weights_history,
+                _evaluated_backtest_loss(
+                    val_bt_t,
                     val_returns,
                     val_masks,
-                    benchmark_returns=val_bench,
-                    can_buy_mask=val_buy_masks,
-                    can_sell_mask=val_sell_masks,
-                    long_only=config.trading.long_only,
-                    buy_fee_rate=config.trading.buy_fee_rate,
-                    sell_fee_rate=config.trading.sell_fee_rate,
-                    max_turnover_ratio=config.trading.max_turnover_ratio,
-                    gross_leverage=config.trading.gross_leverage,
-                    gamma_sharpe=config.evaluation.gamma_sharpe,
-                    gamma_excess=config.evaluation.gamma_excess,
-                    gamma_cvar=config.evaluation.gamma_cvar,
-                    cvar_alpha=config.evaluation.cvar_alpha,
-                    gamma_drawdown=config.evaluation.gamma_drawdown,
-                    drawdown_target=config.evaluation.drawdown_target,
-                    gamma_turnover=config.evaluation.gamma_turnover,
-                    gamma_underperformance=config.evaluation.gamma_underperformance,
-                    excess_target=config.evaluation.excess_target,
-                    cvar_budget=config.evaluation.cvar_budget,
-                    drawdown_budget=config.evaluation.drawdown_budget,
-                    turnover_budget=config.evaluation.turnover_budget,
-                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                    objective=loss_objective,
+                    val_buy_masks,
+                    val_sell_masks,
+                    val_bench,
+                    config,
+                    loss_objective,
                 ).detach().cpu()
             )
 
@@ -3517,7 +3808,13 @@ def _run_inference_neural_models(
 
         test_dates = panel.dates[test_ds.valid_indices]
         test_close_prices = panel.close_prices[test_ds.valid_indices]
-        test_bt, holdings_records = run_backtest_integer_shares(
+        test_met = _compute_metrics_from_tensors(
+            test_bt_t.strategy_returns,
+            test_bt_t.benchmark_returns,
+            test_bt_t.turnovers,
+        )
+        test_bt = test_bt_t.to_numpy()
+        test_integer_bt, holdings_records = run_backtest_integer_shares(
             weights=test_bt_t.weights_history.detach().cpu().numpy(),
             future_returns=test_returns.detach().cpu().numpy(),
             tradable_mask=test_masks.detach().cpu().numpy(),
@@ -3534,7 +3831,7 @@ def _run_inference_neural_models(
             symbols=panel.symbols,
             dates=test_dates,
         )
-        test_met = compute_metrics(test_bt)
+        test_integer_met = compute_metrics(test_integer_bt)
 
         fold_result = FoldResult(
             fold_id=fold.fold_id,
@@ -3546,6 +3843,7 @@ def _run_inference_neural_models(
             val_metrics=val_met,
             test_ic=test_ic,
             test_metrics=test_met,
+            test_integer_metrics=test_integer_met,
         )
         results_by_fold[fold.fold_id] = fold_result
 
@@ -3571,7 +3869,13 @@ def _run_inference_neural_models(
         plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
         plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
-        _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+        _save_integer_share_audit_artifacts(
+            fold_dir,
+            test_integer_bt,
+            test_dates,
+            panel.symbols,
+            holdings_records,
+        )
 
     if results_by_fold:
         _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -4023,10 +4327,16 @@ def run_training(
                     compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", "1" if auto_compile_risk else "0")
                     if compile_loss:
                         try:
-                            compiled_loss_fn = torch.compile(
-                                partial(risk_aware_loss, **risk_loss_kwargs),
+                            eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
+                            raw_compiled_loss_fn = torch.compile(
+                                eager_loss_fn,
                                 mode="reduce-overhead",
                                 dynamic=False,
+                            )
+                            compiled_loss_fn = _CompiledLossFallback(
+                                raw_compiled_loss_fn,
+                                eager_loss_fn,
+                                label=f"Train {train_years}",
                             )
                             print(f"[Train {train_years}] torch.compile loss enabled (mode=reduce-overhead, dynamic=False)")
                         except Exception as e:
@@ -4064,16 +4374,20 @@ def run_training(
             use_dataloader = dl_sps > (tensor_sps * 1.05)
 
         if use_dataloader:
+            train_shuffle = not _is_return_series_objective(loss_objective)
             train_loader = _build_loader(
                 train_ds,
                 train_batch_size,
-                True,
+                train_shuffle,
                 config,
                 device,
                 drop_last=False,
             )
             effective_workers = max(0, int(config.training.num_workers))
-            print(f"[Train {train_years}] training mode=dataloader (num_workers={effective_workers}, from config)")
+            print(
+                f"[Train {train_years}] training mode=dataloader "
+                f"(num_workers={effective_workers}, shuffle={train_shuffle})"
+            )
         else:
             print(f"[Train {train_years}] training mode=tensor (num_workers={config.training.num_workers})")
 
@@ -4230,7 +4544,7 @@ def run_training(
         test_mean_best_by_val: float | None = None
         get_backtest_compile_stats(reset=True)
 
-        def _run_one_train_epoch(train_model: nn.Module) -> tuple[float, TimingBreakdown]:
+        def _run_one_train_epoch(train_model: nn.Module) -> tuple[torch.Tensor, TimingBreakdown]:
             if train_loader is not None:
                 return _train_epoch(
                     train_model,
@@ -4325,7 +4639,7 @@ def run_training(
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
             last_epoch = epoch
-            train_loss, train_timing = _run_one_train_epoch(compiled_train_model)
+            train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
 
             should_validate = (
                 epoch == start_epoch
@@ -4338,6 +4652,9 @@ def run_training(
                     scheduler_start = time.perf_counter()
                     scheduler.step()
                     scheduler_total = time.perf_counter() - scheduler_start
+                scalar_sync_start = time.perf_counter()
+                train_loss = float(train_loss_t.detach().float().cpu())
+                scalar_sync_total = time.perf_counter() - scalar_sync_start
                 progress_update_start = time.perf_counter()
                 bt_stats_after = get_backtest_compile_stats()
                 bt_nonhit_total = (
@@ -4379,6 +4696,7 @@ def run_training(
                             scheduler_s=scheduler_total,
                             progress_update_s=progress_update_total,
                             cuda_sync_s=cuda_sync_total,
+                            scalar_sync_s=scalar_sync_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(device.type != "cuda" or profile_timing),
                         ),
@@ -4400,11 +4718,15 @@ def run_training(
             scheduler_total = 0.0
             progress_update_total = 0.0
             curve_record_total = 0.0
+            scalar_sync_total = 0.0
             cuda_sync_total = 0.0
             gc_total = 0.0
             val_timing = TimingBreakdown()
             test_curve_timing = TimingBreakdown()
-            if loss_objective in {"rank_ic", "factor_generalization", "portfolio_autoencoder"}:
+            deferred_val_loss_contexts: list[FoldRuntimeContext] = []
+            deferred_val_loss_tensors: torch.Tensor | None = None
+            deferred_test_loss_tensors: torch.Tensor | None = None
+            if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
                 val_eval_start = time.perf_counter()
                 model.eval()
                 with torch.inference_mode():
@@ -4498,64 +4820,36 @@ def run_training(
                     return_weights_history=False,
                     profile_timing=profile_timing,
                     timing_out=val_timing,
+                    reset_at_rows=val_offsets,
                 )
                 val_eval_total = time.perf_counter() - val_eval_start
 
                 val_loss_start = time.perf_counter()
-                val_loss_tensors: list[torch.Tensor] = []
-                val_loss_contexts: list[FoldRuntimeContext] = []
-                for index, (_, context) in enumerate(fold_contexts.items()):
-                    start = val_offsets[index]
-                    end = val_offsets[index + 1]
-                    val_loss_tensor = _loss_from_backtest_series(
-                        val_backtest_epoch.strategy_returns[start:end],
-                        val_backtest_epoch.benchmark_returns[start:end],
-                        val_backtest_epoch.turnovers[start:end],
-                        gamma_sharpe=config.evaluation.gamma_sharpe,
-                        gamma_excess=config.evaluation.gamma_excess,
-                        gamma_cvar=config.evaluation.gamma_cvar,
-                        cvar_alpha=config.evaluation.cvar_alpha,
-                        gamma_drawdown=config.evaluation.gamma_drawdown,
-                        drawdown_target=config.evaluation.drawdown_target,
-                        gamma_turnover=config.evaluation.gamma_turnover,
-                        gamma_underperformance=config.evaluation.gamma_underperformance,
-                        excess_target=config.evaluation.excess_target,
-                        cvar_budget=config.evaluation.cvar_budget,
-                        drawdown_budget=config.evaluation.drawdown_budget,
-                        turnover_budget=config.evaluation.turnover_budget,
-                        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                        objective=loss_objective,
-                    )
-                    val_loss_tensors.append(val_loss_tensor.detach().float())
-                    val_loss_contexts.append(context)
-                val_loss_values = (
-                    torch.stack(val_loss_tensors).cpu().tolist()
-                    if val_loss_tensors
-                    else []
+                deferred_val_loss_contexts = list(fold_contexts.values())
+                deferred_val_loss_tensors = _batched_loss_from_backtest_segments(
+                    val_backtest_epoch.strategy_returns,
+                    val_backtest_epoch.benchmark_returns,
+                    val_backtest_epoch.turnovers,
+                    val_offsets,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_excess=config.evaluation.gamma_excess,
+                    gamma_cvar=config.evaluation.gamma_cvar,
+                    cvar_alpha=config.evaluation.cvar_alpha,
+                    gamma_drawdown=config.evaluation.gamma_drawdown,
+                    drawdown_target=config.evaluation.drawdown_target,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                    gamma_underperformance=config.evaluation.gamma_underperformance,
+                    excess_target=config.evaluation.excess_target,
+                    cvar_budget=config.evaluation.cvar_budget,
+                    drawdown_budget=config.evaluation.drawdown_budget,
+                    turnover_budget=config.evaluation.turnover_budget,
+                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                    objective=loss_objective,
                 )
-                for context, val_loss_raw in zip(val_loss_contexts, val_loss_values, strict=False):
-                    val_loss = float(val_loss_raw)
-                    val_losses.append(val_loss)
-                    if val_loss < context.best_val_loss:
-                        any_fold_improved = True
-                        context.best_val_loss = val_loss
-                        fold_ckpt_start = time.perf_counter()
-                        _save_fold_checkpoint(
-                            context.checkpoint_best_path,
-                            fold=context.fold,
-                            epoch=epoch,
-                            best_val_loss=val_loss,
-                            model=model,
-                            optimizer=optimizer,
-                            scaler=scaler,
-                        )
-                        fold_ckpt_total += time.perf_counter() - fold_ckpt_start
+                val_loss_total = time.perf_counter() - val_loss_start
 
-                val_loss_total = max(0.0, time.perf_counter() - val_loss_start - fold_ckpt_total)
-
-            val_mean_loss = float(np.mean(val_losses)) if val_losses else float("nan")
             curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 100)))
             should_compute_test_mean = (
                 epoch == start_epoch
@@ -4565,10 +4859,10 @@ def run_training(
             sampled_test_mean: float | None = None
             curve_test_total = 0.0
             test_loss_total = 0.0
+            test_losses_epoch: list[float] = []
             if should_compute_test_mean:
                 curve_test_start = time.perf_counter()
-                test_losses_epoch: list[float] = []
-                if loss_objective in {"rank_ic", "factor_generalization", "portfolio_autoencoder"}:
+                if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
                     model.eval()
                     with torch.inference_mode():
                         for index in range(len(test_offsets) - 1):
@@ -4640,41 +4934,75 @@ def run_training(
                         return_weights_history=False,
                         profile_timing=False,
                         timing_out=test_curve_timing,
+                        reset_at_rows=test_offsets,
                     )
                     test_loss_start = time.perf_counter()
-                    test_loss_tensors: list[torch.Tensor] = []
-                    for index in range(len(test_offsets) - 1):
-                        start = test_offsets[index]
-                        end = test_offsets[index + 1]
-                        test_loss_t = _loss_from_backtest_series(
-                            test_backtest_epoch.strategy_returns[start:end],
-                            test_backtest_epoch.benchmark_returns[start:end],
-                            test_backtest_epoch.turnovers[start:end],
-                            gamma_sharpe=config.evaluation.gamma_sharpe,
-                            gamma_excess=config.evaluation.gamma_excess,
-                            gamma_cvar=config.evaluation.gamma_cvar,
-                            cvar_alpha=config.evaluation.cvar_alpha,
-                            gamma_drawdown=config.evaluation.gamma_drawdown,
-                            drawdown_target=config.evaluation.drawdown_target,
-                            gamma_turnover=config.evaluation.gamma_turnover,
-                            gamma_underperformance=config.evaluation.gamma_underperformance,
-                            excess_target=config.evaluation.excess_target,
-                            cvar_budget=config.evaluation.cvar_budget,
-                            drawdown_budget=config.evaluation.drawdown_budget,
-                            turnover_budget=config.evaluation.turnover_budget,
-                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                            objective=loss_objective,
-                        )
-                        test_loss_tensors.append(test_loss_t.detach().float())
-                    if test_loss_tensors:
-                        test_loss_values = torch.stack(test_loss_tensors).cpu().tolist()
-                        test_losses_epoch.extend(float(value) for value in test_loss_values)
+                    deferred_test_loss_tensors = _batched_loss_from_backtest_segments(
+                        test_backtest_epoch.strategy_returns,
+                        test_backtest_epoch.benchmark_returns,
+                        test_backtest_epoch.turnovers,
+                        test_offsets,
+                        gamma_sharpe=config.evaluation.gamma_sharpe,
+                        gamma_excess=config.evaluation.gamma_excess,
+                        gamma_cvar=config.evaluation.gamma_cvar,
+                        cvar_alpha=config.evaluation.cvar_alpha,
+                        gamma_drawdown=config.evaluation.gamma_drawdown,
+                        drawdown_target=config.evaluation.drawdown_target,
+                        gamma_turnover=config.evaluation.gamma_turnover,
+                        gamma_underperformance=config.evaluation.gamma_underperformance,
+                        excess_target=config.evaluation.excess_target,
+                        cvar_budget=config.evaluation.cvar_budget,
+                        drawdown_budget=config.evaluation.drawdown_budget,
+                        turnover_budget=config.evaluation.turnover_budget,
+                        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                        objective=loss_objective,
+                    )
                     test_loss_total = time.perf_counter() - test_loss_start
+                curve_test_total = time.perf_counter() - curve_test_start
+
+            scalar_sync_start = time.perf_counter()
+            scalar_parts = [train_loss_t.detach().float().reshape(1)]
+            val_count = int(deferred_val_loss_tensors.numel()) if deferred_val_loss_tensors is not None else 0
+            test_count = int(deferred_test_loss_tensors.numel()) if deferred_test_loss_tensors is not None else 0
+            if val_count > 0 and deferred_val_loss_tensors is not None:
+                scalar_parts.append(deferred_val_loss_tensors.detach().float().reshape(-1))
+            if test_count > 0 and deferred_test_loss_tensors is not None:
+                scalar_parts.append(deferred_test_loss_tensors.detach().float().reshape(-1))
+            scalar_values = torch.cat(scalar_parts).cpu().tolist()
+            scalar_sync_total += time.perf_counter() - scalar_sync_start
+
+            scalar_offset = 0
+            train_loss = float(scalar_values[scalar_offset])
+            scalar_offset += 1
+            if val_count > 0:
+                val_loss_values = scalar_values[scalar_offset : scalar_offset + val_count]
+                scalar_offset += val_count
+                for context, val_loss_raw in zip(deferred_val_loss_contexts, val_loss_values, strict=False):
+                    val_loss = float(val_loss_raw)
+                    val_losses.append(val_loss)
+                    if val_loss < context.best_val_loss:
+                        any_fold_improved = True
+                        context.best_val_loss = val_loss
+                        fold_ckpt_start = time.perf_counter()
+                        _save_fold_checkpoint(
+                            context.checkpoint_best_path,
+                            fold=context.fold,
+                            epoch=epoch,
+                            best_val_loss=val_loss,
+                            model=model,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                        )
+                        fold_ckpt_total += time.perf_counter() - fold_ckpt_start
+            if test_count > 0:
+                test_loss_values = scalar_values[scalar_offset : scalar_offset + test_count]
+                test_losses_epoch.extend(float(value) for value in test_loss_values)
+            val_mean_loss = float(np.mean(val_losses)) if val_losses else float("nan")
+            if should_compute_test_mean:
                 sampled_test_mean = float(np.mean(test_losses_epoch)) if test_losses_epoch else None
                 test_mean_best_by_val = sampled_test_mean
-                curve_test_total = time.perf_counter() - curve_test_start
 
             if any_fold_improved:
                 group_ckpt_start = time.perf_counter()
@@ -4738,6 +5066,7 @@ def run_training(
                                 + group_ckpt_total
                                 + scheduler_total
                                 + progress_update_total
+                                + scalar_sync_total
                             ),
                             fetch_s=train_timing.fetch_s,
                             transfer_s=train_timing.transfer_s,
@@ -4783,6 +5112,7 @@ def run_training(
                             scheduler_s=scheduler_total,
                             progress_update_s=progress_update_total,
                             cuda_sync_s=cuda_sync_total,
+                            scalar_sync_s=scalar_sync_total,
                             gc_s=gc_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(device.type != "cuda" or profile_timing),
@@ -4836,6 +5166,7 @@ def run_training(
                 chunk_rows=eval_chunk_rows,
                 profile_timing=profile_timing,
                 progress_label=f"[Train {train_years} final-val]",
+                reset_at_rows=val_offsets,
             )
             if profile_timing:
                 _log_timing(
@@ -4918,7 +5249,13 @@ def run_training(
 
             test_dates = panel.dates[context.test_ds.valid_indices]
             test_close_prices = panel.close_prices[context.test_ds.valid_indices]
-            test_bt, holdings_records = run_backtest_integer_shares(
+            test_met = _compute_metrics_from_tensors(
+                test_bt_t.strategy_returns,
+                test_bt_t.benchmark_returns,
+                test_bt_t.turnovers,
+            )
+            test_bt = test_bt_t.to_numpy()
+            test_integer_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt_t.weights_history.detach().cpu().numpy(),
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
@@ -4935,7 +5272,7 @@ def run_training(
                 symbols=panel.symbols,
                 dates=test_dates,
             )
-            test_met = compute_metrics(test_bt)
+            test_integer_met = compute_metrics(test_integer_bt)
             test_report_total = time.perf_counter() - test_report_start
 
             objective_key = _objective_metric_key(loss_objective)
@@ -4963,6 +5300,7 @@ def run_training(
                 val_metrics=val_met,
                 test_ic=test_ic,
                 test_metrics=test_met,
+                test_integer_metrics=test_integer_met,
             )
             results_by_fold[fold.fold_id] = fold_result
 
@@ -4992,7 +5330,13 @@ def run_training(
             plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
-            _save_holdings_csv(fold_dir / "holdings.csv", holdings_records)
+            _save_integer_share_audit_artifacts(
+                fold_dir,
+                test_integer_bt,
+                test_dates,
+                panel.symbols,
+                holdings_records,
+            )
             plot_total = time.perf_counter() - plot_start
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))

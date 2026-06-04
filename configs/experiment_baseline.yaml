@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 25
+  start_fold: 1
 
 environment:
   conda_env: fintech
@@ -24,6 +24,7 @@ data:
   use_rapids: false
   usd_only_trading_pairs: false
   tradable_mode: tw_limit_guard
+  # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -32,9 +33,9 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.001425
-  sell_fee_rate: 0.004425
-  max_turnover_ratio: 100.0
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
+  max_turnover_ratio: 50.0
   gross_leverage: 1.0
   long_only: false
   cash_allowed: true
@@ -44,7 +45,7 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  model_name: bottleneck_portfolio_autoencoder
+  model_name: low_rank_market_transformer_portfolio
   enable_torch_compile: true
   auto_torch_compile_sharpe: true
   compile_loss: true
@@ -59,12 +60,12 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: true
-  lookback: 4
-  batch_size: 32
-  batch_size_train: 32
-  batch_size_eval: 32
-  epochs: 10000
-  early_stopping_no_improve_ratio: 1.0
+  lookback: 16
+  batch_size: 1
+  batch_size_train: 1
+  batch_size_eval: 1
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
   curve_plot_interval: 1
@@ -85,7 +86,7 @@ training:
   weight_decay: 0.001
   grad_clip_norm: 0.0
   finite_check_interval_steps: 0
-  loss_type: sortino
+  loss_type: sortino 
   min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
@@ -139,11 +140,52 @@ training:
     dropout: 0.1
     residual_scale: 0.5
     default_temperature: 1.0
-    portfolio_mode: long_short
+    portfolio_mode: long_only
     return_aux: true
+  latent_factor_market_token_portfolio:
+    temporal_enabled: true
+    temporal_dim: 16
+    temporal_hidden_channels: 32
+    temporal_dilations: [1, 2]
+    temporal_kernel_size: 3
+    tabular_dim: 64
+    tabular_hidden_dim: 128
+    tabular_blocks: 2
+    stock_embedding_dim: 64
+    num_latent_factors: 32
+    num_market_tokens: 4
+    num_heads: 4
+    ffn_mult: 2
+    head_hidden_dim: 64
+    head_layers: 1
+    dropout: 0.3
+    residual_scale: 0.5
+    default_temperature: 1.0
+    portfolio_mode: long_only
+    return_aux: true
+  low_rank_market_transformer_portfolio:
+    feature_dim: 32
+    temporal_layers: 1
+    temporal_heads: 2
+    temporal_ffn_dim: 64
+    temporal_dropout: 0.1
+    temporal_pooling: last
+    temporal_checkpoint: true
+    stock_embedding_dim: 32
+    num_latent_factors: 16
+    num_market_tokens: 4
+    cross_heads: 2
+    cross_ffn_mult: 2
+    head_hidden_dim: 32
+    head_layers: 1
+    dropout: 0.3
+    default_temperature: 1.0
+    portfolio_mode: long_only
+    return_aux: true
+    return_aux_details: false
   bottleneck_portfolio_autoencoder:
     d_model: 64
-    z_dim: 16
+    z_dim: 32
     temporal_type: tcn
     temporal_layers: 2
     asset_encoder_type: lite_isab
@@ -209,7 +251,7 @@ training:
     augmentation_time_dropout: 0.05
     augmentation_noise_std: 0.01
   portfolio_autoencoder_loss:
-    cost_rate: 0.001425
+    cost_rate: 0.0005
     lambda_turnover: 0.1
     lambda_concentration: 0.01
     lambda_latent: 0.001
