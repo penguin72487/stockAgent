@@ -896,14 +896,26 @@ def _vectorized_backtest_torch(
             record_weights_history=return_weights_history,
         )
     else:
-        runner = _resolve_scan_runner(
-            prepped_weights,
-            long_only=long_only,
-            max_turnover_ratio=effective_max_turnover_ratio,
-            gross_budget=gross_budget,
-            scan_chunk_size=resolved_chunk,
-            record_weights_history=return_weights_history,
-        )
+        if initial_weights is not None:
+            # Recurrent/stateful training feeds previous-step portfolio state into
+            # the next call. Keeping this path eager avoids CUDA graph output
+            # aliasing/overwrite hazards from compiled scan runners.
+            runner = _scan_runner_factory(
+                long_only=long_only,
+                max_turnover_ratio=effective_max_turnover_ratio,
+                gross_budget=gross_budget,
+                scan_chunk_size=resolved_chunk,
+                record_weights_history=return_weights_history,
+            )
+        else:
+            runner = _resolve_scan_runner(
+                prepped_weights,
+                long_only=long_only,
+                max_turnover_ratio=effective_max_turnover_ratio,
+                gross_budget=gross_budget,
+                scan_chunk_size=resolved_chunk,
+                record_weights_history=return_weights_history,
+            )
 
     if not use_checkpoint:
         try:

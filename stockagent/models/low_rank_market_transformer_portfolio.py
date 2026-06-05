@@ -59,6 +59,115 @@ class TemporalSelfAttentionBlock(nn.Module):
         return x
 
 
+class TemporalDepthwiseConvBlock(nn.Module):
+    """Tensor-friendly temporal mixer with O(L*k*D) per stock cost."""
+
+    def __init__(self, dim: int, ffn_dim: int, kernel_size: int, dropout: float) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        kernel = max(1, int(kernel_size))
+        if kernel % 2 == 0:
+            kernel += 1
+        self.kernel_size = kernel
+
+        self.norm1 = nn.LayerNorm(self.dim)
+        self.depthwise = nn.Conv1d(
+            self.dim,
+            self.dim,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            groups=self.dim,
+        )
+        self.pointwise = nn.Conv1d(self.dim, self.dim, kernel_size=1)
+        self.dropout = nn.Dropout(float(dropout))
+
+        self.norm2 = nn.LayerNorm(self.dim)
+        hidden_dim = max(self.dim, int(ffn_dim))
+        self.ffn = nn.Sequential(
+            nn.Linear(self.dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, self.dim),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, n_symbols, steps, dim = x.shape
+        y = self.norm1(x).reshape(bsz * n_symbols, steps, dim).transpose(1, 2).contiguous()
+        y = self.pointwise(self.depthwise(y))
+        y = y.transpose(1, 2).reshape(bsz, n_symbols, steps, dim)
+        x = x + self.dropout(y)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class PerStockTemporalConvEncoder(nn.Module):
+    """Shared depthwise-conv temporal encoder for longer lookback windows."""
+
+    def __init__(
+        self,
+        *,
+        lookback: int,
+        num_features: int,
+        feature_dim: int,
+        temporal_layers: int,
+        temporal_ffn_dim: int,
+        temporal_dropout: float,
+        temporal_pooling: str,
+        temporal_kernel_size: int,
+        checkpoint_blocks: bool = True,
+    ) -> None:
+        super().__init__()
+        self.lookback = int(lookback)
+        self.num_features = int(num_features)
+        self.feature_dim = int(feature_dim)
+        self.temporal_pooling = PerStockTemporalTransformerEncoder._normalize_pooling(temporal_pooling)
+        self.checkpoint_blocks = bool(checkpoint_blocks)
+
+        self.feature_proj = nn.Linear(self.num_features, self.feature_dim)
+        self.position = nn.Parameter(torch.randn(1, 1, self.lookback, self.feature_dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [
+                TemporalDepthwiseConvBlock(
+                    dim=self.feature_dim,
+                    ffn_dim=max(self.feature_dim, int(temporal_ffn_dim)),
+                    kernel_size=int(temporal_kernel_size),
+                    dropout=float(temporal_dropout),
+                )
+                for _ in range(max(1, int(temporal_layers)))
+            ]
+        )
+        self.output_norm = nn.LayerNorm(self.feature_dim)
+        self.pool_score = nn.Linear(self.feature_dim, 1) if self.temporal_pooling == "attention" else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, steps, n_symbols, n_features = x.shape
+        if int(steps) != self.lookback:
+            raise ValueError(f"Expected lookback={self.lookback}, got {int(steps)}")
+        if int(n_features) != self.num_features:
+            raise ValueError(f"Expected num_features={self.num_features}, got {int(n_features)}")
+
+        h = x.permute(0, 2, 1, 3).contiguous()
+        h = self.feature_proj(h)
+        h = h + self.position[:, :, :steps, :]
+        for block in self.blocks:
+            if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
+                h = activation_checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
+        if self.temporal_pooling == "last":
+            pooled = h[:, :, -1, :]
+        elif self.temporal_pooling == "mean":
+            pooled = h.mean(dim=2)
+        else:
+            if self.pool_score is None:
+                raise RuntimeError("pool_score is unexpectedly None")
+            weights = torch.softmax(self.pool_score(h).squeeze(-1), dim=2)
+            pooled = (h * weights.unsqueeze(-1)).sum(dim=2)
+        pooled = self.output_norm(pooled)
+        return pooled
+
+
 class PerStockTemporalTransformerEncoder(nn.Module):
     """Shared temporal Transformer over each stock's lookback window.
 
@@ -159,11 +268,13 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         num_features: int,
         num_symbols: int,
         feature_dim: int = 64,
+        temporal_mixer: str = "conv",
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         temporal_ffn_dim: int = 128,
         temporal_dropout: float = 0.1,
         temporal_pooling: str = "last",
+        temporal_kernel_size: int = 5,
         temporal_checkpoint: bool = True,
         stock_embedding_dim: int = 64,
         num_latent_factors: int = 32,
@@ -185,6 +296,7 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.feature_dim = int(feature_dim)
+        self.temporal_mixer = self._normalize_temporal_mixer(temporal_mixer)
         self.stock_embedding_dim = int(stock_embedding_dim)
         self.num_latent_factors = max(1, int(num_latent_factors))
         self.num_market_tokens = max(1, int(num_market_tokens))
@@ -198,17 +310,30 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         if self.stock_embedding_dim % max(1, int(cross_heads)) != 0:
             raise ValueError("stock_embedding_dim must be divisible by cross_heads")
 
-        self.temporal_encoder = PerStockTemporalTransformerEncoder(
-            lookback=self.lookback,
-            num_features=self.num_features,
-            feature_dim=self.feature_dim,
-            temporal_layers=int(temporal_layers),
-            temporal_heads=int(temporal_heads),
-            temporal_ffn_dim=int(temporal_ffn_dim),
-            temporal_dropout=float(temporal_dropout),
-            temporal_pooling=temporal_pooling,
-            checkpoint_blocks=bool(temporal_checkpoint),
-        )
+        if self.temporal_mixer == "attention":
+            self.temporal_encoder = PerStockTemporalTransformerEncoder(
+                lookback=self.lookback,
+                num_features=self.num_features,
+                feature_dim=self.feature_dim,
+                temporal_layers=int(temporal_layers),
+                temporal_heads=int(temporal_heads),
+                temporal_ffn_dim=int(temporal_ffn_dim),
+                temporal_dropout=float(temporal_dropout),
+                temporal_pooling=temporal_pooling,
+                checkpoint_blocks=bool(temporal_checkpoint),
+            )
+        else:
+            self.temporal_encoder = PerStockTemporalConvEncoder(
+                lookback=self.lookback,
+                num_features=self.num_features,
+                feature_dim=self.feature_dim,
+                temporal_layers=int(temporal_layers),
+                temporal_ffn_dim=int(temporal_ffn_dim),
+                temporal_dropout=float(temporal_dropout),
+                temporal_pooling=temporal_pooling,
+                temporal_kernel_size=int(temporal_kernel_size),
+                checkpoint_blocks=bool(temporal_checkpoint),
+            )
         stock_proj: list[nn.Module] = []
         if self.feature_dim == self.stock_embedding_dim:
             stock_proj.append(nn.Identity())
@@ -284,6 +409,18 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         raise ValueError(
             "LowRankMarketTransformerPortfolioModel portfolio_mode must be "
             "'long_only' or 'long_short'"
+        )
+
+    @staticmethod
+    def _normalize_temporal_mixer(temporal_mixer: str) -> str:
+        normalized = str(temporal_mixer).strip().lower().replace("-", "_")
+        if normalized in {"attention", "attn", "transformer", "self_attention"}:
+            return "attention"
+        if normalized in {"conv", "convolution", "depthwise_conv", "depthwise", "tcn"}:
+            return "conv"
+        raise ValueError(
+            "LowRankMarketTransformerPortfolioModel temporal_mixer must be "
+            "'attention' or 'conv'"
         )
 
     def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:

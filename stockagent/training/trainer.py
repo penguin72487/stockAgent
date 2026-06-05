@@ -4175,6 +4175,16 @@ def run_training(
         test_offsets: list[int] = [0]
         for length in test_lengths:
             test_offsets.append(test_offsets[-1] + length)
+        curve_test_fold_index = 0
+        curve_test_fold_context = list(fold_contexts.values())[curve_test_fold_index]
+        curve_test_start_row = int(test_offsets[curve_test_fold_index])
+        curve_test_end_row = int(test_offsets[curve_test_fold_index + 1])
+        curve_test_offsets = [0, curve_test_end_row - curve_test_start_row]
+        print(
+            f"[Train {train_years}] epoch-level test loss uses fold "
+            f"{curve_test_fold_context.fold.fold_id} only "
+            f"(rows={curve_test_offsets[-1]})"
+        )
         if profile_timing:
             _log_timing(
                 f"Train {train_years} setup.test_tensors",
@@ -4324,7 +4334,8 @@ def run_training(
                         f"(mode=reduce-overhead, dynamic=False, source={compile_source}, {reason})"
                     )
 
-                    compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", "1" if auto_compile_risk else "0")
+                    default_compile_loss = "1" if auto_compile_risk else "0"
+                    compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
                     if compile_loss:
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
@@ -4351,7 +4362,6 @@ def run_training(
                     print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")
-
         train_loader: DataLoader | None = None
         use_dataloader = config.training.num_workers > 0
         if use_dataloader:
@@ -4865,61 +4875,60 @@ def run_training(
                 if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
                     model.eval()
                     with torch.inference_mode():
-                        for index in range(len(test_offsets) - 1):
-                            start = test_offsets[index]
-                            end = test_offsets[index + 1]
-                            test_loss, _, test_fold_timing = _evaluate_rank_ic_multitask_loss(
-                                model,
-                                combined_test_x[start:end],
-                                combined_test_returns[start:end],
-                                combined_test_masks[start:end],
-                                combined_test_buy_masks[start:end],
-                                combined_test_sell_masks[start:end],
-                                combined_test_bench[start:end],
-                                device,
-                                amp_dtype,
-                                non_blocking,
-                                chunk_rows=eval_chunk_rows,
-                                objective=loss_objective,
-                                long_only=config.trading.long_only,
-                                buy_fee_rate=config.trading.buy_fee_rate,
-                                sell_fee_rate=config.trading.sell_fee_rate,
-                                max_turnover_ratio=config.trading.max_turnover_ratio,
-                                gross_leverage=config.trading.gross_leverage,
-                                gamma_sharpe=config.evaluation.gamma_sharpe,
-                                gamma_excess=config.evaluation.gamma_excess,
-                                gamma_cvar=config.evaluation.gamma_cvar,
-                                cvar_alpha=config.evaluation.cvar_alpha,
-                                gamma_drawdown=config.evaluation.gamma_drawdown,
-                                drawdown_target=config.evaluation.drawdown_target,
-                                gamma_turnover=config.evaluation.gamma_turnover,
-                                gamma_underperformance=config.evaluation.gamma_underperformance,
-                                excess_target=config.evaluation.excess_target,
-                                cvar_budget=config.evaluation.cvar_budget,
-                                drawdown_budget=config.evaluation.drawdown_budget,
-                                turnover_budget=config.evaluation.turnover_budget,
-                                gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
-                                gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
-                                gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
-                                rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
-                                direction_weight=config.training.multitask_loss.direction_weight,
-                                volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
-                                concentration_weight=config.training.multitask_loss.concentration_weight,
-                                regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
-                                regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
-                                factor_loss_kwargs=risk_loss_kwargs,
-                            )
-                            _add_timing(test_curve_timing, test_fold_timing)
-                            test_losses_epoch.append(test_loss)
+                        start = curve_test_start_row
+                        end = curve_test_end_row
+                        test_loss, _, test_fold_timing = _evaluate_rank_ic_multitask_loss(
+                            model,
+                            combined_test_x[start:end],
+                            combined_test_returns[start:end],
+                            combined_test_masks[start:end],
+                            combined_test_buy_masks[start:end],
+                            combined_test_sell_masks[start:end],
+                            combined_test_bench[start:end],
+                            device,
+                            amp_dtype,
+                            non_blocking,
+                            chunk_rows=eval_chunk_rows,
+                            objective=loss_objective,
+                            long_only=config.trading.long_only,
+                            buy_fee_rate=config.trading.buy_fee_rate,
+                            sell_fee_rate=config.trading.sell_fee_rate,
+                            max_turnover_ratio=config.trading.max_turnover_ratio,
+                            gross_leverage=config.trading.gross_leverage,
+                            gamma_sharpe=config.evaluation.gamma_sharpe,
+                            gamma_excess=config.evaluation.gamma_excess,
+                            gamma_cvar=config.evaluation.gamma_cvar,
+                            cvar_alpha=config.evaluation.cvar_alpha,
+                            gamma_drawdown=config.evaluation.gamma_drawdown,
+                            drawdown_target=config.evaluation.drawdown_target,
+                            gamma_turnover=config.evaluation.gamma_turnover,
+                            gamma_underperformance=config.evaluation.gamma_underperformance,
+                            excess_target=config.evaluation.excess_target,
+                            cvar_budget=config.evaluation.cvar_budget,
+                            drawdown_budget=config.evaluation.drawdown_budget,
+                            turnover_budget=config.evaluation.turnover_budget,
+                            gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                            gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                            gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                            rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                            direction_weight=config.training.multitask_loss.direction_weight,
+                            volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                            concentration_weight=config.training.multitask_loss.concentration_weight,
+                            regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                            regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                            factor_loss_kwargs=risk_loss_kwargs,
+                        )
+                        _add_timing(test_curve_timing, test_fold_timing)
+                        test_losses_epoch.append(test_loss)
                 else:
                     test_backtest_epoch, _, _ = _evaluate_tensor_batch(
                         model,
-                        combined_test_x,
-                        combined_test_returns,
-                        combined_test_masks,
-                        combined_test_buy_masks,
-                        combined_test_sell_masks,
-                        combined_test_bench,
+                        combined_test_x[curve_test_start_row:curve_test_end_row],
+                        combined_test_returns[curve_test_start_row:curve_test_end_row],
+                        combined_test_masks[curve_test_start_row:curve_test_end_row],
+                        combined_test_buy_masks[curve_test_start_row:curve_test_end_row],
+                        combined_test_sell_masks[curve_test_start_row:curve_test_end_row],
+                        combined_test_bench[curve_test_start_row:curve_test_end_row],
                         device,
                         amp_dtype,
                         non_blocking,
@@ -4934,14 +4943,14 @@ def run_training(
                         return_weights_history=False,
                         profile_timing=False,
                         timing_out=test_curve_timing,
-                        reset_at_rows=test_offsets,
+                        reset_at_rows=curve_test_offsets,
                     )
                     test_loss_start = time.perf_counter()
                     deferred_test_loss_tensors = _batched_loss_from_backtest_segments(
                         test_backtest_epoch.strategy_returns,
                         test_backtest_epoch.benchmark_returns,
                         test_backtest_epoch.turnovers,
-                        test_offsets,
+                        curve_test_offsets,
                         gamma_sharpe=config.evaluation.gamma_sharpe,
                         gamma_excess=config.evaluation.gamma_excess,
                         gamma_cvar=config.evaluation.gamma_cvar,

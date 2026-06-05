@@ -984,6 +984,15 @@ def _select_fold_and_checkpoint(
     return fold, ckpt
 
 
+def _available_checkpoint_folds(folds: list[WalkForwardFold], output_dir: Path) -> list[int]:
+    available: list[int] = []
+    for fold in folds:
+        ckpt = _fold_dir(output_dir, fold.fold_id) / "checkpoint_best.pt"
+        if ckpt.exists():
+            available.append(int(fold.fold_id))
+    return sorted(available)
+
+
 def _dataset_for_split(panel: PanelData, fold: WalkForwardFold, split: str, lookback: int) -> CrossSectionalDataset:
     split_norm = split.strip().lower()
     if split_norm == "train":
@@ -1115,7 +1124,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Explain a trained stockAgent model checkpoint.")
     parser.add_argument("--config", default="configs/experiment_baseline.yaml", type=Path)
     parser.add_argument("--output-dir", default=None, type=Path)
-    parser.add_argument("--fold", default=None, type=int, help="Fold id. Defaults to latest fold with checkpoint_best.pt.")
+    parser.add_argument("--fold", default=None, type=int, help="Fold id. If omitted, explains all folds with checkpoint_best.pt.")
     parser.add_argument("--checkpoint", default=None, type=Path, help="Optional explicit checkpoint path.")
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--explain-output-dir", default=None, type=Path)
@@ -1139,6 +1148,49 @@ def main(argv: list[str] | None = None) -> None:
         perturb=not args.no_perturb,
         sample_method=args.sample_method,
     )
+    # Default behavior: if neither --fold nor --checkpoint is provided,
+    # run explainability for all folds that have checkpoint_best.pt.
+    run_all_folds = args.fold is None and args.checkpoint is None
+    if run_all_folds:
+        config = load_config(args.config)
+        resolved_output_dir = Path(args.output_dir if args.output_dir is not None else config.runner.output_dir)
+        panel = build_panel(
+            config.data.parquet_root,
+            use_rapids=config.data.use_rapids,
+            benchmark_name=config.data.benchmark_name,
+            usd_only_trading_pairs=config.data.usd_only_trading_pairs,
+            tradable_mode=config.data.tradable_mode,
+        )
+        folds = build_expanding_year_folds(
+            dates=panel.dates,
+            min_train_years=config.walk_forward.min_train_years,
+            val_years=config.walk_forward.val_years,
+            require_future_test_year=config.walk_forward.require_future_test_year,
+        )
+        fold_ids = _available_checkpoint_folds(folds, resolved_output_dir)
+        if not fold_ids:
+            raise FileNotFoundError(f"No fold checkpoint_best.pt found under {resolved_output_dir}")
+
+        print(f"explaining folds: {fold_ids}")
+        for fold_id in fold_ids:
+            fold_output_dir = args.explain_output_dir
+            if fold_output_dir is not None:
+                fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
+            out_dir = run_checkpoint_explanation(
+                config_path=args.config,
+                output_dir=args.output_dir,
+                fold_id=fold_id,
+                checkpoint=None,
+                split=args.split,
+                explain_output_dir=fold_output_dir,
+                settings=settings,
+                device_override=args.device,
+                strict=args.strict,
+                write_plots=not args.no_plots,
+            )
+            print(f"explainability output (fold {fold_id}): {out_dir}")
+        return
+
     out_dir = run_checkpoint_explanation(
         config_path=args.config,
         output_dir=args.output_dir,

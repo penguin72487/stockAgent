@@ -658,7 +658,9 @@ def risk_aware_loss(
     if aux_outputs:
         initial_weights = aux_outputs.get("initial_weights")
         if isinstance(initial_weights, torch.Tensor):
-            initial_weights = initial_weights.detach()
+            # Keep a private, contiguous buffer for recurrent state so we don't
+            # hold references to graph-managed outputs across compiled replays.
+            initial_weights = initial_weights.detach().clone(memory_format=torch.contiguous_format)
 
     backtest = run_backtest_torch(
         weights,
@@ -676,7 +678,8 @@ def risk_aware_loss(
         initial_weights=initial_weights,
     )
     if aux_outputs is not None and backtest.final_weights is not None:
-        aux_outputs["_final_weights"] = backtest.final_weights.detach()
+        # Avoid carrying graph-owned output storage into the next step.
+        aux_outputs["_final_weights"] = backtest.final_weights.detach().clone(memory_format=torch.contiguous_format)
 
     if sample_mask is None:
         valid_mask = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
