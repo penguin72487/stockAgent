@@ -17,31 +17,65 @@ except Exception:  # pragma: no cover - optional GPU dependency
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = [
-    "open",
-    "max",
-    "min",
-    "close",
-    "Trading_Volume",
-    "intraday_return_co",
-    "overnight_gap_oc",
+    # ==================================================
+    # Price Log Return
+    # 前一日價格變化
+    # ==================================================
+    # "open_logret_1d",
+    # "max_logret_1d",
+    # "min_logret_1d",
+    # "close_logret_1d",
+
+    # ==================================================
+    # Volume
+    # 成交量變化
+    # ==================================================
+    "trading_volume_logret_1d",
+    "signed_vol",
+
+    # ==================================================
+    # Intraday Price Structure
+    # 日內價格結構
+    # ==================================================
+    # "intraday_return_co",
+    # "overnight_gap_oc",
     "intraday_range",
+
+    # ==================================================
+    # Body
+    # K棒實體
+    # ==================================================
     "body_ratio",
+    "signed_body_ratio",
+    "delta_body_ratio",
+
+    # ==================================================
+    # CLV
+    # 收盤位置
+    # ==================================================
     "clv",
+    "clv_centered",
+    "delta_clv",
+
+    # ==================================================
+    # Shadow
+    # 上下影線
+    # ==================================================
     "upper_shadow",
     "lower_shadow",
-    "delta_intraday_return_co",
-    "delta_intraday_range",
-    "delta_clv",
-    "delta_body_ratio",
-    "gap_cont",
-    "signed_vol",
-    "effort",
-    "vol_impact",
-    "gap_vol",
+    "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 13
+PANEL_CACHE_VERSION = 15
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
+PREV_DAY_LOG_RETURN_RENAME = {
+    "open": "open_logret_1d",
+    "max": "max_logret_1d",
+    "min": "min_logret_1d",
+    "close": "close_logret_1d",
+    "Trading_Volume": "trading_volume_logret_1d",
+}
+_MISSING_VOLUME_WARNED_SYMBOLS: set[str] = set()
 
 
 def _round_half_up(values: np.ndarray | pd.Series, decimals: int = 2) -> np.ndarray:
@@ -218,17 +252,43 @@ def _add_derived_features(frame: pd.DataFrame) -> pd.DataFrame:
     denom = spread + EPSILON
 
     frame["body_ratio"] = (close_px - open_px).abs() / denom
+    frame["signed_body_ratio"] = (close_px - open_px) / denom
     frame["clv"] = (close_px - low_px) / denom
+    frame["clv_centered"] = frame["clv"] - 0.5
     frame["upper_shadow"] = (high_px - np.maximum(open_px, close_px)) / denom
     frame["lower_shadow"] = (np.minimum(open_px, close_px) - low_px) / denom
+    frame["shadow_imbalance"] = frame["upper_shadow"] - frame["lower_shadow"]
 
-    frame["delta_intraday_return_co"] = frame["intraday_return_co"] - frame["intraday_return_co"].shift(1)
-    frame["delta_intraday_range"] = frame["intraday_range"] - frame["intraday_range"].shift(1)
     frame["delta_clv"] = frame["clv"] - frame["clv"].shift(1)
     frame["delta_body_ratio"] = frame["body_ratio"] - frame["body_ratio"].shift(1)
-    frame["gap_cont"] = frame["overnight_gap_oc"] * frame["intraday_return_co"]
 
     return frame
+
+
+def _apply_prev_day_log_returns(frame: pd.DataFrame, columns: list[str]) -> None:
+    """Convert selected columns to log returns vs previous day in-place."""
+    for col in columns:
+        if col in frame.columns:
+            out_col = PREV_DAY_LOG_RETURN_RENAME.get(col, f"{col}_logret_1d")
+            frame[out_col] = _safe_log_ratio(frame[col], frame[col].shift(1))
+
+
+def _warn_missing_trading_volume(path: Path) -> None:
+    symbol = _symbol_name_from_path(path)
+    if symbol in _MISSING_VOLUME_WARNED_SYMBOLS:
+        return
+    _MISSING_VOLUME_WARNED_SYMBOLS.add(symbol)
+    print(
+        f"[panel] WARN {path.name}: missing Trading_Volume column; "
+        "volume features (trading_volume_logret_1d, signed_vol) will be NaN"
+    )
+
+
+def _ensure_feature_columns(frame: pd.DataFrame, columns: list[str]) -> None:
+    """Materialize all requested feature columns; fill missing ones with NaN."""
+    for col in columns:
+        if col not in frame.columns:
+            frame[col] = np.nan
 
 
 def _load_symbol_frame(path: Path) -> pd.DataFrame:
@@ -249,23 +309,21 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
 
     frame["tradable"] = _compute_tradable_from_frame(frame)
 
-    for col in ["open", "max", "min", "close"]:
-        if col in frame.columns:
-            frame[col] = _safe_log_ratio(frame[col], frame[col].shift(1))
+    _apply_prev_day_log_returns(frame, ["open", "max", "min", "close"])
 
     if "Trading_Volume" in frame.columns:
         vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
-        frame["Trading_Volume"] = _safe_log_ratio(vol, vol.shift(1))
+        frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]] = _safe_log_ratio(vol, vol.shift(1))
 
-        volume_log_delta = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+        volume_log_delta = pd.to_numeric(
+            frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]], errors="coerce"
+        )
         signed_intraday = np.sign(pd.to_numeric(frame["intraday_return_co"], errors="coerce"))
-        abs_volume_log_delta = volume_log_delta.abs()
-
         frame["signed_vol"] = signed_intraday * volume_log_delta
-        frame["effort"] = frame["intraday_return_co"].abs() / (abs_volume_log_delta + EPSILON)
-        frame["vol_impact"] = frame["intraday_range"] / (abs_volume_log_delta + EPSILON)
-        frame["gap_vol"] = frame["overnight_gap_oc"] * volume_log_delta
+    else:
+        _warn_missing_trading_volume(path)
 
+    _ensure_feature_columns(frame, LOG_RETURN_FEATURE_COLUMNS)
     return frame
 
 
@@ -283,44 +341,28 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
             gdf[col] = gdf[col].round(price_decimals)
     gdf["close_raw"] = gdf["close"].astype("float32")
 
-    nxt_close = gdf["close"].shift(-1)
-    valid_ret = (nxt_close > 0) & (gdf["close"] > 0)
-    ret_ratio = (nxt_close / gdf["close"]).where(valid_ret)
-    gdf["return_1d"] = np.log(ret_ratio)
-
-    if "Trading_Volume" in gdf.columns:
-        vol = gdf["Trading_Volume"]
-        gdf["tradable"] = gdf["close"].notnull() & ((vol.fillna(0) > 0) | vol.isnull())
-    else:
-        gdf["tradable"] = gdf["close"].notnull()
-
-    for col in ["open", "max", "min", "close"]:
-        if col in gdf.columns:
-            prev = gdf[col].shift(1)
-            valid = (gdf[col] > 0) & (prev > 0)
-            ratio = (gdf[col] / prev).where(valid)
-            gdf[col] = np.log(ratio)
-
-    if "Trading_Volume" in gdf.columns:
-        vol = gdf["Trading_Volume"].astype("float64")
-        prev_vol = vol.shift(1)
-        valid_vol = (vol > 0) & (prev_vol > 0)
-        vol_ratio = (vol / prev_vol).where(valid_vol)
-        gdf["Trading_Volume"] = np.log(vol_ratio)
-
     frame = gdf.to_pandas()
     frame = _add_derived_features(frame)
 
+    frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
+    frame["tradable"] = _compute_tradable_from_frame(frame)
+
+    _apply_prev_day_log_returns(frame, ["open", "max", "min", "close"])
+
     if "Trading_Volume" in frame.columns:
-        volume_log_delta = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+        vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
+        frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]] = _safe_log_ratio(vol, vol.shift(1))
+
+    if "Trading_Volume" in frame.columns:
+        volume_log_delta = pd.to_numeric(
+            frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]], errors="coerce"
+        )
         signed_intraday = np.sign(pd.to_numeric(frame["intraday_return_co"], errors="coerce"))
-        abs_volume_log_delta = volume_log_delta.abs()
-
         frame["signed_vol"] = signed_intraday * volume_log_delta
-        frame["effort"] = frame["intraday_return_co"].abs() / (abs_volume_log_delta + EPSILON)
-        frame["vol_impact"] = frame["intraday_range"] / (abs_volume_log_delta + EPSILON)
-        frame["gap_vol"] = frame["overnight_gap_oc"] * volume_log_delta
+    else:
+        _warn_missing_trading_volume(path)
 
+    _ensure_feature_columns(frame, LOG_RETURN_FEATURE_COLUMNS)
     return frame
 
 

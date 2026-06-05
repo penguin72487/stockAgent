@@ -12,6 +12,7 @@ from stockagent.models.multi_stock_tcn import CrossSectionalMultiStockTCN
 from stockagent.models.tabular_resnet import CrossSectionalTabularResNet
 from stockagent.models.tcn_hybrid_tabular_resnet import CrossSectionalTCNHybridTabularResNet
 from stockagent.models.temporal_tabular_resnet import CrossSectionalTemporalTabularResNet
+from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
 from stockagent.models.tree_models import CrossSectionalLightGBM, CrossSectionalXGBoost
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
 	"EfficientTCNTabularSetPortfolioModel",
 	"LatentFactorMarketTokenPortfolioModel",
 	"LowRankMarketTransformerPortfolioModel",
+	"TransformerBasePortfolioModel",
 	"CrossSectionalFTTransformer",
 	"CrossSectionalMultiStockTCN",
 	"CrossSectionalTabularResNet",

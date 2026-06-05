@@ -176,6 +176,7 @@ class LowRankMarketTransformerPortfolioModelConfig:
     temporal_dropout: float = 0.1
     temporal_pooling: str = "last"
     temporal_kernel_size: int = 5
+    temporal_dilations: list[int] = field(default_factory=lambda: [1])
     temporal_checkpoint: bool = True
     stock_embedding_dim: int = 24
     num_latent_factors: int = 8
@@ -187,6 +188,39 @@ class LowRankMarketTransformerPortfolioModelConfig:
     dropout: float = 0.1
     default_temperature: float = 1.0
     portfolio_mode: str = "auto"
+    return_aux: bool = True
+    return_aux_details: bool = False
+
+
+@dataclass(slots=True)
+class TransformerBasePortfolioModelConfig:
+    d_model: int = 64
+    attention_mode: str = "latent"
+    use_flash_attention: bool = True
+    use_time_pos: bool = True
+    use_symbol_pos: bool = True
+    input_dropout: float = 0.0
+    temporal_layers: int = 2
+    temporal_heads: int = 4
+    temporal_ffn_mult: int = 2
+    temporal_pooling: str = "attention"
+    cross_layers: int = 1
+    cross_heads: int = 4
+    cross_ffn_mult: int = 2
+    joint_layers: int = 2
+    joint_heads: int = 4
+    joint_ffn_mult: int = 2
+    latent_layers: int = 1
+    num_latent_factors: int = 16
+    num_market_tokens: int = 4
+    market_layers: int = 1
+    head_hidden_dim: int = 64
+    head_layers: int = 1
+    dropout: float = 0.1
+    default_temperature: float = 1.0
+    portfolio_mode: str = "auto"
+    max_full_tokens: int = 4096
+    checkpoint_blocks: bool = False
     return_aux: bool = True
     return_aux_details: bool = False
 
@@ -317,7 +351,7 @@ class TrainingConfig:
     chunk_rows: int = 0
     train_symbol_subsample_ratio: float = 1.0
     detach_prev_state: bool = True
-    prefer_fp16: bool = True
+    prefer_fp16: bool = False
     backtest_autotune: bool = True
     backtest_compile: bool = True
     backtest_verbose: bool = False
@@ -368,6 +402,9 @@ class TrainingConfig:
     )
     low_rank_market_transformer_portfolio: LowRankMarketTransformerPortfolioModelConfig = field(
         default_factory=LowRankMarketTransformerPortfolioModelConfig
+    )
+    transformer_base_portfolio: TransformerBasePortfolioModelConfig = field(
+        default_factory=TransformerBasePortfolioModelConfig
     )
     bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(default_factory=BottleneckPortfolioAutoencoderConfig)
     tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
@@ -441,7 +478,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("chunk_rows", 0)
     training.setdefault("train_symbol_subsample_ratio", 1.0)
     training.setdefault("detach_prev_state", True)
-    training.setdefault("prefer_fp16", True)
+    training.setdefault("prefer_fp16", False)
     training.setdefault("backtest_autotune", True)
     training.setdefault("backtest_compile", True)
     training.setdefault("backtest_verbose", False)
@@ -572,6 +609,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     low_rank_market_transformer_portfolio.setdefault("temporal_dropout", legacy_dropout)
     low_rank_market_transformer_portfolio.setdefault("temporal_pooling", "last")
     low_rank_market_transformer_portfolio.setdefault("temporal_kernel_size", 5)
+    low_rank_market_transformer_portfolio.setdefault("temporal_dilations", [1])
     low_rank_market_transformer_portfolio.setdefault("temporal_checkpoint", True)
     low_rank_market_transformer_portfolio.setdefault("stock_embedding_dim", 24)
     low_rank_market_transformer_portfolio.setdefault("num_latent_factors", 8)
@@ -585,6 +623,37 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     low_rank_market_transformer_portfolio.setdefault("portfolio_mode", "auto")
     low_rank_market_transformer_portfolio.setdefault("return_aux", True)
     low_rank_market_transformer_portfolio.setdefault("return_aux_details", False)
+
+    transformer_base_portfolio = training.setdefault("transformer_base_portfolio", {})
+    transformer_base_portfolio.setdefault("d_model", 64)
+    transformer_base_portfolio.setdefault("attention_mode", "latent")
+    transformer_base_portfolio.setdefault("use_flash_attention", True)
+    transformer_base_portfolio.setdefault("use_time_pos", True)
+    transformer_base_portfolio.setdefault("use_symbol_pos", True)
+    transformer_base_portfolio.setdefault("input_dropout", 0.0)
+    transformer_base_portfolio.setdefault("temporal_layers", 2)
+    transformer_base_portfolio.setdefault("temporal_heads", 4)
+    transformer_base_portfolio.setdefault("temporal_ffn_mult", 2)
+    transformer_base_portfolio.setdefault("temporal_pooling", "attention")
+    transformer_base_portfolio.setdefault("cross_layers", 1)
+    transformer_base_portfolio.setdefault("cross_heads", 4)
+    transformer_base_portfolio.setdefault("cross_ffn_mult", 2)
+    transformer_base_portfolio.setdefault("joint_layers", 2)
+    transformer_base_portfolio.setdefault("joint_heads", 4)
+    transformer_base_portfolio.setdefault("joint_ffn_mult", 2)
+    transformer_base_portfolio.setdefault("latent_layers", 1)
+    transformer_base_portfolio.setdefault("num_latent_factors", 16)
+    transformer_base_portfolio.setdefault("num_market_tokens", 4)
+    transformer_base_portfolio.setdefault("market_layers", 1)
+    transformer_base_portfolio.setdefault("head_hidden_dim", 64)
+    transformer_base_portfolio.setdefault("head_layers", 1)
+    transformer_base_portfolio.setdefault("dropout", legacy_dropout)
+    transformer_base_portfolio.setdefault("default_temperature", 1.0)
+    transformer_base_portfolio.setdefault("portfolio_mode", "auto")
+    transformer_base_portfolio.setdefault("max_full_tokens", 4096)
+    transformer_base_portfolio.setdefault("checkpoint_blocks", False)
+    transformer_base_portfolio.setdefault("return_aux", True)
+    transformer_base_portfolio.setdefault("return_aux_details", False)
 
     bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
     bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
@@ -869,6 +938,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             low_rank_market_transformer_portfolio=LowRankMarketTransformerPortfolioModelConfig(
                 **training_raw["low_rank_market_transformer_portfolio"]
+            ),
+            transformer_base_portfolio=TransformerBasePortfolioModelConfig(
+                **training_raw["transformer_base_portfolio"]
             ),
             bottleneck_portfolio_autoencoder=BottleneckPortfolioAutoencoderConfig(
                 **training_raw["bottleneck_portfolio_autoencoder"]
