@@ -4313,10 +4313,12 @@ def run_training(
             )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
+        config_auto_compile_risk = bool(getattr(config.training, "auto_torch_compile_sharpe", True))
         auto_compile_risk = (
             loss_objective in {"sharpe", "sortino"}
             and device.type == "cuda"
             and not profile_timing
+            and config_auto_compile_risk
             and _env_truthy("STOCKAGENT_AUTO_TORCH_COMPILE_SHARPE", "1")
         )
         should_enable_compile = (config.training.enable_torch_compile or auto_compile_risk) and hasattr(torch, "compile")
@@ -4334,7 +4336,8 @@ def run_training(
                         f"(mode=reduce-overhead, dynamic=False, source={compile_source}, {reason})"
                     )
 
-                    default_compile_loss = "1" if auto_compile_risk else "0"
+                    config_compile_loss = bool(getattr(config.training, "compile_loss", auto_compile_risk))
+                    default_compile_loss = "1" if config_compile_loss else "0"
                     compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
                     if compile_loss:
                         try:
@@ -5052,12 +5055,12 @@ def run_training(
                 epoch_pbar.set_postfix(
                     {
                         "train_loss": f"{train_loss:.8f}",
-                        "val_mean": f"{val_mean_loss:.8f}",
-                        "val_ic": f"{float(np.mean(val_ics)):.6f}" if val_ics else "-",
+                        "val_loss": f"{val_mean_loss:.8f}",
+                        "test_loss": f"{float(np.mean(test_losses_epoch)):.8f}" if test_losses_epoch else "-",
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.8f}",
                         "no_improve": no_improve_epochs,
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                        "bt_nonhit": bt_nonhit_total,
+                        # "bt_nonhit": bt_nonhit_total,
                     }
                 )
                 progress_update_total = time.perf_counter() - progress_update_start

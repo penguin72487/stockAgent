@@ -32,6 +32,7 @@ def _make_model(**overrides) -> LowRankMarketTransformerPortfolioModel:
         "temporal_dropout": 0.1,
         "temporal_pooling": "last",
         "temporal_kernel_size": 5,
+        "temporal_dilations": [1],
         "temporal_checkpoint": True,
         "stock_embedding_dim": 32,
         "num_latent_factors": 16,
@@ -134,6 +135,32 @@ def test_dynamic_symbols_attention_pooling_and_token_counts() -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
 
 
+def test_conv_temporal_dilations_support_lookback32() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=32,
+        temporal_layers=4,
+        temporal_dilations=[1, 1, 2, 4],
+        temporal_pooling="attention",
+        temporal_checkpoint=False,
+        return_aux_details=True,
+    ).eval()
+    x = torch.randn(2, 32, 37, 21, device=device)
+    mask = torch.ones(2, 37, dtype=torch.bool, device=device)
+
+    assert model.temporal_encoder.temporal_dilations == (1, 1, 2, 4)
+    with torch.no_grad():
+        out = model(x, mask)
+
+    weights, aux = _extract_weights_and_aux(out)
+    assert weights.shape == (2, 37)
+    assert aux is not None
+    assert aux["z_time"].shape == (2, 37, 32)
+    assert aux["market_tokens"].shape == (2, 4, 32)
+    assert torch.all(torch.isfinite(weights))
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
+
+
 def test_attention_temporal_mixer_remains_available() -> None:
     device = _device()
     model = _make_model(temporal_mixer="attention").eval()
@@ -189,6 +216,10 @@ def test_factory_builds_low_rank_market_transformer_model() -> None:
 
     assert isinstance(model, LowRankMarketTransformerPortfolioModel)
     assert model_hidden_dim_hint(cfg) == cfg.training.low_rank_market_transformer_portfolio.stock_embedding_dim
+    assert model.portfolio_mode == "long_short"
+    assert model.temporal_encoder.temporal_dilations == tuple(
+        cfg.training.low_rank_market_transformer_portfolio.temporal_dilations
+    )
 
 
 if __name__ == "__main__":
@@ -196,6 +227,7 @@ if __name__ == "__main__":
     test_default_output_is_trainer_compatible()
     test_shapes_mask_and_backward()
     test_dynamic_symbols_attention_pooling_and_token_counts()
+    test_conv_temporal_dilations_support_lookback32()
     test_default_can_opt_into_detailed_aux()
     test_long_only_and_empty_mask_rows_are_safe()
     test_factory_builds_low_rank_market_transformer_model()

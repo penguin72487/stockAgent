@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
@@ -62,20 +64,22 @@ class TemporalSelfAttentionBlock(nn.Module):
 class TemporalDepthwiseConvBlock(nn.Module):
     """Tensor-friendly temporal mixer with O(L*k*D) per stock cost."""
 
-    def __init__(self, dim: int, ffn_dim: int, kernel_size: int, dropout: float) -> None:
+    def __init__(self, dim: int, ffn_dim: int, kernel_size: int, dilation: int, dropout: float) -> None:
         super().__init__()
         self.dim = int(dim)
         kernel = max(1, int(kernel_size))
         if kernel % 2 == 0:
             kernel += 1
         self.kernel_size = kernel
+        self.dilation = max(1, int(dilation))
 
         self.norm1 = nn.LayerNorm(self.dim)
         self.depthwise = nn.Conv1d(
             self.dim,
             self.dim,
             kernel_size=self.kernel_size,
-            padding=self.kernel_size // 2,
+            padding=(self.kernel_size // 2) * self.dilation,
+            dilation=self.dilation,
             groups=self.dim,
         )
         self.pointwise = nn.Conv1d(self.dim, self.dim, kernel_size=1)
@@ -115,6 +119,7 @@ class PerStockTemporalConvEncoder(nn.Module):
         temporal_dropout: float,
         temporal_pooling: str,
         temporal_kernel_size: int,
+        temporal_dilations: Sequence[int] = (1,),
         checkpoint_blocks: bool = True,
     ) -> None:
         super().__init__()
@@ -123,6 +128,14 @@ class PerStockTemporalConvEncoder(nn.Module):
         self.feature_dim = int(feature_dim)
         self.temporal_pooling = PerStockTemporalTransformerEncoder._normalize_pooling(temporal_pooling)
         self.checkpoint_blocks = bool(checkpoint_blocks)
+        n_layers = max(1, int(temporal_layers))
+        dilations = tuple(max(1, int(dilation)) for dilation in temporal_dilations)
+        if not dilations:
+            dilations = (1,)
+        self.temporal_dilations = tuple(
+            dilations[idx] if idx < len(dilations) else dilations[-1]
+            for idx in range(n_layers)
+        )
 
         self.feature_proj = nn.Linear(self.num_features, self.feature_dim)
         self.position = nn.Parameter(torch.randn(1, 1, self.lookback, self.feature_dim) * 0.02)
@@ -132,9 +145,10 @@ class PerStockTemporalConvEncoder(nn.Module):
                     dim=self.feature_dim,
                     ffn_dim=max(self.feature_dim, int(temporal_ffn_dim)),
                     kernel_size=int(temporal_kernel_size),
+                    dilation=self.temporal_dilations[idx],
                     dropout=float(temporal_dropout),
                 )
-                for _ in range(max(1, int(temporal_layers)))
+                for idx in range(n_layers)
             ]
         )
         self.output_norm = nn.LayerNorm(self.feature_dim)
@@ -275,6 +289,7 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         temporal_dropout: float = 0.1,
         temporal_pooling: str = "last",
         temporal_kernel_size: int = 5,
+        temporal_dilations: Sequence[int] = (1,),
         temporal_checkpoint: bool = True,
         stock_embedding_dim: int = 64,
         num_latent_factors: int = 32,
@@ -332,6 +347,7 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
                 temporal_dropout=float(temporal_dropout),
                 temporal_pooling=temporal_pooling,
                 temporal_kernel_size=int(temporal_kernel_size),
+                temporal_dilations=tuple(int(dilation) for dilation in temporal_dilations),
                 checkpoint_blocks=bool(temporal_checkpoint),
             )
         stock_proj: list[nn.Module] = []
