@@ -288,6 +288,7 @@ def build_model(
             use_time_pos=tbp_cfg.use_time_pos,
             use_symbol_pos=tbp_cfg.use_symbol_pos,
             input_dropout=tbp_cfg.input_dropout,
+            sdpa_batch_limit=tbp_cfg.sdpa_batch_limit,
             temporal_layers=tbp_cfg.temporal_layers,
             temporal_heads=tbp_cfg.temporal_heads,
             temporal_ffn_mult=tbp_cfg.temporal_ffn_mult,

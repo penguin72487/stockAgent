@@ -71,6 +71,7 @@ training:
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
+    sdpa_batch_limit: 4096
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
@@ -129,6 +130,7 @@ Modes:
 Rules:
 
 - Keep `use_flash_attention: true` unless debugging. The implementation uses PyTorch SDPA so CUDA can select flash/memory-efficient kernels when shape and dtype allow it.
+- Keep `sdpa_batch_limit` enabled for large universes. Temporal attention flattens to `batch_size * symbols`; unchunked SDPA can hit CUDA `invalid argument` when that dimension is too large.
 - Do not assume Flash Attention removes full attention compute cost. It reduces memory pressure, but `full` mode is still quadratic in `lookback * stocks`.
 - Use `max_full_tokens` as an OOM guard for `full` mode.
 - Prefer `latent` or `market_token` for full market universes.

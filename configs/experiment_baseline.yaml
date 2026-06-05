@@ -61,9 +61,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: true
   lookback: 32
-  batch_size: 256
-  batch_size_train: 256
-  batch_size_eval: 256
+  batch_size: 32
+  batch_size_train: 32
+  batch_size_eval: 32
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -193,11 +193,12 @@ training:
     # latent: temporal + latent factors + market tokens, large universe friendly
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
-    attention_mode: latent
+    attention_mode: axial
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
+    sdpa_batch_limit: 4096
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2

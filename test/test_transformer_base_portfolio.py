@@ -30,6 +30,7 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
         "use_time_pos": True,
         "use_symbol_pos": True,
         "input_dropout": 0.0,
+        "sdpa_batch_limit": 4096,
         "temporal_layers": 1,
         "temporal_heads": 2,
         "temporal_ffn_mult": 1,
@@ -92,6 +93,48 @@ def test_full_mode_token_guard() -> None:
         model(x, mask)
 
 
+def test_sdpa_batch_chunking_matches_unchunked_eval() -> None:
+    device = _device()
+    unchunked = _make_model(sdpa_batch_limit=0).eval()
+    chunked = _make_model(sdpa_batch_limit=3).eval()
+    chunked.load_state_dict(unchunked.state_dict())
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+
+    with torch.no_grad():
+        out_a = unchunked(x, mask)
+        out_b = chunked(x, mask)
+
+    assert torch.allclose(out_a["weights"], out_b["weights"], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(out_a["score_logits"], out_b["score_logits"], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only SDPA batch-limit smoke")
+def test_large_temporal_batch_uses_chunked_sdpa_without_cuda_invalid_argument() -> None:
+    device = _device()
+    model = _make_model(
+        lookback=32,
+        num_symbols=128,
+        d_model=32,
+        temporal_heads=4,
+        cross_heads=4,
+        joint_heads=4,
+        head_hidden_dim=32,
+        sdpa_batch_limit=1024,
+        return_aux_details=False,
+    ).eval()
+    x = torch.randn(8, 32, 128, 11, device=device)
+    mask = torch.ones(8, 128, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        out = model(x, mask)
+        torch.cuda.synchronize(device)
+
+    assert out["weights"].shape == (8, 128)
+    assert torch.isfinite(out["weights"]).all()
+
+
 def test_long_only_mode_and_empty_rows_are_safe() -> None:
     device = _device()
     model = _make_model(portfolio_mode="long_only").eval()
@@ -117,3 +160,4 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model_hidden_dim_hint(cfg) == cfg.training.transformer_base_portfolio.d_model
     assert model.attention_mode == cfg.training.transformer_base_portfolio.attention_mode
     assert model.portfolio_mode == "long_short"
+    assert model.sdpa_batch_limit == cfg.training.transformer_base_portfolio.sdpa_batch_limit

@@ -200,6 +200,7 @@ class TransformerBasePortfolioModelConfig:
     use_time_pos: bool = True
     use_symbol_pos: bool = True
     input_dropout: float = 0.0
+    sdpa_batch_limit: int = 4096
     temporal_layers: int = 2
     temporal_heads: int = 4
     temporal_ffn_mult: int = 2
@@ -631,6 +632,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("use_time_pos", True)
     transformer_base_portfolio.setdefault("use_symbol_pos", True)
     transformer_base_portfolio.setdefault("input_dropout", 0.0)
+    transformer_base_portfolio.setdefault("sdpa_batch_limit", 4096)
     transformer_base_portfolio.setdefault("temporal_layers", 2)
     transformer_base_portfolio.setdefault("temporal_heads", 4)
     transformer_base_portfolio.setdefault("temporal_ffn_mult", 2)
