@@ -36,7 +36,7 @@ trading:
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
-  gross_leverage: 1.0
+  gross_leverage: 2.5
   long_only: false
   cash_allowed: true
 
@@ -60,18 +60,18 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: true
-  lookback: 16
-  batch_size: 1
-  batch_size_train: 1
-  batch_size_eval: 1
+  lookback: 3
+  batch_size: 16
+  batch_size_train: 16
+  batch_size_eval: 16
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  early_stopping_no_improve_ratio: 0.05
   val_interval_epochs: 1
   curve_test_interval: 1
   curve_plot_interval: 1
   curve_plot_async: true
-  cache_train_tensors_on_gpu: true
-  cache_eval_tensors_on_gpu: true
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
   learning_rate: 0.0001
   enable_lr_scheduler: false
   lr_scheduler: plateau
@@ -83,10 +83,10 @@ training:
   hidden_layers: 1
   dropout: 0.1
   num_workers: 0
-  weight_decay: 0.001
+  weight_decay: 0.0001
   grad_clip_norm: 0.0
   finite_check_interval_steps: 0
-  loss_type: sortino 
+  loss_type: sortino
   min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
@@ -164,19 +164,21 @@ training:
     portfolio_mode: long_only
     return_aux: true
   low_rank_market_transformer_portfolio:
-    feature_dim: 32
+    feature_dim: 24
+    temporal_mixer: conv
     temporal_layers: 1
     temporal_heads: 2
-    temporal_ffn_dim: 64
+    temporal_ffn_dim: 48
     temporal_dropout: 0.1
     temporal_pooling: last
+    temporal_kernel_size: 5
     temporal_checkpoint: true
-    stock_embedding_dim: 32
-    num_latent_factors: 16
+    stock_embedding_dim: 24
+    num_latent_factors: 8
     num_market_tokens: 4
     cross_heads: 2
-    cross_ffn_mult: 2
-    head_hidden_dim: 32
+    cross_ffn_mult: 1
+    head_hidden_dim: 24
     head_layers: 1
     dropout: 0.3
     default_temperature: 1.0

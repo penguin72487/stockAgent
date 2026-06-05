@@ -5,7 +5,7 @@ from torch import nn
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.training.loss import risk_aware_loss
-from stockagent.training.trainer import _detach_portfolio_state, _evaluate_tensor_batch
+from stockagent.training.trainer import _CompiledLossFallback, _detach_portfolio_state, _evaluate_tensor_batch
 
 
 class _EchoWeightModel(nn.Module):
@@ -29,6 +29,25 @@ def test_detach_portfolio_state_clones_independent_buffer() -> None:
 
     detached[0] = -123.0
     assert not torch.allclose(detached, state.detach())
+
+
+def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> None:
+    calls = {"compiled": 0, "eager": 0}
+
+    def compiled_fn(x: torch.Tensor) -> torch.Tensor:
+        calls["compiled"] += 1
+        raise RuntimeError("tensor output of CUDAGraphs that has been overwritten by a subsequent run")
+
+    def eager_fn(x: torch.Tensor) -> torch.Tensor:
+        calls["eager"] += 1
+        return x + 1.0
+
+    wrapped = _CompiledLossFallback(compiled_fn, eager_fn, label="test")
+    x = torch.tensor(2.0)
+
+    assert torch.equal(wrapped(x), torch.tensor(3.0))
+    assert torch.equal(wrapped(x), torch.tensor(3.0))
+    assert calls == {"compiled": 1, "eager": 2}
 
 
 def _chunked_backtest(

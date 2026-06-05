@@ -168,19 +168,21 @@ class LatentFactorMarketTokenPortfolioModelConfig:
 
 @dataclass(slots=True)
 class LowRankMarketTransformerPortfolioModelConfig:
-    feature_dim: int = 32
+    feature_dim: int = 24
+    temporal_mixer: str = "conv"
     temporal_layers: int = 1
     temporal_heads: int = 2
-    temporal_ffn_dim: int = 64
+    temporal_ffn_dim: int = 48
     temporal_dropout: float = 0.1
     temporal_pooling: str = "last"
+    temporal_kernel_size: int = 5
     temporal_checkpoint: bool = True
-    stock_embedding_dim: int = 32
-    num_latent_factors: int = 16
+    stock_embedding_dim: int = 24
+    num_latent_factors: int = 8
     num_market_tokens: int = 4
     cross_heads: int = 2
-    cross_ffn_mult: int = 2
-    head_hidden_dim: int = 32
+    cross_ffn_mult: int = 1
+    head_hidden_dim: int = 24
     head_layers: int = 1
     dropout: float = 0.1
     default_temperature: float = 1.0
@@ -562,19 +564,21 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     latent_factor_market_token_portfolio.setdefault("return_aux", True)
 
     low_rank_market_transformer_portfolio = training.setdefault("low_rank_market_transformer_portfolio", {})
-    low_rank_market_transformer_portfolio.setdefault("feature_dim", 32)
+    low_rank_market_transformer_portfolio.setdefault("feature_dim", 24)
+    low_rank_market_transformer_portfolio.setdefault("temporal_mixer", "conv")
     low_rank_market_transformer_portfolio.setdefault("temporal_layers", 1)
     low_rank_market_transformer_portfolio.setdefault("temporal_heads", 2)
-    low_rank_market_transformer_portfolio.setdefault("temporal_ffn_dim", 64)
+    low_rank_market_transformer_portfolio.setdefault("temporal_ffn_dim", 48)
     low_rank_market_transformer_portfolio.setdefault("temporal_dropout", legacy_dropout)
     low_rank_market_transformer_portfolio.setdefault("temporal_pooling", "last")
+    low_rank_market_transformer_portfolio.setdefault("temporal_kernel_size", 5)
     low_rank_market_transformer_portfolio.setdefault("temporal_checkpoint", True)
-    low_rank_market_transformer_portfolio.setdefault("stock_embedding_dim", 32)
-    low_rank_market_transformer_portfolio.setdefault("num_latent_factors", 16)
+    low_rank_market_transformer_portfolio.setdefault("stock_embedding_dim", 24)
+    low_rank_market_transformer_portfolio.setdefault("num_latent_factors", 8)
     low_rank_market_transformer_portfolio.setdefault("num_market_tokens", 4)
     low_rank_market_transformer_portfolio.setdefault("cross_heads", 2)
-    low_rank_market_transformer_portfolio.setdefault("cross_ffn_mult", 2)
-    low_rank_market_transformer_portfolio.setdefault("head_hidden_dim", 32)
+    low_rank_market_transformer_portfolio.setdefault("cross_ffn_mult", 1)
+    low_rank_market_transformer_portfolio.setdefault("head_hidden_dim", 24)
     low_rank_market_transformer_portfolio.setdefault("head_layers", 1)
     low_rank_market_transformer_portfolio.setdefault("dropout", legacy_dropout)
     low_rank_market_transformer_portfolio.setdefault("default_temperature", 1.0)

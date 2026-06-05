@@ -25,11 +25,13 @@ def _make_model(**overrides) -> LowRankMarketTransformerPortfolioModel:
         "num_features": 21,
         "num_symbols": 100,
         "feature_dim": 32,
+        "temporal_mixer": "conv",
         "temporal_layers": 1,
         "temporal_heads": 2,
         "temporal_ffn_dim": 64,
         "temporal_dropout": 0.1,
         "temporal_pooling": "last",
+        "temporal_kernel_size": 5,
         "temporal_checkpoint": True,
         "stock_embedding_dim": 32,
         "num_latent_factors": 16,
@@ -129,6 +131,21 @@ def test_dynamic_symbols_attention_pooling_and_token_counts() -> None:
     assert scores.shape == (2, 37)
     assert aux["latent_factors"].shape == (2, 32, 32)
     assert aux["market_tokens"].shape == (2, 8, 32)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
+
+
+def test_attention_temporal_mixer_remains_available() -> None:
+    device = _device()
+    model = _make_model(temporal_mixer="attention").eval()
+    x = torch.randn(2, 8, 37, 21, device=device)
+    mask = torch.ones(2, 37, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        weights, scores, aux = model(x, mask, return_aux=True)
+
+    assert weights.shape == (2, 37)
+    assert scores.shape == (2, 37)
+    assert aux["z_time"].shape == (2, 37, 32)
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
 
 
