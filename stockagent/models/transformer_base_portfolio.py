@@ -17,7 +17,14 @@ class FlashSDPAAttention(nn.Module):
     tests can disable SDPA deterministically.
     """
 
-    def __init__(self, dim: int, num_heads: int, dropout: float, use_flash_attention: bool = True) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        dropout: float,
+        use_flash_attention: bool = True,
+        sdpa_batch_limit: int = 4096,
+    ) -> None:
         super().__init__()
         self.dim = int(dim)
         self.num_heads = max(1, int(num_heads))
@@ -26,6 +33,7 @@ class FlashSDPAAttention(nn.Module):
         self.head_dim = self.dim // self.num_heads
         self.scale = float(self.head_dim) ** -0.5
         self.use_flash_attention = bool(use_flash_attention)
+        self.sdpa_batch_limit = int(sdpa_batch_limit)
 
         self.q_proj = nn.Linear(self.dim, self.dim)
         self.k_proj = nn.Linear(self.dim, self.dim)
@@ -60,14 +68,31 @@ class FlashSDPAAttention(nn.Module):
             attn_mask = key_mask[:, None, None, :].expand(bsz, self.num_heads, query_steps, key_steps)
 
         if self.use_flash_attention:
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=False,
-            )
+            if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
+                chunks: list[torch.Tensor] = []
+                for start in range(0, int(q.size(0)), self.sdpa_batch_limit):
+                    end = min(start + self.sdpa_batch_limit, int(q.size(0)))
+                    mask_chunk = attn_mask[start:end] if attn_mask is not None else None
+                    chunks.append(
+                        F.scaled_dot_product_attention(
+                            q[start:end],
+                            k[start:end],
+                            v[start:end],
+                            attn_mask=mask_chunk,
+                            dropout_p=self.dropout_p if self.training else 0.0,
+                            is_causal=False,
+                        )
+                    )
+                y = torch.cat(chunks, dim=0)
+            else:
+                y = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                    is_causal=False,
+                )
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
             if attn_mask is not None:
@@ -91,6 +116,7 @@ class TransformerPortfolioBlock(nn.Module):
         ffn_mult: int,
         dropout: float,
         use_flash_attention: bool,
+        sdpa_batch_limit: int,
     ) -> None:
         super().__init__()
         self.norm_query = nn.LayerNorm(int(dim))
@@ -100,6 +126,7 @@ class TransformerPortfolioBlock(nn.Module):
             num_heads=int(num_heads),
             dropout=float(dropout),
             use_flash_attention=bool(use_flash_attention),
+            sdpa_batch_limit=int(sdpa_batch_limit),
         )
         self.resid_dropout = nn.Dropout(float(dropout))
         self.norm_ffn = nn.LayerNorm(int(dim))
@@ -149,6 +176,7 @@ class TransformerBasePortfolioModel(nn.Module):
         use_time_pos: bool = True,
         use_symbol_pos: bool = True,
         input_dropout: float = 0.0,
+        sdpa_batch_limit: int = 4096,
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         temporal_ffn_mult: int = 2,
@@ -192,6 +220,7 @@ class TransformerBasePortfolioModel(nn.Module):
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
         self.use_time_pos = bool(use_time_pos)
         self.use_symbol_pos = bool(use_symbol_pos)
+        self.sdpa_batch_limit = int(sdpa_batch_limit)
 
         self.feature_proj = nn.Linear(self.num_features, self.d_model)
         self.input_dropout = nn.Dropout(float(input_dropout))
@@ -206,6 +235,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(temporal_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(0, int(temporal_layers)))
             ]
@@ -218,6 +248,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(cross_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(0, int(cross_layers)))
             ]
@@ -230,6 +261,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(joint_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(0, int(joint_layers)))
             ]
@@ -245,6 +277,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(cross_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(1, int(latent_layers)))
             ]
@@ -257,6 +290,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(cross_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(1, int(market_layers)))
             ]
@@ -269,6 +303,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(cross_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(1, int(market_layers)))
             ]
@@ -281,6 +316,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     ffn_mult=int(cross_ffn_mult),
                     dropout=float(dropout),
                     use_flash_attention=bool(use_flash_attention),
+                    sdpa_batch_limit=self.sdpa_batch_limit,
                 )
                 for _ in range(max(1, int(market_layers)))
             ]
