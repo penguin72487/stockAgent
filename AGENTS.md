@@ -72,6 +72,11 @@ training:
     use_symbol_pos: true
     input_dropout: 0.0
     sdpa_batch_limit: 4096
+    norm_type: rmsnorm
+    ffn_type: swiglu
+    qk_norm: true
+    rope_temporal: true
+    rope_base: 10000.0
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
@@ -86,6 +91,11 @@ training:
     num_latent_factors: 16
     num_market_tokens: 4
     market_layers: 1
+    dynamic_latent_tokens: true
+    dynamic_market_tokens: true
+    dynamic_token_hidden_mult: 2
+    dynamic_token_gate_init: 0.1
+    dynamic_token_dropout: 0.1
     head_hidden_dim: 48
     head_layers: 1
     dropout: 0.2
@@ -104,6 +114,18 @@ Notes:
 - For large universes, prefer `latent` or `market_token`.
 - `return_aux_details` is useful for explainability but can increase memory pressure during training. Prefer `false` for tight VRAM training and enable it for explainability runs when needed.
 - The previous low-rank model remains available as `low_rank_market_transformer_portfolio`.
+
+Modern Transformer module contract:
+
+- Keep residual connections and Pre-Norm.
+- Default modern block settings are `norm_type: rmsnorm`, `ffn_type: swiglu`, `qk_norm: true`, `rope_temporal: true`.
+- Apply RoPE only to temporal attention by default. Do not apply RoPE over the stock axis unless stock order is deliberately made meaningful.
+- Keep PyTorch SDPA/Flash path enabled and keep `sdpa_batch_limit` for large `batch * symbols` temporal attention.
+- Dynamic latent/market tokens should be gated deltas around static token anchors:
+  - `dynamic_token = static_query + sigmoid(gate) * input_conditioned_delta`
+  - use market-summary inputs such as masked stock embedding mean/std
+  - keep dynamic gates small at initialization, e.g. `dynamic_token_gate_init: 0.1`
+- When `return_aux_details` is true, expose dynamic token query/delta/gate/summary tensors so explainability can detect token collapse, over-concentration, or strange liquidity/price-level rules.
 
 ## Scalable Transformer Base Portfolio
 
@@ -202,6 +224,8 @@ Expected explainability workflow:
 
 - `python explain_model.py` should default to drawing the full explainability set unless the user asks for a smaller run.
 - Analyze all folds when making model-level claims.
+- During training, if `training.explain_after_each_fold: true`, generate that fold's test explainability immediately after the fold final-test artifacts are written.
+- Default test explainability should use only each fold's first test year unless the user explicitly asks for all test years.
 - Use local artifacts under paths such as:
   - `data_yahoo/tw_stocks/lookback16/explainability`
   - future lookback-32 explainability outputs
@@ -214,6 +238,13 @@ Expected explainability workflow:
   - aux summaries for latent factors and market tokens
 - Be cautious with perturbation `score_abs_delta` when masked scores use sentinel values such as `-1e9`; prefer weight deltas, rank changes, gradients, and integrated gradients.
 - Report concentration, turnover, drawdown, and time-attribution issues plainly.
+
+Walk-forward summary visualization rules:
+
+- Do not recreate `walkforward_first_test_year_only.png`; delete stale copies when refreshing artifacts.
+- Top-level walk-forward summary plots should include multiple first-test-year views, not only one equity curve.
+- First-test-year summary visuals should use only each fold's first test year, even when the fold's test split contains all future years.
+- Keep fold-level first-test-year return/risk, turnover, and concentration views visible so strategy behavior can be judged before later test years dominate the picture.
 
 ## Testing And Verification
 

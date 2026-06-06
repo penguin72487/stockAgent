@@ -566,6 +566,141 @@ def plot_fold_first_year_returns(
     plt.close()
 
 
+def plot_first_year_fold_metric_bars(
+    fold_ids: list[int],
+    all_first_year_strategy_log: list[np.ndarray],
+    all_first_year_baseline_log: list[np.ndarray],
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot per-fold first-test-year return/risk metrics."""
+    if not fold_ids:
+        return
+
+    labels = [f"F{int(fold_id):02d}" for fold_id in fold_ids]
+    rows: list[dict[str, float]] = []
+    for strategy, baseline in zip(all_first_year_strategy_log, all_first_year_baseline_log, strict=False):
+        result = _build_plot_result(strategy, baseline)
+        metrics = compute_metrics(result)
+        rows.append(
+            {
+                "strategy_return": float(metrics["cumulative_return"]),
+                "baseline_return": float(metrics["cumulative_benchmark"]),
+                "excess_return": float(metrics["excess_return_vs_universe_average"]),
+                "sharpe": float(metrics["sharpe"]),
+                "sortino": float(metrics["sortino"]),
+                "max_drawdown": float(metrics["max_drawdown"]),
+            }
+        )
+    if not rows:
+        return
+
+    x = np.arange(len(rows), dtype=np.float64)
+    width = 0.36
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+
+    strategy_return = np.array([row["strategy_return"] for row in rows], dtype=np.float64)
+    baseline_return = np.array([row["baseline_return"] for row in rows], dtype=np.float64)
+    excess_return = np.array([row["excess_return"] for row in rows], dtype=np.float64)
+    sharpe = np.array([row["sharpe"] for row in rows], dtype=np.float64)
+    sortino = np.array([row["sortino"] for row in rows], dtype=np.float64)
+    max_drawdown = np.array([row["max_drawdown"] for row in rows], dtype=np.float64)
+
+    ax = axes[0, 0]
+    ax.bar(x - width / 2, strategy_return, width, label="Strategy")
+    ax.bar(x + width / 2, baseline_return, width, label="Baseline")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Cumulative Return")
+    ax.set_ylabel("Return")
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.bar(x, excess_return, color=np.where(excess_return >= 0.0, "tab:green", "tab:red"))
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Excess Return")
+    ax.set_ylabel("Strategy - Baseline")
+
+    ax = axes[1, 0]
+    ax.plot(x, sharpe, marker="o", label="Sharpe")
+    ax.plot(x, sortino, marker="o", label="Sortino")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Risk-Adjusted Return")
+    ax.set_ylabel("Ratio")
+    ax.legend()
+
+    ax = axes[1, 1]
+    ax.bar(x, max_drawdown, color="tab:orange")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Max Drawdown")
+    ax.set_ylabel("Drawdown")
+
+    for ax in axes.ravel():
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_first_year_turnover_concentration(
+    fold_ids: list[int],
+    all_first_year_turnovers: list[np.ndarray],
+    all_first_year_weights: list[np.ndarray],
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot first-test-year turnover and concentration by fold."""
+    if not fold_ids:
+        return
+
+    labels = [f"F{int(fold_id):02d}" for fold_id in fold_ids]
+    mean_turnover: list[float] = []
+    mean_max_abs_weight: list[float] = []
+    mean_hhi: list[float] = []
+    for turnovers, weights in zip(all_first_year_turnovers, all_first_year_weights, strict=False):
+        turnover_arr = np.nan_to_num(np.asarray(turnovers, dtype=np.float64), nan=0.0)
+        weight_arr = np.nan_to_num(np.asarray(weights, dtype=np.float64), nan=0.0)
+        mean_turnover.append(float(turnover_arr.mean()) if turnover_arr.size else 0.0)
+        if weight_arr.size == 0:
+            mean_max_abs_weight.append(0.0)
+            mean_hhi.append(0.0)
+            continue
+        abs_weights = np.abs(weight_arr)
+        gross = abs_weights.sum(axis=1, keepdims=True)
+        shares = np.divide(abs_weights, np.maximum(gross, 1e-12))
+        hhi = np.square(shares).sum(axis=1)
+        mean_max_abs_weight.append(float(abs_weights.max(axis=1).mean()))
+        mean_hhi.append(float(hhi.mean()))
+
+    x = np.arange(len(labels), dtype=np.float64)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    axes[0].bar(x, np.array(mean_turnover, dtype=np.float64), color="tab:blue")
+    axes[0].set_title("First Test Year Mean Turnover")
+    axes[0].set_ylabel("Turnover")
+
+    axes[1].bar(x, np.array(mean_max_abs_weight, dtype=np.float64), color="tab:purple")
+    axes[1].set_title("First Test Year Mean Max Absolute Single-Name Weight")
+    axes[1].set_ylabel("Weight")
+
+    axes[2].bar(x, np.array(mean_hhi, dtype=np.float64), color="tab:brown")
+    axes[2].set_title("First Test Year Mean Weight HHI")
+    axes[2].set_ylabel("HHI")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=45, ha="right")
+
+    for ax in axes:
+        ax.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
 def plot_first_test_year_only(
     dates: np.ndarray,
     strategy_log_returns: np.ndarray,

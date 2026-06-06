@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -7,6 +9,199 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from stockagent.models.latent_factor_market_token_portfolio import _safe_attention_mask
 from stockagent.models.normalization import dual_branch_softmax, masked_cross_sectional_mean, masked_softmax
+
+
+class PortfolioRMSNorm(nn.Module):
+    """RMSNorm for transformer blocks without forcing a PyTorch version dependency."""
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(int(dim)))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x * torch.rsqrt(variance + self.eps).to(dtype=x.dtype)
+        return x_norm * self.weight.to(device=x.device, dtype=x.dtype)
+
+
+def _normalize_norm_type(norm_type: str) -> str:
+    normalized = str(norm_type).strip().lower().replace("-", "_")
+    if normalized in {"rms", "rms_norm", "rmsnorm"}:
+        return "rmsnorm"
+    if normalized in {"layer", "layer_norm", "layernorm"}:
+        return "layernorm"
+    raise ValueError("norm_type must be 'rmsnorm' or 'layernorm'")
+
+
+def _normalize_ffn_type(ffn_type: str) -> str:
+    normalized = str(ffn_type).strip().lower().replace("-", "_")
+    if normalized in {"swiglu", "swi_glu", "silu_glu"}:
+        return "swiglu"
+    if normalized in {"gelu", "mlp"}:
+        return "gelu"
+    raise ValueError("ffn_type must be 'swiglu' or 'gelu'")
+
+
+def _make_norm(dim: int, norm_type: str) -> nn.Module:
+    norm_type = _normalize_norm_type(norm_type)
+    if norm_type == "rmsnorm":
+        return PortfolioRMSNorm(int(dim))
+    return nn.LayerNorm(int(dim))
+
+
+def _round_up_to_multiple(value: float, multiple: int = 8) -> int:
+    multiple = max(1, int(multiple))
+    return int(math.ceil(float(value) / multiple) * multiple)
+
+
+def _ffn_hidden_dim(dim: int, ffn_mult: int, ffn_type: str) -> int:
+    dim = int(dim)
+    ffn_mult = max(1, int(ffn_mult))
+    if _normalize_ffn_type(ffn_type) == "swiglu":
+        return max(8, _round_up_to_multiple(dim * ffn_mult * 2.0 / 3.0, 8))
+    return max(dim, dim * ffn_mult)
+
+
+class SwiGLUFeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(int(dim), int(hidden_dim))
+        self.value_proj = nn.Linear(int(dim), int(hidden_dim))
+        self.out_proj = nn.Linear(int(hidden_dim), int(dim))
+        self.dropout = nn.Dropout(float(dropout))
+        self.out_dropout = nn.Dropout(float(dropout))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = F.silu(self.gate_proj(x)) * self.value_proj(x)
+        hidden = self.dropout(hidden)
+        return self.out_dropout(self.out_proj(hidden))
+
+
+class GELUFeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(int(dim), int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), int(dim)),
+            nn.Dropout(float(dropout)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class GatedProjection(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, dropout: float, ffn_type: str) -> None:
+        super().__init__()
+        self.ffn_type = _normalize_ffn_type(ffn_type)
+        if self.ffn_type == "swiglu":
+            self.proj = nn.Linear(int(in_dim), int(out_dim) * 2)
+        else:
+            self.proj = nn.Linear(int(in_dim), int(out_dim))
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        projected = self.proj(x)
+        if self.ffn_type == "swiglu":
+            gate, value = projected.chunk(2, dim=-1)
+            projected = F.silu(gate) * value
+        else:
+            projected = F.gelu(projected)
+        return self.dropout(projected)
+
+
+def _apply_rope(x: torch.Tensor, positions: torch.Tensor, base: float = 10000.0) -> torch.Tensor:
+    rot_dim = (int(x.size(-1)) // 2) * 2
+    if rot_dim <= 0:
+        return x
+    positions = positions.to(device=x.device, dtype=torch.float32)
+    inv_freq = torch.arange(0, rot_dim, 2, device=x.device, dtype=torch.float32)
+    inv_freq = torch.pow(float(base), -inv_freq / float(rot_dim))
+    angles = positions[:, None] * inv_freq[None, :]
+    cos = angles.cos().to(dtype=x.dtype)[None, None, :, :]
+    sin = angles.sin().to(dtype=x.dtype)[None, None, :, :]
+
+    x_rot = x[..., :rot_dim]
+    x_pass = x[..., rot_dim:]
+    x_even = x_rot[..., 0::2]
+    x_odd = x_rot[..., 1::2]
+    rotated = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1)
+    rotated = rotated.flatten(start_dim=-2)
+    if x_pass.numel() == 0:
+        return rotated
+    return torch.cat([rotated, x_pass], dim=-1)
+
+
+def _rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    return x * torch.rsqrt(variance + eps).to(dtype=x.dtype)
+
+
+def _masked_market_summary_parts(z_stock: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_bool = mask.to(device=z_stock.device, dtype=torch.bool)
+    weights = mask_bool.to(dtype=z_stock.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=1).clamp_min(1.0)
+    mean = (z_stock * weights).sum(dim=1) / denom
+    centered = (z_stock - mean.unsqueeze(1)) * weights
+    variance = centered.float().pow(2).sum(dim=1) / denom.float()
+    std = torch.sqrt(variance.clamp_min(0.0) + 1e-6).to(dtype=z_stock.dtype)
+    return torch.stack([mean, std], dim=1)
+
+
+def _gate_logit(init_value: float) -> float:
+    value = min(max(float(init_value), 1e-4), 1.0 - 1e-4)
+    return math.log(value / (1.0 - value))
+
+
+class DynamicTokenGenerator(nn.Module):
+    """Generate input-conditioned latent or market query deltas from market summary."""
+
+    def __init__(
+        self,
+        *,
+        dim: int,
+        num_tokens: int,
+        hidden_mult: int,
+        dropout: float,
+        gate_init: float,
+        norm_type: str,
+        ffn_type: str,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.num_tokens = max(1, int(num_tokens))
+        summary_dim = self.dim * 2
+        hidden_dim = max(self.dim, _round_up_to_multiple(self.dim * max(1, int(hidden_mult)), 8))
+        self.summary_norm = _make_norm(summary_dim, norm_type)
+        self.summary_proj = GatedProjection(summary_dim, hidden_dim, dropout, ffn_type)
+        self.out_proj = nn.Linear(hidden_dim, self.num_tokens * self.dim)
+        self.delta_dropout = nn.Dropout(float(dropout))
+        self.gate_logit = nn.Parameter(torch.tensor(_gate_logit(gate_init), dtype=torch.float32))
+
+    def forward(
+        self,
+        base_queries: torch.Tensor,
+        z_stock: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz = int(z_stock.size(0))
+        summary_parts = _masked_market_summary_parts(z_stock, mask)
+        summary = summary_parts.flatten(start_dim=1)
+        hidden = self.summary_proj(self.summary_norm(summary))
+        delta = self.out_proj(hidden).reshape(bsz, self.num_tokens, self.dim)
+        delta = self.delta_dropout(delta)
+        gate = torch.sigmoid(self.gate_logit).to(device=delta.device, dtype=delta.dtype)
+        base = base_queries.expand(bsz, -1, -1)
+        dynamic = base + gate * delta
+        return dynamic, {
+            "delta": delta,
+            "gate": gate.reshape(1),
+            "summary_parts": summary_parts,
+            "queries": dynamic,
+        }
 
 
 class FlashSDPAAttention(nn.Module):
@@ -24,6 +219,8 @@ class FlashSDPAAttention(nn.Module):
         dropout: float,
         use_flash_attention: bool = True,
         sdpa_batch_limit: int = 4096,
+        qk_norm: bool = True,
+        rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -34,6 +231,8 @@ class FlashSDPAAttention(nn.Module):
         self.scale = float(self.head_dim) ** -0.5
         self.use_flash_attention = bool(use_flash_attention)
         self.sdpa_batch_limit = int(sdpa_batch_limit)
+        self.qk_norm = bool(qk_norm)
+        self.rope_base = float(rope_base)
 
         self.q_proj = nn.Linear(self.dim, self.dim)
         self.k_proj = nn.Linear(self.dim, self.dim)
@@ -55,12 +254,19 @@ class FlashSDPAAttention(nn.Module):
         query: torch.Tensor,
         context: torch.Tensor,
         key_mask: torch.Tensor | None = None,
+        rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, query_steps, _ = query.shape
         key_steps = int(context.size(1))
         q = self._project(query, self.q_proj)
         k = self._project(context, self.k_proj)
         v = self._project(context, self.v_proj)
+        if rope_positions is not None and int(rope_positions.numel()) >= max(query_steps, key_steps):
+            q = _apply_rope(q, rope_positions[:query_steps], base=self.rope_base)
+            k = _apply_rope(k, rope_positions[:key_steps], base=self.rope_base)
+        if self.qk_norm:
+            q = _rms_normalize_last_dim(q)
+            k = _rms_normalize_last_dim(k)
 
         attn_mask = None
         if key_mask is not None:
@@ -117,36 +323,47 @@ class TransformerPortfolioBlock(nn.Module):
         dropout: float,
         use_flash_attention: bool,
         sdpa_batch_limit: int,
+        norm_type: str,
+        ffn_type: str,
+        qk_norm: bool,
+        rope_base: float,
     ) -> None:
         super().__init__()
-        self.norm_query = nn.LayerNorm(int(dim))
-        self.norm_context = nn.LayerNorm(int(dim))
+        norm_type = _normalize_norm_type(norm_type)
+        ffn_type = _normalize_ffn_type(ffn_type)
+        self.norm_query = _make_norm(int(dim), norm_type)
+        self.norm_context = _make_norm(int(dim), norm_type)
         self.attn = FlashSDPAAttention(
             dim=int(dim),
             num_heads=int(num_heads),
             dropout=float(dropout),
             use_flash_attention=bool(use_flash_attention),
             sdpa_batch_limit=int(sdpa_batch_limit),
+            qk_norm=bool(qk_norm),
+            rope_base=float(rope_base),
         )
         self.resid_dropout = nn.Dropout(float(dropout))
-        self.norm_ffn = nn.LayerNorm(int(dim))
-        hidden_dim = max(int(dim), int(dim) * max(1, int(ffn_mult)))
-        self.ffn = nn.Sequential(
-            nn.Linear(int(dim), hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, int(dim)),
-            nn.Dropout(float(dropout)),
-        )
+        self.norm_ffn = _make_norm(int(dim), norm_type)
+        hidden_dim = _ffn_hidden_dim(int(dim), int(ffn_mult), ffn_type)
+        if ffn_type == "swiglu":
+            self.ffn = SwiGLUFeedForward(int(dim), hidden_dim, float(dropout))
+        else:
+            self.ffn = GELUFeedForward(int(dim), hidden_dim, float(dropout))
 
     def forward(
         self,
         query: torch.Tensor,
         context: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
+        rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         context = query if context is None else context
-        attn_out = self.attn(self.norm_query(query), self.norm_context(context), key_mask=key_mask)
+        attn_out = self.attn(
+            self.norm_query(query),
+            self.norm_context(context),
+            key_mask=key_mask,
+            rope_positions=rope_positions,
+        )
         query = query + self.resid_dropout(attn_out)
         query = query + self.ffn(self.norm_ffn(query))
         return query
@@ -177,6 +394,11 @@ class TransformerBasePortfolioModel(nn.Module):
         use_symbol_pos: bool = True,
         input_dropout: float = 0.0,
         sdpa_batch_limit: int = 4096,
+        norm_type: str = "rmsnorm",
+        ffn_type: str = "swiglu",
+        qk_norm: bool = True,
+        rope_temporal: bool = True,
+        rope_base: float = 10000.0,
         temporal_layers: int = 2,
         temporal_heads: int = 4,
         temporal_ffn_mult: int = 2,
@@ -191,6 +413,11 @@ class TransformerBasePortfolioModel(nn.Module):
         num_latent_factors: int = 16,
         num_market_tokens: int = 4,
         market_layers: int = 1,
+        dynamic_latent_tokens: bool = True,
+        dynamic_market_tokens: bool = True,
+        dynamic_token_hidden_mult: int = 2,
+        dynamic_token_gate_init: float = 0.1,
+        dynamic_token_dropout: float = 0.1,
         head_hidden_dim: int = 64,
         head_layers: int = 1,
         dropout: float = 0.1,
@@ -221,114 +448,117 @@ class TransformerBasePortfolioModel(nn.Module):
         self.use_time_pos = bool(use_time_pos)
         self.use_symbol_pos = bool(use_symbol_pos)
         self.sdpa_batch_limit = int(sdpa_batch_limit)
+        self.norm_type = _normalize_norm_type(norm_type)
+        self.ffn_type = _normalize_ffn_type(ffn_type)
+        self.qk_norm = bool(qk_norm)
+        self.rope_temporal = bool(rope_temporal)
+        self.rope_base = float(rope_base)
+        self.dynamic_latent_tokens = bool(dynamic_latent_tokens)
+        self.dynamic_market_tokens = bool(dynamic_market_tokens)
 
         self.feature_proj = nn.Linear(self.num_features, self.d_model)
         self.input_dropout = nn.Dropout(float(input_dropout))
         self.time_position = nn.Parameter(torch.randn(1, self.lookback, 1, self.d_model) * 0.02)
         self.symbol_position = nn.Parameter(torch.randn(1, 1, self.num_symbols, self.d_model) * 0.02)
+        self.register_buffer(
+            "temporal_rope_positions",
+            torch.arange(self.lookback, dtype=torch.float32),
+            persistent=False,
+        )
+
+        def make_block(num_heads: int, ffn_mult: int) -> TransformerPortfolioBlock:
+            return TransformerPortfolioBlock(
+                dim=self.d_model,
+                num_heads=int(num_heads),
+                ffn_mult=int(ffn_mult),
+                dropout=float(dropout),
+                use_flash_attention=bool(use_flash_attention),
+                sdpa_batch_limit=self.sdpa_batch_limit,
+                norm_type=self.norm_type,
+                ffn_type=self.ffn_type,
+                qk_norm=self.qk_norm,
+                rope_base=self.rope_base,
+            )
 
         self.temporal_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(temporal_heads),
-                    ffn_mult=int(temporal_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(temporal_heads), int(temporal_ffn_mult))
                 for _ in range(max(0, int(temporal_layers)))
             ]
         )
         self.cross_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(cross_heads),
-                    ffn_mult=int(cross_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(0, int(cross_layers)))
             ]
         )
         self.joint_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(joint_heads),
-                    ffn_mult=int(joint_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(joint_heads), int(joint_ffn_mult))
                 for _ in range(max(0, int(joint_layers)))
             ]
         )
 
-        self.latent_queries = nn.Parameter(torch.randn(1, max(1, int(num_latent_factors)), self.d_model) * 0.02)
-        self.market_queries = nn.Parameter(torch.randn(1, max(1, int(num_market_tokens)), self.d_model) * 0.02)
+        latent_count = max(1, int(num_latent_factors))
+        market_count = max(1, int(num_market_tokens))
+        self.latent_queries = nn.Parameter(torch.randn(1, latent_count, self.d_model) * 0.02)
+        self.market_queries = nn.Parameter(torch.randn(1, market_count, self.d_model) * 0.02)
+        self.dynamic_latent_generator = (
+            DynamicTokenGenerator(
+                dim=self.d_model,
+                num_tokens=latent_count,
+                hidden_mult=int(dynamic_token_hidden_mult),
+                dropout=float(dynamic_token_dropout),
+                gate_init=float(dynamic_token_gate_init),
+                norm_type=self.norm_type,
+                ffn_type=self.ffn_type,
+            )
+            if self.dynamic_latent_tokens
+            else None
+        )
+        self.dynamic_market_generator = (
+            DynamicTokenGenerator(
+                dim=self.d_model,
+                num_tokens=market_count,
+                hidden_mult=int(dynamic_token_hidden_mult),
+                dropout=float(dynamic_token_dropout),
+                gate_init=float(dynamic_token_gate_init),
+                norm_type=self.norm_type,
+                ffn_type=self.ffn_type,
+            )
+            if self.dynamic_market_tokens
+            else None
+        )
         self.latent_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(cross_heads),
-                    ffn_mult=int(cross_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(latent_layers)))
             ]
         )
         self.market_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(cross_heads),
-                    ffn_mult=int(cross_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
         )
         self.stock_read_latent_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(cross_heads),
-                    ffn_mult=int(cross_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
         )
         self.stock_read_market_blocks = nn.ModuleList(
             [
-                TransformerPortfolioBlock(
-                    dim=self.d_model,
-                    num_heads=int(cross_heads),
-                    ffn_mult=int(cross_ffn_mult),
-                    dropout=float(dropout),
-                    use_flash_attention=bool(use_flash_attention),
-                    sdpa_batch_limit=self.sdpa_batch_limit,
-                )
+                make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
         )
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
-        self.output_norm = nn.LayerNorm(self.d_model)
+        self.output_norm = _make_norm(self.d_model, self.norm_type)
         self.portfolio_fusion = nn.Sequential(
-            nn.Linear(self.d_model * 3, self.d_model),
-            nn.LayerNorm(self.d_model),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
+            GatedProjection(self.d_model * 3, self.d_model, float(dropout), self.ffn_type),
+            _make_norm(self.d_model, self.norm_type),
         )
 
         head: list[nn.Module] = []
@@ -336,9 +566,7 @@ class TransformerBasePortfolioModel(nn.Module):
         for _ in range(max(0, int(head_layers))):
             head.extend(
                 [
-                    nn.Linear(in_dim, int(head_hidden_dim)),
-                    nn.GELU(),
-                    nn.Dropout(float(dropout)),
+                    GatedProjection(in_dim, int(head_hidden_dim), float(dropout), self.ffn_type),
                 ]
             )
             in_dim = int(head_hidden_dim)
@@ -401,6 +629,17 @@ class TransformerBasePortfolioModel(nn.Module):
             return activation_checkpoint(block, *args, use_reentrant=False)
         return block(*args)
 
+    def _temporal_rope_positions(self, steps: int, device: torch.device) -> torch.Tensor | None:
+        if not self.rope_temporal:
+            return None
+        if steps <= int(self.temporal_rope_positions.numel()):
+            return self.temporal_rope_positions[:steps].to(device=device)
+        return torch.arange(steps, device=device, dtype=torch.float32)
+
+    @staticmethod
+    def _prefixed_aux(prefix: str, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {f"{prefix}_{name}": value for name, value in values.items()}
+
     def _symbol_position(self, n_symbols: int) -> torch.Tensor:
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]
@@ -423,8 +662,9 @@ class TransformerBasePortfolioModel(nn.Module):
     def _apply_temporal_blocks(self, h: torch.Tensor) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
         seq = h.permute(0, 2, 1, 3).contiguous().reshape(bsz * n_symbols, steps, dim)
+        rope_positions = self._temporal_rope_positions(steps, h.device)
         for block in self.temporal_blocks:
-            seq = self._run_block(block, seq, None, None)
+            seq = self._run_block(block, seq, None, None, rope_positions)
         return seq.reshape(bsz, n_symbols, steps, dim).permute(0, 2, 1, 3).contiguous()
 
     def _apply_cross_blocks(self, h: torch.Tensor, safe_mask: torch.Tensor) -> torch.Tensor:
@@ -486,9 +726,14 @@ class TransformerBasePortfolioModel(nn.Module):
         h = self._apply_temporal_blocks(h)
         z_base = self._pool_temporal(h, safe_mask)
         bsz = int(h.size(0))
+        aux: dict[str, torch.Tensor] = {}
 
         if use_latent:
-            latent = self.latent_queries.expand(bsz, -1, -1)
+            if self.dynamic_latent_generator is not None:
+                latent, dynamic_aux = self.dynamic_latent_generator(self.latent_queries, z_base, safe_mask)
+                aux.update(self._prefixed_aux("dynamic_latent", dynamic_aux))
+            else:
+                latent = self.latent_queries.expand(bsz, -1, -1)
             for block in self.latent_blocks:
                 latent = self._run_block(block, latent, z_base, safe_mask)
             market_context = latent
@@ -502,7 +747,11 @@ class TransformerBasePortfolioModel(nn.Module):
             market_key_mask = safe_mask
             z_factor_context = z_base
 
-        market_tokens = self.market_queries.expand(bsz, -1, -1)
+        if self.dynamic_market_generator is not None:
+            market_tokens, dynamic_aux = self.dynamic_market_generator(self.market_queries, z_base, safe_mask)
+            aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
+        else:
+            market_tokens = self.market_queries.expand(bsz, -1, -1)
         for block in self.market_blocks:
             market_tokens = self._run_block(block, market_tokens, market_context, market_key_mask)
 
@@ -512,14 +761,15 @@ class TransformerBasePortfolioModel(nn.Module):
 
         z_stock = self.portfolio_fusion(torch.cat([z_base, z_factor_context, z_market_context], dim=-1))
         z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
-        return z_stock, {
+        aux.update({
             "token_embedding": h,
             "stock_embedding": z_base,
             "latent_factors": latent,
             "market_tokens": market_tokens,
             "z_factor_context": z_factor_context,
             "z_market_context": z_market_context,
-        }
+        })
+        return z_stock, aux
 
     def forward(
         self,

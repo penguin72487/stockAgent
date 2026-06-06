@@ -27,6 +27,7 @@ class ExplainabilitySettings:
     ig_steps: int = 8
     perturb: bool = True
     sample_method: str = "even"
+    first_test_year_only: bool = True
 
 
 @dataclass(slots=True)
@@ -993,7 +994,23 @@ def _available_checkpoint_folds(folds: list[WalkForwardFold], output_dir: Path) 
     return sorted(available)
 
 
-def _dataset_for_split(panel: PanelData, fold: WalkForwardFold, split: str, lookback: int) -> CrossSectionalDataset:
+def _first_year_indices(panel: PanelData, indices: np.ndarray) -> np.ndarray:
+    if indices.size == 0:
+        return indices
+    dates = np.asarray(panel.dates[indices], dtype="datetime64[D]").astype(object)
+    years = np.array([int(date.year) for date in dates], dtype=np.int32)
+    first_year = int(years.min())
+    return indices[years == first_year]
+
+
+def _dataset_for_split(
+    panel: PanelData,
+    fold: WalkForwardFold,
+    split: str,
+    lookback: int,
+    *,
+    first_test_year_only: bool = True,
+) -> CrossSectionalDataset:
     split_norm = split.strip().lower()
     if split_norm == "train":
         indices = fold.train_indices
@@ -1001,6 +1018,8 @@ def _dataset_for_split(panel: PanelData, fold: WalkForwardFold, split: str, look
         indices = fold.val_indices
     elif split_norm == "test":
         indices = fold.test_indices
+        if first_test_year_only:
+            indices = _first_year_indices(panel, indices)
     else:
         raise ValueError("split must be one of: train, val, test")
     return CrossSectionalDataset(panel, indices, lookback)
@@ -1088,7 +1107,13 @@ def run_checkpoint_explanation(
         device,
         strict=strict,
     )
-    dataset = _dataset_for_split(context.panel, context.fold, split, context.config.training.lookback)
+    dataset = _dataset_for_split(
+        context.panel,
+        context.fold,
+        split,
+        context.config.training.lookback,
+        first_test_year_only=settings.first_test_year_only,
+    )
     batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
     dates = [str(np.datetime_as_string(context.panel.dates[int(idx)], unit="D")) for idx in date_indices]
     result = explain_batch(
@@ -1112,6 +1137,7 @@ def run_checkpoint_explanation(
         "checkpoint": str(context.checkpoint_path),
         "device": str(device),
         "sample_rows": int(len(dates)),
+        "first_test_year_only": bool(settings.first_test_year_only),
         "date_start": dates[0] if dates else None,
         "date_end": dates[-1] if dates else None,
         **checkpoint_info,
@@ -1133,6 +1159,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rows", default=32, type=int)
     parser.add_argument("--ig-steps", default=8, type=int)
     parser.add_argument("--sample-method", default="even", choices=("even", "first", "last"))
+    parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
     parser.add_argument("--no-perturb", action="store_true", help="Skip feature perturbation sensitivity.")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
@@ -1147,6 +1174,7 @@ def main(argv: list[str] | None = None) -> None:
         ig_steps=args.ig_steps,
         perturb=not args.no_perturb,
         sample_method=args.sample_method,
+        first_test_year_only=not args.all_test_years,
     )
     # Default behavior: if neither --fold nor --checkpoint is provided,
     # run explainability for all folds that have checkpoint_best.pt.
