@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 2
 
 environment:
   conda_env: fintech
@@ -16,8 +16,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_okx
-  benchmark_name: "BTCUSDTSWAP"
+  parquet_root: data_yahoo/tw_stocks
+  benchmark_name: "2330"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -33,8 +33,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0005
-  sell_fee_rate: 0.0005
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -60,16 +60,24 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: true
-  lookback: 32
-  batch_size: 32
-  batch_size_train: 32
-  batch_size_eval: 32
+  lookback: 8
+  batch_size: 64
+  batch_size_train: 64
+  batch_size_eval: 64
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  early_stopping_no_improve_ratio: 0.2
   val_interval_epochs: 1
   curve_test_interval: 1
   curve_plot_interval: 1
   curve_plot_async: true
+  explain_after_each_fold: true
+  explain_first_test_year_only: true
+  explain_top_k: 20
+  explain_max_rows: 32
+  explain_ig_steps: 8
+  explain_sample_method: even
+  explain_perturb: true
+  explain_write_plots: true
   cache_train_tensors_on_gpu: false
   cache_eval_tensors_on_gpu: false
   learning_rate: 0.0001
@@ -83,7 +91,7 @@ training:
   hidden_layers: 1
   dropout: 0.1
   num_workers: 0
-  weight_decay: 0.0001
+  weight_decay: 0.1
   grad_clip_norm: 0.0
   finite_check_interval_steps: 0
   loss_type: sortino
@@ -187,18 +195,23 @@ training:
     return_aux: true
     return_aux_details: false
   transformer_base_portfolio:
-    d_model: 48
+    d_model: 32
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
-    attention_mode: axial
+    attention_mode: market_token
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
-    sdpa_batch_limit: 4096
+    sdpa_batch_limit: 16384
+    norm_type: rmsnorm
+    ffn_type: swiglu
+    qk_norm: true
+    rope_temporal: true
+    rope_base: 10000.0
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
@@ -213,12 +226,17 @@ training:
     num_latent_factors: 16
     num_market_tokens: 4
     market_layers: 1
-    head_hidden_dim: 48
+    dynamic_latent_tokens: true
+    dynamic_market_tokens: true
+    dynamic_token_hidden_mult: 2
+    dynamic_token_gate_init: 0.1
+    dynamic_token_dropout: 0.1
+    head_hidden_dim: 32
     head_layers: 1
     dropout: 0.2
     default_temperature: 1.0
     portfolio_mode: long_short
-    max_full_tokens: 4096
+    max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: true
     return_aux_details: false

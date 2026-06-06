@@ -21,10 +21,10 @@ LOG_RETURN_FEATURE_COLUMNS = [
     # Price Log Return
     # 前一日價格變化
     # ==================================================
-    # "open_logret_1d",
-    # "max_logret_1d",
-    # "min_logret_1d",
-    # "close_logret_1d",
+    "open_logret_1d",
+    "max_logret_1d",
+    "min_logret_1d",
+    "close_logret_1d",
 
     # ==================================================
     # Volume
@@ -39,7 +39,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     # ==================================================
     # "intraday_return_co",
     # "overnight_gap_oc",
-    "intraday_range",
+    # "intraday_range",
 
     # ==================================================
     # Body

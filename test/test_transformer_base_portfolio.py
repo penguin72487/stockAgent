@@ -8,7 +8,11 @@ import torch
 
 from stockagent.config import load_config
 from stockagent.models.factory import build_model, model_hidden_dim_hint
-from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
+from stockagent.models.transformer_base_portfolio import (
+    PortfolioRMSNorm,
+    SwiGLUFeedForward,
+    TransformerBasePortfolioModel,
+)
 from stockagent.training.trainer import _extract_weights_and_aux
 
 
@@ -31,6 +35,11 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
         "use_symbol_pos": True,
         "input_dropout": 0.0,
         "sdpa_batch_limit": 4096,
+        "norm_type": "rmsnorm",
+        "ffn_type": "swiglu",
+        "qk_norm": True,
+        "rope_temporal": True,
+        "rope_base": 10000.0,
         "temporal_layers": 1,
         "temporal_heads": 2,
         "temporal_ffn_mult": 1,
@@ -45,6 +54,11 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
         "num_latent_factors": 4,
         "num_market_tokens": 2,
         "market_layers": 1,
+        "dynamic_latent_tokens": True,
+        "dynamic_market_tokens": True,
+        "dynamic_token_hidden_mult": 2,
+        "dynamic_token_gate_init": 0.1,
+        "dynamic_token_dropout": 0.0,
         "head_hidden_dim": 24,
         "head_layers": 1,
         "dropout": 0.0,
@@ -110,6 +124,58 @@ def test_sdpa_batch_chunking_matches_unchunked_eval() -> None:
     assert torch.allclose(out_a["score_logits"], out_b["score_logits"], atol=1e-5, rtol=1e-5)
 
 
+def test_modern_components_and_dynamic_token_aux() -> None:
+    device = _device()
+    model = _make_model(attention_mode="latent").eval()
+    assert isinstance(model.temporal_blocks[0].norm_query, PortfolioRMSNorm)
+    assert isinstance(model.temporal_blocks[0].ffn, SwiGLUFeedForward)
+    assert model.temporal_blocks[0].attn.qk_norm is True
+    assert model.rope_temporal is True
+    assert model.dynamic_latent_generator is not None
+    assert model.dynamic_market_generator is not None
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    with torch.no_grad():
+        out = model(x, mask)
+
+    aux = out["aux"]
+    assert aux["dynamic_latent_delta"].shape == (2, 4, 24)
+    assert aux["dynamic_latent_queries"].shape == (2, 4, 24)
+    assert aux["dynamic_market_delta"].shape == (2, 2, 24)
+    assert aux["dynamic_market_queries"].shape == (2, 2, 24)
+    assert aux["dynamic_latent_summary_parts"].shape == (2, 2, 24)
+    assert aux["dynamic_market_summary_parts"].shape == (2, 2, 24)
+    assert 0.0 < float(aux["dynamic_latent_gate"].item()) < 1.0
+    assert 0.0 < float(aux["dynamic_market_gate"].item()) < 1.0
+
+
+def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:
+    device = _device()
+    model = _make_model(
+        norm_type="layernorm",
+        ffn_type="gelu",
+        qk_norm=False,
+        rope_temporal=False,
+        dynamic_latent_tokens=False,
+        dynamic_market_tokens=False,
+    ).eval()
+    assert isinstance(model.temporal_blocks[0].norm_query, torch.nn.LayerNorm)
+    assert not isinstance(model.temporal_blocks[0].ffn, SwiGLUFeedForward)
+    assert model.temporal_blocks[0].attn.qk_norm is False
+    assert model.dynamic_latent_generator is None
+    assert model.dynamic_market_generator is None
+
+    x = torch.randn(1, 6, 13, 11, device=device)
+    mask = torch.ones(1, 13, dtype=torch.bool, device=device)
+    with torch.no_grad():
+        out = model(x, mask)
+
+    aux = out["aux"]
+    assert "dynamic_latent_delta" not in aux
+    assert "dynamic_market_delta" not in aux
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only SDPA batch-limit smoke")
 def test_large_temporal_batch_uses_chunked_sdpa_without_cuda_invalid_argument() -> None:
     device = _device()
@@ -161,3 +227,9 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.attention_mode == cfg.training.transformer_base_portfolio.attention_mode
     assert model.portfolio_mode == "long_short"
     assert model.sdpa_batch_limit == cfg.training.transformer_base_portfolio.sdpa_batch_limit
+    assert model.norm_type == cfg.training.transformer_base_portfolio.norm_type
+    assert model.ffn_type == cfg.training.transformer_base_portfolio.ffn_type
+    assert model.qk_norm == cfg.training.transformer_base_portfolio.qk_norm
+    assert model.rope_temporal == cfg.training.transformer_base_portfolio.rope_temporal
+    assert model.dynamic_latent_tokens == cfg.training.transformer_base_portfolio.dynamic_latent_tokens
+    assert model.dynamic_market_tokens == cfg.training.transformer_base_portfolio.dynamic_market_tokens

@@ -30,7 +30,8 @@ from stockagent.backtest.report import (
     plot_annual_performance,
     plot_equity_curve,
     plot_equity_curve_log,
-    plot_first_test_year_only,
+    plot_first_year_fold_metric_bars,
+    plot_first_year_turnover_concentration,
     plot_fold_first_year_returns,
 )
 from stockagent.backtest.simulator import (
@@ -2120,15 +2121,21 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
     stale_combined_log_plot = output_path / "walkforward_equity_curve_log.png"
     if stale_combined_log_plot.exists():
         stale_combined_log_plot.unlink()
+    stale_first_test_year_only_plot = output_path / "walkforward_first_test_year_only.png"
+    if stale_first_test_year_only_plot.exists():
+        stale_first_test_year_only_plot.unlink()
 
     all_strategy_returns: list[np.ndarray] = []
     all_benchmark_returns: list[np.ndarray] = []
     all_turnovers: list[np.ndarray] = []
     all_weights: list[np.ndarray] = []
     all_dates: list[np.ndarray] = []
+    all_first_year_fold_ids: list[int] = []
     all_first_year_dates: list[np.ndarray] = []
     all_first_year_strategy_log: list[np.ndarray] = []
     all_first_year_baseline_log: list[np.ndarray] = []
+    all_first_year_turnovers: list[np.ndarray] = []
+    all_first_year_weights: list[np.ndarray] = []
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
@@ -2147,9 +2154,12 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
         if years.size > 0:
             first_year = int(np.min(years))
             mask = years == first_year
+            all_first_year_fold_ids.append(int(result.fold_id))
             all_first_year_dates.append(fold_dates[mask])
             all_first_year_strategy_log.append(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).astype(np.float64))
             all_first_year_baseline_log.append(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).astype(np.float64))
+            all_first_year_turnovers.append(np.nan_to_num(fold_backtest.turnovers[mask], nan=0.0).astype(np.float64))
+            all_first_year_weights.append(np.nan_to_num(fold_backtest.weights_history[mask], nan=0.0).astype(np.float64))
 
     if not all_dates:
         return
@@ -2161,12 +2171,93 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
             all_first_year_baseline_log,
             output_path / "walkforward_first_year_cumulative_returns.png",
         )
-        plot_first_test_year_only(
-            all_first_year_dates[0],
-            all_first_year_strategy_log[0],
-            all_first_year_baseline_log[0],
-            output_path / "walkforward_first_test_year_only.png",
+        plot_first_year_fold_metric_bars(
+            all_first_year_fold_ids,
+            all_first_year_strategy_log,
+            all_first_year_baseline_log,
+            output_path / "walkforward_first_year_fold_metrics.png",
         )
+        plot_first_year_turnover_concentration(
+            all_first_year_fold_ids,
+            all_first_year_turnovers,
+            all_first_year_weights,
+            output_path / "walkforward_first_year_turnover_concentration.png",
+        )
+
+
+def _run_fold_explainability(
+    *,
+    model: nn.Module,
+    panel: PanelData,
+    config: ExperimentConfig,
+    output_path: Path,
+    fold: WalkForwardFold,
+    device: torch.device,
+    checkpoint_path: Path,
+) -> Path | None:
+    if not bool(getattr(config.training, "explain_after_each_fold", False)):
+        return None
+
+    from stockagent.explainability import (
+        ExplainabilitySettings,
+        _first_year_indices,
+        _sample_dataset,
+        explain_batch,
+        write_explanation_outputs,
+    )
+
+    test_indices = fold.test_indices
+    first_year_only = bool(getattr(config.training, "explain_first_test_year_only", True))
+    if first_year_only:
+        test_indices = _first_year_indices(panel, test_indices)
+    dataset = CrossSectionalDataset(panel, test_indices, config.training.lookback)
+    settings = ExplainabilitySettings(
+        top_k=int(getattr(config.training, "explain_top_k", 20)),
+        max_rows=int(getattr(config.training, "explain_max_rows", 32)),
+        ig_steps=int(getattr(config.training, "explain_ig_steps", 8)),
+        perturb=bool(getattr(config.training, "explain_perturb", True)),
+        sample_method=str(getattr(config.training, "explain_sample_method", "even")),
+        first_test_year_only=first_year_only,
+    )
+    batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
+    dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
+    was_training = model.training
+    model.eval()
+    try:
+        result = explain_batch(
+            model,
+            batch,
+            feature_names=panel.feature_names,
+            symbols=panel.symbols,
+            dates=dates,
+            settings=settings,
+            device=device,
+        )
+    finally:
+        if was_training:
+            model.train()
+
+    destination = output_path / "explainability" / f"fold_{int(fold.fold_id):02d}_test"
+    metadata = {
+        "model_name": config.training.model_name,
+        "fold_id": int(fold.fold_id),
+        "split": "test",
+        "checkpoint": str(checkpoint_path),
+        "device": str(device),
+        "sample_rows": int(len(dates)),
+        "first_test_year_only": first_year_only,
+        "date_start": dates[0] if dates else None,
+        "date_end": dates[-1] if dates else None,
+    }
+    write_explanation_outputs(
+        result,
+        destination,
+        metadata=metadata,
+        write_plots=bool(getattr(config.training, "explain_write_plots", True)),
+    )
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return destination
 
 
 def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult | None:
@@ -5238,7 +5329,6 @@ def run_training(
                 config.trading.gross_leverage,
                 chunk_rows=eval_chunk_rows,
                 profile_timing=profile_timing,
-                progress_label=f"[Fold {fold.fold_id} final-test]",
             )
             test_eval_total = time.perf_counter() - test_eval_start
 
@@ -5352,13 +5442,25 @@ def run_training(
             plot_total = time.perf_counter() - plot_start
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+            explain_start = time.perf_counter()
+            explain_path = _run_fold_explainability(
+                model=model,
+                panel=panel,
+                config=config,
+                output_path=output_path,
+                fold=fold,
+                device=device,
+                checkpoint_path=best_checkpoint_path,
+            )
+            if explain_path is not None:
+                print(f"[Fold {fold.fold_id}] explainability output: {explain_path}")
             if profile_timing:
                 _log_timing(
                     f"Train {train_years} fold {fold.fold_id} save_plot",
                     TimingBreakdown(
                         total_s=time.perf_counter() - save_start,
                         save_s=plot_start - save_start,
-                        plot_s=plot_total,
+                        plot_s=plot_total + (time.perf_counter() - explain_start),
                     ),
                 )
 

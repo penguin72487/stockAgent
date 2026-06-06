@@ -201,6 +201,11 @@ class TransformerBasePortfolioModelConfig:
     use_symbol_pos: bool = True
     input_dropout: float = 0.0
     sdpa_batch_limit: int = 4096
+    norm_type: str = "rmsnorm"
+    ffn_type: str = "swiglu"
+    qk_norm: bool = True
+    rope_temporal: bool = True
+    rope_base: float = 10000.0
     temporal_layers: int = 2
     temporal_heads: int = 4
     temporal_ffn_mult: int = 2
@@ -215,6 +220,11 @@ class TransformerBasePortfolioModelConfig:
     num_latent_factors: int = 16
     num_market_tokens: int = 4
     market_layers: int = 1
+    dynamic_latent_tokens: bool = True
+    dynamic_market_tokens: bool = True
+    dynamic_token_hidden_mult: int = 2
+    dynamic_token_gate_init: float = 0.1
+    dynamic_token_dropout: float = 0.1
     head_hidden_dim: int = 64
     head_layers: int = 1
     dropout: float = 0.1
@@ -374,6 +384,14 @@ class TrainingConfig:
     curve_test_interval: int = 100
     curve_plot_interval: int = 1
     curve_plot_async: bool = True
+    explain_after_each_fold: bool = True
+    explain_first_test_year_only: bool = True
+    explain_top_k: int = 20
+    explain_max_rows: int = 32
+    explain_ig_steps: int = 8
+    explain_sample_method: str = "even"
+    explain_perturb: bool = True
+    explain_write_plots: bool = True
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -495,6 +513,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("curve_test_interval", 100)
     training.setdefault("curve_plot_interval", 1)
     training.setdefault("curve_plot_async", True)
+    training.setdefault("explain_after_each_fold", True)
+    training.setdefault("explain_first_test_year_only", True)
+    training.setdefault("explain_top_k", 20)
+    training.setdefault("explain_max_rows", 32)
+    training.setdefault("explain_ig_steps", 8)
+    training.setdefault("explain_sample_method", "even")
+    training.setdefault("explain_perturb", True)
+    training.setdefault("explain_write_plots", True)
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -633,6 +659,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("use_symbol_pos", True)
     transformer_base_portfolio.setdefault("input_dropout", 0.0)
     transformer_base_portfolio.setdefault("sdpa_batch_limit", 4096)
+    transformer_base_portfolio.setdefault("norm_type", "rmsnorm")
+    transformer_base_portfolio.setdefault("ffn_type", "swiglu")
+    transformer_base_portfolio.setdefault("qk_norm", True)
+    transformer_base_portfolio.setdefault("rope_temporal", True)
+    transformer_base_portfolio.setdefault("rope_base", 10000.0)
     transformer_base_portfolio.setdefault("temporal_layers", 2)
     transformer_base_portfolio.setdefault("temporal_heads", 4)
     transformer_base_portfolio.setdefault("temporal_ffn_mult", 2)
@@ -647,6 +678,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("num_latent_factors", 16)
     transformer_base_portfolio.setdefault("num_market_tokens", 4)
     transformer_base_portfolio.setdefault("market_layers", 1)
+    transformer_base_portfolio.setdefault("dynamic_latent_tokens", True)
+    transformer_base_portfolio.setdefault("dynamic_market_tokens", True)
+    transformer_base_portfolio.setdefault("dynamic_token_hidden_mult", 2)
+    transformer_base_portfolio.setdefault("dynamic_token_gate_init", 0.1)
+    transformer_base_portfolio.setdefault("dynamic_token_dropout", 0.1)
     transformer_base_portfolio.setdefault("head_hidden_dim", 64)
     transformer_base_portfolio.setdefault("head_layers", 1)
     transformer_base_portfolio.setdefault("dropout", legacy_dropout)
