@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 2
+  start_fold: 1
 
 environment:
   conda_env: fintech
@@ -65,7 +65,7 @@ training:
   batch_size_train: 64
   batch_size_eval: 64
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.2
+  early_stopping_no_improve_ratio: 0.05
   val_interval_epochs: 1
   curve_test_interval: 1
   curve_plot_interval: 1
@@ -94,7 +94,7 @@ training:
   weight_decay: 0.1
   grad_clip_norm: 0.0
   finite_check_interval_steps: 0
-  loss_type: sortino
+  loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: true
   vram_budget_gb: 16
@@ -240,6 +240,7 @@ training:
     checkpoint_blocks: false
     return_aux: true
     return_aux_details: false
+     # return_aux_details: whether to return detailed aux outputs for analysis, such as attention weights and latent factors. Setting this to true may increase memory usage and reduce training speed, so it is typically set to false during training and true during inference or analysis.
   bottleneck_portfolio_autoencoder:
     d_model: 64
     z_dim: 32

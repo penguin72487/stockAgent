@@ -91,6 +91,58 @@ def _resolve_exposure_budget(gross_leverage: float) -> float:
     return min(1.0, max(0.0, float(gross_leverage)))
 
 
+def _normalize_target_weights_numpy(
+    weights: np.ndarray,
+    *,
+    long_only: bool,
+    gross_budget: float,
+) -> np.ndarray:
+    """Normalize target weights via tanh + L1 and apply gross budget."""
+    out = np.tanh(np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False))
+    if long_only:
+        out = np.clip(out, 0.0, None)
+    l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
+    out = out / np.clip(l1, 1e-12, None)
+    out *= np.float32(gross_budget)
+    return out.astype(np.float32, copy=False)
+
+
+def _normalize_target_weights_row_numpy(
+    weights_row: np.ndarray,
+    *,
+    long_only: bool,
+    gross_budget: float,
+) -> np.ndarray:
+    """Single-row variant of tanh + L1 normalization for integer-share path."""
+    row = np.tanh(np.nan_to_num(weights_row, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False))
+    if long_only:
+        row = np.clip(row, 0.0, None)
+    l1 = float(np.abs(row).sum(dtype=np.float64))
+    if l1 > 1e-12:
+        row = row / l1
+    else:
+        row = np.zeros_like(row, dtype=np.float64)
+    row *= float(gross_budget)
+    return row
+
+
+def _normalize_target_weights_torch(
+    weights: torch.Tensor,
+    *,
+    long_only: bool,
+    gross_budget: float,
+) -> torch.Tensor:
+    """Torch normalization via tanh + L1 and gross budget scaling."""
+    out = torch.tanh(weights)
+    if long_only:
+        out = out.clamp_min(0.0)
+    l1 = out.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
+    out = out / l1
+    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
+    out = out * leverage
+    return out
+
+
 def _apply_turnover_cap_numpy(
     prev_weights: np.ndarray,
     target_weights: np.ndarray,
@@ -519,16 +571,11 @@ def _vectorized_backtest(
     buy_mask = tradable if can_buy_mask is None else can_buy_mask.astype(bool)
     sell_mask = tradable if can_sell_mask is None else can_sell_mask.astype(bool)
 
-    if long_only:
-        target_weights = np.clip(target_weights, 0.0, None)
-        weight_sums = target_weights.sum(axis=1, keepdims=True)
-        nonzero = weight_sums.squeeze(1) > 0
-        target_weights[nonzero] /= weight_sums[nonzero]
-    else:
-        gross_sums = np.abs(target_weights).sum(axis=1, keepdims=True)
-        nonzero = gross_sums.squeeze(1) > 0
-        target_weights[nonzero] /= gross_sums[nonzero]
-    target_weights *= np.float32(gross_budget)
+    target_weights = _normalize_target_weights_numpy(
+        target_weights,
+        long_only=long_only,
+        gross_budget=gross_budget,
+    )
 
     t_len, n_symbols = target_weights.shape
     weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
@@ -753,16 +800,11 @@ def _prepare_scan_inputs(
     buy_mask = tradable if can_buy_mask is None else can_buy_mask.to(device=device, dtype=torch.bool)
     sell_mask = tradable if can_sell_mask is None else can_sell_mask.to(device=device, dtype=torch.bool)
 
-    if long_only:
-        target_weights = target_weights.clamp_min(0.0)
-        weight_sums = target_weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        target_weights = target_weights / weight_sums
-    else:
-        gross_sums = target_weights.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
-        target_weights = target_weights / gross_sums
-
-    leverage = torch.as_tensor(gross_budget, device=target_weights.device, dtype=target_weights.dtype)
-    target_weights = target_weights * leverage
+    target_weights = _normalize_target_weights_torch(
+        target_weights,
+        long_only=long_only,
+        gross_budget=gross_budget,
+    )
 
     return target_weights, tradable, buy_mask, sell_mask
 
@@ -1174,15 +1216,11 @@ def run_backtest_integer_shares(
         target_w = np.nan_to_num(w[t], nan=0.0, posinf=0.0, neginf=0.0)
         target_w[~day_mask] = 0.0
 
-        if long_only:
-            target_w = np.clip(target_w, 0.0, None)
-            total_target = float(target_w.sum())
-            if total_target > 0.0:
-                target_w = (target_w / total_target) * gross_leverage
-        else:
-            gross_target = float(np.abs(target_w).sum())
-            if gross_target > 0.0:
-                target_w = (target_w / gross_target) * gross_leverage
+        target_w = _normalize_target_weights_row_numpy(
+            target_w,
+            long_only=long_only,
+            gross_budget=gross_leverage,
+        )
 
         equity_before = float(cash + np.dot(shares.astype(np.float64), current_prices))
         equity_before = max(equity_before, 1e-12)
@@ -1241,6 +1279,19 @@ def run_backtest_integer_shares(
             sell_notional = float(np.dot(sell_qty.astype(np.float64), current_prices))
             buy_notional = float(np.dot(buy_qty.astype(np.float64), current_prices))
 
+        # Guardrail: if this trade plan would make same-day post-trade equity
+        # non-positive, skip rebalancing for the day to keep position/equity
+        # ratios well-defined and bounded.
+        tentative_cash = cash + sell_notional - sell_notional * sell_fee_rate - buy_notional - buy_notional * buy_fee_rate
+        tentative_equity_after_trade = float(tentative_cash + np.dot(desired_shares.astype(np.float64), current_prices))
+        if (not np.isfinite(tentative_equity_after_trade)) or tentative_equity_after_trade <= 1e-9:
+            desired_shares = shares.copy()
+            delta = desired_shares - shares
+            sell_qty = np.clip(-delta, 0, None)
+            buy_qty = np.clip(delta, 0, None)
+            sell_notional = 0.0
+            buy_notional = 0.0
+
         # Cash-hold rule: if strategy wants stock exposure but cannot buy even 1 share,
         # stop trading and keep current cash through the remaining dates.
         if long_only:
@@ -1285,10 +1336,27 @@ def run_backtest_integer_shares(
         equity_after_trade = float(cash + stock_market_values.sum())
         equity_after_trade = max(equity_after_trade, 1e-12)
 
-        stock_weights_history[t] = (stock_market_values / equity_after_trade).astype(np.float32)
+        # Output normalization for holdings report:
+        # 1) tanh keeps signed direction in (-1, 1)
+        # 2) L1 normalization keeps total absolute exposure at 1.
+        stock_holding_ratio_raw = stock_market_values / equity_after_trade
+        cash_ratio_raw = float(cash / equity_after_trade)
+        ratio_vec = np.empty(n_symbols + 1, dtype=np.float64)
+        ratio_vec[0] = cash_ratio_raw
+        ratio_vec[1:] = stock_holding_ratio_raw
+        ratio_vec = np.tanh(ratio_vec)
+        l1 = float(np.sum(np.abs(ratio_vec), dtype=np.float64))
+        if l1 > 1e-12:
+            ratio_vec /= l1
+        else:
+            ratio_vec.fill(0.0)
+
+        cash_ratio = float(ratio_vec[0])
+        stock_holding_ratio = ratio_vec[1:]
+
+        stock_weights_history[t] = stock_holding_ratio.astype(np.float32)
         turnovers[t] = float(traded_notional / equity_before)
 
-        cash_ratio = float(cash / equity_after_trade)
         day_rows: list[HoldingsRecord] = []
         day_rows.append(
             HoldingsRecord(
@@ -1314,19 +1382,29 @@ def run_backtest_integer_shares(
                     shares=int(shares[idx]),
                     price=price_out,
                     market_value=mv,
-                    holding_ratio=float(mv / equity_after_trade),
+                    holding_ratio=float(stock_holding_ratio[idx]),
                     is_cash=False,
                 )
             )
         day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
         records.extend(day_rows)
 
+        # Keep PnL calculation aligned with realized holdings ratio.
         if price_matrix is not None and (t + 1) < t_len:
             next_prices = np.where(price_matrix[t + 1] > 1e-12, price_matrix[t + 1], current_prices)
+            simple_returns = np.divide(
+                next_prices - current_prices,
+                current_prices,
+                out=np.zeros_like(current_prices, dtype=np.float64),
+                where=current_prices > 1e-12,
+            )
         else:
-            next_prices = current_prices * np.exp(r[t])
+            simple_returns = np.expm1(r[t])
+            simple_returns = np.where(np.isfinite(simple_returns), simple_returns, 0.0)
+            next_prices = current_prices * (1.0 + simple_returns)
             next_prices = np.where(np.isfinite(next_prices) & (next_prices > 1e-12), next_prices, current_prices)
-        equity_end = float(cash + np.dot(shares.astype(np.float64), next_prices))
+
+        equity_end = float(equity_after_trade + np.dot(stock_market_values, simple_returns))
         equity_end = max(equity_end, 1e-12)
 
         strategy_returns[t] = np.float32(np.log(equity_end / equity_before))

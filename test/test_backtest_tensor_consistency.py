@@ -262,6 +262,71 @@ def test_sortino_loss_uses_canonical_tensor_backtest_returns() -> None:
     assert torch.isfinite(weights.grad).all()
 
 
+def test_log_utility_loss_uses_fee_adjusted_canonical_tensor_backtest_returns() -> None:
+    weights = torch.tensor(
+        [
+            [0.65, 0.25, 0.10],
+            [0.15, 0.75, 0.10],
+            [0.50, 0.20, 0.30],
+            [0.05, 0.60, 0.35],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    returns = torch.tensor(
+        [
+            [0.018, -0.008, 0.004],
+            [-0.010, 0.014, 0.003],
+            [0.005, -0.017, 0.016],
+            [-0.003, 0.004, -0.010],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = returns.mean(dim=1)
+    buy_fee_rate = 0.000855
+    sell_fee_rate = 0.003855
+
+    loss = risk_aware_loss(
+        weights,
+        returns,
+        mask,
+        benchmark_returns=benchmark,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        long_only=True,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+        objective="log_utility",
+    )
+
+    bt = run_backtest_torch(
+        weights,
+        returns,
+        mask,
+        benchmark,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=True,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        return_weights_history=False,
+    )
+    expected = -bt.strategy_returns.mean() * 252.0
+
+    assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+
+
 def test_sortino_loss_accepts_initial_weights_for_stateful_batches() -> None:
     weights = torch.tensor(
         [

@@ -186,6 +186,8 @@ class DynamicTokenGenerator(nn.Module):
         base_queries: torch.Tensor,
         z_stock: torch.Tensor,
         mask: torch.Tensor,
+        *,
+        collect_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         bsz = int(z_stock.size(0))
         summary_parts = _masked_market_summary_parts(z_stock, mask)
@@ -196,6 +198,8 @@ class DynamicTokenGenerator(nn.Module):
         gate = torch.sigmoid(self.gate_logit).to(device=delta.device, dtype=delta.dtype)
         base = base_queries.expand(bsz, -1, -1)
         dynamic = base + gate * delta
+        if not collect_aux:
+            return dynamic, {}
         return dynamic, {
             "delta": delta,
             "gate": gate.reshape(1),
@@ -688,7 +692,13 @@ class TransformerBasePortfolioModel(nn.Module):
             pooled = (h.permute(0, 2, 1, 3) * weights.unsqueeze(-1)).sum(dim=2)
         return self.output_norm(pooled).masked_fill(~mask_bool.unsqueeze(-1), 0.0)
 
-    def _forward_full(self, h: torch.Tensor, safe_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def _forward_full(
+        self,
+        h: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         bsz, steps, n_symbols, dim = h.shape
         token_count = steps * n_symbols
         if self.max_full_tokens > 0 and token_count > self.max_full_tokens:
@@ -701,20 +711,31 @@ class TransformerBasePortfolioModel(nn.Module):
         for block in self.joint_blocks:
             tokens = self._run_block(block, tokens, None, key_mask)
         h_full = tokens.reshape(bsz, steps, n_symbols, dim)
-        return self._pool_temporal(h_full, safe_mask), {"token_embedding": h_full}
+        aux = {"token_embedding": h_full} if collect_aux else {}
+        return self._pool_temporal(h_full, safe_mask), aux
 
-    def _forward_axial(self, h: torch.Tensor, safe_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def _forward_axial(
+        self,
+        h: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         h = self._apply_temporal_blocks(h)
         h = self._apply_cross_blocks(h, safe_mask)
-        return self._pool_temporal(h, safe_mask), {"token_embedding": h}
+        aux = {"token_embedding": h} if collect_aux else {}
+        return self._pool_temporal(h, safe_mask), aux
 
     def _forward_temporal_only(
         self,
         h: torch.Tensor,
         safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         h = self._apply_temporal_blocks(h)
-        return self._pool_temporal(h, safe_mask), {"token_embedding": h}
+        aux = {"token_embedding": h} if collect_aux else {}
+        return self._pool_temporal(h, safe_mask), aux
 
     def _forward_latent_or_market(
         self,
@@ -722,6 +743,7 @@ class TransformerBasePortfolioModel(nn.Module):
         safe_mask: torch.Tensor,
         *,
         use_latent: bool,
+        collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         h = self._apply_temporal_blocks(h)
         z_base = self._pool_temporal(h, safe_mask)
@@ -730,8 +752,14 @@ class TransformerBasePortfolioModel(nn.Module):
 
         if use_latent:
             if self.dynamic_latent_generator is not None:
-                latent, dynamic_aux = self.dynamic_latent_generator(self.latent_queries, z_base, safe_mask)
-                aux.update(self._prefixed_aux("dynamic_latent", dynamic_aux))
+                latent, dynamic_aux = self.dynamic_latent_generator(
+                    self.latent_queries,
+                    z_base,
+                    safe_mask,
+                    collect_aux=collect_aux,
+                )
+                if collect_aux:
+                    aux.update(self._prefixed_aux("dynamic_latent", dynamic_aux))
             else:
                 latent = self.latent_queries.expand(bsz, -1, -1)
             for block in self.latent_blocks:
@@ -748,8 +776,14 @@ class TransformerBasePortfolioModel(nn.Module):
             z_factor_context = z_base
 
         if self.dynamic_market_generator is not None:
-            market_tokens, dynamic_aux = self.dynamic_market_generator(self.market_queries, z_base, safe_mask)
-            aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
+            market_tokens, dynamic_aux = self.dynamic_market_generator(
+                self.market_queries,
+                z_base,
+                safe_mask,
+                collect_aux=collect_aux,
+            )
+            if collect_aux:
+                aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
         else:
             market_tokens = self.market_queries.expand(bsz, -1, -1)
         for block in self.market_blocks:
@@ -761,14 +795,15 @@ class TransformerBasePortfolioModel(nn.Module):
 
         z_stock = self.portfolio_fusion(torch.cat([z_base, z_factor_context, z_market_context], dim=-1))
         z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
-        aux.update({
-            "token_embedding": h,
-            "stock_embedding": z_base,
-            "latent_factors": latent,
-            "market_tokens": market_tokens,
-            "z_factor_context": z_factor_context,
-            "z_market_context": z_market_context,
-        })
+        if collect_aux:
+            aux.update({
+                "token_embedding": h,
+                "stock_embedding": z_base,
+                "latent_factors": latent,
+                "market_tokens": market_tokens,
+                "z_factor_context": z_factor_context,
+                "z_market_context": z_market_context,
+            })
         return z_stock, aux
 
     def forward(
@@ -784,18 +819,19 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             mask_bool = mask.to(device=x.device, dtype=torch.bool)
         safe_mask = _safe_attention_mask(mask_bool)
+        collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
 
         h = self._embed_inputs(x)
         if self.attention_mode == "full":
-            z_stock, aux = self._forward_full(h, safe_mask)
+            z_stock, aux = self._forward_full(h, safe_mask, collect_aux=collect_aux)
         elif self.attention_mode == "axial":
-            z_stock, aux = self._forward_axial(h, safe_mask)
+            z_stock, aux = self._forward_axial(h, safe_mask, collect_aux=collect_aux)
         elif self.attention_mode == "latent":
-            z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=True)
+            z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=True, collect_aux=collect_aux)
         elif self.attention_mode == "market_token":
-            z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=False)
+            z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=False, collect_aux=collect_aux)
         else:
-            z_stock, aux = self._forward_temporal_only(h, safe_mask)
+            z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
 
         z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
         scores = self.score_head(z_stock).squeeze(-1)
@@ -816,16 +852,15 @@ class TransformerBasePortfolioModel(nn.Module):
             weights = dual_branch_softmax(relative_scores / temp, mask_bool)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
-        aux = dict(aux)
-        aux.update(
-            {
-                "z_stock": z_stock,
-                "score_logits": scores,
-                "rank_logits": scores,
-            }
-        )
-
         if return_aux is True:
+            aux = dict(aux)
+            aux.update(
+                {
+                    "z_stock": z_stock,
+                    "score_logits": scores,
+                    "rank_logits": scores,
+                }
+            )
             return weights, masked_scores, aux
         if return_aux is None and self.return_aux:
             output = {
@@ -835,6 +870,14 @@ class TransformerBasePortfolioModel(nn.Module):
                 "rank_logits": scores,
             }
             if self.return_aux_details:
+                aux = dict(aux)
+                aux.update(
+                    {
+                        "z_stock": z_stock,
+                        "score_logits": scores,
+                        "rank_logits": scores,
+                    }
+                )
                 output["aux"] = aux
                 output.update(aux)
             return output
