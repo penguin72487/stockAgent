@@ -46,16 +46,16 @@ training:
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
-  enable_torch_compile: false
-  auto_torch_compile_sharpe: false
+  enable_torch_compile: true
+  auto_torch_compile_sharpe: true
   compile_loss: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
-  backtest_autotune: false
-  backtest_compile: false
+  backtest_autotune: true
+  backtest_compile: true
   backtest_verbose: false
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
@@ -78,7 +78,7 @@ training:
   explain_sample_method: even
   explain_perturb: true
   explain_write_plots: true
-  cache_train_tensors_on_gpu: false
+  cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: false
   learning_rate: 0.0001
   enable_lr_scheduler: false

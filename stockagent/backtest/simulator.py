@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -189,12 +192,39 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _prepend_cuda_toolchain_paths() -> None:
+    env_bin = Path(sys.executable).resolve().parent
+    entries = [str(env_bin)]
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        entries.append(str(Path(conda_prefix) / "bin"))
+    try:
+        import site
+
+        for site_dir in site.getsitepackages():
+            entries.append(str(Path(site_dir) / "nvidia" / "cuda_nvcc" / "bin"))
+    except Exception:
+        pass
+    existing = os.environ.get("PATH", "")
+    existing_parts = [part for part in existing.split(os.pathsep) if part]
+    prepend = [part for part in entries if part and Path(part).exists() and part not in existing_parts]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join([*prepend, existing])
+    os.environ.setdefault("CC", str(env_bin / "x86_64-conda-linux-gnu-gcc"))
+    os.environ.setdefault("CXX", str(env_bin / "x86_64-conda-linux-gnu-g++"))
+
+
 def _autotune_enabled() -> bool:
     return _env_flag("STOCKAGENT_BACKTEST_AUTOTUNE", "1")
 
 
 def _compile_enabled() -> bool:
-    return _env_flag("STOCKAGENT_BACKTEST_COMPILE", "1")
+    enabled = _env_flag("STOCKAGENT_BACKTEST_COMPILE", "1")
+    if enabled:
+        _prepend_cuda_toolchain_paths()
+        if not shutil.which("ptxas"):
+            return False
+    return enabled
 
 
 def _compile_verbose() -> bool:

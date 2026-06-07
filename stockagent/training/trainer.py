@@ -1896,11 +1896,13 @@ def _evaluate_tensor_batch(
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
 
+            # Clone CUDAGraph output tensors before the next compiled-backtest call
+            # overwrites the same output buffers (CUDA Graph static allocation).
             if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history)
-            strategy_chunks.append(backtest_chunk.strategy_returns)
-            benchmark_chunks.append(backtest_chunk.benchmark_returns)
-            turnover_chunks.append(backtest_chunk.turnovers)
+                weights_chunks.append(backtest_chunk.weights_history.clone())
+            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
+            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
+            turnover_chunks.append(backtest_chunk.turnovers.clone())
 
             if compute_metrics_summary:
                 metrics_start = time.perf_counter()
@@ -2327,18 +2329,27 @@ def _is_compile_backward_shape_error(exc: RuntimeError) -> bool:
 
 
 def _resolve_host_compilers() -> tuple[str | None, str | None]:
+    env_bin = Path(sys.executable).resolve().parent
     cc_candidates = [
         os.environ.get("CC"),
+        str(env_bin / "x86_64-conda-linux-gnu-gcc"),
+        str(env_bin / "gcc"),
+        str(env_bin / "cc"),
         "cc",
         "gcc",
         "clang",
+        "x86_64-conda-linux-gnu-gcc",
         "x86_64-conda-linux-gnu-cc",
     ]
     cxx_candidates = [
         os.environ.get("CXX"),
+        str(env_bin / "x86_64-conda-linux-gnu-g++"),
+        str(env_bin / "g++"),
+        str(env_bin / "c++"),
         "c++",
         "g++",
         "clang++",
+        "x86_64-conda-linux-gnu-g++",
         "x86_64-conda-linux-gnu-c++",
     ]
 
@@ -2354,10 +2365,34 @@ def _resolve_host_compilers() -> tuple[str | None, str | None]:
     return _resolve(cc_candidates), _resolve(cxx_candidates)
 
 
+def _prepend_compile_toolchain_paths() -> None:
+    entries: list[str] = []
+    env_bin = Path(sys.executable).resolve().parent
+    entries.append(str(env_bin))
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        entries.append(str(Path(conda_prefix) / "bin"))
+    try:
+        import site
+
+        for site_dir in site.getsitepackages():
+            entries.append(str(Path(site_dir) / "nvidia" / "cuda_nvcc" / "bin"))
+    except Exception:
+        pass
+
+    existing = os.environ.get("PATH", "")
+    existing_parts = [part for part in existing.split(os.pathsep) if part]
+    prepend = [part for part in entries if part and Path(part).exists() and part not in existing_parts]
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join([*prepend, existing])
+
+
 def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
     """Return whether torch.compile is safe to enable in current environment."""
     if device.type != "cuda":
         return False, "torch.compile is only enabled for CUDA in this project"
+
+    _prepend_compile_toolchain_paths()
 
     # Inductor+Triton on CUDA needs a host C compiler at runtime.
     cc, cxx = _resolve_host_compilers()
@@ -2366,8 +2401,21 @@ def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
 
     os.environ.setdefault("CC", cc)
     os.environ.setdefault("CXX", cxx)
+    ptxas = shutil.which("ptxas")
+    if not ptxas:
+        return False, "no CUDA ptxas found (install cuda-nvcc/cuda-nvvm-tools in the active env)"
 
-    return True, f"CC={cc}, CXX={cxx}"
+    return True, f"CC={cc}, CXX={cxx}, ptxas={ptxas}"
+
+
+def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
+    training = config.training
+    os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if bool(training.backtest_autotune) else "0"
+    os.environ["STOCKAGENT_BACKTEST_COMPILE"] = "1" if bool(training.backtest_compile) else "0"
+    os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
+    os.environ["STOCKAGENT_BACKTEST_CHECKPOINT_CHUNK_ROWS"] = str(
+        max(0, int(training.backtest_checkpoint_chunk_rows))
+    )
 
 
 def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
@@ -4018,6 +4066,7 @@ def run_training(
     device = _resolve_device(config)
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    _configure_backtest_runtime_from_config(config)
     if config.environment.use_tensor_cores and device.type == "cuda":
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True

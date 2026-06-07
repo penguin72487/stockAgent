@@ -201,13 +201,33 @@ Rules:
 
 - Use `epoch_curve.jsonl` when optimizing epoch-level speed.
 - Break down "other" time before optimizing blindly.
+- For long-year runs, re-check the latest artifact before optimizing. The run under
+  `artifacts/train_2000-2001-...-2024/epoch_curve.jsonl` showed train time
+  dominating epoch wall time, with CPU-to-GPU train tensor transfer larger than
+  model forward. In that case, prioritize guarded GPU train tensor caching over
+  test-curve work.
 - Every epoch should account for train, validation, sampled test loss, curve test, curve plot, checkpoint, scheduler/progress, and any reporting work.
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
 - Keep curve plotting async where possible.
-- Keep GPU tensor caches disabled by default if VRAM is tight:
-  - `cache_train_tensors_on_gpu: false`
-  - `cache_eval_tensors_on_gpu: false`
+- GPU tensor caching is allowed when transfer dominates and VRAM checks pass:
+  - prefer `cache_train_tensors_on_gpu: true` for transfer-bound long-year runs
+  - keep `cache_eval_tensors_on_gpu: false` unless eval transfer becomes material
+  - `_maybe_cache_tensors_on_device` must keep the VRAM safety check and skip caching if it does not fit
+
+Compile/runtime rules:
+
+- Use CUDA 13 ptxas for the current PyTorch CUDA 13 environment. Prefer mamba/conda packages such as `cuda-nvcc` / `cuda-nvvm-tools` in the `fintech` env; do not leave a CUDA 12 pip `nvidia-cuda-nvcc-cu12` package around as a fallback ptxas source.
+- Trainer compile checks should discover `/home/user/miniforge3/envs/fintech/bin/ptxas` and the conda compilers `x86_64-conda-linux-gnu-gcc/g++` even when the parent shell PATH is sparse.
+- Actual-shape compile probes on the 2000-2024 checkpoint showed:
+  - compiled `transformer_base_portfolio` model forward is beneficial
+  - compiled tensor backtest is beneficial and may use fallback on unsupported graph states
+  - isolated compiled loss has small benefit, but compiled model plus compiled loss was unstable in the actual-shape probe
+- Current safe baseline preference:
+  - `enable_torch_compile: true`
+  - `backtest_compile: true`
+  - `backtest_autotune: true`
+  - `compile_loss: false`
 
 ## Feature Engineering Guardrails
 
