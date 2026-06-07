@@ -5,7 +5,7 @@ import os
 import torch
 from torch import nn
 
-from stockagent.models.normalization import masked_softmax
+from stockagent.models.normalization import masked_tanh_l1_weights
 
 
 class _FeatureResBlock(nn.Module):
@@ -174,7 +174,7 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         topk_indices_in_candidates = torch.topk(masked_logits, k=k, dim=1).indices
         topk_mask = torch.zeros_like(candidate_mask)
         topk_mask = topk_mask.scatter(1, topk_indices_in_candidates, True) & candidate_mask
-        candidate_weights = masked_softmax(portfolio_logits, topk_mask)
+        candidate_weights = masked_tanh_l1_weights(portfolio_logits, topk_mask, long_only=True)
         return _scatter_candidates(candidate_weights, candidate_indices, n_symbols)
 
     def _sparse_long_short_weights(
@@ -194,14 +194,7 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         short_indices = torch.topk(short_scores, k=k, dim=1).indices
         short_mask = torch.zeros_like(candidate_mask).scatter(1, short_indices, True) & candidate_mask & ~long_mask
 
-        long_weights = masked_softmax(portfolio_logits, long_mask)
-        short_weights = masked_softmax(-portfolio_logits, short_mask)
-        has_long = long_mask.any(dim=1, keepdim=True).to(dtype=portfolio_logits.dtype)
-        has_short = short_mask.any(dim=1, keepdim=True).to(dtype=portfolio_logits.dtype)
-        both = has_long * has_short
-        long_budget = torch.where(both > 0.0, portfolio_logits.new_full((portfolio_logits.size(0), 1), 0.5), has_long)
-        short_budget = torch.where(both > 0.0, portfolio_logits.new_full((portfolio_logits.size(0), 1), 0.5), has_short)
-        candidate_weights = long_budget * long_weights - short_budget * short_weights
+        candidate_weights = masked_tanh_l1_weights(portfolio_logits, long_mask | short_mask, long_only=False)
         return _scatter_candidates(candidate_weights, candidate_indices, n_symbols)
 
     def forward(

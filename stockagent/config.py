@@ -408,7 +408,7 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
     finite_check_interval_steps: int = 0
-    loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "excess_cvar_drawdown", etc.
+    loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "log_utility", etc.
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
     tabular_resnet: TabularResNetModelConfig = field(default_factory=TabularResNetModelConfig)

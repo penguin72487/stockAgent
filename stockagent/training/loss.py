@@ -453,6 +453,13 @@ def _compute_risk_ratio(valid_returns: Tensor, objective: str) -> Tensor:
     return mean_return / std_return * annualizer
 
 
+def _compute_log_utility(valid_returns: Tensor) -> Tensor:
+    """Annualized expected net log utility from canonical backtest log returns."""
+    valid_returns = torch.nan_to_num(valid_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    annualizer = torch.as_tensor(252.0, device=valid_returns.device, dtype=valid_returns.dtype)
+    return valid_returns.mean() * annualizer
+
+
 def _compute_excess_risk_terms(
     valid_returns: Tensor,
     valid_benchmark: Tensor,
@@ -691,7 +698,9 @@ def risk_aware_loss(
     if valid_returns.numel() == 0:
         return weights.sum() * 0.0
 
-    if objective_norm in {
+    if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
+        objective_value = -float(gamma_sharpe) * _compute_log_utility(valid_returns)
+    elif objective_norm in {
         "excess_cvar_drawdown",
         "cvar",
         "cvar_drawdown",

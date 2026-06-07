@@ -150,6 +150,25 @@ def test_modern_components_and_dynamic_token_aux() -> None:
     assert 0.0 < float(aux["dynamic_market_gate"].item()) < 1.0
 
 
+def test_aux_details_false_keeps_training_output_light() -> None:
+    device = _device()
+    model = _make_model(attention_mode="latent", return_aux=True, return_aux_details=False).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        light_out = model(x, mask)
+        weights, scores, aux = model(x, mask, return_aux=True)
+
+    assert set(light_out) == {"weights", "scores", "score_logits", "rank_logits"}
+    assert "aux" not in light_out
+    assert torch.allclose(light_out["weights"], weights, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(light_out["scores"], scores, atol=1e-6, rtol=1e-6)
+    assert aux["token_embedding"].shape == (2, 6, 13, 24)
+    assert aux["dynamic_latent_delta"].shape == (2, 4, 24)
+    assert aux["dynamic_market_delta"].shape == (2, 2, 24)
+
+
 def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:
     device = _device()
     model = _make_model(

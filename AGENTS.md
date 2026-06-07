@@ -48,7 +48,7 @@ Implementation expectations:
 - It is normal and desirable that some tensors remain FP32:
   - model parameters
   - input storage tensors
-  - portfolio weights after softmax
+  - portfolio weights after tanh + L1 normalization
   - loss/backtest accumulation and numerically sensitive finance metrics
 - Do not force the entire pipeline to permanent BF16 storage just to satisfy "BF16"; use AMP for compute and keep sensitive reductions stable.
 
@@ -62,7 +62,7 @@ The active Transformer-base lookback-32 config is:
 training:
   model_name: transformer_base_portfolio
   lookback: 32
-  loss_type: sortino
+  loss_type: log_utility
 
   transformer_base_portfolio:
     d_model: 48
@@ -169,6 +169,8 @@ Guidelines:
 
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
+- Portfolio direction and sizing should use `tanh(score)` for signed direction followed by L1 normalization for gross exposure control.
+- Do not use dual-branch softmax as the active long/short position calculator. Legacy `dual_branch_softmax` / `masked_softmax` names are now compatibility wrappers around tanh + L1 portfolio normalization.
 - If changing `trading.long_only`, understand that it affects loss/backtest interpretation, not just the model head.
 - Keep model output mode, loss assumptions, backtest assumptions, and report wording aligned. If they disagree, flag it explicitly.
 - Rank-only loss can over-concentrate positions. If using rank objectives, keep turnover/concentration/backtest regularization in mind.
@@ -183,6 +185,8 @@ Rules:
 - Do not fork separate train/inference return formulas.
 - Prefer the canonical tensor backtest in `stockagent/backtest/simulator.py` and loss integration in `stockagent/training/loss.py`.
 - Keep computations GPU/tensor-friendly where possible.
+- The active loss preference is `log_utility`: maximize annualized mean net log return from canonical `run_backtest_torch` outputs.
+- `log_utility` must use fee-adjusted `backtest.strategy_returns`, after `buy_fee_rate` and `sell_fee_rate` have been applied.
 - Do not move portfolio state to CPU between batches/chunks.
 - Cross-batch/chunk portfolio state should be detached and cloned on GPU:
   - `t.detach().clone(memory_format=torch.contiguous_format)`

@@ -424,7 +424,9 @@ def _loss_from_backtest_series(
         return strategy_returns.sum() * 0.0
 
     objective_norm = objective.strip().lower()
-    if objective_norm in {
+    if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
+        objective_value = -float(gamma_sharpe) * valid_returns.mean() * valid_returns.new_tensor(252.0)
+    elif objective_norm in {
         "excess_cvar_drawdown",
         "cvar",
         "cvar_drawdown",
@@ -495,6 +497,11 @@ def _is_return_series_objective(objective: str) -> bool:
     return objective.strip().lower() in {
         "sharpe",
         "sortino",
+        "log_utility",
+        "log_util",
+        "kelly",
+        "growth",
+        "mean_log_return",
         "excess_cvar_drawdown",
         "cvar",
         "cvar_drawdown",
@@ -604,7 +611,7 @@ def _batched_loss_from_backtest_segments(
         return strategy_returns.new_empty((0,), dtype=torch.float32)
 
     objective_norm = objective.strip().lower()
-    if objective_norm not in {"sharpe", "sortino"}:
+    if objective_norm not in {"sharpe", "sortino", "log_utility"}:
         losses = [
             _loss_from_backtest_series(
                 strategy_returns[int(offsets[idx]) : int(offsets[idx + 1])],
@@ -653,13 +660,16 @@ def _batched_loss_from_backtest_segments(
     mean_return = r.sum(dim=1) / count
     annualizer = torch.sqrt(torch.as_tensor(252.0, device=device, dtype=calc_dtype))
 
-    if objective_norm == "sortino":
+    if objective_norm == "log_utility":
+        objective_value = -float(gamma_sharpe) * mean_return * torch.as_tensor(252.0, device=device, dtype=calc_dtype)
+    elif objective_norm == "sortino":
         downside = torch.minimum(r, torch.zeros_like(r))
         risk_dev = torch.sqrt(downside.pow(2).sum(dim=1) / count + 1e-8)
+        objective_value = -float(gamma_sharpe) * (mean_return / risk_dev * annualizer)
     else:
         centered = (r - mean_return.unsqueeze(1)) * valid_f
         risk_dev = torch.sqrt(centered.pow(2).sum(dim=1) / count + 1e-8)
-    objective_value = -float(gamma_sharpe) * (mean_return / risk_dev * annualizer)
+        objective_value = -float(gamma_sharpe) * (mean_return / risk_dev * annualizer)
 
     if float(gamma_turnover) != 0.0:
         t = torch.nan_to_num(turnovers[gather_idx].to(dtype=calc_dtype), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
@@ -672,6 +682,11 @@ def _normalize_risk_objective(loss_type: str) -> str:
     if objective in {
         "sharpe",
         "sortino",
+        "log_utility",
+        "log_util",
+        "kelly",
+        "growth",
+        "mean_log_return",
         "rank",
         "rank_ic",
         "ic",
@@ -702,6 +717,8 @@ def _normalize_risk_objective(loss_type: str) -> str:
             return "rank_ic"
         if objective in {"rank_only", "score_rank"}:
             return "pure_rank"
+        if objective in {"log_util", "kelly", "growth", "mean_log_return"}:
+            return "log_utility"
         if objective in {"cvar", "cvar_drawdown", "excess_cvar"}:
             return "excess_cvar_drawdown"
         if objective in {"outperformance_budget", "outperformance_first"}:
@@ -860,6 +877,8 @@ def _objective_metric_key(objective: str) -> str:
         return "factor_generalization"
     if objective == "portfolio_autoencoder":
         return "sharpe"
+    if objective == "log_utility":
+        return "cagr"
     if objective in {"outperformance_risk_budget", "excess_cvar_drawdown"}:
         return "excess_return_vs_universe_average"
     return objective
@@ -4247,7 +4266,9 @@ def run_training(
                 TimingBreakdown(total_s=time.perf_counter() - val_setup_start),
             )
 
-        test_datasets = [context.test_ds for context in fold_contexts.values()]
+        curve_test_fold_index = 0
+        curve_test_fold_context = list(fold_contexts.values())[curve_test_fold_index]
+        test_datasets = [curve_test_fold_context.test_ds]
         test_setup_start = time.perf_counter()
         _progress(f"[Train {train_years}] setup test tensors")
         combined_test_x, combined_test_returns, combined_test_masks, combined_test_buy_masks, combined_test_sell_masks, combined_test_bench, test_lengths = _combine_datasets_to_tensors(
@@ -4263,13 +4284,8 @@ def run_training(
             device,
             non_blocking,
         )
-        test_offsets: list[int] = [0]
-        for length in test_lengths:
-            test_offsets.append(test_offsets[-1] + length)
-        curve_test_fold_index = 0
-        curve_test_fold_context = list(fold_contexts.values())[curve_test_fold_index]
-        curve_test_start_row = int(test_offsets[curve_test_fold_index])
-        curve_test_end_row = int(test_offsets[curve_test_fold_index + 1])
+        curve_test_start_row = 0
+        curve_test_end_row = int(test_lengths[0])
         curve_test_offsets = [0, curve_test_end_row - curve_test_start_row]
         print(
             f"[Train {train_years}] epoch-level test loss uses fold "
@@ -4406,7 +4422,7 @@ def run_training(
 
         config_auto_compile_risk = bool(getattr(config.training, "auto_torch_compile_sharpe", True))
         auto_compile_risk = (
-            loss_objective in {"sharpe", "sortino"}
+            loss_objective in {"sharpe", "sortino", "log_utility"}
             and device.type == "cuda"
             and not profile_timing
             and config_auto_compile_risk
@@ -4832,14 +4848,14 @@ def run_training(
             deferred_test_loss_tensors: torch.Tensor | None = None
             if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
                 val_eval_start = time.perf_counter()
-                model.eval()
+                compiled_train_model.eval()
                 with torch.inference_mode():
                     for index, (_, context) in enumerate(fold_contexts.items()):
                         start = val_offsets[index]
                         end = val_offsets[index + 1]
 
                         val_loss, val_ic, val_fold_timing = _evaluate_rank_ic_multitask_loss(
-                            model,
+                            compiled_train_model,
                             combined_val_x[start:end],
                             combined_val_returns[start:end],
                             combined_val_masks[start:end],
@@ -4903,7 +4919,7 @@ def run_training(
             else:
                 val_eval_start = time.perf_counter()
                 val_backtest_epoch, _, _ = _evaluate_tensor_batch(
-                    model,
+                    compiled_train_model,
                     combined_val_x,
                     combined_val_returns,
                     combined_val_masks,
@@ -4967,12 +4983,12 @@ def run_training(
             if should_compute_test_mean:
                 curve_test_start = time.perf_counter()
                 if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
-                    model.eval()
+                    compiled_train_model.eval()
                     with torch.inference_mode():
                         start = curve_test_start_row
                         end = curve_test_end_row
                         test_loss, _, test_fold_timing = _evaluate_rank_ic_multitask_loss(
-                            model,
+                            compiled_train_model,
                             combined_test_x[start:end],
                             combined_test_returns[start:end],
                             combined_test_masks[start:end],
@@ -5016,7 +5032,7 @@ def run_training(
                         test_losses_epoch.append(test_loss)
                 else:
                     test_backtest_epoch, _, _ = _evaluate_tensor_batch(
-                        model,
+                        compiled_train_model,
                         combined_test_x[curve_test_start_row:curve_test_end_row],
                         combined_test_returns[curve_test_start_row:curve_test_end_row],
                         combined_test_masks[curve_test_start_row:curve_test_end_row],
@@ -5251,7 +5267,7 @@ def run_training(
         if val_backtest is None:
             eval_only_start = time.perf_counter()
             val_backtest, _, _ = _evaluate_tensor_batch(
-                model,
+                compiled_train_model,
                 combined_val_x,
                 combined_val_returns,
                 combined_val_masks,
@@ -5312,7 +5328,7 @@ def run_training(
             )
             test_eval_start = time.perf_counter()
             test_bt_t, test_ic, _ = _evaluate_tensor_batch(
-                model,
+                compiled_train_model,
                 test_x,
                 test_returns,
                 test_masks,

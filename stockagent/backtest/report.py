@@ -113,6 +113,55 @@ def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
     return float(dd.min(initial=0.0))
 
 
+def _annotate_max_drawdown_segment(
+    ax: plt.Axes,
+    dates: np.ndarray,
+    equity_curve: np.ndarray,
+    color: str = "tab:red",
+) -> None:
+    """Connect MDD peak-to-trough with a dashed line and label the drawdown percent."""
+    equity = np.nan_to_num(np.asarray(equity_curve, dtype=np.float64), nan=0.0)
+    x_values = np.asarray(dates)
+    if equity.size < 2 or x_values.size != equity.size:
+        return
+
+    running_max = np.maximum.accumulate(equity)
+    safe_running_max = np.maximum(running_max, 1e-12)
+    drawdowns = equity / safe_running_max - 1.0
+    trough_idx = int(np.argmin(drawdowns))
+    mdd = float(drawdowns[trough_idx])
+    if mdd >= 0.0:
+        return
+
+    peak_idx = int(np.argmax(equity[: trough_idx + 1]))
+    x_peak = x_values[peak_idx]
+    x_trough = x_values[trough_idx]
+    y_peak = float(equity[peak_idx])
+    y_trough = float(equity[trough_idx])
+
+    ax.plot(
+        [x_peak, x_trough],
+        [y_peak, y_trough],
+        linestyle="--",
+        color=color,
+        linewidth=1.8,
+        alpha=0.9,
+        label="_nolegend_",
+        zorder=5,
+    )
+    ax.scatter([x_peak, x_trough], [y_peak, y_trough], color=color, s=22, zorder=6, label="_nolegend_")
+    ax.annotate(
+        f"{mdd:.2%}",
+        xy=(x_trough, y_trough),
+        xytext=(8, -10),
+        textcoords="offset points",
+        color=color,
+        fontsize=9,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+    )
+
+
 def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
@@ -387,6 +436,7 @@ def plot_equity_curve(
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
     ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
     ax.set_title("Strategy vs Benchmark Equity Curve")
@@ -423,6 +473,7 @@ def plot_equity_curve_log(
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
     ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
     _configure_log_y_axis(ax, strategy_equity, benchmark_equity)
@@ -497,6 +548,7 @@ def plot_configured_leverage_equity_curve(
         alpha=0.9,
     )
     ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=1.8, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
     ax.set_title("Equity Curve (Configured Leverage Run)")
@@ -548,6 +600,7 @@ def plot_fold_first_year_returns(
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.plot(date_pd, strat_nav, label="Strategy", linewidth=2.2)
     ax.plot(date_pd, base_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment(ax, date_pd, strat_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
     ax.set_title("Walkforward First-Test-Year Daily Cumulative NAV (All Folds)")
@@ -723,6 +776,7 @@ def plot_first_test_year_only(
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.plot(date_pd, strategy_nav, label="Strategy", linewidth=2.2)
     ax.plot(date_pd, baseline_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment(ax, date_pd, strategy_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
     ax.set_title("Walkforward First Test Year Only")
