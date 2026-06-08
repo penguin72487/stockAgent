@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.models.normalization import dual_branch_softmax
+
+
+_LOSS_RUNTIME_STATS: dict[str, float] = {
+    "initial_weights_clone_s": 0.0,
+    "initial_weights_clone_calls": 0.0,
+    "final_weights_clone_s": 0.0,
+    "final_weights_clone_calls": 0.0,
+}
+
+
+def _add_loss_runtime_stat(key: str, value: float = 1.0) -> None:
+    _LOSS_RUNTIME_STATS[key] = float(_LOSS_RUNTIME_STATS.get(key, 0.0)) + float(value)
+
+
+def get_loss_runtime_stats(reset: bool = False) -> dict[str, float]:
+    stats = dict(_LOSS_RUNTIME_STATS)
+    if reset:
+        for key in _LOSS_RUNTIME_STATS:
+            _LOSS_RUNTIME_STATS[key] = 0.0
+    return stats
 
 
 def _rank_from_sorted_indices(sorted_idx: Tensor, dtype: torch.dtype) -> Tensor:
@@ -667,7 +689,10 @@ def risk_aware_loss(
         if isinstance(initial_weights, torch.Tensor):
             # Keep a private, contiguous buffer for recurrent state so we don't
             # hold references to graph-managed outputs across compiled replays.
+            clone_start = time.perf_counter()
             initial_weights = initial_weights.detach().clone(memory_format=torch.contiguous_format)
+            _add_loss_runtime_stat("initial_weights_clone_s", time.perf_counter() - clone_start)
+            _add_loss_runtime_stat("initial_weights_clone_calls")
 
     backtest = run_backtest_torch(
         weights,
@@ -686,7 +711,10 @@ def risk_aware_loss(
     )
     if aux_outputs is not None and backtest.final_weights is not None:
         # Avoid carrying graph-owned output storage into the next step.
+        clone_start = time.perf_counter()
         aux_outputs["_final_weights"] = backtest.final_weights.detach().clone(memory_format=torch.contiguous_format)
+        _add_loss_runtime_stat("final_weights_clone_s", time.perf_counter() - clone_start)
+        _add_loss_runtime_stat("final_weights_clone_calls")
 
     if sample_mask is None:
         valid_mask = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)

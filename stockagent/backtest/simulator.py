@@ -38,13 +38,58 @@ _SCAN_COMPILED_CACHE: dict[
         ],
     ],
 ] = {}
+_PREP_COMPILED_CACHE: dict[tuple, Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
 _SCAN_COMPILE_FAILED: set[tuple] = set()
+_PREP_COMPILE_FAILED: set[tuple] = set()
 _SCAN_COMPILE_STATS: dict[str, int] = {
     "hits": 0,
     "misses": 0,
     "failures": 0,
     "disabled": 0,
 }
+_PREP_COMPILE_STATS: dict[str, int] = {
+    "hits": 0,
+    "misses": 0,
+    "failures": 0,
+    "disabled": 0,
+}
+_BACKTEST_RUNTIME_STATS: dict[str, float] = {
+    "calls": 0.0,
+    "total_s": 0.0,
+    "total_cuda_s": 0.0,
+    "prep_s": 0.0,
+    "prep_cuda_s": 0.0,
+    "prev_init_s": 0.0,
+    "prev_init_cuda_s": 0.0,
+    "dense_fast_path_s": 0.0,
+    "dense_fast_path_cuda_s": 0.0,
+    "cpp_ext_s": 0.0,
+    "cpp_ext_cuda_s": 0.0,
+    "runner_resolve_s": 0.0,
+    "runner_call_s": 0.0,
+    "runner_call_cuda_s": 0.0,
+    "runtime_fallback_s": 0.0,
+    "checkpoint_s": 0.0,
+    "checkpoint_cuda_s": 0.0,
+    "finalize_s": 0.0,
+    "finalize_cuda_s": 0.0,
+    "dense_fast_path_calls": 0.0,
+    "cpp_ext_calls": 0.0,
+    "cpp_ext_failures": 0.0,
+    "checkpoint_calls": 0.0,
+    "compiled_prep_calls": 0.0,
+    "eager_prep_calls": 0.0,
+    "compiled_runner_calls": 0.0,
+    "eager_runner_calls": 0.0,
+    "stateful_calls": 0.0,
+    "stateful_compiled_runner_calls": 0.0,
+    "stateful_eager_runner_calls": 0.0,
+    "nonstateful_compiled_runner_calls": 0.0,
+    "nonstateful_eager_runner_calls": 0.0,
+    "runtime_fallback_calls": 0.0,
+    "return_weights_history_calls": 0.0,
+}
+_BACKTEST_PENDING_CUDA_EVENTS: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
 
 def _round_half_up(values: np.ndarray | float, decimals: int = 2) -> np.ndarray:
@@ -207,6 +252,12 @@ def _torch_dynamo_is_compiling() -> bool:
 
 def _prepend_cuda_toolchain_paths() -> None:
     env_bin = Path(sys.executable).resolve().parent
+    env_root = env_bin.parent
+    os.environ.setdefault("CONDA_PREFIX", str(env_root))
+    ptxas_path = env_bin / "ptxas"
+    if ptxas_path.exists():
+        os.environ.setdefault("TRITON_PTXAS_PATH", str(ptxas_path))
+        os.environ.setdefault("TRITON_PTXAS_BLACKWELL_PATH", str(ptxas_path))
     entries = [str(env_bin)]
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
@@ -242,6 +293,14 @@ def _compile_enabled() -> bool:
     return enabled
 
 
+def _compile_stateful_enabled() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_COMPILE_STATEFUL", "1")
+
+
+def _compile_prep_enabled() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_COMPILE_PREP", "1")
+
+
 def _compile_verbose() -> bool:
     return _env_flag("STOCKAGENT_BACKTEST_VERBOSE", "0")
 
@@ -255,6 +314,61 @@ def get_backtest_compile_stats(reset: bool = False) -> dict[str, int]:
     if reset:
         for key in _SCAN_COMPILE_STATS:
             _SCAN_COMPILE_STATS[key] = 0
+    return stats
+
+
+def get_backtest_prep_compile_stats(reset: bool = False) -> dict[str, int]:
+    stats = dict(_PREP_COMPILE_STATS)
+    if reset:
+        for key in _PREP_COMPILE_STATS:
+            _PREP_COMPILE_STATS[key] = 0
+    return stats
+
+
+def _add_backtest_runtime_stat(key: str, value: float = 1.0) -> None:
+    _BACKTEST_RUNTIME_STATS[key] = float(_BACKTEST_RUNTIME_STATS.get(key, 0.0)) + float(value)
+
+
+class _CudaRuntimeTimer:
+    def __init__(self, key: str, tensor: torch.Tensor):
+        self.key = key
+        self.enabled = tensor.device.type == "cuda" and torch.cuda.is_available() and not _torch_dynamo_is_compiling()
+        self.start: torch.cuda.Event | None = None
+        self.end: torch.cuda.Event | None = None
+
+    def __enter__(self) -> "_CudaRuntimeTimer":
+        if self.enabled:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+            self.start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.enabled and self.start is not None and self.end is not None:
+            self.end.record()
+            _BACKTEST_PENDING_CUDA_EVENTS.append((self.key, self.start, self.end))
+
+
+def _flush_backtest_cuda_event_stats() -> None:
+    if not _BACKTEST_PENDING_CUDA_EVENTS:
+        return
+    pending = list(_BACKTEST_PENDING_CUDA_EVENTS)
+    _BACKTEST_PENDING_CUDA_EVENTS.clear()
+    for key, start, end in pending:
+        try:
+            end.synchronize()
+            _add_backtest_runtime_stat(key, float(start.elapsed_time(end)) / 1000.0)
+        except Exception:
+            continue
+
+
+def get_backtest_runtime_stats(reset: bool = False) -> dict[str, float]:
+    _flush_backtest_cuda_event_stats()
+    stats = dict(_BACKTEST_RUNTIME_STATS)
+    if reset:
+        for key in _BACKTEST_RUNTIME_STATS:
+            _BACKTEST_RUNTIME_STATS[key] = 0.0
+        _BACKTEST_PENDING_CUDA_EVENTS.clear()
     return stats
 
 
@@ -313,6 +427,7 @@ def _scan_compile_key(
     gross_budget: float,
     scan_chunk_size: int,
     record_weights_history: bool,
+    stateful_initial: bool = False,
 ) -> tuple:
     return (
         str(weights.device),
@@ -323,6 +438,7 @@ def _scan_compile_key(
         float(gross_budget),
         int(scan_chunk_size),
         bool(record_weights_history),
+        bool(stateful_initial),
     )
 
 
@@ -450,6 +566,7 @@ def _resolve_scan_runner(
     gross_budget: float,
     scan_chunk_size: int,
     record_weights_history: bool,
+    stateful_initial: bool = False,
 ):
     base_runner = _scan_runner_factory(
         long_only=long_only,
@@ -479,13 +596,14 @@ def _resolve_scan_runner(
         gross_budget,
         scan_chunk_size,
         record_weights_history,
+        stateful_initial,
     )
     if key in _SCAN_COMPILE_FAILED:
         _SCAN_COMPILE_STATS["disabled"] += 1
         if _compile_verbose():
             print(
                 "[backtest compile] disabled after previous failure for "
-                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial})"
             )
         return base_runner
 
@@ -495,7 +613,7 @@ def _resolve_scan_runner(
         if _compile_verbose():
             print(
                 "[backtest compile] cache hit for "
-                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial})"
             )
         return cached
 
@@ -506,10 +624,17 @@ def _resolve_scan_runner(
         if _compile_verbose():
             print(
                 "[backtest compile] compiling fixed-shape runner for "
-                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial})"
             )
         _configure_inductor_cudagraphs()
-        compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=True)
+        if stateful_initial:
+            compiled = torch.compile(
+                base_runner,
+                dynamic=True,
+                options={"triton.cudagraphs": False},
+            )
+        else:
+            compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=True)
         _SCAN_COMPILED_CACHE[key] = compiled
         return compiled
     except Exception:
@@ -517,7 +642,7 @@ def _resolve_scan_runner(
         _SCAN_COMPILE_STATS["failures"] += 1
         print(
             "[backtest compile] compile failed, falling back to eager for "
-            f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history})"
+            f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial})"
         )
         return base_runner
 
@@ -531,6 +656,7 @@ def _fallback_scan_runner_after_runtime_failure(
     gross_budget: float,
     scan_chunk_size: int,
     record_weights_history: bool,
+    stateful_initial: bool = False,
 ):
     key = _scan_compile_key(
         weights,
@@ -539,6 +665,7 @@ def _fallback_scan_runner_after_runtime_failure(
         gross_budget,
         scan_chunk_size,
         record_weights_history,
+        stateful_initial,
     )
     _SCAN_COMPILE_FAILED.add(key)
     _SCAN_COMPILED_CACHE.pop(key, None)
@@ -547,7 +674,8 @@ def _fallback_scan_runner_after_runtime_failure(
         "[backtest compile] runtime failed, falling back to eager for "
         f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, "
         f"dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, "
-        f"record_weights={record_weights_history}): {type(error).__name__}: {str(error)[:300]}"
+        f"record_weights={record_weights_history}, stateful={stateful_initial}): "
+        f"{type(error).__name__}: {str(error)[:300]}"
     )
     return _scan_runner_factory(
         long_only=long_only,
@@ -831,6 +959,116 @@ def _vectorized_backtest_torch_scan_long_short(
     return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev
 
 
+def _prepare_runner_factory(
+    *,
+    long_only: bool,
+    gross_budget: float,
+):
+    def _runner(
+        weights: torch.Tensor,
+        tradable_mask: torch.Tensor,
+        can_buy_mask: torch.Tensor,
+        can_sell_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        compute_dtype = _supported_scan_dtype(weights.dtype)
+        target_weights = weights.to(dtype=compute_dtype)
+        tradable = tradable_mask.to(device=target_weights.device, dtype=torch.bool)
+        buy_mask = can_buy_mask.to(device=target_weights.device, dtype=torch.bool)
+        sell_mask = can_sell_mask.to(device=target_weights.device, dtype=torch.bool)
+        target_weights = _normalize_target_weights_torch(
+            target_weights,
+            long_only=long_only,
+            gross_budget=gross_budget,
+        )
+        return target_weights, tradable, buy_mask, sell_mask
+
+    return _runner
+
+
+def _prepare_compile_key(
+    weights: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    long_only: bool,
+    gross_budget: float,
+) -> tuple:
+    return (
+        str(weights.device),
+        int(weights.size(0)),
+        int(weights.size(1)),
+        str(weights.dtype),
+        str(tradable_mask.dtype),
+        str(can_buy_mask.dtype),
+        str(can_sell_mask.dtype),
+        bool(long_only),
+        float(gross_budget),
+    )
+
+
+def _resolve_prepare_runner(
+    weights: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    *,
+    long_only: bool,
+    gross_budget: float,
+):
+    base_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+    if (
+        not _compile_prep_enabled()
+        or not _compile_enabled()
+        or weights.device.type != "cuda"
+        or not hasattr(torch, "compile")
+    ):
+        _PREP_COMPILE_STATS["disabled"] += 1
+        _add_backtest_runtime_stat("eager_prep_calls")
+        return base_runner
+
+    key = _prepare_compile_key(
+        weights,
+        tradable_mask,
+        can_buy_mask,
+        can_sell_mask,
+        long_only,
+        gross_budget,
+    )
+    if key in _PREP_COMPILE_FAILED:
+        _PREP_COMPILE_STATS["disabled"] += 1
+        _add_backtest_runtime_stat("eager_prep_calls")
+        return base_runner
+
+    cached = _PREP_COMPILED_CACHE.get(key)
+    if cached is not None:
+        _PREP_COMPILE_STATS["hits"] += 1
+        _add_backtest_runtime_stat("compiled_prep_calls")
+        return cached
+
+    try:
+        _PREP_COMPILE_STATS["misses"] += 1
+        _configure_inductor_cudagraphs()
+        compiled = torch.compile(
+            base_runner,
+            dynamic=True,
+            options={"triton.cudagraphs": False},
+        )
+        _PREP_COMPILED_CACHE[key] = compiled
+        _add_backtest_runtime_stat("compiled_prep_calls")
+        return compiled
+    except Exception as e:
+        _PREP_COMPILE_FAILED.add(key)
+        _PREP_COMPILE_STATS["failures"] += 1
+        _add_backtest_runtime_stat("eager_prep_calls")
+        if _compile_verbose():
+            print(
+                "[backtest prep compile] compile failed, falling back to eager for "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}): "
+                f"{type(e).__name__}: {str(e)[:300]}"
+            )
+        return base_runner
+
+
 def _prepare_scan_inputs(
     weights: torch.Tensor,
     tradable_mask: torch.Tensor,
@@ -839,21 +1077,47 @@ def _prepare_scan_inputs(
     long_only: bool,
     gross_leverage: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    compute_dtype = _supported_scan_dtype(weights.dtype)
-    target_weights = weights.to(dtype=compute_dtype)
     gross_budget = _resolve_exposure_budget(gross_leverage)
-    device = target_weights.device
-    tradable = tradable_mask.to(device=device, dtype=torch.bool)
-    buy_mask = tradable if can_buy_mask is None else can_buy_mask.to(device=device, dtype=torch.bool)
-    sell_mask = tradable if can_sell_mask is None else can_sell_mask.to(device=device, dtype=torch.bool)
-
-    target_weights = _normalize_target_weights_torch(
-        target_weights,
+    buy_input = tradable_mask if can_buy_mask is None else can_buy_mask
+    sell_input = tradable_mask if can_sell_mask is None else can_sell_mask
+    runner = _resolve_prepare_runner(
+        weights,
+        tradable_mask,
+        buy_input,
+        sell_input,
         long_only=long_only,
         gross_budget=gross_budget,
     )
-
-    return target_weights, tradable, buy_mask, sell_mask
+    try:
+        return runner(weights, tradable_mask, buy_input, sell_input)
+    except Exception as e:
+        if _torch_dynamo_is_compiling() or not (
+            _compile_prep_enabled()
+            and _compile_enabled()
+            and weights.device.type == "cuda"
+            and hasattr(torch, "compile")
+        ):
+            raise
+        key = _prepare_compile_key(
+            weights,
+            tradable_mask,
+            buy_input,
+            sell_input,
+            long_only,
+            gross_budget,
+        )
+        _PREP_COMPILE_FAILED.add(key)
+        _PREP_COMPILED_CACHE.pop(key, None)
+        _PREP_COMPILE_STATS["failures"] += 1
+        _add_backtest_runtime_stat("eager_prep_calls")
+        if _compile_verbose():
+            print(
+                "[backtest prep compile] runtime failed, falling back to eager for "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}): "
+                f"{type(e).__name__}: {str(e)[:300]}"
+            )
+        eager_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+        return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
 
 def _vectorized_backtest_torch(
@@ -872,53 +1136,72 @@ def _vectorized_backtest_torch(
     dense_mask_constraints: bool = False,
     initial_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    gross_budget = _resolve_exposure_budget(gross_leverage)
-    effective_max_turnover_ratio = float(max_turnover_ratio)
-    max_possible_turnover = 2.0 * gross_budget
-    if effective_max_turnover_ratio >= max_possible_turnover:
-        effective_max_turnover_ratio = 0.0
-    prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
-        weights,
-        tradable_mask,
-        can_buy_mask,
-        can_sell_mask,
-        long_only,
-        gross_leverage,
-    )
-    prev_init = (
-        torch.nan_to_num(
-            initial_weights.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        if initial_weights is not None
-        else torch.zeros_like(prepped_weights[0])
-    )
+    total_start = time.perf_counter()
+    _add_backtest_runtime_stat("calls")
+    if initial_weights is not None:
+        _add_backtest_runtime_stat("stateful_calls")
+    if return_weights_history:
+        _add_backtest_runtime_stat("return_weights_history_calls")
+
+    with _CudaRuntimeTimer("total_cuda_s", weights):
+        gross_budget = _resolve_exposure_budget(gross_leverage)
+        effective_max_turnover_ratio = float(max_turnover_ratio)
+        max_possible_turnover = 2.0 * gross_budget
+        if effective_max_turnover_ratio >= max_possible_turnover:
+            effective_max_turnover_ratio = 0.0
+        prep_start = time.perf_counter()
+        with _CudaRuntimeTimer("prep_cuda_s", weights):
+            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
+                weights,
+                tradable_mask,
+                can_buy_mask,
+                can_sell_mask,
+                long_only,
+                gross_leverage,
+            )
+        _add_backtest_runtime_stat("prep_s", time.perf_counter() - prep_start)
+        prev_init_start = time.perf_counter()
+        with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
+            prev_init = (
+                torch.nan_to_num(
+                    initial_weights.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if initial_weights is not None
+                else torch.zeros_like(prepped_weights[0])
+            )
+        _add_backtest_runtime_stat("prev_init_s", time.perf_counter() - prev_init_start)
 
     # Fast path: no tradability/side restrictions and no turnover cap.
     # In this case, each day's realised target equals model target, so we can
     # compute turnover/returns via pure tensor ops without recurrent scan.
     use_dense_fast_path = effective_max_turnover_ratio <= 0.0 and bool(dense_mask_constraints)
     if use_dense_fast_path:
-        returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
-        deltas = torch.empty_like(prepped_weights)
-        deltas[0] = prepped_weights[0] - prev_init
-        if int(prepped_weights.size(0)) > 1:
-            deltas[1:] = prepped_weights[1:] - prepped_weights[:-1]
+        _add_backtest_runtime_stat("dense_fast_path_calls")
+        dense_start = time.perf_counter()
+        with _CudaRuntimeTimer("dense_fast_path_cuda_s", prepped_weights):
+            returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
+            deltas = torch.empty_like(prepped_weights)
+            deltas[0] = prepped_weights[0] - prev_init
+            if int(prepped_weights.size(0)) > 1:
+                deltas[1:] = prepped_weights[1:] - prepped_weights[:-1]
 
-        buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
-        sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
-        turnovers = buy_turnovers + sell_turnovers
-        gross_returns = (prepped_weights * returns_t).sum(dim=1)
-        strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+            buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
+            sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
+            turnovers = buy_turnovers + sell_turnovers
+            gross_returns = (prepped_weights * returns_t).sum(dim=1)
+            strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
 
-        if return_weights_history:
-            weights_history = prepped_weights
-        else:
-            weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+            if return_weights_history:
+                weights_history = prepped_weights
+            else:
+                weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
 
-        returns_dtype = prepped_weights.dtype
+            returns_dtype = prepped_weights.dtype
+        _add_backtest_runtime_stat("dense_fast_path_s", time.perf_counter() - dense_start)
+        _add_backtest_runtime_stat("total_s", time.perf_counter() - total_start)
         return (
             strategy_returns.to(returns_dtype),
             turnovers.to(returns_dtype),
@@ -950,23 +1233,30 @@ def _vectorized_backtest_torch(
         and initial_weights is None
     )
     if use_cpp_long_short:
+        _add_backtest_runtime_stat("cpp_ext_calls")
+        cpp_start = time.perf_counter()
         try:
-            strategy_returns, turnovers, weights_history = run_long_short_cpp_autograd(
-                prepped_weights,
-                future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
-                prepped_tradable,
-                prepped_buy,
-                prepped_sell,
-                buy_fee_rate,
-                sell_fee_rate,
-                effective_max_turnover_ratio,
-                gross_budget,
-            )
+            with _CudaRuntimeTimer("cpp_ext_cuda_s", prepped_weights):
+                strategy_returns, turnovers, weights_history = run_long_short_cpp_autograd(
+                    prepped_weights,
+                    future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                    prepped_tradable,
+                    prepped_buy,
+                    prepped_sell,
+                    buy_fee_rate,
+                    sell_fee_rate,
+                    effective_max_turnover_ratio,
+                    gross_budget,
+                )
             final_weights = weights_history[-1]
             if not return_weights_history:
                 weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+            _add_backtest_runtime_stat("cpp_ext_s", time.perf_counter() - cpp_start)
+            _add_backtest_runtime_stat("total_s", time.perf_counter() - total_start)
             return strategy_returns, turnovers, weights_history, final_weights
         except Exception as e:
+            _add_backtest_runtime_stat("cpp_ext_failures")
+            _add_backtest_runtime_stat("cpp_ext_s", time.perf_counter() - cpp_start)
             if _compile_verbose():
                 print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
 
@@ -978,6 +1268,8 @@ def _vectorized_backtest_torch(
     )
 
     if use_checkpoint:
+        _add_backtest_runtime_stat("checkpoint_calls")
+        resolve_start = time.perf_counter()
         # Checkpoint recomputation and cudagraph-captured compiled functions can
         # conflict in backward. Use eager runner for this path to keep training stable.
         runner = _scan_runner_factory(
@@ -987,18 +1279,45 @@ def _vectorized_backtest_torch(
             scan_chunk_size=resolved_chunk,
             record_weights_history=return_weights_history,
         )
+        _add_backtest_runtime_stat("runner_resolve_s", time.perf_counter() - resolve_start)
+        _add_backtest_runtime_stat("eager_runner_calls")
     else:
+        stateful_initial = initial_weights is not None
+        compile_possible = (
+            _compile_enabled()
+            and prepped_weights.device.type == "cuda"
+            and hasattr(torch, "compile")
+        )
+        resolve_start = time.perf_counter()
         if initial_weights is not None:
-            # Recurrent/stateful training feeds previous-step portfolio state into
-            # the next call. Keeping this path eager avoids CUDA graph output
-            # aliasing/overwrite hazards from compiled scan runners.
-            runner = _scan_runner_factory(
-                long_only=long_only,
-                max_turnover_ratio=effective_max_turnover_ratio,
-                gross_budget=gross_budget,
-                scan_chunk_size=resolved_chunk,
-                record_weights_history=return_weights_history,
-            )
+            if _compile_stateful_enabled():
+                # Stateful train/eval scans carry detached portfolio state between
+                # batches/chunks. Compile this path separately with CUDA graphs off.
+                runner = _resolve_scan_runner(
+                    prepped_weights,
+                    long_only=long_only,
+                    max_turnover_ratio=effective_max_turnover_ratio,
+                    gross_budget=gross_budget,
+                    scan_chunk_size=resolved_chunk,
+                    record_weights_history=return_weights_history,
+                    stateful_initial=True,
+                )
+                if compile_possible:
+                    _add_backtest_runtime_stat("compiled_runner_calls")
+                    _add_backtest_runtime_stat("stateful_compiled_runner_calls")
+                else:
+                    _add_backtest_runtime_stat("eager_runner_calls")
+                    _add_backtest_runtime_stat("stateful_eager_runner_calls")
+            else:
+                runner = _scan_runner_factory(
+                    long_only=long_only,
+                    max_turnover_ratio=effective_max_turnover_ratio,
+                    gross_budget=gross_budget,
+                    scan_chunk_size=resolved_chunk,
+                    record_weights_history=return_weights_history,
+                )
+                _add_backtest_runtime_stat("eager_runner_calls")
+                _add_backtest_runtime_stat("stateful_eager_runner_calls")
         else:
             runner = _resolve_scan_runner(
                 prepped_weights,
@@ -1007,23 +1326,36 @@ def _vectorized_backtest_torch(
                 gross_budget=gross_budget,
                 scan_chunk_size=resolved_chunk,
                 record_weights_history=return_weights_history,
+                stateful_initial=False,
             )
+            if compile_possible:
+                _add_backtest_runtime_stat("compiled_runner_calls")
+                _add_backtest_runtime_stat("nonstateful_compiled_runner_calls")
+            else:
+                _add_backtest_runtime_stat("eager_runner_calls")
+                _add_backtest_runtime_stat("nonstateful_eager_runner_calls")
+        _add_backtest_runtime_stat("runner_resolve_s", time.perf_counter() - resolve_start)
 
     if not use_checkpoint:
         try:
-            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
-                prepped_weights,
-                future_returns,
-                prepped_tradable,
-                prepped_buy,
-                prepped_sell,
-                prev_init,
-            )
+            runner_call_start = time.perf_counter()
+            with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
+                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
+                    prepped_weights,
+                    future_returns,
+                    prepped_tradable,
+                    prepped_buy,
+                    prepped_sell,
+                    prev_init,
+                )
+            _add_backtest_runtime_stat("runner_call_s", time.perf_counter() - runner_call_start)
         except Exception as e:
             if _torch_dynamo_is_compiling() or not (
                 _compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")
             ):
                 raise
+            _add_backtest_runtime_stat("runtime_fallback_calls")
+            fallback_start = time.perf_counter()
             runner = _fallback_scan_runner_after_runtime_failure(
                 error=e,
                 weights=prepped_weights,
@@ -1032,70 +1364,83 @@ def _vectorized_backtest_torch(
                 gross_budget=gross_budget,
                 scan_chunk_size=resolved_chunk,
                 record_weights_history=return_weights_history,
+                stateful_initial=initial_weights is not None,
             )
-            turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
-                prepped_weights,
-                future_returns,
-                prepped_tradable,
-                prepped_buy,
-                prepped_sell,
-                prev_init,
-            )
+            _add_backtest_runtime_stat("runtime_fallback_s", time.perf_counter() - fallback_start)
+            runner_call_start = time.perf_counter()
+            with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
+                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
+                    prepped_weights,
+                    future_returns,
+                    prepped_tradable,
+                    prepped_buy,
+                    prepped_sell,
+                    prev_init,
+                )
+            _add_backtest_runtime_stat("runner_call_s", time.perf_counter() - runner_call_start)
     else:
-        chunk_rows = max(1, int(checkpoint_rows))
-        turnovers_chunks: list[torch.Tensor] = []
-        buy_chunks: list[torch.Tensor] = []
-        sell_chunks: list[torch.Tensor] = []
-        gross_chunks: list[torch.Tensor] = []
-        weights_chunks: list[torch.Tensor] = [] if return_weights_history else []
-        prev = prev_init
+        checkpoint_start = time.perf_counter()
+        with _CudaRuntimeTimer("checkpoint_cuda_s", prepped_weights):
+            chunk_rows = max(1, int(checkpoint_rows))
+            turnovers_chunks: list[torch.Tensor] = []
+            buy_chunks: list[torch.Tensor] = []
+            sell_chunks: list[torch.Tensor] = []
+            gross_chunks: list[torch.Tensor] = []
+            weights_chunks: list[torch.Tensor] = [] if return_weights_history else []
+            prev = prev_init
 
-        for start in range(0, int(prepped_weights.size(0)), chunk_rows):
-            end = min(start + chunk_rows, int(prepped_weights.size(0)))
-            w_chunk = prepped_weights[start:end]
-            r_chunk = future_returns[start:end]
-            t_chunk = prepped_tradable[start:end]
-            b_chunk = prepped_buy[start:end]
-            s_chunk = prepped_sell[start:end]
+            for start in range(0, int(prepped_weights.size(0)), chunk_rows):
+                end = min(start + chunk_rows, int(prepped_weights.size(0)))
+                w_chunk = prepped_weights[start:end]
+                r_chunk = future_returns[start:end]
+                t_chunk = prepped_tradable[start:end]
+                b_chunk = prepped_buy[start:end]
+                s_chunk = prepped_sell[start:end]
 
-            chunk_out = checkpoint_fn(
-                runner,
-                w_chunk,
-                r_chunk,
-                t_chunk,
-                b_chunk,
-                s_chunk,
-                prev,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
-            t_out, b_out, s_out, g_out, w_out, last_w = chunk_out
-            turnovers_chunks.append(t_out)
-            buy_chunks.append(b_out)
-            sell_chunks.append(s_out)
-            gross_chunks.append(g_out)
+                chunk_out = checkpoint_fn(
+                    runner,
+                    w_chunk,
+                    r_chunk,
+                    t_chunk,
+                    b_chunk,
+                    s_chunk,
+                    prev,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+                t_out, b_out, s_out, g_out, w_out, last_w = chunk_out
+                turnovers_chunks.append(t_out)
+                buy_chunks.append(b_out)
+                sell_chunks.append(s_out)
+                gross_chunks.append(g_out)
+                if return_weights_history:
+                    weights_chunks.append(w_out)
+                prev = last_w
+
+            turnovers = torch.cat(turnovers_chunks, dim=0)
+            buy_turnovers = torch.cat(buy_chunks, dim=0)
+            sell_turnovers = torch.cat(sell_chunks, dim=0)
+            gross_returns = torch.cat(gross_chunks, dim=0)
             if return_weights_history:
-                weights_chunks.append(w_out)
-            prev = last_w
+                weights_history = torch.cat(weights_chunks, dim=0)
+            else:
+                weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
+            final_weights = prev
+        _add_backtest_runtime_stat("checkpoint_s", time.perf_counter() - checkpoint_start)
 
-        turnovers = torch.cat(turnovers_chunks, dim=0)
-        buy_turnovers = torch.cat(buy_chunks, dim=0)
-        sell_turnovers = torch.cat(sell_chunks, dim=0)
-        gross_returns = torch.cat(gross_chunks, dim=0)
-        if return_weights_history:
-            weights_history = torch.cat(weights_chunks, dim=0)
-        else:
-            weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
-        final_weights = prev
-
-    returns_dtype = prepped_weights.dtype
-    strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
-    return (
-        strategy_returns.to(returns_dtype),
-        turnovers.to(returns_dtype),
-        weights_history.to(returns_dtype),
-        final_weights.to(returns_dtype),
-    )
+    finalize_start = time.perf_counter()
+    with _CudaRuntimeTimer("finalize_cuda_s", prepped_weights):
+        returns_dtype = prepped_weights.dtype
+        strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+        result = (
+            strategy_returns.to(returns_dtype),
+            turnovers.to(returns_dtype),
+            weights_history.to(returns_dtype),
+            final_weights.to(returns_dtype),
+        )
+    _add_backtest_runtime_stat("finalize_s", time.perf_counter() - finalize_start)
+    _add_backtest_runtime_stat("total_s", time.perf_counter() - total_start)
+    return result
 
 
 def run_backtest(

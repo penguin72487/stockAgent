@@ -50,7 +50,7 @@ training:
   model_name: transformer_base_portfolio
   enable_torch_compile: true
   auto_torch_compile_sharpe: true
-  compile_loss: true
+  compile_loss: false
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
@@ -59,6 +59,7 @@ training:
   prefer_fp16: false
   backtest_autotune: true
   backtest_compile: true
+  backtest_compile_stateful: true
   backtest_verbose: false
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
@@ -68,11 +69,13 @@ training:
   batch_size_train: 64
   batch_size_eval: 64
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.05
+  early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
   curve_plot_interval: 1
   curve_plot_async: true
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: true
   explain_first_test_year_only: true
   explain_top_k: 20
@@ -82,7 +85,7 @@ training:
   explain_perturb: true
   explain_write_plots: true
   cache_train_tensors_on_gpu: true
-  cache_eval_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: true
   learning_rate: 0.0001
   enable_lr_scheduler: false
   lr_scheduler: plateau
