@@ -11,7 +11,7 @@ import sys
 import time
 import gc
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -39,6 +39,8 @@ from stockagent.backtest.simulator import (
     BacktestResultTensor,
     HoldingsRecord,
     get_backtest_compile_stats,
+    get_backtest_prep_compile_stats,
+    get_backtest_runtime_stats,
     run_backtest_integer_shares,
     run_backtest_torch,
 )
@@ -48,7 +50,7 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
-from stockagent.training.loss import risk_aware_loss
+from stockagent.training.loss import get_loss_runtime_stats, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
 
@@ -83,13 +85,19 @@ class TimingBreakdown:
     transfer_s: float = 0.0
     forward_s: float = 0.0
     model_forward_s: float = 0.0
+    model_forward_cuda_s: float = 0.0
     factor_aug_s: float = 0.0
+    factor_aug_cuda_s: float = 0.0
     loss_s: float = 0.0
+    loss_cuda_s: float = 0.0
+    portfolio_state_s: float = 0.0
     backward_s: float = 0.0
     grad_s: float = 0.0
+    grad_cuda_s: float = 0.0
     clip_s: float = 0.0
     finite_check_s: float = 0.0
     step_s: float = 0.0
+    step_cuda_s: float = 0.0
     backtest_s: float = 0.0
     ic_s: float = 0.0
     metrics_s: float = 0.0
@@ -99,6 +107,7 @@ class TimingBreakdown:
     sync_s: float = 0.0
     gc_s: float = 0.0
     batches: int = 0
+    cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
 
 
 def _log_timing(label: str, timing: TimingBreakdown) -> None:
@@ -110,13 +119,19 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "transfer_s",
         "forward_s",
         "model_forward_s",
+        "model_forward_cuda_s",
         "factor_aug_s",
+        "factor_aug_cuda_s",
         "loss_s",
+        "loss_cuda_s",
+        "portfolio_state_s",
         "backward_s",
         "grad_s",
+        "grad_cuda_s",
         "clip_s",
         "finite_check_s",
         "step_s",
+        "step_cuda_s",
         "backtest_s",
         "ic_s",
         "metrics_s",
@@ -139,13 +154,19 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "transfer_s",
         "forward_s",
         "model_forward_s",
+        "model_forward_cuda_s",
         "factor_aug_s",
+        "factor_aug_cuda_s",
         "loss_s",
+        "loss_cuda_s",
+        "portfolio_state_s",
         "backward_s",
         "grad_s",
+        "grad_cuda_s",
         "clip_s",
         "finite_check_s",
         "step_s",
+        "step_cuda_s",
         "backtest_s",
         "ic_s",
         "metrics_s",
@@ -157,6 +178,45 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
     ):
         setattr(dst, name, getattr(dst, name) + getattr(src, name))
     dst.batches += src.batches
+    dst.cuda_events.extend(src.cuda_events)
+
+
+class _CudaTimingRecorder:
+    def __init__(self, timing: TimingBreakdown, attr: str, device: torch.device):
+        self.timing = timing
+        self.attr = attr
+        self.enabled = device.type == "cuda" and torch.cuda.is_available()
+        self.start: torch.cuda.Event | None = None
+        self.end: torch.cuda.Event | None = None
+
+    def __enter__(self) -> "_CudaTimingRecorder":
+        if self.enabled:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+            self.start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.enabled and self.start is not None and self.end is not None:
+            self.end.record()
+            self.timing.cuda_events.append((self.attr, self.start, self.end))
+
+
+def _cuda_timing(timing: TimingBreakdown, attr: str, device: torch.device) -> _CudaTimingRecorder:
+    return _CudaTimingRecorder(timing, attr, device)
+
+
+def _flush_cuda_timing_events(timing: TimingBreakdown) -> None:
+    if not timing.cuda_events:
+        return
+    pending = list(timing.cuda_events)
+    timing.cuda_events.clear()
+    for attr, start, end in pending:
+        try:
+            end.synchronize()
+            setattr(timing, attr, getattr(timing, attr) + float(start.elapsed_time(end)) / 1000.0)
+        except Exception:
+            continue
 
 
 def _maybe_sync_cuda(device: torch.device, enabled: bool) -> None:
@@ -229,6 +289,10 @@ class _CompiledLossFallback:
             if isinstance(aux_outputs, dict):
                 aux_outputs.pop("_final_weights", None)
             return self._eager_fn(*args, **kwargs)
+
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -1184,13 +1248,42 @@ def _timing_curve_payload(
     gc_s: float = 0.0,
     epoch_wall_s: float | None = None,
     timing_synchronized: bool = False,
+    backtest_compile_stats: dict[str, int] | None = None,
+    backtest_prep_compile_stats: dict[str, int] | None = None,
+    backtest_runtime_stats: dict[str, float] | None = None,
+    train_backtest_runtime_stats: dict[str, float] | None = None,
+    loss_runtime_stats: dict[str, float] | None = None,
 ) -> dict[str, float | int]:
+    _flush_cuda_timing_events(train_timing)
+    if val_timing is not None:
+        _flush_cuda_timing_events(val_timing)
+    if test_curve_timing is not None:
+        _flush_cuda_timing_events(test_curve_timing)
     val_timing = val_timing or TimingBreakdown()
     test_curve_timing = test_curve_timing or TimingBreakdown()
+    backtest_compile_stats = backtest_compile_stats or {}
+    backtest_prep_compile_stats = backtest_prep_compile_stats or {}
+    backtest_runtime_stats = backtest_runtime_stats or {}
+    train_backtest_runtime_stats = train_backtest_runtime_stats or backtest_runtime_stats
+    loss_runtime_stats = loss_runtime_stats or {}
     batches = max(1, int(train_timing.batches))
+    bt_calls = max(1.0, float(backtest_runtime_stats.get("calls", 0.0)))
 
     def _avg_ms(value_s: float) -> float:
         return float(value_s) * 1000.0 / float(batches)
+
+    def _bt_avg_ms(key: str) -> float:
+        return float(backtest_runtime_stats.get(key, 0.0)) * 1000.0 / bt_calls
+
+    def _train_bt_avg_batch_ms(key: str) -> float:
+        return float(train_backtest_runtime_stats.get(key, 0.0)) * 1000.0 / float(batches)
+
+    def _train_bt_avg_call_ms(key: str) -> float:
+        calls = max(1.0, float(train_backtest_runtime_stats.get("calls", 0.0)))
+        return float(train_backtest_runtime_stats.get(key, 0.0)) * 1000.0 / calls
+
+    def _loss_avg_ms(key: str) -> float:
+        return float(loss_runtime_stats.get(key, 0.0)) * 1000.0 / float(batches)
 
     val_metrics_value = float(val_loss_s if val_metrics_s is None else val_metrics_s)
     checkpoint_total_s = (
@@ -1222,13 +1315,50 @@ def _timing_curve_payload(
         "train_transfer_ms_per_batch": _avg_ms(train_timing.transfer_s),
         "train_forward_ms_per_batch": _avg_ms(train_timing.forward_s),
         "train_model_forward_ms_per_batch": _avg_ms(train_timing.model_forward_s),
+        "train_model_forward_cuda_ms_per_batch": _avg_ms(train_timing.model_forward_cuda_s),
         "train_factor_aug_ms_per_batch": _avg_ms(train_timing.factor_aug_s),
+        "train_factor_aug_cuda_ms_per_batch": _avg_ms(train_timing.factor_aug_cuda_s),
         "train_loss_ms_per_batch": _avg_ms(train_timing.loss_s),
+        "train_loss_cuda_ms_per_batch": _avg_ms(train_timing.loss_cuda_s),
+        "train_loss_bt_calls": int(train_backtest_runtime_stats.get("calls", 0.0)),
+        "train_loss_bt_calls_per_batch": float(train_backtest_runtime_stats.get("calls", 0.0)) / float(batches),
+        "train_loss_bt_runtime_ms_per_batch": _train_bt_avg_batch_ms("total_s"),
+        "train_loss_bt_runtime_cuda_ms_per_batch": _train_bt_avg_batch_ms("total_cuda_s"),
+        "train_loss_bt_prep_ms_per_batch": _train_bt_avg_batch_ms("prep_s"),
+        "train_loss_bt_prep_cuda_ms_per_batch": _train_bt_avg_batch_ms("prep_cuda_s"),
+        "train_loss_bt_prev_init_ms_per_batch": _train_bt_avg_batch_ms("prev_init_s"),
+        "train_loss_bt_prev_init_cuda_ms_per_batch": _train_bt_avg_batch_ms("prev_init_cuda_s"),
+        "train_loss_bt_runner_resolve_ms_per_batch": _train_bt_avg_batch_ms("runner_resolve_s"),
+        "train_loss_bt_runner_call_ms_per_batch": _train_bt_avg_batch_ms("runner_call_s"),
+        "train_loss_bt_runner_call_cuda_ms_per_batch": _train_bt_avg_batch_ms("runner_call_cuda_s"),
+        "train_loss_bt_runtime_fallback_ms_per_batch": _train_bt_avg_batch_ms("runtime_fallback_s"),
+        "train_loss_bt_checkpoint_ms_per_batch": _train_bt_avg_batch_ms("checkpoint_s"),
+        "train_loss_bt_checkpoint_cuda_ms_per_batch": _train_bt_avg_batch_ms("checkpoint_cuda_s"),
+        "train_loss_bt_finalize_ms_per_batch": _train_bt_avg_batch_ms("finalize_s"),
+        "train_loss_bt_finalize_cuda_ms_per_batch": _train_bt_avg_batch_ms("finalize_cuda_s"),
+        "train_loss_bt_cpp_ext_ms_per_batch": _train_bt_avg_batch_ms("cpp_ext_s"),
+        "train_loss_bt_cpp_ext_cuda_ms_per_batch": _train_bt_avg_batch_ms("cpp_ext_cuda_s"),
+        "train_loss_bt_runtime_cuda_ms_per_call": _train_bt_avg_call_ms("total_cuda_s"),
+        "train_loss_bt_prep_cuda_ms_per_call": _train_bt_avg_call_ms("prep_cuda_s"),
+        "train_loss_bt_runner_call_cuda_ms_per_call": _train_bt_avg_call_ms("runner_call_cuda_s"),
+        "train_loss_bt_compiled_runner_calls": int(train_backtest_runtime_stats.get("compiled_runner_calls", 0.0)),
+        "train_loss_bt_eager_runner_calls": int(train_backtest_runtime_stats.get("eager_runner_calls", 0.0)),
+        "train_loss_bt_compiled_prep_calls": int(train_backtest_runtime_stats.get("compiled_prep_calls", 0.0)),
+        "train_loss_bt_eager_prep_calls": int(train_backtest_runtime_stats.get("eager_prep_calls", 0.0)),
+        "train_loss_bt_stateful_calls": int(train_backtest_runtime_stats.get("stateful_calls", 0.0)),
+        "train_loss_bt_stateful_compiled_runner_calls": int(train_backtest_runtime_stats.get("stateful_compiled_runner_calls", 0.0)),
+        "train_loss_bt_stateful_eager_runner_calls": int(train_backtest_runtime_stats.get("stateful_eager_runner_calls", 0.0)),
+        "train_loss_bt_runtime_fallback_calls": int(train_backtest_runtime_stats.get("runtime_fallback_calls", 0.0)),
+        "train_portfolio_state_ms_per_batch": _avg_ms(train_timing.portfolio_state_s),
         "train_backward_total_ms_per_batch": _avg_ms(train_timing.backward_s),
+        "train_backward_autograd_ms_per_batch": _avg_ms(train_timing.grad_s),
+        "train_backward_autograd_cuda_ms_per_batch": _avg_ms(train_timing.grad_cuda_s),
         "train_grad_ms_per_batch": _avg_ms(train_timing.grad_s),
+        "train_grad_cuda_ms_per_batch": _avg_ms(train_timing.grad_cuda_s),
         "train_clip_ms_per_batch": _avg_ms(train_timing.clip_s),
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
         "train_step_ms_per_batch": _avg_ms(train_timing.step_s),
+        "train_step_cuda_ms_per_batch": _avg_ms(train_timing.step_cuda_s),
         "val_eval_s": float(val_eval_s),
         "val_transfer_s": float(val_timing.transfer_s),
         "val_forward_s": float(val_timing.forward_s),
@@ -1250,6 +1380,63 @@ def _timing_curve_payload(
         "test_curve_ic_s": float(test_curve_timing.ic_s),
         "test_curve_metrics_reduce_s": float(test_curve_timing.metrics_s),
         "test_curve_concat_s": float(test_curve_timing.concat_s),
+        "bt_compile_hits": int(backtest_compile_stats.get("hits", 0)),
+        "bt_compile_misses": int(backtest_compile_stats.get("misses", 0)),
+        "bt_compile_failures": int(backtest_compile_stats.get("failures", 0)),
+        "bt_compile_disabled": int(backtest_compile_stats.get("disabled", 0)),
+        "bt_compile_nonhit": int(
+            backtest_compile_stats.get("misses", 0)
+            + backtest_compile_stats.get("failures", 0)
+            + backtest_compile_stats.get("disabled", 0)
+        ),
+        "bt_prep_compile_hits": int(backtest_prep_compile_stats.get("hits", 0)),
+        "bt_prep_compile_misses": int(backtest_prep_compile_stats.get("misses", 0)),
+        "bt_prep_compile_failures": int(backtest_prep_compile_stats.get("failures", 0)),
+        "bt_prep_compile_disabled": int(backtest_prep_compile_stats.get("disabled", 0)),
+        "bt_prep_compile_nonhit": int(
+            backtest_prep_compile_stats.get("misses", 0)
+            + backtest_prep_compile_stats.get("failures", 0)
+            + backtest_prep_compile_stats.get("disabled", 0)
+        ),
+        "bt_runtime_calls": int(backtest_runtime_stats.get("calls", 0.0)),
+        "bt_runtime_ms_per_call": _bt_avg_ms("total_s"),
+        "bt_runtime_cuda_ms_per_call": _bt_avg_ms("total_cuda_s"),
+        "bt_runtime_calls_per_train_batch": float(backtest_runtime_stats.get("calls", 0.0)) / float(batches),
+        "bt_prep_ms_per_call": _bt_avg_ms("prep_s"),
+        "bt_prep_cuda_ms_per_call": _bt_avg_ms("prep_cuda_s"),
+        "bt_prev_init_ms_per_call": _bt_avg_ms("prev_init_s"),
+        "bt_prev_init_cuda_ms_per_call": _bt_avg_ms("prev_init_cuda_s"),
+        "bt_runner_resolve_ms_per_call": _bt_avg_ms("runner_resolve_s"),
+        "bt_runner_call_ms_per_call": _bt_avg_ms("runner_call_s"),
+        "bt_runner_call_cuda_ms_per_call": _bt_avg_ms("runner_call_cuda_s"),
+        "bt_runtime_fallback_ms_per_call": _bt_avg_ms("runtime_fallback_s"),
+        "bt_checkpoint_ms_per_call": _bt_avg_ms("checkpoint_s"),
+        "bt_checkpoint_cuda_ms_per_call": _bt_avg_ms("checkpoint_cuda_s"),
+        "bt_finalize_ms_per_call": _bt_avg_ms("finalize_s"),
+        "bt_finalize_cuda_ms_per_call": _bt_avg_ms("finalize_cuda_s"),
+        "bt_dense_fast_path_ms_per_call": _bt_avg_ms("dense_fast_path_s"),
+        "bt_dense_fast_path_cuda_ms_per_call": _bt_avg_ms("dense_fast_path_cuda_s"),
+        "bt_cpp_ext_ms_per_call": _bt_avg_ms("cpp_ext_s"),
+        "bt_cpp_ext_cuda_ms_per_call": _bt_avg_ms("cpp_ext_cuda_s"),
+        "bt_compiled_runner_calls": int(backtest_runtime_stats.get("compiled_runner_calls", 0.0)),
+        "bt_eager_runner_calls": int(backtest_runtime_stats.get("eager_runner_calls", 0.0)),
+        "bt_stateful_calls": int(backtest_runtime_stats.get("stateful_calls", 0.0)),
+        "bt_stateful_compiled_runner_calls": int(backtest_runtime_stats.get("stateful_compiled_runner_calls", 0.0)),
+        "bt_stateful_eager_runner_calls": int(backtest_runtime_stats.get("stateful_eager_runner_calls", 0.0)),
+        "bt_nonstateful_compiled_runner_calls": int(backtest_runtime_stats.get("nonstateful_compiled_runner_calls", 0.0)),
+        "bt_nonstateful_eager_runner_calls": int(backtest_runtime_stats.get("nonstateful_eager_runner_calls", 0.0)),
+        "bt_runtime_fallback_calls": int(backtest_runtime_stats.get("runtime_fallback_calls", 0.0)),
+        "bt_dense_fast_path_calls": int(backtest_runtime_stats.get("dense_fast_path_calls", 0.0)),
+        "bt_cpp_ext_calls": int(backtest_runtime_stats.get("cpp_ext_calls", 0.0)),
+        "bt_cpp_ext_failures": int(backtest_runtime_stats.get("cpp_ext_failures", 0.0)),
+        "bt_checkpoint_calls": int(backtest_runtime_stats.get("checkpoint_calls", 0.0)),
+        "bt_compiled_prep_calls": int(backtest_runtime_stats.get("compiled_prep_calls", 0.0)),
+        "bt_eager_prep_calls": int(backtest_runtime_stats.get("eager_prep_calls", 0.0)),
+        "bt_return_weights_history_calls": int(backtest_runtime_stats.get("return_weights_history_calls", 0.0)),
+        "loss_initial_weights_clone_ms_per_batch": _loss_avg_ms("initial_weights_clone_s"),
+        "loss_initial_weights_clone_calls": int(loss_runtime_stats.get("initial_weights_clone_calls", 0.0)),
+        "loss_final_weights_clone_ms_per_batch": _loss_avg_ms("final_weights_clone_s"),
+        "loss_final_weights_clone_calls": int(loss_runtime_stats.get("final_weights_clone_calls", 0.0)),
         "fold_checkpoint_save_s": float(fold_checkpoint_save_s),
         "group_checkpoint_save_s": float(group_checkpoint_save_s),
         "checkpoint_save_s": checkpoint_total_s,
@@ -1482,6 +1669,63 @@ def _benchmark_input_pipeline_throughput(
     tensor_sps = samples / elapsed
 
     return dataloader_sps, tensor_sps
+
+
+def _benchmark_windowed_input_pipeline_throughput(
+    *,
+    train_ds: CrossSectionalDataset,
+    train_windowed: WindowedSplitTensors,
+    train_batch_size: int,
+    config: ExperimentConfig,
+    device: torch.device,
+    non_blocking: bool,
+    drop_last: bool = False,
+    max_steps: int = 20,
+) -> tuple[float, float]:
+    """Return (dataloader_samples_per_sec, windowed_tensor_samples_per_sec)."""
+    if max_steps <= 0:
+        return 0.0, 0.0
+
+    def _sync_if_cuda() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    dataloader_sps = 0.0
+    if config.training.num_workers > 0:
+        loader = _build_loader(train_ds, train_batch_size, True, config, device, drop_last=drop_last)
+        steps = 0
+        samples = 0
+        start_t = time.perf_counter()
+        for batch in loader:
+            moved = _move_batch(batch, device, non_blocking)
+            samples += int(moved["x"].size(0))
+            steps += 1
+            if steps >= max_steps:
+                break
+        _sync_if_cuda()
+        elapsed = max(time.perf_counter() - start_t, 1e-6)
+        dataloader_sps = samples / elapsed
+
+    total_rows = int(len(train_windowed))
+    if total_rows == 0:
+        return dataloader_sps, 0.0
+
+    windowed_steps = min(max_steps, max(1, math.ceil(total_rows / max(1, train_batch_size))))
+    samples = 0
+    start_t = time.perf_counter()
+    for idx in range(windowed_steps):
+        start = idx * train_batch_size
+        if start >= total_rows:
+            break
+        end = min(start + train_batch_size, total_rows)
+        batch = train_windowed.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+        samples += int(batch["x"].size(0))
+        _ = batch
+    _sync_if_cuda()
+    elapsed = max(time.perf_counter() - start_t, 1e-6)
+    windowed_sps = samples / elapsed
+
+    return dataloader_sps, windowed_sps
 
 
 def _save_backtest_artifact(output_path: Path, result: BacktestResult, dates: np.ndarray) -> None:
@@ -2804,6 +3048,12 @@ def _resolve_host_compilers() -> tuple[str | None, str | None]:
 def _prepend_compile_toolchain_paths() -> None:
     entries: list[str] = []
     env_bin = Path(sys.executable).resolve().parent
+    env_root = env_bin.parent
+    os.environ.setdefault("CONDA_PREFIX", str(env_root))
+    ptxas_path = env_bin / "ptxas"
+    if ptxas_path.exists():
+        os.environ.setdefault("TRITON_PTXAS_PATH", str(ptxas_path))
+        os.environ.setdefault("TRITON_PTXAS_BLACKWELL_PATH", str(ptxas_path))
     entries.append(str(env_bin))
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
@@ -2848,6 +3098,10 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     training = config.training
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if bool(training.backtest_autotune) else "0"
     os.environ["STOCKAGENT_BACKTEST_COMPILE"] = "1" if bool(training.backtest_compile) else "0"
+    os.environ["STOCKAGENT_BACKTEST_COMPILE_STATEFUL"] = (
+        "1" if bool(training.backtest_compile_stateful) else "0"
+    )
+    os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
     os.environ["STOCKAGENT_BACKTEST_CHECKPOINT_CHUNK_ROWS"] = str(
         max(0, int(training.backtest_checkpoint_chunk_rows))
@@ -3361,19 +3615,21 @@ def _train_epoch(
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
-            model_output = model(batch["x"], batch["tradable_mask"])
-            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            with _cuda_timing(timing, "model_forward_cuda_s", device):
+                model_output = model(batch["x"], batch["tradable_mask"])
+                weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
             factor_aug_start = time.perf_counter()
-            aux_outputs = _attach_factor_augmented_scores(
-                model=model,
-                aux_outputs=aux_outputs,
-                x=batch["x"],
-                tradable_mask=batch["tradable_mask"],
-                aug_kwargs=factor_aug_kwargs or {},
-            )
+            with _cuda_timing(timing, "factor_aug_cuda_s", device):
+                aux_outputs = _attach_factor_augmented_scores(
+                    model=model,
+                    aux_outputs=aux_outputs,
+                    x=batch["x"],
+                    tradable_mask=batch["tradable_mask"],
+                    aug_kwargs=factor_aug_kwargs or {},
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
@@ -3382,43 +3638,44 @@ def _train_epoch(
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
             loss_start = time.perf_counter()
-            loss = loss_fn(
-                weights,
-                batch["future_log_returns"],
-                batch["tradable_mask"],
-                benchmark_returns=batch.get("benchmark"),
-                can_buy_mask=batch["can_buy_mask"],
-                can_sell_mask=batch["can_sell_mask"],
-                sample_mask=batch.get("sample_mask"),
-                long_only=long_only,
-                buy_fee_rate=buy_fee_rate,
-                sell_fee_rate=sell_fee_rate,
-                max_turnover_ratio=max_turnover_ratio,
-                gross_leverage=gross_leverage,
-                gamma_sharpe=gamma_sharpe,
-                gamma_excess=gamma_excess,
-                gamma_cvar=gamma_cvar,
-                cvar_alpha=cvar_alpha,
-                gamma_drawdown=gamma_drawdown,
-                drawdown_target=drawdown_target,
-                gamma_turnover=gamma_turnover,
-                gamma_underperformance=gamma_underperformance,
-                excess_target=excess_target,
-                cvar_budget=cvar_budget,
-                drawdown_budget=drawdown_budget,
-                turnover_budget=turnover_budget,
-                gamma_cvar_budget=gamma_cvar_budget,
-                gamma_drawdown_budget=gamma_drawdown_budget,
-                gamma_turnover_budget=gamma_turnover_budget,
-                objective=objective,
-                aux_outputs=aux_outputs,
-                rank_ic_weight=rank_ic_weight,
-                direction_weight=direction_weight,
-                volatility_regime_weight=volatility_regime_weight,
-                concentration_weight=concentration_weight,
-                regime_up_threshold=regime_up_threshold,
-                regime_down_threshold=regime_down_threshold,
-            )
+            with _cuda_timing(timing, "loss_cuda_s", device):
+                loss = loss_fn(
+                    weights,
+                    batch["future_log_returns"],
+                    batch["tradable_mask"],
+                    benchmark_returns=batch.get("benchmark"),
+                    can_buy_mask=batch["can_buy_mask"],
+                    can_sell_mask=batch["can_sell_mask"],
+                    sample_mask=batch.get("sample_mask"),
+                    long_only=long_only,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
+                    max_turnover_ratio=max_turnover_ratio,
+                    gross_leverage=gross_leverage,
+                    gamma_sharpe=gamma_sharpe,
+                    gamma_excess=gamma_excess,
+                    gamma_cvar=gamma_cvar,
+                    cvar_alpha=cvar_alpha,
+                    gamma_drawdown=gamma_drawdown,
+                    drawdown_target=drawdown_target,
+                    gamma_turnover=gamma_turnover,
+                    gamma_underperformance=gamma_underperformance,
+                    excess_target=excess_target,
+                    cvar_budget=cvar_budget,
+                    drawdown_budget=drawdown_budget,
+                    turnover_budget=turnover_budget,
+                    gamma_cvar_budget=gamma_cvar_budget,
+                    gamma_drawdown_budget=gamma_drawdown_budget,
+                    gamma_turnover_budget=gamma_turnover_budget,
+                    objective=objective,
+                    aux_outputs=aux_outputs,
+                    rank_ic_weight=rank_ic_weight,
+                    direction_weight=direction_weight,
+                    volatility_regime_weight=volatility_regime_weight,
+                    concentration_weight=concentration_weight,
+                    regime_up_threshold=regime_up_threshold,
+                    regime_down_threshold=regime_down_threshold,
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
         should_check_finite = _should_check_finite(batch_no, finite_check_interval_steps)
@@ -3434,7 +3691,10 @@ def _train_epoch(
         if sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
             if next_prev is not None:
+                state_start = time.perf_counter()
                 portfolio_prev_weights = _detach_portfolio_state(next_prev)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.portfolio_state_s += time.perf_counter() - state_start
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -3443,7 +3703,8 @@ def _train_epoch(
             _progress(f"{progress_label}: batch {batch_no}{suffix} backward")
         if scaler.is_enabled():
             grad_start = time.perf_counter()
-            scaler.scale(loss).backward()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -3471,13 +3732,15 @@ def _train_epoch(
             if progress_label:
                 _progress(f"{progress_label}: batch {batch_no}{suffix} optimizer step")
             step_start = time.perf_counter()
-            scaler.step(optimizer)
-            scaler.update()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                scaler.step(optimizer)
+                scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
         else:
             grad_start = time.perf_counter()
-            loss.backward()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                loss.backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -3504,7 +3767,8 @@ def _train_epoch(
             if progress_label:
                 _progress(f"{progress_label}: batch {batch_no}{suffix} optimizer step")
             step_start = time.perf_counter()
-            optimizer.step()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
 
@@ -3633,19 +3897,21 @@ def _train_epoch_tensor(
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
-            model_output = model(batch_x, batch_mask)
-            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            with _cuda_timing(timing, "model_forward_cuda_s", device):
+                model_output = model(batch_x, batch_mask)
+                weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
             factor_aug_start = time.perf_counter()
-            aux_outputs = _attach_factor_augmented_scores(
-                model=model,
-                aux_outputs=aux_outputs,
-                x=batch_x,
-                tradable_mask=batch_mask,
-                aug_kwargs=factor_aug_kwargs or {},
-            )
+            with _cuda_timing(timing, "factor_aug_cuda_s", device):
+                aux_outputs = _attach_factor_augmented_scores(
+                    model=model,
+                    aux_outputs=aux_outputs,
+                    x=batch_x,
+                    tradable_mask=batch_mask,
+                    aug_kwargs=factor_aug_kwargs or {},
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
@@ -3654,43 +3920,44 @@ def _train_epoch_tensor(
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
             loss_start = time.perf_counter()
-            loss = loss_fn(
-                weights,
-                batch_ret,
-                batch_mask,
-                benchmark_returns=batch_bench,
-                can_buy_mask=batch_buy_mask,
-                can_sell_mask=batch_sell_mask,
-                sample_mask=batch_sample_mask,
-                long_only=long_only,
-                buy_fee_rate=buy_fee_rate,
-                sell_fee_rate=sell_fee_rate,
-                max_turnover_ratio=max_turnover_ratio,
-                gross_leverage=gross_leverage,
-                gamma_sharpe=gamma_sharpe,
-                gamma_excess=gamma_excess,
-                gamma_cvar=gamma_cvar,
-                cvar_alpha=cvar_alpha,
-                gamma_drawdown=gamma_drawdown,
-                drawdown_target=drawdown_target,
-                gamma_turnover=gamma_turnover,
-                gamma_underperformance=gamma_underperformance,
-                excess_target=excess_target,
-                cvar_budget=cvar_budget,
-                drawdown_budget=drawdown_budget,
-                turnover_budget=turnover_budget,
-                gamma_cvar_budget=gamma_cvar_budget,
-                gamma_drawdown_budget=gamma_drawdown_budget,
-                gamma_turnover_budget=gamma_turnover_budget,
-                objective=objective,
-                aux_outputs=aux_outputs,
-                rank_ic_weight=rank_ic_weight,
-                direction_weight=direction_weight,
-                volatility_regime_weight=volatility_regime_weight,
-                concentration_weight=concentration_weight,
-                regime_up_threshold=regime_up_threshold,
-                regime_down_threshold=regime_down_threshold,
-            )
+            with _cuda_timing(timing, "loss_cuda_s", device):
+                loss = loss_fn(
+                    weights,
+                    batch_ret,
+                    batch_mask,
+                    benchmark_returns=batch_bench,
+                    can_buy_mask=batch_buy_mask,
+                    can_sell_mask=batch_sell_mask,
+                    sample_mask=batch_sample_mask,
+                    long_only=long_only,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
+                    max_turnover_ratio=max_turnover_ratio,
+                    gross_leverage=gross_leverage,
+                    gamma_sharpe=gamma_sharpe,
+                    gamma_excess=gamma_excess,
+                    gamma_cvar=gamma_cvar,
+                    cvar_alpha=cvar_alpha,
+                    gamma_drawdown=gamma_drawdown,
+                    drawdown_target=drawdown_target,
+                    gamma_turnover=gamma_turnover,
+                    gamma_underperformance=gamma_underperformance,
+                    excess_target=excess_target,
+                    cvar_budget=cvar_budget,
+                    drawdown_budget=drawdown_budget,
+                    turnover_budget=turnover_budget,
+                    gamma_cvar_budget=gamma_cvar_budget,
+                    gamma_drawdown_budget=gamma_drawdown_budget,
+                    gamma_turnover_budget=gamma_turnover_budget,
+                    objective=objective,
+                    aux_outputs=aux_outputs,
+                    rank_ic_weight=rank_ic_weight,
+                    direction_weight=direction_weight,
+                    volatility_regime_weight=volatility_regime_weight,
+                    concentration_weight=concentration_weight,
+                    regime_up_threshold=regime_up_threshold,
+                    regime_down_threshold=regime_down_threshold,
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
         should_check_finite = _should_check_finite(step_idx, finite_check_interval_steps)
@@ -3706,7 +3973,10 @@ def _train_epoch_tensor(
         if sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
             if next_prev is not None:
+                state_start = time.perf_counter()
                 portfolio_prev_weights = _detach_portfolio_state(next_prev)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.portfolio_state_s += time.perf_counter() - state_start
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -3715,7 +3985,8 @@ def _train_epoch_tensor(
             _progress(f"{progress_label}: batch {step_idx}/{num_batches} backward")
         if scaler.is_enabled():
             grad_start = time.perf_counter()
-            scaler.scale(loss).backward()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -3743,13 +4014,15 @@ def _train_epoch_tensor(
             if progress_label:
                 _progress(f"{progress_label}: batch {step_idx}/{num_batches} optimizer step")
             step_start = time.perf_counter()
-            scaler.step(optimizer)
-            scaler.update()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                scaler.step(optimizer)
+                scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
         else:
             grad_start = time.perf_counter()
-            loss.backward()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                loss.backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -3776,7 +4049,8 @@ def _train_epoch_tensor(
             if progress_label:
                 _progress(f"{progress_label}: batch {step_idx}/{num_batches} optimizer step")
             step_start = time.perf_counter()
-            optimizer.step()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
 
@@ -3896,19 +4170,21 @@ def _train_epoch_windowed_tensor(
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
-            model_output = model(batch_x, batch_mask)
-            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            with _cuda_timing(timing, "model_forward_cuda_s", device):
+                model_output = model(batch_x, batch_mask)
+                weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
             factor_aug_start = time.perf_counter()
-            aux_outputs = _attach_factor_augmented_scores(
-                model=model,
-                aux_outputs=aux_outputs,
-                x=batch_x,
-                tradable_mask=batch_mask,
-                aug_kwargs=factor_aug_kwargs or {},
-            )
+            with _cuda_timing(timing, "factor_aug_cuda_s", device):
+                aux_outputs = _attach_factor_augmented_scores(
+                    model=model,
+                    aux_outputs=aux_outputs,
+                    x=batch_x,
+                    tradable_mask=batch_mask,
+                    aug_kwargs=factor_aug_kwargs or {},
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
@@ -3917,43 +4193,44 @@ def _train_epoch_windowed_tensor(
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
             loss_start = time.perf_counter()
-            loss = loss_fn(
-                weights,
-                batch_ret,
-                batch_mask,
-                benchmark_returns=batch_bench,
-                can_buy_mask=batch_buy_mask,
-                can_sell_mask=batch_sell_mask,
-                sample_mask=batch_sample_mask,
-                long_only=long_only,
-                buy_fee_rate=buy_fee_rate,
-                sell_fee_rate=sell_fee_rate,
-                max_turnover_ratio=max_turnover_ratio,
-                gross_leverage=gross_leverage,
-                gamma_sharpe=gamma_sharpe,
-                gamma_excess=gamma_excess,
-                gamma_cvar=gamma_cvar,
-                cvar_alpha=cvar_alpha,
-                gamma_drawdown=gamma_drawdown,
-                drawdown_target=drawdown_target,
-                gamma_turnover=gamma_turnover,
-                gamma_underperformance=gamma_underperformance,
-                excess_target=excess_target,
-                cvar_budget=cvar_budget,
-                drawdown_budget=drawdown_budget,
-                turnover_budget=turnover_budget,
-                gamma_cvar_budget=gamma_cvar_budget,
-                gamma_drawdown_budget=gamma_drawdown_budget,
-                gamma_turnover_budget=gamma_turnover_budget,
-                objective=objective,
-                aux_outputs=aux_outputs,
-                rank_ic_weight=rank_ic_weight,
-                direction_weight=direction_weight,
-                volatility_regime_weight=volatility_regime_weight,
-                concentration_weight=concentration_weight,
-                regime_up_threshold=regime_up_threshold,
-                regime_down_threshold=regime_down_threshold,
-            )
+            with _cuda_timing(timing, "loss_cuda_s", device):
+                loss = loss_fn(
+                    weights,
+                    batch_ret,
+                    batch_mask,
+                    benchmark_returns=batch_bench,
+                    can_buy_mask=batch_buy_mask,
+                    can_sell_mask=batch_sell_mask,
+                    sample_mask=batch_sample_mask,
+                    long_only=long_only,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
+                    max_turnover_ratio=max_turnover_ratio,
+                    gross_leverage=gross_leverage,
+                    gamma_sharpe=gamma_sharpe,
+                    gamma_excess=gamma_excess,
+                    gamma_cvar=gamma_cvar,
+                    cvar_alpha=cvar_alpha,
+                    gamma_drawdown=gamma_drawdown,
+                    drawdown_target=drawdown_target,
+                    gamma_turnover=gamma_turnover,
+                    gamma_underperformance=gamma_underperformance,
+                    excess_target=excess_target,
+                    cvar_budget=cvar_budget,
+                    drawdown_budget=drawdown_budget,
+                    turnover_budget=turnover_budget,
+                    gamma_cvar_budget=gamma_cvar_budget,
+                    gamma_drawdown_budget=gamma_drawdown_budget,
+                    gamma_turnover_budget=gamma_turnover_budget,
+                    objective=objective,
+                    aux_outputs=aux_outputs,
+                    rank_ic_weight=rank_ic_weight,
+                    direction_weight=direction_weight,
+                    volatility_regime_weight=volatility_regime_weight,
+                    concentration_weight=concentration_weight,
+                    regime_up_threshold=regime_up_threshold,
+                    regime_down_threshold=regime_down_threshold,
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
 
@@ -3968,14 +4245,18 @@ def _train_epoch_windowed_tensor(
         if sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
             if next_prev is not None:
+                state_start = time.perf_counter()
                 portfolio_prev_weights = _detach_portfolio_state(next_prev)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.portfolio_state_s += time.perf_counter() - state_start
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
         backward_start = time.perf_counter()
         if scaler.is_enabled():
             grad_start = time.perf_counter()
-            scaler.scale(loss).backward()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             if grad_clip_norm > 0.0:
@@ -3993,13 +4274,15 @@ def _train_epoch_windowed_tensor(
                 optimizer.zero_grad(set_to_none=True)
                 continue
             step_start = time.perf_counter()
-            scaler.step(optimizer)
-            scaler.update()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                scaler.step(optimizer)
+                scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
         else:
             grad_start = time.perf_counter()
-            loss.backward()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                loss.backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             if grad_clip_norm > 0.0:
@@ -4016,7 +4299,8 @@ def _train_epoch_windowed_tensor(
                 optimizer.zero_grad(set_to_none=True)
                 continue
             step_start = time.perf_counter()
-            optimizer.step()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
 
@@ -5031,7 +5315,20 @@ def run_training(
 
         curve_test_fold_index = 0
         curve_test_fold_context = list(fold_contexts.values())[curve_test_fold_index]
-        test_datasets = [curve_test_fold_context.test_ds]
+        curve_test_years = curve_test_fold_context.fold.test_years[:1]
+        panel_years = panel.dates.astype("datetime64[Y]").astype(np.int64) + 1970
+        curve_test_indices = curve_test_fold_context.fold.test_indices[
+            np.isin(panel_years[curve_test_fold_context.fold.test_indices], curve_test_years)
+        ]
+        if curve_test_indices.size == 0:
+            curve_test_indices = curve_test_fold_context.fold.test_indices
+            curve_test_years = curve_test_fold_context.fold.test_years
+        curve_test_ds = CrossSectionalDataset(panel, curve_test_indices, config.training.lookback)
+        if len(curve_test_ds) == 0 and curve_test_indices.size != curve_test_fold_context.fold.test_indices.size:
+            curve_test_indices = curve_test_fold_context.fold.test_indices
+            curve_test_years = curve_test_fold_context.fold.test_years
+            curve_test_ds = curve_test_fold_context.test_ds
+        test_datasets = [curve_test_ds]
         test_setup_start = time.perf_counter()
         if use_windowed_tensors:
             _progress(f"[Train {train_years}] setup test tensors: lazy windowed split")
@@ -5064,7 +5361,7 @@ def run_training(
         print(
             f"[Train {train_years}] epoch-level test loss uses fold "
             f"{curve_test_fold_context.fold.fold_id} only "
-            f"(rows={curve_test_offsets[-1]})"
+            f"(years={curve_test_years}, rows={curve_test_offsets[-1]})"
         )
         if profile_timing:
             _log_timing(
@@ -5151,11 +5448,19 @@ def run_training(
             interval=int(config.training.curve_plot_interval),
             async_enabled=bool(config.training.curve_plot_async),
         )
+        run_epoch_test_curve = bool(getattr(config.training, "epoch_test_curve", True))
+        defer_epoch_curve_plot_until_end = bool(
+            getattr(config.training, "defer_epoch_curve_plot_until_end", False)
+        )
+        if not run_epoch_test_curve:
+            print(f"[Train {train_years}] epoch-level test curve disabled; final test runs after training")
+        if defer_epoch_curve_plot_until_end:
+            print(f"[Train {train_years}] epoch curve plotting deferred until training completes")
 
         def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
             start_t = time.perf_counter()
             _append_group_curve(group_curve_path, payload)
-            if request_plot:
+            if request_plot and not defer_epoch_curve_plot_until_end:
                 curve_plotter.request()
             return time.perf_counter() - start_t
 
@@ -5221,6 +5526,11 @@ def run_training(
             and _env_truthy("STOCKAGENT_AUTO_TORCH_COMPILE_SHARPE", "1")
         )
         should_enable_compile = (config.training.enable_torch_compile or auto_compile_risk) and hasattr(torch, "compile")
+        model_compile_status = "requested" if should_enable_compile else "off"
+        loss_compile_status = "eager"
+        config_compile_loss = bool(getattr(config.training, "compile_loss", auto_compile_risk))
+        default_compile_loss = "1" if config_compile_loss else "0"
+        compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
 
         if should_enable_compile:
             can_compile, reason = _can_enable_torch_compile(device)
@@ -5234,10 +5544,8 @@ def run_training(
                         f"[Train {train_years}] torch.compile enabled "
                         f"(mode=reduce-overhead, dynamic=False, source={compile_source}, {reason})"
                     )
+                    model_compile_status = f"enabled:{compile_source}"
 
-                    config_compile_loss = bool(getattr(config.training, "compile_loss", auto_compile_risk))
-                    default_compile_loss = "1" if config_compile_loss else "0"
-                    compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
                     if compile_loss:
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
@@ -5255,24 +5563,62 @@ def run_training(
                                 f"[Train {train_years}] torch.compile loss enabled "
                                 "(mode=default, dynamic=False, cudagraphs=False)"
                             )
+                            loss_compile_status = "enabled"
                         except Exception as e:
                             compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
+                            loss_compile_status = "fallback:eager"
                             print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
+                    else:
+                        loss_compile_status = "off:eager"
                     if profile_timing:
                         _log_timing(
                             f"Train {train_years} setup.torch_compile",
                             TimingBreakdown(total_s=time.perf_counter() - compile_start),
                         )
                 except Exception as e:
+                    model_compile_status = "fallback:eager"
+                    loss_compile_status = "eager"
                     print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
+                model_compile_status = f"skipped:{reason}"
+                loss_compile_status = "eager"
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")
+        elif compile_loss:
+            loss_compile_status = "off:model_compile_disabled"
+        else:
+            loss_compile_status = "off:eager"
+        print(
+            f"[Train {train_years}] optimization status: "
+            f"model_compile={model_compile_status}; "
+            f"loss_compile={loss_compile_status}; "
+            f"backtest_compile={bool(config.training.backtest_compile)}; "
+            f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
+            f"backtest_prep_compile={_env_truthy('STOCKAGENT_BACKTEST_COMPILE_PREP', '1')}; "
+            f"backtest_cpp_ext={bool(config.training.backtest_cpp_ext)}; "
+            f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
+            f"cache_eval_gpu={bool(config.training.cache_eval_tensors_on_gpu)}; "
+            f"epoch_test_curve={run_epoch_test_curve}; "
+            f"curve_plot_async={bool(config.training.curve_plot_async)}"
+        )
         train_loader: DataLoader | None = None
         use_dataloader = config.training.num_workers > 0
         if use_dataloader:
             if train_windowed is not None:
-                use_dataloader = False
-                print(f"[Train {train_years}] training mode=windowed tensor; dataloader A/B skipped")
+                dl_sps, windowed_sps = _benchmark_windowed_input_pipeline_throughput(
+                    train_ds=train_ds,
+                    train_windowed=train_windowed,
+                    train_batch_size=train_batch_size,
+                    config=config,
+                    device=device,
+                    non_blocking=non_blocking,
+                    max_steps=20,
+                )
+                print(
+                    f"[Train {train_years}] input pipeline A/B: "
+                    f"dataloader={dl_sps:,.0f} samples/s vs windowed={windowed_sps:,.0f} samples/s"
+                )
+                # Prefer windowed unless dataloader is clearly faster.
+                use_dataloader = dl_sps > (windowed_sps * 1.05)
             else:
                 dl_sps, tensor_sps = _benchmark_input_pipeline_throughput(
                     train_ds=train_ds,
@@ -5502,6 +5848,9 @@ def run_training(
         val_backtest: BacktestResultTensor | None = None
         test_mean_best_by_val: float | None = None
         get_backtest_compile_stats(reset=True)
+        get_backtest_prep_compile_stats(reset=True)
+        get_backtest_runtime_stats(reset=True)
+        get_loss_runtime_stats(reset=True)
 
         def _run_one_train_epoch(train_model: nn.Module) -> tuple[torch.Tensor, TimingBreakdown]:
             if train_loader is not None:
@@ -5641,7 +5990,13 @@ def run_training(
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
             last_epoch = epoch
+            get_backtest_compile_stats(reset=True)
+            get_backtest_prep_compile_stats(reset=True)
+            get_backtest_runtime_stats(reset=True)
+            get_loss_runtime_stats(reset=True)
             train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
+            train_bt_runtime_after = get_backtest_runtime_stats()
+            train_loss_runtime_after = get_loss_runtime_stats()
 
             should_validate = (
                 epoch == start_epoch
@@ -5659,10 +6014,15 @@ def run_training(
                 scalar_sync_total = time.perf_counter() - scalar_sync_start
                 progress_update_start = time.perf_counter()
                 bt_stats_after = get_backtest_compile_stats()
+                bt_prep_stats_after = get_backtest_prep_compile_stats()
+                bt_runtime_after = get_backtest_runtime_stats()
                 bt_nonhit_total = (
                     bt_stats_after["misses"]
                     + bt_stats_after["failures"]
                     + bt_stats_after["disabled"]
+                )
+                loss_compile_fallback = int(
+                    isinstance(compiled_loss_fn, _CompiledLossFallback) and compiled_loss_fn.disabled
                 )
                 epoch_pbar.set_postfix(
                     {
@@ -5671,7 +6031,14 @@ def run_training(
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.6f}",
                         "no_improve": no_improve_epochs,
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "bt": (
+                            f"{bt_stats_after['hits']}/"
+                            f"{bt_stats_after['misses']}/"
+                            f"{bt_stats_after['failures']}/"
+                            f"{bt_stats_after['disabled']}"
+                        ),
                         "bt_nonhit": bt_nonhit_total,
+                        "loss_fb": loss_compile_fallback,
                     }
                 )
                 progress_update_total = time.perf_counter() - progress_update_start
@@ -5701,6 +6068,11 @@ def run_training(
                             scalar_sync_s=scalar_sync_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(device.type != "cuda" or profile_timing),
+                            backtest_compile_stats=bt_stats_after,
+                            backtest_prep_compile_stats=bt_prep_stats_after,
+                            backtest_runtime_stats=bt_runtime_after,
+                            train_backtest_runtime_stats=train_bt_runtime_after,
+                            loss_runtime_stats=train_loss_runtime_after,
                         ),
                     },
                     request_plot=request_plot,
@@ -5875,9 +6247,12 @@ def run_training(
 
             curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 100)))
             should_compute_test_mean = (
-                epoch == start_epoch
-                or (epoch % curve_test_interval == 0)
-                or (epoch == config.training.epochs)
+                run_epoch_test_curve
+                and (
+                    epoch == start_epoch
+                    or (epoch % curve_test_interval == 0)
+                    or (epoch == config.training.epochs)
+                )
             )
             sampled_test_mean: float | None = None
             curve_test_total = 0.0
@@ -6077,10 +6452,15 @@ def run_training(
 
                 progress_update_start = time.perf_counter()
                 bt_stats_after = get_backtest_compile_stats()
+                bt_prep_stats_after = get_backtest_prep_compile_stats()
+                bt_runtime_after = get_backtest_runtime_stats()
                 bt_nonhit_total = (
                     bt_stats_after["misses"]
                     + bt_stats_after["failures"]
                     + bt_stats_after["disabled"]
+                )
+                loss_compile_fallback = int(
+                    isinstance(compiled_loss_fn, _CompiledLossFallback) and compiled_loss_fn.disabled
                 )
 
                 epoch_pbar.set_postfix(
@@ -6091,7 +6471,14 @@ def run_training(
                         "best_val": f"{min(c.best_val_loss for c in fold_contexts.values()):.8f}",
                         "no_improve": no_improve_epochs,
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                        # "bt_nonhit": bt_nonhit_total,
+                        "bt": (
+                            f"{bt_stats_after['hits']}/"
+                            f"{bt_stats_after['misses']}/"
+                            f"{bt_stats_after['failures']}/"
+                            f"{bt_stats_after['disabled']}"
+                        ),
+                        "bt_nonhit": bt_nonhit_total,
+                        "loss_fb": loss_compile_fallback,
                     }
                 )
                 progress_update_total = time.perf_counter() - progress_update_start
@@ -6159,6 +6546,11 @@ def run_training(
                             gc_s=gc_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
                             timing_synchronized=(device.type != "cuda" or profile_timing),
+                            backtest_compile_stats=bt_stats_after,
+                            backtest_prep_compile_stats=bt_prep_stats_after,
+                            backtest_runtime_stats=bt_runtime_after,
+                            train_backtest_runtime_stats=train_bt_runtime_after,
+                            loss_runtime_stats=train_loss_runtime_after,
                         ),
                     },
                     request_plot=request_plot,
@@ -6178,6 +6570,8 @@ def run_training(
                     break
 
         curve_flush_start = time.perf_counter()
+        if defer_epoch_curve_plot_until_end:
+            curve_plotter.request()
         curve_plotter.flush()
         curve_flush_total = time.perf_counter() - curve_flush_start
         if profile_timing and curve_flush_total > 0.0:

@@ -367,6 +367,8 @@ class TrainingConfig:
     prefer_fp16: bool = False
     backtest_autotune: bool = True
     backtest_compile: bool = True
+    backtest_compile_stateful: bool = True
+    backtest_cpp_ext: bool = False
     backtest_verbose: bool = False
     backtest_checkpoint_chunk_rows: int = 0
     runtime_shape_check: bool = False
@@ -386,6 +388,8 @@ class TrainingConfig:
     curve_test_interval: int = 100
     curve_plot_interval: int = 1
     curve_plot_async: bool = True
+    epoch_test_curve: bool = True
+    defer_epoch_curve_plot_until_end: bool = False
     explain_after_each_fold: bool = True
     explain_first_test_year_only: bool = True
     explain_top_k: int = 20
@@ -503,6 +507,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("prefer_fp16", False)
     training.setdefault("backtest_autotune", True)
     training.setdefault("backtest_compile", True)
+    training.setdefault("backtest_compile_stateful", True)
+    training.setdefault("backtest_cpp_ext", False)
     training.setdefault("backtest_verbose", False)
     training.setdefault("backtest_checkpoint_chunk_rows", 0)
     training.setdefault("runtime_shape_check", False)
@@ -516,6 +522,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("curve_test_interval", 100)
     training.setdefault("curve_plot_interval", 1)
     training.setdefault("curve_plot_async", True)
+    training.setdefault("epoch_test_curve", True)
+    training.setdefault("defer_epoch_curve_plot_until_end", False)
     training.setdefault("explain_after_each_fold", True)
     training.setdefault("explain_first_test_year_only", True)
     training.setdefault("explain_top_k", 20)
@@ -942,6 +950,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             prefer_fp16=training_raw["prefer_fp16"],
             backtest_autotune=training_raw["backtest_autotune"],
             backtest_compile=training_raw["backtest_compile"],
+            backtest_compile_stateful=training_raw["backtest_compile_stateful"],
+            backtest_cpp_ext=training_raw["backtest_cpp_ext"],
             backtest_verbose=training_raw["backtest_verbose"],
             backtest_checkpoint_chunk_rows=training_raw["backtest_checkpoint_chunk_rows"],
             runtime_shape_check=training_raw["runtime_shape_check"],
@@ -961,6 +971,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             curve_test_interval=training_raw["curve_test_interval"],
             curve_plot_interval=training_raw["curve_plot_interval"],
             curve_plot_async=training_raw["curve_plot_async"],
+            epoch_test_curve=training_raw["epoch_test_curve"],
+            defer_epoch_curve_plot_until_end=training_raw["defer_epoch_curve_plot_until_end"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],
