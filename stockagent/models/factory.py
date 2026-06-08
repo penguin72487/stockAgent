@@ -14,6 +14,7 @@ from stockagent.models.multi_stock_tcn import CrossSectionalMultiStockTCN
 from stockagent.models.tabular_resnet import CrossSectionalTabularResNet
 from stockagent.models.tcn_hybrid_tabular_resnet import CrossSectionalTCNHybridTabularResNet
 from stockagent.models.temporal_tabular_resnet import CrossSectionalTemporalTabularResNet
+from stockagent.models.time_block_transformer_base_portfolio import TimeBlockTransformerBasePortfolioModel
 from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
 from stockagent.models.tree_models import CrossSectionalLightGBM, CrossSectionalXGBoost
 
@@ -62,6 +63,14 @@ _TRANSFORMER_BASE_PORTFOLIO_NAMES = {
     "tbp",
 }
 
+_TIME_BLOCK_TRANSFORMER_BASE_PORTFOLIO_NAMES = {
+    "time_block_transformer_base_portfolio",
+    "timeblock_transformer_base_portfolio",
+    "causal_time_block_transformer",
+    "streaming_transformer_portfolio",
+    "tbp_time_block",
+}
+
 
 def model_hidden_dim_hint(config: ExperimentConfig) -> int:
     """Return a representative hidden width for VRAM/sample-size estimation."""
@@ -80,7 +89,7 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.latent_factor_market_token_portfolio.stock_embedding_dim)
     if model_name in _LOW_RANK_MARKET_TRANSFORMER_NAMES:
         return int(config.training.low_rank_market_transformer_portfolio.stock_embedding_dim)
-    if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
+    if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES or model_name in _TIME_BLOCK_TRANSFORMER_BASE_PORTFOLIO_NAMES:
         return int(config.training.transformer_base_portfolio.d_model)
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:
         return int(config.training.bottleneck_portfolio_autoencoder.d_model)
@@ -273,12 +282,17 @@ def build_model(
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
 
-    if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
+    if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES or model_name in _TIME_BLOCK_TRANSFORMER_BASE_PORTFOLIO_NAMES:
         tbp_cfg = config.training.transformer_base_portfolio
         portfolio_mode = str(tbp_cfg.portfolio_mode).strip().lower().replace("-", "_")
         if portfolio_mode in {"", "auto"}:
             portfolio_mode = "long_only" if config.trading.long_only else "long_short"
-        return TransformerBasePortfolioModel(
+        model_cls = (
+            TimeBlockTransformerBasePortfolioModel
+            if model_name in _TIME_BLOCK_TRANSFORMER_BASE_PORTFOLIO_NAMES
+            else TransformerBasePortfolioModel
+        )
+        return model_cls(
             lookback=lookback,
             num_features=num_features,
             num_symbols=num_symbols,
@@ -322,6 +336,10 @@ def build_model(
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,
             return_aux_details=tbp_cfg.return_aux_details,
+            temporal_causal=tbp_cfg.temporal_causal,
+            temporal_local_window=tbp_cfg.temporal_local_window,
+            use_flex_temporal_attention=tbp_cfg.use_flex_temporal_attention,
+            time_block_mode=tbp_cfg.time_block_mode,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -453,7 +471,7 @@ def build_model(
         "Supported values: mlp, ft_transformer, tabular_resnet, multi_stock_tcn, "
         "efficient_tcn_tabular_set_portfolio, tcn_hybrid_tabular_resnet, "
         "latent_factor_market_token_portfolio, low_rank_market_transformer_portfolio, "
-        "transformer_base_portfolio, "
+        "transformer_base_portfolio, time_block_transformer_base_portfolio, "
         "bottleneck_portfolio_autoencoder, temporal_tabular_resnet, "
         "cross_sectional_temporal_portfolio_model, lightgbm, xgboost"
     )

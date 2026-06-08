@@ -49,6 +49,7 @@ from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.loss import risk_aware_loss
+from stockagent.training.time_block_dataset import TimeBlockSplit, dataset_to_time_block_split
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
 
@@ -257,6 +258,30 @@ def _extract_weights_and_aux(model_output: torch.Tensor | dict[str, torch.Tensor
         weights = model_output["weights"]
         return weights, model_output
     return model_output, None
+
+
+def _forward_time_block(
+    model: nn.Module,
+    *,
+    x_context: torch.Tensor,
+    target_mask: torch.Tensor,
+    target_offset: int,
+    target_len: int,
+    context_positions: torch.Tensor | None,
+):
+    forward_fn = getattr(model, "forward_time_block", None)
+    if forward_fn is None:
+        original = getattr(model, "_orig_mod", None)
+        forward_fn = getattr(original, "forward_time_block", None)
+    if forward_fn is None:
+        raise ValueError("time_block_training requires a model with forward_time_block(...)")
+    return forward_fn(
+        x_context,
+        target_mask,
+        target_offset=int(target_offset),
+        target_len=int(target_len),
+        context_positions=context_positions,
+    )
 
 
 def _print_backward_top10(prof_obj: profile) -> None:
@@ -1796,6 +1821,122 @@ def _combine_datasets_to_windowed(
     return combined, lengths
 
 
+def _dataset_to_time_block_split(dataset: CrossSectionalDataset) -> TimeBlockSplit:
+    return dataset_to_time_block_split(dataset)
+
+
+def _combine_datasets_to_time_block(
+    datasets: list[CrossSectionalDataset],
+) -> tuple[TimeBlockSplit, list[int]]:
+    if not datasets:
+        raise ValueError("datasets must be non-empty")
+    first = _dataset_to_time_block_split(datasets[0])
+    lengths = [len(datasets[0])]
+    valid_indices = [first.valid_indices]
+    for dataset in datasets[1:]:
+        split = _dataset_to_time_block_split(dataset)
+        if split.lookback != first.lookback:
+            raise ValueError("all time-block datasets must use the same lookback")
+        valid_indices.append(split.valid_indices)
+        lengths.append(len(dataset))
+    combined = TimeBlockSplit(
+        features=first.features,
+        valid_indices=torch.cat(valid_indices, dim=0),
+        future_log_returns=first.future_log_returns,
+        tradable_mask=first.tradable_mask,
+        can_buy_mask=first.can_buy_mask,
+        can_sell_mask=first.can_sell_mask,
+        benchmark=first.benchmark,
+        lookback=first.lookback,
+    )
+    return combined, lengths
+
+
+def _prepare_time_block_split(
+    split: TimeBlockSplit,
+    device: torch.device,
+    non_blocking: bool,
+) -> TimeBlockSplit:
+    pin_memory = device.type == "cuda" and non_blocking
+    return TimeBlockSplit(
+        features=_prepare_host_tensor(split.features, pin_memory),
+        valid_indices=_prepare_host_tensor(split.valid_indices, pin_memory),
+        future_log_returns=_prepare_host_tensor(split.future_log_returns, pin_memory),
+        tradable_mask=_prepare_host_tensor(split.tradable_mask, pin_memory),
+        can_buy_mask=_prepare_host_tensor(split.can_buy_mask, pin_memory),
+        can_sell_mask=_prepare_host_tensor(split.can_sell_mask, pin_memory),
+        benchmark=_prepare_host_tensor(split.benchmark, pin_memory),
+        lookback=split.lookback,
+        sample_mask=None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory),
+    )
+
+
+def _maybe_cache_time_block_split_on_device(
+    *,
+    name: str,
+    split: TimeBlockSplit,
+    device: torch.device,
+    enabled: bool,
+    target_fraction: float,
+    safety_margin_gb: float,
+) -> TimeBlockSplit:
+    tensors: tuple[torch.Tensor, ...]
+    if split.sample_mask is None:
+        tensors = (
+            split.features,
+            split.valid_indices,
+            split.future_log_returns,
+            split.tradable_mask,
+            split.can_buy_mask,
+            split.can_sell_mask,
+            split.benchmark,
+        )
+    else:
+        tensors = (
+            split.features,
+            split.valid_indices,
+            split.future_log_returns,
+            split.tradable_mask,
+            split.can_buy_mask,
+            split.can_sell_mask,
+            split.benchmark,
+            split.sample_mask,
+        )
+    moved = _maybe_cache_tensors_on_device(
+        name=name,
+        tensors=tensors,
+        device=device,
+        enabled=enabled,
+        target_fraction=target_fraction,
+        safety_margin_gb=safety_margin_gb,
+    )
+    return TimeBlockSplit(
+        features=moved[0],
+        valid_indices=moved[1],
+        future_log_returns=moved[2],
+        tradable_mask=moved[3],
+        can_buy_mask=moved[4],
+        can_sell_mask=moved[5],
+        benchmark=moved[6],
+        lookback=split.lookback,
+        sample_mask=None if split.sample_mask is None else moved[7],
+    )
+
+
+def _slice_time_block_split(split: TimeBlockSplit, start: int, end: int) -> TimeBlockSplit:
+    return TimeBlockSplit(
+        features=split.features,
+        valid_indices=split.valid_indices[int(start) : int(end)],
+        future_log_returns=split.future_log_returns,
+        tradable_mask=split.tradable_mask,
+        can_buy_mask=split.can_buy_mask,
+        can_sell_mask=split.can_sell_mask,
+        benchmark=split.benchmark,
+        lookback=split.lookback,
+        sample_mask=None if split.sample_mask is None else split.sample_mask[int(start) : int(end)],
+    )
+
+
 def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -> WindowedSplitTensors:
     total_rows = len(split)
     if total_rows == 0:
@@ -2504,6 +2645,186 @@ def _evaluate_windowed_tensor_batch(
         _progress(f"{progress_label}: eval done total={timing.total_s:.1f}s chunks={timing.batches}")
     if profile_timing:
         _log_timing("eval.windowed", timing)
+    if timing_out is not None:
+        _add_timing(timing_out, timing)
+    return backtest, ic, metrics
+
+
+def _evaluate_time_block(
+    model: nn.Module,
+    split: TimeBlockSplit,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    target_block_size: int,
+    compute_ic: bool = True,
+    compute_metrics_summary: bool = True,
+    return_weights_history: bool = True,
+    profile_timing: bool = False,
+    progress_label: str | None = None,
+    timing_out: TimingBreakdown | None = None,
+    reset_at_rows: Sequence[int] | None = None,
+) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
+    model.eval()
+    total_rows_for_eval = len(split)
+    if total_rows_for_eval <= 0:
+        empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_weights = torch.empty((0, split.num_symbols), device=device, dtype=torch.float32)
+        backtest = BacktestResultTensor(
+            strategy_returns=empty_returns,
+            benchmark_returns=empty_returns.clone(),
+            turnovers=empty_returns.clone(),
+            weights_history=empty_weights,
+        )
+        return backtest, {}, {}
+
+    reset_points = {0, total_rows_for_eval}
+    if reset_at_rows is not None:
+        reset_points.update(int(value) for value in reset_at_rows if 0 <= int(value) <= total_rows_for_eval)
+    reset_points_sorted = sorted(reset_points)
+    segment_splits = [
+        _slice_time_block_split(split, start, end)
+        for start, end in zip(reset_points_sorted[:-1], reset_points_sorted[1:])
+        if end > start
+    ]
+    segment_specs = [
+        (segment_idx, spec)
+        for segment_idx, segment in enumerate(segment_splits)
+        for spec in segment.iter_blocks(target_block_size, shuffle=False)
+    ]
+
+    weights_chunks: list[torch.Tensor] = []
+    strategy_chunks: list[torch.Tensor] = []
+    benchmark_chunks: list[torch.Tensor] = []
+    turnover_chunks: list[torch.Tensor] = []
+    ic_chunks: list[torch.Tensor] = []
+    timing = TimingBreakdown()
+    overall_start = time.perf_counter()
+    if progress_label:
+        _progress(
+            f"{progress_label}: start eval mode=time_block rows={total_rows_for_eval} "
+            f"target_block_size={target_block_size} chunks={len(segment_specs)}"
+        )
+
+    with torch.inference_mode():
+        prev_weights: torch.Tensor | None = None
+        current_segment = -1
+        for chunk_idx, (segment_idx, spec) in enumerate(segment_specs, start=1):
+            if segment_idx != current_segment or spec.reset_state:
+                prev_weights = None
+                current_segment = segment_idx
+            _maybe_cudagraph_step_begin()
+            transfer_start = time.perf_counter()
+            segment = segment_splits[segment_idx]
+            batch = segment.get_block(spec, device=device, non_blocking=non_blocking)
+            x_context = batch["x_context"]
+            returns_chunk = batch["future_log_returns"]
+            mask_chunk = batch["tradable_mask"]
+            buy_mask_chunk = batch["can_buy_mask"]
+            sell_mask_chunk = batch["can_sell_mask"]
+            bench_chunk = batch["benchmark"]
+            target_offset = int(batch["target_offset"])
+            target_len = int(batch["target_len"])
+            context_positions = batch["context_positions"]
+            _maybe_sync_cuda(device, profile_timing)
+            timing.transfer_s += time.perf_counter() - transfer_start
+
+            forward_start = time.perf_counter()
+            with _autocast_context(device, amp_dtype):
+                model_output_chunk = _forward_time_block(
+                    model,
+                    x_context=x_context,
+                    target_mask=mask_chunk,
+                    target_offset=target_offset,
+                    target_len=target_len,
+                    context_positions=context_positions,
+                )
+                weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
+            _maybe_sync_cuda(device, profile_timing)
+            chunk_forward_elapsed = time.perf_counter() - forward_start
+            timing.forward_s += chunk_forward_elapsed
+            timing.model_forward_s += chunk_forward_elapsed
+
+            backtest_start = time.perf_counter()
+            backtest_chunk = run_backtest_torch(
+                weights_chunk,
+                returns_chunk,
+                mask_chunk,
+                bench_chunk,
+                buy_fee_rate,
+                sell_fee_rate,
+                long_only=long_only,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
+                can_buy_mask=buy_mask_chunk,
+                can_sell_mask=sell_mask_chunk,
+                return_weights_history=return_weights_history,
+                initial_weights=prev_weights,
+            )
+            prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.backtest_s += time.perf_counter() - backtest_start
+
+            if compute_ic:
+                ic_start = time.perf_counter()
+                ic_chunks.append(compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk))
+                _maybe_sync_cuda(device, profile_timing)
+                timing.ic_s += time.perf_counter() - ic_start
+
+            if return_weights_history:
+                weights_chunks.append(backtest_chunk.weights_history.clone())
+            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
+            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
+            turnover_chunks.append(backtest_chunk.turnovers.clone())
+            if progress_label:
+                _progress(
+                    f"{progress_label}: chunk {chunk_idx}/{len(segment_specs)} done "
+                    f"(forward={timing.forward_s:.1f}s backtest={timing.backtest_s:.1f}s)"
+                )
+
+        concat_start = time.perf_counter()
+        strategy_returns = torch.cat(strategy_chunks, dim=0) if strategy_chunks else torch.empty((0,), device=device)
+        benchmark_returns = torch.cat(benchmark_chunks, dim=0) if benchmark_chunks else torch.empty((0,), device=device)
+        turnovers = torch.cat(turnover_chunks, dim=0) if turnover_chunks else torch.empty((0,), device=device)
+        if return_weights_history:
+            weights = torch.cat(weights_chunks, dim=0) if weights_chunks else torch.empty((0, split.num_symbols), device=device)
+        else:
+            weights = torch.empty((0, split.num_symbols), device=device, dtype=strategy_returns.dtype)
+        backtest = BacktestResultTensor(
+            strategy_returns=strategy_returns,
+            benchmark_returns=benchmark_returns,
+            turnovers=turnovers,
+            weights_history=weights,
+        )
+        timing.concat_s += time.perf_counter() - concat_start
+
+        metrics_start = time.perf_counter()
+        metrics = (
+            _compute_metrics_from_tensors(strategy_returns, benchmark_returns, turnovers)
+            if compute_metrics_summary
+            else {}
+        )
+        timing.metrics_s += time.perf_counter() - metrics_start
+
+        ic_start = time.perf_counter()
+        ic = (
+            ic_summary(torch.cat(ic_chunks, dim=0).detach().cpu().numpy())
+            if compute_ic and ic_chunks
+            else {}
+        )
+        timing.ic_s += time.perf_counter() - ic_start
+
+    timing.total_s = time.perf_counter() - overall_start
+    timing.batches = int(len(segment_specs))
+    if progress_label:
+        _progress(f"{progress_label}: eval done total={timing.total_s:.1f}s chunks={timing.batches}")
+    if profile_timing:
+        _log_timing("eval.time_block", timing)
     if timing_out is not None:
         _add_timing(timing_out, timing)
     return backtest, ic, metrics
@@ -4045,6 +4366,240 @@ def _train_epoch_windowed_tensor(
     return (total_loss_t / steps).detach(), timing
 
 
+def _train_epoch_time_block(
+    model: nn.Module,
+    loss_fn: Callable[..., torch.Tensor],
+    split: TimeBlockSplit,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    target_block_size: int,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
+    gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
+    objective: str,
+    grad_clip_norm: float,
+    finite_check_interval_steps: int = 0,
+    rank_ic_weight: float = 0.20,
+    direction_weight: float = 0.05,
+    volatility_regime_weight: float = 0.05,
+    concentration_weight: float = 0.005,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
+    shuffle_blocks: bool = False,
+    profile_timing: bool = False,
+    progress_label: str | None = None,
+) -> tuple[torch.Tensor, TimingBreakdown]:
+    model.train()
+    if len(split) == 0:
+        return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
+
+    sequential_return_objective = _is_return_series_objective(objective)
+    block_specs = split.iter_blocks(
+        target_block_size,
+        shuffle=bool(shuffle_blocks and not sequential_return_objective),
+    )
+    portfolio_prev_weights: torch.Tensor | None = None
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    steps = 0
+    timing = TimingBreakdown()
+    total_start = time.perf_counter()
+    if progress_label:
+        _progress(
+            f"{progress_label}: train epoch start mode=time_block rows={len(split)} "
+            f"target_block_size={target_block_size} blocks={len(block_specs)} objective={objective}"
+        )
+
+    for step_idx, spec in enumerate(block_specs, start=1):
+        if sequential_return_objective and spec.reset_state:
+            portfolio_prev_weights = None
+        batch_start = time.perf_counter()
+        _maybe_sync_cuda(device, profile_timing)
+        timing.fetch_s += time.perf_counter() - batch_start
+
+        transfer_start = time.perf_counter()
+        batch = split.get_block(spec, device=device, non_blocking=non_blocking)
+        x_context = batch["x_context"]
+        batch_ret = batch["future_log_returns"]
+        batch_mask = batch["tradable_mask"]
+        batch_buy_mask = batch["can_buy_mask"]
+        batch_sell_mask = batch["can_sell_mask"]
+        batch_bench = batch["benchmark"]
+        batch_sample_mask = batch["sample_mask"]
+        target_offset = int(batch["target_offset"])
+        target_len = int(batch["target_len"])
+        context_positions = batch["context_positions"]
+        _maybe_sync_cuda(device, profile_timing)
+        timing.transfer_s += time.perf_counter() - transfer_start
+
+        _maybe_cudagraph_step_begin()
+        optimizer.zero_grad(set_to_none=True)
+        forward_start = time.perf_counter()
+        with _autocast_context(device, amp_dtype):
+            model_forward_start = time.perf_counter()
+            model_output = _forward_time_block(
+                model,
+                x_context=x_context,
+                target_mask=batch_mask,
+                target_offset=target_offset,
+                target_len=target_len,
+                context_positions=context_positions,
+            )
+            weights, aux_outputs = _extract_weights_and_aux(model_output)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.model_forward_s += time.perf_counter() - model_forward_start
+
+            if sequential_return_objective:
+                aux_outputs = dict(aux_outputs or {})
+                aux_outputs["initial_weights"] = portfolio_prev_weights
+
+            loss_start = time.perf_counter()
+            loss = loss_fn(
+                weights,
+                batch_ret,
+                batch_mask,
+                benchmark_returns=batch_bench,
+                can_buy_mask=batch_buy_mask,
+                can_sell_mask=batch_sell_mask,
+                sample_mask=batch_sample_mask,
+                long_only=long_only,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
+                gamma_sharpe=gamma_sharpe,
+                gamma_excess=gamma_excess,
+                gamma_cvar=gamma_cvar,
+                cvar_alpha=cvar_alpha,
+                gamma_drawdown=gamma_drawdown,
+                drawdown_target=drawdown_target,
+                gamma_turnover=gamma_turnover,
+                gamma_underperformance=gamma_underperformance,
+                excess_target=excess_target,
+                cvar_budget=cvar_budget,
+                drawdown_budget=drawdown_budget,
+                turnover_budget=turnover_budget,
+                gamma_cvar_budget=gamma_cvar_budget,
+                gamma_drawdown_budget=gamma_drawdown_budget,
+                gamma_turnover_budget=gamma_turnover_budget,
+                objective=objective,
+                aux_outputs=aux_outputs,
+                rank_ic_weight=rank_ic_weight,
+                direction_weight=direction_weight,
+                volatility_regime_weight=volatility_regime_weight,
+                concentration_weight=concentration_weight,
+                regime_up_threshold=regime_up_threshold,
+                regime_down_threshold=regime_down_threshold,
+            )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.loss_s += time.perf_counter() - loss_start
+
+        should_check_finite = _should_check_finite(step_idx, finite_check_interval_steps)
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            loss_is_finite = _tensor_is_finite(loss)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not loss_is_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+        if sequential_return_objective and aux_outputs is not None:
+            next_prev = aux_outputs.get("_final_weights")
+            if next_prev is not None:
+                portfolio_prev_weights = _detach_portfolio_state(next_prev)
+        _maybe_sync_cuda(device, profile_timing)
+        timing.forward_s += time.perf_counter() - forward_start
+
+        backward_start = time.perf_counter()
+        if scaler.is_enabled():
+            grad_start = time.perf_counter()
+            scaler.scale(loss).backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+            if grad_clip_norm > 0.0:
+                clip_start = time.perf_counter()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.clip_s += time.perf_counter() - clip_start
+            gradients_are_finite = True
+            if should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            if not gradients_are_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            step_start = time.perf_counter()
+            scaler.step(optimizer)
+            scaler.update()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+        else:
+            grad_start = time.perf_counter()
+            loss.backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+            if grad_clip_norm > 0.0:
+                clip_start = time.perf_counter()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
+                _maybe_sync_cuda(device, profile_timing)
+                timing.clip_s += time.perf_counter() - clip_start
+            gradients_are_finite = True
+            if should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            if not gradients_are_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            step_start = time.perf_counter()
+            optimizer.step()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            parameters_are_finite = _model_parameters_are_finite(model)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not parameters_are_finite:
+                raise RuntimeError("Model parameters became non-finite after optimizer step")
+
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backward_s += time.perf_counter() - backward_start
+        total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
+        steps += 1
+        if progress_label:
+            _progress(
+                f"{progress_label}: block {step_idx}/{len(block_specs)} done "
+                f"target_rows={target_len} loss={float(loss.detach().cpu()):.8f}"
+            )
+
+    timing.total_s = time.perf_counter() - total_start
+    timing.batches = steps
+    if steps == 0:
+        return total_loss_t.detach(), timing
+    return (total_loss_t / steps).detach(), timing
+
+
 def _compute_metrics_from_tensors(
     strategy_returns: torch.Tensor,
     benchmark_returns: torch.Tensor,
@@ -4541,6 +5096,10 @@ def _run_inference_neural_models(
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
         ).to(device)
+        if use_time_block_tensors and not (
+            hasattr(model, "forward_time_block") or hasattr(getattr(model, "_orig_mod", None), "forward_time_block")
+        ):
+            raise ValueError("time_block_training requires model.forward_time_block(...)")
         _load_state_dict(model, model_state_dict)
 
         val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
@@ -4885,10 +5444,18 @@ def run_training(
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
         train_setup_start = time.perf_counter()
         rank_tensor_objectives = {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}
+        use_time_block_tensors = bool(getattr(config.training, "time_block_training", False))
+        if use_time_block_tensors and loss_objective in rank_tensor_objectives:
+            raise ValueError("time_block_training currently supports return-series losses such as log_utility/sortino")
         use_windowed_tensors = (
+            not use_time_block_tensors
+            and
             not bool(getattr(config.training, "materialize_window_tensors", False))
             and loss_objective not in rank_tensor_objectives
         )
+        train_time_block: TimeBlockSplit | None = None
+        combined_val_time_block: TimeBlockSplit | None = None
+        combined_test_time_block: TimeBlockSplit | None = None
         train_windowed: WindowedSplitTensors | None = None
         combined_val_windowed: WindowedSplitTensors | None = None
         combined_test_windowed: WindowedSplitTensors | None = None
@@ -4899,7 +5466,17 @@ def run_training(
         train_sell_masks: torch.Tensor | None
         train_benchmark: torch.Tensor | None
         train_sample_mask: torch.Tensor | None
-        if use_windowed_tensors:
+        if use_time_block_tensors:
+            _progress(f"[Train {train_years}] setup train tensors: time-block split")
+            train_time_block = _prepare_time_block_split(_dataset_to_time_block_split(train_ds), device, non_blocking)
+            train_x = None
+            train_returns = None
+            train_masks = None
+            train_buy_masks = None
+            train_sell_masks = None
+            train_benchmark = None
+            train_sample_mask = None
+        elif use_windowed_tensors:
             _progress(f"[Train {train_years}] setup train tensors: lazy windowed split")
             train_windowed = _pad_windowed_training_split(dataset_to_windowed_tensors(train_ds), train_batch_size)
             train_windowed = _prepare_windowed_split(train_windowed, device, non_blocking)
@@ -4979,6 +5556,9 @@ def run_training(
                 )
 
         if not fold_contexts:
+            train_time_block = None
+            combined_val_time_block = None
+            combined_test_time_block = None
             train_windowed = None
             combined_val_windowed = None
             combined_test_windowed = None
@@ -4995,7 +5575,17 @@ def run_training(
 
         val_datasets = [context.val_ds for context in fold_contexts.values()]
         val_setup_start = time.perf_counter()
-        if use_windowed_tensors:
+        if use_time_block_tensors:
+            _progress(f"[Train {train_years}] setup validation tensors: time-block split")
+            combined_val_time_block, val_lengths = _combine_datasets_to_time_block(val_datasets)
+            combined_val_time_block = _prepare_time_block_split(combined_val_time_block, device, non_blocking)
+            combined_val_x = None
+            combined_val_returns = None
+            combined_val_masks = None
+            combined_val_buy_masks = None
+            combined_val_sell_masks = None
+            combined_val_bench = None
+        elif use_windowed_tensors:
             _progress(f"[Train {train_years}] setup validation tensors: lazy windowed split")
             combined_val_windowed, val_lengths = _combine_datasets_to_windowed(val_datasets)
             combined_val_windowed = _prepare_windowed_split(combined_val_windowed, device, non_blocking)
@@ -5033,7 +5623,17 @@ def run_training(
         curve_test_fold_context = list(fold_contexts.values())[curve_test_fold_index]
         test_datasets = [curve_test_fold_context.test_ds]
         test_setup_start = time.perf_counter()
-        if use_windowed_tensors:
+        if use_time_block_tensors:
+            _progress(f"[Train {train_years}] setup test tensors: time-block split")
+            combined_test_time_block, test_lengths = _combine_datasets_to_time_block(test_datasets)
+            combined_test_time_block = _prepare_time_block_split(combined_test_time_block, device, non_blocking)
+            combined_test_x = None
+            combined_test_returns = None
+            combined_test_masks = None
+            combined_test_buy_masks = None
+            combined_test_sell_masks = None
+            combined_test_bench = None
+        elif use_windowed_tensors:
             _progress(f"[Train {train_years}] setup test tensors: lazy windowed split")
             combined_test_windowed, test_lengths = _combine_datasets_to_windowed(test_datasets)
             combined_test_windowed = _prepare_windowed_split(combined_test_windowed, device, non_blocking)
@@ -5160,9 +5760,22 @@ def run_training(
             return time.perf_counter() - start_t
 
         curve_plot_request_interval = max(1, int(config.training.curve_plot_interval))
-        combined_val_rows = len(combined_val_windowed) if combined_val_windowed is not None else int(combined_val_x.size(0))
+        if combined_val_time_block is not None:
+            combined_val_rows = len(combined_val_time_block)
+        elif combined_val_windowed is not None:
+            combined_val_rows = len(combined_val_windowed)
+        else:
+            combined_val_rows = int(combined_val_x.size(0))
 
-        if config.training.chunk_rows > 0:
+        if use_time_block_tensors:
+            eval_chunk_rows = min(
+                max(1, int(getattr(config.training, "eval_target_block_size", 256))),
+                max(1, combined_val_rows),
+            )
+            if config.training.chunk_rows > 0:
+                eval_chunk_rows = min(max(1, int(config.training.chunk_rows)), max(1, combined_val_rows))
+            print(f"[Train {train_years}] eval target_block_size={eval_chunk_rows} (time-block)")
+        elif config.training.chunk_rows > 0:
             eval_chunk_rows = min(config.training.chunk_rows, combined_val_rows)
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (manual)")
         else:
@@ -5270,7 +5883,10 @@ def run_training(
         train_loader: DataLoader | None = None
         use_dataloader = config.training.num_workers > 0
         if use_dataloader:
-            if train_windowed is not None:
+            if train_time_block is not None:
+                use_dataloader = False
+                print(f"[Train {train_years}] training mode=time-block tensor; dataloader A/B skipped")
+            elif train_windowed is not None:
                 use_dataloader = False
                 print(f"[Train {train_years}] training mode=windowed tensor; dataloader A/B skipped")
             else:
@@ -5308,11 +5924,25 @@ def run_training(
                 f"(num_workers={effective_workers}, shuffle={train_shuffle})"
             )
         else:
-            mode_label = "windowed tensor" if train_windowed is not None else "tensor"
+            if train_time_block is not None:
+                mode_label = "time-block tensor"
+            elif train_windowed is not None:
+                mode_label = "windowed tensor"
+            else:
+                mode_label = "tensor"
             print(f"[Train {train_years}] training mode={mode_label} (num_workers={config.training.num_workers})")
 
         if train_loader is None:
-            if train_windowed is not None:
+            if train_time_block is not None:
+                train_time_block = _maybe_cache_time_block_split_on_device(
+                    name=f"train time-block tensors {train_years}",
+                    split=train_time_block,
+                    device=device,
+                    enabled=bool(config.training.cache_train_tensors_on_gpu),
+                    target_fraction=float(config.training.target_vram_fraction),
+                    safety_margin_gb=float(config.training.vram_safety_margin_gb),
+                )
+            elif train_windowed is not None:
                 train_windowed = _maybe_cache_windowed_split_on_device(
                     name=f"train windowed tensors {train_years}",
                     split=train_windowed,
@@ -5347,7 +5977,16 @@ def run_training(
                     safety_margin_gb=float(config.training.vram_safety_margin_gb),
                 )
 
-        if combined_val_windowed is not None:
+        if combined_val_time_block is not None:
+            combined_val_time_block = _maybe_cache_time_block_split_on_device(
+                name=f"validation time-block tensors {train_years}",
+                split=combined_val_time_block,
+                device=device,
+                enabled=bool(config.training.cache_eval_tensors_on_gpu),
+                target_fraction=float(config.training.target_vram_fraction),
+                safety_margin_gb=float(config.training.vram_safety_margin_gb),
+            )
+        elif combined_val_windowed is not None:
             combined_val_windowed = _maybe_cache_windowed_split_on_device(
                 name=f"validation windowed tensors {train_years}",
                 split=combined_val_windowed,
@@ -5379,7 +6018,16 @@ def run_training(
                 target_fraction=float(config.training.target_vram_fraction),
                 safety_margin_gb=float(config.training.vram_safety_margin_gb),
             )
-        if combined_test_windowed is not None:
+        if combined_test_time_block is not None:
+            combined_test_time_block = _maybe_cache_time_block_split_on_device(
+                name=f"test time-block tensors {train_years}",
+                split=combined_test_time_block,
+                device=device,
+                enabled=bool(config.training.cache_eval_tensors_on_gpu),
+                target_fraction=float(config.training.target_vram_fraction),
+                safety_margin_gb=float(config.training.vram_safety_margin_gb),
+            )
+        elif combined_test_windowed is not None:
             combined_test_windowed = _maybe_cache_windowed_split_on_device(
                 name=f"test windowed tensors {train_years}",
                 split=combined_test_windowed,
@@ -5418,6 +6066,24 @@ def run_training(
                 if train_loader is not None:
                     raw_batch = next(iter(train_loader))
                     profile_batch = _move_batch(raw_batch, device, non_blocking)
+                elif train_time_block is not None:
+                    specs = train_time_block.iter_blocks(
+                        max(1, int(getattr(config.training, "target_block_size", 64))),
+                        shuffle=False,
+                    )
+                    if specs:
+                        tb_batch = train_time_block.get_block(specs[0], device=device, non_blocking=non_blocking)
+                        profile_batch = {
+                            "x": tb_batch["x_context"][
+                                int(tb_batch["target_offset"]) : int(tb_batch["target_offset"]) + int(tb_batch["target_len"])
+                            ].unsqueeze(1),
+                            "future_log_returns": tb_batch["future_log_returns"],
+                            "tradable_mask": tb_batch["tradable_mask"],
+                            "can_buy_mask": tb_batch["can_buy_mask"],
+                            "can_sell_mask": tb_batch["can_sell_mask"],
+                            "benchmark": tb_batch["benchmark"],
+                            "sample_mask": tb_batch["sample_mask"],
+                        }
                 elif train_windowed is not None:
                     slice_end = min(train_batch_size, len(train_windowed))
                     if slice_end > 0:
@@ -5544,6 +6210,49 @@ def run_training(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    profile_timing=profile_timing,
+                )
+            if train_time_block is not None:
+                return _train_epoch_time_block(
+                    train_model,
+                    compiled_loss_fn,
+                    train_time_block,
+                    optimizer,
+                    scaler,
+                    target_block_size=max(1, int(getattr(config.training, "target_block_size", 64))),
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    non_blocking=non_blocking,
+                    long_only=config.trading.long_only,
+                    buy_fee_rate=config.trading.buy_fee_rate,
+                    sell_fee_rate=config.trading.sell_fee_rate,
+                    max_turnover_ratio=config.trading.max_turnover_ratio,
+                    gross_leverage=config.trading.gross_leverage,
+                    gamma_sharpe=config.evaluation.gamma_sharpe,
+                    gamma_excess=config.evaluation.gamma_excess,
+                    gamma_cvar=config.evaluation.gamma_cvar,
+                    cvar_alpha=config.evaluation.cvar_alpha,
+                    gamma_drawdown=config.evaluation.gamma_drawdown,
+                    drawdown_target=config.evaluation.drawdown_target,
+                    gamma_turnover=config.evaluation.gamma_turnover,
+                    gamma_underperformance=config.evaluation.gamma_underperformance,
+                    excess_target=config.evaluation.excess_target,
+                    cvar_budget=config.evaluation.cvar_budget,
+                    drawdown_budget=config.evaluation.drawdown_budget,
+                    turnover_budget=config.evaluation.turnover_budget,
+                    gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                    gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                    gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
+                    objective=loss_objective,
+                    grad_clip_norm=config.training.grad_clip_norm,
+                    finite_check_interval_steps=config.training.finite_check_interval_steps,
+                    rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                    direction_weight=config.training.multitask_loss.direction_weight,
+                    volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                    concentration_weight=config.training.multitask_loss.concentration_weight,
+                    regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                    regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
+                    shuffle_blocks=bool(getattr(config.training, "shuffle_time_blocks", False)),
                     profile_timing=profile_timing,
                 )
             if train_windowed is not None:
@@ -5800,7 +6509,27 @@ def run_training(
                 val_loss_total = 0.0
             else:
                 val_eval_start = time.perf_counter()
-                if combined_val_windowed is not None:
+                if combined_val_time_block is not None:
+                    val_backtest_epoch, _, _ = _evaluate_time_block(
+                        compiled_train_model,
+                        combined_val_time_block,
+                        device,
+                        amp_dtype,
+                        non_blocking,
+                        config.trading.long_only,
+                        config.trading.buy_fee_rate,
+                        config.trading.sell_fee_rate,
+                        config.trading.max_turnover_ratio,
+                        config.trading.gross_leverage,
+                        target_block_size=eval_chunk_rows,
+                        compute_ic=False,
+                        compute_metrics_summary=False,
+                        return_weights_history=False,
+                        profile_timing=profile_timing,
+                        timing_out=val_timing,
+                        reset_at_rows=val_offsets,
+                    )
+                elif combined_val_windowed is not None:
                     val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                         compiled_train_model,
                         combined_val_windowed,
@@ -5934,7 +6663,27 @@ def run_training(
                         _add_timing(test_curve_timing, test_fold_timing)
                         test_losses_epoch.append(test_loss)
                 else:
-                    if combined_test_windowed is not None:
+                    if combined_test_time_block is not None:
+                        test_backtest_epoch, _, _ = _evaluate_time_block(
+                            compiled_train_model,
+                            combined_test_time_block,
+                            device,
+                            amp_dtype,
+                            non_blocking,
+                            config.trading.long_only,
+                            config.trading.buy_fee_rate,
+                            config.trading.sell_fee_rate,
+                            config.trading.max_turnover_ratio,
+                            config.trading.gross_leverage,
+                            target_block_size=eval_chunk_rows,
+                            compute_ic=False,
+                            compute_metrics_summary=False,
+                            return_weights_history=False,
+                            profile_timing=False,
+                            timing_out=test_curve_timing,
+                            reset_at_rows=curve_test_offsets,
+                        )
+                    elif combined_test_windowed is not None:
                         test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                             compiled_train_model,
                             combined_test_windowed,
@@ -6190,7 +6939,24 @@ def run_training(
         # the epoch loop does not run; compute validation backtest once for reporting.
         if val_backtest is None:
             eval_only_start = time.perf_counter()
-            if combined_val_windowed is not None:
+            if combined_val_time_block is not None:
+                val_backtest, _, _ = _evaluate_time_block(
+                    compiled_train_model,
+                    combined_val_time_block,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.long_only,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
+                    config.trading.gross_leverage,
+                    target_block_size=eval_chunk_rows,
+                    profile_timing=profile_timing,
+                    progress_label=f"[Train {train_years} final-val]",
+                    reset_at_rows=val_offsets,
+                )
+            elif combined_val_windowed is not None:
                 val_backtest, _, _ = _evaluate_windowed_tensor_batch(
                     compiled_train_model,
                     combined_val_windowed,
@@ -6237,7 +7003,20 @@ def run_training(
         if val_backtest is None:
             raise RuntimeError("Validation backtest is unavailable in eval stage.")
 
-        if combined_val_windowed is not None:
+        if combined_val_time_block is not None:
+            val_date_idx = combined_val_time_block.valid_indices.to(
+                device=combined_val_time_block.future_log_returns.device,
+                dtype=torch.long,
+            )
+            val_returns_device = combined_val_time_block.future_log_returns[val_date_idx].to(
+                device=val_backtest.weights_history.device,
+                non_blocking=False,
+            )
+            val_masks_device = combined_val_time_block.tradable_mask[val_date_idx].to(
+                device=val_backtest.weights_history.device,
+                non_blocking=False,
+            )
+        elif combined_val_windowed is not None:
             val_date_idx = combined_val_windowed.valid_indices.to(
                 device=combined_val_windowed.future_log_returns.device,
                 dtype=torch.long,
@@ -6272,7 +7051,36 @@ def run_training(
                 best_val_loss = context.best_val_loss
 
             test_eval_start = time.perf_counter()
-            if use_windowed_tensors:
+            if use_time_block_tensors:
+                test_time_block = _prepare_time_block_split(
+                    _dataset_to_time_block_split(context.test_ds),
+                    device,
+                    non_blocking,
+                )
+                test_bt_t, test_ic, _ = _evaluate_time_block(
+                    compiled_train_model,
+                    test_time_block,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.long_only,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
+                    config.trading.gross_leverage,
+                    target_block_size=eval_chunk_rows,
+                    profile_timing=profile_timing,
+                )
+                test_date_idx = test_time_block.valid_indices.to(
+                    device=test_time_block.future_log_returns.device,
+                    dtype=torch.long,
+                )
+                test_returns = test_time_block.future_log_returns[test_date_idx]
+                test_masks = test_time_block.tradable_mask[test_date_idx]
+                test_buy_masks = test_time_block.can_buy_mask[test_date_idx]
+                test_sell_masks = test_time_block.can_sell_mask[test_date_idx]
+                test_bench = test_time_block.benchmark[test_date_idx]
+            elif use_windowed_tensors:
                 test_windowed = _prepare_windowed_split(
                     dataset_to_windowed_tensors(context.test_ds),
                     device,
@@ -6480,6 +7288,9 @@ def run_training(
             warm_start_checkpoint_path = group_checkpoint_path
 
         # Drop large per-group tensors/models so next group's batch-search sees true free VRAM.
+        train_time_block = None
+        combined_val_time_block = None
+        combined_test_time_block = None
         train_windowed = None
         combined_val_windowed = None
         combined_test_windowed = None

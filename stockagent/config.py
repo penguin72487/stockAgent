@@ -236,6 +236,10 @@ class TransformerBasePortfolioModelConfig:
     checkpoint_blocks: bool = False
     return_aux: bool = True
     return_aux_details: bool = False
+    temporal_causal: bool = False
+    temporal_local_window: int = 0
+    use_flex_temporal_attention: bool = False
+    time_block_mode: bool = False
 
 
 @dataclass(slots=True)
@@ -410,7 +414,11 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
     finite_check_interval_steps: int = 0
-    materialize_window_tensors: bool = False
+    materialize_window_tensors: bool = True
+    time_block_training: bool = False
+    target_block_size: int = 64
+    eval_target_block_size: int = 256
+    shuffle_time_blocks: bool = False
     loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "log_utility", etc.
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
@@ -541,7 +549,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("grad_clip_norm", 1.0)
     training.setdefault("finite_check_interval_steps", 0)
-    training.setdefault("materialize_window_tensors", False)
+    training.setdefault("materialize_window_tensors", True)
+    training.setdefault("time_block_training", False)
+    training.setdefault("target_block_size", 64)
+    training.setdefault("eval_target_block_size", 256)
+    training.setdefault("shuffle_time_blocks", False)
     training.setdefault("loss_type", "mse")
 
     # Model-specific blocks.
@@ -696,6 +708,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
     transformer_base_portfolio.setdefault("return_aux_details", False)
+    transformer_base_portfolio.setdefault("temporal_causal", False)
+    transformer_base_portfolio.setdefault("temporal_local_window", 0)
+    transformer_base_portfolio.setdefault("use_flex_temporal_attention", False)
+    transformer_base_portfolio.setdefault("time_block_mode", False)
 
     bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
     bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
@@ -978,6 +994,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
             grad_clip_norm=training_raw["grad_clip_norm"],
             finite_check_interval_steps=training_raw["finite_check_interval_steps"],
             materialize_window_tensors=training_raw["materialize_window_tensors"],
+            time_block_training=training_raw["time_block_training"],
+            target_block_size=training_raw["target_block_size"],
+            eval_target_block_size=training_raw["eval_target_block_size"],
+            shuffle_time_blocks=training_raw["shuffle_time_blocks"],
             loss_type=training_raw["loss_type"],
             mlp=MLPModelConfig(**training_raw["mlp"]),
             ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),
