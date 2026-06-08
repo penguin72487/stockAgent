@@ -5442,12 +5442,17 @@ def run_training(
         if start_epoch > config.training.epochs:
             print(f"[Train {train_years}] checkpoint already reached epoch {config.training.epochs}; evaluating only")
 
-        _trim_group_curve(group_curve_path, start_epoch)
-        curve_plotter = _AsyncEpochCurvePlotter(
-            group_curve_path,
-            interval=int(config.training.curve_plot_interval),
-            async_enabled=bool(config.training.curve_plot_async),
-        )
+        record_epoch_curve = bool(getattr(config.training, "record_epoch_curve", True))
+        if record_epoch_curve:
+            _trim_group_curve(group_curve_path, start_epoch)
+            curve_plotter: _AsyncEpochCurvePlotter | None = _AsyncEpochCurvePlotter(
+                group_curve_path,
+                interval=int(config.training.curve_plot_interval),
+                async_enabled=bool(config.training.curve_plot_async),
+            )
+        else:
+            curve_plotter = None
+            print(f"[Train {train_years}] epoch curve recording disabled")
         run_epoch_test_curve = bool(getattr(config.training, "epoch_test_curve", True))
         defer_epoch_curve_plot_until_end = bool(
             getattr(config.training, "defer_epoch_curve_plot_until_end", False)
@@ -5458,9 +5463,11 @@ def run_training(
             print(f"[Train {train_years}] epoch curve plotting deferred until training completes")
 
         def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
+            if not record_epoch_curve:
+                return 0.0
             start_t = time.perf_counter()
             _append_group_curve(group_curve_path, payload)
-            if request_plot and not defer_epoch_curve_plot_until_end:
+            if request_plot and not defer_epoch_curve_plot_until_end and curve_plotter is not None:
                 curve_plotter.request()
             return time.perf_counter() - start_t
 
@@ -5597,13 +5604,27 @@ def run_training(
             f"backtest_cpp_ext={bool(config.training.backtest_cpp_ext)}; "
             f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
             f"cache_eval_gpu={bool(config.training.cache_eval_tensors_on_gpu)}; "
+            f"record_epoch_curve={record_epoch_curve}; "
             f"epoch_test_curve={run_epoch_test_curve}; "
             f"curve_plot_async={bool(config.training.curve_plot_async)}"
         )
         train_loader: DataLoader | None = None
+        input_pipeline_ab_test = bool(getattr(config.training, "input_pipeline_ab_test", True))
+        input_pipeline_ab_test_steps = max(1, int(getattr(config.training, "input_pipeline_ab_test_steps", 20)))
         use_dataloader = config.training.num_workers > 0
         if use_dataloader:
-            if train_windowed is not None:
+            if not input_pipeline_ab_test:
+                use_dataloader = False
+                print(
+                    f"[Train {train_years}] input throughput benchmark disabled; "
+                    f"prefer {'windowed tensor' if train_windowed is not None else 'tensor'} path"
+                )
+            elif train_windowed is not None:
+                print(
+                    f"[Train {train_years}] input throughput benchmark "
+                    f"(location=train_setup_pre_cache, steps={input_pipeline_ab_test_steps}): "
+                    "dataloader(host->device) vs windowed_tensor(row-slice+to-device)"
+                )
                 dl_sps, windowed_sps = _benchmark_windowed_input_pipeline_throughput(
                     train_ds=train_ds,
                     train_windowed=train_windowed,
@@ -5611,15 +5632,21 @@ def run_training(
                     config=config,
                     device=device,
                     non_blocking=non_blocking,
-                    max_steps=20,
+                    max_steps=input_pipeline_ab_test_steps,
                 )
                 print(
-                    f"[Train {train_years}] input pipeline A/B: "
-                    f"dataloader={dl_sps:,.0f} samples/s vs windowed={windowed_sps:,.0f} samples/s"
+                    f"[Train {train_years}] input throughput benchmark result: "
+                    f"dataloader(host->device)={dl_sps:,.0f} samples/s vs "
+                    f"windowed_tensor(row-slice+to-device)={windowed_sps:,.0f} samples/s"
                 )
                 # Prefer windowed unless dataloader is clearly faster.
                 use_dataloader = dl_sps > (windowed_sps * 1.05)
             else:
+                print(
+                    f"[Train {train_years}] input throughput benchmark "
+                    f"(location=train_setup_pre_cache, steps={input_pipeline_ab_test_steps}): "
+                    "dataloader(host->device) vs tensor(batch-slice+to-device)"
+                )
                 dl_sps, tensor_sps = _benchmark_input_pipeline_throughput(
                     train_ds=train_ds,
                     train_x=train_x,
@@ -5629,11 +5656,12 @@ def run_training(
                     config=config,
                     device=device,
                     non_blocking=non_blocking,
-                    max_steps=20,
+                    max_steps=input_pipeline_ab_test_steps,
                 )
                 print(
-                    f"[Train {train_years}] input pipeline A/B: "
-                    f"dataloader={dl_sps:,.0f} samples/s vs tensor={tensor_sps:,.0f} samples/s"
+                    f"[Train {train_years}] input throughput benchmark result: "
+                    f"dataloader(host->device)={dl_sps:,.0f} samples/s vs "
+                    f"tensor(batch-slice+to-device)={tensor_sps:,.0f} samples/s"
                 )
                 # Prefer tensor mode unless dataloader is clearly faster.
                 use_dataloader = dl_sps > (tensor_sps * 1.05)
@@ -6570,9 +6598,10 @@ def run_training(
                     break
 
         curve_flush_start = time.perf_counter()
-        if defer_epoch_curve_plot_until_end:
-            curve_plotter.request()
-        curve_plotter.flush()
+        if curve_plotter is not None:
+            if defer_epoch_curve_plot_until_end:
+                curve_plotter.request()
+            curve_plotter.flush()
         curve_flush_total = time.perf_counter() - curve_flush_start
         if profile_timing and curve_flush_total > 0.0:
             _log_timing(

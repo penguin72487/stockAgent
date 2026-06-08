@@ -386,10 +386,13 @@ class TrainingConfig:
     early_stopping_no_improve_ratio: float = 0.2
     val_interval_epochs: int = 1
     curve_test_interval: int = 100
+    record_epoch_curve: bool = True
     curve_plot_interval: int = 1
     curve_plot_async: bool = True
     epoch_test_curve: bool = True
     defer_epoch_curve_plot_until_end: bool = False
+    input_pipeline_ab_test: bool = True
+    input_pipeline_ab_test_steps: int = 20
     explain_after_each_fold: bool = True
     explain_first_test_year_only: bool = True
     explain_top_k: int = 20
@@ -520,10 +523,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("early_stopping_no_improve_ratio", 0.2)
     training.setdefault("val_interval_epochs", 1)
     training.setdefault("curve_test_interval", 100)
+    training.setdefault("record_epoch_curve", True)
     training.setdefault("curve_plot_interval", 1)
     training.setdefault("curve_plot_async", True)
     training.setdefault("epoch_test_curve", True)
     training.setdefault("defer_epoch_curve_plot_until_end", False)
+    training.setdefault("input_pipeline_ab_test", True)
+    training.setdefault("input_pipeline_ab_test_steps", 20)
     training.setdefault("explain_after_each_fold", True)
     training.setdefault("explain_first_test_year_only", True)
     training.setdefault("explain_top_k", 20)
