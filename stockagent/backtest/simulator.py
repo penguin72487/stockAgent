@@ -192,6 +192,19 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _torch_dynamo_is_compiling() -> bool:
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        return False
+    is_compiling = getattr(dynamo, "is_compiling", None)
+    if is_compiling is None:
+        return False
+    try:
+        return bool(is_compiling())
+    except Exception:
+        return False
+
+
 def _prepend_cuda_toolchain_paths() -> None:
     env_bin = Path(sys.executable).resolve().parent
     entries = [str(env_bin)]
@@ -219,6 +232,8 @@ def _autotune_enabled() -> bool:
 
 
 def _compile_enabled() -> bool:
+    if _torch_dynamo_is_compiling():
+        return False
     enabled = _env_flag("STOCKAGENT_BACKTEST_COMPILE", "1")
     if enabled:
         _prepend_cuda_toolchain_paths()
@@ -444,15 +459,17 @@ def _resolve_scan_runner(
         record_weights_history=record_weights_history,
     )
 
-    if not _compile_enabled() or weights.device.type != "cuda" or not hasattr(torch, "compile"):
-        return base_runner
-
     # If we're currently being traced by an outer torch.compile (e.g. the compiled
     # risk_aware_loss), skip creating a nested compiled runner.  The outer compiler
     # will inline the scan loop into its own unified CUDA graph, which avoids the
     # "tensor output of CUDAGraphs overwritten by subsequent run" error that arises
     # when two reduce-overhead / CUDA-graph compiled functions are nested at runtime.
-    if hasattr(torch, "_dynamo") and torch._dynamo.is_compiling():
+    # Keep this check before _compile_enabled(), because _compile_enabled() probes
+    # the local compiler toolchain via filesystem calls that Dynamo cannot trace.
+    if _torch_dynamo_is_compiling():
+        return base_runner
+
+    if not _compile_enabled() or weights.device.type != "cuda" or not hasattr(torch, "compile"):
         return base_runner
 
     key = _scan_compile_key(
@@ -912,6 +929,8 @@ def _vectorized_backtest_torch(
     resolved_chunk = (
         int(scan_chunk_size)
         if scan_chunk_size is not None and int(scan_chunk_size) > 0
+        else 256
+        if _torch_dynamo_is_compiling()
         else _autotune_scan_chunk_size(
             prepped_weights,
             future_returns,
@@ -924,7 +943,8 @@ def _vectorized_backtest_torch(
         )
     )
     use_cpp_long_short = (
-        cpp_long_short_enabled()
+        not _torch_dynamo_is_compiling()
+        and cpp_long_short_enabled()
         and not long_only
         and prepped_weights.device.type == "cuda"
         and initial_weights is None
@@ -1000,7 +1020,9 @@ def _vectorized_backtest_torch(
                 prev_init,
             )
         except Exception as e:
-            if not (_compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")):
+            if _torch_dynamo_is_compiling() or not (
+                _compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")
+            ):
                 raise
             runner = _fallback_scan_runner_after_runtime_failure(
                 error=e,

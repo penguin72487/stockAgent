@@ -1056,6 +1056,8 @@ def load_explanation_context(
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
+        panel_backend=config.data.panel_backend,
+        panel_load_workers=config.data.panel_load_workers,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -1188,6 +1190,8 @@ def main(argv: list[str] | None = None) -> None:
             benchmark_name=config.data.benchmark_name,
             usd_only_trading_pairs=config.data.usd_only_trading_pairs,
             tradable_mode=config.data.tradable_mode,
+            panel_backend=config.data.panel_backend,
+            panel_load_workers=config.data.panel_load_workers,
         )
         folds = build_expanding_year_folds(
             dates=panel.dates,

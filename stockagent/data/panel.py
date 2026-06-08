@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
@@ -13,6 +14,20 @@ try:
     import cudf
 except Exception:  # pragma: no cover - optional GPU dependency
     cudf = None
+
+try:
+    import polars as pl
+except Exception:  # pragma: no cover - optional parquet reader
+    pl = None
+
+from stockagent.data.panel_cache import (
+    legacy_panel_cache_path,
+    legacy_panel_meta_path,
+    load_panel_cache_v2,
+    panel_cache_v2_is_valid,
+    panel_cache_v2_dir,
+    save_panel_cache_v2,
+)
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
@@ -291,8 +306,8 @@ def _ensure_feature_columns(frame: pd.DataFrame, columns: list[str]) -> None:
             frame[col] = np.nan
 
 
-def _load_symbol_frame(path: Path) -> pd.DataFrame:
-    frame = pd.read_parquet(path).copy()
+def _prepare_symbol_frame(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
+    frame = frame.copy()
     if not pd.api.types.is_datetime64_any_dtype(frame["date"]):
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values("date").reset_index(drop=True)
@@ -325,6 +340,16 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
 
     _ensure_feature_columns(frame, LOG_RETURN_FEATURE_COLUMNS)
     return frame
+
+
+def _load_symbol_frame(path: Path) -> pd.DataFrame:
+    return _prepare_symbol_frame(pd.read_parquet(path), path)
+
+
+def _load_symbol_frame_polars(path: Path) -> pd.DataFrame:
+    if pl is None:
+        raise RuntimeError("Polars is not available")
+    return _prepare_symbol_frame(pl.read_parquet(path).to_pandas(), path)
 
 
 def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
@@ -484,11 +509,11 @@ def _get_feature_columns(frame: pd.DataFrame) -> list[str]:
 
 
 def _panel_cache_path(parquet_root: str | Path) -> Path:
-    return Path(parquet_root) / "panel_cache.npz"
+    return legacy_panel_cache_path(parquet_root)
 
 
 def _cache_meta_path(parquet_root: str | Path) -> Path:
-    return Path(parquet_root) / ".panel_meta.pkl"
+    return legacy_panel_meta_path(parquet_root)
 
 
 def _compute_source_hash(paths: list[Path]) -> str:
@@ -502,36 +527,18 @@ def _compute_source_hash(paths: list[Path]) -> str:
 
 
 def _save_panel_cache(
-    cache_path: Path,
-    meta_path: Path,
+    parquet_root: str | Path,
     panel: PanelData,
     source_hash: str,
     backend_key: str,
 ) -> None:
-    np.savez_compressed(
-        cache_path,
-        dates=panel.dates,
-        symbols=np.array(panel.symbols, dtype=object),
-        feature_names=np.array(panel.feature_names, dtype=object),
-        features=panel.features,
-        returns_1d=panel.returns_1d,
-        tradable_mask=panel.tradable_mask,
-        can_buy_mask=panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask,
-        can_sell_mask=panel.can_sell_mask if panel.can_sell_mask is not None else panel.tradable_mask,
-        alive_mask=panel.alive_mask,
-        benchmark_returns=panel.benchmark_returns,
-        close_prices=panel.close_prices,
+    save_panel_cache_v2(
+        parquet_root,
+        panel,
+        source_hash=source_hash,
+        backend_key=backend_key,
+        version=PANEL_CACHE_VERSION,
     )
-    
-    meta = {
-        'version': PANEL_CACHE_VERSION,
-        'source_hash': source_hash,
-        'backend_key': backend_key,
-        'num_dates': panel.num_dates,
-        'num_symbols': panel.num_symbols,
-    }
-    with meta_path.open('wb') as f:
-        pickle.dump(meta, f)
 
 
 def _load_panel_cache(cache_path: Path) -> PanelData:
@@ -552,6 +559,25 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
         close_prices=cached["close_prices"],
+    )
+
+
+def _panel_from_cache_payload(payload: dict) -> PanelData:
+    tradable_mask = payload["tradable_mask"]
+    can_buy_mask = payload.get("can_buy_mask", tradable_mask)
+    can_sell_mask = payload.get("can_sell_mask", tradable_mask)
+    return PanelData(
+        dates=payload["dates"],
+        symbols=list(payload["symbols"]),
+        feature_names=list(payload["feature_names"]),
+        features=payload["features"],
+        returns_1d=payload["returns_1d"],
+        tradable_mask=tradable_mask,
+        can_buy_mask=can_buy_mask,
+        can_sell_mask=can_sell_mask,
+        alive_mask=payload["alive_mask"],
+        benchmark_returns=payload["benchmark_returns"],
+        close_prices=payload["close_prices"],
     )
 
 
@@ -591,6 +617,31 @@ def _check_cache_valid(cache_path: Path, meta_path: Path, parquet_paths: list[Pa
         return False
 
 
+def _load_valid_panel_cache(
+    parquet_root: str | Path,
+    parquet_paths: list[Path],
+    backend_key: str,
+    source_hash: str,
+) -> PanelData | None:
+    if panel_cache_v2_is_valid(
+        parquet_root,
+        source_hash=source_hash,
+        backend_key=backend_key,
+        version=PANEL_CACHE_VERSION,
+        source_paths=parquet_paths,
+    ):
+        cache_dir = panel_cache_v2_dir(parquet_root)
+        print(f"[panel] loading cache v2 (valid): {cache_dir}")
+        return _panel_from_cache_payload(load_panel_cache_v2(parquet_root, mmap_mode="c"))
+
+    cache_path = _panel_cache_path(parquet_root)
+    meta_path = _cache_meta_path(parquet_root)
+    if _check_cache_valid(cache_path, meta_path, parquet_paths, backend_key):
+        print(f"[panel] loading legacy cache (valid): {cache_path}")
+        return _load_panel_cache(cache_path)
+    return None
+
+
 def build_panel(
     parquet_root: str | Path,
     use_rapids: bool = True,
@@ -599,6 +650,8 @@ def build_panel(
     tradable_mode: str = "tradable",
     buy_tradable_mode: str | None = None,
     sell_tradable_mode: str | None = None,
+    panel_backend: str = "auto",
+    panel_load_workers: int = 4,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -610,10 +663,12 @@ def build_panel(
         if not parquet_paths:
             raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
 
-    cache_path = _panel_cache_path(parquet_root)
-    meta_path = _cache_meta_path(parquet_root)
-
-    use_cudf = bool(use_rapids) and cudf is not None
+    panel_backend = str(panel_backend).strip().lower()
+    valid_backends = {"auto", "pandas", "polars"}
+    if panel_backend not in valid_backends:
+        raise ValueError(f"panel_backend must be one of {sorted(valid_backends)}, got {panel_backend!r}")
+    panel_load_workers = max(0, int(panel_load_workers))
+    use_cudf = bool(use_rapids) and cudf is not None and panel_backend == "auto"
     if buy_tradable_mode is not None or sell_tradable_mode is not None:
         buy_mode = str(buy_tradable_mode if buy_tradable_mode is not None else tradable_mode).strip().lower()
         sell_mode = str(sell_tradable_mode if sell_tradable_mode is not None else tradable_mode).strip().lower()
@@ -630,19 +685,32 @@ def build_panel(
             f"tradable_mode must be one of {sorted(valid_tradable_modes)}, got {tradable_mode!r}"
         )
 
+    if use_cudf:
+        selected_backend = "cudf"
+    elif panel_backend == "polars":
+        if pl is None:
+            raise RuntimeError("data.panel_backend='polars' requires the polars package")
+        selected_backend = "polars"
+    elif panel_backend == "auto" and pl is not None:
+        selected_backend = "polars"
+    else:
+        selected_backend = "pandas"
+
     backend_key = (
-        f"{'cudf' if use_cudf else 'pandas'}|benchmark={benchmark_name}|"
+        f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}"
     )
-    
-    # Check cache validity
-    if _check_cache_valid(cache_path, meta_path, parquet_paths, backend_key):
-        print(f"[panel] loading cache (valid): {cache_path}")
-        panel = _load_panel_cache(cache_path)
+    source_hash = _compute_source_hash(parquet_paths)
+
+    panel = _load_valid_panel_cache(parquet_root, parquet_paths, backend_key, source_hash)
+    if panel is not None:
         _print_feature_overview(panel)
         return panel
 
-    print(f"[panel] building from {len(parquet_paths)} parquet files...")
+    print(
+        f"[panel] building from {len(parquet_paths)} parquet files "
+        f"(backend={selected_backend}, workers={panel_load_workers})..."
+    )
     if use_cudf:
         try:
             symbol_frames_cudf: list[pd.DataFrame] = []
@@ -670,23 +738,29 @@ def build_panel(
                     symbols_cudf,
                     benchmark_name=benchmark_name,
                 )
-                source_hash = _compute_source_hash(parquet_paths)
-                _save_panel_cache(cache_path, meta_path, panel, source_hash, backend_key)
-                print(f"[panel] cache saved: {cache_path} (cuDF path)")
+                _save_panel_cache(parquet_root, panel, source_hash, backend_key)
+                print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)} (cuDF path)")
                 _print_feature_overview(panel)
                 return panel
         except Exception as exc:
             print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
+            selected_backend = "pandas"
             backend_key = (
                 f"pandas|benchmark={benchmark_name}|"
                 f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}"
             )
+            panel = _load_valid_panel_cache(parquet_root, parquet_paths, backend_key, source_hash)
+            if panel is not None:
+                _print_feature_overview(panel)
+                return panel
     
     symbol_frames: list[pd.DataFrame] = []
     valid_paths: list[Path] = []
-    for path in parquet_paths:
+    load_frame = _load_symbol_frame_polars if selected_backend == "polars" else _load_symbol_frame
+
+    def _load_one(path: Path) -> tuple[Path, pd.DataFrame | None, Exception | None]:
         try:
-            frame = _load_symbol_frame(path)
+            frame = load_frame(path)
             if len(frame) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
             use_tw_limit_guard = tradable_mode == "tw_limit_guard"
@@ -697,10 +771,24 @@ def build_panel(
             else:
                 frame["can_buy"] = frame["tradable"].astype(bool)
                 frame["can_sell"] = frame["tradable"].astype(bool)
-            symbol_frames.append(frame)
-            valid_paths.append(path)
+            return path, frame, None
         except Exception as exc:
+            return path, None, exc
+
+    if panel_load_workers > 1 and len(parquet_paths) > 1:
+        with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
+            loaded = list(executor.map(_load_one, parquet_paths))
+    else:
+        loaded = [_load_one(path) for path in parquet_paths]
+
+    for path, frame, exc in loaded:
+        if exc is not None:
             print(f"[panel] SKIP {path.name}: {exc}")
+            continue
+        if frame is None:
+            continue
+        symbol_frames.append(frame)
+        valid_paths.append(path)
 
     if not symbol_frames:
         raise RuntimeError("No valid parquet files could be loaded.")
@@ -709,8 +797,7 @@ def build_panel(
     frame_all = pd.concat(symbol_frames, ignore_index=True)
     panel = _build_panel_from_frame(frame_all, symbols, benchmark_name=benchmark_name)
     
-    source_hash = _compute_source_hash(parquet_paths)
-    _save_panel_cache(cache_path, meta_path, panel, source_hash, backend_key)
-    print(f"[panel] cache saved: {cache_path}")
+    _save_panel_cache(parquet_root, panel, source_hash, backend_key)
+    print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)
     return panel
