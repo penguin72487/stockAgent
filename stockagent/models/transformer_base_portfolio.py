@@ -10,6 +10,33 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from stockagent.models.latent_factor_market_token_portfolio import _safe_attention_mask
 from stockagent.models.normalization import dual_branch_softmax, masked_cross_sectional_mean, masked_softmax
 
+_LOCAL_CAUSAL_MASK_CACHE: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
+
+
+def local_causal_mask(seq_len: int, window: int, device: torch.device) -> torch.Tensor:
+    """Return a bool [Q,K] mask where True means the key is visible.
+
+    Query position q may attend to keys k where k <= q and q - k < window.
+    ``window <= 0`` means full causal history.
+    """
+    seq_len = int(seq_len)
+    window = int(window)
+    if seq_len < 1:
+        raise ValueError("seq_len must be >= 1")
+    cache_key = (device.type, device.index, seq_len, window)
+    cached = _LOCAL_CAUSAL_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    idx = torch.arange(seq_len, device=device)
+    q = idx[:, None]
+    k = idx[None, :]
+    mask = k <= q
+    if window > 0:
+        mask = mask & ((q - k) < window)
+    _LOCAL_CAUSAL_MASK_CACHE[cache_key] = mask
+    return mask
+
 
 class PortfolioRMSNorm(nn.Module):
     """RMSNorm for transformer blocks without forcing a PyTorch version dependency."""
@@ -259,6 +286,8 @@ class FlashSDPAAttention(nn.Module):
         context: torch.Tensor,
         key_mask: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         bsz, query_steps, _ = query.shape
         key_steps = int(context.size(1))
@@ -272,17 +301,32 @@ class FlashSDPAAttention(nn.Module):
             q = _rms_normalize_last_dim(q)
             k = _rms_normalize_last_dim(k)
 
-        attn_mask = None
+        combined_mask = None
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device=query.device, dtype=torch.bool)
+            if attn_mask.dim() == 2:
+                if tuple(attn_mask.shape) != (query_steps, key_steps):
+                    raise ValueError(
+                        f"attn_mask shape must be {(query_steps, key_steps)}, got {tuple(attn_mask.shape)}"
+                    )
+                combined_mask = attn_mask[None, None, :, :].expand(bsz, self.num_heads, query_steps, key_steps)
+            elif attn_mask.dim() == 4:
+                combined_mask = attn_mask.expand(bsz, self.num_heads, query_steps, key_steps)
+            else:
+                raise ValueError("attn_mask must be 2D [Q,K] or 4D [B,H,Q,K]")
         if key_mask is not None:
             key_mask = key_mask.to(device=query.device, dtype=torch.bool)
-            attn_mask = key_mask[:, None, None, :].expand(bsz, self.num_heads, query_steps, key_steps)
+            key_allowed = key_mask[:, None, None, :].expand(bsz, self.num_heads, query_steps, key_steps)
+            combined_mask = key_allowed if combined_mask is None else (combined_mask & key_allowed)
+
+        sdpa_is_causal = bool(is_causal) and combined_mask is None
 
         if self.use_flash_attention:
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
                 chunks: list[torch.Tensor] = []
                 for start in range(0, int(q.size(0)), self.sdpa_batch_limit):
                     end = min(start + self.sdpa_batch_limit, int(q.size(0)))
-                    mask_chunk = attn_mask[start:end] if attn_mask is not None else None
+                    mask_chunk = combined_mask[start:end] if combined_mask is not None else None
                     chunks.append(
                         F.scaled_dot_product_attention(
                             q[start:end],
@@ -290,7 +334,7 @@ class FlashSDPAAttention(nn.Module):
                             v[start:end],
                             attn_mask=mask_chunk,
                             dropout_p=self.dropout_p if self.training else 0.0,
-                            is_causal=False,
+                            is_causal=sdpa_is_causal,
                         )
                     )
                 y = torch.cat(chunks, dim=0)
@@ -299,14 +343,17 @@ class FlashSDPAAttention(nn.Module):
                     q,
                     k,
                     v,
-                    attn_mask=attn_mask,
+                    attn_mask=combined_mask,
                     dropout_p=self.dropout_p if self.training else 0.0,
-                    is_causal=False,
+                    is_causal=sdpa_is_causal,
                 )
         else:
             scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            if attn_mask is not None:
-                scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
+            if combined_mask is not None:
+                scores = scores.masked_fill(~combined_mask, torch.finfo(scores.dtype).min)
+            elif is_causal:
+                causal = local_causal_mask(query_steps, 0, query.device)
+                scores = scores.masked_fill(~causal[None, None, :, :], torch.finfo(scores.dtype).min)
             attn = torch.softmax(scores, dim=-1)
             attn = F.dropout(attn, p=self.dropout_p, training=self.training)
             y = torch.matmul(attn, v)
@@ -360,12 +407,16 @@ class TransformerPortfolioBlock(nn.Module):
         context: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         context = query if context is None else context
         attn_out = self.attn(
             self.norm_query(query),
             self.norm_context(context),
             key_mask=key_mask,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
             rope_positions=rope_positions,
         )
         query = query + self.resid_dropout(attn_out)
@@ -431,6 +482,10 @@ class TransformerBasePortfolioModel(nn.Module):
         checkpoint_blocks: bool = False,
         return_aux: bool = True,
         return_aux_details: bool = False,
+        temporal_causal: bool = False,
+        temporal_local_window: int = 0,
+        use_flex_temporal_attention: bool = False,
+        time_block_mode: bool = False,
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
     ) -> None:
@@ -447,6 +502,10 @@ class TransformerBasePortfolioModel(nn.Module):
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.return_aux = bool(return_aux)
         self.return_aux_details = bool(return_aux_details)
+        self.temporal_causal = bool(temporal_causal)
+        self.temporal_local_window = int(temporal_local_window) if int(temporal_local_window) > 0 else self.lookback
+        self.use_flex_temporal_attention = bool(use_flex_temporal_attention)
+        self.time_block_mode = bool(time_block_mode)
         self.runtime_shape_check = bool(runtime_shape_check)
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
         self.use_time_pos = bool(use_time_pos)
@@ -667,8 +726,17 @@ class TransformerBasePortfolioModel(nn.Module):
         bsz, steps, n_symbols, dim = h.shape
         seq = h.permute(0, 2, 1, 3).contiguous().reshape(bsz * n_symbols, steps, dim)
         rope_positions = self._temporal_rope_positions(steps, h.device)
+        attn_mask = local_causal_mask(steps, self.temporal_local_window, h.device) if self.temporal_causal else None
         for block in self.temporal_blocks:
-            seq = self._run_block(block, seq, None, None, rope_positions)
+            seq = self._run_block(
+                block,
+                seq,
+                None,
+                None,
+                rope_positions,
+                attn_mask,
+                self.temporal_causal and attn_mask is None,
+            )
         return seq.reshape(bsz, n_symbols, steps, dim).permute(0, 2, 1, 3).contiguous()
 
     def _apply_cross_blocks(self, h: torch.Tensor, safe_mask: torch.Tensor) -> torch.Tensor:

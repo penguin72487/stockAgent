@@ -20,3 +20,17 @@ def test_runtime_source_does_not_import_duckdb() -> None:
             offenders.append(str(path.relative_to(root)))
 
     assert offenders == []
+
+
+def test_dependency_files_do_not_require_duckdb() -> None:
+    root = Path(__file__).resolve().parents[1]
+    dependency_files = [root / "requirements.txt", root / "fintech_environment.yml"]
+    offenders = []
+    for path in dependency_files:
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        if "duckdb" in text:
+            offenders.append(path.name)
+
+    assert offenders == []

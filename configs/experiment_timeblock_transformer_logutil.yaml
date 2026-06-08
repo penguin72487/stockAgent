@@ -1,0 +1,173 @@
+experiment_name: tw-stock-timeblock-transformer-logutil
+
+runner:
+  output_dir: artifacts
+  require_cuda: true
+  mode: train
+  resume: true
+  post_train_infer: false
+  start_fold: 1
+
+environment:
+  conda_env: fintech
+  device: cuda
+  use_tensor_cores: true
+  amp_dtype: bf16
+  target_vram_fraction: 0.85
+
+data:
+  parquet_root: data_yahoo/tw_stocks
+  benchmark_name: "2330"
+  benchmark_required: false
+  benchmark_source: derived_from_panel
+  universe_mode: all_daily_symbols
+  use_rapids: false
+  usd_only_trading_pairs: false
+  panel_backend: auto
+  panel_load_workers: 4
+  tradable_mode: tradable
+
+walk_forward:
+  min_train_years: 1
+  val_years: 1
+  require_future_test_year: false
+
+trading:
+  frequency: daily
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
+  max_turnover_ratio: 50.0
+  gross_leverage: 2.5
+  long_only: false
+  cash_allowed: true
+
+training:
+  backend: pytorch
+  target: next_1d_rank
+  batch_mode: time_block_x_all_symbols
+  non_blocking_transfer: true
+  model_name: time_block_transformer_base_portfolio
+  enable_torch_compile: true
+  auto_torch_compile_sharpe: true
+  compile_loss: true
+  time_block_training: true
+  materialize_window_tensors: false
+  target_block_size: 64
+  eval_target_block_size: 256
+  shuffle_time_blocks: false
+  warm_start_from_previous_fold: false
+  chunk_rows: 0
+  train_symbol_subsample_ratio: 1.0
+  detach_prev_state: true
+  prefer_fp16: false
+  backtest_autotune: true
+  backtest_compile: true
+  backtest_verbose: false
+  backtest_checkpoint_chunk_rows: 0
+  runtime_shape_check: false
+  allow_dynamic_symbols: true
+  lookback: 256
+  batch_size: 64
+  batch_size_train: 64
+  batch_size_eval: 64
+  min_batch_size: 1
+  auto_batch_size: true
+  vram_budget_gb: 16
+  vram_safety_margin_gb: 0.7
+  target_vram_fraction: 0.9
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.05
+  val_interval_epochs: 1
+  curve_test_interval: 1
+  curve_plot_interval: 1
+  curve_plot_async: true
+  explain_after_each_fold: false
+  explain_first_test_year_only: true
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  learning_rate: 0.0001
+  enable_lr_scheduler: false
+  lr_scheduler: plateau
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_patience: 10
+  lr_scheduler_threshold: 0.001
+  top_k: 10
+  num_workers: 0
+  weight_decay: 0.1
+  grad_clip_norm: 0.0
+  finite_check_interval_steps: 0
+  loss_type: log_utility
+
+  transformer_base_portfolio:
+    d_model: 64
+    attention_mode: market_token
+    use_flash_attention: true
+    use_time_pos: false
+    use_symbol_pos: true
+    input_dropout: 0.0
+    sdpa_batch_limit: 16384
+    norm_type: rmsnorm
+    ffn_type: swiglu
+    qk_norm: true
+    rope_temporal: true
+    rope_base: 10000.0
+    temporal_causal: true
+    temporal_local_window: 256
+    use_flex_temporal_attention: false
+    time_block_mode: true
+    temporal_layers: 2
+    temporal_heads: 4
+    temporal_ffn_mult: 2
+    temporal_pooling: last
+    cross_layers: 1
+    cross_heads: 4
+    cross_ffn_mult: 2
+    joint_layers: 0
+    joint_heads: 4
+    joint_ffn_mult: 2
+    latent_layers: 1
+    num_latent_factors: 16
+    num_market_tokens: 4
+    market_layers: 1
+    dynamic_latent_tokens: true
+    dynamic_market_tokens: true
+    dynamic_token_hidden_mult: 2
+    dynamic_token_gate_init: 0.1
+    dynamic_token_dropout: 0.1
+    head_hidden_dim: 64
+    head_layers: 1
+    dropout: 0.2
+    default_temperature: 1.0
+    portfolio_mode: long_short
+    max_full_tokens: 4096
+    checkpoint_blocks: false
+    return_aux: true
+    return_aux_details: false
+
+evaluation:
+  primary_baseline: "2330"
+  metrics:
+    - cumulative_return
+    - annualized_return
+    - cagr
+    - sharpe
+    - sortino
+    - max_drawdown
+    - calmar
+    - turnover
+    - excess_return_vs_universe_average
+  gamma_sharpe: 1.0
+  gamma_excess: 1.0
+  gamma_cvar: 1.0
+  cvar_alpha: 0.95
+  gamma_drawdown: 0.5
+  drawdown_target: 0.2
+  gamma_turnover: 0.005
+  gamma_underperformance: 2.0
+  excess_target: 0.0
+  cvar_budget: 0.03
+  drawdown_budget: 0.18
+  turnover_budget: 0.35
+  gamma_cvar_budget: 2.0
+  gamma_drawdown_budget: 2.5
+  gamma_turnover_budget: 0.5
