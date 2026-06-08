@@ -14,6 +14,11 @@ import torch
 from torch import nn
 
 from stockagent.config import ExperimentConfig, load_config
+from stockagent.backtest.gpu_plot import (
+    rapids_datashader_available,
+    save_heatmap_points_datashader,
+    save_line_series_datashader,
+)
 from stockagent.data.panel import PanelData, build_panel
 from stockagent.data.walkforward import WalkForwardFold, build_expanding_year_folds
 from stockagent.models.factory import build_model
@@ -621,6 +626,28 @@ def _safe_plot_filename(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(name))
 
 
+def _normalize_plot_backend(value: str | None) -> str:
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"rapids", "datashader", "gpu", "gpu_datashader"}:
+        normalized = "rapids_datashader"
+    if normalized not in {"auto", "matplotlib", "rapids_datashader"}:
+        raise ValueError("plot_backend must be one of: auto, matplotlib, rapids_datashader")
+    return normalized
+
+
+def _use_datashader_for_explainability(plot_backend: str) -> bool:
+    normalized = _normalize_plot_backend(plot_backend)
+    if normalized == "matplotlib":
+        return False
+    available = rapids_datashader_available(require_cuda=True)
+    if normalized == "rapids_datashader" and not available:
+        raise RuntimeError(
+            "training.plot_backend=rapids_datashader was requested for explainability, "
+            "but RAPIDS/cuDF/Datashader with CUDA is unavailable."
+        )
+    return bool(available)
+
+
 def _plot_barh(
     frame: pd.DataFrame,
     *,
@@ -738,6 +765,59 @@ def _plot_feature_time_heatmap(
     plt.close(fig)
 
 
+def _plot_feature_time_heatmap_datashader(
+    frame: pd.DataFrame,
+    *,
+    output_path: Path,
+    value_col: str,
+    title: str,
+    top_features: int = 40,
+) -> None:
+    required = {"feature", "lookback_from_end", value_col}
+    if frame.empty or not required.issubset(frame.columns):
+        return
+    data = frame[list(required)].dropna().copy()
+    if data.empty:
+        return
+    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
+    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
+    data = data.dropna()
+    if data.empty:
+        return
+    top = (
+        data.groupby("feature")[value_col]
+        .sum()
+        .sort_values(ascending=False)
+        .head(top_features)
+        .index
+        .astype(str)
+        .tolist()
+    )
+    if not top:
+        return
+    data["feature"] = data["feature"].astype(str)
+    data = data[data["feature"].isin(top)].copy()
+    feature_to_y = {feature: len(top) - 1 - idx for idx, feature in enumerate(top)}
+    data["feature_y"] = data["feature"].map(feature_to_y)
+    data = data.dropna(subset=["feature_y"])
+    if data.empty:
+        return
+    labels = [(feature_to_y[feature], feature) for feature in top]
+    height = max(520, min(1400, 24 * len(top) + 180))
+    save_heatmap_points_datashader(
+        data["lookback_from_end"].to_numpy(dtype=np.float64),
+        data["feature_y"].to_numpy(dtype=np.float64),
+        data[value_col].to_numpy(dtype=np.float64),
+        output_path=output_path,
+        title=title,
+        x_label="lookback_from_end (0 = latest)",
+        y_label=value_col,
+        y_labels=labels,
+        width=1100,
+        height=height,
+    )
+
+
 def _plot_feature_correlations(frame: pd.DataFrame, output_path: Path) -> None:
     if frame.empty or "feature" not in frame.columns:
         return
@@ -799,11 +879,71 @@ def _plot_decision_exposure(frame: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
+def _plot_decision_exposure_datashader(frame: pd.DataFrame, output_path: Path) -> None:
+    if frame.empty or not {"date", "side", "weight"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["abs_weight"] = pd.to_numeric(data["weight"], errors="coerce").abs()
+    data = data.dropna(subset=["abs_weight"])
+    if data.empty:
+        return
+    pivot = data.pivot_table(index="date", columns="side", values="abs_weight", aggfunc="sum", fill_value=0.0)
+    if pivot.empty:
+        return
+    x = np.arange(len(pivot), dtype=np.float64)
+    series = []
+    colors = {"long": "#1f77b4", "short": "#d62728", "flat": "#7f7f7f"}
+    for side in ("long", "short", "flat"):
+        if side not in pivot.columns:
+            continue
+        series.append((side, x, pivot[side].to_numpy(dtype=np.float64), colors[side]))
+    if not series:
+        return
+    save_line_series_datashader(
+        series,
+        output_path=output_path,
+        title="Top Decision Absolute Exposure By Side",
+        y_label="sum abs(weight)",
+        width=1100,
+        height=520,
+    )
+
+
+def _plot_aux_dim_datashader(
+    frame: pd.DataFrame,
+    *,
+    output_path: Path,
+    title: str,
+) -> None:
+    if frame.empty or not {"dim", "mean_abs"}.issubset(frame.columns):
+        return
+    data = frame[["dim", "mean_abs"]].dropna().copy()
+    if data.empty:
+        return
+    data["dim"] = pd.to_numeric(data["dim"], errors="coerce")
+    data["mean_abs"] = pd.to_numeric(data["mean_abs"], errors="coerce")
+    data = data.dropna().sort_values("dim")
+    if data.empty:
+        return
+    save_line_series_datashader(
+        [("mean_abs", data["dim"].to_numpy(dtype=np.float64), data["mean_abs"].to_numpy(dtype=np.float64), "#2171b5")],
+        output_path=output_path,
+        title=title,
+        y_label="mean_abs",
+        width=1000,
+        height=420,
+    )
+
+
 def _plot_all_explanation_figures(
     frames: dict[str, pd.DataFrame],
     aux_dim_frames: dict[str, pd.DataFrame],
     output_dir: Path,
+    *,
+    plot_backend: str = "auto",
 ) -> list[str]:
+    normalized_backend = _normalize_plot_backend(plot_backend)
+    use_datashader = _use_datashader_for_explainability(normalized_backend)
     try:
         import matplotlib
 
@@ -851,7 +991,16 @@ def _plot_all_explanation_figures(
     ]
     for frame_name, value_col, title in heatmap_specs:
         out = plot_dir / f"{frame_name}_{value_col}_heatmap.png"
-        _plot_feature_time_heatmap(frames.get(frame_name, pd.DataFrame()), output_path=out, value_col=value_col, title=title)
+        frame = frames.get(frame_name, pd.DataFrame())
+        if use_datashader:
+            try:
+                _plot_feature_time_heatmap_datashader(frame, output_path=out, value_col=value_col, title=title)
+            except Exception:
+                if normalized_backend == "rapids_datashader":
+                    raise
+                _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
+        else:
+            _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
 
@@ -861,21 +1010,45 @@ def _plot_all_explanation_figures(
         generated.append(out)
 
     out = plot_dir / "top_decisions_exposure_by_side.png"
-    _plot_decision_exposure(frames.get("top_decisions", pd.DataFrame()), out)
+    decision_frame = frames.get("top_decisions", pd.DataFrame())
+    if use_datashader:
+        try:
+            _plot_decision_exposure_datashader(decision_frame, out)
+        except Exception:
+            if normalized_backend == "rapids_datashader":
+                raise
+            _plot_decision_exposure(decision_frame, out)
+    else:
+        _plot_decision_exposure(decision_frame, out)
     if out.exists():
         generated.append(out)
 
     aux_plot_dir = plot_dir / "aux_dims"
     for name, frame in aux_dim_frames.items():
         out = aux_plot_dir / f"{_safe_plot_filename(name)}.png"
-        _plot_barh(
-            frame,
-            output_path=out,
-            label_col="dim",
-            value_col="mean_abs",
-            title=f"Aux Dimension Importance: {name}",
-            top_n=32,
-        )
+        if use_datashader:
+            try:
+                _plot_aux_dim_datashader(frame, output_path=out, title=f"Aux Dimension Profile: {name}")
+            except Exception:
+                if normalized_backend == "rapids_datashader":
+                    raise
+                _plot_barh(
+                    frame,
+                    output_path=out,
+                    label_col="dim",
+                    value_col="mean_abs",
+                    title=f"Aux Dimension Importance: {name}",
+                    top_n=32,
+                )
+        else:
+            _plot_barh(
+                frame,
+                output_path=out,
+                label_col="dim",
+                value_col="mean_abs",
+                title=f"Aux Dimension Importance: {name}",
+                top_n=32,
+            )
         if out.exists():
             generated.append(out)
 
@@ -888,6 +1061,7 @@ def write_explanation_outputs(
     *,
     metadata: dict[str, Any] | None = None,
     write_plots: bool = True,
+    plot_backend: str = "auto",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = metadata or {}
@@ -902,11 +1076,16 @@ def write_explanation_outputs(
         safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
         frame.to_csv(aux_dir / f"{safe_name}.csv", index=False)
     plots_generated = (
-        _plot_all_explanation_figures(frames, aux_dim_frames, output_dir)
+        _plot_all_explanation_figures(frames, aux_dim_frames, output_dir, plot_backend=plot_backend)
         if write_plots
         else []
     )
-    summary = {**result["summary"], "metadata": metadata, "plots_generated": plots_generated}
+    summary = {
+        **result["summary"],
+        "metadata": metadata,
+        "plot_backend": _normalize_plot_backend(plot_backend),
+        "plots_generated": plots_generated,
+    }
     (output_dir / "summary.json").write_text(
         json.dumps(_to_builtin(summary), indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -1089,6 +1268,7 @@ def run_checkpoint_explanation(
     device_override: str | None = None,
     strict: bool = False,
     write_plots: bool = True,
+    plot_backend: str | None = None,
 ) -> Path:
     context = load_explanation_context(
         config_path=config_path,
@@ -1144,7 +1324,14 @@ def run_checkpoint_explanation(
         "date_end": dates[-1] if dates else None,
         **checkpoint_info,
     }
-    write_explanation_outputs(result, destination, metadata=metadata, write_plots=write_plots)
+    resolved_plot_backend = plot_backend or str(getattr(context.config.training, "plot_backend", "auto"))
+    write_explanation_outputs(
+        result,
+        destination,
+        metadata=metadata,
+        write_plots=write_plots,
+        plot_backend=resolved_plot_backend,
+    )
     return destination
 
 
@@ -1164,6 +1351,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
     parser.add_argument("--no-perturb", action="store_true", help="Skip feature perturbation sensitivity.")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")
+    parser.add_argument(
+        "--plot-backend",
+        default=None,
+        choices=("auto", "matplotlib", "rapids_datashader"),
+        help="PNG plot backend. auto uses RAPIDS Datashader for dense explainability plots when CUDA is available.",
+    )
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
     return parser.parse_args(argv)
 
@@ -1219,6 +1412,7 @@ def main(argv: list[str] | None = None) -> None:
                 device_override=args.device,
                 strict=args.strict,
                 write_plots=not args.no_plots,
+                plot_backend=args.plot_backend,
             )
             print(f"explainability output (fold {fold_id}): {out_dir}")
         return
@@ -1234,6 +1428,7 @@ def main(argv: list[str] | None = None) -> None:
         device_override=args.device,
         strict=args.strict,
         write_plots=not args.no_plots,
+        plot_backend=args.plot_backend,
     )
     print(f"explainability output: {out_dir}")
 
