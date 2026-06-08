@@ -93,7 +93,7 @@ training:
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
-  num_workers: 0
+  num_workers: 16
   weight_decay: 0.1
   grad_clip_norm: 0.0
   finite_check_interval_steps: 0

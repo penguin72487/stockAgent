@@ -36,10 +36,10 @@ Multi-asset Taiwan stock trading research workspace.
 - Crypto symbols are loaded from CoinGecko `/coins/list` and mapped to Yahoo format `${SYMBOL}-USD`.
 - Forex symbols are loaded from Yahoo Finance currencies page tickers (with static fallback when rate-limited).
 - Pepperstone-style FX universe is available via `configs/forex_pepperstone_pairs.txt` and can be downloaded to `data_yahoo/forex_pepperstone/`.
-- Use `python download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
-- Use `python download_yahoo_ohlcv.py --asset us_stocks` to download only the expanded U.S. stock universe.
-- Use `python download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
-- Use `python download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
+- Use `python downloader/download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
+- Use `python downloader/download_yahoo_ohlcv.py --asset us_stocks` to download only the expanded U.S. stock universe.
+- Use `python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
+- Use `python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
 - Use `python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.
 - Use `python downloader/download_forex_pepperstone.py --mode daily-update` for daily incremental updates.
