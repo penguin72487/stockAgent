@@ -23,6 +23,8 @@ data:
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
+  panel_backend: auto
+  panel_load_workers: 4
   # tradable_mode: tw_limit_guard
   tradable_mode: tradable
 
@@ -48,7 +50,8 @@ training:
   model_name: transformer_base_portfolio
   enable_torch_compile: true
   auto_torch_compile_sharpe: true
-  compile_loss: false
+  compile_loss: true
+  materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0

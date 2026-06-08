@@ -4,8 +4,18 @@ import torch
 from torch import nn
 
 from stockagent.backtest.simulator import run_backtest_torch
+import stockagent.backtest.simulator as simulator
+from stockagent.data.panel import PanelData
+from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.loss import risk_aware_loss
-from stockagent.training.trainer import _CompiledLossFallback, _detach_portfolio_state, _evaluate_tensor_batch
+from stockagent.training.trainer import (
+    _CompiledLossFallback,
+    _dataset_to_tensors,
+    _detach_portfolio_state,
+    _evaluate_tensor_batch,
+    _evaluate_windowed_tensor_batch,
+)
+from stockagent.training.windowed import dataset_to_windowed_tensors
 
 
 class _EchoWeightModel(nn.Module):
@@ -48,6 +58,22 @@ def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> No
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert calls == {"compiled": 1, "eager": 2}
+
+
+def test_backtest_compile_gate_skips_toolchain_lookup_while_dynamo_compiling(monkeypatch) -> None:
+    monkeypatch.setattr(simulator, "_torch_dynamo_is_compiling", lambda: True)
+    monkeypatch.setattr(
+        simulator,
+        "_prepend_cuda_toolchain_paths",
+        lambda: (_ for _ in ()).throw(AssertionError("toolchain lookup should be skipped")),
+    )
+    monkeypatch.setattr(
+        simulator.shutil,
+        "which",
+        lambda name: (_ for _ in ()).throw(AssertionError(f"which({name}) should be skipped")),
+    )
+
+    assert simulator._compile_enabled() is False
 
 
 def _chunked_backtest(
@@ -195,6 +221,87 @@ def test_evaluate_tensor_batch_resets_only_at_segment_boundaries() -> None:
     assert torch.allclose(backtest.strategy_returns.cpu(), expected_returns, atol=1e-7, rtol=1e-6)
     assert torch.allclose(backtest.turnovers.cpu(), expected_turnovers, atol=1e-7, rtol=1e-6)
     assert torch.allclose(backtest.weights_history.cpu(), expected_weights, atol=1e-7, rtol=1e-6)
+
+
+def _make_panel(rows: int = 8, symbols: int = 4, features: int = 3) -> PanelData:
+    values = torch.arange(rows * symbols * features, dtype=torch.float32).reshape(rows, symbols, features)
+    returns = torch.linspace(-0.02, 0.02, rows * symbols, dtype=torch.float32).reshape(rows, symbols)
+    mask = torch.ones(rows, symbols, dtype=torch.bool)
+    return PanelData(
+        dates=torch.arange(rows).numpy().astype("datetime64[D]"),
+        symbols=[f"S{i}" for i in range(symbols)],
+        feature_names=[f"f{i}" for i in range(features)],
+        features=values.numpy(),
+        returns_1d=returns.numpy(),
+        tradable_mask=mask.numpy(),
+        can_buy_mask=mask.numpy(),
+        can_sell_mask=mask.numpy(),
+        alive_mask=mask.numpy(),
+        benchmark_returns=returns.mean(dim=1).numpy(),
+        close_prices=torch.ones(rows, symbols).numpy(),
+    )
+
+
+def test_windowed_split_matches_materialized_dataset_tensors() -> None:
+    panel = _make_panel()
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=3)
+    expected = _dataset_to_tensors(dataset)
+    split = dataset_to_windowed_tensors(dataset)
+    actual = split.materialize_windows()
+
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+
+    batch = split.batch_by_rows(1, 4, torch.device("cpu"), non_blocking=False)
+    assert torch.equal(batch["x"], expected[0][1:4])
+    assert torch.equal(batch["future_log_returns"], expected[1][1:4])
+    assert torch.equal(batch["tradable_mask"], expected[2][1:4])
+    assert torch.equal(batch["can_buy_mask"], expected[3][1:4])
+    assert torch.equal(batch["can_sell_mask"], expected[4][1:4])
+    assert torch.equal(batch["benchmark"], expected[5][1:4])
+    assert torch.equal(batch["sample_mask"], torch.ones(3, dtype=torch.bool))
+
+
+def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
+    panel = _make_panel(rows=9, symbols=5, features=1)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+    x, returns, masks, can_buy, can_sell, bench = _dataset_to_tensors(dataset)
+    split = dataset_to_windowed_tensors(dataset)
+    materialized_bt, _, _ = _evaluate_tensor_batch(
+        _EchoWeightModel(),
+        x,
+        returns,
+        masks,
+        can_buy,
+        can_sell,
+        bench,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+    windowed_bt, _, _ = _evaluate_windowed_tensor_batch(
+        _EchoWeightModel(),
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+
+    assert torch.allclose(windowed_bt.strategy_returns.cpu(), materialized_bt.strategy_returns.cpu())
+    assert torch.allclose(windowed_bt.turnovers.cpu(), materialized_bt.turnovers.cpu())
+    assert torch.allclose(windowed_bt.weights_history.cpu(), materialized_bt.weights_history.cpu())
 
 
 def test_sortino_loss_uses_canonical_tensor_backtest_returns() -> None:

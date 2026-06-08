@@ -36,6 +36,8 @@ class DataConfig:
     use_rapids: bool = False
     usd_only_trading_pairs: bool = False
     tradable_mode: str = "tradable"
+    panel_backend: str = "auto"
+    panel_load_workers: int = 4
 
 
 @dataclass(slots=True)
@@ -408,6 +410,7 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
     finite_check_interval_steps: int = 0
+    materialize_window_tensors: bool = False
     loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "log_utility", etc.
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
     ft_transformer: FTTransformerModelConfig = field(default_factory=FTTransformerModelConfig)
@@ -538,6 +541,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("grad_clip_norm", 1.0)
     training.setdefault("finite_check_interval_steps", 0)
+    training.setdefault("materialize_window_tensors", False)
     training.setdefault("loss_type", "mse")
 
     # Model-specific blocks.
@@ -838,6 +842,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
     data.setdefault("usd_only_trading_pairs", False)
+    data.setdefault("panel_backend", "auto")
+    data.setdefault("panel_load_workers", 4)
 
     trading = raw.setdefault("trading", {})
 
@@ -879,6 +885,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             f"data.tradable_mode must be one of {sorted(valid_tradable_modes)}, got {data.get('tradable_mode')!r}"
         )
     data["tradable_mode"] = mode
+    panel_backend = str(data.get("panel_backend", "auto")).strip().lower()
+    valid_panel_backends = {"auto", "pandas", "polars"}
+    if panel_backend not in valid_panel_backends:
+        raise ValueError(
+            f"data.panel_backend must be one of {sorted(valid_panel_backends)}, got {data.get('panel_backend')!r}"
+        )
+    data["panel_backend"] = panel_backend
+    data["panel_load_workers"] = max(0, int(data.get("panel_load_workers", 4)))
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
@@ -963,6 +977,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             weight_decay=training_raw["weight_decay"],
             grad_clip_norm=training_raw["grad_clip_norm"],
             finite_check_interval_steps=training_raw["finite_check_interval_steps"],
+            materialize_window_tensors=training_raw["materialize_window_tensors"],
             loss_type=training_raw["loss_type"],
             mlp=MLPModelConfig(**training_raw["mlp"]),
             ft_transformer=FTTransformerModelConfig(**training_raw["ft_transformer"]),
