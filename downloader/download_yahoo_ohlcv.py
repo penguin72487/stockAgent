@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import yfinance as yf
@@ -213,6 +213,18 @@ FOREX_EXPANDED_FALLBACK_YAHOO_SYMBOLS: tuple[str, ...] = (
     "USDZAR=X", "USDMXN=X", "USDBRL=X", "USDCLP=X", "USDCOP=X", "USDPEN=X",
     "USDTRY=X", "USDINR=X", "USDKRW=X", "USDCNH=X", "USDCNY=X",
 )
+
+FALLBACK_SYMBOL_MANIFESTS: dict[str, Path] = {
+    "tw_stocks": Path("configs") / "fallback_tw_stocks_symbols.csv",
+    "us_stocks": Path("configs") / "fallback_us_stocks_symbols.csv",
+    "crypto": Path("configs") / "fallback_crypto_symbols.csv",
+    "forex": Path("configs") / "fallback_forex_symbols.csv",
+}
+
+TW_INCLUDED_SECTION_LABELS: dict[str, set[str]] = {
+    "listed": {"股票", "特別股", "ETF"},
+    "otc": {"股票", "特別股", "ETF"},
+}
 
 
 @dataclass(slots=True)
@@ -601,9 +613,29 @@ def _normalize_us_yahoo_symbol(symbol: str) -> str:
 
 
 def _http_get_text(url: str, timeout: int = 30) -> str:
-    with urlopen(url, timeout=timeout) as response:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/137.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
         raw = response.read()
-    return raw.decode("utf-8", errors="ignore")
+        charset = response.headers.get_content_charset() or "utf-8"
+    try:
+        return raw.decode(charset, errors="ignore")
+    except LookupError:
+        return raw.decode("utf-8", errors="ignore")
+
+
+def _read_html_tables(url: str, timeout: int = 30) -> list[pd.DataFrame]:
+    html = _http_get_text(url, timeout=timeout)
+    return pd.read_html(io.StringIO(html))
 
 
 def _http_get_json(url: str, timeout: int = 30) -> object:
@@ -628,7 +660,7 @@ def _fetch_with_hard_timeout(fn, *args, timeout: int = 60, **kwargs):
 def _extract_tw_codes_from_tables(url: str) -> set[str]:
     codes: set[str] = set()
     try:
-        tables = pd.read_html(url)
+        tables = _read_html_tables(url)
     except Exception:
         return codes
 
@@ -707,17 +739,54 @@ def _load_tw_symbols_from_local_manifest() -> list[SymbolRecord]:
     return records
 
 
+def _load_tw_symbols_from_local_parquet() -> list[SymbolRecord]:
+    data_dir = Path("data_parquet")
+    if not data_dir.exists():
+        return []
+
+    records: list[SymbolRecord] = []
+    seen_codes: set[str] = set()
+    suffix = "_features.parquet"
+    for output_path in sorted(data_dir.glob(f"*{suffix}")):
+        code = output_path.name[: -len(suffix)].strip().upper()
+        if not code or code in seen_codes or not TW_GENERIC_CODE_PATTERN.fullmatch(code):
+            continue
+        seen_codes.add(code)
+        records.append(
+            SymbolRecord(
+                code=code,
+                name=code,
+                market="tw_stocks",
+                yahoo_symbol=f"{code}.TW,{code}.TWO",
+            )
+        )
+    return records
+
+
 def _load_tw_symbols_from_exchange() -> list[SymbolRecord]:
     records: list[SymbolRecord] = []
     seen_codes: set[str] = set()
     for market, (url, suffix) in TWSE_SOURCES.items():
-        tables = pd.read_html(url)
+        tables = _read_html_tables(url)
         for table in tables:
-            if "有價證券代號及名稱" not in table.columns:
-                continue
-            values = table["有價證券代號及名稱"].astype(str)
-            for raw_value in values:
-                match = TWSE_CODE_NAME_PATTERN.match(raw_value.strip())
+            current_section: str | None = None
+            for row in table.fillna("").itertuples(index=False):
+                values = [str(value).strip() for value in row]
+                nonempty = [value for value in values if value]
+                if nonempty and len(set(nonempty)) == 1 and len(nonempty) >= 3:
+                    current_section = nonempty[0]
+                    continue
+                if current_section not in TW_INCLUDED_SECTION_LABELS.get(market, set()):
+                    continue
+                if len(values) < 4:
+                    continue
+                raw_value = values[0]
+                market_value = values[3]
+                if market == "listed" and market_value != "上市":
+                    continue
+                if market == "otc" and market_value != "上櫃":
+                    continue
+                match = TWSE_CODE_NAME_PATTERN.match(raw_value)
                 if not match:
                     continue
                 code = match.group("code").upper()
@@ -945,8 +1014,28 @@ def _records_from_defaults(asset_class: str) -> list[SymbolRecord]:
     ]
 
 
+def _load_repo_symbol_fallback(asset_class: str) -> list[SymbolRecord]:
+    manifest_path = FALLBACK_SYMBOL_MANIFESTS.get(asset_class)
+    if manifest_path is None:
+        return []
+    return _load_symbols_from_manifest_csv(manifest_path, asset_class)
+
+
 def _resolve_cached_manifest(output_dir: Path, asset_class: str) -> list[SymbolRecord]:
     return _load_symbols_from_manifest_csv(output_dir / "symbols.csv", asset_class)
+
+
+def _asset_output_is_bootstrap_empty(output_dir: Path) -> bool:
+    manifest_path = output_dir / "symbols.csv"
+    if manifest_path.exists():
+        return False
+    if any(output_dir.glob("*_features.parquet")):
+        return False
+    if _blacklist_file_path(output_dir).exists():
+        return False
+    if _whitelist_file_path(output_dir).exists():
+        return False
+    return True
 
 
 def _use_daily_update_cache_if_available(
@@ -967,12 +1056,32 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         return cached_daily
 
     records = _load_tw_symbols_from_local_manifest()
+    local_parquet_records = _load_tw_symbols_from_local_parquet()
+    repo_fallback_records = _load_repo_symbol_fallback("tw_stocks")
     if not records:
         try:
+            print(f"[symbols] fetching tw_stocks from exchange (timeout=60s)…")
             records = _fetch_with_hard_timeout(_load_tw_symbols_from_exchange, timeout=60)
         except Exception as exc:
             print(f"[symbols] failed to load tw symbols from exchange: {exc}")
-            records = cached or []
+            if repo_fallback_records:
+                print(f"[symbols] using repo fallback manifest for tw_stocks ({len(repo_fallback_records)} symbols)")
+                records = repo_fallback_records
+            elif local_parquet_records:
+                print(f"[symbols] fallback to local data_parquet codes for tw_stocks ({len(local_parquet_records)} symbols)")
+                records = local_parquet_records
+            else:
+                records = cached or []
+        else:
+            if not records:
+                if repo_fallback_records:
+                    print(f"[symbols] exchange returned no tw_stocks symbols; using repo fallback manifest ({len(repo_fallback_records)} symbols)")
+                    records = repo_fallback_records
+                elif local_parquet_records:
+                    print(f"[symbols] exchange returned no tw_stocks symbols; using local data_parquet fallback ({len(local_parquet_records)} symbols)")
+                    records = local_parquet_records
+            else:
+                print(f"[symbols] loaded {len(records)} tw_stocks symbols from exchange")
 
     if args.include_tw_delisted:
         try:
@@ -987,12 +1096,19 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
     if cached_daily is not None:
         return cached_daily
 
+    repo_fallback_records = _load_repo_symbol_fallback("us_stocks")
     records = _records_from_defaults("us_stocks")
     try:
-        records.extend(_fetch_with_hard_timeout(_load_us_symbols_from_web, timeout=60))
+        print("[symbols] fetching us_stocks from Nasdaq (timeout=60s)…")
+        fetched = _fetch_with_hard_timeout(_load_us_symbols_from_web, timeout=60)
+        records.extend(fetched)
+        print(f"[symbols] loaded {len(fetched)} us_stocks symbols from web")
     except Exception as exc:
         print(f"[symbols] fallback to static us_stocks list: {exc}")
-        if cached:
+        if repo_fallback_records:
+            print(f"[symbols] using repo fallback manifest for us_stocks ({len(repo_fallback_records)} symbols)")
+            records = repo_fallback_records
+        elif cached:
             print(f"[symbols] using cached manifest as fallback ({len(cached)} symbols)")
             records = cached
 
@@ -1015,12 +1131,19 @@ def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]
     if cached_daily is not None:
         return cached_daily
 
+    repo_fallback_records = _load_repo_symbol_fallback("crypto")
     records = _records_from_defaults("crypto")
     try:
-        records.extend(_fetch_with_hard_timeout(_load_crypto_symbols_from_coingecko, timeout=60))
+        print("[symbols] fetching crypto list from CoinGecko (timeout=60s)…")
+        fetched = _fetch_with_hard_timeout(_load_crypto_symbols_from_coingecko, timeout=60)
+        records.extend(fetched)
+        print(f"[symbols] loaded {len(fetched)} crypto symbols from CoinGecko")
     except Exception as exc:
         print(f"[symbols] fallback to static crypto list: {exc}")
-        if cached:
+        if repo_fallback_records:
+            print(f"[symbols] using repo fallback manifest for crypto ({len(repo_fallback_records)} symbols)")
+            records = repo_fallback_records
+        elif cached:
             print(f"[symbols] using cached manifest as fallback ({len(cached)} symbols)")
             records = cached
     return records
@@ -1031,18 +1154,26 @@ def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: l
     if cached_daily is not None:
         return cached_daily
 
+    repo_fallback_records = _load_repo_symbol_fallback("forex")
     records = _records_from_defaults("forex")
     records.extend(_load_cached_symbols_from_manifest(output_dir / "symbols.csv", "forex"))
     records.extend(_load_cached_symbols_from_whitelist(_whitelist_file_path(output_dir), "forex"))
 
     used_web_symbols = False
     try:
-        records.extend(_fetch_with_hard_timeout(_load_forex_symbols_from_yahoo_page, timeout=60))
+        print("[symbols] fetching forex symbols from Yahoo (timeout=60s)…")
+        fetched = _fetch_with_hard_timeout(_load_forex_symbols_from_yahoo_page, timeout=60)
+        records.extend(fetched)
         used_web_symbols = True
+        print(f"[symbols] loaded {len(fetched)} forex symbols from Yahoo")
     except Exception as exc:
         print(f"[symbols] fallback to static forex list: {exc}")
     if not used_web_symbols:
-        records.extend(_load_forex_expanded_fallback())
+        if repo_fallback_records:
+            print(f"[symbols] using repo fallback manifest for forex ({len(repo_fallback_records)} symbols)")
+            records.extend(repo_fallback_records)
+        else:
+            records.extend(_load_forex_expanded_fallback())
     return records
 
 
@@ -1071,10 +1202,21 @@ def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolR
             tracked_records = _load_local_tracked_records(asset_class, output_dir, cached)
             if tracked_records:
                 tracked_records.extend(_records_from_defaults(asset_class))
+                # Also include any new symbols from the repo fallback manifest
+                # that aren't yet tracked locally, so new listings get added.
+                repo_new = _load_repo_symbol_fallback(asset_class)
+                tracked_before = {r.code for r in tracked_records}
+                new_from_repo = [r for r in repo_new if r.code not in tracked_before]
+                if new_from_repo:
+                    print(
+                        f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
+                        f"from repo fallback manifest for {asset_class}"
+                    )
+                    tracked_records.extend(new_from_repo)
                 deduped = _dedupe_records_by_code(tracked_records)
                 print(
                     f"[symbols] daily-update: local tracked {asset_class} "
-                    f"({len(deduped)} symbols, parquet+whitelist+defaults)"
+                    f"({len(deduped)} symbols, parquet+whitelist+defaults+repo_new)"
                 )
                 if args.limit is not None:
                     deduped = deduped[: args.limit]
@@ -1651,6 +1793,24 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     for check in checks:
         status_counts[check.status] = status_counts.get(check.status, 0) + 1
 
+    # For symbols with 'missing' status (no local file at all), clear their
+    # candidates from the in-memory blacklist so they get a genuine retry.
+    # Previous interrupted runs may have blacklisted valid tickers prematurely.
+    missing_candidates: set[str] = set()
+    for check in checks:
+        if check.status == "missing":
+            for cand in YAHOO_SYMBOL_SPLIT_PATTERN.split(check.record.yahoo_symbol.strip()):
+                if cand:
+                    missing_candidates.add(cand.upper())
+    if missing_candidates:
+        cleared = blacklist_symbols & missing_candidates
+        if cleared:
+            blacklist_symbols -= cleared
+            print(
+                f"[repair] cleared {len(cleared)} blacklist entries for missing symbols "
+                f"to allow fresh retry (will re-blacklist if still unavailable)"
+            )
+
     print(
         f"[repair] asset={asset_class} current={status_counts.get('current', 0)} "
         f"missing={status_counts.get('missing', 0)} stale={status_counts.get('stale', 0)} "
@@ -1797,7 +1957,16 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
 
 def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dict[str, int]]:
     print(f"[{args.mode}] asset={asset_class} start={args.start_date} end={args.end_date}")
-    if args.mode in {"repair", "daily-update"}:
+    if args.mode == "daily-update":
+        output_dir = _resolve_asset_output_dir(args, asset_class)
+        if _asset_output_is_bootstrap_empty(output_dir):
+            print(f"[daily-update] asset={asset_class} bootstrap empty output; switching to download mode")
+            download_args = argparse.Namespace(**vars(args))
+            download_args.mode = "download"
+            counts = _download_asset_class(asset_class, download_args)
+        else:
+            counts = _repair_asset_class(asset_class, args)
+    elif args.mode == "repair":
         counts = _repair_asset_class(asset_class, args)
     else:
         counts = _download_asset_class(asset_class, args)
