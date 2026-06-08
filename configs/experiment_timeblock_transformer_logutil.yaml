@@ -81,6 +81,8 @@ training:
   curve_test_interval: 1
   curve_plot_interval: 1
   curve_plot_async: true
+  curve_plot_preprocess_device: auto
+  plot_backend: auto
   explain_after_each_fold: false
   explain_first_test_year_only: true
   cache_train_tensors_on_gpu: false

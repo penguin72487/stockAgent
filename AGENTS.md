@@ -250,6 +250,8 @@ Expected explainability workflow:
 - Analyze all folds when making model-level claims.
 - During training, if `training.explain_after_each_fold: true`, generate that fold's test explainability immediately after the fold final-test artifacts are written.
 - Default test explainability should use only each fold's first test year unless the user explicitly asks for all test years.
+- Dense explainability visuals should use `training.plot_backend`. In `auto`, use RAPIDS/cuDF/Datashader for feature-time heatmaps, top-decision exposure trends, and aux dimension profiles when CUDA is available. Keep compact top-N bars/correlation charts on Matplotlib unless there is a clear density problem.
+- Set `--plot-backend rapids_datashader` in `explain_model.py` only when the GPU raster path must be forced; if forced and RAPIDS/CUDA is unavailable, fail loudly instead of silently falling back.
 - Use local artifacts under paths such as:
   - `data_yahoo/tw_stocks/lookback16/explainability`
   - future lookback-32 explainability outputs

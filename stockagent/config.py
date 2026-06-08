@@ -390,6 +390,8 @@ class TrainingConfig:
     curve_test_interval: int = 100
     curve_plot_interval: int = 1
     curve_plot_async: bool = True
+    curve_plot_preprocess_device: str = "auto"
+    plot_backend: str = "auto"
     explain_after_each_fold: bool = True
     explain_first_test_year_only: bool = True
     explain_top_k: int = 20
@@ -524,6 +526,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("curve_test_interval", 100)
     training.setdefault("curve_plot_interval", 1)
     training.setdefault("curve_plot_async", True)
+    training.setdefault("curve_plot_preprocess_device", "auto")
+    training.setdefault("plot_backend", "auto")
     training.setdefault("explain_after_each_fold", True)
     training.setdefault("explain_first_test_year_only", True)
     training.setdefault("explain_top_k", 20)
@@ -909,6 +913,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data.get("panel_load_workers", 4)))
+    curve_plot_preprocess_device = str(training.get("curve_plot_preprocess_device", "auto")).strip().lower()
+    valid_plot_preprocess_devices = {"auto", "cpu", "cuda"}
+    if curve_plot_preprocess_device not in valid_plot_preprocess_devices:
+        raise ValueError(
+            "training.curve_plot_preprocess_device must be one of "
+            f"{sorted(valid_plot_preprocess_devices)}, got {training.get('curve_plot_preprocess_device')!r}"
+        )
+    training["curve_plot_preprocess_device"] = curve_plot_preprocess_device
+    plot_backend = str(training.get("plot_backend", "auto")).strip().lower()
+    valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
+    if plot_backend not in valid_plot_backends:
+        raise ValueError(
+            f"training.plot_backend must be one of {sorted(valid_plot_backends)}, "
+            f"got {training.get('plot_backend')!r}"
+        )
+    training["plot_backend"] = plot_backend
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
@@ -977,6 +997,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             curve_test_interval=training_raw["curve_test_interval"],
             curve_plot_interval=training_raw["curve_plot_interval"],
             curve_plot_async=training_raw["curve_plot_async"],
+            curve_plot_preprocess_device=training_raw["curve_plot_preprocess_device"],
+            plot_backend=training_raw["plot_backend"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],

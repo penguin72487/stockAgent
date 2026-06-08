@@ -62,3 +62,36 @@ The helper prints benchmark commands and summarizes existing epoch curves:
 
 Do not claim a speedup until both runs have measured `epoch_wall_s` in
 `epoch_curve.jsonl`.
+
+## GPU Plot Backend
+
+High-density equity plots can use RAPIDS + cuDF + Datashader directly from
+CUDA tensors:
+
+```yaml
+training:
+  plot_backend: auto  # auto, matplotlib, rapids_datashader
+```
+
+`auto` uses RAPIDS Datashader for final tensor equity plots when CUDA tensors
+are available. Epoch-curve plots are JSON-file based, so their `auto` path
+keeps Matplotlib to avoid paying Datashader/Numba JIT cost every epoch. Force
+GPU raster for epoch curves only when needed:
+
+```bash
+/home/user/miniforge3/envs/fintech/bin/python plot_epoch_curves.py \
+  --curve-file artifacts/<run>/epoch_curve.jsonl \
+  --raster-backend rapids_datashader
+```
+
+Explainability uses the same `training.plot_backend` setting. In `auto`,
+feature-time attribution heatmaps, top-decision exposure trends, and aux
+dimension profiles use RAPIDS/cuDF/Datashader when CUDA is available; compact
+top-N bars and correlation charts stay on Matplotlib because they are small and
+more readable as ordinary static charts. Use this to force the GPU raster path:
+
+```bash
+/home/user/miniforge3/envs/fintech/bin/python explain_model.py \
+  --config configs/experiment_baseline.yaml \
+  --plot-backend rapids_datashader
+```

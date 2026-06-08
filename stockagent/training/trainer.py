@@ -34,6 +34,7 @@ from stockagent.backtest.report import (
     plot_first_year_turnover_concentration,
     plot_fold_first_year_returns,
 )
+from stockagent.backtest.gpu_plot import plot_equity_curve_tensor_datashader, rapids_datashader_available
 from stockagent.backtest.simulator import (
     BacktestResult,
     BacktestResultTensor,
@@ -1095,7 +1096,26 @@ def _epoch_curve_plot_paths(curve_path: Path, interval: int) -> tuple[Path, Path
     )
 
 
-def _epoch_curve_plot_command(curve_path: Path, interval: int) -> list[str]:
+def _normalize_curve_plot_preprocess_device(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"auto", "cpu", "cuda"}:
+        return normalized
+    return "auto"
+
+
+def _normalize_plot_backend(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"auto", "matplotlib", "rapids_datashader"}:
+        return normalized
+    return "auto"
+
+
+def _epoch_curve_plot_command(
+    curve_path: Path,
+    interval: int,
+    preprocess_device: str = "auto",
+    plot_backend: str = "auto",
+) -> list[str]:
     output_path, timing_output_path = _epoch_curve_plot_paths(curve_path, interval)
     return [
         sys.executable,
@@ -1108,15 +1128,24 @@ def _epoch_curve_plot_command(curve_path: Path, interval: int) -> list[str]:
         str(output_path),
         "--timing-output",
         str(timing_output_path),
+        "--preprocess-device",
+        _normalize_curve_plot_preprocess_device(preprocess_device),
+        "--raster-backend",
+        _normalize_plot_backend(plot_backend),
     ]
 
 
-def _run_epoch_curve_plot_once(curve_path: Path, interval: int) -> None:
+def _run_epoch_curve_plot_once(
+    curve_path: Path,
+    interval: int,
+    preprocess_device: str = "auto",
+    plot_backend: str = "auto",
+) -> None:
     script_path = _epoch_curve_plot_script()
     if not script_path.exists():
         return
     proc = subprocess.run(
-        _epoch_curve_plot_command(curve_path, interval),
+        _epoch_curve_plot_command(curve_path, interval, preprocess_device, plot_backend),
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -1130,10 +1159,19 @@ def _run_epoch_curve_plot_once(curve_path: Path, interval: int) -> None:
 class _AsyncEpochCurvePlotter:
     """Update epoch loss/timing plots without blocking the training loop."""
 
-    def __init__(self, curve_path: Path, interval: int, async_enabled: bool) -> None:
+    def __init__(
+        self,
+        curve_path: Path,
+        interval: int,
+        async_enabled: bool,
+        preprocess_device: str = "auto",
+        plot_backend: str = "auto",
+    ) -> None:
         self.curve_path = curve_path
         self.interval = max(1, int(interval))
         self.async_enabled = bool(async_enabled)
+        self.preprocess_device = _normalize_curve_plot_preprocess_device(preprocess_device)
+        self.plot_backend = _normalize_plot_backend(plot_backend)
         self._proc: subprocess.Popen[str] | None = None
         self._pending = False
 
@@ -1141,7 +1179,7 @@ class _AsyncEpochCurvePlotter:
         if not self.curve_path.exists():
             return
         if not self.async_enabled:
-            _run_epoch_curve_plot_once(self.curve_path, self.interval)
+            _run_epoch_curve_plot_once(self.curve_path, self.interval, self.preprocess_device, self.plot_backend)
             return
         self._reap_finished()
         if self._proc is None:
@@ -1160,14 +1198,14 @@ class _AsyncEpochCurvePlotter:
             self._proc = None
         if self._pending:
             self._pending = False
-            _run_epoch_curve_plot_once(self.curve_path, self.interval)
+            _run_epoch_curve_plot_once(self.curve_path, self.interval, self.preprocess_device, self.plot_backend)
 
     def _launch(self) -> None:
         script_path = _epoch_curve_plot_script()
         if not script_path.exists():
             return
         self._proc = subprocess.Popen(
-            _epoch_curve_plot_command(self.curve_path, self.interval),
+            _epoch_curve_plot_command(self.curve_path, self.interval, self.preprocess_device, self.plot_backend),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -1186,6 +1224,80 @@ class _AsyncEpochCurvePlotter:
         if self._pending:
             self._pending = False
             self._launch()
+
+
+def _plot_fold_equity_outputs(
+    *,
+    tensor_result: BacktestResultTensor,
+    numpy_result: BacktestResult,
+    dates: np.ndarray,
+    fold_dir: Path,
+    plot_backend: str,
+) -> None:
+    backend = _normalize_plot_backend(plot_backend)
+    use_gpu = (
+        backend == "rapids_datashader"
+        or (
+            backend == "auto"
+            and tensor_result.strategy_returns.device.type == "cuda"
+            and rapids_datashader_available(require_cuda=True)
+        )
+    )
+
+    gpu_succeeded = False
+    if use_gpu:
+        try:
+            gpu_succeeded = plot_equity_curve_tensor_datashader(
+                tensor_result,
+                dates,
+                fold_dir / "equity_curve.png",
+                log_y=False,
+                title="Strategy vs Benchmark Equity Curve (RAPIDS Datashader)",
+            )
+            gpu_succeeded = (
+                plot_equity_curve_tensor_datashader(
+                    tensor_result,
+                    dates,
+                    fold_dir / "equity_curve_log.png",
+                    log_y=True,
+                    title="Strategy vs Benchmark Equity Curve Log (RAPIDS Datashader)",
+                )
+                and gpu_succeeded
+            )
+            gpu_succeeded = (
+                plot_equity_curve_tensor_datashader(
+                    tensor_result,
+                    dates,
+                    fold_dir / "leverage_equity_curve.png",
+                    log_y=False,
+                    title="Strategy vs Benchmark Equity Curve (Configured Leverage, RAPIDS Datashader)",
+                )
+                and gpu_succeeded
+            )
+            gpu_succeeded = (
+                plot_equity_curve_tensor_datashader(
+                    tensor_result,
+                    dates,
+                    fold_dir / "leverage_equity_curve_log.png",
+                    log_y=True,
+                    title="Strategy vs Benchmark Equity Curve Log (Configured Leverage, RAPIDS Datashader)",
+                )
+                and gpu_succeeded
+            )
+            if gpu_succeeded:
+                return
+        except Exception as exc:
+            if backend == "rapids_datashader":
+                raise
+            print(f"[plot] RAPIDS Datashader equity plot failed, falling back to Matplotlib: {exc}")
+
+    if backend == "rapids_datashader" and not gpu_succeeded:
+        raise RuntimeError("RAPIDS Datashader plot_backend requested but tensor GPU plotting did not run")
+
+    plot_equity_curve(numpy_result, dates, fold_dir / "equity_curve.png")
+    plot_equity_curve_log(numpy_result, dates, fold_dir / "equity_curve_log.png")
+    plot_equity_curve(numpy_result, dates, fold_dir / "leverage_equity_curve.png")
+    plot_equity_curve_log(numpy_result, dates, fold_dir / "leverage_equity_curve_log.png")
 
 
 def _timing_curve_payload(
@@ -3032,6 +3144,7 @@ def _run_fold_explainability(
         destination,
         metadata=metadata,
         write_plots=bool(getattr(config.training, "explain_write_plots", True)),
+        plot_backend=str(getattr(config.training, "plot_backend", "auto")),
     )
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -5750,6 +5863,8 @@ def run_training(
             group_curve_path,
             interval=int(config.training.curve_plot_interval),
             async_enabled=bool(config.training.curve_plot_async),
+            preprocess_device=str(getattr(config.training, "curve_plot_preprocess_device", "auto")),
+            plot_backend=str(getattr(config.training, "plot_backend", "auto")),
         )
 
         def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
@@ -7236,11 +7351,14 @@ def run_training(
                 f.write(report)
 
             plot_start = time.perf_counter()
-            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            _plot_fold_equity_outputs(
+                tensor_result=test_bt_t,
+                numpy_result=test_bt,
+                dates=test_dates,
+                fold_dir=fold_dir,
+                plot_backend=str(getattr(config.training, "plot_backend", "auto")),
+            )
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
-            plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
             _save_integer_share_audit_artifacts(
                 fold_dir,

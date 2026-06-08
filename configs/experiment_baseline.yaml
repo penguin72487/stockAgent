@@ -73,6 +73,8 @@ training:
   curve_test_interval: 1
   curve_plot_interval: 1
   curve_plot_async: true
+  curve_plot_preprocess_device: auto
+  plot_backend: auto
   explain_after_each_fold: true
   explain_first_test_year_only: true
   explain_top_k: 20
