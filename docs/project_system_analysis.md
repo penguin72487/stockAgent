@@ -172,6 +172,9 @@ feature projection
   - self-attention 用一次 GEMM 產生 QKV。
   - cross-attention 用同一組權重切成 Q 與 KV，減少獨立 projection overhead。
 - Temporal RoPE cos/sin 依 lookback/head dim 預先 cache，不在每個 forward 重算。
+- `temporal_pooling: last` 在 training/light aux path 使用 last-query fast path：
+  最後一層 temporal block 只計算最後一天 query 對完整 lookback context 的 attention；
+  `return_aux=True` 時仍保留完整 `[B,L,S,D]` token embedding 以供解釋性檢查。
 - `torch.compile(model)` 在 TW full universe、lookback32、batch16 實測約 1.9x batch hotpath speedup。
 - `compile_loss: true` 即使移除 Python timing graph break 後仍比 eager loss 慢，因此目前維持 `compile_loss: false`。
 
@@ -183,8 +186,8 @@ feature projection
 - full attention 必須受 `max_full_tokens` 保護。
 - 對 `S≈2304` 的 TW full universe，lookback32 建議從
   `batch_size_train: 16` 起跑；batch32 會明顯增加 VRAM 並降低吞吐。
-- `temporal_pooling: mean` 比 attention pooling 稍快，且仍利用整個 lookback；
-  這是速度優先設定，改回 attention pooling 前應重新 benchmark。
+- `temporal_pooling: last` 是目前 active user preference。它比 attention pooling 稍快，
+  但依賴 temporal blocks 把歷史資訊帶到最後一天 token；改回 attention/mean 前應重新 benchmark。
 
 ## 3.1 2026-06-09 Throughput Benchmark Summary
 
@@ -197,8 +200,11 @@ feature projection
 | --- | ---: | ---: | --- | --- | --- | ---: |
 | eager | 32 | 16 | false | false | attention | 0.181 |
 | eager | 32 | 16 | false | false | mean | 0.175 |
+| eager, before last fast path | 32 | 16 | false | false | last | 0.176 |
+| eager, last fast path | 32 | 16 | false | false | last | 0.151 |
 | eager | 32 | 32 | false | false | attention | 1.072 |
 | compiled model | 32 | 16 | true | false | mean | 0.091 |
+| compiled model, last fast path | 32 | 16 | true | false | last | 0.085 |
 | compiled model+loss | 32 | 16 | true | true | mean | 1.131 |
 
 決策:

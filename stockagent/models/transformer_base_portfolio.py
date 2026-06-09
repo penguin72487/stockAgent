@@ -294,15 +294,19 @@ class FlashSDPAAttention(nn.Module):
         k, v = kv.unbind(dim=0)
         return q, k, v
 
-    def _apply_cached_rope(self, x: torch.Tensor, steps: int) -> torch.Tensor:
+    def _apply_cached_rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         rot_dim = (int(x.size(-1)) // 2) * 2
         if rot_dim <= 0:
             return x
-        if int(self.rope_cos_cached.numel()) == 0 or steps > int(self.rope_cos_cached.size(0)):
-            positions = torch.arange(steps, device=x.device, dtype=torch.float32)
+        positions = positions.to(device=x.device)
+        if int(self.rope_cos_cached.numel()) == 0:
+            positions = positions.to(dtype=torch.float32)
             return _apply_rope(x, positions, base=self.rope_base)
-        cos = self.rope_cos_cached[:steps].to(device=x.device, dtype=x.dtype)[None, None, :, :]
-        sin = self.rope_sin_cached[:steps].to(device=x.device, dtype=x.dtype)[None, None, :, :]
+        pos_idx = positions.to(dtype=torch.long)
+        cos_cache = self.rope_cos_cached.to(device=x.device, dtype=x.dtype)
+        sin_cache = self.rope_sin_cached.to(device=x.device, dtype=x.dtype)
+        cos = cos_cache.index_select(0, pos_idx)[None, None, :, :]
+        sin = sin_cache.index_select(0, pos_idx)[None, None, :, :]
         x_rot = x[..., :rot_dim]
         x_pass = x[..., rot_dim:]
         x_even = x_rot[..., 0::2]
@@ -319,6 +323,8 @@ class FlashSDPAAttention(nn.Module):
         context: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
+        query_rope_positions: torch.Tensor | None = None,
+        key_rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, query_steps, _ = query.shape
         if context is None:
@@ -328,8 +334,10 @@ class FlashSDPAAttention(nn.Module):
             key_steps = int(context.size(1))
             q, k, v = self._project_cross(query, context)
         if rope_positions is not None and int(rope_positions.numel()) >= max(query_steps, key_steps):
-            q = self._apply_cached_rope(q, query_steps)
-            k = self._apply_cached_rope(k, key_steps)
+            query_positions = rope_positions[:query_steps] if query_rope_positions is None else query_rope_positions
+            key_positions = rope_positions[:key_steps] if key_rope_positions is None else key_rope_positions
+            q = self._apply_cached_rope(q, query_positions)
+            k = self._apply_cached_rope(k, key_positions)
         if self.qk_norm:
             q = _rms_normalize_last_dim(q)
             k = _rms_normalize_last_dim(k)
@@ -424,6 +432,8 @@ class TransformerPortfolioBlock(nn.Module):
         context: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
+        query_rope_positions: torch.Tensor | None = None,
+        key_rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if context is None:
             attn_out = self.attn(
@@ -431,6 +441,8 @@ class TransformerPortfolioBlock(nn.Module):
                 None,
                 key_mask=key_mask,
                 rope_positions=rope_positions,
+                query_rope_positions=query_rope_positions,
+                key_rope_positions=key_rope_positions,
             )
         else:
             attn_out = self.attn(
@@ -438,6 +450,8 @@ class TransformerPortfolioBlock(nn.Module):
                 self.norm_context(context),
                 key_mask=key_mask,
                 rope_positions=rope_positions,
+                query_rope_positions=query_rope_positions,
+                key_rope_positions=key_rope_positions,
             )
         query = query + self.resid_dropout(attn_out)
         query = query + self.ffn(self.norm_ffn(query))
@@ -735,12 +749,33 @@ class TransformerBasePortfolioModel(nn.Module):
             h = h + self._symbol_position(int(x.size(2)))
         return self.input_dropout(h)
 
-    def _apply_temporal_blocks(self, h: torch.Tensor) -> torch.Tensor:
+    def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
         seq = h.permute(0, 2, 1, 3).contiguous().reshape(bsz * n_symbols, steps, dim)
         rope_positions = self._temporal_rope_positions(steps, h.device)
-        for block in self.temporal_blocks:
+        use_last_query_fast_path = (
+            self.temporal_pooling == "last"
+            and not bool(keep_all_steps)
+            and len(self.temporal_blocks) > 0
+            and steps > 1
+        )
+        blocks = list(self.temporal_blocks)
+        full_blocks = blocks[:-1] if use_last_query_fast_path else blocks
+        for block in full_blocks:
             seq = self._run_block(block, seq, None, None, rope_positions)
+        if use_last_query_fast_path:
+            last_query = seq[:, -1:, :]
+            last_pos = None if rope_positions is None else rope_positions[-1:]
+            seq = self._run_block(
+                blocks[-1],
+                last_query,
+                seq,
+                None,
+                rope_positions,
+                last_pos,
+                rope_positions,
+            )
+            steps = 1
         return seq.reshape(bsz, n_symbols, steps, dim).permute(0, 2, 1, 3).contiguous()
 
     def _apply_cross_blocks(self, h: torch.Tensor, safe_mask: torch.Tensor) -> torch.Tensor:
@@ -793,7 +828,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h)
+        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
         h = self._apply_cross_blocks(h, safe_mask)
         aux = {"token_embedding": h} if collect_aux else {}
         return self._pool_temporal(h, safe_mask), aux
@@ -805,7 +840,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h)
+        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
         aux = {"token_embedding": h} if collect_aux else {}
         return self._pool_temporal(h, safe_mask), aux
 
@@ -817,7 +852,7 @@ class TransformerBasePortfolioModel(nn.Module):
         use_latent: bool,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h)
+        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
         z_base = self._pool_temporal(h, safe_mask)
         bsz = int(h.size(0))
         aux: dict[str, torch.Tensor] = {}

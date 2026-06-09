@@ -84,7 +84,7 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: mean
+    temporal_pooling: last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -118,8 +118,9 @@ Notes:
 - For large universes, prefer `latent` or `market_token`.
 - `return_aux_details` is useful for explainability but can increase memory pressure during training. Prefer `false` for tight VRAM training and enable it for explainability runs when needed.
 - The previous low-rank model remains available as `low_rank_market_transformer_portfolio`.
-- Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 16`, and `temporal_pooling: mean`.
-- `temporal_pooling: mean` is a speed-first choice that still uses all lookback days. It changes model behavior versus attention pooling, so re-check validation/test metrics after changing it.
+- Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 16`, and `temporal_pooling: last`.
+- `temporal_pooling: last` is the active user preference. It is slightly faster than attention pooling but relies on temporal blocks to carry useful history into the final token; re-check validation/test metrics after changing it.
+- For `temporal_pooling: last`, the model has a last-query temporal fast path when `return_aux_details=false`: all but the final temporal block run on the full lookback, and the final temporal block computes only the final-day query against the full context. Keep `return_aux=True` / detailed aux paths full-length for explainability parity.
 
 Modern Transformer module contract:
 
