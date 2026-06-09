@@ -39,6 +39,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Use `python downloader/download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
 - Use `python downloader/download_yahoo_ohlcv.py --asset us_stocks` to download only the expanded U.S. stock universe.
 - Use `python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
+- Yahoo crypto uses 15-minute bars; existing crypto parquet files that look like old daily data are rebuilt from the 15-minute source instead of being merged.
 - Use `python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
 - Use `python downloader/download_forex_pepperstone.py --mode repair` to repair stale/missing Pepperstone forex files.

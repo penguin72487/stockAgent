@@ -63,6 +63,7 @@ REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose"}
 BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
 YF_CRYPTO_INTRADAY_INTERVAL = "15m"
+YF_CRYPTO_INTRADAY_SECONDS = 15 * 60
 YF_CRYPTO_MAX_LOOKBACK_DAYS = 59
 DEFAULT_SYMBOLS: dict[str, list[tuple[str, str, str]]] = {
     "us_stocks": [
@@ -412,7 +413,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "download: grab the configured universe; "
             "repair: check existing parquet files and refill missing/stale data; "
-            "daily-update: incremental daily refresh (same behavior as repair)."
+            "daily-update: incremental refresh (same behavior as repair; crypto uses 15m bars)."
         ),
     )
     parser.add_argument(
@@ -638,6 +639,31 @@ def _normalize_download_frame(frame: pd.DataFrame) -> pd.DataFrame:
             normalized = normalized.drop(columns=["Trading_Volume"])
 
     return normalized.reset_index(drop=True)
+
+
+def _frame_matches_expected_interval(frame: pd.DataFrame, expected_seconds: int) -> bool:
+    if frame.empty or "date" not in frame.columns:
+        return True
+
+    parsed = pd.to_datetime(frame["date"], errors="coerce").dropna().sort_values()
+    if len(parsed) < 3:
+        return True
+
+    deltas = parsed.diff().dropna().dt.total_seconds()
+    deltas = deltas[deltas > 0]
+    if deltas.empty:
+        return True
+
+    median_delta = float(deltas.median())
+    large_gap_share = float((deltas >= 12 * 60 * 60).mean())
+    if large_gap_share > 0.05:
+        return False
+    midnight_share = float(
+        ((parsed.dt.hour == 0) & (parsed.dt.minute == 0) & (parsed.dt.second == 0)).mean()
+    )
+    if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
+        return False
+    return median_delta <= expected_seconds * 4
 
 
 def _normalize_us_yahoo_symbol(symbol: str) -> str:
@@ -1321,15 +1347,24 @@ def _download_symbol(
         else:
             try:
                 existing = pd.read_parquet(output_path)
-                return DownloadResult(
-                    asset_class=asset_class,
-                    code=record.code,
-                    yahoo_symbol=record.yahoo_symbol,
-                    market=record.market,
-                    status="skipped_existing",
-                    rows=int(len(existing)),
-                    output_path=str(output_path),
-                )
+                if asset_class == "crypto" and not _frame_matches_expected_interval(
+                    existing,
+                    YF_CRYPTO_INTRADAY_SECONDS,
+                ):
+                    print(
+                        f"[download] {record.code}: existing parquet does not look like "
+                        f"{YF_CRYPTO_INTRADAY_INTERVAL}; rebuilding from crypto intraday source"
+                    )
+                else:
+                    return DownloadResult(
+                        asset_class=asset_class,
+                        code=record.code,
+                        yahoo_symbol=record.yahoo_symbol,
+                        market=record.market,
+                        status="skipped_existing",
+                        rows=int(len(existing)),
+                        output_path=str(output_path),
+                    )
             except Exception as exc:
                 return DownloadResult(
                     asset_class=asset_class,
@@ -1346,7 +1381,16 @@ def _download_symbol(
     if output_path.exists() and merge_existing:
         try:
             existing_frame = pd.read_parquet(output_path)
-            if "date" in existing_frame.columns:
+            if asset_class == "crypto" and not _frame_matches_expected_interval(
+                existing_frame,
+                YF_CRYPTO_INTRADAY_SECONDS,
+            ):
+                print(
+                    f"[download] {record.code}: existing parquet does not look like "
+                    f"{YF_CRYPTO_INTRADAY_INTERVAL}; rebuilding from crypto intraday source"
+                )
+                existing_frame = None
+            elif "date" in existing_frame.columns:
                 existing_frame["date"] = pd.to_datetime(existing_frame["date"], errors="coerce").dt.tz_localize(None)
         except Exception as exc:
             existing_frame = None
@@ -1496,6 +1540,9 @@ def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[
         "row_count": total_rows,
         "status_counts": counts,
     }
+    if asset_class == "crypto":
+        summary["interval"] = YF_CRYPTO_INTRADAY_INTERVAL
+        summary["max_lookback_days"] = YF_CRYPTO_MAX_LOOKBACK_DAYS
     (output_dir / "download_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
 

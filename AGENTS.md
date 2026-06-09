@@ -238,6 +238,17 @@ Compile/runtime rules:
   - `backtest_autotune: true`
   - `compile_loss: false`
 
+## Crypto Downloader Baseline
+
+The active crypto downloader baseline is 15-minute bars.
+
+Rules:
+
+- Yahoo `crypto`, OKX perpetual, and Bybit perpetual downloaders should treat 15m candles as the source of truth.
+- Do not silently merge old daily crypto parquet rows with new 15m rows in the same file.
+- If an existing crypto parquet file looks like a daily-frequency artifact, rebuild it from the 15m source instead of appending to it.
+- Keep stock and FX Yahoo downloads on daily bars unless the user explicitly changes those markets too.
+
 ## Feature Engineering Guardrails
 
 Explainability indicated suspicious dependence on raw price level and raw liquidity.

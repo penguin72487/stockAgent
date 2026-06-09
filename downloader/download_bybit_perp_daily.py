@@ -22,6 +22,7 @@ INSTRUMENTS_ENDPOINT = "/v5/market/instruments-info"
 KLINE_ENDPOINT = "/v5/market/kline"
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 KLINE_INTERVAL = "15"
+KLINE_INTERVAL_LABEL = "15m"
 CANDLE_INTERVAL_MS = 15 * 60 * 1000
 WINDOW_DAYS = 10
 
@@ -123,6 +124,31 @@ def _resolve_next_start_ms(existing_df: pd.DataFrame, fallback_start_ms: int) ->
 
 def _ms_to_date_string(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _frame_matches_15m_interval(frame: pd.DataFrame) -> bool:
+    if frame.empty or "date" not in frame.columns:
+        return True
+
+    parsed = pd.to_datetime(frame["date"], errors="coerce", utc=True).dropna().sort_values()
+    if len(parsed) < 3:
+        return True
+
+    deltas = parsed.diff().dropna().dt.total_seconds()
+    deltas = deltas[deltas > 0]
+    if deltas.empty:
+        return True
+
+    median_delta = float(deltas.median())
+    large_gap_share = float((deltas >= 12 * 60 * 60).mean())
+    if large_gap_share > 0.05:
+        return False
+    midnight_share = float(
+        ((parsed.dt.hour == 0) & (parsed.dt.minute == 0) & (parsed.dt.second == 0)).mean()
+    )
+    if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
+        return False
+    return median_delta <= (CANDLE_INTERVAL_MS / 1000) * 4
 
 
 def _iter_windows(start_ms: int, end_ms: int, days_per_window: int = WINDOW_DAYS) -> list[tuple[int, int]]:
@@ -331,10 +357,16 @@ def _download_symbol_daily(
     if output_path.exists() and not refresh:
         try:
             existing_df = pd.read_parquet(output_path)
+            if not _frame_matches_15m_interval(existing_df):
+                print(
+                    f"[bybit] {record.bybit_symbol}: existing parquet does not look like "
+                    f"{KLINE_INTERVAL_LABEL}; rebuilding from start_date"
+                )
+                existing_df = None
         except Exception:
             existing_df = None
 
-        if mode == "full":
+        if mode == "full" and existing_df is not None:
             rows = len(existing_df) if existing_df is not None else 0
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
@@ -516,6 +548,7 @@ def main() -> None:
 
     summary = {
         "asset_class": "crypto_bybit_perp",
+        "interval": KLINE_INTERVAL_LABEL,
         "symbol_count": len(symbols),
         "row_count": int(result_df["rows"].sum()) if not result_df.empty else 0,
         "status_counts": {k: int(v) for k, v in result_df["status"].value_counts().to_dict().items()},
