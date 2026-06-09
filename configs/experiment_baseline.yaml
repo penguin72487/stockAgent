@@ -80,7 +80,9 @@ training:
   defer_epoch_curve_plot_until_end: false
   input_pipeline_ab_test: false
   input_pipeline_ab_test_steps: 20
-  explain_after_each_fold: true
+  # Keep training VRAM/time focused on training. Run `python explain_model.py`
+  # after training to generate the full paper explainability set for all folds.
+  explain_after_each_fold: false
   explain_first_test_year_only: true
   explain_top_k: 20
   explain_max_rows: 32
