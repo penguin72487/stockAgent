@@ -80,7 +80,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 15
+PANEL_CACHE_VERSION = 16
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
 PREV_DAY_LOG_RETURN_RENAME = {
@@ -118,6 +118,16 @@ def _price_decimals_for_path(path: Path) -> int:
     symbol = _symbol_name_from_path(path)
     is_tw_market = "tw_stocks" in parts or symbol.isdigit()
     return 2 if is_tw_market else 8
+
+
+def _return_price_column(frame: pd.DataFrame, path: Path) -> str:
+    """Choose the price series used for forward return labels."""
+    parts = {part.lower() for part in path.parts}
+    symbol = _symbol_name_from_path(path)
+    is_tw_market = "tw_stocks" in parts or symbol.isdigit()
+    if is_tw_market and "adjclose" in frame.columns:
+        return "adjclose"
+    return "close"
 
 
 def _round_price_series(series: pd.Series, decimals: int) -> pd.Series:
@@ -316,11 +326,14 @@ def _prepare_symbol_frame(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
     for col in ["open", "max", "min", "close"]:
         if col in frame.columns:
             frame[col] = _round_price_series(frame[col], decimals=price_decimals)
+    if "adjclose" in frame.columns:
+        frame["adjclose"] = _round_price_series(frame["adjclose"], decimals=price_decimals)
     frame["close_raw"] = pd.to_numeric(frame["close"], errors="coerce").astype(np.float32)
 
     frame = _add_derived_features(frame)
 
-    frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
+    return_price_col = _return_price_column(frame, path)
+    frame["return_1d"] = _safe_log_ratio(frame[return_price_col].shift(-1), frame[return_price_col])
 
     frame["tradable"] = _compute_tradable_from_frame(frame)
 
@@ -364,12 +377,15 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
     for col in ["open", "max", "min", "close"]:
         if col in gdf.columns:
             gdf[col] = gdf[col].round(price_decimals)
+    if "adjclose" in gdf.columns:
+        gdf["adjclose"] = gdf["adjclose"].round(price_decimals)
     gdf["close_raw"] = gdf["close"].astype("float32")
 
     frame = gdf.to_pandas()
     frame = _add_derived_features(frame)
 
-    frame["return_1d"] = _safe_log_ratio(frame["close"].shift(-1), frame["close"])
+    return_price_col = _return_price_column(frame, path)
+    frame["return_1d"] = _safe_log_ratio(frame[return_price_col].shift(-1), frame[return_price_col])
     frame["tradable"] = _compute_tradable_from_frame(frame)
 
     _apply_prev_day_log_returns(frame, ["open", "max", "min", "close"])
