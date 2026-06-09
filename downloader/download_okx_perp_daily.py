@@ -23,6 +23,9 @@ HISTORY_CANDLES_ENDPOINT = "/api/v5/market/history-candles"
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 KLINE_BAR = "15m"
 CANDLE_INTERVAL_MS = 15 * 60 * 1000
+OKX_MAX_REQ_PER_SEC = 10.0
+OKX_MIN_REQUEST_INTERVAL = 1.0 / OKX_MAX_REQ_PER_SEC
+OKX_HISTORY_LIMIT = "300"
 
 
 @dataclass(slots=True)
@@ -100,6 +103,12 @@ def _resolve_next_start_ms(existing_df: pd.DataFrame, fallback_start_ms: int) ->
 class OkxClient:
     def __init__(self, request_interval: float, max_retries: int, retry_base: float) -> None:
         self.request_interval = max(0.0, request_interval)
+        if 0.0 < self.request_interval < OKX_MIN_REQUEST_INTERVAL:
+            print(
+                "[okx] request_interval too small for 10 req/s limit; "
+                f"clamp {self.request_interval} -> {OKX_MIN_REQUEST_INTERVAL:.3f}"
+            )
+            self.request_interval = OKX_MIN_REQUEST_INTERVAL
         self.max_retries = max(0, max_retries)
         self.retry_base = max(0.1, retry_base)
         self._lock = threading.Lock()
@@ -294,7 +303,7 @@ def _download_symbol_daily(
         params: dict[str, Any] = {
             "instId": record.okx_symbol,
             "bar": KLINE_BAR,
-            "limit": "100",
+            "limit": OKX_HISTORY_LIMIT,
         }
         if cursor_after:
             params["after"] = cursor_after
