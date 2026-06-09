@@ -21,6 +21,8 @@ BASE_URL = "https://www.okx.com"
 INSTRUMENTS_ENDPOINT = "/api/v5/public/instruments"
 HISTORY_CANDLES_ENDPOINT = "/api/v5/market/history-candles"
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
+KLINE_BAR = "15m"
+CANDLE_INTERVAL_MS = 15 * 60 * 1000
 
 
 @dataclass(slots=True)
@@ -51,7 +53,7 @@ class DownloadResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download all OKX perpetual swap daily bars to parquet files."
+        description="Download all OKX perpetual swap 15-minute bars to parquet files."
     )
     parser.add_argument("--output-dir", default="data_okx", help="Output folder.")
     parser.add_argument(
@@ -62,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="2019-01-01", help="Inclusive start date YYYY-MM-DD")
     parser.add_argument("--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'")
-    parser.add_argument("--workers", type=int, default=2, help="Parallel symbol workers")
+    parser.add_argument("--workers", type=int, default=16, help="Parallel symbol workers")
     parser.add_argument("--limit", type=int, default=None, help="Optional symbol limit for quick tests")
     parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
     parser.add_argument(
@@ -83,9 +85,16 @@ def _date_to_ms(date_str: str, *, end_of_day: bool) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _next_day_ms(date_str: str) -> int:
-    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return int((dt.timestamp() + 86400) * 1000)
+def _resolve_next_start_ms(existing_df: pd.DataFrame, fallback_start_ms: int) -> int:
+    if "date" not in existing_df.columns:
+        return fallback_start_ms
+
+    parsed = pd.to_datetime(existing_df["date"], errors="coerce", utc=True).dropna()
+    if parsed.empty:
+        return fallback_start_ms
+
+    latest_ms = int(parsed.max().timestamp() * 1000)
+    return max(fallback_start_ms, latest_ms + CANDLE_INTERVAL_MS)
 
 
 class OkxClient:
@@ -156,7 +165,7 @@ class OkxClient:
 
 
 def _ms_to_date_string(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _fetch_swap_symbols(client: OkxClient, limit: int | None = None) -> list[SymbolRecord]:
@@ -222,6 +231,17 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pd.DataFrame:
     return df.drop(columns=["ts"])
 
 
+def _normalize_existing_dates(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "date" not in frame.columns:
+        return frame
+
+    normalized = frame.copy()
+    parsed = pd.to_datetime(normalized["date"], errors="coerce", utc=True)
+    normalized = normalized.assign(date=parsed.dt.strftime("%Y-%m-%d %H:%M:%S"))
+    normalized = normalized.dropna(subset=["date"]).sort_values("date")
+    return normalized.reset_index(drop=True)
+
+
 def _download_symbol_daily(
     client: OkxClient,
     record: SymbolRecord,
@@ -253,9 +273,8 @@ def _download_symbol_daily(
                 output_path=str(output_path),
             )
 
-        if existing_df is not None and not existing_df.empty and "date" in existing_df.columns:
-            last_date = str(existing_df["date"].max())
-            effective_start_ms = max(start_ms, _next_day_ms(last_date))
+        if existing_df is not None and not existing_df.empty:
+            effective_start_ms = _resolve_next_start_ms(existing_df, start_ms)
             if effective_start_ms > end_ms:
                 return DownloadResult(
                     asset_class="crypto_okx_perp",
@@ -274,7 +293,7 @@ def _download_symbol_daily(
     while True:
         params: dict[str, Any] = {
             "instId": record.okx_symbol,
-            "bar": "1Dutc",
+            "bar": KLINE_BAR,
             "limit": "100",
         }
         if cursor_after:
@@ -323,7 +342,7 @@ def _download_symbol_daily(
         )
 
     if existing_df is not None and not existing_df.empty:
-        combined = pd.concat([existing_df, df], ignore_index=True)
+        combined = pd.concat([_normalize_existing_dates(existing_df), df], ignore_index=True)
         combined = combined.sort_values("date").drop_duplicates(subset=["date"], keep="last")
         added_rows = max(0, len(combined) - len(existing_df))
         if added_rows == 0:

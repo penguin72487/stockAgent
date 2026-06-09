@@ -21,6 +21,9 @@ BASE_URL = "https://api.bybit.com"
 INSTRUMENTS_ENDPOINT = "/v5/market/instruments-info"
 KLINE_ENDPOINT = "/v5/market/kline"
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
+KLINE_INTERVAL = "15"
+CANDLE_INTERVAL_MS = 15 * 60 * 1000
+WINDOW_DAYS = 10
 
 
 @dataclass(slots=True)
@@ -52,7 +55,7 @@ class DownloadResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download Bybit perpetual futures daily bars to parquet files."
+        description="Download Bybit perpetual futures 15-minute bars to parquet files."
     )
     parser.add_argument("--output-dir", default="data_bybit", help="Output folder.")
     parser.add_argument(
@@ -106,16 +109,23 @@ def _date_to_ms(date_str: str, *, end_of_day: bool) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _next_day_ms(date_str: str) -> int:
-    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return int((dt.timestamp() + 86400) * 1000)
+def _resolve_next_start_ms(existing_df: pd.DataFrame, fallback_start_ms: int) -> int:
+    if "date" not in existing_df.columns:
+        return fallback_start_ms
+
+    parsed = pd.to_datetime(existing_df["date"], errors="coerce", utc=True).dropna()
+    if parsed.empty:
+        return fallback_start_ms
+
+    latest_ms = int(parsed.max().timestamp() * 1000)
+    return max(fallback_start_ms, latest_ms + CANDLE_INTERVAL_MS)
 
 
 def _ms_to_date_string(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _iter_windows(start_ms: int, end_ms: int, days_per_window: int = 900) -> list[tuple[int, int]]:
+def _iter_windows(start_ms: int, end_ms: int, days_per_window: int = WINDOW_DAYS) -> list[tuple[int, int]]:
     windows: list[tuple[int, int]] = []
     cursor = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -294,6 +304,17 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pd.DataFrame:
     return df.drop(columns=["ts"])
 
 
+def _normalize_existing_dates(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "date" not in frame.columns:
+        return frame
+
+    normalized = frame.copy()
+    parsed = pd.to_datetime(normalized["date"], errors="coerce", utc=True)
+    normalized = normalized.assign(date=parsed.dt.strftime("%Y-%m-%d %H:%M:%S"))
+    normalized = normalized.dropna(subset=["date"]).sort_values("date")
+    return normalized.reset_index(drop=True)
+
+
 def _download_symbol_daily(
     client: BybitClient,
     record: SymbolRecord,
@@ -325,9 +346,8 @@ def _download_symbol_daily(
                 output_path=str(output_path),
             )
 
-        if existing_df is not None and not existing_df.empty and "date" in existing_df.columns:
-            last_date = str(existing_df["date"].max())
-            effective_start_ms = max(start_ms, _next_day_ms(last_date))
+        if existing_df is not None and not existing_df.empty:
+            effective_start_ms = _resolve_next_start_ms(existing_df, start_ms)
             if effective_start_ms > end_ms:
                 return DownloadResult(
                     asset_class="crypto_bybit_perp",
@@ -346,7 +366,7 @@ def _download_symbol_daily(
             {
                 "category": record.category,
                 "symbol": record.bybit_symbol,
-                "interval": "D",
+                "interval": KLINE_INTERVAL,
                 "start": str(window_start),
                 "end": str(window_end),
                 "limit": "1000",
@@ -403,7 +423,7 @@ def _download_symbol_daily(
         )
 
     if existing_df is not None and not existing_df.empty:
-        combined = pd.concat([existing_df, df], ignore_index=True)
+        combined = pd.concat([_normalize_existing_dates(existing_df), df], ignore_index=True)
         combined = combined.sort_values("date").drop_duplicates(subset=["date"], keep="last")
         added_rows = max(0, len(combined) - len(existing_df))
         if added_rows == 0:
