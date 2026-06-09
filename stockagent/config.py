@@ -394,7 +394,7 @@ class TrainingConfig:
     defer_epoch_curve_plot_until_end: bool = False
     input_pipeline_ab_test: bool = True
     input_pipeline_ab_test_steps: int = 20
-    explain_after_each_fold: bool = True
+    explain_after_each_fold: bool = False
     explain_first_test_year_only: bool = True
     explain_top_k: int = 20
     explain_max_rows: int = 32
@@ -544,7 +544,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("defer_epoch_curve_plot_until_end", False)
     training.setdefault("input_pipeline_ab_test", True)
     training.setdefault("input_pipeline_ab_test_steps", 20)
-    training.setdefault("explain_after_each_fold", True)
+    training.setdefault("explain_after_each_fold", False)
     training.setdefault("explain_first_test_year_only", True)
     training.setdefault("explain_top_k", 20)
     training.setdefault("explain_max_rows", 32)

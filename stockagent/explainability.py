@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import inspect
 import json
 import math
@@ -25,6 +26,16 @@ from stockagent.data.panel import PanelData, build_panel
 from stockagent.data.walkforward import WalkForwardFold, build_expanding_year_folds
 from stockagent.models.factory import build_model
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
+
+
+def _clear_explainability_runtime_cache() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 
 PAPER_TOKENS = {
@@ -2932,7 +2943,10 @@ def run_checkpoint_explanation(
         report_style=settings.report_style,
         plot_theme=settings.plot_theme,
     )
-    return destination
+    destination_out = destination
+    del result, batch, dataset, model
+    _clear_explainability_runtime_cache()
+    return destination_out
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -3025,19 +3039,22 @@ def main(argv: list[str] | None = None) -> None:
             fold_output_dir = args.explain_output_dir
             if fold_output_dir is not None:
                 fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
-            out_dir = run_checkpoint_explanation(
-                config_path=args.config,
-                output_dir=args.output_dir,
-                fold_id=fold_id,
-                checkpoint=None,
-                split=args.split,
-                explain_output_dir=fold_output_dir,
-                settings=settings,
-                device_override=args.device,
-                strict=args.strict,
-                write_plots=not args.no_plots,
-                plot_backend=args.plot_backend,
-            )
+            try:
+                out_dir = run_checkpoint_explanation(
+                    config_path=args.config,
+                    output_dir=args.output_dir,
+                    fold_id=fold_id,
+                    checkpoint=None,
+                    split=args.split,
+                    explain_output_dir=fold_output_dir,
+                    settings=settings,
+                    device_override=args.device,
+                    strict=args.strict,
+                    write_plots=not args.no_plots,
+                    plot_backend=args.plot_backend,
+                )
+            finally:
+                _clear_explainability_runtime_cache()
             print(f"explainability output (fold {fold_id}): {out_dir}")
         if settings.fold_stability:
             stability_dir = write_fold_stability_outputs(resolved_output_dir / "explainability")
