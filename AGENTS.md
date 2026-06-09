@@ -257,7 +257,9 @@ Expected explainability workflow:
 
 - `python explain_model.py` should default to drawing the full explainability set unless the user asks for a smaller run.
 - Analyze all folds when making model-level claims.
-- During training, if `training.explain_after_each_fold: true`, generate that fold's test explainability immediately after the fold final-test artifacts are written.
+- Keep `training.explain_after_each_fold: false` by default so training VRAM/time stays focused on train/eval/test artifacts.
+- Generate explainability after training with `python explain_model.py`, which defaults to scanning all folds that have `checkpoint_best.pt`.
+- Only enable `training.explain_after_each_fold: true` for deliberate smoke/debug runs, because paper explainability can be slow and VRAM-heavy.
 - Default test explainability should use only each fold's first test year unless the user explicitly asks for all test years.
 - Paper-grade explainability is the default report style:
   - `explain_report_style: paper`
