@@ -62,6 +62,8 @@ BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Tradi
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose"}
 BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
+YF_CRYPTO_INTRADAY_INTERVAL = "15m"
+YF_CRYPTO_MAX_LOOKBACK_DAYS = 59
 DEFAULT_SYMBOLS: dict[str, list[tuple[str, str, str]]] = {
     "us_stocks": [
         ("AAPL", "Apple", "AAPL"),
@@ -1350,6 +1352,17 @@ def _download_symbol(
             existing_frame = None
             print(f"[download] merge-existing read failed for {output_path.name}: {exc}")
 
+    yf_interval = YF_CRYPTO_INTRADAY_INTERVAL if asset_class == "crypto" else "1d"
+    effective_start_date = start_date
+    if asset_class == "crypto":
+        max_lookback_start = (_parse_date(end_date) - timedelta(days=YF_CRYPTO_MAX_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        if _parse_date(start_date) < _parse_date(max_lookback_start):
+            effective_start_date = max_lookback_start
+            print(
+                f"[download] {record.code}: clamp start_date to {effective_start_date} "
+                f"for Yahoo intraday {yf_interval} limit"
+            )
+
     period_end_exclusive = (_parse_date(end_date) + timedelta(days=1)).strftime("%Y-%m-%d")
     last_error: str | None = None
     for candidate_symbol in candidates_to_try:
@@ -1361,9 +1374,9 @@ def _download_symbol(
                 def _download_frame() -> pd.DataFrame:
                     return yf.download(
                         tickers=candidate_symbol,
-                        start=start_date,
+                        start=effective_start_date,
                         end=period_end_exclusive,
-                        interval="1d",
+                        interval=yf_interval,
                         auto_adjust=False,
                         actions=True,
                         progress=False,

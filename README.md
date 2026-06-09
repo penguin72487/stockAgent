@@ -46,13 +46,13 @@ Multi-asset Taiwan stock trading research workspace.
 - Use `python downloader/download_pepperstone.py` to download grouped Pepperstone-style data to `data_peperstone/24hTrading`, `data_peperstone/commodites`, `data_peperstone/crypto`, and `data_peperstone/fores`.
 - Use `python downloader/download_pepperstone.py --groups crypto fores` to download only selected groups.
 - Use `python downloader/download_pepperstone.py --mode daily-update --groups all` for daily incremental updates across groups.
-- Use `python downloader/download_okx_perp_daily.py --output-dir data_okx` to download all OKX perpetual swap daily bars.
+- Use `python downloader/download_okx_perp_daily.py --output-dir data_okx` to download all OKX perpetual swap 15-minute bars.
 - Use `python downloader/download_okx_perp_daily.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
-- Use `python downloader/download_okx_perp_daily.py --mode daily-update` for daily incremental updates (only missing dates).
+- Use `python downloader/download_okx_perp_daily.py --mode daily-update` for incremental updates (only missing candles).
 - Use `python downloader/download_okx_perp_daily.py --mode full --refresh` when you need a full re-download.
-- Use `python downloader/download_bybit_perp_daily.py --output-dir data_bybit` to download Bybit perpetual daily bars.
+- Use `python downloader/download_bybit_perp_daily.py --output-dir data_bybit` to download Bybit perpetual 15-minute bars.
 - Use `python downloader/download_bybit_perp_daily.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
-- Use `python downloader/download_bybit_perp_daily.py --mode daily-update` for daily incremental updates (only missing dates).
+- Use `python downloader/download_bybit_perp_daily.py --mode daily-update` for incremental updates (only missing candles).
 - Use `python downloader/download_forex_frankfurter.py --mode daily-update --output-dir data_yahoo/forex` for daily incremental FX updates from Frankfurter.
 - Each asset folder includes `symbols.csv`, `download_report.csv`, and `download_summary.json` alongside `*_features.parquet` files.
 - Parquet output includes at least `date`, `open`, `max`, `min`, `close`, `adjclose`, `Trading_Volume`, and also preserves extra Yahoo columns when available (for example `Dividends`, `Stock Splits`).
@@ -71,7 +71,7 @@ Multi-asset Taiwan stock trading research workspace.
 ### Daily All-Market Update
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
-- The script runs Yahoo all-asset daily-update (`tw_stocks`, `us_stocks`, `crypto`, `forex`), Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual daily-update.
+- The script runs Yahoo all-asset daily-update (`tw_stocks`, `us_stocks`, `crypto`, `forex`), Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
 - Set `RUN_PEPPERSTONE_GROUPS=0` to skip Pepperstone groups when you only want Yahoo+Frankfurter.
 - Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
 - Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
