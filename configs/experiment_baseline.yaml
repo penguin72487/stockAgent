@@ -24,7 +24,7 @@ data:
   use_rapids: false
   usd_only_trading_pairs: false
   panel_backend: auto
-  panel_load_workers: 28
+  panel_load_workers: 16
   tradable_mode: tw_limit_guard
   # tradable_mode: tradable
 
@@ -35,8 +35,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0005
-  sell_fee_rate: 0.005
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -80,7 +80,7 @@ training:
   defer_epoch_curve_plot_until_end: false
   input_pipeline_ab_test: false
   input_pipeline_ab_test_steps: 20
-  explain_after_each_fold: true
+  explain_after_each_fold: false
   explain_first_test_year_only: true
   explain_top_k: 20
   explain_max_rows: 32

@@ -303,6 +303,36 @@ def _append_whitelist_symbol(path: Path, symbol: str) -> None:
         handle.write(f"{symbol}\n")
 
 
+def _rewrite_symbol_file(path: Path, symbols: set[str]) -> None:
+    """Rewrite symbol list file with a deduplicated sorted snapshot."""
+    ordered = sorted(sym for sym in symbols if sym)
+    with path.open("w", encoding="utf-8") as handle:
+        for sym in ordered:
+            handle.write(f"{sym}\n")
+
+
+def _clear_blacklist_candidates(
+    *,
+    blacklist_symbols: set[str],
+    blacklist_path: Path,
+    candidates: set[str],
+    reason: str,
+) -> int:
+    """Remove candidate symbols from blacklist set+file and return cleared count."""
+    if not candidates:
+        return 0
+    cleared = blacklist_symbols & {c.upper() for c in candidates if c}
+    if not cleared:
+        return 0
+    blacklist_symbols -= cleared
+    _rewrite_symbol_file(blacklist_path, blacklist_symbols)
+    print(
+        f"[repair] cleared {len(cleared)} blacklist entries for {reason} "
+        "to allow fresh retry (will re-blacklist if still unavailable)"
+    )
+    return len(cleared)
+
+
 def _blacklist_symbol(
     symbol: str,
     blacklist_symbols: set[str] | None,
@@ -1793,23 +1823,20 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     for check in checks:
         status_counts[check.status] = status_counts.get(check.status, 0) + 1
 
-    # For symbols with 'missing' status (no local file at all), clear their
-    # candidates from the in-memory blacklist so they get a genuine retry.
-    # Previous interrupted runs may have blacklisted valid tickers prematurely.
-    missing_candidates: set[str] = set()
+    # For symbols that require repair, clear candidates from blacklist so daily
+    # update does not get stuck in repeated 'blacklisted_skip' loops.
+    retry_candidates: set[str] = set()
     for check in checks:
-        if check.status == "missing":
+        if check.repair_start_date is not None:
             for cand in YAHOO_SYMBOL_SPLIT_PATTERN.split(check.record.yahoo_symbol.strip()):
                 if cand:
-                    missing_candidates.add(cand.upper())
-    if missing_candidates:
-        cleared = blacklist_symbols & missing_candidates
-        if cleared:
-            blacklist_symbols -= cleared
-            print(
-                f"[repair] cleared {len(cleared)} blacklist entries for missing symbols "
-                f"to allow fresh retry (will re-blacklist if still unavailable)"
-            )
+                    retry_candidates.add(cand.upper())
+    _clear_blacklist_candidates(
+        blacklist_symbols=blacklist_symbols,
+        blacklist_path=blacklist_path,
+        candidates=retry_candidates,
+        reason="pending repair symbols",
+    )
 
     print(
         f"[repair] asset={asset_class} current={status_counts.get('current', 0)} "
