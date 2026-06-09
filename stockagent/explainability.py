@@ -14,10 +14,59 @@ import torch
 from torch import nn
 
 from stockagent.config import ExperimentConfig, load_config
+from stockagent.backtest.gpu_plot import (
+    rapids_datashader_available,
+    run_cuml_umap,
+    save_heatmap_points_datashader,
+    save_line_series_datashader,
+    save_scatter_datashader,
+)
 from stockagent.data.panel import PanelData, build_panel
 from stockagent.data.walkforward import WalkForwardFold, build_expanding_year_folds
 from stockagent.models.factory import build_model
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
+
+
+PAPER_TOKENS = {
+    "surface": "#FCFCFD",
+    "panel": "#FFFFFF",
+    "ink": "#1F2430",
+    "muted": "#6F768A",
+    "grid": "#E6E8F0",
+    "axis": "#D7DBE7",
+    "blue_xlight": "#EAF1FE",
+    "blue_light": "#CEDFFE",
+    "blue_base": "#A3BEFA",
+    "blue_mid": "#5477C4",
+    "blue_dark": "#2E4780",
+    "gold_xlight": "#FFF4C2",
+    "gold_light": "#FFEA8F",
+    "gold_base": "#FFE15B",
+    "gold_mid": "#B8A037",
+    "gold_dark": "#736422",
+    "orange_xlight": "#FFEDDE",
+    "orange_base": "#F0986E",
+    "orange_mid": "#CC6F47",
+    "orange_dark": "#804126",
+    "olive_base": "#A3D576",
+    "olive_mid": "#71B436",
+    "olive_dark": "#386411",
+    "pink_base": "#F390CA",
+    "pink_mid": "#BD569B",
+    "pink_dark": "#8A3A6F",
+    "neutral_light": "#E2E5EA",
+    "neutral_base": "#C5CAD3",
+    "neutral_mid": "#7A828F",
+    "neutral_dark": "#464C55",
+}
+
+FEATURE_GROUP_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Return", ("logret", "return", "ret_", "_ret")),
+    ("Volume", ("volume", "vol", "turnover", "amount")),
+    ("Candlestick", ("body", "clv", "kline", "candle")),
+    ("Shadow", ("shadow", "upper", "lower")),
+    ("Position", ("range", "rank", "zscore", "position", "price_level")),
+)
 
 
 @dataclass(slots=True)
@@ -28,6 +77,18 @@ class ExplainabilitySettings:
     perturb: bool = True
     sample_method: str = "even"
     first_test_year_only: bool = True
+    report_style: str = "paper"
+    plot_theme: str = "paper"
+    interactive_plots: bool = False
+    shap_enabled: bool = True
+    shap_mode: str = "score_head_surrogate"
+    case_study_top_k: int = 5
+    regime_analysis: bool = True
+    fold_stability: bool = True
+    umap_enabled: bool = True
+    umap_max_points: int = 10000
+    umap_n_neighbors: int = 15
+    umap_min_dist: float = 0.1
 
 
 @dataclass(slots=True)
@@ -65,6 +126,70 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if not math.isfinite(out):
         return default
     return out
+
+
+def _normalize_plot_backend(value: str | None) -> str:
+    normalized = str(value or "auto").strip().lower()
+    if normalized in {"rapids", "datashader", "gpu", "gpu_datashader"}:
+        normalized = "rapids_datashader"
+    if normalized not in {"auto", "matplotlib", "rapids_datashader"}:
+        raise ValueError("plot_backend must be one of: auto, matplotlib, rapids_datashader")
+    return normalized
+
+
+def _normalize_report_style(value: str | None) -> str:
+    normalized = str(value or "paper").strip().lower()
+    if normalized not in {"paper", "standard", "none"}:
+        raise ValueError("explain_report_style must be one of: paper, standard, none")
+    return normalized
+
+
+def _normalize_plot_theme(value: str | None) -> str:
+    normalized = str(value or "paper").strip().lower()
+    if normalized not in {"paper", "standard"}:
+        raise ValueError("explain_plot_theme must be one of: paper, standard")
+    return normalized
+
+
+def _normalize_shap_mode(value: str | None) -> str:
+    normalized = str(value or "score_head_surrogate").strip().lower()
+    if normalized in {"surrogate", "score_head"}:
+        normalized = "score_head_surrogate"
+    if normalized not in {"score_head_surrogate", "off", "none"}:
+        raise ValueError("explain_shap_mode must be one of: score_head_surrogate, off, none")
+    return normalized
+
+
+def _feature_group(feature: str) -> str:
+    lowered = str(feature).lower()
+    for group, patterns in FEATURE_GROUP_PATTERNS:
+        if any(pattern in lowered for pattern in patterns):
+            return group
+    return "Other"
+
+
+def _feature_label(feature: str) -> str:
+    return f"{_feature_group(feature)} / {feature}"
+
+
+def _lookback_label(value: Any) -> str:
+    try:
+        offset = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"t-{offset}"
+
+
+def _use_datashader_for_explainability(plot_backend: str) -> bool:
+    normalized = _normalize_plot_backend(plot_backend)
+    if normalized == "matplotlib":
+        return False
+    available = rapids_datashader_available(require_cuda=True)
+    if normalized == "rapids_datashader" and not available:
+        raise RuntimeError(
+            "RAPIDS/cuDF/Datashader with CUDA was requested for explainability, but it is unavailable."
+        )
+    return bool(available)
 
 
 def _device_from_config(config: ExperimentConfig, override: str | None = None) -> torch.device:
@@ -205,6 +330,8 @@ def _feature_time_frame(
                     "lookback_index": int(time_idx),
                     "lookback_from_end": int(values.shape[0] - 1 - time_idx),
                     "feature": feature,
+                    "feature_group": _feature_group(feature),
+                    "feature_label": _feature_label(feature),
                     metric_name: float(values[time_idx, feat_idx]),
                 }
             )
@@ -213,8 +340,10 @@ def _feature_time_frame(
 
 def _feature_summary_frame(feature_time: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     if feature_time.empty:
-        return pd.DataFrame(columns=["feature", metric_name, "share"])
+        return pd.DataFrame(columns=["feature", "feature_group", "feature_label", metric_name, "share"])
     summary = feature_time.groupby("feature", as_index=False)[metric_name].sum()
+    summary["feature_group"] = summary["feature"].map(_feature_group)
+    summary["feature_label"] = summary["feature"].map(_feature_label)
     total = float(summary[metric_name].sum())
     summary["share"] = summary[metric_name] / total if total > 0.0 else 0.0
     return summary.sort_values(metric_name, ascending=False)
@@ -249,6 +378,8 @@ def _perturbation_importance(
                         "lookback_index": int(time_idx),
                         "lookback_from_end": int(x.size(1) - 1 - time_idx),
                         "feature": feature,
+                        "feature_group": _feature_group(feature),
+                        "feature_label": _feature_label(feature),
                         "weight_abs_delta": float((weights_p - base_weights).abs().mean().detach().cpu()),
                         "score_abs_delta": float((scores_p - base_scores).abs().mean().detach().cpu()),
                     }
@@ -257,6 +388,8 @@ def _perturbation_importance(
     if frame.empty:
         return frame, pd.DataFrame()
     summary = frame.groupby("feature", as_index=False)[["weight_abs_delta", "score_abs_delta"]].sum()
+    summary["feature_group"] = summary["feature"].map(_feature_group)
+    summary["feature_label"] = summary["feature"].map(_feature_label)
     total = float(summary["weight_abs_delta"].sum())
     summary["weight_delta_share"] = summary["weight_abs_delta"] / total if total > 0.0 else 0.0
     summary = summary.sort_values("weight_abs_delta", ascending=False)
@@ -403,6 +536,156 @@ def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pd.DataFrame, dict[str, 
     return pd.DataFrame(rows).sort_values("mean_abs", ascending=False), dim_frames
 
 
+def _aux_point_metadata(
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    flat_indices: np.ndarray,
+    symbols: list[str],
+    dates: list[str],
+) -> dict[str, list[Any]]:
+    rows = int(shape[0]) if len(shape) >= 1 else 0
+    second = int(shape[1]) if len(shape) >= 2 else 0
+    meta: dict[str, list[Any]] = {
+        "tensor": [name] * int(flat_indices.size),
+        "flat_index": flat_indices.astype(np.int64).tolist(),
+    }
+    if len(shape) == 3 and second == len(symbols):
+        symbol_idx = flat_indices % max(1, second)
+        date_idx = flat_indices // max(1, second)
+        meta["point_type"] = ["stock"] * int(flat_indices.size)
+        meta["date"] = [dates[int(idx)] if 0 <= int(idx) < len(dates) else "" for idx in date_idx]
+        meta["symbol"] = [symbols[int(idx)] if 0 <= int(idx) < len(symbols) else str(int(idx)) for idx in symbol_idx]
+        meta["token_index"] = symbol_idx.astype(np.int64).tolist()
+    elif len(shape) == 3:
+        token_idx = flat_indices % max(1, second)
+        date_idx = flat_indices // max(1, second)
+        meta["point_type"] = ["token"] * int(flat_indices.size)
+        meta["date"] = [dates[int(idx)] if 0 <= int(idx) < len(dates) else "" for idx in date_idx]
+        meta["token_index"] = token_idx.astype(np.int64).tolist()
+    elif len(shape) == 4:
+        steps = int(shape[1])
+        n_symbols = int(shape[2])
+        per_row = max(1, steps * n_symbols)
+        row_idx = flat_indices // per_row
+        rem = flat_indices % per_row
+        lookback_idx = rem // max(1, n_symbols)
+        symbol_idx = rem % max(1, n_symbols)
+        meta["point_type"] = ["time_stock"] * int(flat_indices.size)
+        meta["date"] = [dates[int(idx)] if 0 <= int(idx) < len(dates) else "" for idx in row_idx]
+        meta["lookback_index"] = lookback_idx.astype(np.int64).tolist()
+        meta["lookback_from_end"] = (steps - 1 - lookback_idx).astype(np.int64).tolist()
+        meta["symbol"] = [symbols[int(idx)] if 0 <= int(idx) < len(symbols) else str(int(idx)) for idx in symbol_idx]
+        meta["token_index"] = symbol_idx.astype(np.int64).tolist()
+    else:
+        meta["point_type"] = ["vector"] * int(flat_indices.size)
+        if rows > 0:
+            meta["date"] = [dates[int(idx)] if 0 <= int(idx) < len(dates) else "" for idx in (flat_indices % rows)]
+    return meta
+
+
+def _aux_umap_projection_frames(
+    aux: dict[str, torch.Tensor],
+    *,
+    symbols: list[str],
+    dates: list[str],
+    settings: ExplainabilitySettings,
+    device: torch.device,
+) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]], list[str]]:
+    if not bool(settings.umap_enabled):
+        return {}, [], ["cuML UMAP projections disabled by settings."]
+    if device.type != "cuda":
+        return {}, [], ["cuML UMAP projections require CUDA; skipped because explainability device is not CUDA."]
+
+    max_points = max(0, int(settings.umap_max_points))
+    if max_points < 4:
+        return {}, [], ["cuML UMAP projections skipped because explain_umap_max_points < 4."]
+
+    projection_frames: dict[str, pd.DataFrame] = {}
+    summaries: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    preferred_names = {
+        "stock_embedding",
+        "z_stock",
+        "latent_factors",
+        "market_tokens",
+        "dynamic_latent_queries",
+        "dynamic_market_queries",
+        "dynamic_latent_delta",
+        "dynamic_market_delta",
+        "z_factor_context",
+        "z_market_context",
+        "token_embedding",
+    }
+    for name, value in sorted(aux.items()):
+        if name not in preferred_names:
+            continue
+        if not torch.is_tensor(value) or value.ndim < 3 or int(value.shape[-1]) < 2:
+            continue
+        tensor = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        original_shape = tuple(int(dim) for dim in tensor.shape)
+        flat = tensor.reshape(-1, original_shape[-1])
+        n_points = int(flat.size(0))
+        if n_points < 4:
+            warnings.append(f"{name}: fewer than 4 vectors; cuML UMAP skipped.")
+            continue
+        if n_points > max_points:
+            sample_idx = torch.linspace(0, n_points - 1, max_points, device=flat.device).round().to(torch.long)
+            flat_sample = flat.index_select(0, sample_idx)
+        else:
+            sample_idx = torch.arange(n_points, device=flat.device, dtype=torch.long)
+            flat_sample = flat
+        if flat_sample.device.type != "cuda":
+            flat_sample = flat_sample.to(device=device, non_blocking=True)
+            sample_idx = sample_idx.to(device=device, non_blocking=True)
+        try:
+            embedding = run_cuml_umap(
+                flat_sample,
+                n_neighbors=int(settings.umap_n_neighbors),
+                min_dist=float(settings.umap_min_dist),
+                random_state=42,
+            )
+        except Exception as exc:
+            warnings.append(f"{name}: cuML UMAP failed: {type(exc).__name__}: {exc}")
+            continue
+        sample_idx_cpu = sample_idx.detach().cpu().numpy().astype(np.int64, copy=False)
+        embedding_cpu = embedding.get()
+        meta = _aux_point_metadata(
+            name=name,
+            shape=original_shape,
+            flat_indices=sample_idx_cpu,
+            symbols=symbols,
+            dates=dates,
+        )
+        frame = pd.DataFrame(meta)
+        frame["umap_x"] = embedding_cpu[:, 0].astype(np.float32, copy=False)
+        frame["umap_y"] = embedding_cpu[:, 1].astype(np.float32, copy=False)
+        frame["sampled_points"] = int(sample_idx_cpu.size)
+        frame["original_points"] = int(n_points)
+        projection_frames[name] = frame
+        x_std = float(np.nanstd(frame["umap_x"].to_numpy(dtype=np.float64)))
+        y_std = float(np.nanstd(frame["umap_y"].to_numpy(dtype=np.float64)))
+        summaries.append(
+            {
+                "name": name,
+                "shape": "x".join(str(dim) for dim in original_shape),
+                "original_points": int(n_points),
+                "sampled_points": int(sample_idx_cpu.size),
+                "method": "cuml_umap",
+                "n_neighbors": int(min(max(2, int(settings.umap_n_neighbors)), int(sample_idx_cpu.size) - 1)),
+                "min_dist": float(settings.umap_min_dist),
+                "umap_x_std": x_std,
+                "umap_y_std": y_std,
+                "near_collapsed": bool(max(x_std, y_std) < 1e-4),
+            }
+        )
+        if max(x_std, y_std) < 1e-4:
+            warnings.append(f"{name}: cuML UMAP projection is nearly collapsed; inspect aux tensor and token gates.")
+    if not projection_frames and not warnings:
+        warnings.append("No eligible transformer aux tensors were found for cuML UMAP projection.")
+    return projection_frames, summaries, warnings
+
+
 def _stock_contribution_frame(
     weights: torch.Tensor,
     returns: torch.Tensor,
@@ -470,6 +753,355 @@ def _make_warnings(
     return warnings
 
 
+def _daily_portfolio_frame(
+    weights: torch.Tensor,
+    returns: torch.Tensor,
+    mask: torch.Tensor,
+    dates: list[str],
+) -> pd.DataFrame:
+    weights_f = weights.detach().float().masked_fill(~mask.detach().bool(), 0.0)
+    returns_f = returns.detach().float().masked_fill(~mask.detach().bool(), 0.0)
+    active = mask.detach().bool().sum(dim=1).clamp_min(1)
+    strategy_return = (weights_f * returns_f).sum(dim=1)
+    market_return = returns_f.sum(dim=1) / active.to(dtype=returns_f.dtype)
+    long_gross = weights_f.clamp_min(0.0).sum(dim=1)
+    short_gross = (-weights_f.clamp_max(0.0)).sum(dim=1)
+    gross = weights_f.abs().sum(dim=1)
+    net = weights_f.sum(dim=1)
+    max_abs_weight = weights_f.abs().amax(dim=1)
+    hhi = (weights_f.abs().square().sum(dim=1) / gross.clamp_min(1e-12).square()).nan_to_num(0.0)
+    turnover = torch.zeros_like(gross)
+    if int(weights_f.size(0)) > 1:
+        turnover[1:] = (weights_f[1:] - weights_f[:-1]).abs().sum(dim=1)
+    rows: list[dict[str, Any]] = []
+    for idx, date in enumerate(dates):
+        rows.append(
+            {
+                "date": date,
+                "strategy_log_return": float(strategy_return[idx].cpu()),
+                "market_log_return": float(market_return[idx].cpu()),
+                "gross_exposure": float(gross[idx].cpu()),
+                "net_exposure": float(net[idx].cpu()),
+                "long_gross": float(long_gross[idx].cpu()),
+                "short_gross": float(short_gross[idx].cpu()),
+                "turnover_proxy": float(turnover[idx].cpu()),
+                "max_abs_weight": float(max_abs_weight[idx].cpu()),
+                "hhi": float(hhi[idx].cpu()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _regime_analysis_frame(daily: pd.DataFrame) -> pd.DataFrame:
+    required = {"market_log_return", "strategy_log_return", "turnover_proxy", "gross_exposure", "net_exposure"}
+    if daily.empty or not required.issubset(daily.columns):
+        return pd.DataFrame()
+    data = daily.copy()
+    data["market_direction"] = np.where(
+        data["market_log_return"] > 0.001,
+        "market_up",
+        np.where(data["market_log_return"] < -0.001, "market_down", "market_flat"),
+    )
+    abs_market = data["market_log_return"].abs()
+    if int(abs_market.notna().sum()) >= 3 and float(abs_market.max()) > float(abs_market.min()):
+        try:
+            data["volatility_bucket"] = pd.qcut(
+                abs_market,
+                q=min(3, int(abs_market.notna().sum())),
+                labels=False,
+                duplicates="drop",
+            ).map({0: "low_abs_market_move", 1: "mid_abs_market_move", 2: "high_abs_market_move"})
+        except ValueError:
+            data["volatility_bucket"] = "single_vol_bucket"
+    else:
+        data["volatility_bucket"] = "single_vol_bucket"
+    rows: list[dict[str, Any]] = []
+    for dimension in ("market_direction", "volatility_bucket"):
+        for regime, group in data.groupby(dimension, dropna=False):
+            rows.append(
+                {
+                    "dimension": dimension,
+                    "regime": str(regime),
+                    "rows": int(len(group)),
+                    "mean_strategy_log_return": float(group["strategy_log_return"].mean()),
+                    "mean_market_log_return": float(group["market_log_return"].mean()),
+                    "mean_turnover_proxy": float(group["turnover_proxy"].mean()),
+                    "mean_gross_exposure": float(group["gross_exposure"].mean()),
+                    "mean_net_exposure": float(group["net_exposure"].mean()),
+                    "hit_rate": float((group["strategy_log_return"] > 0.0).mean()),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _case_study_frame(decisions: pd.DataFrame, daily: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    if decisions.empty or daily.empty or "date" not in decisions.columns:
+        return pd.DataFrame()
+    top_k = max(1, int(top_k))
+    selected: list[tuple[str, str]] = []
+    if "strategy_log_return" in daily.columns:
+        best = daily.sort_values("strategy_log_return", ascending=False).head(1)
+        worst = daily.sort_values("strategy_log_return", ascending=True).head(1)
+        if not best.empty:
+            selected.append(("best_strategy_day", str(best.iloc[0]["date"])))
+        if not worst.empty:
+            selected.append(("worst_strategy_day", str(worst.iloc[0]["date"])))
+    if "turnover_proxy" in daily.columns:
+        turnover = daily.sort_values("turnover_proxy", ascending=False).head(1)
+        if not turnover.empty:
+            selected.append(("highest_turnover_day", str(turnover.iloc[0]["date"])))
+    if "gross_exposure" in daily.columns:
+        gross = daily.sort_values("gross_exposure", ascending=False).head(1)
+        if not gross.empty:
+            selected.append(("highest_gross_exposure_day", str(gross.iloc[0]["date"])))
+    unique_selected: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in selected:
+        if item not in seen:
+            unique_selected.append(item)
+            seen.add(item)
+    rows: list[pd.DataFrame] = []
+    daily_small = daily.set_index("date", drop=False)
+    for case_type, date in unique_selected:
+        chunk = decisions[decisions["date"].astype(str) == date].copy()
+        if chunk.empty:
+            continue
+        chunk["abs_weight"] = pd.to_numeric(chunk.get("weight", 0.0), errors="coerce").abs()
+        chunk = chunk.sort_values("abs_weight", ascending=False).head(top_k)
+        chunk.insert(0, "case_type", case_type)
+        if date in daily_small.index:
+            daily_row = daily_small.loc[date]
+            if isinstance(daily_row, pd.DataFrame):
+                daily_row = daily_row.iloc[0]
+            for col in ("strategy_log_return", "market_log_return", "turnover_proxy", "gross_exposure", "net_exposure"):
+                chunk[f"case_{col}"] = daily_row.get(col)
+        rows.append(chunk)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+def _feature_time_top_cells(frame: pd.DataFrame, metric_name: str, top_n: int = 20) -> pd.DataFrame:
+    required = {"feature", "lookback_from_end", metric_name}
+    if frame.empty or not required.issubset(frame.columns):
+        return pd.DataFrame()
+    data = frame.copy()
+    data[metric_name] = pd.to_numeric(data[metric_name], errors="coerce")
+    data = data.dropna(subset=[metric_name]).sort_values(metric_name, ascending=False).head(top_n)
+    if data.empty:
+        return data
+    total = float(pd.to_numeric(frame[metric_name], errors="coerce").fillna(0.0).sum())
+    data["share"] = data[metric_name] / total if total > 0.0 else 0.0
+    data["lookback_label"] = data["lookback_from_end"].map(_lookback_label)
+    if "feature_group" not in data.columns:
+        data["feature_group"] = data["feature"].map(_feature_group)
+    if "feature_label" not in data.columns:
+        data["feature_label"] = data["feature"].map(_feature_label)
+    return data
+
+
+def _trust_check_frame(
+    portfolio: dict[str, float],
+    feature_summary: pd.DataFrame,
+    time_summary: pd.DataFrame,
+    corr: pd.DataFrame,
+    aux_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+
+    def add_check(name: str, value: float, threshold: float, comparator: str, interpretation: str) -> None:
+        if comparator == "<=":
+            passed = value <= threshold
+        else:
+            passed = value >= threshold
+        rows.append(
+            {
+                "check": name,
+                "value": float(value),
+                "threshold": float(threshold),
+                "rule": f"{comparator} {threshold:g}",
+                "status": "pass" if passed else "warn",
+                "interpretation": interpretation,
+            }
+        )
+
+    add_check(
+        "untradable_abs_weight_sum",
+        float(portfolio.get("untradable_abs_weight_sum", 0.0)),
+        1e-5,
+        "<=",
+        "Should be zero; non-zero means the mask/tradability logic leaked into actual positions.",
+    )
+    add_check(
+        "max_abs_weight_max",
+        float(portfolio.get("max_abs_weight_max", 0.0)),
+        0.35,
+        "<=",
+        "Large single-name weights can indicate shortcut learning or unstable concentration.",
+    )
+    add_check(
+        "mean_turnover_proxy",
+        float(portfolio.get("mean_turnover_proxy", 0.0)),
+        1.5,
+        "<=",
+        "High turnover makes net performance highly fee-sensitive and less trustworthy.",
+    )
+    if not feature_summary.empty and "share" in feature_summary.columns:
+        add_check(
+            "top_feature_attribution_share",
+            float(feature_summary.iloc[0].get("share", 0.0)),
+            0.55,
+            "<=",
+            "A single dominant feature can be a sign that the model learned a narrow rule.",
+        )
+    if not time_summary.empty and "share" in time_summary.columns:
+        add_check(
+            "top_lookback_day_attribution_share",
+            float(time_summary.sort_values("share", ascending=False).iloc[0].get("share", 0.0)),
+            0.70,
+            "<=",
+            "A single dominant day can mean the temporal model is mostly ignoring the lookback window.",
+        )
+    if not corr.empty and {"abs_score_corr", "abs_weight_corr"}.issubset(corr.columns):
+        corr_max = float(np.nanmax(corr[["abs_score_corr", "abs_weight_corr"]].to_numpy(dtype=np.float64)))
+        add_check(
+            "max_simple_feature_score_weight_corr",
+            corr_max,
+            0.75,
+            "<=",
+            "High raw correlation can reveal price-level, liquidity, or other simple shortcut rules.",
+        )
+    if not aux_summary.empty and "zero_fraction" in aux_summary.columns:
+        add_check(
+            "max_aux_zero_fraction",
+            float(pd.to_numeric(aux_summary["zero_fraction"], errors="coerce").fillna(0.0).max()),
+            0.95,
+            "<=",
+            "Near-zero aux tensors can indicate collapsed latent/market token representations.",
+        )
+    return pd.DataFrame(rows)
+
+
+def _score_head_surrogate_shap(
+    x: torch.Tensor,
+    scores: torch.Tensor,
+    mask: torch.Tensor,
+    feature_names: list[str],
+    *,
+    enabled: bool,
+    mode: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], list[str]]:
+    mode = _normalize_shap_mode(mode)
+    if not enabled or mode in {"off", "none"}:
+        return pd.DataFrame(), pd.DataFrame(), {"enabled": bool(enabled), "method": "skipped"}, []
+    warnings: list[str] = []
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.metrics import r2_score
+    except Exception as exc:
+        return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "error": str(exc)}, [
+            f"SHAP skipped because scikit-learn is unavailable: {type(exc).__name__}: {exc}"
+        ]
+
+    x_cpu = x.detach().float().cpu()
+    scores_cpu = scores.detach().float().cpu()
+    mask_cpu = mask.detach().bool().cpu()
+    aggregates: list[tuple[str, torch.Tensor]] = [
+        ("last", x_cpu[:, -1]),
+        ("lookback_mean", x_cpu.mean(dim=1)),
+    ]
+    if int(x_cpu.size(1)) > 1:
+        aggregates.append(("lookback_delta", x_cpu[:, -1] - x_cpu[:, 0]))
+    components: list[np.ndarray] = []
+    component_meta: list[tuple[str, str]] = []
+    for source, values in aggregates:
+        components.append(values.numpy())
+        component_meta.extend((source, feature) for feature in feature_names)
+    design = np.concatenate(components, axis=-1).reshape(-1, len(component_meta))
+    target = scores_cpu.reshape(-1).numpy()
+    valid = mask_cpu.reshape(-1).numpy().astype(bool)
+    finite = valid & np.isfinite(target) & np.isfinite(design).all(axis=1)
+    design = design[finite]
+    target = target[finite]
+    if design.shape[0] < max(20, 2 * design.shape[1]):
+        message = "SHAP skipped because there are too few valid stock-date observations for a surrogate model."
+        return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
+    max_fit_rows = min(20000, int(design.shape[0]))
+    if design.shape[0] > max_fit_rows:
+        idx = np.linspace(0, design.shape[0] - 1, max_fit_rows).round().astype(np.int64)
+        design_fit = design[idx]
+        target_fit = target[idx]
+    else:
+        design_fit = design
+        target_fit = target
+    mean = design_fit.mean(axis=0, keepdims=True)
+    std = design_fit.std(axis=0, keepdims=True)
+    std = np.where(std < 1e-8, 1.0, std)
+    design_z = (design_fit - mean) / std
+    target_std = float(np.std(target_fit))
+    if target_std < 1e-10:
+        message = "SHAP skipped because score targets are nearly constant."
+        return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
+    model = Ridge(alpha=1e-3)
+    model.fit(design_z, target_fit)
+    pred = model.predict(design_z)
+    r2 = _safe_float(r2_score(target_fit, pred))
+    sample_rows = min(5000, int(design_z.shape[0]))
+    sample_idx = np.linspace(0, design_z.shape[0] - 1, sample_rows).round().astype(np.int64)
+    sample_z = design_z[sample_idx]
+    background = design_z[np.linspace(0, design_z.shape[0] - 1, min(1024, int(design_z.shape[0]))).round().astype(np.int64)]
+    method = "linear_surrogate_closed_form"
+    try:
+        import shap
+
+        explainer = shap.LinearExplainer(model, background)
+        values = explainer(sample_z)
+        shap_values = np.asarray(getattr(values, "values", values), dtype=np.float64)
+        method = "shap_linear_explainer"
+    except Exception as exc:
+        warnings.append(f"SHAP LinearExplainer fallback used: {type(exc).__name__}: {exc}")
+        shap_values = (sample_z - background.mean(axis=0, keepdims=True)) * np.asarray(model.coef_, dtype=np.float64)
+    component_rows: list[dict[str, Any]] = []
+    abs_values = np.nan_to_num(np.abs(shap_values), nan=0.0, posinf=0.0, neginf=0.0).mean(axis=0)
+    for idx, (source, feature) in enumerate(component_meta):
+        component_rows.append(
+            {
+                "source": source,
+                "feature": feature,
+                "feature_group": _feature_group(feature),
+                "feature_label": _feature_label(feature),
+                "shap_abs": float(abs_values[idx]),
+                "surrogate_coef": float(np.asarray(model.coef_).reshape(-1)[idx]),
+            }
+        )
+    component_frame = pd.DataFrame(component_rows).sort_values("shap_abs", ascending=False)
+    summary = component_frame.groupby("feature", as_index=False)["shap_abs"].sum()
+    summary["feature_group"] = summary["feature"].map(_feature_group)
+    summary["feature_label"] = summary["feature"].map(_feature_label)
+    total = float(summary["shap_abs"].sum())
+    summary["share"] = summary["shap_abs"] / total if total > 0.0 else 0.0
+    if not component_frame.empty:
+        top_source = component_frame.sort_values("shap_abs", ascending=False).drop_duplicates("feature")
+        summary = summary.merge(top_source[["feature", "source"]].rename(columns={"source": "top_source"}), on="feature", how="left")
+    summary["surrogate_r2"] = r2
+    summary["method"] = method
+    info = {
+        "enabled": True,
+        "method": method,
+        "mode": mode,
+        "valid_rows": int(design.shape[0]),
+        "fit_rows": int(design_fit.shape[0]),
+        "sample_rows": int(sample_rows),
+        "num_components": int(design.shape[1]),
+        "surrogate_r2": r2,
+    }
+    if r2 < 0.20:
+        warnings.append(
+            f"Score-head surrogate SHAP has low R2 ({r2:.3f}); use it as a rough global diagnostic, not a faithful local explanation."
+        )
+    return summary.sort_values("shap_abs", ascending=False), component_frame, info, warnings
+
+
 def explain_batch(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
@@ -513,12 +1145,40 @@ def explain_batch(
         perturb_ft = pd.DataFrame()
         perturb_feature = pd.DataFrame()
 
+    shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap(
+        x,
+        scores,
+        mask,
+        feature_names,
+        enabled=bool(settings.shap_enabled),
+        mode=str(settings.shap_mode),
+    )
+
     corr = _feature_correlations(x, scores, weights, mask, feature_names)
     decisions = _decision_rows(weights, scores, returns, mask, dates, symbols, settings.top_k)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
+    daily = _daily_portfolio_frame(weights, returns, mask, dates)
+    regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pd.DataFrame()
+    case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
     aux_frame, aux_dim_frames = _aux_summary(aux)
+    aux_projection_frames, aux_projection_summary, aux_projection_warnings = _aux_umap_projection_frames(
+        aux,
+        symbols=symbols,
+        dates=dates,
+        settings=settings,
+        device=device,
+    )
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
+    warnings.extend(aux_projection_warnings)
+    warnings.extend(shap_warnings)
+    trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
+    grad_top_cells = _feature_time_top_cells(grad_ft, "grad_x_input_abs")
+    ig_top_cells = _feature_time_top_cells(ig_ft, "integrated_gradients_abs")
+    perturb_top_cells = _feature_time_top_cells(perturb_ft, "weight_abs_delta")
+    attribution_lookback = 0
+    if not grad_ft.empty and "lookback_from_end" in grad_ft.columns:
+        attribution_lookback = int(pd.to_numeric(grad_ft["lookback_from_end"], errors="coerce").max() + 1)
 
     return {
         "summary": {
@@ -526,6 +1186,19 @@ def explain_batch(
             "rows": len(dates),
             "top_k": int(settings.top_k),
             "ig_steps": int(settings.ig_steps),
+            "report_style": _normalize_report_style(settings.report_style),
+            "plot_theme": _normalize_plot_theme(settings.plot_theme),
+            "interactive_plots": bool(settings.interactive_plots),
+            "shap_enabled": bool(settings.shap_enabled),
+            "shap_mode": _normalize_shap_mode(settings.shap_mode),
+            "shap_info": shap_info,
+            "case_study_top_k": int(settings.case_study_top_k),
+            "regime_analysis": bool(settings.regime_analysis),
+            "fold_stability": bool(settings.fold_stability),
+            "attribution_lookback": attribution_lookback,
+            "umap_enabled": bool(settings.umap_enabled),
+            "umap_method": "cuml_umap",
+            "aux_projection_summary": aux_projection_summary,
             "warnings": warnings,
         },
         "frames": {
@@ -537,12 +1210,22 @@ def explain_batch(
             "time_importance_integrated_gradients": ig_time,
             "feature_time_perturbation": perturb_ft,
             "feature_importance_perturbation": perturb_feature,
+            "feature_importance_shap": shap_feature,
+            "shap_components": shap_components,
+            "top_feature_time_gradient_cells": grad_top_cells,
+            "top_feature_time_integrated_gradients_cells": ig_top_cells,
+            "top_feature_time_perturbation_cells": perturb_top_cells,
             "feature_correlations": corr,
             "top_decisions": decisions,
+            "daily_portfolio": daily,
+            "regime_analysis": regime,
+            "decision_case_studies": case_studies,
+            "trust_checks": trust_checks,
             "stock_contributions": stock_contrib,
             "aux_summary": aux_frame,
         },
         "aux_dim_frames": aux_dim_frames,
+        "aux_projection_frames": aux_projection_frames,
     }
 
 
@@ -561,6 +1244,7 @@ def _write_markdown_report(
 
     warnings = summary.get("warnings", [])
     portfolio = summary.get("portfolio", {})
+    aux_projection_summary = summary.get("aux_projection_summary", [])
     lines: list[str] = []
     lines.append("# Model Explainability Report")
     lines.append("")
@@ -577,7 +1261,32 @@ def _write_markdown_report(
             "- Feature and lookback-day attribution: gradient x input and Integrated Gradients.",
             "- Perturbation sensitivity: score/weight changes when each feature-day slice is zeroed.",
             "- Auxiliary representations: branch/latent tensor norms and collapse checks.",
+            "- cuML UMAP projections: 2D maps of transformer aux tensors such as stock embeddings, latent factors, market tokens, and dynamic token deltas.",
             "- Plausibility warnings: concentration, exposure, turnover proxy, single-feature dominance, simple feature correlations.",
+        ]
+    )
+    lines.append("")
+    lines.append("## How To Read The Diagnostics")
+    lines.append("")
+    lines.extend(
+        [
+            "- `gradient x input`: fast local sensitivity around the sampled decisions; useful for spotting dominant features or single-day dependence.",
+            "- `integrated gradients`: smoother attribution from a zero baseline to the actual window; usually more stable than raw gradients but costs multiple forward/backward passes.",
+            "- `perturbation weight_abs_delta`: decision-level sensitivity after zeroing one feature-day slice; prefer this over score delta when masked scores use sentinel values.",
+            "- `feature_correlations`: simple linear checks between raw feature values and score/weight; high values can reveal price-level or liquidity shortcuts.",
+            "- `aux_summary` and `aux_dims`: tensor norm and dimension usage checks; very high zero fraction or one dominant dimension can indicate collapsed representations.",
+            "- `aux_projections`: cuML UMAP maps of high-dimensional transformer states; collapsed clouds, isolated single-token islands, or date-only bands deserve manual inspection.",
+        ]
+    )
+    lines.append("")
+    lines.append("## Backend Notes")
+    lines.append("")
+    lines.extend(
+        [
+            "- Batch artifacts are static PNG/CSV. Datashader is used for dense explainability visuals when available.",
+            "- cuML UMAP is the dimensionality-reduction method for aux projections. If CUDA/cuML is unavailable, projection tables are not fabricated.",
+            "- Plotly is best reserved for interactive dashboards. PyQtGraph is best for live training curves from scalar streams, not fold artifact generation.",
+            "- SHAP is not used by default because the current tensor portfolio model and full-market lookback windows make exact SHAP expensive; gradient/IG/perturbation stay tensor-friendly.",
         ]
     )
     lines.append("")
@@ -591,6 +1300,11 @@ def _write_markdown_report(
     for key, value in portfolio.items():
         lines.append(f"- `{key}`: {value:.6g}" if isinstance(value, float) else f"- `{key}`: {value}")
     lines.append("")
+    if aux_projection_summary:
+        lines.append("## cuML UMAP Aux Projections")
+        lines.append("")
+        lines.append(_render_frame(pd.DataFrame(aux_projection_summary)))
+        lines.append("")
     plots = summary.get("plots_generated", [])
     if plots:
         lines.append("## Plots")
@@ -615,6 +1329,817 @@ def _write_markdown_report(
         lines.append(_render_frame(frame))
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _setup_paper_plotting() -> tuple[Any, Any]:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(
+        context="paper",
+        style="whitegrid",
+        rc={
+            "figure.facecolor": PAPER_TOKENS["surface"],
+            "axes.facecolor": PAPER_TOKENS["panel"],
+            "axes.edgecolor": PAPER_TOKENS["axis"],
+            "axes.labelcolor": PAPER_TOKENS["ink"],
+            "xtick.color": PAPER_TOKENS["muted"],
+            "ytick.color": PAPER_TOKENS["muted"],
+            "grid.color": PAPER_TOKENS["grid"],
+            "grid.linestyle": "-",
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Aptos", "Inter", "Segoe UI", "DejaVu Sans", "Arial"],
+            "savefig.facecolor": PAPER_TOKENS["surface"],
+            "savefig.bbox": "tight",
+        },
+    )
+    return plt, sns
+
+
+def _add_paper_header(fig: Any, ax: Any, title: str, subtitle: str) -> None:
+    import textwrap
+
+    ax.set_title("")
+    title_wrapped = textwrap.fill(str(title).strip(), width=88, break_long_words=False)
+    subtitle_wrapped = textwrap.fill(str(subtitle).strip(), width=124, break_long_words=False)
+    title_lines = title_wrapped.count("\n") + 1
+    subtitle_lines = subtitle_wrapped.count("\n") + 1
+    fig.subplots_adjust(top=max(0.58, 0.84 - 0.035 * max(0, title_lines - 1) - 0.025 * max(0, subtitle_lines - 1)))
+    left = ax.get_position().x0
+    fig.text(left, 0.975, title_wrapped, ha="left", va="top", fontsize=15, fontweight="bold", color=PAPER_TOKENS["ink"])
+    fig.text(left, 0.925, subtitle_wrapped, ha="left", va="top", fontsize=10.5, color=PAPER_TOKENS["muted"])
+
+
+def _finish_paper_axes(ax: Any) -> None:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color(PAPER_TOKENS["axis"])
+    ax.spines["bottom"].set_color(PAPER_TOKENS["axis"])
+    ax.tick_params(axis="both", labelsize=9)
+
+
+def _format_share(value: Any) -> str:
+    return f"{100.0 * _safe_float(value):.1f}%"
+
+
+def _paper_scope(metadata: dict[str, Any], summary: dict[str, Any]) -> str:
+    parts = []
+    for key in ("fold_id", "split", "date_start", "date_end"):
+        value = metadata.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+    rows = summary.get("rows")
+    if rows is not None:
+        parts.append(f"sample_rows={rows}")
+    return "; ".join(parts)
+
+
+def _global_attribution_table(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    tables: list[pd.DataFrame] = []
+
+    def add(frame_name: str, value_col: str, share_col: str, prefix: str) -> None:
+        frame = frames.get(frame_name, pd.DataFrame())
+        if frame.empty or "feature" not in frame.columns or value_col not in frame.columns:
+            return
+        cols = ["feature", value_col]
+        if "share" in frame.columns:
+            cols.append("share")
+        if "weight_delta_share" in frame.columns:
+            cols.append("weight_delta_share")
+        data = frame[cols].copy()
+        data = data.rename(columns={value_col: f"{prefix}_value"})
+        if "share" in data.columns:
+            data = data.rename(columns={"share": f"{prefix}_share"})
+        if "weight_delta_share" in data.columns:
+            data = data.rename(columns={"weight_delta_share": f"{prefix}_share"})
+        if f"{prefix}_share" not in data.columns:
+            total = float(pd.to_numeric(data[f"{prefix}_value"], errors="coerce").fillna(0.0).sum())
+            data[f"{prefix}_share"] = data[f"{prefix}_value"] / total if total > 0.0 else 0.0
+        tables.append(data)
+
+    add("feature_importance_gradient", "grad_x_input_abs", "share", "gradient")
+    add("feature_importance_integrated_gradients", "integrated_gradients_abs", "share", "integrated_gradients")
+    add("feature_importance_perturbation", "weight_abs_delta", "weight_delta_share", "perturbation_weight")
+    add("feature_importance_shap", "shap_abs", "share", "shap")
+    if not tables:
+        return pd.DataFrame()
+    out = tables[0]
+    for table in tables[1:]:
+        out = out.merge(table, on="feature", how="outer")
+    out["feature_group"] = out["feature"].map(_feature_group)
+    out["feature_label"] = out["feature"].map(_feature_label)
+    share_cols = [col for col in out.columns if col.endswith("_share")]
+    out[share_cols] = out[share_cols].fillna(0.0)
+    out["mean_available_share"] = out[share_cols].mean(axis=1) if share_cols else 0.0
+    return out.sort_values("mean_available_share", ascending=False)
+
+
+def _write_paper_tables(
+    output_dir: Path,
+    *,
+    frames: dict[str, pd.DataFrame],
+    summary: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, str]:
+    table_dir = output_dir / "paper_tables"
+    table_dir.mkdir(parents=True, exist_ok=True)
+    tables: dict[str, pd.DataFrame] = {}
+    tables["global_feature_attribution"] = _global_attribution_table(frames)
+    top_cell_frames: list[pd.DataFrame] = []
+    for name, method in (
+        ("top_feature_time_gradient_cells", "gradient_x_input"),
+        ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
+        ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
+    ):
+        frame = frames.get(name, pd.DataFrame())
+        if frame is not None and not frame.empty:
+            chunk = frame.copy()
+            chunk.insert(0, "method", method)
+            top_cell_frames.append(chunk)
+    tables["feature_time_top_cells"] = pd.concat(top_cell_frames, ignore_index=True) if top_cell_frames else pd.DataFrame()
+    for name in (
+        "daily_portfolio",
+        "regime_analysis",
+        "decision_case_studies",
+        "trust_checks",
+        "feature_correlations",
+        "feature_importance_shap",
+        "shap_components",
+        "aux_summary",
+    ):
+        tables[name] = frames.get(name, pd.DataFrame())
+    lookback_expected = metadata.get("config_lookback")
+    lookback_observed = summary.get("attribution_lookback")
+    tables["lookback_consistency"] = pd.DataFrame(
+        [
+            {
+                "config_lookback": lookback_expected,
+                "attribution_lookback": lookback_observed,
+                "status": "match"
+                if lookback_expected is None or int(lookback_expected) == int(lookback_observed or 0)
+                else "warn",
+                "interpretation": "Attribution days should match the configured lookback; mismatch means the artifact is not lookback-complete or came from an older run.",
+            }
+        ]
+    )
+    written: dict[str, str] = {}
+    for name, table in tables.items():
+        if table is None or table.empty:
+            continue
+        path = table_dir / f"{name}.csv"
+        table.to_csv(path, index=False)
+        written[name] = str(path.relative_to(output_dir))
+    return written
+
+
+def _plot_paper_global_attribution(table: pd.DataFrame, output_path: Path, *, subtitle: str) -> None:
+    if table.empty:
+        return
+    share_cols = [
+        ("gradient_share", "Grad x input"),
+        ("integrated_gradients_share", "Integrated gradients"),
+        ("perturbation_weight_share", "Perturbation"),
+        ("shap_share", "Surrogate SHAP"),
+    ]
+    available = [(col, label) for col, label in share_cols if col in table.columns]
+    if not available:
+        return
+    data = table.head(14).copy()
+    melted = []
+    for col, label in available:
+        chunk = data[["feature_label", col]].copy()
+        chunk["method"] = label
+        chunk = chunk.rename(columns={col: "share"})
+        melted.append(chunk)
+    plot_data = pd.concat(melted, ignore_index=True)
+    plt, sns = _setup_paper_plotting()
+    fig_height = max(5.2, 0.42 * data["feature_label"].nunique() + 2.1)
+    fig, ax = plt.subplots(figsize=(12.5, fig_height), dpi=160)
+    palette = {
+        "Grad x input": PAPER_TOKENS["blue_mid"],
+        "Integrated gradients": PAPER_TOKENS["gold_mid"],
+        "Perturbation": PAPER_TOKENS["orange_mid"],
+        "Surrogate SHAP": PAPER_TOKENS["olive_mid"],
+    }
+    order = data["feature_label"].tolist()[::-1]
+    sns.barplot(
+        data=plot_data,
+        y="feature_label",
+        x="share",
+        hue="method",
+        order=order,
+        palette={key: palette[key] for key in plot_data["method"].unique()},
+        ax=ax,
+    )
+    ax.set_xlabel("Attribution share")
+    ax.set_ylabel("")
+    ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
+    ax.grid(True, axis="x", color=PAPER_TOKENS["grid"], linewidth=0.8)
+    ax.legend(loc="lower right", frameon=True, fontsize=8)
+    _add_paper_header(
+        fig,
+        ax,
+        "Global feature attribution agrees on the dominant decision signals",
+        subtitle,
+    )
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_feature_time_heatmap(
+    frame: pd.DataFrame,
+    *,
+    output_path: Path,
+    value_col: str,
+    title: str,
+    subtitle: str,
+    top_features: int = 24,
+) -> None:
+    required = {"feature", "lookback_from_end", value_col}
+    if frame.empty or not required.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
+    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
+    data = data.dropna(subset=[value_col, "lookback_from_end"])
+    if data.empty:
+        return
+    top = data.groupby("feature")[value_col].sum().sort_values(ascending=False).head(top_features).index
+    data = data[data["feature"].isin(top)].copy()
+    data["feature_label"] = data["feature"].map(_feature_label)
+    pivot = data.pivot_table(
+        index="feature_label",
+        columns="lookback_from_end",
+        values=value_col,
+        aggfunc="sum",
+        fill_value=0.0,
+    )
+    ordered_labels = [_feature_label(feature) for feature in top if _feature_label(feature) in pivot.index]
+    pivot = pivot.loc[ordered_labels]
+    pivot = pivot.reindex(columns=sorted(pivot.columns))
+    if pivot.empty:
+        return
+    plt, sns = _setup_paper_plotting()
+    from matplotlib.colors import LinearSegmentedColormap
+
+    fig_height = max(5.0, 0.38 * len(pivot) + 2.0)
+    fig, ax = plt.subplots(figsize=(12.2, fig_height), dpi=170)
+    cmap = LinearSegmentedColormap.from_list(
+        "paper_blue_gold",
+        [PAPER_TOKENS["blue_xlight"], PAPER_TOKENS["blue_base"], PAPER_TOKENS["blue_dark"], PAPER_TOKENS["gold_mid"]],
+    )
+    vmax = float(np.nanpercentile(pivot.to_numpy(dtype=np.float64), 98))
+    if vmax <= 0.0:
+        vmax = None
+    sns.heatmap(
+        pivot,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=vmax,
+        linewidths=0.7,
+        linecolor=PAPER_TOKENS["panel"],
+        cbar_kws={"label": value_col},
+        ax=ax,
+    )
+    ax.set_xlabel("Lookback day (t-0 = latest day before decision)")
+    ax.set_ylabel("")
+    ax.set_xticklabels([_lookback_label(label.get_text()) for label in ax.get_xticklabels()], rotation=0)
+    ax.tick_params(axis="y", labelsize=8)
+    _add_paper_header(fig, ax, title, subtitle)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_time_importance(frame: pd.DataFrame, *, output_path: Path, value_col: str, subtitle: str) -> None:
+    if frame.empty or not {"lookback_from_end", value_col}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
+    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
+    data = data.dropna(subset=[value_col, "lookback_from_end"]).sort_values("lookback_from_end")
+    if data.empty:
+        return
+    plt, sns = _setup_paper_plotting()
+    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=160)
+    sns.barplot(data=data, x="lookback_from_end", y="share" if "share" in data.columns else value_col, color=PAPER_TOKENS["blue_mid"], ax=ax)
+    ax.set_xlabel("Lookback day (t-0 = latest)")
+    ax.set_ylabel("Attribution share" if "share" in data.columns else value_col)
+    ax.set_xticks(np.arange(len(data)))
+    ax.set_xticklabels([_lookback_label(value) for value in data["lookback_from_end"].tolist()])
+    if "share" in data.columns:
+        ax.yaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
+        for patch, value in zip(ax.patches, data["share"].to_numpy(dtype=np.float64), strict=False):
+            ax.text(patch.get_x() + patch.get_width() / 2.0, patch.get_height(), _format_share(value), ha="center", va="bottom", fontsize=8, color=PAPER_TOKENS["ink"])
+    _add_paper_header(fig, ax, "Temporal attribution across the lookback window", subtitle)
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_feature_correlations(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+    if frame.empty or not {"feature", "source", "score_corr", "weight_corr"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["max_abs_corr"] = pd.to_numeric(data[["score_corr", "weight_corr"]].abs().max(axis=1), errors="coerce")
+    data = data.dropna(subset=["max_abs_corr"]).sort_values("max_abs_corr", ascending=False).head(18)
+    if data.empty:
+        return
+    data["label"] = data["source"].astype(str) + " / " + data["feature"].astype(str)
+    plot = data.melt(id_vars=["label"], value_vars=["score_corr", "weight_corr"], var_name="target", value_name="corr")
+    plt, sns = _setup_paper_plotting()
+    fig_height = max(5.2, 0.36 * data.shape[0] + 2.0)
+    fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+    sns.barplot(
+        data=plot,
+        y="label",
+        x="corr",
+        hue="target",
+        order=data["label"].tolist()[::-1],
+        palette={"score_corr": PAPER_TOKENS["blue_mid"], "weight_corr": PAPER_TOKENS["pink_mid"]},
+        ax=ax,
+    )
+    ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
+    ax.set_xlabel("Correlation")
+    ax.set_ylabel("")
+    ax.legend(loc="lower right", frameon=True, fontsize=8)
+    _add_paper_header(fig, ax, "Simple feature correlations test for shortcut rules", subtitle)
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_trust_checks(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+    if frame.empty or not {"check", "value", "status"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["value"] = pd.to_numeric(data["value"], errors="coerce")
+    data = data.dropna(subset=["value"])
+    if data.empty:
+        return
+    plt, sns = _setup_paper_plotting()
+    fig_height = max(4.8, 0.48 * len(data) + 2.0)
+    fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+    palette = {"pass": PAPER_TOKENS["blue_mid"], "warn": PAPER_TOKENS["orange_mid"]}
+    sns.barplot(data=data, y="check", x="value", hue="status", dodge=False, palette=palette, ax=ax)
+    for row_idx, row in data.reset_index(drop=True).iterrows():
+        ax.text(float(row["value"]), row_idx, f"  {row['rule']}", va="center", ha="left", fontsize=8, color=PAPER_TOKENS["muted"])
+    ax.set_xlabel("Measured value")
+    ax.set_ylabel("")
+    ax.legend(loc="lower right", frameon=True, fontsize=8)
+    _add_paper_header(fig, ax, "Strategy trust checks highlight concentration, masking, and shortcut risks", subtitle)
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_regime(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+    if frame.empty or not {"dimension", "regime", "mean_strategy_log_return"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["mean_strategy_log_return"] = pd.to_numeric(data["mean_strategy_log_return"], errors="coerce")
+    data = data.dropna(subset=["mean_strategy_log_return"])
+    if data.empty:
+        return
+    data["label"] = data["dimension"].astype(str) + " / " + data["regime"].astype(str)
+    plt, sns = _setup_paper_plotting()
+    fig_height = max(4.8, 0.42 * len(data) + 2.0)
+    fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in data["mean_strategy_log_return"]]
+    sns.barplot(data=data, y="label", x="mean_strategy_log_return", palette=colors, hue="label", legend=False, ax=ax)
+    ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
+    ax.set_xlabel("Mean strategy log return")
+    ax.set_ylabel("")
+    _add_paper_header(fig, ax, "Performance by market regime checks whether the rule survives different states", subtitle)
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_case_studies(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+    if frame.empty or not {"case_type", "symbol", "gross_contribution"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["gross_contribution"] = pd.to_numeric(data["gross_contribution"], errors="coerce")
+    data = data.dropna(subset=["gross_contribution"])
+    if data.empty:
+        return
+    data["label"] = data["case_type"].astype(str) + " / " + data["symbol"].astype(str)
+    data = data.sort_values("gross_contribution")
+    plt, sns = _setup_paper_plotting()
+    fig_height = max(5.2, 0.28 * len(data) + 2.0)
+    fig, ax = plt.subplots(figsize=(12, fig_height), dpi=160)
+    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in data["gross_contribution"]]
+    sns.barplot(data=data, y="label", x="gross_contribution", palette=colors, hue="label", legend=False, ax=ax)
+    ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
+    ax.set_xlabel("Weight × future log return")
+    ax.set_ylabel("")
+    _add_paper_header(fig, ax, "Case-study trades show which names drove wins and losses", subtitle)
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_paper_aux_summary(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+    if frame.empty or not {"name", "mean_abs"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["mean_abs"] = pd.to_numeric(data["mean_abs"], errors="coerce")
+    data = data.dropna(subset=["mean_abs"]).sort_values("mean_abs", ascending=False).head(24)
+    if data.empty:
+        return
+    plt, sns = _setup_paper_plotting()
+    fig_height = max(4.8, 0.36 * len(data) + 2.0)
+    fig, ax = plt.subplots(figsize=(11, fig_height), dpi=160)
+    sns.barplot(data=data, y="name", x="mean_abs", color=PAPER_TOKENS["olive_mid"], ax=ax)
+    ax.set_xlabel("Mean absolute activation")
+    ax.set_ylabel("")
+    _add_paper_header(fig, ax, "Latent and market-token diagnostics check whether representations collapse", subtitle)
+    _finish_paper_axes(ax)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_all_paper_figures(
+    output_dir: Path,
+    *,
+    frames: dict[str, pd.DataFrame],
+    summary: dict[str, Any],
+    metadata: dict[str, Any],
+    paper_tables: dict[str, str],
+) -> list[str]:
+    plot_dir = output_dir / "plots_paper"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    generated: list[Path] = []
+    scope = _paper_scope(metadata, summary)
+    global_table = _global_attribution_table(frames)
+    out = plot_dir / "global_feature_attribution.png"
+    _plot_paper_global_attribution(global_table, out, subtitle=f"Share of total attribution by method; {scope}")
+    if out.exists():
+        generated.append(out)
+    heatmap_specs = [
+        (
+            "feature_time_gradient",
+            "grad_x_input_abs",
+            "Feature-time heatmap shows where local gradient sensitivity concentrates",
+            "Mean absolute gradient × input across selected top-weight decisions; t-0 is the latest input day.",
+        ),
+        (
+            "feature_time_integrated_gradients",
+            "integrated_gradients_abs",
+            "Integrated gradients test whether the same feature-days matter along the input path",
+            "Mean absolute integrated gradients from zero baseline; brighter cells indicate stronger contribution.",
+        ),
+        (
+            "feature_time_perturbation",
+            "weight_abs_delta",
+            "Perturbation heatmap shows which feature-days move portfolio weights",
+            "Mean absolute weight change after zeroing one feature-day slice; preferred over raw score deltas.",
+        ),
+    ]
+    for frame_name, value_col, title, subtitle in heatmap_specs:
+        out = plot_dir / f"{frame_name}_{value_col}_heatmap.png"
+        _plot_paper_feature_time_heatmap(
+            frames.get(frame_name, pd.DataFrame()),
+            output_path=out,
+            value_col=value_col,
+            title=title,
+            subtitle=f"{subtitle} {scope}",
+        )
+        if out.exists():
+            generated.append(out)
+    out = plot_dir / "time_importance_gradient.png"
+    _plot_paper_time_importance(
+        frames.get("time_importance_gradient", pd.DataFrame()),
+        output_path=out,
+        value_col="grad_x_input_abs",
+        subtitle=f"Share of gradient × input by lookback day; {scope}",
+    )
+    if out.exists():
+        generated.append(out)
+    out = plot_dir / "feature_correlations_shortcut_checks.png"
+    _plot_paper_feature_correlations(frames.get("feature_correlations", pd.DataFrame()), output_path=out, subtitle=scope)
+    if out.exists():
+        generated.append(out)
+    out = plot_dir / "trust_checks.png"
+    _plot_paper_trust_checks(frames.get("trust_checks", pd.DataFrame()), output_path=out, subtitle=scope)
+    if out.exists():
+        generated.append(out)
+    out = plot_dir / "regime_analysis.png"
+    _plot_paper_regime(frames.get("regime_analysis", pd.DataFrame()), output_path=out, subtitle=scope)
+    if out.exists():
+        generated.append(out)
+    out = plot_dir / "decision_case_studies.png"
+    _plot_paper_case_studies(frames.get("decision_case_studies", pd.DataFrame()), output_path=out, subtitle=scope)
+    if out.exists():
+        generated.append(out)
+    out = plot_dir / "aux_token_diagnostics.png"
+    _plot_paper_aux_summary(frames.get("aux_summary", pd.DataFrame()), output_path=out, subtitle=scope)
+    if out.exists():
+        generated.append(out)
+    return [str(path.relative_to(output_dir)) for path in generated]
+
+
+PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
+    "global_feature_attribution.png": (
+        "Compares global feature importance across gradient x input, Integrated Gradients, perturbation, and surrogate SHAP.",
+        "Features that stay near the top across methods are more credible than features that appear in only one diagnostic.",
+        "One feature taking more than half of total attribution, or SHAP disagreeing completely with perturbation, suggests a narrow or unstable rule.",
+    ),
+    "feature_time_gradient_grad_x_input_abs_heatmap.png": (
+        "Measures local sensitivity by feature and lookback day for the selected top-weight decisions.",
+        "Read rows as feature families and columns as days before the decision; brighter cells mean stronger local influence.",
+        "A blank-looking chart, one isolated column, or one isolated feature row means the model may be ignoring most of the lookback window.",
+    ),
+    "feature_time_integrated_gradients_integrated_gradients_abs_heatmap.png": (
+        "Measures path-integrated attribution from a zero baseline to the actual input window.",
+        "Use it as a smoother confirmation of the gradient heatmap; repeated bright regions across both charts are more trustworthy.",
+        "Large disagreement with gradient and perturbation means the explanation is locally unstable.",
+    ),
+    "feature_time_perturbation_weight_abs_delta_heatmap.png": (
+        "Measures how much portfolio weights change when a feature-day slice is zeroed.",
+        "This is closest to trading behavior because it observes the final position change, not only score movement.",
+        "Huge score deltas with tiny weight deltas, or sensitivity only to raw liquidity/price-like fields, is suspicious.",
+    ),
+    "time_importance_gradient.png": (
+        "Aggregates attribution by lookback day.",
+        "A healthy temporal model should use a pattern over several days unless the strategy is intentionally one-day reactive.",
+        "A single day dominating the whole bar chart suggests the model is effectively temporal-only at one lag.",
+    ),
+    "feature_correlations_shortcut_checks.png": (
+        "Checks simple linear correlation between raw feature values and model scores/weights.",
+        "High absolute correlations are not proof of leakage, but they are a fast shortcut detector.",
+        "Very high correlation with raw price level, raw volume, or liquidity proxies means the model may not generalize cross-sectionally.",
+    ),
+    "trust_checks.png": (
+        "Summarizes concentration, turnover, mask leakage, attribution dominance, and aux collapse checks.",
+        "Blue/pass is acceptable by rule of thumb; orange/warn deserves manual inspection before trusting the strategy.",
+        "Warnings in mask leakage, concentration, or turnover can invalidate backtest conclusions even if returns look good.",
+    ),
+    "regime_analysis.png": (
+        "Splits sampled decisions by market direction and volatility regime.",
+        "The strategy is more credible if the rule has understandable behavior in up/down and high/low volatility states.",
+        "Performance that only appears in one tiny regime bucket may be overfit.",
+    ),
+    "decision_case_studies.png": (
+        "Shows which symbols drove selected best/worst/high-turnover days.",
+        "Use it to inspect whether winning and losing trades match the claimed signal logic.",
+        "Repeated losses from similar names or very concentrated single-name contributions suggest unstable decision rules.",
+    ),
+    "aux_token_diagnostics.png": (
+        "Checks activation magnitude for latent factors, market tokens, and transformer auxiliary tensors.",
+        "Non-zero, non-dominant representations suggest tokens are being used rather than collapsed.",
+        "Near-zero or single-dimension dominance suggests latent/market tokens are not absorbing meaningful market regime information.",
+    ),
+}
+
+
+def _render_frame_markdown(frame: pd.DataFrame, limit: int = 20) -> str:
+    if frame is None or frame.empty:
+        return "_No rows._"
+    try:
+        return frame.head(limit).to_markdown(index=False)
+    except ImportError:
+        return "```text\n" + frame.head(limit).to_string(index=False) + "\n```"
+
+
+def _paper_executive_summary(
+    *,
+    frames: dict[str, pd.DataFrame],
+    summary: dict[str, Any],
+    metadata: dict[str, Any],
+) -> list[str]:
+    lines: list[str] = []
+    portfolio = summary.get("portfolio", {})
+    global_table = _global_attribution_table(frames)
+    if not global_table.empty:
+        top = global_table.iloc[0]
+        lines.append(
+            f"- The strongest global signal is `{top['feature']}` ({top['feature_group']}); "
+            f"mean available attribution share is {_format_share(top.get('mean_available_share', 0.0))}."
+        )
+    shap = frames.get("feature_importance_shap", pd.DataFrame())
+    if shap is not None and not shap.empty:
+        row = shap.iloc[0]
+        r2 = _safe_float(row.get("surrogate_r2", summary.get("shap_info", {}).get("surrogate_r2", 0.0)))
+        lines.append(
+            f"- Score-head surrogate SHAP top feature is `{row['feature']}` with surrogate R2={r2:.3f}; "
+            "treat it as global evidence, not exact full-Transformer SHAP."
+        )
+    else:
+        shap_info = summary.get("shap_info", {})
+        lines.append(f"- Surrogate SHAP was not produced: `{shap_info.get('error', shap_info.get('method', 'skipped'))}`.")
+    if portfolio:
+        lines.append(
+            "- Portfolio behavior: "
+            f"gross={_safe_float(portfolio.get('mean_gross')):.3f}, "
+            f"abs net={_safe_float(portfolio.get('mean_abs_net')):.3f}, "
+            f"turnover proxy={_safe_float(portfolio.get('mean_turnover_proxy')):.3f}, "
+            f"max single-name weight={_safe_float(portfolio.get('max_abs_weight_max')):.3f}."
+        )
+    config_lookback = metadata.get("config_lookback")
+    attribution_lookback = summary.get("attribution_lookback")
+    if config_lookback is not None and attribution_lookback is not None and int(config_lookback) != int(attribution_lookback):
+        lines.append(
+            f"- Lookback warning: config lookback is {config_lookback}, but this artifact only contains "
+            f"{attribution_lookback} attribution days. Do not cite it as a complete lookback-{config_lookback} explanation."
+        )
+    warnings = summary.get("warnings", [])
+    if warnings:
+        lines.append(f"- Main warning: {warnings[0]}")
+    if not lines:
+        lines.append("- No explainability rows were available; inspect data loading and model output hooks.")
+    return lines
+
+
+def _write_paper_report(
+    path: Path,
+    *,
+    metadata: dict[str, Any],
+    summary: dict[str, Any],
+    frames: dict[str, pd.DataFrame],
+    paper_tables: dict[str, str],
+    paper_plots: list[str],
+) -> None:
+    lines: list[str] = []
+    lines.append("# Paper-Grade Model Explainability Report")
+    lines.append("")
+    lines.append("## Executive Summary")
+    lines.append("")
+    lines.extend(_paper_executive_summary(frames=frames, summary=summary, metadata=metadata))
+    lines.append("")
+    lines.append("## Scope")
+    lines.append("")
+    for key, value in metadata.items():
+        lines.append(f"- **{key}**: `{value}`")
+    lines.append(f"- **attribution_lookback**: `{summary.get('attribution_lookback')}`")
+    lines.append(f"- **shap_method**: `{summary.get('shap_info', {}).get('method', 'unknown')}`")
+    lines.append("")
+    lines.append("## Figure Reading Guide")
+    lines.append("")
+    for plot in paper_plots:
+        name = Path(plot).name
+        guide = PAPER_FIGURE_GUIDE.get(name)
+        if guide is None:
+            continue
+        lines.append(f"### {name}")
+        lines.append("")
+        lines.append(f"- **What it measures**: {guide[0]}")
+        lines.append(f"- **How to read it**: {guide[1]}")
+        lines.append(f"- **What would be suspicious**: {guide[2]}")
+        lines.append("")
+    lines.append("## Trust And Sanity Checks")
+    lines.append("")
+    lines.append(_render_frame_markdown(frames.get("trust_checks", pd.DataFrame()), limit=30))
+    lines.append("")
+    lines.append("## Global Attribution Table")
+    lines.append("")
+    lines.append(_render_frame_markdown(_global_attribution_table(frames), limit=20))
+    lines.append("")
+    lines.append("## Top Feature-Time Cells")
+    lines.append("")
+    feature_time_tables = []
+    for key, method in (
+        ("top_feature_time_gradient_cells", "gradient_x_input"),
+        ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
+        ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
+    ):
+        frame = frames.get(key, pd.DataFrame())
+        if frame is not None and not frame.empty:
+            chunk = frame.copy()
+            chunk.insert(0, "method", method)
+            feature_time_tables.append(chunk)
+    lines.append(_render_frame_markdown(pd.concat(feature_time_tables, ignore_index=True) if feature_time_tables else pd.DataFrame(), limit=30))
+    lines.append("")
+    lines.append("## Regime Analysis")
+    lines.append("")
+    lines.append(_render_frame_markdown(frames.get("regime_analysis", pd.DataFrame()), limit=30))
+    lines.append("")
+    lines.append("## Decision Case Studies")
+    lines.append("")
+    lines.append(_render_frame_markdown(frames.get("decision_case_studies", pd.DataFrame()), limit=30))
+    lines.append("")
+    lines.append("## Output Files")
+    lines.append("")
+    lines.append("### Paper Plots")
+    lines.extend(f"- `{plot}`" for plot in paper_plots)
+    lines.append("")
+    lines.append("### Paper Tables")
+    lines.extend(f"- `{path}`" for path in paper_tables.values())
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_paper_summary(
+    path: Path,
+    *,
+    metadata: dict[str, Any],
+    summary: dict[str, Any],
+    paper_tables: dict[str, str],
+    paper_plots: list[str],
+) -> None:
+    payload = {
+        "metadata": _to_builtin(metadata),
+        "paper_tables": paper_tables,
+        "paper_plots": paper_plots,
+        "attribution_lookback": summary.get("attribution_lookback"),
+        "shap_info": summary.get("shap_info", {}),
+        "warnings": summary.get("warnings", []),
+    }
+    path.write_text(json.dumps(_to_builtin(payload), indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
+    root = Path(explainability_root)
+    fold_dirs = sorted(path for path in root.glob("fold_*_test") if path.is_dir())
+    rows: list[pd.DataFrame] = []
+    for fold_dir in fold_dirs:
+        path = fold_dir / "paper_tables" / "global_feature_attribution.csv"
+        if not path.exists():
+            fallback = fold_dir / "feature_importance_gradient.csv"
+            if not fallback.exists():
+                continue
+            table = pd.read_csv(fallback)
+            if "share" not in table.columns:
+                continue
+            table = table.rename(columns={"share": "gradient_share"})
+            table["mean_available_share"] = table["gradient_share"]
+            table["feature_group"] = table["feature"].map(_feature_group)
+            table["feature_label"] = table["feature"].map(_feature_label)
+        else:
+            table = pd.read_csv(path)
+        if table.empty or "feature" not in table.columns:
+            continue
+        fold_id = fold_dir.name.removeprefix("fold_").removesuffix("_test")
+        table = table.copy()
+        table["fold_id"] = int(fold_id)
+        table["rank"] = table["mean_available_share"].rank(ascending=False, method="min") if "mean_available_share" in table.columns else table.index + 1
+        rows.append(table)
+    if not rows:
+        return None
+    combined = pd.concat(rows, ignore_index=True)
+    summary = (
+        combined.groupby("feature", as_index=False)
+        .agg(
+            folds_present=("fold_id", "nunique"),
+            mean_rank=("rank", "mean"),
+            std_rank=("rank", "std"),
+            mean_share=("mean_available_share", "mean"),
+            std_share=("mean_available_share", "std"),
+        )
+        .sort_values(["mean_rank", "mean_share"], ascending=[True, False])
+    )
+    summary["feature_group"] = summary["feature"].map(_feature_group)
+    summary["feature_label"] = summary["feature"].map(_feature_label)
+    output_dir = root / "paper_fold_stability"
+    table_dir = output_dir / "paper_tables"
+    plot_dir = output_dir / "plots_paper"
+    table_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(table_dir / "fold_feature_attribution_long.csv", index=False)
+    summary.to_csv(table_dir / "fold_feature_stability.csv", index=False)
+    plt, sns = _setup_paper_plotting()
+    data = summary.head(20).copy()
+    if not data.empty:
+        fig_height = max(5.0, 0.36 * len(data) + 2.0)
+        fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+        sns.barplot(data=data, y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
+        ax.set_xlabel("Mean attribution share across folds")
+        ax.set_ylabel("")
+        ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
+        _add_paper_header(
+            fig,
+            ax,
+            "Fold stability shows whether the same features remain important",
+            f"Computed across {combined['fold_id'].nunique()} fold explainability outputs.",
+        )
+        _finish_paper_axes(ax)
+        fig.savefig(plot_dir / "fold_stability_feature_share.png")
+        plt.close(fig)
+    report = [
+        "# Paper Fold Stability Summary",
+        "",
+        f"- folds: `{combined['fold_id'].nunique()}`",
+        f"- features: `{summary['feature'].nunique()}`",
+        "",
+        "## Most Stable Features",
+        "",
+        _render_frame_markdown(summary, limit=30),
+        "",
+    ]
+    (output_dir / "paper_fold_stability_report.md").write_text("\n".join(report), encoding="utf-8")
+    return output_dir
 
 
 def _safe_plot_filename(name: str) -> str:
@@ -738,6 +2263,54 @@ def _plot_feature_time_heatmap(
     plt.close(fig)
 
 
+def _plot_feature_time_heatmap_datashader(
+    frame: pd.DataFrame,
+    *,
+    output_path: Path,
+    value_col: str,
+    title: str,
+    top_features: int = 40,
+) -> None:
+    required = {"feature", "lookback_from_end", value_col}
+    if frame.empty or not required.issubset(frame.columns):
+        return
+    data = frame[list(required)].dropna().copy()
+    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
+    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
+    data = data.dropna()
+    if data.empty:
+        return
+    top = (
+        data.groupby("feature")[value_col]
+        .sum()
+        .sort_values(ascending=False)
+        .head(top_features)
+        .index.astype(str)
+        .tolist()
+    )
+    if not top:
+        return
+    data["feature"] = data["feature"].astype(str)
+    data = data[data["feature"].isin(top)].copy()
+    feature_to_y = {feature: len(top) - 1 - idx for idx, feature in enumerate(top)}
+    data["feature_y"] = data["feature"].map(feature_to_y)
+    data = data.dropna(subset=["feature_y"])
+    if data.empty:
+        return
+    save_heatmap_points_datashader(
+        data["lookback_from_end"].to_numpy(dtype=np.float64),
+        data["feature_y"].to_numpy(dtype=np.float64),
+        data[value_col].to_numpy(dtype=np.float64),
+        output_path=output_path,
+        title=title,
+        x_label="lookback_from_end (0 = latest)",
+        y_label=value_col,
+        y_labels=[(feature_to_y[feature], feature) for feature in top],
+        width=1100,
+        height=max(520, min(1400, 24 * len(top) + 180)),
+    )
+
+
 def _plot_feature_correlations(frame: pd.DataFrame, output_path: Path) -> None:
     if frame.empty or "feature" not in frame.columns:
         return
@@ -799,11 +2372,95 @@ def _plot_decision_exposure(frame: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
+def _plot_decision_exposure_datashader(frame: pd.DataFrame, output_path: Path) -> None:
+    if frame.empty or not {"date", "side", "weight"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["abs_weight"] = pd.to_numeric(data["weight"], errors="coerce").abs()
+    data = data.dropna(subset=["abs_weight"])
+    pivot = data.pivot_table(index="date", columns="side", values="abs_weight", aggfunc="sum", fill_value=0.0)
+    if pivot.empty:
+        return
+    x = np.arange(len(pivot), dtype=np.float64)
+    colors = {"long": "#1f77b4", "short": "#d62728", "flat": "#7f7f7f"}
+    series = [
+        (side, x, pivot[side].to_numpy(dtype=np.float64), colors[side])
+        for side in ("long", "short", "flat")
+        if side in pivot.columns
+    ]
+    if not series:
+        return
+    save_line_series_datashader(
+        series,
+        output_path=output_path,
+        title="Top Decision Absolute Exposure By Side",
+        y_label="sum abs(weight)",
+        width=1100,
+        height=520,
+    )
+
+
+def _plot_aux_dim_datashader(frame: pd.DataFrame, *, output_path: Path, title: str) -> None:
+    if frame.empty or not {"dim", "mean_abs"}.issubset(frame.columns):
+        return
+    data = frame[["dim", "mean_abs"]].dropna().copy()
+    data["dim"] = pd.to_numeric(data["dim"], errors="coerce")
+    data["mean_abs"] = pd.to_numeric(data["mean_abs"], errors="coerce")
+    data = data.dropna().sort_values("dim")
+    if data.empty:
+        return
+    save_line_series_datashader(
+        [("mean_abs", data["dim"].to_numpy(dtype=np.float64), data["mean_abs"].to_numpy(dtype=np.float64), "#2171b5")],
+        output_path=output_path,
+        title=title,
+        y_label="mean_abs",
+        width=1000,
+        height=420,
+    )
+
+
+def _plot_aux_projection_datashader(frame: pd.DataFrame, *, output_path: Path, title: str) -> None:
+    if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
+        return
+    data = frame.copy()
+    data["umap_x"] = pd.to_numeric(data["umap_x"], errors="coerce")
+    data["umap_y"] = pd.to_numeric(data["umap_y"], errors="coerce")
+    data = data.dropna(subset=["umap_x", "umap_y"])
+    if data.empty:
+        return
+    colors = {
+        "stock": "#1f77b4",
+        "token": "#9467bd",
+        "time_stock": "#2ca02c",
+        "vector": "#ff7f0e",
+    }
+    series = []
+    if "point_type" in data.columns:
+        for point_type, group in data.groupby("point_type"):
+            color = colors.get(str(point_type), "#17becf")
+            series.append(
+                (
+                    str(point_type),
+                    group["umap_x"].to_numpy(dtype=np.float64),
+                    group["umap_y"].to_numpy(dtype=np.float64),
+                    color,
+                )
+            )
+    else:
+        series.append(("points", data["umap_x"].to_numpy(dtype=np.float64), data["umap_y"].to_numpy(dtype=np.float64), "#1f77b4"))
+    save_scatter_datashader(series, output_path=output_path, title=title, width=1100, height=760)
+
+
 def _plot_all_explanation_figures(
     frames: dict[str, pd.DataFrame],
     aux_dim_frames: dict[str, pd.DataFrame],
     output_dir: Path,
+    *,
+    aux_projection_frames: dict[str, pd.DataFrame] | None = None,
+    plot_backend: str = "auto",
 ) -> list[str]:
+    normalized_backend = _normalize_plot_backend(plot_backend)
+    use_datashader = _use_datashader_for_explainability(normalized_backend)
     try:
         import matplotlib
 
@@ -851,7 +2508,16 @@ def _plot_all_explanation_figures(
     ]
     for frame_name, value_col, title in heatmap_specs:
         out = plot_dir / f"{frame_name}_{value_col}_heatmap.png"
-        _plot_feature_time_heatmap(frames.get(frame_name, pd.DataFrame()), output_path=out, value_col=value_col, title=title)
+        frame = frames.get(frame_name, pd.DataFrame())
+        if use_datashader:
+            try:
+                _plot_feature_time_heatmap_datashader(frame, output_path=out, value_col=value_col, title=title)
+            except Exception:
+                if normalized_backend == "rapids_datashader":
+                    raise
+                _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
+        else:
+            _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
 
@@ -861,21 +2527,71 @@ def _plot_all_explanation_figures(
         generated.append(out)
 
     out = plot_dir / "top_decisions_exposure_by_side.png"
-    _plot_decision_exposure(frames.get("top_decisions", pd.DataFrame()), out)
+    decision_frame = frames.get("top_decisions", pd.DataFrame())
+    if use_datashader:
+        try:
+            _plot_decision_exposure_datashader(decision_frame, out)
+        except Exception:
+            if normalized_backend == "rapids_datashader":
+                raise
+            _plot_decision_exposure(decision_frame, out)
+    else:
+        _plot_decision_exposure(decision_frame, out)
     if out.exists():
         generated.append(out)
 
     aux_plot_dir = plot_dir / "aux_dims"
     for name, frame in aux_dim_frames.items():
         out = aux_plot_dir / f"{_safe_plot_filename(name)}.png"
-        _plot_barh(
-            frame,
-            output_path=out,
-            label_col="dim",
-            value_col="mean_abs",
-            title=f"Aux Dimension Importance: {name}",
-            top_n=32,
-        )
+        if use_datashader:
+            try:
+                _plot_aux_dim_datashader(frame, output_path=out, title=f"Aux Dimension Profile: {name}")
+            except Exception:
+                if normalized_backend == "rapids_datashader":
+                    raise
+                _plot_barh(
+                    frame,
+                    output_path=out,
+                    label_col="dim",
+                    value_col="mean_abs",
+                    title=f"Aux Dimension Importance: {name}",
+                    top_n=32,
+                )
+        else:
+            _plot_barh(
+                frame,
+                output_path=out,
+                label_col="dim",
+                value_col="mean_abs",
+                title=f"Aux Dimension Importance: {name}",
+                top_n=32,
+            )
+        if out.exists():
+            generated.append(out)
+
+    projection_plot_dir = plot_dir / "aux_umap"
+    for name, frame in (aux_projection_frames or {}).items():
+        out = projection_plot_dir / f"{_safe_plot_filename(name)}.png"
+        if use_datashader:
+            _plot_aux_projection_datashader(
+                frame,
+                output_path=out,
+                title=f"cuML UMAP Projection: {name}",
+            )
+        else:
+            if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
+                continue
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(8, 6), dpi=130)
+            ax.scatter(frame["umap_x"], frame["umap_y"], s=4, alpha=0.5)
+            ax.set_title(f"cuML UMAP Projection: {name}")
+            ax.set_xlabel("umap_x")
+            ax.set_ylabel("umap_y")
+            fig.tight_layout()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out)
+            plt.close(fig)
         if out.exists():
             generated.append(out)
 
@@ -888,11 +2604,15 @@ def write_explanation_outputs(
     *,
     metadata: dict[str, Any] | None = None,
     write_plots: bool = True,
+    plot_backend: str = "auto",
+    report_style: str | None = None,
+    plot_theme: str | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = metadata or {}
     frames: dict[str, pd.DataFrame] = result["frames"]
     aux_dim_frames: dict[str, pd.DataFrame] = result.get("aux_dim_frames", {})
+    aux_projection_frames: dict[str, pd.DataFrame] = result.get("aux_projection_frames", {})
     for name, frame in frames.items():
         if frame is not None and not frame.empty:
             frame.to_csv(output_dir / f"{name}.csv", index=False)
@@ -901,12 +2621,52 @@ def write_explanation_outputs(
         aux_dir.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
         frame.to_csv(aux_dir / f"{safe_name}.csv", index=False)
+    projection_dir = output_dir / "aux_projections"
+    for name, frame in aux_projection_frames.items():
+        if frame is not None and not frame.empty:
+            projection_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
+            frame.to_csv(projection_dir / f"{safe_name}.csv", index=False)
     plots_generated = (
-        _plot_all_explanation_figures(frames, aux_dim_frames, output_dir)
+        _plot_all_explanation_figures(
+            frames,
+            aux_dim_frames,
+            output_dir,
+            aux_projection_frames=aux_projection_frames,
+            plot_backend=plot_backend,
+        )
         if write_plots
         else []
     )
-    summary = {**result["summary"], "metadata": metadata, "plots_generated": plots_generated}
+    resolved_report_style = _normalize_report_style(report_style or result["summary"].get("report_style", "paper"))
+    resolved_plot_theme = _normalize_plot_theme(plot_theme or result["summary"].get("plot_theme", "paper"))
+    summary = {
+        **result["summary"],
+        "metadata": metadata,
+        "plot_backend": _normalize_plot_backend(plot_backend),
+        "report_style": resolved_report_style,
+        "plot_theme": resolved_plot_theme,
+        "plots_generated": plots_generated,
+    }
+    paper_tables: dict[str, str] = {}
+    paper_plots: list[str] = []
+    if resolved_report_style == "paper":
+        paper_tables = _write_paper_tables(
+            output_dir,
+            frames=frames,
+            summary=summary,
+            metadata=metadata,
+        )
+        if write_plots:
+            paper_plots = _plot_all_paper_figures(
+                output_dir,
+                frames=frames,
+                summary=summary,
+                metadata=metadata,
+                paper_tables=paper_tables,
+            )
+        summary["paper_tables"] = paper_tables
+        summary["paper_plots"] = paper_plots
     (output_dir / "summary.json").write_text(
         json.dumps(_to_builtin(summary), indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -917,6 +2677,22 @@ def write_explanation_outputs(
         summary=summary,
         frames=frames,
     )
+    if resolved_report_style == "paper":
+        _write_paper_report(
+            output_dir / "paper_explainability_report.md",
+            metadata=metadata,
+            summary=summary,
+            frames=frames,
+            paper_tables=paper_tables,
+            paper_plots=paper_plots,
+        )
+        _write_paper_summary(
+            output_dir / "paper_explainability_summary.json",
+            metadata=metadata,
+            summary=summary,
+            paper_tables=paper_tables,
+            paper_plots=paper_plots,
+        )
 
 
 def _strip_orig_mod_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -1089,6 +2865,7 @@ def run_checkpoint_explanation(
     device_override: str | None = None,
     strict: bool = False,
     write_plots: bool = True,
+    plot_backend: str | None = None,
 ) -> Path:
     context = load_explanation_context(
         config_path=config_path,
@@ -1140,11 +2917,21 @@ def run_checkpoint_explanation(
         "device": str(device),
         "sample_rows": int(len(dates)),
         "first_test_year_only": bool(settings.first_test_year_only),
+        "config_lookback": int(context.config.training.lookback),
         "date_start": dates[0] if dates else None,
         "date_end": dates[-1] if dates else None,
         **checkpoint_info,
     }
-    write_explanation_outputs(result, destination, metadata=metadata, write_plots=write_plots)
+    resolved_plot_backend = plot_backend or str(getattr(context.config.training, "plot_backend", "auto"))
+    write_explanation_outputs(
+        result,
+        destination,
+        metadata=metadata,
+        write_plots=write_plots,
+        plot_backend=resolved_plot_backend,
+        report_style=settings.report_style,
+        plot_theme=settings.plot_theme,
+    )
     return destination
 
 
@@ -1164,6 +2951,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
     parser.add_argument("--no-perturb", action="store_true", help="Skip feature perturbation sensitivity.")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")
+    parser.add_argument("--report-style", default="paper", choices=("paper", "standard", "none"))
+    parser.add_argument("--plot-theme", default="paper", choices=("paper", "standard"))
+    parser.add_argument("--no-interactive-plots", action="store_true", help="Keep explainability output static only.")
+    parser.add_argument("--no-shap", action="store_true", help="Skip score-head surrogate SHAP.")
+    parser.add_argument("--shap-mode", default="score_head_surrogate", choices=("score_head_surrogate", "off", "none"))
+    parser.add_argument("--case-study-top-k", default=5, type=int)
+    parser.add_argument("--no-regime-analysis", action="store_true", help="Skip regime-analysis tables and plots.")
+    parser.add_argument("--no-fold-stability", action="store_true", help="Skip cross-fold attribution-stability summary.")
+    parser.add_argument(
+        "--plot-backend",
+        default=None,
+        choices=("auto", "matplotlib", "rapids_datashader"),
+        help="PNG plot backend. auto uses RAPIDS Datashader for dense plots when CUDA is available.",
+    )
+    parser.add_argument("--no-umap", action="store_true", help="Skip cuML UMAP aux projections.")
+    parser.add_argument("--umap-max-points", default=10000, type=int)
+    parser.add_argument("--umap-n-neighbors", default=15, type=int)
+    parser.add_argument("--umap-min-dist", default=0.1, type=float)
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
     return parser.parse_args(argv)
 
@@ -1177,6 +2982,18 @@ def main(argv: list[str] | None = None) -> None:
         perturb=not args.no_perturb,
         sample_method=args.sample_method,
         first_test_year_only=not args.all_test_years,
+        report_style=args.report_style,
+        plot_theme=args.plot_theme,
+        interactive_plots=not args.no_interactive_plots,
+        shap_enabled=not args.no_shap,
+        shap_mode=args.shap_mode,
+        case_study_top_k=args.case_study_top_k,
+        regime_analysis=not args.no_regime_analysis,
+        fold_stability=not args.no_fold_stability,
+        umap_enabled=not args.no_umap,
+        umap_max_points=args.umap_max_points,
+        umap_n_neighbors=args.umap_n_neighbors,
+        umap_min_dist=args.umap_min_dist,
     )
     # Default behavior: if neither --fold nor --checkpoint is provided,
     # run explainability for all folds that have checkpoint_best.pt.
@@ -1219,8 +3036,13 @@ def main(argv: list[str] | None = None) -> None:
                 device_override=args.device,
                 strict=args.strict,
                 write_plots=not args.no_plots,
+                plot_backend=args.plot_backend,
             )
             print(f"explainability output (fold {fold_id}): {out_dir}")
+        if settings.fold_stability:
+            stability_dir = write_fold_stability_outputs(resolved_output_dir / "explainability")
+            if stability_dir is not None:
+                print(f"fold stability output: {stability_dir}")
         return
 
     out_dir = run_checkpoint_explanation(
@@ -1234,6 +3056,7 @@ def main(argv: list[str] | None = None) -> None:
         device_override=args.device,
         strict=args.strict,
         write_plots=not args.no_plots,
+        plot_backend=args.plot_backend,
     )
     print(f"explainability output: {out_dir}")
 

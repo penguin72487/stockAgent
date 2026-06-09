@@ -389,6 +389,7 @@ class TrainingConfig:
     record_epoch_curve: bool = True
     curve_plot_interval: int = 1
     curve_plot_async: bool = True
+    plot_backend: str = "auto"
     epoch_test_curve: bool = True
     defer_epoch_curve_plot_until_end: bool = False
     input_pipeline_ab_test: bool = True
@@ -401,6 +402,18 @@ class TrainingConfig:
     explain_sample_method: str = "even"
     explain_perturb: bool = True
     explain_write_plots: bool = True
+    explain_report_style: str = "paper"
+    explain_plot_theme: str = "paper"
+    explain_interactive_plots: bool = False
+    explain_shap_enabled: bool = True
+    explain_shap_mode: str = "score_head_surrogate"
+    explain_case_study_top_k: int = 5
+    explain_regime_analysis: bool = True
+    explain_fold_stability: bool = True
+    explain_umap_enabled: bool = True
+    explain_umap_max_points: int = 10000
+    explain_umap_n_neighbors: int = 15
+    explain_umap_min_dist: float = 0.1
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -526,6 +539,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("record_epoch_curve", True)
     training.setdefault("curve_plot_interval", 1)
     training.setdefault("curve_plot_async", True)
+    training.setdefault("plot_backend", "auto")
     training.setdefault("epoch_test_curve", True)
     training.setdefault("defer_epoch_curve_plot_until_end", False)
     training.setdefault("input_pipeline_ab_test", True)
@@ -538,6 +552,18 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_sample_method", "even")
     training.setdefault("explain_perturb", True)
     training.setdefault("explain_write_plots", True)
+    training.setdefault("explain_report_style", "paper")
+    training.setdefault("explain_plot_theme", "paper")
+    training.setdefault("explain_interactive_plots", False)
+    training.setdefault("explain_shap_enabled", True)
+    training.setdefault("explain_shap_mode", "score_head_surrogate")
+    training.setdefault("explain_case_study_top_k", 5)
+    training.setdefault("explain_regime_analysis", True)
+    training.setdefault("explain_fold_stability", True)
+    training.setdefault("explain_umap_enabled", True)
+    training.setdefault("explain_umap_max_points", 10000)
+    training.setdefault("explain_umap_n_neighbors", 15)
+    training.setdefault("explain_umap_min_dist", 0.1)
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -907,6 +933,30 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data.get("panel_load_workers", 4)))
+    plot_backend = str(training.get("plot_backend", "auto")).strip().lower()
+    valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
+    if plot_backend not in valid_plot_backends:
+        raise ValueError(
+            f"training.plot_backend must be one of {sorted(valid_plot_backends)}, got {training.get('plot_backend')!r}"
+        )
+    training["plot_backend"] = plot_backend
+    report_style = str(training.get("explain_report_style", "paper")).strip().lower()
+    if report_style not in {"paper", "standard", "none"}:
+        raise ValueError("training.explain_report_style must be one of: paper, standard, none")
+    training["explain_report_style"] = report_style
+    plot_theme = str(training.get("explain_plot_theme", "paper")).strip().lower()
+    if plot_theme not in {"paper", "standard"}:
+        raise ValueError("training.explain_plot_theme must be one of: paper, standard")
+    training["explain_plot_theme"] = plot_theme
+    shap_mode = str(training.get("explain_shap_mode", "score_head_surrogate")).strip().lower()
+    valid_shap_modes = {"score_head_surrogate", "surrogate", "score_head", "off", "none"}
+    if shap_mode not in valid_shap_modes:
+        raise ValueError(f"training.explain_shap_mode must be one of {sorted(valid_shap_modes)}")
+    training["explain_shap_mode"] = shap_mode
+    training["explain_case_study_top_k"] = max(1, int(training.get("explain_case_study_top_k", 5)))
+    training["explain_umap_max_points"] = max(0, int(training.get("explain_umap_max_points", 10000)))
+    training["explain_umap_n_neighbors"] = max(2, int(training.get("explain_umap_n_neighbors", 15)))
+    training["explain_umap_min_dist"] = max(0.0, float(training.get("explain_umap_min_dist", 0.1)))
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
@@ -975,10 +1025,34 @@ def load_config(path: str | Path) -> ExperimentConfig:
             early_stopping_no_improve_ratio=training_raw["early_stopping_no_improve_ratio"],
             val_interval_epochs=training_raw["val_interval_epochs"],
             curve_test_interval=training_raw["curve_test_interval"],
+            record_epoch_curve=training_raw["record_epoch_curve"],
             curve_plot_interval=training_raw["curve_plot_interval"],
             curve_plot_async=training_raw["curve_plot_async"],
+            plot_backend=training_raw["plot_backend"],
             epoch_test_curve=training_raw["epoch_test_curve"],
             defer_epoch_curve_plot_until_end=training_raw["defer_epoch_curve_plot_until_end"],
+            input_pipeline_ab_test=training_raw["input_pipeline_ab_test"],
+            input_pipeline_ab_test_steps=training_raw["input_pipeline_ab_test_steps"],
+            explain_after_each_fold=training_raw["explain_after_each_fold"],
+            explain_first_test_year_only=training_raw["explain_first_test_year_only"],
+            explain_top_k=training_raw["explain_top_k"],
+            explain_max_rows=training_raw["explain_max_rows"],
+            explain_ig_steps=training_raw["explain_ig_steps"],
+            explain_sample_method=training_raw["explain_sample_method"],
+            explain_perturb=training_raw["explain_perturb"],
+            explain_write_plots=training_raw["explain_write_plots"],
+            explain_report_style=training_raw["explain_report_style"],
+            explain_plot_theme=training_raw["explain_plot_theme"],
+            explain_interactive_plots=training_raw["explain_interactive_plots"],
+            explain_shap_enabled=training_raw["explain_shap_enabled"],
+            explain_shap_mode=training_raw["explain_shap_mode"],
+            explain_case_study_top_k=training_raw["explain_case_study_top_k"],
+            explain_regime_analysis=training_raw["explain_regime_analysis"],
+            explain_fold_stability=training_raw["explain_fold_stability"],
+            explain_umap_enabled=training_raw["explain_umap_enabled"],
+            explain_umap_max_points=training_raw["explain_umap_max_points"],
+            explain_umap_n_neighbors=training_raw["explain_umap_n_neighbors"],
+            explain_umap_min_dist=training_raw["explain_umap_min_dist"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],

@@ -62,16 +62,20 @@ The active Transformer-base lookback-32 config is:
 training:
   model_name: transformer_base_portfolio
   lookback: 32
+  batch_size_train: 16
+  batch_size_eval: 16
+  enable_torch_compile: true
+  compile_loss: false
   loss_type: log_utility
 
   transformer_base_portfolio:
-    d_model: 48
-    attention_mode: latent
+    d_model: 32
+    attention_mode: market_token
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
-    sdpa_batch_limit: 4096
+    sdpa_batch_limit: 16384
     norm_type: rmsnorm
     ffn_type: swiglu
     qk_norm: true
@@ -80,7 +84,7 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: attention
+    temporal_pooling: mean
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -96,12 +100,12 @@ training:
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
     dynamic_token_dropout: 0.1
-    head_hidden_dim: 48
+    head_hidden_dim: 32
     head_layers: 1
     dropout: 0.2
     default_temperature: 1.0
     portfolio_mode: long_short
-    max_full_tokens: 4096
+    max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: true
     return_aux_details: false
@@ -114,6 +118,8 @@ Notes:
 - For large universes, prefer `latent` or `market_token`.
 - `return_aux_details` is useful for explainability but can increase memory pressure during training. Prefer `false` for tight VRAM training and enable it for explainability runs when needed.
 - The previous low-rank model remains available as `low_rank_market_transformer_portfolio`.
+- Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 16`, and `temporal_pooling: mean`.
+- `temporal_pooling: mean` is a speed-first choice that still uses all lookback days. It changes model behavior versus attention pooling, so re-check validation/test metrics after changing it.
 
 Modern Transformer module contract:
 
@@ -218,6 +224,8 @@ Rules:
 Compile/runtime rules:
 
 - Use CUDA 13 ptxas for the current PyTorch CUDA 13 environment. Prefer mamba/conda packages such as `cuda-nvcc` / `cuda-nvvm-tools` in the `fintech` env; do not leave a CUDA 12 pip `nvidia-cuda-nvcc-cu12` package around as a fallback ptxas source.
+- When invoking `/home/user/miniforge3/envs/fintech/bin/python` directly, PATH may not include the env `bin`. Compile helpers must prepend that path so Triton can find `/home/user/miniforge3/envs/fintech/bin/ptxas`.
+- Current benchmark result: model `torch.compile` is worthwhile for `transformer_base_portfolio` lookback32/batch16, but `compile_loss: true` is slower for the canonical log-utility backtest path. Keep model compile on and loss compile off unless a fresh benchmark proves otherwise.
 - Trainer compile checks should discover `/home/user/miniforge3/envs/fintech/bin/ptxas` and the conda compilers `x86_64-conda-linux-gnu-gcc/g++` even when the parent shell PATH is sparse.
 - Actual-shape compile probes on the 2000-2024 checkpoint showed:
   - compiled `transformer_base_portfolio` model forward is beneficial
@@ -250,6 +258,11 @@ Expected explainability workflow:
 - Analyze all folds when making model-level claims.
 - During training, if `training.explain_after_each_fold: true`, generate that fold's test explainability immediately after the fold final-test artifacts are written.
 - Default test explainability should use only each fold's first test year unless the user explicitly asks for all test years.
+- Paper-grade explainability is the default report style:
+  - `explain_report_style: paper`
+  - `explain_plot_theme: paper`
+  - `explain_shap_enabled: true`
+  - `explain_shap_mode: score_head_surrogate`
 - Use local artifacts under paths such as:
   - `data_yahoo/tw_stocks/lookback16/explainability`
   - future lookback-32 explainability outputs
@@ -260,8 +273,26 @@ Expected explainability workflow:
   - correlations between raw features and scores/weights
   - stock contribution and concentration
   - aux summaries for latent factors and market tokens
+- Dense explainability plots should use RAPIDS/cuDF/Datashader when available.
+- Dimensionality reduction for transformer aux tensors should use cuML UMAP, not PCA, for the default explainability projection path.
+- Aux UMAP projection outputs live under `aux_projections/*.csv` and `plots/aux_umap/*.png`; use them to inspect stock embeddings, latent factors, market tokens, dynamic token deltas, and token collapse/regime clustering.
 - Be cautious with perturbation `score_abs_delta` when masked scores use sentinel values such as `-1e9`; prefer weight deltas, rank changes, gradients, and integrated gradients.
 - Report concentration, turnover, drawdown, and time-attribution issues plainly.
+- Paper outputs should be generated under:
+  - `plots_paper/*.png`
+  - `paper_tables/*.csv`
+  - `paper_explainability_report.md`
+  - `paper_explainability_summary.json`
+- If `config_lookback` and attribution lookback differ, the paper report must warn that the artifact is not a complete explanation for that lookback.
+
+Plot/backend rules:
+
+- PyQtGraph is for live scalar monitoring from streams such as `epoch_curve.jsonl`; do not put a GUI event loop in the trainer main path.
+- Plotly is for optional interactive dashboards from saved CSV artifacts; do not make Plotly a required training dependency.
+- SHAP for `transformer_base_portfolio` should use score-head/surrogate SHAP by default. Do not run full `[batch, lookback, symbols, features]` tensor SHAP except as a tiny explicit case study.
+- Datashader is the preferred backend for dense scatter, UMAP projections, and GPU-resident high-cardinality plots.
+- Do not use Datashader point rasterization for small discrete feature-time matrices; use true grid heatmaps with visible cells, colorbar, subtitles, and `t-0/t-1/...` labels.
+- Static PNG chart labels should avoid CJK text unless a CJK-capable Matplotlib font is confirmed; use ASCII feature-group labels in plots and explain them in the Markdown report.
 
 Walk-forward summary visualization rules:
 

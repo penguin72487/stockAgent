@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -18,6 +18,9 @@ class WindowedSplitTensors:
     benchmark: torch.Tensor
     lookback: int
     sample_mask: torch.Tensor | None = None
+    _window_offsets: torch.Tensor = field(init=False, repr=False)
+    _valid_indices_are_contiguous: bool = field(init=False, repr=False)
+    _first_valid_index: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.lookback = int(self.lookback)
@@ -27,6 +30,28 @@ class WindowedSplitTensors:
             raise ValueError(f"features must have shape [T,S,F], got {tuple(self.features.shape)}")
         if self.valid_indices.dim() != 1:
             raise ValueError("valid_indices must be 1D")
+        self._window_offsets = torch.arange(
+            self.lookback - 1,
+            -1,
+            -1,
+            device=self.valid_indices.device,
+            dtype=torch.long,
+        )
+        if int(self.valid_indices.numel()) == 0:
+            self._valid_indices_are_contiguous = True
+            self._first_valid_index = 0
+        else:
+            self._first_valid_index = int(self.valid_indices[0].detach().cpu().item())
+            if int(self.valid_indices.numel()) == 1:
+                self._valid_indices_are_contiguous = True
+            else:
+                expected_last = self._first_valid_index + int(self.valid_indices.numel()) - 1
+                actual_last = int(self.valid_indices[-1].detach().cpu().item())
+                if actual_last != expected_last:
+                    self._valid_indices_are_contiguous = False
+                else:
+                    diffs = self.valid_indices[1:] - self.valid_indices[:-1]
+                    self._valid_indices_are_contiguous = bool(torch.all(diffs == 1).detach().cpu().item())
 
     def __len__(self) -> int:
         return int(self.valid_indices.numel())
@@ -76,14 +101,30 @@ class WindowedSplitTensors:
     def _window_indices_for_rows(self, row_indices: torch.Tensor) -> torch.Tensor:
         row_indices = row_indices.to(device=self.valid_indices.device, dtype=torch.long)
         date_idx = self.valid_indices[row_indices]
-        offsets = torch.arange(
-            self.lookback - 1,
-            -1,
-            -1,
-            device=date_idx.device,
-            dtype=torch.long,
-        )
-        return date_idx[:, None] - offsets[None, :]
+        return date_idx[:, None] - self._window_offsets[None, :]
+
+    def _window_view_for_contiguous_rows(
+        self,
+        start: int,
+        end: int,
+        *,
+        contiguous_x: bool,
+    ) -> tuple[torch.Tensor, int, torch.Tensor]:
+        batch_rows = int(end) - int(start)
+        source_device = self.features.device
+        date_start = self._first_valid_index + int(start)
+        feature_start = date_start - self.lookback + 1
+        if batch_rows <= 0 or feature_start < 0:
+            raise ValueError("invalid contiguous window slice")
+        source = self.features.narrow(0, feature_start, batch_rows + self.lookback - 1)
+        x = source.unfold(0, self.lookback, 1).permute(0, 3, 1, 2)
+        if contiguous_x:
+            x = x.contiguous()
+        if self.sample_mask is None:
+            sample_mask = torch.ones(batch_rows, dtype=torch.bool, device=source_device)
+        else:
+            sample_mask = self.sample_mask.narrow(0, int(start), batch_rows)
+        return x, date_start, sample_mask
 
     def _batch_from_row_indices(
         self,
@@ -115,6 +156,43 @@ class WindowedSplitTensors:
             "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
         }
 
+    def _batch_from_contiguous_rows(
+        self,
+        start: int,
+        end: int,
+        device: torch.device,
+        non_blocking: bool,
+        *,
+        contiguous_x: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        x, date_start, sample_mask = self._window_view_for_contiguous_rows(
+            start,
+            end,
+            contiguous_x=contiguous_x,
+        )
+        rows = int(end) - int(start)
+        return {
+            "x": x.to(device=device, non_blocking=non_blocking),
+            "future_log_returns": self.future_log_returns.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "tradable_mask": self.tradable_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "can_buy_mask": self.can_buy_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "can_sell_mask": self.can_sell_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "benchmark": self.benchmark.narrow(0, date_start, rows).to(device=device, non_blocking=non_blocking),
+            "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
+        }
+
     def batch_by_rows(
         self,
         start: int,
@@ -124,6 +202,8 @@ class WindowedSplitTensors:
     ) -> dict[str, torch.Tensor]:
         if end < start:
             raise ValueError("end must be >= start")
+        if self._valid_indices_are_contiguous:
+            return self._batch_from_contiguous_rows(start, end, device, non_blocking)
         rows = torch.arange(int(start), int(end), dtype=torch.long, device=self.valid_indices.device)
         return self._batch_from_row_indices(rows, device, non_blocking)
 
@@ -146,10 +226,14 @@ class WindowedSplitTensors:
             return empty_x, empty_2d, empty_mask, empty_mask.clone(), empty_mask.clone(), empty_bench
 
         row_indices = torch.arange(len(self), dtype=torch.long, device=self.valid_indices.device)
-        window_idx = self._window_indices_for_rows(row_indices)
         date_idx = self.valid_indices[row_indices]
+        if self._valid_indices_are_contiguous:
+            x, _, _ = self._window_view_for_contiguous_rows(0, len(self), contiguous_x=True)
+        else:
+            window_idx = self._window_indices_for_rows(row_indices)
+            x = self.features[window_idx].contiguous()
         return (
-            self.features[window_idx].contiguous(),
+            x,
             self.future_log_returns[date_idx],
             self.tradable_mask[date_idx],
             self.can_buy_mask[date_idx],

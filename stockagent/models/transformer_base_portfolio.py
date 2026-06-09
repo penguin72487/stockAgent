@@ -135,6 +135,19 @@ def _apply_rope(x: torch.Tensor, positions: torch.Tensor, base: float = 10000.0)
     return torch.cat([rotated, x_pass], dim=-1)
 
 
+def _build_rope_cache(max_steps: int, dim: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
+    rot_dim = (int(dim) // 2) * 2
+    max_steps = max(0, int(max_steps))
+    if max_steps <= 0 or rot_dim <= 0:
+        empty = torch.empty(0, dtype=torch.float32)
+        return empty, empty
+    positions = torch.arange(max_steps, dtype=torch.float32)
+    inv_freq = torch.arange(0, rot_dim, 2, dtype=torch.float32)
+    inv_freq = torch.pow(float(base), -inv_freq / float(rot_dim))
+    angles = positions[:, None] * inv_freq[None, :]
+    return angles.cos(), angles.sin()
+
+
 def _rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     variance = x.float().pow(2).mean(dim=-1, keepdim=True)
     return x * torch.rsqrt(variance + eps).to(dtype=x.dtype)
@@ -225,6 +238,7 @@ class FlashSDPAAttention(nn.Module):
         sdpa_batch_limit: int = 4096,
         qk_norm: bool = True,
         rope_base: float = 10000.0,
+        max_rope_steps: int = 0,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -238,36 +252,84 @@ class FlashSDPAAttention(nn.Module):
         self.qk_norm = bool(qk_norm)
         self.rope_base = float(rope_base)
 
-        self.q_proj = nn.Linear(self.dim, self.dim)
-        self.k_proj = nn.Linear(self.dim, self.dim)
-        self.v_proj = nn.Linear(self.dim, self.dim)
+        self.in_proj = nn.Linear(self.dim, self.dim * 3)
         self.out_proj = nn.Linear(self.dim, self.dim)
         self.dropout_p = float(dropout)
+        rope_cos, rope_sin = _build_rope_cache(int(max_rope_steps), self.head_dim, self.rope_base)
+        self.register_buffer("rope_cos_cached", rope_cos, persistent=False)
+        self.register_buffer("rope_sin_cached", rope_sin, persistent=False)
 
-    def _project(self, tensor: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
+    def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         bsz, steps, _ = tensor.shape
         return (
-            proj(tensor)
+            tensor
             .reshape(bsz, steps, self.num_heads, self.head_dim)
             .transpose(1, 2)
-            .contiguous()
         )
+
+    def _project_self(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, steps, _ = tensor.shape
+        qkv = self.in_proj(tensor).reshape(bsz, steps, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(dim=0)
+        return q, k, v
+
+    def _project_cross(
+        self,
+        query: torch.Tensor,
+        context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_weight = self.in_proj.weight[: self.dim]
+        kv_weight = self.in_proj.weight[self.dim :]
+        if self.in_proj.bias is None:
+            q_bias = None
+            kv_bias = None
+        else:
+            q_bias = self.in_proj.bias[: self.dim]
+            kv_bias = self.in_proj.bias[self.dim :]
+        q = self._reshape_heads(F.linear(query, q_weight, q_bias))
+        bsz, key_steps, _ = context.shape
+        kv = F.linear(context, kv_weight, kv_bias).reshape(bsz, key_steps, 2, self.num_heads, self.head_dim)
+        kv = kv.permute(2, 0, 3, 1, 4)
+        k, v = kv.unbind(dim=0)
+        return q, k, v
+
+    def _apply_cached_rope(self, x: torch.Tensor, steps: int) -> torch.Tensor:
+        rot_dim = (int(x.size(-1)) // 2) * 2
+        if rot_dim <= 0:
+            return x
+        if int(self.rope_cos_cached.numel()) == 0 or steps > int(self.rope_cos_cached.size(0)):
+            positions = torch.arange(steps, device=x.device, dtype=torch.float32)
+            return _apply_rope(x, positions, base=self.rope_base)
+        cos = self.rope_cos_cached[:steps].to(device=x.device, dtype=x.dtype)[None, None, :, :]
+        sin = self.rope_sin_cached[:steps].to(device=x.device, dtype=x.dtype)[None, None, :, :]
+        x_rot = x[..., :rot_dim]
+        x_pass = x[..., rot_dim:]
+        x_even = x_rot[..., 0::2]
+        x_odd = x_rot[..., 1::2]
+        rotated = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1)
+        rotated = rotated.flatten(start_dim=-2)
+        if x_pass.numel() == 0:
+            return rotated
+        return torch.cat([rotated, x_pass], dim=-1)
 
     def forward(
         self,
         query: torch.Tensor,
-        context: torch.Tensor,
+        context: torch.Tensor | None = None,
         key_mask: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, query_steps, _ = query.shape
-        key_steps = int(context.size(1))
-        q = self._project(query, self.q_proj)
-        k = self._project(context, self.k_proj)
-        v = self._project(context, self.v_proj)
+        if context is None:
+            key_steps = query_steps
+            q, k, v = self._project_self(query)
+        else:
+            key_steps = int(context.size(1))
+            q, k, v = self._project_cross(query, context)
         if rope_positions is not None and int(rope_positions.numel()) >= max(query_steps, key_steps):
-            q = _apply_rope(q, rope_positions[:query_steps], base=self.rope_base)
-            k = _apply_rope(k, rope_positions[:key_steps], base=self.rope_base)
+            q = self._apply_cached_rope(q, query_steps)
+            k = self._apply_cached_rope(k, key_steps)
         if self.qk_norm:
             q = _rms_normalize_last_dim(q)
             k = _rms_normalize_last_dim(k)
@@ -331,6 +393,7 @@ class TransformerPortfolioBlock(nn.Module):
         ffn_type: str,
         qk_norm: bool,
         rope_base: float,
+        max_rope_steps: int = 0,
     ) -> None:
         super().__init__()
         norm_type = _normalize_norm_type(norm_type)
@@ -345,6 +408,7 @@ class TransformerPortfolioBlock(nn.Module):
             sdpa_batch_limit=int(sdpa_batch_limit),
             qk_norm=bool(qk_norm),
             rope_base=float(rope_base),
+            max_rope_steps=int(max_rope_steps),
         )
         self.resid_dropout = nn.Dropout(float(dropout))
         self.norm_ffn = _make_norm(int(dim), norm_type)
@@ -361,13 +425,20 @@ class TransformerPortfolioBlock(nn.Module):
         key_mask: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        context = query if context is None else context
-        attn_out = self.attn(
-            self.norm_query(query),
-            self.norm_context(context),
-            key_mask=key_mask,
-            rope_positions=rope_positions,
-        )
+        if context is None:
+            attn_out = self.attn(
+                self.norm_query(query),
+                None,
+                key_mask=key_mask,
+                rope_positions=rope_positions,
+            )
+        else:
+            attn_out = self.attn(
+                self.norm_query(query),
+                self.norm_context(context),
+                key_mask=key_mask,
+                rope_positions=rope_positions,
+            )
         query = query + self.resid_dropout(attn_out)
         query = query + self.ffn(self.norm_ffn(query))
         return query
@@ -482,6 +553,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 ffn_type=self.ffn_type,
                 qk_norm=self.qk_norm,
                 rope_base=self.rope_base,
+                max_rope_steps=self.lookback,
             )
 
         self.temporal_blocks = nn.ModuleList(

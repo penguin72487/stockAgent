@@ -22,6 +22,34 @@ def _add_loss_runtime_stat(key: str, value: float = 1.0) -> None:
     _LOSS_RUNTIME_STATS[key] = float(_LOSS_RUNTIME_STATS.get(key, 0.0)) + float(value)
 
 
+def _torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    if callable(is_compiling):
+        try:
+            return bool(is_compiling())
+        except Exception:
+            return False
+    dynamo = getattr(torch, "_dynamo", None)
+    is_compiling = getattr(dynamo, "is_compiling", None)
+    if callable(is_compiling):
+        try:
+            return bool(is_compiling())
+        except Exception:
+            return False
+    return False
+
+
+def _clone_portfolio_state_for_loss(tensor: Tensor, *, stat_prefix: str) -> Tensor:
+    if _torch_is_compiling():
+        return tensor.detach().clone(memory_format=torch.contiguous_format)
+    clone_start = time.perf_counter()
+    cloned = tensor.detach().clone(memory_format=torch.contiguous_format)
+    _add_loss_runtime_stat(f"{stat_prefix}_s", time.perf_counter() - clone_start)
+    _add_loss_runtime_stat(f"{stat_prefix}_calls")
+    return cloned
+
+
 def get_loss_runtime_stats(reset: bool = False) -> dict[str, float]:
     stats = dict(_LOSS_RUNTIME_STATS)
     if reset:
@@ -689,10 +717,10 @@ def risk_aware_loss(
         if isinstance(initial_weights, torch.Tensor):
             # Keep a private, contiguous buffer for recurrent state so we don't
             # hold references to graph-managed outputs across compiled replays.
-            clone_start = time.perf_counter()
-            initial_weights = initial_weights.detach().clone(memory_format=torch.contiguous_format)
-            _add_loss_runtime_stat("initial_weights_clone_s", time.perf_counter() - clone_start)
-            _add_loss_runtime_stat("initial_weights_clone_calls")
+            initial_weights = _clone_portfolio_state_for_loss(
+                initial_weights,
+                stat_prefix="initial_weights_clone",
+            )
 
     backtest = run_backtest_torch(
         weights,
@@ -711,10 +739,10 @@ def risk_aware_loss(
     )
     if aux_outputs is not None and backtest.final_weights is not None:
         # Avoid carrying graph-owned output storage into the next step.
-        clone_start = time.perf_counter()
-        aux_outputs["_final_weights"] = backtest.final_weights.detach().clone(memory_format=torch.contiguous_format)
-        _add_loss_runtime_stat("final_weights_clone_s", time.perf_counter() - clone_start)
-        _add_loss_runtime_stat("final_weights_clone_calls")
+        aux_outputs["_final_weights"] = _clone_portfolio_state_for_loss(
+            backtest.final_weights,
+            stat_prefix="final_weights_clone",
+        )
 
     if sample_mask is None:
         valid_mask = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
