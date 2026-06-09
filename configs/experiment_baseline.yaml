@@ -1,11 +1,11 @@
-experiment_name: tw-stock-bottleneck-backtest
+experiment_name: tw-stock-expanding-walkforward
 
 runner:
   output_dir: artifacts
   require_cuda: true
   mode: train
   resume: true
-  post_train_infer: false
+  post_train_infer: true
   start_fold: 1
 
 environment:
@@ -23,10 +23,7 @@ data:
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
-  panel_backend: auto
-  panel_load_workers: 28
-  tradable_mode: tw_limit_guard
-  # tradable_mode: tradable
+  tw_limit_up_down_guard: true
 
 walk_forward:
   min_train_years: 1
@@ -35,95 +32,59 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0005
-  sell_fee_rate: 0.005
-  max_turnover_ratio: 50.0
-  gross_leverage: 2.5
+  buy_fee_rate: 0.001425
+  sell_fee_rate: 0.004425
+  max_turnover_ratio: 100.0
   long_only: false
   cash_allowed: true
+  use_all_tradable_symbols: true
 
 training:
   backend: pytorch
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  model_name: transformer_base_portfolio
-  enable_torch_compile: true
-  auto_torch_compile_sharpe: true
-  compile_loss: false
-  materialize_window_tensors: false
-  warm_start_from_previous_fold: false
+  model_name: tabular_resnet
+  enable_torch_compile: false
+  auto_torch_compile_sharpe: false
+  compile_loss: null
+  warm_start_from_previous_fold: true
   chunk_rows: 0
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
-  prefer_fp16: false
-  backtest_autotune: true
-  backtest_compile: true
-  backtest_compile_stateful: true
+  prefer_fp16: true
+  backtest_autotune: false
+  backtest_compile: false
   backtest_verbose: false
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: true
-  lookback: 32
-  batch_size: 16
-  batch_size_train: 16
-  batch_size_eval: 16
+  lookback: 1
+  batch_size: 2048
+  batch_size_train: 2048
+  batch_size_eval: 2048
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  early_stopping_no_improve_ratio: 0.001
   val_interval_epochs: 1
-  curve_test_interval: 1
-  record_epoch_curve: true
-  curve_plot_interval: 1
-  curve_plot_async: true
-  plot_backend: auto
-  epoch_test_curve: true
-  defer_epoch_curve_plot_until_end: false
-  input_pipeline_ab_test: false
-  input_pipeline_ab_test_steps: 20
-  # Keep training VRAM/time focused on training. Run `python explain_model.py`
-  # after training to generate the full paper explainability set for all folds.
-  explain_after_each_fold: false
-  explain_first_test_year_only: true
-  explain_top_k: 20
-  explain_max_rows: 32
-  explain_ig_steps: 8
-  explain_sample_method: even
-  explain_perturb: true
-  explain_write_plots: true
-  explain_report_style: paper
-  explain_plot_theme: paper
-  explain_interactive_plots: false
-  explain_shap_enabled: true
-  explain_shap_mode: score_head_surrogate
-  explain_case_study_top_k: 5
-  explain_regime_analysis: true
-  explain_fold_stability: true
-  explain_umap_enabled: true
-  explain_umap_max_points: 10000
-  explain_umap_n_neighbors: 15
-  explain_umap_min_dist: 0.1
-  cache_train_tensors_on_gpu: true
-  cache_eval_tensors_on_gpu: true
-  learning_rate: 0.0001
+  learning_rate: 0.001
   enable_lr_scheduler: false
   lr_scheduler: plateau
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 10
-  lr_scheduler_threshold: 0.001
-  top_k: 10
+  lr_scheduler_threshold: 0.0005
+  top_k: 20
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
-  num_workers: 16
-  weight_decay: 0.1
+  num_workers: 0
+  weight_decay: 0.00001
   grad_clip_norm: 0.0
-  finite_check_interval_steps: 0
-  loss_type: log_utility
-  min_batch_size: 1
+  loss_type: sharpe
+  min_batch_size: 32
   auto_batch_size: true
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
-  target_vram_fraction: 0.9
+  target_vram_fraction: 1
   mlp:
     hidden_dim: 1024
     hidden_layers: 2
@@ -141,202 +102,6 @@ training:
     hidden_dim: 256
     n_blocks: 4
     dropout: 0.1
-  multi_stock_tcn:
-    hidden_channels: 16
-    embedding_dim: 16
-    tcn_blocks: 4
-    tcn_kernel_size: 3
-    head_hidden_dim: 16
-    head_layers: 1
-    dropout: 0.1
-    tcn_conv_mode: separable
-    conv_layers_per_block: 1
-    norm_type: none
-    sanitize_inputs: false
-  efficient_tcn_tabular_set_portfolio:
-    temporal_enabled: true
-    temporal_dim: 16
-    temporal_hidden_channels: 32
-    temporal_dilations: [1, 2]
-    temporal_kernel_size: 3
-    tabular_dim: 64
-    tabular_hidden_dim: 128
-    tabular_blocks: 2
-    model_dim: 64
-    set_enabled: true
-    num_inducing_points: 16
-    num_heads: 4
-    ffn_mult: 2
-    head_hidden_dim: 64
-    head_layers: 1
-    dropout: 0.1
-    residual_scale: 0.5
-    default_temperature: 1.0
-    portfolio_mode: long_only
-    return_aux: true
-  latent_factor_market_token_portfolio:
-    temporal_enabled: true
-    temporal_dim: 16
-    temporal_hidden_channels: 32
-    temporal_dilations: [1, 2]
-    temporal_kernel_size: 3
-    tabular_dim: 64
-    tabular_hidden_dim: 128
-    tabular_blocks: 2
-    stock_embedding_dim: 64
-    num_latent_factors: 32
-    num_market_tokens: 4
-    num_heads: 4
-    ffn_mult: 2
-    head_hidden_dim: 64
-    head_layers: 1
-    dropout: 0.3
-    residual_scale: 0.5
-    default_temperature: 1.0
-    portfolio_mode: long_only
-    return_aux: true
-  low_rank_market_transformer_portfolio:
-    feature_dim: 32
-    temporal_mixer: conv
-    temporal_layers: 4
-    temporal_heads: 2
-    temporal_ffn_dim: 64
-    temporal_dropout: 0.1
-    temporal_pooling: attention
-    temporal_kernel_size: 3
-    temporal_dilations: [1, 2, 4, 8]
-    temporal_checkpoint: false
-    stock_embedding_dim: 32
-    num_latent_factors: 8
-    num_market_tokens: 4
-    cross_heads: 2
-    cross_ffn_mult: 1
-    head_hidden_dim: 32
-    head_layers: 1
-    dropout: 0.1
-    default_temperature: 1.0
-    portfolio_mode: long_short
-    return_aux: true
-    return_aux_details: false
-  transformer_base_portfolio:
-    d_model: 32
-    # full: most complete O((lookback*stocks)^2), small universes only
-    # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
-    # latent: temporal + latent factors + market tokens, large universe friendly
-    # market_token: temporal + market tokens, smallest cross-stock transformer
-    # temporal_only: no cross-stock attention
-    attention_mode: market_token
-    use_flash_attention: true
-    use_time_pos: true
-    use_symbol_pos: true
-    input_dropout: 0.0
-    sdpa_batch_limit: 16384
-    norm_type: rmsnorm
-    ffn_type: swiglu
-    qk_norm: true
-    rope_temporal: true
-    rope_base: 10000.0
-    temporal_layers: 2
-    temporal_heads: 4
-    temporal_ffn_mult: 2
-    temporal_pooling: last
-    cross_layers: 1
-    cross_heads: 4
-    cross_ffn_mult: 2
-    joint_layers: 2
-    joint_heads: 4
-    joint_ffn_mult: 2
-    latent_layers: 1
-    num_latent_factors: 16
-    num_market_tokens: 4
-    market_layers: 1
-    dynamic_latent_tokens: true
-    dynamic_market_tokens: true
-    dynamic_token_hidden_mult: 2
-    dynamic_token_gate_init: 0.1
-    dynamic_token_dropout: 0.1
-    head_hidden_dim: 32
-    head_layers: 1
-    dropout: 0.2
-    default_temperature: 1.0
-    portfolio_mode: long_short
-    max_full_tokens: 16384
-    checkpoint_blocks: false
-    return_aux: true
-    return_aux_details: false
-     # return_aux_details: whether to return detailed aux outputs for analysis, such as attention weights and latent factors. Setting this to true may increase memory usage and reduce training speed, so it is typically set to false during training and true during inference or analysis.
-  bottleneck_portfolio_autoencoder:
-    d_model: 64
-    z_dim: 32
-    temporal_type: tcn
-    temporal_layers: 2
-    asset_encoder_type: lite_isab
-    asset_encoder_layers: 1
-    n_heads: 4
-    num_inducing_points: 32
-    ffn_mult: 2
-    dropout: 0.1
-    long_short: true
-    noise_std: 0.01
-    return_aux: false
-  tcn_hybrid_tabular_resnet:
-    embedding_dim: 64
-    encoder_hidden_dim: 128
-    encoder_blocks: 2
-    tcn_blocks: 2
-    tcn_kernel_size: 3
-    dropout: 0.3
-  temporal_tabular_resnet:
-    temporal_hidden_dim: 128
-    temporal_layers: 1
-    temporal_dropout: 0.3
-    embedding_dim: 128
-    hidden_dim: 256
-    n_blocks: 4
-    dropout: 0.1
-  cross_sectional_temporal_portfolio_model:
-    candidate_k: 64
-    trade_k: 10
-    scorer: tabular_resnet
-    scorer_hidden: 128
-    scorer_blocks: 2
-    reranker: set_transformer
-    d_model: 128
-    heads: 4
-    layers: 2
-    dropout: 0.15
-    regime_classes: 3
-  multitask_loss:
-    rank_ic_weight: 1.00
-    direction_weight: 0.00
-    volatility_regime_weight: 0.00
-    concentration_weight: 0.00
-    regime_up_threshold: 0.002
-    regime_down_threshold: -0.002
-  factor_generalization_loss:
-    slope_tstat_weight: 1.0
-    rank_ic_weight: 0.5
-    factor_sharpe_weight: 0.25
-    block_stability_weight: 0.20
-    regime_stability_weight: 0.20
-    consistency_weight: 0.05
-    net_exposure_weight: 0.05
-    gross_exposure_weight: 0.02
-    concentration_weight: 0.02
-    turnover_weight: 0.02
-    score_l2_weight: 0.001
-    factor_temperature: 1.0
-    block_count: 4
-    worst_fraction: 0.25
-    augmentation_feature_dropout: 0.10
-    augmentation_stock_dropout: 0.05
-    augmentation_time_dropout: 0.05
-    augmentation_noise_std: 0.01
-  portfolio_autoencoder_loss:
-    cost_rate: 0.0005
-    lambda_turnover: 0.1
-    lambda_concentration: 0.01
-    lambda_latent: 0.001
   lightgbm:
     use_gpu: true
     gpu_device_id: 0
@@ -366,25 +131,9 @@ evaluation:
   metrics:
     - cumulative_return
     - annualized_return
-    - cagr
     - sharpe
-    - sortino
     - max_drawdown
-    - calmar
     - turnover
     - excess_return_vs_universe_average
   gamma_sharpe: 1.0
-  gamma_excess: 1.0
-  gamma_cvar: 1.0
-  cvar_alpha: 0.95
-  gamma_drawdown: 0.5
-  drawdown_target: 0.2
-  gamma_turnover: 0.005
-  gamma_underperformance: 2.0
-  excess_target: 0.0
-  cvar_budget: 0.03
-  drawdown_budget: 0.18
-  turnover_budget: 0.35
-  gamma_cvar_budget: 2.0
-  gamma_drawdown_budget: 2.5
-  gamma_turnover_budget: 0.5
+  gamma_turnover: 0.0
