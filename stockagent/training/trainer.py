@@ -2919,6 +2919,18 @@ def _run_fold_explainability(
         perturb=bool(getattr(config.training, "explain_perturb", True)),
         sample_method=str(getattr(config.training, "explain_sample_method", "even")),
         first_test_year_only=first_year_only,
+        report_style=str(getattr(config.training, "explain_report_style", "paper")),
+        plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
+        interactive_plots=bool(getattr(config.training, "explain_interactive_plots", False)),
+        shap_enabled=bool(getattr(config.training, "explain_shap_enabled", True)),
+        shap_mode=str(getattr(config.training, "explain_shap_mode", "score_head_surrogate")),
+        case_study_top_k=int(getattr(config.training, "explain_case_study_top_k", 5)),
+        regime_analysis=bool(getattr(config.training, "explain_regime_analysis", True)),
+        fold_stability=bool(getattr(config.training, "explain_fold_stability", True)),
+        umap_enabled=bool(getattr(config.training, "explain_umap_enabled", True)),
+        umap_max_points=int(getattr(config.training, "explain_umap_max_points", 10000)),
+        umap_n_neighbors=int(getattr(config.training, "explain_umap_n_neighbors", 15)),
+        umap_min_dist=float(getattr(config.training, "explain_umap_min_dist", 0.1)),
     )
     batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
     dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
@@ -2947,6 +2959,7 @@ def _run_fold_explainability(
         "device": str(device),
         "sample_rows": int(len(dates)),
         "first_test_year_only": first_year_only,
+        "config_lookback": int(config.training.lookback),
         "date_start": dates[0] if dates else None,
         "date_end": dates[-1] if dates else None,
     }
@@ -2955,7 +2968,17 @@ def _run_fold_explainability(
         destination,
         metadata=metadata,
         write_plots=bool(getattr(config.training, "explain_write_plots", True)),
+        plot_backend=str(getattr(config.training, "plot_backend", "auto")),
+        report_style=str(getattr(config.training, "explain_report_style", "paper")),
+        plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
     )
+    if bool(getattr(config.training, "explain_fold_stability", True)):
+        try:
+            from stockagent.explainability import write_fold_stability_outputs
+
+            write_fold_stability_outputs(output_path / "explainability")
+        except Exception as exc:
+            print(f"[Fold {fold.fold_id}] fold stability explainability skipped: {type(exc).__name__}: {exc}")
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return destination

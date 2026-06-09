@@ -262,6 +262,21 @@ def test_windowed_split_matches_materialized_dataset_tensors() -> None:
     assert torch.equal(batch["sample_mask"], torch.ones(3, dtype=torch.bool))
 
 
+def test_windowed_contiguous_fast_path_matches_indexed_path() -> None:
+    panel = _make_panel(rows=10, symbols=4, features=3)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=4)
+    split = dataset_to_windowed_tensors(dataset)
+    assert split._valid_indices_are_contiguous
+
+    fast = split.batch_by_rows(1, 5, torch.device("cpu"), non_blocking=False)
+    rows = torch.arange(1, 5, dtype=torch.long)
+    indexed = split._batch_from_row_indices(rows, torch.device("cpu"), non_blocking=False)
+
+    assert set(fast) == set(indexed)
+    for key in fast:
+        assert torch.equal(fast[key], indexed[key]), key
+
+
 def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     panel = _make_panel(rows=9, symbols=5, features=1)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)

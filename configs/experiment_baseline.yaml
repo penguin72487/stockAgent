@@ -24,9 +24,9 @@ data:
   use_rapids: false
   usd_only_trading_pairs: false
   panel_backend: auto
-  panel_load_workers: 4
-  # tradable_mode: tw_limit_guard
-  tradable_mode: tradable
+  panel_load_workers: 28
+  tradable_mode: tw_limit_guard
+  # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -35,8 +35,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.000855
-  sell_fee_rate: 0.003855
+  buy_fee_rate: 0.0005
+  sell_fee_rate: 0.005
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -64,17 +64,18 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: true
-  lookback: 8
-  batch_size: 64
-  batch_size_train: 64
-  batch_size_eval: 64
+  lookback: 32
+  batch_size: 16
+  batch_size_train: 16
+  batch_size_eval: 16
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
-  record_epoch_curve: false
+  record_epoch_curve: true
   curve_plot_interval: 1
   curve_plot_async: true
+  plot_backend: auto
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
   input_pipeline_ab_test: false
@@ -87,6 +88,18 @@ training:
   explain_sample_method: even
   explain_perturb: true
   explain_write_plots: true
+  explain_report_style: paper
+  explain_plot_theme: paper
+  explain_interactive_plots: false
+  explain_shap_enabled: true
+  explain_shap_mode: score_head_surrogate
+  explain_case_study_top_k: 5
+  explain_regime_analysis: true
+  explain_fold_stability: true
+  explain_umap_enabled: true
+  explain_umap_max_points: 10000
+  explain_umap_n_neighbors: 15
+  explain_umap_min_dist: 0.1
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
   learning_rate: 0.0001
@@ -224,7 +237,7 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: attention
+    temporal_pooling: last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2

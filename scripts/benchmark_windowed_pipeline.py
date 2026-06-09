@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 
@@ -21,10 +27,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark materialized vs lazy windowed tensor setup.")
     parser.add_argument("--config", default="configs/experiment_baseline.yaml")
     parser.add_argument("--fold-index", type=int, default=0)
+    parser.add_argument("--lookback", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--batches", type=int, default=20)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--cache-on-device", action="store_true")
+    parser.add_argument("--skip-materialized", action="store_true")
     args = parser.parse_args()
 
     config = load_config(args.config)
+    lookback = int(args.lookback) if args.lookback is not None else int(config.training.lookback)
+    device = torch.device(args.device)
     panel = build_panel(
         config.data.parquet_root,
         use_rapids=config.data.use_rapids,
@@ -41,16 +54,22 @@ def main() -> None:
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
     fold = folds[min(args.fold_index, len(folds) - 1)]
-    dataset = CrossSectionalDataset(panel, fold.train_indices, config.training.lookback)
-    batch_size = max(1, min(int(config.training.batch_size_train), len(dataset)))
+    dataset = CrossSectionalDataset(panel, fold.train_indices, lookback)
+    configured_batch = int(args.batch_size) if args.batch_size is not None else int(config.training.batch_size_train)
+    batch_size = max(1, min(configured_batch, len(dataset)))
 
-    materialized_start = time.perf_counter()
-    materialized = _dataset_to_tensors(dataset)
-    materialized_s = time.perf_counter() - materialized_start
-    materialized_bytes = sum(_tensor_nbytes(tensor) for tensor in materialized)
+    materialized_s: float | None = None
+    materialized_bytes: int | None = None
+    if not args.skip_materialized:
+        materialized_start = time.perf_counter()
+        materialized = _dataset_to_tensors(dataset)
+        materialized_s = time.perf_counter() - materialized_start
+        materialized_bytes = sum(_tensor_nbytes(tensor) for tensor in materialized)
 
     windowed_start = time.perf_counter()
     windowed = dataset_to_windowed_tensors(dataset)
+    if args.cache_on_device and device.type != "cpu":
+        windowed = windowed.to_device_cache(device)
     windowed_s = time.perf_counter() - windowed_start
     base_tensors = (
         windowed.features,
@@ -69,23 +88,28 @@ def main() -> None:
     for batch_idx in range(batches):
         start = (batch_idx * batch_size) % rows
         end = min(start + batch_size, rows)
-        _ = windowed.batch_by_rows(start, end, torch.device("cpu"), non_blocking=False)
+        _ = windowed.batch_by_rows(start, end, device, non_blocking=(device.type == "cuda"))
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
     gather_s = time.perf_counter() - gather_start
 
     print(
         {
             "fold_id": fold.fold_id,
-            "lookback": config.training.lookback,
+            "lookback": lookback,
             "rows": len(dataset),
             "symbols": panel.num_symbols,
             "features": len(panel.feature_names),
             "batch_size": batch_size,
-            "materialized_setup_s": round(materialized_s, 4),
-            "materialized_gb": round(_gb(materialized_bytes), 4),
+            "device": str(device),
+            "cache_on_device": bool(args.cache_on_device and device.type != "cpu"),
+            "materialized_setup_s": None if materialized_s is None else round(materialized_s, 4),
+            "materialized_gb": None if materialized_bytes is None else round(_gb(materialized_bytes), 4),
             "windowed_setup_s": round(windowed_s, 4),
             "windowed_base_gb": round(_gb(windowed_bytes), 4),
             "windowed_gather_s_per_batch": round(gather_s / batches, 6),
-        }
+        },
+        flush=True,
     )
 
 

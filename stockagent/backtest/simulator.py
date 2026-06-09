@@ -238,6 +238,13 @@ def _env_int(name: str, default: int = 0) -> int:
 
 
 def _torch_dynamo_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    compiler_is_compiling = getattr(compiler, "is_compiling", None)
+    if callable(compiler_is_compiling):
+        try:
+            return bool(compiler_is_compiling())
+        except Exception:
+            pass
     dynamo = getattr(torch, "_dynamo", None)
     if dynamo is None:
         return False
@@ -326,7 +333,21 @@ def get_backtest_prep_compile_stats(reset: bool = False) -> dict[str, int]:
 
 
 def _add_backtest_runtime_stat(key: str, value: float = 1.0) -> None:
+    if _torch_dynamo_is_compiling():
+        return
     _BACKTEST_RUNTIME_STATS[key] = float(_BACKTEST_RUNTIME_STATS.get(key, 0.0)) + float(value)
+
+
+def _runtime_stat_start() -> float | None:
+    if _torch_dynamo_is_compiling():
+        return None
+    return time.perf_counter()
+
+
+def _add_backtest_elapsed_stat(key: str, start: float | None) -> None:
+    if start is None:
+        return
+    _add_backtest_runtime_stat(key, time.perf_counter() - start)
 
 
 class _CudaRuntimeTimer:
@@ -1136,7 +1157,7 @@ def _vectorized_backtest_torch(
     dense_mask_constraints: bool = False,
     initial_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    total_start = time.perf_counter()
+    total_start = _runtime_stat_start()
     _add_backtest_runtime_stat("calls")
     if initial_weights is not None:
         _add_backtest_runtime_stat("stateful_calls")
@@ -1149,7 +1170,7 @@ def _vectorized_backtest_torch(
         max_possible_turnover = 2.0 * gross_budget
         if effective_max_turnover_ratio >= max_possible_turnover:
             effective_max_turnover_ratio = 0.0
-        prep_start = time.perf_counter()
+        prep_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prep_cuda_s", weights):
             prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
                 weights,
@@ -1159,8 +1180,8 @@ def _vectorized_backtest_torch(
                 long_only,
                 gross_leverage,
             )
-        _add_backtest_runtime_stat("prep_s", time.perf_counter() - prep_start)
-        prev_init_start = time.perf_counter()
+        _add_backtest_elapsed_stat("prep_s", prep_start)
+        prev_init_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
             prev_init = (
                 torch.nan_to_num(
@@ -1172,7 +1193,7 @@ def _vectorized_backtest_torch(
                 if initial_weights is not None
                 else torch.zeros_like(prepped_weights[0])
             )
-        _add_backtest_runtime_stat("prev_init_s", time.perf_counter() - prev_init_start)
+        _add_backtest_elapsed_stat("prev_init_s", prev_init_start)
 
     # Fast path: no tradability/side restrictions and no turnover cap.
     # In this case, each day's realised target equals model target, so we can
@@ -1180,7 +1201,7 @@ def _vectorized_backtest_torch(
     use_dense_fast_path = effective_max_turnover_ratio <= 0.0 and bool(dense_mask_constraints)
     if use_dense_fast_path:
         _add_backtest_runtime_stat("dense_fast_path_calls")
-        dense_start = time.perf_counter()
+        dense_start = _runtime_stat_start()
         with _CudaRuntimeTimer("dense_fast_path_cuda_s", prepped_weights):
             returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
             deltas = torch.empty_like(prepped_weights)
@@ -1200,8 +1221,8 @@ def _vectorized_backtest_torch(
                 weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
 
             returns_dtype = prepped_weights.dtype
-        _add_backtest_runtime_stat("dense_fast_path_s", time.perf_counter() - dense_start)
-        _add_backtest_runtime_stat("total_s", time.perf_counter() - total_start)
+        _add_backtest_elapsed_stat("dense_fast_path_s", dense_start)
+        _add_backtest_elapsed_stat("total_s", total_start)
         return (
             strategy_returns.to(returns_dtype),
             turnovers.to(returns_dtype),
@@ -1234,7 +1255,7 @@ def _vectorized_backtest_torch(
     )
     if use_cpp_long_short:
         _add_backtest_runtime_stat("cpp_ext_calls")
-        cpp_start = time.perf_counter()
+        cpp_start = _runtime_stat_start()
         try:
             with _CudaRuntimeTimer("cpp_ext_cuda_s", prepped_weights):
                 strategy_returns, turnovers, weights_history = run_long_short_cpp_autograd(
@@ -1251,12 +1272,12 @@ def _vectorized_backtest_torch(
             final_weights = weights_history[-1]
             if not return_weights_history:
                 weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
-            _add_backtest_runtime_stat("cpp_ext_s", time.perf_counter() - cpp_start)
-            _add_backtest_runtime_stat("total_s", time.perf_counter() - total_start)
+            _add_backtest_elapsed_stat("cpp_ext_s", cpp_start)
+            _add_backtest_elapsed_stat("total_s", total_start)
             return strategy_returns, turnovers, weights_history, final_weights
         except Exception as e:
             _add_backtest_runtime_stat("cpp_ext_failures")
-            _add_backtest_runtime_stat("cpp_ext_s", time.perf_counter() - cpp_start)
+            _add_backtest_elapsed_stat("cpp_ext_s", cpp_start)
             if _compile_verbose():
                 print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
 
@@ -1269,7 +1290,7 @@ def _vectorized_backtest_torch(
 
     if use_checkpoint:
         _add_backtest_runtime_stat("checkpoint_calls")
-        resolve_start = time.perf_counter()
+        resolve_start = _runtime_stat_start()
         # Checkpoint recomputation and cudagraph-captured compiled functions can
         # conflict in backward. Use eager runner for this path to keep training stable.
         runner = _scan_runner_factory(
@@ -1279,7 +1300,7 @@ def _vectorized_backtest_torch(
             scan_chunk_size=resolved_chunk,
             record_weights_history=return_weights_history,
         )
-        _add_backtest_runtime_stat("runner_resolve_s", time.perf_counter() - resolve_start)
+        _add_backtest_elapsed_stat("runner_resolve_s", resolve_start)
         _add_backtest_runtime_stat("eager_runner_calls")
     else:
         stateful_initial = initial_weights is not None
@@ -1288,7 +1309,7 @@ def _vectorized_backtest_torch(
             and prepped_weights.device.type == "cuda"
             and hasattr(torch, "compile")
         )
-        resolve_start = time.perf_counter()
+        resolve_start = _runtime_stat_start()
         if initial_weights is not None:
             if _compile_stateful_enabled():
                 # Stateful train/eval scans carry detached portfolio state between
@@ -1334,11 +1355,11 @@ def _vectorized_backtest_torch(
             else:
                 _add_backtest_runtime_stat("eager_runner_calls")
                 _add_backtest_runtime_stat("nonstateful_eager_runner_calls")
-        _add_backtest_runtime_stat("runner_resolve_s", time.perf_counter() - resolve_start)
+        _add_backtest_elapsed_stat("runner_resolve_s", resolve_start)
 
     if not use_checkpoint:
         try:
-            runner_call_start = time.perf_counter()
+            runner_call_start = _runtime_stat_start()
             with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
                 turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
                     prepped_weights,
@@ -1348,14 +1369,14 @@ def _vectorized_backtest_torch(
                     prepped_sell,
                     prev_init,
                 )
-            _add_backtest_runtime_stat("runner_call_s", time.perf_counter() - runner_call_start)
+            _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
         except Exception as e:
             if _torch_dynamo_is_compiling() or not (
                 _compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")
             ):
                 raise
             _add_backtest_runtime_stat("runtime_fallback_calls")
-            fallback_start = time.perf_counter()
+            fallback_start = _runtime_stat_start()
             runner = _fallback_scan_runner_after_runtime_failure(
                 error=e,
                 weights=prepped_weights,
@@ -1366,8 +1387,8 @@ def _vectorized_backtest_torch(
                 record_weights_history=return_weights_history,
                 stateful_initial=initial_weights is not None,
             )
-            _add_backtest_runtime_stat("runtime_fallback_s", time.perf_counter() - fallback_start)
-            runner_call_start = time.perf_counter()
+            _add_backtest_elapsed_stat("runtime_fallback_s", fallback_start)
+            runner_call_start = _runtime_stat_start()
             with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
                 turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
                     prepped_weights,
@@ -1377,9 +1398,9 @@ def _vectorized_backtest_torch(
                     prepped_sell,
                     prev_init,
                 )
-            _add_backtest_runtime_stat("runner_call_s", time.perf_counter() - runner_call_start)
+            _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
     else:
-        checkpoint_start = time.perf_counter()
+        checkpoint_start = _runtime_stat_start()
         with _CudaRuntimeTimer("checkpoint_cuda_s", prepped_weights):
             chunk_rows = max(1, int(checkpoint_rows))
             turnovers_chunks: list[torch.Tensor] = []
@@ -1426,9 +1447,9 @@ def _vectorized_backtest_torch(
             else:
                 weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
             final_weights = prev
-        _add_backtest_runtime_stat("checkpoint_s", time.perf_counter() - checkpoint_start)
+        _add_backtest_elapsed_stat("checkpoint_s", checkpoint_start)
 
-    finalize_start = time.perf_counter()
+    finalize_start = _runtime_stat_start()
     with _CudaRuntimeTimer("finalize_cuda_s", prepped_weights):
         returns_dtype = prepped_weights.dtype
         strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
@@ -1438,8 +1459,8 @@ def _vectorized_backtest_torch(
             weights_history.to(returns_dtype),
             final_weights.to(returns_dtype),
         )
-    _add_backtest_runtime_stat("finalize_s", time.perf_counter() - finalize_start)
-    _add_backtest_runtime_stat("total_s", time.perf_counter() - total_start)
+    _add_backtest_elapsed_stat("finalize_s", finalize_start)
+    _add_backtest_elapsed_stat("total_s", total_start)
     return result
 
 
