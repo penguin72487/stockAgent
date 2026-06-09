@@ -169,6 +169,30 @@ def test_aux_details_false_keeps_training_output_light() -> None:
     assert aux["dynamic_market_delta"].shape == (2, 2, 24)
 
 
+@pytest.mark.parametrize("mode", ["axial", "latent", "market_token", "temporal_only"])
+def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode=mode,
+        temporal_pooling="last",
+        temporal_layers=2,
+        return_aux=True,
+        return_aux_details=False,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 11:] = False
+
+    with torch.no_grad():
+        fast_out = model(x, mask)
+        full_weights, full_scores, full_aux = model(x, mask, return_aux=True)
+
+    assert "aux" not in fast_out
+    assert full_aux["token_embedding"].shape == (2, 6, 13, 24)
+    assert torch.allclose(fast_out["weights"], full_weights, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(fast_out["scores"], full_scores, atol=1e-5, rtol=1e-5)
+
+
 def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:
     device = _device()
     model = _make_model(
