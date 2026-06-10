@@ -1807,20 +1807,13 @@ def run_backtest_integer_shares(
         day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
         records.extend(day_rows)
 
-        # Keep PnL calculation aligned with realized holdings ratio.
-        if price_matrix is not None and (t + 1) < t_len:
-            next_prices = np.where(price_matrix[t + 1] > 1e-12, price_matrix[t + 1], current_prices)
-            simple_returns = np.divide(
-                next_prices - current_prices,
-                current_prices,
-                out=np.zeros_like(current_prices, dtype=np.float64),
-                where=current_prices > 1e-12,
-            )
-        else:
-            simple_returns = np.expm1(r[t])
-            simple_returns = np.where(np.isfinite(simple_returns), simple_returns, 0.0)
-            next_prices = current_prices * (1.0 + simple_returns)
-            next_prices = np.where(np.isfinite(next_prices) & (next_prices > 1e-12), next_prices, current_prices)
+        # PnL follows the canonical return label (adj close when available).
+        # close_prices are reserved for execution prices, integer share sizing,
+        # turnover, and the holdings report.
+        simple_returns = np.expm1(r[t])
+        simple_returns = np.where(np.isfinite(simple_returns), simple_returns, 0.0)
+        next_prices = current_prices * (1.0 + simple_returns)
+        next_prices = np.where(np.isfinite(next_prices) & (next_prices > 1e-12), next_prices, current_prices)
 
         equity_end = float(equity_after_trade + np.dot(stock_market_values, simple_returns))
         equity_end = max(equity_end, 1e-12)
