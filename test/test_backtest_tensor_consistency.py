@@ -12,8 +12,10 @@ from stockagent.training.trainer import (
     _CompiledLossFallback,
     _dataset_to_tensors,
     _detach_portfolio_state,
+    _estimate_eval_chunk_rows,
     _evaluate_tensor_batch,
     _evaluate_windowed_tensor_batch,
+    _maybe_share_windowed_base_from_cached,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -58,6 +60,15 @@ def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> No
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert calls == {"compiled": 1, "eager": 2}
+
+
+def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048) == 2048
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=999999) == 4096
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=0) == 1
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048, max_chunk_rows=64) == 64
+    assert _estimate_eval_chunk_rows(total_rows=32, estimated_rows=2048, max_chunk_rows=64) == 32
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048, max_chunk_rows=0) == 2048
 
 
 def test_backtest_compile_gate_skips_toolchain_lookup_while_dynamo_compiling(monkeypatch) -> None:
@@ -223,6 +234,58 @@ def test_evaluate_tensor_batch_resets_only_at_segment_boundaries() -> None:
     assert torch.allclose(backtest.weights_history.cpu(), expected_weights, atol=1e-7, rtol=1e-6)
 
 
+def test_evaluate_tensor_batch_ragged_chunk_padding_matches_full_long_short_backtest() -> None:
+    torch.manual_seed(654)
+    rows, symbols = 13, 6
+    raw_weights = torch.randn(rows, symbols)
+    x = raw_weights[:, None, :, None].contiguous()
+    returns = torch.randn(rows, symbols) * 0.01
+    tradable = torch.ones(rows, symbols, dtype=torch.bool)
+    can_buy = torch.rand(rows, symbols) > 0.20
+    can_sell = torch.rand(rows, symbols) > 0.20
+    can_buy[0] = True
+    can_sell[0] = True
+    benchmark = returns.mean(dim=1)
+
+    expected = run_backtest_torch(
+        raw_weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.001,
+        sell_fee_rate=0.003,
+        long_only=False,
+        max_turnover_ratio=0.55,
+        gross_leverage=1.0,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+    )
+    actual, _, _ = _evaluate_tensor_batch(
+        _EchoWeightModel(),
+        x,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        benchmark,
+        torch.device("cpu"),
+        None,
+        False,
+        False,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=4,
+    )
+
+    assert actual.strategy_returns.numel() == rows
+    assert actual.weights_history.shape == expected.weights_history.shape
+    assert torch.allclose(actual.strategy_returns.cpu(), expected.strategy_returns, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(actual.turnovers.cpu(), expected.turnovers, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(actual.weights_history.cpu(), expected.weights_history, atol=1e-7, rtol=1e-6)
+
+
 def _make_panel(rows: int = 8, symbols: int = 4, features: int = 3) -> PanelData:
     values = torch.arange(rows * symbols * features, dtype=torch.float32).reshape(rows, symbols, features)
     returns = torch.linspace(-0.02, 0.02, rows * symbols, dtype=torch.float32).reshape(rows, symbols)
@@ -275,6 +338,33 @@ def test_windowed_contiguous_fast_path_matches_indexed_path() -> None:
     assert set(fast) == set(indexed)
     for key in fast:
         assert torch.equal(fast[key], indexed[key]), key
+
+
+def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> None:
+    panel = _make_panel(rows=12, symbols=4, features=3)
+    first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
+    first = dataset_to_windowed_tensors(first_ds)
+    second = dataset_to_windowed_tensors(second_ds)
+
+    shared = _maybe_share_windowed_base_from_cached(
+        name="test split",
+        split=second,
+        cached_base=first,
+        device=torch.device("cpu"),
+        non_blocking=False,
+        enabled=True,
+    )
+
+    assert shared is not None
+    assert shared.features.data_ptr() == first.features.data_ptr()
+    assert shared.future_log_returns.data_ptr() == first.future_log_returns.data_ptr()
+    assert shared.valid_indices.data_ptr() != first.valid_indices.data_ptr()
+
+    expected = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
+    actual = shared.batch_by_rows(0, len(shared), torch.device("cpu"), non_blocking=False)
+    for key in expected:
+        assert torch.equal(actual[key], expected[key]), key
 
 
 def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:

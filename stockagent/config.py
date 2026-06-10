@@ -362,6 +362,7 @@ class TrainingConfig:
     compile_loss: bool | None = None
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
+    eval_auto_chunk_rows_cap: int = 16
     train_symbol_subsample_ratio: float = 1.0
     detach_prev_state: bool = True
     prefer_fp16: bool = False
@@ -518,6 +519,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("compile_loss", None)
     training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
+    training.setdefault("eval_auto_chunk_rows_cap", 16)
     training.setdefault("train_symbol_subsample_ratio", 1.0)
     training.setdefault("detach_prev_state", True)
     training.setdefault("prefer_fp16", False)
@@ -1001,6 +1003,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             compile_loss=training_raw["compile_loss"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
+            eval_auto_chunk_rows_cap=training_raw["eval_auto_chunk_rows_cap"],
             train_symbol_subsample_ratio=training_raw["train_symbol_subsample_ratio"],
             detach_prev_state=training_raw["detach_prev_state"],
             prefer_fp16=training_raw["prefer_fp16"],
