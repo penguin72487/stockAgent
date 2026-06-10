@@ -24,7 +24,11 @@ OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Vo
 KLINE_INTERVAL = "15"
 KLINE_INTERVAL_LABEL = "15m"
 CANDLE_INTERVAL_MS = 15 * 60 * 1000
-WINDOW_DAYS = 10
+BYBIT_MAX_REQ_PER_SEC = 10.0
+BYBIT_MIN_REQUEST_INTERVAL = 1.0 / BYBIT_MAX_REQ_PER_SEC
+BYBIT_MAX_KLINE_LIMIT = "1000"
+BYBIT_MAX_CANDLES_PER_REQUEST = int(BYBIT_MAX_KLINE_LIMIT)
+BYBIT_WINDOW_SPAN_MS = (BYBIT_MAX_CANDLES_PER_REQUEST - 1) * CANDLE_INTERVAL_MS
 
 
 @dataclass(slots=True)
@@ -73,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         default=["linear", "inverse"],
         help="Bybit categories to fetch: linear inverse (default: both)",
     )
-    parser.add_argument("--workers", type=int, default=2, help="Parallel symbol workers")
+    parser.add_argument("--workers", type=int, default=16, help="Parallel symbol workers")
     parser.add_argument("--limit", type=int, default=None, help="Optional symbol limit for quick tests")
     parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
     parser.add_argument(
@@ -151,20 +155,14 @@ def _frame_matches_15m_interval(frame: pd.DataFrame) -> bool:
     return median_delta <= (CANDLE_INTERVAL_MS / 1000) * 4
 
 
-def _iter_windows(start_ms: int, end_ms: int, days_per_window: int = WINDOW_DAYS) -> list[tuple[int, int]]:
+def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
     windows: list[tuple[int, int]] = []
-    cursor = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    cursor = start_ms
 
-    while cursor <= end_dt:
-        chunk_end = min(cursor + timedelta(days=days_per_window - 1), end_dt)
-        chunk_end = chunk_end.replace(hour=23, minute=59, second=59, microsecond=999000)
-        windows.append((int(cursor.timestamp() * 1000), int(chunk_end.timestamp() * 1000)))
-        cursor = (chunk_end + timedelta(milliseconds=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+    while cursor <= end_ms:
+        chunk_end = min(cursor + BYBIT_WINDOW_SPAN_MS, end_ms)
+        windows.append((cursor, chunk_end))
+        cursor = chunk_end + CANDLE_INTERVAL_MS
 
     return windows
 
@@ -172,6 +170,12 @@ def _iter_windows(start_ms: int, end_ms: int, days_per_window: int = WINDOW_DAYS
 class BybitClient:
     def __init__(self, request_interval: float, max_retries: int, retry_base: float) -> None:
         self.request_interval = max(0.0, request_interval)
+        if 0.0 < self.request_interval < BYBIT_MIN_REQUEST_INTERVAL:
+            print(
+                "[bybit] request_interval too small for 10 req/s limit; "
+                f"clamp {self.request_interval} -> {BYBIT_MIN_REQUEST_INTERVAL:.3f}"
+            )
+            self.request_interval = BYBIT_MIN_REQUEST_INTERVAL
         self.max_retries = max(0, max_retries)
         self.retry_base = max(0.1, retry_base)
         self._lock = threading.Lock()
@@ -401,7 +405,7 @@ def _download_symbol_daily(
                 "interval": KLINE_INTERVAL,
                 "start": str(window_start),
                 "end": str(window_end),
-                "limit": "1000",
+                "limit": BYBIT_MAX_KLINE_LIMIT,
             },
         )
         chunk = payload.get("result", {}).get("list", [])
@@ -508,8 +512,31 @@ def main() -> None:
     symbols_path = output_dir / "symbols.csv"
     pd.DataFrame([asdict(s) for s in symbols]).to_csv(symbols_path, index=False)
 
+    total_symbols = len(symbols)
+    print(
+        "[bybit] start "
+        f"symbols={total_symbols} interval={KLINE_INTERVAL_LABEL} "
+        f"workers={args.workers} request_interval={args.request_interval}s"
+    )
+
+    progress_lock = threading.Lock()
+    started_symbols = 0
+    finished_symbols = 0
+
     def _worker(record: SymbolRecord) -> DownloadResult:
-        return _download_symbol_daily(
+        nonlocal started_symbols, finished_symbols
+
+        with progress_lock:
+            started_symbols += 1
+            started_idx = started_symbols
+
+        if started_idx <= 5 or started_idx % 50 == 0:
+            print(
+                f"[bybit] start symbol {started_idx}/{total_symbols} "
+                f"{record.bybit_symbol} ({record.category})"
+            )
+
+        result = _download_symbol_daily(
             client,
             record,
             output_dir,
@@ -518,6 +545,18 @@ def main() -> None:
             args.mode,
             args.refresh,
         )
+
+        with progress_lock:
+            finished_symbols += 1
+            done_idx = finished_symbols
+
+        if done_idx <= 5 or done_idx % 25 == 0:
+            print(
+                f"[bybit] done symbol {done_idx}/{total_symbols} "
+                f"{record.bybit_symbol} status={result.status} rows={result.rows}"
+            )
+
+        return result
 
     def _on_error(record: SymbolRecord, exc: Exception) -> DownloadResult:
         return DownloadResult(

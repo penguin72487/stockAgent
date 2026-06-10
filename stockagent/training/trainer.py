@@ -99,12 +99,16 @@ class TimingBreakdown:
     step_s: float = 0.0
     step_cuda_s: float = 0.0
     backtest_s: float = 0.0
+    backtest_prepare_s: float = 0.0
+    backtest_runner_s: float = 0.0
+    backtest_finalize_s: float = 0.0
     ic_s: float = 0.0
     metrics_s: float = 0.0
     concat_s: float = 0.0
     save_s: float = 0.0
     plot_s: float = 0.0
     sync_s: float = 0.0
+    cpu_gpu_sync_s: float = 0.0
     gc_s: float = 0.0
     batches: int = 0
     cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
@@ -133,12 +137,16 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "step_s",
         "step_cuda_s",
         "backtest_s",
+        "backtest_prepare_s",
+        "backtest_runner_s",
+        "backtest_finalize_s",
         "ic_s",
         "metrics_s",
         "concat_s",
         "save_s",
         "plot_s",
         "sync_s",
+        "cpu_gpu_sync_s",
         "gc_s",
     ):
         value = getattr(timing, name)
@@ -168,12 +176,16 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "step_s",
         "step_cuda_s",
         "backtest_s",
+        "backtest_prepare_s",
+        "backtest_runner_s",
+        "backtest_finalize_s",
         "ic_s",
         "metrics_s",
         "concat_s",
         "save_s",
         "plot_s",
         "sync_s",
+        "cpu_gpu_sync_s",
         "gc_s",
     ):
         setattr(dst, name, getattr(dst, name) + getattr(src, name))
@@ -1285,6 +1297,13 @@ def _timing_curve_payload(
     def _loss_avg_ms(key: str) -> float:
         return float(loss_runtime_stats.get(key, 0.0)) * 1000.0 / float(batches)
 
+    def _timing_ms_per_call(total_s: float, calls: int | float) -> float:
+        denom = max(1.0, float(calls))
+        return float(total_s) * 1000.0 / denom
+
+    def _epoch_percent(value_s: float) -> float:
+        return float(value_s) * 100.0 / max(1e-12, float(epoch_total_s))
+
     val_metrics_value = float(val_loss_s if val_metrics_s is None else val_metrics_s)
     checkpoint_total_s = (
         float(checkpoint_save_s)
@@ -1361,25 +1380,41 @@ def _timing_curve_payload(
         "train_step_cuda_ms_per_batch": _avg_ms(train_timing.step_cuda_s),
         "val_eval_s": float(val_eval_s),
         "val_transfer_s": float(val_timing.transfer_s),
+        "val_eval_transfer_to_gpu_s": float(val_timing.transfer_s),
         "val_forward_s": float(val_timing.forward_s),
+        "val_eval_model_forward_s": float(val_timing.model_forward_s),
         "val_model_forward_s": float(val_timing.model_forward_s),
         "val_loss_compute_s": float(val_timing.loss_s),
         "val_backtest_s": float(val_timing.backtest_s),
+        "val_eval_backtest_prepare_s": float(val_timing.backtest_prepare_s),
+        "val_eval_backtest_runner_s": float(val_timing.backtest_runner_s),
+        "val_eval_backtest_finalize_s": float(val_timing.backtest_finalize_s),
         "val_ic_s": float(val_timing.ic_s),
         "val_metrics_reduce_s": float(val_timing.metrics_s),
+        "val_eval_metrics_s": float(val_timing.metrics_s),
         "val_concat_s": float(val_timing.concat_s),
+        "val_eval_concat_s": float(val_timing.concat_s),
+        "val_eval_cpu_gpu_sync_s": float(val_timing.cpu_gpu_sync_s),
         "val_loss_s": float(val_loss_s),
         "val_metrics_s": val_metrics_value,
         "test_curve_s": float(test_curve_s),
         "test_curve_loss_s": float(test_curve_loss_s),
         "test_curve_transfer_s": float(test_curve_timing.transfer_s),
+        "test_curve_eval_transfer_to_gpu_s": float(test_curve_timing.transfer_s),
         "test_curve_forward_s": float(test_curve_timing.forward_s),
         "test_curve_model_forward_s": float(test_curve_timing.model_forward_s),
+        "test_curve_eval_model_forward_s": float(test_curve_timing.model_forward_s),
         "test_curve_loss_compute_s": float(test_curve_timing.loss_s),
         "test_curve_backtest_s": float(test_curve_timing.backtest_s),
+        "test_curve_eval_backtest_prepare_s": float(test_curve_timing.backtest_prepare_s),
+        "test_curve_eval_backtest_runner_s": float(test_curve_timing.backtest_runner_s),
+        "test_curve_eval_backtest_finalize_s": float(test_curve_timing.backtest_finalize_s),
         "test_curve_ic_s": float(test_curve_timing.ic_s),
         "test_curve_metrics_reduce_s": float(test_curve_timing.metrics_s),
+        "test_curve_eval_metrics_s": float(test_curve_timing.metrics_s),
         "test_curve_concat_s": float(test_curve_timing.concat_s),
+        "test_curve_eval_concat_s": float(test_curve_timing.concat_s),
+        "test_curve_eval_cpu_gpu_sync_s": float(test_curve_timing.cpu_gpu_sync_s),
         "bt_compile_hits": int(backtest_compile_stats.get("hits", 0)),
         "bt_compile_misses": int(backtest_compile_stats.get("misses", 0)),
         "bt_compile_failures": int(backtest_compile_stats.get("failures", 0)),
@@ -1437,6 +1472,42 @@ def _timing_curve_payload(
         "loss_initial_weights_clone_calls": int(loss_runtime_stats.get("initial_weights_clone_calls", 0.0)),
         "loss_final_weights_clone_ms_per_batch": _loss_avg_ms("final_weights_clone_s"),
         "loss_final_weights_clone_calls": int(loss_runtime_stats.get("final_weights_clone_calls", 0.0)),
+        "loss_prepare_inputs_ms_per_batch": _loss_avg_ms("prepare_inputs_s"),
+        "loss_prepare_inputs_calls": int(loss_runtime_stats.get("prepare_inputs_calls", 0.0)),
+        "loss_normalize_weights_ms_per_batch": _loss_avg_ms("normalize_weights_s"),
+        "loss_normalize_weights_calls": int(loss_runtime_stats.get("normalize_weights_calls", 0.0)),
+        "loss_build_orders_ms_per_batch": _loss_avg_ms("build_orders_s"),
+        "loss_build_orders_calls": int(loss_runtime_stats.get("build_orders_calls", 0.0)),
+        "loss_backtest_ms_per_batch": _loss_avg_ms("backtest_s"),
+        "loss_backtest_calls": int(loss_runtime_stats.get("backtest_calls", 0.0)),
+        "loss_returns_postprocess_ms_per_batch": _loss_avg_ms("returns_postprocess_s"),
+        "loss_returns_postprocess_calls": int(loss_runtime_stats.get("returns_postprocess_calls", 0.0)),
+        "loss_log_utility_ms_per_batch": _loss_avg_ms("log_utility_s"),
+        "loss_log_utility_calls": int(loss_runtime_stats.get("log_utility_calls", 0.0)),
+        "loss_nan_to_num_ms_per_batch": _loss_avg_ms("nan_to_num_s"),
+        "loss_nan_to_num_calls": int(loss_runtime_stats.get("nan_to_num_calls", 0.0)),
+        "loss_mask_apply_ms_per_batch": _loss_avg_ms("mask_apply_s"),
+        "loss_mask_apply_calls": int(loss_runtime_stats.get("mask_apply_calls", 0.0)),
+        "loss_reduce_ms_per_batch": _loss_avg_ms("reduce_s"),
+        "loss_reduce_calls": int(loss_runtime_stats.get("reduce_calls", 0.0)),
+        "loss_clone_ms_per_batch": _loss_avg_ms("clone_s"),
+        "loss_clone_calls": int(loss_runtime_stats.get("clone_calls", 0.0)),
+        "loss_state_update_ms_per_batch": _loss_avg_ms("state_update_s"),
+        "loss_state_update_calls": int(loss_runtime_stats.get("state_update_calls", 0.0)),
+        "loss_autograd_graph_build_ms_per_batch": _loss_avg_ms("autograd_graph_build_s"),
+        "loss_autograd_graph_build_calls": int(loss_runtime_stats.get("autograd_graph_build_calls", 0.0)),
+        "loss_prepare_inputs_total_s": float(loss_runtime_stats.get("prepare_inputs_s", 0.0)),
+        "loss_normalize_weights_total_s": float(loss_runtime_stats.get("normalize_weights_s", 0.0)),
+        "loss_build_orders_total_s": float(loss_runtime_stats.get("build_orders_s", 0.0)),
+        "loss_backtest_total_s": float(loss_runtime_stats.get("backtest_s", 0.0)),
+        "loss_returns_postprocess_total_s": float(loss_runtime_stats.get("returns_postprocess_s", 0.0)),
+        "loss_log_utility_total_s": float(loss_runtime_stats.get("log_utility_s", 0.0)),
+        "loss_nan_to_num_total_s": float(loss_runtime_stats.get("nan_to_num_s", 0.0)),
+        "loss_mask_apply_total_s": float(loss_runtime_stats.get("mask_apply_s", 0.0)),
+        "loss_reduce_total_s": float(loss_runtime_stats.get("reduce_s", 0.0)),
+        "loss_clone_total_s": float(loss_runtime_stats.get("clone_s", 0.0)),
+        "loss_state_update_total_s": float(loss_runtime_stats.get("state_update_s", 0.0)),
+        "loss_autograd_graph_build_total_s": float(loss_runtime_stats.get("autograd_graph_build_s", 0.0)),
         "fold_checkpoint_save_s": float(fold_checkpoint_save_s),
         "group_checkpoint_save_s": float(group_checkpoint_save_s),
         "checkpoint_save_s": checkpoint_total_s,
@@ -1449,6 +1520,26 @@ def _timing_curve_payload(
         "epoch_wall_s": epoch_total_s,
         "epoch_unattributed_s": unattributed_s,
         "epoch_total_s": epoch_total_s,
+        "epoch_step_train_loss_total_time_s": float(train_timing.loss_s),
+        "epoch_step_train_loss_percent": _epoch_percent(train_timing.loss_s),
+        "epoch_step_train_loss_calls": int(train_timing.batches),
+        "epoch_step_train_loss_ms_per_call": _timing_ms_per_call(train_timing.loss_s, train_timing.batches),
+        "epoch_step_val_backtest_total_time_s": float(val_timing.backtest_s),
+        "epoch_step_val_backtest_percent": _epoch_percent(val_timing.backtest_s),
+        "epoch_step_val_backtest_calls": int(val_timing.batches),
+        "epoch_step_val_backtest_ms_per_call": _timing_ms_per_call(val_timing.backtest_s, val_timing.batches),
+        "epoch_step_test_curve_backtest_total_time_s": float(test_curve_timing.backtest_s),
+        "epoch_step_test_curve_backtest_percent": _epoch_percent(test_curve_timing.backtest_s),
+        "epoch_step_test_curve_backtest_calls": int(test_curve_timing.batches),
+        "epoch_step_test_curve_backtest_ms_per_call": _timing_ms_per_call(test_curve_timing.backtest_s, test_curve_timing.batches),
+        "epoch_step_test_curve_transfer_total_time_s": float(test_curve_timing.transfer_s),
+        "epoch_step_test_curve_transfer_percent": _epoch_percent(test_curve_timing.transfer_s),
+        "epoch_step_test_curve_transfer_calls": int(test_curve_timing.batches),
+        "epoch_step_test_curve_transfer_ms_per_call": _timing_ms_per_call(test_curve_timing.transfer_s, test_curve_timing.batches),
+        "epoch_step_val_transfer_total_time_s": float(val_timing.transfer_s),
+        "epoch_step_val_transfer_percent": _epoch_percent(val_timing.transfer_s),
+        "epoch_step_val_transfer_calls": int(val_timing.batches),
+        "epoch_step_val_transfer_ms_per_call": _timing_ms_per_call(val_timing.transfer_s, val_timing.batches),
     }
 
 
@@ -2260,6 +2351,11 @@ def _evaluate_tensor_batch(
             if progress_label:
                 _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} backtest")
             backtest_start = time.perf_counter()
+            backtest_prepare_start = time.perf_counter()
+            initial_weights_chunk = prev_weights
+            timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
+
+            backtest_runner_start = time.perf_counter()
             backtest_chunk = run_backtest_torch(
                 weights_chunk,
                 returns_chunk,
@@ -2273,10 +2369,22 @@ def _evaluate_tensor_batch(
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
-                initial_weights=prev_weights,
+                initial_weights=initial_weights_chunk,
             )
-            prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
             _maybe_sync_cuda(device, profile_timing)
+            timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
+
+            backtest_finalize_start = time.perf_counter()
+            prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
+            # These clones are required because compiled/CUDA-graph backtest
+            # outputs can be overwritten by the next replay.
+            if return_weights_history:
+                weights_chunks.append(backtest_chunk.weights_history.clone())
+            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
+            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
+            turnover_chunks.append(backtest_chunk.turnovers.clone())
+            _maybe_sync_cuda(device, profile_timing)
+            timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
             timing.backtest_s += time.perf_counter() - backtest_start
 
             if compute_ic:
@@ -2286,14 +2394,6 @@ def _evaluate_tensor_batch(
                 ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
-
-            # Clone CUDAGraph output tensors before the next compiled-backtest call
-            # overwrites the same output buffers (CUDA Graph static allocation).
-            if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history.clone())
-            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
-            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
-            turnover_chunks.append(backtest_chunk.turnovers.clone())
 
             if compute_metrics_summary:
                 metrics_start = time.perf_counter()
@@ -2374,6 +2474,7 @@ def _evaluate_tensor_batch(
                 "cumulative_benchmark": 0.0,
             }
         else:
+            cpu_gpu_sync_start = time.perf_counter()
             (
                 sum_r,
                 sumsq_r,
@@ -2384,19 +2485,25 @@ def _evaluate_tensor_batch(
                 sum_turnover,
                 hit_count,
                 min_dd_value,
-            ) = torch.stack(
-                [
-                    sum_r_t,
-                    sumsq_r_t,
-                    sum_b_t,
-                    sumsq_b_t,
-                    sum_downside_sq_r_t,
-                    sum_downside_sq_b_t,
-                    sum_turnover_t,
-                    hit_count_t,
-                    min_dd,
-                ]
-            ).detach().cpu().tolist()
+            ) = (
+                torch.stack(
+                    [
+                        sum_r_t,
+                        sumsq_r_t,
+                        sum_b_t,
+                        sumsq_b_t,
+                        sum_downside_sq_r_t,
+                        sum_downside_sq_b_t,
+                        sum_turnover_t,
+                        hit_count_t,
+                        min_dd,
+                    ]
+                )
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            timing.cpu_gpu_sync_s += time.perf_counter() - cpu_gpu_sync_start
             n = float(n_rows)
             mean_r = sum_r / n
             mean_b = sum_b / n
@@ -2436,9 +2543,14 @@ def _evaluate_tensor_batch(
         if not compute_ic:
             ic = {}
         else:
-            ic_count, ic_sum, ic_sumsq, ic_pos = torch.stack(
-                [ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t]
-            ).detach().cpu().tolist()
+            cpu_gpu_sync_start = time.perf_counter()
+            ic_count, ic_sum, ic_sumsq, ic_pos = (
+                torch.stack([ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t])
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            timing.cpu_gpu_sync_s += time.perf_counter() - cpu_gpu_sync_start
             if ic_count <= 0:
                 ic = {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
             else:
@@ -2567,6 +2679,11 @@ def _evaluate_windowed_tensor_batch(
             timing.model_forward_s += chunk_forward_elapsed
 
             backtest_start = time.perf_counter()
+            backtest_prepare_start = time.perf_counter()
+            initial_weights_chunk = prev_weights
+            timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
+
+            backtest_runner_start = time.perf_counter()
             backtest_chunk = run_backtest_torch(
                 weights_chunk,
                 returns_chunk,
@@ -2580,10 +2697,22 @@ def _evaluate_windowed_tensor_batch(
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
-                initial_weights=prev_weights,
+                initial_weights=initial_weights_chunk,
             )
-            prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
             _maybe_sync_cuda(device, profile_timing)
+            timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
+
+            backtest_finalize_start = time.perf_counter()
+            prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
+            # Required for compiled/CUDA-graph backtest outputs; the next replay
+            # may reuse output storage.
+            if return_weights_history:
+                weights_chunks.append(backtest_chunk.weights_history.clone())
+            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
+            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
+            turnover_chunks.append(backtest_chunk.turnovers.clone())
+            _maybe_sync_cuda(device, profile_timing)
+            timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
             timing.backtest_s += time.perf_counter() - backtest_start
 
             if compute_ic:
@@ -2591,12 +2720,6 @@ def _evaluate_windowed_tensor_batch(
                 ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
-
-            if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history.clone())
-            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
-            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
-            turnover_chunks.append(backtest_chunk.turnovers.clone())
 
             if compute_metrics_summary:
                 metrics_start = time.perf_counter()
@@ -2677,19 +2800,26 @@ def _evaluate_windowed_tensor_batch(
                 "cumulative_benchmark": 0.0,
             }
         else:
-            values = torch.stack(
-                [
-                    sum_r_t,
-                    sumsq_r_t,
-                    sum_b_t,
-                    sumsq_b_t,
-                    sum_downside_sq_r_t,
-                    sum_downside_sq_b_t,
-                    sum_turnover_t,
-                    hit_count_t,
-                    min_dd,
-                ]
-            ).detach().cpu().tolist()
+            cpu_gpu_sync_start = time.perf_counter()
+            values = (
+                torch.stack(
+                    [
+                        sum_r_t,
+                        sumsq_r_t,
+                        sum_b_t,
+                        sumsq_b_t,
+                        sum_downside_sq_r_t,
+                        sum_downside_sq_b_t,
+                        sum_turnover_t,
+                        hit_count_t,
+                        min_dd,
+                    ]
+                )
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            timing.cpu_gpu_sync_s += time.perf_counter() - cpu_gpu_sync_start
             sum_r, sumsq_r, sum_b, sumsq_b, sum_down_r, sum_down_b, sum_turnover, hit_count, min_dd_value = values
             n = float(n_rows)
             mean_r = sum_r / n
@@ -2724,9 +2854,14 @@ def _evaluate_windowed_tensor_batch(
         if not compute_ic:
             ic = {}
         else:
-            ic_count, ic_sum, ic_sumsq, ic_pos = torch.stack(
-                [ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t]
-            ).detach().cpu().tolist()
+            cpu_gpu_sync_start = time.perf_counter()
+            ic_count, ic_sum, ic_sumsq, ic_pos = (
+                torch.stack([ic_count_t, ic_sum_t, ic_sumsq_t, ic_pos_t])
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            timing.cpu_gpu_sync_s += time.perf_counter() - cpu_gpu_sync_start
             if ic_count <= 0:
                 ic = {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
             else:

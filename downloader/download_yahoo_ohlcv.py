@@ -487,6 +487,15 @@ def parse_args() -> argparse.Namespace:
             "by more than this many days. Set 0 to disable."
         ),
     )
+    parser.add_argument(
+        "--daily-discover-symbols",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Only for --mode daily-update: merge fresh stock listings and delisted candidates "
+            "from upstream symbol sources into the local tracked universe."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1102,7 +1111,7 @@ def _use_daily_update_cache_if_available(
     cached: list[SymbolRecord],
 ) -> list[SymbolRecord] | None:
     is_daily_update = getattr(args, "mode", "") == "daily-update"
-    if cached and is_daily_update:
+    if cached and is_daily_update and not getattr(args, "daily_discover_symbols", True):
         print(f"[symbols] daily-update: cached manifest {asset_class} ({len(cached)} symbols, skipping HTTP)")
         return cached
     return None
@@ -1113,33 +1122,34 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
     if cached_daily is not None:
         return cached_daily
 
-    records = _load_tw_symbols_from_local_manifest()
+    records: list[SymbolRecord] = []
+    local_manifest_records = _load_tw_symbols_from_local_manifest()
     local_parquet_records = _load_tw_symbols_from_local_parquet()
     repo_fallback_records = _load_repo_symbol_fallback("tw_stocks")
-    if not records:
-        try:
-            print(f"[symbols] fetching tw_stocks from exchange (timeout=60s)…")
-            records = _fetch_with_hard_timeout(_load_tw_symbols_from_exchange, timeout=60)
-        except Exception as exc:
-            print(f"[symbols] failed to load tw symbols from exchange: {exc}")
-            if repo_fallback_records:
-                print(f"[symbols] using repo fallback manifest for tw_stocks ({len(repo_fallback_records)} symbols)")
-                records = repo_fallback_records
-            elif local_parquet_records:
-                print(f"[symbols] fallback to local data_parquet codes for tw_stocks ({len(local_parquet_records)} symbols)")
-                records = local_parquet_records
-            else:
-                records = cached or []
-        else:
-            if not records:
-                if repo_fallback_records:
-                    print(f"[symbols] exchange returned no tw_stocks symbols; using repo fallback manifest ({len(repo_fallback_records)} symbols)")
-                    records = repo_fallback_records
-                elif local_parquet_records:
-                    print(f"[symbols] exchange returned no tw_stocks symbols; using local data_parquet fallback ({len(local_parquet_records)} symbols)")
-                    records = local_parquet_records
-            else:
-                print(f"[symbols] loaded {len(records)} tw_stocks symbols from exchange")
+    try:
+        print(f"[symbols] fetching tw_stocks from exchange (timeout=60s)…")
+        fetched = _fetch_with_hard_timeout(_load_tw_symbols_from_exchange, timeout=60)
+        records.extend(fetched)
+        print(f"[symbols] loaded {len(fetched)} tw_stocks symbols from exchange")
+    except Exception as exc:
+        print(f"[symbols] failed to load tw symbols from exchange: {exc}")
+
+    if records:
+        # Keep historical/local names and stale but previously-tracked symbols in
+        # the manifest while still allowing new exchange listings to be added.
+        records.extend(local_manifest_records)
+        records.extend(local_parquet_records)
+    elif repo_fallback_records:
+        print(f"[symbols] using repo fallback manifest for tw_stocks ({len(repo_fallback_records)} symbols)")
+        records = repo_fallback_records
+    elif local_manifest_records:
+        print(f"[symbols] using local data_parquet manifest for tw_stocks ({len(local_manifest_records)} symbols)")
+        records = local_manifest_records
+    elif local_parquet_records:
+        print(f"[symbols] fallback to local data_parquet codes for tw_stocks ({len(local_parquet_records)} symbols)")
+        records = local_parquet_records
+    else:
+        records = cached or []
 
     if args.include_tw_delisted:
         try:
@@ -1147,6 +1157,24 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         except Exception as exc:
             print(f"[symbols] failed to load tw delisted list: {exc}")
     return records
+
+
+def _discover_daily_stock_records(
+    asset_class: str,
+    args: argparse.Namespace,
+    cached: list[SymbolRecord],
+) -> list[SymbolRecord]:
+    discovery_args = argparse.Namespace(**vars(args))
+    discovery_args.mode = "download"
+    discovery_args.limit = None
+    discovery_args.symbols = None
+    discovery_args.symbols_file = None
+
+    if asset_class == "tw_stocks":
+        return _resolve_tw_symbols(discovery_args, cached)
+    if asset_class == "us_stocks":
+        return _resolve_us_symbols(discovery_args, cached)
+    return []
 
 
 def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
@@ -1271,10 +1299,25 @@ def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolR
                         f"from repo fallback manifest for {asset_class}"
                     )
                     tracked_records.extend(new_from_repo)
+                    tracked_before.update(r.code for r in new_from_repo)
+
+                if getattr(args, "daily_discover_symbols", True) and asset_class in {"tw_stocks", "us_stocks"}:
+                    try:
+                        discovered = _discover_daily_stock_records(asset_class, args, cached)
+                    except Exception as exc:
+                        print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
+                    else:
+                        new_from_discovery = [r for r in discovered if r.code not in tracked_before]
+                        if new_from_discovery:
+                            print(
+                                f"[symbols] daily-update: adding {len(new_from_discovery)} new symbols "
+                                f"from upstream discovery for {asset_class}"
+                            )
+                            tracked_records.extend(new_from_discovery)
                 deduped = _dedupe_records_by_code(tracked_records)
                 print(
                     f"[symbols] daily-update: local tracked {asset_class} "
-                    f"({len(deduped)} symbols, parquet+whitelist+defaults+repo_new)"
+                    f"({len(deduped)} symbols, parquet+whitelist+defaults+repo_new+discovery)"
                 )
                 if args.limit is not None:
                     deduped = deduped[: args.limit]
