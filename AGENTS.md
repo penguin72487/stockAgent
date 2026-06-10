@@ -62,7 +62,7 @@ The active Transformer-base lookback-32 config is:
 training:
   model_name: transformer_base_portfolio
   lookback: 32
-  batch_size_train: 16
+  batch_size_train: 32
   batch_size_eval: 16
   enable_torch_compile: true
   compile_loss: false
@@ -118,7 +118,8 @@ Notes:
 - For large universes, prefer `latent` or `market_token`.
 - `return_aux_details` is useful for explainability but can increase memory pressure during training. Prefer `false` for tight VRAM training and enable it for explainability runs when needed.
 - The previous low-rank model remains available as `low_rank_market_transformer_portfolio`.
-- Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 16`, and `temporal_pooling: last`.
+- Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 32`, `batch_size_eval: 16`, and `temporal_pooling: last`.
+- `batch_size_train: 32` improves steady-state epoch throughput versus 16 on the current benchmark, but first-epoch compile/warmup time is higher; use it for long training runs, and re-benchmark before reducing it.
 - `temporal_pooling: last` is the active user preference. It is slightly faster than attention pooling but relies on temporal blocks to carry useful history into the final token; re-check validation/test metrics after changing it.
 - For `temporal_pooling: last`, the model has a last-query temporal fast path when `return_aux_details=false`: all but the final temporal block run on the full lookback, and the final temporal block computes only the final-day query against the full context. Keep `return_aux=True` / detailed aux paths full-length for explainability parity.
 
@@ -219,8 +220,12 @@ Rules:
 - Keep curve plotting async where possible.
 - GPU tensor caching is allowed when transfer dominates and VRAM checks pass:
   - prefer `cache_train_tensors_on_gpu: true` for transfer-bound long-year runs
-  - keep `cache_eval_tensors_on_gpu: false` unless eval transfer becomes material
+  - keep `cache_eval_tensors_on_gpu: true` for lazy windowed tensor runs when train/val/test can reuse the same cached base panel tensors
+  - do not duplicate full `[T,S,F]` panel tensors for train/val/test windowed splits on GPU; cache the base tensors once and share them, moving only split-specific `valid_indices` / `sample_mask`
   - `_maybe_cache_tensors_on_device` must keep the VRAM safety check and skip caching if it does not fit
+  - keep `eval_auto_chunk_rows_cap: 16` as the compile-safe auto-eval default unless a benchmark proves a larger compiled eval chunk is faster and stable
+  - eval chunk code pads only the final ragged chunk to the configured chunk size and trims outputs back to valid rows; keep this to avoid extra compile shapes without changing canonical returns
+  - `eval_auto_chunk_rows_cap: 32` and `batch_size_train: 64` were tested on the current single-fold lookback32 benchmark and were not adopted; cap32 had worse warmup/final eval, batch64 had worse warmup and slower steady epoch
 
 Compile/runtime rules:
 

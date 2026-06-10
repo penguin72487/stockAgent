@@ -16,8 +16,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/tw_stocks
-  benchmark_name: "2330"
+  parquet_root: data_okx
+  benchmark_name: "BTCUSDTSWAP"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -25,8 +25,8 @@ data:
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
-  tradable_mode: tw_limit_guard
-  # tradable_mode: tradable
+  # tradable_mode: tw_limit_guard
+  tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -35,8 +35,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.000855
-  sell_fee_rate: 0.003855
+  buy_fee_rate: 0.0005
+  sell_fee_rate: 0.0005
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -54,6 +54,7 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
+  eval_auto_chunk_rows_cap: 16
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
@@ -65,11 +66,11 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: true
   lookback: 32
-  batch_size: 16
-  batch_size_train: 16
+  batch_size: 32
+  batch_size_train: 32
   batch_size_eval: 16
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  early_stopping_no_improve_ratio: 0.05
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true

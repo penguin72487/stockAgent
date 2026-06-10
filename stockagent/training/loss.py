@@ -15,11 +15,48 @@ _LOSS_RUNTIME_STATS: dict[str, float] = {
     "initial_weights_clone_calls": 0.0,
     "final_weights_clone_s": 0.0,
     "final_weights_clone_calls": 0.0,
+    "clone_s": 0.0,
+    "clone_calls": 0.0,
+    "prepare_inputs_s": 0.0,
+    "prepare_inputs_calls": 0.0,
+    "normalize_weights_s": 0.0,
+    "normalize_weights_calls": 0.0,
+    "build_orders_s": 0.0,
+    "build_orders_calls": 0.0,
+    "backtest_s": 0.0,
+    "backtest_calls": 0.0,
+    "returns_postprocess_s": 0.0,
+    "returns_postprocess_calls": 0.0,
+    "log_utility_s": 0.0,
+    "log_utility_calls": 0.0,
+    "nan_to_num_s": 0.0,
+    "nan_to_num_calls": 0.0,
+    "mask_apply_s": 0.0,
+    "mask_apply_calls": 0.0,
+    "reduce_s": 0.0,
+    "reduce_calls": 0.0,
+    "state_update_s": 0.0,
+    "state_update_calls": 0.0,
+    "autograd_graph_build_s": 0.0,
+    "autograd_graph_build_calls": 0.0,
 }
 
 
 def _add_loss_runtime_stat(key: str, value: float = 1.0) -> None:
     _LOSS_RUNTIME_STATS[key] = float(_LOSS_RUNTIME_STATS.get(key, 0.0)) + float(value)
+
+
+def _loss_timer_start() -> float | None:
+    if _torch_is_compiling():
+        return None
+    return time.perf_counter()
+
+
+def _loss_timer_stop(stat_prefix: str, start: float | None) -> None:
+    if start is None:
+        return
+    _add_loss_runtime_stat(f"{stat_prefix}_s", time.perf_counter() - start)
+    _add_loss_runtime_stat(f"{stat_prefix}_calls")
 
 
 def _torch_is_compiling() -> bool:
@@ -45,8 +82,11 @@ def _clone_portfolio_state_for_loss(tensor: Tensor, *, stat_prefix: str) -> Tens
         return tensor.detach().clone(memory_format=torch.contiguous_format)
     clone_start = time.perf_counter()
     cloned = tensor.detach().clone(memory_format=torch.contiguous_format)
-    _add_loss_runtime_stat(f"{stat_prefix}_s", time.perf_counter() - clone_start)
+    elapsed = time.perf_counter() - clone_start
+    _add_loss_runtime_stat(f"{stat_prefix}_s", elapsed)
     _add_loss_runtime_stat(f"{stat_prefix}_calls")
+    _add_loss_runtime_stat("clone_s", elapsed)
+    _add_loss_runtime_stat("clone_calls")
     return cloned
 
 
@@ -510,6 +550,16 @@ def _compute_log_utility(valid_returns: Tensor) -> Tensor:
     return valid_returns.mean() * annualizer
 
 
+def _dense_masked_clean_mean(values: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+    """Mean of values[valid_mask] after nan_to_num, without dynamic-shape indexing."""
+    mask_bool = valid_mask.to(device=values.device, dtype=torch.bool)
+    mask_f = mask_bool.to(dtype=values.dtype)
+    clean = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    total = (clean * mask_f).sum()
+    count = mask_f.sum()
+    return total / count.clamp_min(1.0), count
+
+
 def _compute_excess_risk_terms(
     valid_returns: Tensor,
     valid_benchmark: Tensor,
@@ -590,10 +640,15 @@ def risk_aware_loss(
     autoencoder_lambda_latent: float = 0.001,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
+    normalize_start = _loss_timer_start()
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    _loss_timer_stop("normalize_weights", normalize_start)
+
+    prepare_start = _loss_timer_start()
     returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    _loss_timer_stop("prepare_inputs", prepare_start)
 
     if objective_norm in {"portfolio_autoencoder", "bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
         return portfolio_autoencoder_loss(
@@ -695,6 +750,7 @@ def risk_aware_loss(
 
         return total_loss
 
+    build_orders_start = _loss_timer_start()
     can_buy = (
         can_buy_mask.to(dtype=torch.bool, device=weights.device)
         if can_buy_mask is not None
@@ -711,6 +767,8 @@ def risk_aware_loss(
             posinf=0.0,
             neginf=0.0,
         )
+    _loss_timer_stop("build_orders", build_orders_start)
+
     initial_weights = None
     if aux_outputs:
         initial_weights = aux_outputs.get("initial_weights")
@@ -722,6 +780,7 @@ def risk_aware_loss(
                 stat_prefix="initial_weights_clone",
             )
 
+    backtest_start = _loss_timer_start()
     backtest = run_backtest_torch(
         weights,
         returns,
@@ -737,26 +796,74 @@ def risk_aware_loss(
         return_weights_history=False,
         initial_weights=initial_weights,
     )
+    _loss_timer_stop("backtest", backtest_start)
+
     if aux_outputs is not None and backtest.final_weights is not None:
+        state_update_start = _loss_timer_start()
         # Avoid carrying graph-owned output storage into the next step.
         aux_outputs["_final_weights"] = _clone_portfolio_state_for_loss(
             backtest.final_weights,
             stat_prefix="final_weights_clone",
         )
+        _loss_timer_stop("state_update", state_update_start)
 
+    postprocess_start = _loss_timer_start()
     if sample_mask is None:
         valid_mask = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
     else:
         valid_mask = sample_mask.to(device=weights.device, dtype=torch.bool)
+    _loss_timer_stop("returns_postprocess", postprocess_start)
 
-    valid_returns = backtest.strategy_returns[valid_mask]
-    valid_returns = torch.nan_to_num(valid_returns, nan=0.0, posinf=0.0, neginf=0.0)
-    if valid_returns.numel() == 0:
-        return weights.sum() * 0.0
-
+    dense_valid_count: Tensor | None = None
     if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
-        objective_value = -float(gamma_sharpe) * _compute_log_utility(valid_returns)
-    elif objective_norm in {
+        graph_start = _loss_timer_start()
+        nan_start = _loss_timer_start()
+        clean_returns = torch.nan_to_num(backtest.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        _loss_timer_stop("nan_to_num", nan_start)
+
+        mask_start = _loss_timer_start()
+        valid_f = valid_mask.to(dtype=clean_returns.dtype)
+        valid_count = valid_f.sum()
+        masked_returns = clean_returns * valid_f
+        _loss_timer_stop("mask_apply", mask_start)
+
+        reduce_start = _loss_timer_start()
+        mean_return = masked_returns.sum() / valid_count.clamp_min(1.0)
+        annualizer = torch.as_tensor(252.0, device=clean_returns.device, dtype=clean_returns.dtype)
+        _loss_timer_stop("reduce", reduce_start)
+
+        log_utility_start = _loss_timer_start()
+        objective_value = -float(gamma_sharpe) * (mean_return * annualizer)
+        _loss_timer_stop("log_utility", log_utility_start)
+
+        if gamma_turnover == 0.0:
+            turnover_term = clean_returns.new_zeros(())
+        else:
+            turnover_nan_start = _loss_timer_start()
+            clean_turnovers = torch.nan_to_num(backtest.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            _loss_timer_stop("nan_to_num", turnover_nan_start)
+            turnover_reduce_start = _loss_timer_start()
+            turnover_mean = (clean_turnovers * valid_f).sum() / valid_count.clamp_min(1.0)
+            turnover_term = gamma_turnover * turnover_mean
+            _loss_timer_stop("reduce", turnover_reduce_start)
+
+        total_loss = objective_value + turnover_term
+        if concentration_weight > 0.0:
+            weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            tradable_f = tradable.to(dtype=weights_safe.dtype)
+            active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+            concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
+            total_loss = total_loss + float(concentration_weight) * concentration
+        valid_returns = clean_returns
+        dense_valid_count = valid_count
+    else:
+        valid_returns = backtest.strategy_returns[valid_mask]
+        valid_returns = torch.nan_to_num(valid_returns, nan=0.0, posinf=0.0, neginf=0.0)
+        if valid_returns.numel() == 0:
+            return weights.sum() * 0.0
+
+        graph_start = _loss_timer_start()
+        if objective_norm in {
         "excess_cvar_drawdown",
         "cvar",
         "cvar_drawdown",
@@ -764,62 +871,65 @@ def risk_aware_loss(
         "outperformance_risk_budget",
         "outperformance_budget",
         "outperformance_first",
-    }:
-        valid_benchmark = backtest.benchmark_returns[valid_mask]
-        valid_benchmark = torch.nan_to_num(valid_benchmark, nan=0.0, posinf=0.0, neginf=0.0)
-        _, mean_excess, cvar, mdd, drawdown_penalty = _compute_excess_risk_terms(
-            valid_returns,
-            valid_benchmark,
-            cvar_alpha=cvar_alpha,
-            drawdown_target=drawdown_target,
-        )
-
-        if objective_norm in {"outperformance_risk_budget", "outperformance_budget", "outperformance_first"}:
-            underperformance = torch.relu(float(excess_target) - (valid_returns - valid_benchmark)).mean()
-            turnover_mean = backtest.turnovers[valid_mask]
-            turnover_mean = torch.nan_to_num(turnover_mean, nan=0.0, posinf=0.0, neginf=0.0)
-            turnover_mean = turnover_mean.mean() if turnover_mean.numel() > 0 else mean_excess.new_zeros(())
-
-            cvar_budget_penalty = torch.relu(cvar - float(cvar_budget))
-            drawdown_budget_penalty = torch.relu(mdd - float(drawdown_budget))
-            turnover_budget_penalty = torch.relu(turnover_mean - float(turnover_budget))
-
-            objective_value = (
-                -gamma_excess * mean_excess
-                + gamma_underperformance * underperformance
-                + gamma_cvar_budget * cvar_budget_penalty
-                + gamma_drawdown_budget * drawdown_budget_penalty
-                + gamma_turnover_budget * turnover_budget_penalty
-                + gamma_cvar * cvar
-                + gamma_drawdown * drawdown_penalty
+        }:
+            valid_benchmark = backtest.benchmark_returns[valid_mask]
+            valid_benchmark = torch.nan_to_num(valid_benchmark, nan=0.0, posinf=0.0, neginf=0.0)
+            _, mean_excess, cvar, mdd, drawdown_penalty = _compute_excess_risk_terms(
+                valid_returns,
+                valid_benchmark,
+                cvar_alpha=cvar_alpha,
+                drawdown_target=drawdown_target,
             )
+
+            if objective_norm in {"outperformance_risk_budget", "outperformance_budget", "outperformance_first"}:
+                underperformance = torch.relu(float(excess_target) - (valid_returns - valid_benchmark)).mean()
+                turnover_mean = backtest.turnovers[valid_mask]
+                turnover_mean = torch.nan_to_num(turnover_mean, nan=0.0, posinf=0.0, neginf=0.0)
+                turnover_mean = turnover_mean.mean() if turnover_mean.numel() > 0 else mean_excess.new_zeros(())
+
+                cvar_budget_penalty = torch.relu(cvar - float(cvar_budget))
+                drawdown_budget_penalty = torch.relu(mdd - float(drawdown_budget))
+                turnover_budget_penalty = torch.relu(turnover_mean - float(turnover_budget))
+
+                objective_value = (
+                    -gamma_excess * mean_excess
+                    + gamma_underperformance * underperformance
+                    + gamma_cvar_budget * cvar_budget_penalty
+                    + gamma_drawdown_budget * drawdown_budget_penalty
+                    + gamma_turnover_budget * turnover_budget_penalty
+                    + gamma_cvar * cvar
+                    + gamma_drawdown * drawdown_penalty
+                )
+            else:
+                objective_value = (
+                    -gamma_excess * mean_excess
+                    + gamma_cvar * cvar
+                    + gamma_drawdown * drawdown_penalty
+                )
         else:
-            objective_value = (
-                -gamma_excess * mean_excess
-                + gamma_cvar * cvar
-                + gamma_drawdown * drawdown_penalty
-            )
-    else:
-        risk_ratio = _compute_risk_ratio(valid_returns, objective)
-        objective_value = -gamma_sharpe * risk_ratio
+            risk_ratio = _compute_risk_ratio(valid_returns, objective)
+            objective_value = -gamma_sharpe * risk_ratio
 
-    if gamma_turnover == 0.0:
-        turnover_term = valid_returns.new_zeros(())
-    else:
-        valid_turnovers = backtest.turnovers[valid_mask]
-        valid_turnovers = torch.nan_to_num(valid_turnovers, nan=0.0, posinf=0.0, neginf=0.0)
-        turnover_term = gamma_turnover * (valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(()))
+        if gamma_turnover == 0.0:
+            turnover_term = valid_returns.new_zeros(())
+        else:
+            valid_turnovers = backtest.turnovers[valid_mask]
+            valid_turnovers = torch.nan_to_num(valid_turnovers, nan=0.0, posinf=0.0, neginf=0.0)
+            turnover_term = gamma_turnover * (valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(()))
 
-    total_loss = objective_value + turnover_term
+        total_loss = objective_value + turnover_term
 
-    if concentration_weight > 0.0:
-        weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        tradable_f = tradable.to(dtype=weights_safe.dtype)
-        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-        concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
-        total_loss = total_loss + float(concentration_weight) * concentration
+        if concentration_weight > 0.0:
+            weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            tradable_f = tradable.to(dtype=weights_safe.dtype)
+            active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+            concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
+            total_loss = total_loss + float(concentration_weight) * concentration
 
     if not aux_outputs:
+        if dense_valid_count is not None:
+            total_loss = torch.where(dense_valid_count > 0.0, total_loss, weights.sum() * 0.0)
+        _loss_timer_stop("autograd_graph_build", graph_start)
         return total_loss
 
     aux_loss = valid_returns.new_zeros(())
@@ -863,4 +973,8 @@ def risk_aware_loss(
     if has_vol_regime and float(volatility_regime_weight) > 0.0:
         aux_loss = aux_loss + float(volatility_regime_weight) * vol_regime_loss
 
-    return total_loss + aux_loss
+    total_loss = total_loss + aux_loss
+    if dense_valid_count is not None:
+        total_loss = torch.where(dense_valid_count > 0.0, total_loss, weights.sum() * 0.0)
+    _loss_timer_stop("autograd_graph_build", graph_start)
+    return total_loss
