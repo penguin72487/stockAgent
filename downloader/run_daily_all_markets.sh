@@ -4,8 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
-if [[ -z "$PYTHON_BIN" ]]; then
+PYTHON_BIN="${PYTHON_BIN:-/home/user/miniforge3/envs/fintech/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="$(command -v python3 || command -v python || true)"
+fi
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
   echo "[daily] python not found in PATH" >&2
   exit 2
 fi
@@ -17,24 +20,43 @@ MAX_CYCLES="${MAX_CYCLES:-0}"                       # 0 means unlimited
 FAIL_FAST="${FAIL_FAST:-0}"                         # 1 => fail immediately on any step error
 LOCK_FILE="${LOCK_FILE:-/tmp/stockagent_daily.lock}"
 SCHEDULE_STATE_FILE="${SCHEDULE_STATE_FILE:-/tmp/stockagent_market_schedule.state}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_LOG_DIR="${RUN_LOG_DIR:-artifacts/daily_downloader}"
+RUN_LOG_FILE="${RUN_LOG_FILE:-${RUN_LOG_DIR}/${RUN_ID}.log}"
+RUN_RECORD_FILE="${RUN_RECORD_FILE:-${RUN_LOG_DIR}/daily_runs.tsv}"
+TEE_LOG="${TEE_LOG:-1}"
 
-WORKERS="${WORKERS:-8}"
+WORKERS="${WORKERS:-16}"
 ASSET_WORKERS="${ASSET_WORKERS:-1}"
 RETRIES="${RETRIES:-2}"
 REPAIR_OVERLAP_DAYS="${REPAIR_OVERLAP_DAYS:-7}"
 DAILY_STALE_MAX_LAG_DAYS="${DAILY_STALE_MAX_LAG_DAYS:-14}"
 PRECHECK_FILE_TIMEOUT_SECONDS="${PRECHECK_FILE_TIMEOUT_SECONDS:-20}"
 REPAIR_SYMBOL_TIMEOUT_SECONDS="${REPAIR_SYMBOL_TIMEOUT_SECONDS:-90}"
+YAHOO_DAILY_DISCOVER_SYMBOLS="${YAHOO_DAILY_DISCOVER_SYMBOLS:-1}"
+YAHOO_INCLUDE_TW_DELISTED="${YAHOO_INCLUDE_TW_DELISTED:-1}"
+YAHOO_INCLUDE_US_DELISTED="${YAHOO_INCLUDE_US_DELISTED:-1}"
 FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
 RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-1}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
-OKX_WORKERS="${OKX_WORKERS:-4}"
-BYBIT_WORKERS="${BYBIT_WORKERS:-4}"
+OKX_WORKERS="${OKX_WORKERS:-16}"
+OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-0.1}"
+OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
+BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
+BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
+BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
 YAHOO_ASSETS="${YAHOO_ASSETS:-tw_stocks us_stocks crypto forex}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-0}"  # 0 disables timeout
+RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-1}"
+AUDIT_ROOTS="${AUDIT_ROOTS:-data_yahoo/tw_stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
+AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
+AUDIT_WORKERS="${AUDIT_WORKERS:-16}"
+AUDIT_STALE_MAX_LAG_DAYS="${AUDIT_STALE_MAX_LAG_DAYS:-14}"
+AUDIT_DAILY_GAP_DAYS="${AUDIT_DAILY_GAP_DAYS:-10}"
+AUDIT_INTRADAY_GAP_MULTIPLE="${AUDIT_INTRADAY_GAP_MULTIPLE:-4}"
 
 TW_CLOSE_TZ="${TW_CLOSE_TZ:-Asia/Taipei}"
 TW_CLOSE_TIME="${TW_CLOSE_TIME:-13:40}"
@@ -54,6 +76,39 @@ LAST_RUN_CEX=""
 log() {
   local message="$1"
   echo "[daily] ts=$(date +%F' '%T) ${message}"
+}
+
+init_run_logging() {
+  mkdir -p "$RUN_LOG_DIR"
+  if [[ "$TEE_LOG" == "1" ]]; then
+    exec > >(tee -a "$RUN_LOG_FILE") 2>&1
+  fi
+}
+
+append_cycle_record() {
+  local cycle_id="$1"
+  local status="$2"
+  local elapsed_sec="$3"
+  local failed=""
+
+  if (( ${#FAILED_STEPS[@]} > 0 )); then
+    local IFS=","
+    failed="${FAILED_STEPS[*]}"
+  fi
+
+  mkdir -p "$(dirname "$RUN_RECORD_FILE")"
+  if [[ ! -f "$RUN_RECORD_FILE" ]]; then
+    printf "timestamp_utc\trun_id\trun_mode\tcycle_id\tstatus\telapsed_sec\tfailed_steps\tlog_file\n" >> "$RUN_RECORD_FILE"
+  fi
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$(date -u +%F'T'%T'Z')" \
+    "$RUN_ID" \
+    "$RUN_MODE" \
+    "$cycle_id" \
+    "$status" \
+    "$elapsed_sec" \
+    "$failed" \
+    "$RUN_LOG_FILE" >> "$RUN_RECORD_FILE"
 }
 
 record_failure() {
@@ -153,12 +208,29 @@ run_yahoo_incremental() {
   local -a assets=()
   local -a base_cmd=()
   local -a run_cmd=()
+  local -a yahoo_flags=()
 
   today="$(date +%F)"
   read -r -a assets <<< "$YAHOO_ASSETS"
   if (( ${#assets[@]} == 0 )); then
     log "skip=yahoo_incremental reason=empty_YAHOO_ASSETS"
     return 0
+  fi
+
+  if [[ "$YAHOO_DAILY_DISCOVER_SYMBOLS" == "1" ]]; then
+    yahoo_flags+=(--daily-discover-symbols)
+  else
+    yahoo_flags+=(--no-daily-discover-symbols)
+  fi
+  if [[ "$YAHOO_INCLUDE_TW_DELISTED" == "1" ]]; then
+    yahoo_flags+=(--include-tw-delisted)
+  else
+    yahoo_flags+=(--no-include-tw-delisted)
+  fi
+  if [[ "$YAHOO_INCLUDE_US_DELISTED" == "1" ]]; then
+    yahoo_flags+=(--include-us-delisted)
+  else
+    yahoo_flags+=(--no-include-us-delisted)
   fi
 
   for asset in "${assets[@]}"; do
@@ -174,6 +246,7 @@ run_yahoo_incremental() {
       --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
       --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
       --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
+      "${yahoo_flags[@]}"
     )
 
     run_cmd=("${base_cmd[@]}")
@@ -238,7 +311,9 @@ run_cex_incremental() {
     "$PYTHON_BIN" downloader/download_okx_perp_daily.py \
     --mode daily-update \
     --end-date "$today" \
-    --workers "$OKX_WORKERS"
+    --workers "$OKX_WORKERS" \
+    --request-interval "$OKX_REQUEST_INTERVAL" \
+    --max-retries "$OKX_MAX_RETRIES"
 
   read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
   run_step bybit_perp_daily_update \
@@ -246,7 +321,38 @@ run_cex_incremental() {
     --mode daily-update \
     --end-date "$today" \
     --workers "$BYBIT_WORKERS" \
+    --request-interval "$BYBIT_REQUEST_INTERVAL" \
+    --max-retries "$BYBIT_MAX_RETRIES" \
     --categories "${bybit_categories[@]}"
+}
+
+run_data_quality_audit() {
+  local cycle_id="$1"
+  local today
+  local -a audit_roots=()
+
+  if [[ "$RUN_DATA_QUALITY_AUDIT" != "1" ]]; then
+    log "skip=data_quality_audit reason=RUN_DATA_QUALITY_AUDIT=${RUN_DATA_QUALITY_AUDIT}"
+    return 0
+  fi
+
+  today="$(date +%F)"
+  read -r -a audit_roots <<< "$AUDIT_ROOTS"
+  if (( ${#audit_roots[@]} == 0 )); then
+    log "skip=data_quality_audit reason=empty_AUDIT_ROOTS"
+    return 0
+  fi
+
+  run_step data_quality_audit \
+    "$PYTHON_BIN" downloader/audit_ohlcv_data.py \
+    --roots "${audit_roots[@]}" \
+    --output-dir "$AUDIT_OUTPUT_DIR" \
+    --run-id "${RUN_ID}-cycle-${cycle_id}" \
+    --workers "$AUDIT_WORKERS" \
+    --end-date "$today" \
+    --stale-max-lag-days "$AUDIT_STALE_MAX_LAG_DAYS" \
+    --daily-gap-days "$AUDIT_DAILY_GAP_DAYS" \
+    --intraday-gap-multiple "$AUDIT_INTRADAY_GAP_MULTIPLE"
 }
 
 run_market_close_cycle() {
@@ -254,6 +360,8 @@ run_market_close_cycle() {
   local cycle_start
   local cycle_end
   local cycle_elapsed
+  local did_run=0
+  local failures_before
   local tw_date
   local us_date
   local fx_date
@@ -266,32 +374,54 @@ run_market_close_cycle() {
   if market_due_today "$TW_CLOSE_TZ" "$TW_CLOSE_TIME" "$LAST_RUN_TW"; then
     tw_date="$(TZ="$TW_CLOSE_TZ" date +%F)"
     log "market=tw due date=${tw_date} close=${TW_CLOSE_TIME} tz=${TW_CLOSE_TZ}"
+    failures_before="${#FAILED_STEPS[@]}"
     run_yahoo_incremental_assets "tw_stocks" || true
-    LAST_RUN_TW="$tw_date"
+    did_run=1
+    if (( ${#FAILED_STEPS[@]} == failures_before )); then
+      LAST_RUN_TW="$tw_date"
+    fi
   fi
 
   if market_due_today "$US_CLOSE_TZ" "$US_CLOSE_TIME" "$LAST_RUN_US"; then
     us_date="$(TZ="$US_CLOSE_TZ" date +%F)"
     log "market=us due date=${us_date} close=${US_CLOSE_TIME} tz=${US_CLOSE_TZ}"
+    failures_before="${#FAILED_STEPS[@]}"
     run_yahoo_incremental_assets "us_stocks" || true
-    LAST_RUN_US="$us_date"
+    did_run=1
+    if (( ${#FAILED_STEPS[@]} == failures_before )); then
+      LAST_RUN_US="$us_date"
+    fi
   fi
 
   if market_due_today "$FOREX_CLOSE_TZ" "$FOREX_CLOSE_TIME" "$LAST_RUN_FOREX"; then
     fx_date="$(TZ="$FOREX_CLOSE_TZ" date +%F)"
     log "market=forex due date=${fx_date} close=${FOREX_CLOSE_TIME} tz=${FOREX_CLOSE_TZ}"
+    failures_before="${#FAILED_STEPS[@]}"
     run_yahoo_incremental_assets "forex" || true
     run_frankfurter_incremental || true
     run_pepperstone_incremental || true
-    LAST_RUN_FOREX="$fx_date"
+    did_run=1
+    if (( ${#FAILED_STEPS[@]} == failures_before )); then
+      LAST_RUN_FOREX="$fx_date"
+    fi
   fi
 
   if market_due_today "$CEX_CLOSE_TZ" "$CEX_CLOSE_TIME" "$LAST_RUN_CEX"; then
     cex_date="$(TZ="$CEX_CLOSE_TZ" date +%F)"
     log "market=cex due date=${cex_date} close=${CEX_CLOSE_TIME} tz=${CEX_CLOSE_TZ}"
+    failures_before="${#FAILED_STEPS[@]}"
     run_yahoo_incremental_assets "crypto" || true
     run_cex_incremental || true
-    LAST_RUN_CEX="$cex_date"
+    did_run=1
+    if (( ${#FAILED_STEPS[@]} == failures_before )); then
+      LAST_RUN_CEX="$cex_date"
+    fi
+  fi
+
+  if [[ "$did_run" == "1" ]]; then
+    run_data_quality_audit "$cycle_id" || true
+  else
+    log "cycle=${cycle_id} no_market_due"
   fi
 
   save_schedule_state
@@ -300,9 +430,11 @@ run_market_close_cycle() {
 
   if (( ${#FAILED_STEPS[@]} > 0 )); then
     log "cycle=${cycle_id} completed_with_failures elapsed_sec=${cycle_elapsed} failed_steps=${FAILED_STEPS[*]}"
+    append_cycle_record "$cycle_id" "completed_with_failures" "$cycle_elapsed"
     return 1
   fi
   log "cycle=${cycle_id} completed elapsed_sec=${cycle_elapsed}"
+  append_cycle_record "$cycle_id" "completed" "$cycle_elapsed"
   return 0
 }
 
@@ -320,16 +452,19 @@ run_once_cycle() {
   run_frankfurter_incremental || true
   run_pepperstone_incremental || true
   run_cex_incremental || true
+  run_data_quality_audit "$cycle_id" || true
 
   cycle_end="$(date +%s)"
   cycle_elapsed="$((cycle_end - cycle_start))"
 
   if (( ${#FAILED_STEPS[@]} > 0 )); then
     log "cycle=${cycle_id} completed_with_failures elapsed_sec=${cycle_elapsed} failed_steps=${FAILED_STEPS[*]}"
+    append_cycle_record "$cycle_id" "completed_with_failures" "$cycle_elapsed"
     return 1
   fi
 
   log "cycle=${cycle_id} completed elapsed_sec=${cycle_elapsed}"
+  append_cycle_record "$cycle_id" "completed" "$cycle_elapsed"
   return 0
 }
 
@@ -357,6 +492,26 @@ validate_settings() {
   fi
   if [[ "$FAIL_FAST" != "0" && "$FAIL_FAST" != "1" ]]; then
     echo "[daily] FAIL_FAST must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$TEE_LOG" != "0" && "$TEE_LOG" != "1" ]]; then
+    echo "[daily] TEE_LOG must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$YAHOO_DAILY_DISCOVER_SYMBOLS" != "0" && "$YAHOO_DAILY_DISCOVER_SYMBOLS" != "1" ]]; then
+    echo "[daily] YAHOO_DAILY_DISCOVER_SYMBOLS must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$YAHOO_INCLUDE_TW_DELISTED" != "0" && "$YAHOO_INCLUDE_TW_DELISTED" != "1" ]]; then
+    echo "[daily] YAHOO_INCLUDE_TW_DELISTED must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$YAHOO_INCLUDE_US_DELISTED" != "0" && "$YAHOO_INCLUDE_US_DELISTED" != "1" ]]; then
+    echo "[daily] YAHOO_INCLUDE_US_DELISTED must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_DATA_QUALITY_AUDIT" != "0" && "$RUN_DATA_QUALITY_AUDIT" != "1" ]]; then
+    echo "[daily] RUN_DATA_QUALITY_AUDIT must be 0 or 1" >&2
     exit 2
   fi
   if ! [[ "$YAHOO_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
@@ -405,8 +560,9 @@ run_scheduler() {
   done
 }
 
+init_run_logging
 validate_settings
 acquire_lock
 load_schedule_state
-log "scheduler boot run_mode=${RUN_MODE} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES}"
+log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
 run_scheduler

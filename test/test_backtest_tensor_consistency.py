@@ -7,13 +7,15 @@ from stockagent.backtest.simulator import run_backtest_torch
 import stockagent.backtest.simulator as simulator
 from stockagent.data.panel import PanelData
 from stockagent.training.dataset import CrossSectionalDataset
-from stockagent.training.loss import risk_aware_loss
+from stockagent.training.loss import _dense_masked_clean_mean, get_loss_runtime_stats, risk_aware_loss
 from stockagent.training.trainer import (
     _CompiledLossFallback,
     _dataset_to_tensors,
     _detach_portfolio_state,
+    _estimate_eval_chunk_rows,
     _evaluate_tensor_batch,
     _evaluate_windowed_tensor_batch,
+    _maybe_share_windowed_base_from_cached,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -58,6 +60,15 @@ def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> No
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert calls == {"compiled": 1, "eager": 2}
+
+
+def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048) == 2048
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=999999) == 4096
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=0) == 1
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048, max_chunk_rows=64) == 64
+    assert _estimate_eval_chunk_rows(total_rows=32, estimated_rows=2048, max_chunk_rows=64) == 32
+    assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048, max_chunk_rows=0) == 2048
 
 
 def test_backtest_compile_gate_skips_toolchain_lookup_while_dynamo_compiling(monkeypatch) -> None:
@@ -223,6 +234,58 @@ def test_evaluate_tensor_batch_resets_only_at_segment_boundaries() -> None:
     assert torch.allclose(backtest.weights_history.cpu(), expected_weights, atol=1e-7, rtol=1e-6)
 
 
+def test_evaluate_tensor_batch_ragged_chunk_padding_matches_full_long_short_backtest() -> None:
+    torch.manual_seed(654)
+    rows, symbols = 13, 6
+    raw_weights = torch.randn(rows, symbols)
+    x = raw_weights[:, None, :, None].contiguous()
+    returns = torch.randn(rows, symbols) * 0.01
+    tradable = torch.ones(rows, symbols, dtype=torch.bool)
+    can_buy = torch.rand(rows, symbols) > 0.20
+    can_sell = torch.rand(rows, symbols) > 0.20
+    can_buy[0] = True
+    can_sell[0] = True
+    benchmark = returns.mean(dim=1)
+
+    expected = run_backtest_torch(
+        raw_weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.001,
+        sell_fee_rate=0.003,
+        long_only=False,
+        max_turnover_ratio=0.55,
+        gross_leverage=1.0,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+    )
+    actual, _, _ = _evaluate_tensor_batch(
+        _EchoWeightModel(),
+        x,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        benchmark,
+        torch.device("cpu"),
+        None,
+        False,
+        False,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=4,
+    )
+
+    assert actual.strategy_returns.numel() == rows
+    assert actual.weights_history.shape == expected.weights_history.shape
+    assert torch.allclose(actual.strategy_returns.cpu(), expected.strategy_returns, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(actual.turnovers.cpu(), expected.turnovers, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(actual.weights_history.cpu(), expected.weights_history, atol=1e-7, rtol=1e-6)
+
+
 def _make_panel(rows: int = 8, symbols: int = 4, features: int = 3) -> PanelData:
     values = torch.arange(rows * symbols * features, dtype=torch.float32).reshape(rows, symbols, features)
     returns = torch.linspace(-0.02, 0.02, rows * symbols, dtype=torch.float32).reshape(rows, symbols)
@@ -275,6 +338,33 @@ def test_windowed_contiguous_fast_path_matches_indexed_path() -> None:
     assert set(fast) == set(indexed)
     for key in fast:
         assert torch.equal(fast[key], indexed[key]), key
+
+
+def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> None:
+    panel = _make_panel(rows=12, symbols=4, features=3)
+    first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
+    first = dataset_to_windowed_tensors(first_ds)
+    second = dataset_to_windowed_tensors(second_ds)
+
+    shared = _maybe_share_windowed_base_from_cached(
+        name="test split",
+        split=second,
+        cached_base=first,
+        device=torch.device("cpu"),
+        non_blocking=False,
+        enabled=True,
+    )
+
+    assert shared is not None
+    assert shared.features.data_ptr() == first.features.data_ptr()
+    assert shared.future_log_returns.data_ptr() == first.future_log_returns.data_ptr()
+    assert shared.valid_indices.data_ptr() != first.valid_indices.data_ptr()
+
+    expected = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
+    actual = shared.batch_by_rows(0, len(shared), torch.device("cpu"), non_blocking=False)
+    for key in expected:
+        assert torch.equal(actual[key], expected[key]), key
 
 
 def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
@@ -447,6 +537,104 @@ def test_log_utility_loss_uses_fee_adjusted_canonical_tensor_backtest_returns() 
     loss.backward()
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
+
+
+def test_dense_masked_clean_mean_matches_boolean_indexing_semantics() -> None:
+    values = torch.tensor(
+        [0.01, float("nan"), -0.02, float("inf"), -float("inf"), 0.03],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.tensor([True, True, False, True, False, True])
+
+    old_effective_returns = torch.nan_to_num(values[valid_mask], nan=0.0, posinf=0.0, neginf=0.0)
+    old_mean = old_effective_returns.mean()
+
+    new_mean, new_count = _dense_masked_clean_mean(values, valid_mask)
+
+    assert int(new_count.item()) == int(valid_mask.sum().item())
+    assert torch.allclose(new_mean, old_mean, atol=1e-8, rtol=1e-6)
+    assert torch.allclose(
+        torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)[valid_mask],
+        old_effective_returns,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+def test_log_utility_loss_sample_mask_dense_path_matches_canonical_backtest_returns() -> None:
+    weights = torch.tensor(
+        [
+            [0.65, 0.25, 0.10],
+            [0.15, 0.75, 0.10],
+            [0.50, 0.20, 0.30],
+            [0.05, 0.60, 0.35],
+            [0.40, 0.10, 0.50],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    returns = torch.tensor(
+        [
+            [0.018, -0.008, 0.004],
+            [-0.010, 0.014, 0.003],
+            [0.005, -0.017, 0.016],
+            [-0.003, 0.004, -0.010],
+            [0.012, -0.006, 0.002],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    sample_mask = torch.tensor([True, False, True, True, False])
+    benchmark = returns.mean(dim=1)
+    buy_fee_rate = 0.000855
+    sell_fee_rate = 0.003855
+
+    get_loss_runtime_stats(reset=True)
+    loss = risk_aware_loss(
+        weights,
+        returns,
+        mask,
+        benchmark_returns=benchmark,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        sample_mask=sample_mask,
+        long_only=True,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+        objective="log_utility",
+    )
+
+    bt = run_backtest_torch(
+        weights,
+        returns,
+        mask,
+        benchmark,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=True,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        return_weights_history=False,
+    )
+    old_valid_returns = torch.nan_to_num(bt.strategy_returns[sample_mask], nan=0.0, posinf=0.0, neginf=0.0)
+    expected = -old_valid_returns.mean() * 252.0
+
+    assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+
+    stats = get_loss_runtime_stats(reset=True)
+    assert stats["prepare_inputs_calls"] >= 1
+    assert stats["backtest_calls"] >= 1
+    assert stats["log_utility_calls"] >= 1
 
 
 def test_sortino_loss_accepts_initial_weights_for_stateful_batches() -> None:
