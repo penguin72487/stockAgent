@@ -80,7 +80,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 16
+PANEL_CACHE_VERSION = 18
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
 PREV_DAY_LOG_RETURN_RENAME = {
@@ -122,10 +122,9 @@ def _price_decimals_for_path(path: Path) -> int:
 
 def _return_price_column(frame: pd.DataFrame, path: Path) -> str:
     """Choose the price series used for forward return labels."""
-    parts = {part.lower() for part in path.parts}
-    symbol = _symbol_name_from_path(path)
-    is_tw_market = "tw_stocks" in parts or symbol.isdigit()
-    if is_tw_market and "adjclose" in frame.columns:
+    # Use adjusted close whenever available so corporate actions
+    # (splits/dividends/capital changes) do not create fake label jumps.
+    if "adjclose" in frame.columns:
         return "adjclose"
     return "close"
 

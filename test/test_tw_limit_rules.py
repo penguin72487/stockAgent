@@ -203,6 +203,40 @@ def test_tw_holdings_price_has_no_float_tail() -> None:
     assert stock_rows[0].price == 21.4
 
 
+def test_integer_backtest_uses_future_returns_not_close_price_delta_for_pnl() -> None:
+    weights = np.array([[1.0], [1.0]], dtype=np.float32)
+    # Mimic an adjusted-close return that differs from the raw close-to-close move.
+    future_returns = np.array([[math.log(1.5)], [0.0]], dtype=np.float32)
+    tradable = np.ones_like(weights, dtype=bool)
+    can_buy = np.ones_like(weights, dtype=bool)
+    can_sell = np.ones_like(weights, dtype=bool)
+    benchmark = np.zeros((weights.shape[0],), dtype=np.float32)
+    close_prices = np.array([[100.0], [110.0]], dtype=np.float32)
+    dates = np.array(["2024-01-01", "2024-01-02"], dtype="datetime64[D]")
+
+    result, records = run_backtest_integer_shares(
+        weights=weights,
+        future_returns=future_returns,
+        tradable_mask=tradable,
+        benchmark_returns=benchmark,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        initial_capital=1000.0,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        close_prices=close_prices,
+        symbols=["3516"],
+        dates=dates,
+    )
+
+    assert math.isclose(float(result.strategy_returns[0]), math.log(1.5), rel_tol=1e-6, abs_tol=1e-7)
+    first_day_stock_rows = [
+        row for row in records if row.date == "2024-01-01" and (not row.is_cash) and row.symbol == "3516"
+    ]
+    assert len(first_day_stock_rows) == 1
+    assert first_day_stock_rows[0].price == 100.0
+
+
 def main() -> None:
     test_limit_price_examples()
     test_limit_masks()
@@ -211,6 +245,7 @@ def main() -> None:
     test_no_buy_on_limit_up_day()
     test_no_sell_on_limit_down_day()
     test_tw_holdings_price_has_no_float_tail()
+    test_integer_backtest_uses_future_returns_not_close_price_delta_for_pnl()
     print("All TW limit rule tests passed.")
 
 
