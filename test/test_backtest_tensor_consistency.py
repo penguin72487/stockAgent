@@ -7,7 +7,7 @@ from stockagent.backtest.simulator import run_backtest_torch
 import stockagent.backtest.simulator as simulator
 from stockagent.data.panel import PanelData
 from stockagent.training.dataset import CrossSectionalDataset
-from stockagent.training.loss import risk_aware_loss
+from stockagent.training.loss import _dense_masked_clean_mean, get_loss_runtime_stats, risk_aware_loss
 from stockagent.training.trainer import (
     _CompiledLossFallback,
     _dataset_to_tensors,
@@ -447,6 +447,104 @@ def test_log_utility_loss_uses_fee_adjusted_canonical_tensor_backtest_returns() 
     loss.backward()
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()
+
+
+def test_dense_masked_clean_mean_matches_boolean_indexing_semantics() -> None:
+    values = torch.tensor(
+        [0.01, float("nan"), -0.02, float("inf"), -float("inf"), 0.03],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.tensor([True, True, False, True, False, True])
+
+    old_effective_returns = torch.nan_to_num(values[valid_mask], nan=0.0, posinf=0.0, neginf=0.0)
+    old_mean = old_effective_returns.mean()
+
+    new_mean, new_count = _dense_masked_clean_mean(values, valid_mask)
+
+    assert int(new_count.item()) == int(valid_mask.sum().item())
+    assert torch.allclose(new_mean, old_mean, atol=1e-8, rtol=1e-6)
+    assert torch.allclose(
+        torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)[valid_mask],
+        old_effective_returns,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+def test_log_utility_loss_sample_mask_dense_path_matches_canonical_backtest_returns() -> None:
+    weights = torch.tensor(
+        [
+            [0.65, 0.25, 0.10],
+            [0.15, 0.75, 0.10],
+            [0.50, 0.20, 0.30],
+            [0.05, 0.60, 0.35],
+            [0.40, 0.10, 0.50],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    returns = torch.tensor(
+        [
+            [0.018, -0.008, 0.004],
+            [-0.010, 0.014, 0.003],
+            [0.005, -0.017, 0.016],
+            [-0.003, 0.004, -0.010],
+            [0.012, -0.006, 0.002],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    sample_mask = torch.tensor([True, False, True, True, False])
+    benchmark = returns.mean(dim=1)
+    buy_fee_rate = 0.000855
+    sell_fee_rate = 0.003855
+
+    get_loss_runtime_stats(reset=True)
+    loss = risk_aware_loss(
+        weights,
+        returns,
+        mask,
+        benchmark_returns=benchmark,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        sample_mask=sample_mask,
+        long_only=True,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+        objective="log_utility",
+    )
+
+    bt = run_backtest_torch(
+        weights,
+        returns,
+        mask,
+        benchmark,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=True,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        return_weights_history=False,
+    )
+    old_valid_returns = torch.nan_to_num(bt.strategy_returns[sample_mask], nan=0.0, posinf=0.0, neginf=0.0)
+    expected = -old_valid_returns.mean() * 252.0
+
+    assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+
+    stats = get_loss_runtime_stats(reset=True)
+    assert stats["prepare_inputs_calls"] >= 1
+    assert stats["backtest_calls"] >= 1
+    assert stats["log_utility_calls"] >= 1
 
 
 def test_sortino_loss_accepts_initial_weights_for_stateful_batches() -> None:
