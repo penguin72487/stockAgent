@@ -2250,6 +2250,103 @@ def _maybe_cache_windowed_split_on_device(
     )
 
 
+def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) -> bool:
+    attrs = (
+        "features",
+        "future_log_returns",
+        "tradable_mask",
+        "can_buy_mask",
+        "can_sell_mask",
+        "benchmark",
+    )
+    for attr in attrs:
+        lhs = getattr(a, attr)
+        rhs = getattr(b, attr)
+        if tuple(lhs.shape) != tuple(rhs.shape) or lhs.dtype != rhs.dtype:
+            return False
+    return int(a.lookback) == int(b.lookback)
+
+
+def _tensor_on_requested_device(tensor: torch.Tensor, device: torch.device) -> bool:
+    if tensor.device.type != device.type:
+        return False
+    if device.index is not None and tensor.device.index != device.index:
+        return False
+    return True
+
+
+def _maybe_share_windowed_base_from_cached(
+    *,
+    name: str,
+    split: WindowedSplitTensors,
+    cached_base: WindowedSplitTensors | None,
+    device: torch.device,
+    non_blocking: bool,
+    enabled: bool,
+) -> WindowedSplitTensors | None:
+    if not enabled or cached_base is None:
+        return None
+    if not _tensor_on_requested_device(cached_base.features, device):
+        return None
+    if not _windowed_base_compatible(split, cached_base):
+        return None
+    valid_indices = split.valid_indices.to(device=device, non_blocking=non_blocking)
+    sample_mask = None
+    if split.sample_mask is not None:
+        sample_mask = split.sample_mask.to(device=device, non_blocking=non_blocking)
+    _progress(f"[gpu cache] reused shared base tensors for {name} on {device.type}")
+    return WindowedSplitTensors(
+        features=cached_base.features,
+        valid_indices=valid_indices,
+        future_log_returns=cached_base.future_log_returns,
+        tradable_mask=cached_base.tradable_mask,
+        can_buy_mask=cached_base.can_buy_mask,
+        can_sell_mask=cached_base.can_sell_mask,
+        benchmark=cached_base.benchmark,
+        lookback=split.lookback,
+        sample_mask=sample_mask,
+    )
+
+
+def _pad_eval_chunk_first_dim(
+    x: torch.Tensor,
+    returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    benchmark: torch.Tensor,
+    *,
+    target_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    valid_rows = int(x.size(0))
+    target_rows = int(target_rows)
+    if valid_rows <= 0 or valid_rows >= target_rows:
+        return x, returns, tradable_mask, can_buy_mask, can_sell_mask, benchmark, valid_rows
+
+    pad_rows = target_rows - valid_rows
+    x_pad = x[-1:].expand((pad_rows,) + tuple(x.shape[1:]))
+    returns_pad = returns.new_zeros((pad_rows,) + tuple(returns.shape[1:]))
+    tradable_pad = tradable_mask.new_zeros((pad_rows,) + tuple(tradable_mask.shape[1:]))
+    buy_pad = can_buy_mask.new_zeros((pad_rows,) + tuple(can_buy_mask.shape[1:]))
+    sell_pad = can_sell_mask.new_zeros((pad_rows,) + tuple(can_sell_mask.shape[1:]))
+    benchmark_pad = benchmark.new_zeros((pad_rows,) + tuple(benchmark.shape[1:]))
+    return (
+        torch.cat((x, x_pad), dim=0),
+        torch.cat((returns, returns_pad), dim=0),
+        torch.cat((tradable_mask, tradable_pad), dim=0),
+        torch.cat((can_buy_mask, buy_pad), dim=0),
+        torch.cat((can_sell_mask, sell_pad), dim=0),
+        torch.cat((benchmark, benchmark_pad), dim=0),
+        valid_rows,
+    )
+
+
+def _should_log_eval_chunk(chunk_idx: int, total_chunks: int) -> bool:
+    total_chunks = max(1, int(total_chunks))
+    interval = max(1, total_chunks // 20)
+    return int(chunk_idx) == 1 or int(chunk_idx) == total_chunks or int(chunk_idx) % interval == 0
+
+
 def _evaluate_tensor_batch(
     model: nn.Module,
     x: torch.Tensor,
@@ -2325,7 +2422,8 @@ def _evaluate_tensor_batch(
             if reset_state:
                 prev_weights = None
             _maybe_cudagraph_step_begin()
-            if progress_label:
+            log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_chunks)
+            if log_chunk_progress:
                 _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} transfer rows=[{start},{end})")
             chunk_start = time.perf_counter()
             x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
@@ -2334,10 +2432,27 @@ def _evaluate_tensor_batch(
             buy_mask_chunk = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
             sell_mask_chunk = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
             bench_chunk = benchmark[start:end].to(device=device, non_blocking=non_blocking)
+            (
+                x_chunk,
+                returns_chunk,
+                mask_chunk,
+                buy_mask_chunk,
+                sell_mask_chunk,
+                bench_chunk,
+                valid_rows,
+            ) = _pad_eval_chunk_first_dim(
+                x_chunk,
+                returns_chunk,
+                mask_chunk,
+                buy_mask_chunk,
+                sell_mask_chunk,
+                bench_chunk,
+                target_rows=chunk_rows,
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.transfer_s += time.perf_counter() - chunk_start
 
-            if progress_label:
+            if log_chunk_progress:
                 _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} forward model")
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
@@ -2348,7 +2463,7 @@ def _evaluate_tensor_batch(
             timing.forward_s += chunk_forward_elapsed
             timing.model_forward_s += chunk_forward_elapsed
 
-            if progress_label:
+            if log_chunk_progress:
                 _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} backtest")
             backtest_start = time.perf_counter()
             backtest_prepare_start = time.perf_counter()
@@ -2379,27 +2494,34 @@ def _evaluate_tensor_batch(
             # These clones are required because compiled/CUDA-graph backtest
             # outputs can be overwritten by the next replay.
             if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history.clone())
-            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
-            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
-            turnover_chunks.append(backtest_chunk.turnovers.clone())
+                weights_chunks.append(backtest_chunk.weights_history[:valid_rows].clone())
+            strategy_returns_valid = backtest_chunk.strategy_returns[:valid_rows]
+            benchmark_returns_valid = backtest_chunk.benchmark_returns[:valid_rows]
+            turnovers_valid = backtest_chunk.turnovers[:valid_rows]
+            strategy_chunks.append(strategy_returns_valid.clone())
+            benchmark_chunks.append(benchmark_returns_valid.clone())
+            turnover_chunks.append(turnovers_valid.clone())
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
             timing.backtest_s += time.perf_counter() - backtest_start
 
             if compute_ic:
-                if progress_label:
+                if log_chunk_progress:
                     _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} compute IC")
                 ic_start = time.perf_counter()
-                ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
+                ic_chunk = compute_ic_series_torch(
+                    weights_chunk[:valid_rows],
+                    returns_chunk[:valid_rows],
+                    mask_chunk[:valid_rows],
+                )
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
 
             if compute_metrics_summary:
                 metrics_start = time.perf_counter()
-                r = torch.nan_to_num(backtest_chunk.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-                b = torch.nan_to_num(backtest_chunk.benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-                t = torch.nan_to_num(backtest_chunk.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                r = torch.nan_to_num(strategy_returns_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                b = torch.nan_to_num(benchmark_returns_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                t = torch.nan_to_num(turnovers_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
 
                 n_rows += int(r.numel())
                 sum_r_t = sum_r_t + r.sum()
@@ -2427,7 +2549,7 @@ def _evaluate_tensor_batch(
                 ic_sum_t = ic_sum_t + (ic_clean64 * ic_mask64).sum()
                 ic_sumsq_t = ic_sumsq_t + (ic_clean64 * ic_clean64 * ic_mask64).sum()
                 ic_pos_t = ic_pos_t + ((ic_clean64 > 0).to(torch.float64) * ic_mask64).sum()
-            if progress_label:
+            if log_chunk_progress:
                 _progress(
                     f"{progress_label}: chunk {chunk_idx}/{total_chunks} done "
                     f"(transfer={timing.transfer_s:.1f}s forward={timing.forward_s:.1f}s "
@@ -2658,6 +2780,7 @@ def _evaluate_windowed_tensor_batch(
             if reset_state:
                 prev_weights = None
             _maybe_cudagraph_step_begin()
+            log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_chunks)
             chunk_start = time.perf_counter()
             batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
             x_chunk = batch["x"]
@@ -2666,6 +2789,23 @@ def _evaluate_windowed_tensor_batch(
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
+            (
+                x_chunk,
+                returns_chunk,
+                mask_chunk,
+                buy_mask_chunk,
+                sell_mask_chunk,
+                bench_chunk,
+                valid_rows,
+            ) = _pad_eval_chunk_first_dim(
+                x_chunk,
+                returns_chunk,
+                mask_chunk,
+                buy_mask_chunk,
+                sell_mask_chunk,
+                bench_chunk,
+                target_rows=chunk_rows,
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.transfer_s += time.perf_counter() - chunk_start
 
@@ -2707,25 +2847,32 @@ def _evaluate_windowed_tensor_batch(
             # Required for compiled/CUDA-graph backtest outputs; the next replay
             # may reuse output storage.
             if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history.clone())
-            strategy_chunks.append(backtest_chunk.strategy_returns.clone())
-            benchmark_chunks.append(backtest_chunk.benchmark_returns.clone())
-            turnover_chunks.append(backtest_chunk.turnovers.clone())
+                weights_chunks.append(backtest_chunk.weights_history[:valid_rows].clone())
+            strategy_returns_valid = backtest_chunk.strategy_returns[:valid_rows]
+            benchmark_returns_valid = backtest_chunk.benchmark_returns[:valid_rows]
+            turnovers_valid = backtest_chunk.turnovers[:valid_rows]
+            strategy_chunks.append(strategy_returns_valid.clone())
+            benchmark_chunks.append(benchmark_returns_valid.clone())
+            turnover_chunks.append(turnovers_valid.clone())
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
             timing.backtest_s += time.perf_counter() - backtest_start
 
             if compute_ic:
                 ic_start = time.perf_counter()
-                ic_chunk = compute_ic_series_torch(weights_chunk, returns_chunk, mask_chunk)
+                ic_chunk = compute_ic_series_torch(
+                    weights_chunk[:valid_rows],
+                    returns_chunk[:valid_rows],
+                    mask_chunk[:valid_rows],
+                )
                 _maybe_sync_cuda(device, profile_timing)
                 timing.ic_s += time.perf_counter() - ic_start
 
             if compute_metrics_summary:
                 metrics_start = time.perf_counter()
-                r = torch.nan_to_num(backtest_chunk.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-                b = torch.nan_to_num(backtest_chunk.benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
-                t = torch.nan_to_num(backtest_chunk.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                r = torch.nan_to_num(strategy_returns_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                b = torch.nan_to_num(benchmark_returns_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+                t = torch.nan_to_num(turnovers_valid.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
                 n_rows += int(r.numel())
                 sum_r_t = sum_r_t + r.sum()
                 sumsq_r_t = sumsq_r_t + (r * r).sum()
@@ -2752,7 +2899,7 @@ def _evaluate_windowed_tensor_batch(
                 ic_sumsq_t = ic_sumsq_t + (ic_clean64 * ic_clean64 * ic_mask64).sum()
                 ic_pos_t = ic_pos_t + ((ic_clean64 > 0).to(torch.float64) * ic_mask64).sum()
 
-            if progress_label:
+            if log_chunk_progress:
                 _progress(
                     f"{progress_label}: chunk {chunk_idx}/{total_chunks} done "
                     f"(transfer={timing.transfer_s:.1f}s forward={timing.forward_s:.1f}s "
@@ -2898,13 +3045,16 @@ def _auto_chunk_rows(
     vram_budget_gb: float,
     vram_safety_margin_gb: float,
     measured_free_bytes: int | None = None,
+    max_rows: int | None = None,
+    max_chunk_rows: int | None = None,
 ) -> int:
+    total_rows = int(x.size(0)) if max_rows is None else int(max_rows)
     if device.type != "cuda":
-        return max(1, min(256, int(x.size(0))))
+        return max(1, min(256, total_rows))
 
-    total_rows = int(x.size(0))
     if total_rows <= 1:
         return 1
+    probe_available_rows = max(1, int(x.size(0)))
 
     torch.cuda.empty_cache()
     free_mem, total_mem = torch.cuda.mem_get_info(device)
@@ -2922,7 +3072,7 @@ def _auto_chunk_rows(
 
     # Measure per-row incremental VRAM cost on a tiny probe, then size chunk
     # from currently free VRAM. This avoids OOM-driven probing.
-    probe_rows = max(1, min(32, total_rows))
+    probe_rows = max(1, min(32, probe_available_rows))
     _progress(f"[eval chunk auto] probing rows={probe_rows}/{total_rows} to estimate eval VRAM")
     torch.cuda.reset_peak_memory_stats(device)
     base_alloc = torch.cuda.memory_allocated(device)
@@ -2941,14 +3091,31 @@ def _auto_chunk_rows(
     # Keep headroom for allocator/workspace fluctuations.
     usable_bytes = int(usable_pool_bytes * target_vram_fraction * 0.9)
     estimated_rows = usable_bytes // bytes_per_row
-    chunk_rows = max(1, min(total_rows, int(estimated_rows)))
+    chunk_rows = _estimate_eval_chunk_rows(
+        total_rows=total_rows,
+        estimated_rows=int(estimated_rows),
+        max_chunk_rows=max_chunk_rows,
+    )
+    cap_label = "" if max_chunk_rows is None or int(max_chunk_rows) <= 0 else f" cap={int(max_chunk_rows)}"
     _progress(
         f"[eval chunk auto] peak_increment={incremental_bytes/1024**2:.1f}MiB "
         f"bytes_per_row={bytes_per_row/1024**2:.2f}MiB usable={usable_bytes/1024**3:.2f}GB "
-        f"chunk_rows={chunk_rows}"
+        f"chunk_rows={chunk_rows}{cap_label}"
     )
 
     return chunk_rows
+
+
+def _estimate_eval_chunk_rows(
+    *,
+    total_rows: int,
+    estimated_rows: int,
+    max_chunk_rows: int | None = None,
+) -> int:
+    upper = int(total_rows)
+    if max_chunk_rows is not None and int(max_chunk_rows) > 0:
+        upper = min(upper, int(max_chunk_rows))
+    return max(1, min(upper, int(estimated_rows)))
 
 
 def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
@@ -5548,6 +5715,7 @@ def run_training(
                 print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
 
         compiled_train_model: nn.Module = model
+        eval_model: nn.Module = model
         compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
 
         if device.type == "cuda":
@@ -5631,6 +5799,7 @@ def run_training(
 
         curve_plot_request_interval = max(1, int(config.training.curve_plot_interval))
         combined_val_rows = len(combined_val_windowed) if combined_val_windowed is not None else int(combined_val_x.size(0))
+        eval_auto_chunk_rows_cap = int(getattr(config.training, "eval_auto_chunk_rows_cap", 16))
 
         if config.training.chunk_rows > 0:
             eval_chunk_rows = min(config.training.chunk_rows, combined_val_rows)
@@ -5665,6 +5834,8 @@ def run_training(
                     vram_budget_gb=config.training.vram_budget_gb,
                     vram_safety_margin_gb=config.training.vram_safety_margin_gb,
                     measured_free_bytes=measured_free_bytes,
+                    max_rows=combined_val_rows,
+                    max_chunk_rows=eval_auto_chunk_rows_cap,
                 )
                 eval_chunk_rows = max(1, min(eval_chunk_rows, combined_val_rows))
                 del probe_batch
@@ -5679,6 +5850,7 @@ def run_training(
                     vram_budget_gb=config.training.vram_budget_gb,
                     vram_safety_margin_gb=config.training.vram_safety_margin_gb,
                     measured_free_bytes=measured_free_bytes,
+                    max_chunk_rows=eval_auto_chunk_rows_cap,
                 )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
 
@@ -5704,6 +5876,7 @@ def run_training(
                     compile_start = time.perf_counter()
                     print(f"[Train {train_years}] compile warmup may take extra time at epoch 0")
                     compiled_train_model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+                    eval_model = compiled_train_model
                     compile_source = f"auto({loss_objective})" if (auto_compile_risk and not config.training.enable_torch_compile) else "config"
                     print(
                         f"[Train {train_years}] torch.compile enabled "
@@ -5755,6 +5928,7 @@ def run_training(
         print(
             f"[Train {train_years}] optimization status: "
             f"model_compile={model_compile_status}; "
+            f"eval_model={'compiled' if eval_model is compiled_train_model and compiled_train_model is not model else 'eager'}; "
             f"loss_compile={loss_compile_status}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
@@ -5880,14 +6054,25 @@ def run_training(
                 )
 
         if combined_val_windowed is not None:
-            combined_val_windowed = _maybe_cache_windowed_split_on_device(
+            combined_val_windowed_shared = _maybe_share_windowed_base_from_cached(
                 name=f"validation windowed tensors {train_years}",
                 split=combined_val_windowed,
                 device=device,
+                non_blocking=non_blocking,
                 enabled=bool(config.training.cache_eval_tensors_on_gpu),
-                target_fraction=float(config.training.target_vram_fraction),
-                safety_margin_gb=float(config.training.vram_safety_margin_gb),
+                cached_base=train_windowed,
             )
+            if combined_val_windowed_shared is not None:
+                combined_val_windowed = combined_val_windowed_shared
+            else:
+                combined_val_windowed = _maybe_cache_windowed_split_on_device(
+                    name=f"validation windowed tensors {train_years}",
+                    split=combined_val_windowed,
+                    device=device,
+                    enabled=bool(config.training.cache_eval_tensors_on_gpu),
+                    target_fraction=float(config.training.target_vram_fraction),
+                    safety_margin_gb=float(config.training.vram_safety_margin_gb),
+                )
         else:
             (
                 combined_val_x,
@@ -5912,14 +6097,25 @@ def run_training(
                 safety_margin_gb=float(config.training.vram_safety_margin_gb),
             )
         if combined_test_windowed is not None:
-            combined_test_windowed = _maybe_cache_windowed_split_on_device(
+            combined_test_windowed_shared = _maybe_share_windowed_base_from_cached(
                 name=f"test windowed tensors {train_years}",
                 split=combined_test_windowed,
                 device=device,
+                non_blocking=non_blocking,
                 enabled=bool(config.training.cache_eval_tensors_on_gpu),
-                target_fraction=float(config.training.target_vram_fraction),
-                safety_margin_gb=float(config.training.vram_safety_margin_gb),
+                cached_base=train_windowed if train_windowed is not None else combined_val_windowed,
             )
+            if combined_test_windowed_shared is not None:
+                combined_test_windowed = combined_test_windowed_shared
+            else:
+                combined_test_windowed = _maybe_cache_windowed_split_on_device(
+                    name=f"test windowed tensors {train_years}",
+                    split=combined_test_windowed,
+                    device=device,
+                    enabled=bool(config.training.cache_eval_tensors_on_gpu),
+                    target_fraction=float(config.training.target_vram_fraction),
+                    safety_margin_gb=float(config.training.vram_safety_margin_gb),
+                )
         else:
             (
                 combined_test_x,
@@ -6288,14 +6484,14 @@ def run_training(
             deferred_test_loss_tensors: torch.Tensor | None = None
             if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
                 val_eval_start = time.perf_counter()
-                compiled_train_model.eval()
+                eval_model.eval()
                 with torch.inference_mode():
                     for index, (_, context) in enumerate(fold_contexts.items()):
                         start = val_offsets[index]
                         end = val_offsets[index + 1]
 
                         val_loss, val_ic, val_fold_timing = _evaluate_rank_ic_multitask_loss(
-                            compiled_train_model,
+                            eval_model,
                             combined_val_x[start:end],
                             combined_val_returns[start:end],
                             combined_val_masks[start:end],
@@ -6360,7 +6556,7 @@ def run_training(
                 val_eval_start = time.perf_counter()
                 if combined_val_windowed is not None:
                     val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
-                        compiled_train_model,
+                        eval_model,
                         combined_val_windowed,
                         device,
                         amp_dtype,
@@ -6380,7 +6576,7 @@ def run_training(
                     )
                 else:
                     val_backtest_epoch, _, _ = _evaluate_tensor_batch(
-                        compiled_train_model,
+                        eval_model,
                         combined_val_x,
                         combined_val_returns,
                         combined_val_masks,
@@ -6447,12 +6643,12 @@ def run_training(
             if should_compute_test_mean:
                 curve_test_start = time.perf_counter()
                 if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
-                    compiled_train_model.eval()
+                    eval_model.eval()
                     with torch.inference_mode():
                         start = curve_test_start_row
                         end = curve_test_end_row
                         test_loss, _, test_fold_timing = _evaluate_rank_ic_multitask_loss(
-                            compiled_train_model,
+                            eval_model,
                             combined_test_x[start:end],
                             combined_test_returns[start:end],
                             combined_test_masks[start:end],
@@ -6497,7 +6693,7 @@ def run_training(
                 else:
                     if combined_test_windowed is not None:
                         test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
-                            compiled_train_model,
+                            eval_model,
                             combined_test_windowed,
                             device,
                             amp_dtype,
@@ -6517,7 +6713,7 @@ def run_training(
                         )
                     else:
                         test_backtest_epoch, _, _ = _evaluate_tensor_batch(
-                            compiled_train_model,
+                            eval_model,
                             combined_test_x[curve_test_start_row:curve_test_end_row],
                             combined_test_returns[curve_test_start_row:curve_test_end_row],
                             combined_test_masks[curve_test_start_row:curve_test_end_row],
@@ -6773,7 +6969,7 @@ def run_training(
             eval_only_start = time.perf_counter()
             if combined_val_windowed is not None:
                 val_backtest, _, _ = _evaluate_windowed_tensor_batch(
-                    compiled_train_model,
+                    eval_model,
                     combined_val_windowed,
                     device,
                     amp_dtype,
@@ -6790,7 +6986,7 @@ def run_training(
                 )
             else:
                 val_backtest, _, _ = _evaluate_tensor_batch(
-                    compiled_train_model,
+                    eval_model,
                     combined_val_x,
                     combined_val_returns,
                     combined_val_masks,
@@ -6860,7 +7056,7 @@ def run_training(
                     non_blocking,
                 )
                 test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
-                    compiled_train_model,
+                    eval_model,
                     test_windowed,
                     device,
                     amp_dtype,
@@ -6895,7 +7091,7 @@ def run_training(
                     non_blocking,
                 )
                 test_bt_t, test_ic, _ = _evaluate_tensor_batch(
-                    compiled_train_model,
+                    eval_model,
                     test_x,
                     test_returns,
                     test_masks,

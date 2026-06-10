@@ -54,6 +54,7 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
+  eval_auto_chunk_rows_cap: 16
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
@@ -65,8 +66,8 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: true
   lookback: 32
-  batch_size: 16
-  batch_size_train: 16
+  batch_size: 32
+  batch_size_train: 32
   batch_size_eval: 16
   epochs: 1000
   early_stopping_no_improve_ratio: 0.05
