@@ -67,12 +67,19 @@ training:
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
-  compile_loss: false
+  torchinductor_cache_dir: ~/.cache/torchinductor
+  triton_cache_dir: ~/.cache/triton
+  cuda_cache_path: ~/.cache/nv_cuda
+  compile_loss: true
+  fused_log_utility_loss: true
+  auto_batch_size: false
+  allow_dynamic_symbols: false
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   backtest_compile: true
   backtest_compile_stateful: true
+  backtest_compile_dynamic: false
   loss_type: log_utility
 
   transformer_base_portfolio:
@@ -239,12 +246,19 @@ Compile/runtime rules:
 
 - Use CUDA 13 ptxas for the current PyTorch CUDA 13 environment. Prefer mamba/conda packages such as `cuda-nvcc` / `cuda-nvvm-tools` in the `fintech` env; do not leave a CUDA 12 pip `nvidia-cuda-nvcc-cu12` package around as a fallback ptxas source.
 - When invoking `/home/user/miniforge3/envs/fintech/bin/python` directly, PATH may not include the env `bin`. Compile helpers must prepend that path so Triton can find `/home/user/miniforge3/envs/fintech/bin/ptxas`.
-- Current benchmark result for the active `data_okx` lookback32 run: compare only epoch 2 or later. The fastest measured compile combination is model compile plus stateful tensor backtest compile:
+- Compile cache paths should be stable and persistent across runs:
+  - `TORCHINDUCTOR_CACHE_DIR=~/.cache/torchinductor`
+  - `TRITON_CACHE_DIR=~/.cache/triton`
+  - `CUDA_CACHE_PATH=~/.cache/nv_cuda`
+  - do not delete these caches between repeated same-shape benchmarks unless explicitly testing cold compile behavior
+- Current benchmark result for the active `data_okx` lookback32 run: compare only epoch 2 or later. The fastest measured compile combination is model compile plus fullgraph fused log-utility loss:
   - `enable_torch_compile: true`
   - `backtest_compile: true`
   - `backtest_compile_stateful: true`
-  - `compile_loss: false`
-  - epoch 2 wall time improved from about `67.54s` with all compile off to about `19.54s`.
+  - `backtest_compile_dynamic: false` for fixed train/eval shapes
+  - `fused_log_utility_loss: true`
+  - `compile_loss: true`
+  - epoch 2 wall time improved from about `67.54s` with all compile off to about `18.99s`.
 - Compile mode benchmark result:
   - keep `torch_compile_mode: reduce-overhead`
   - `default` and `max-autotune` were slower on epoch 2 for the active `data_okx` lookback32 shape
@@ -264,8 +278,11 @@ Compile/runtime rules:
   - `auto_torch_compile_sharpe: false`
   - `backtest_compile: true`
   - `backtest_compile_stateful: true`
+  - `backtest_compile_dynamic: false`
   - `backtest_autotune: true`
-  - `compile_loss: false`
+  - `fused_log_utility_loss: true`
+  - `compile_loss: true`
+  - only compile the fullgraph fused log-utility fast path; keep general `risk_aware_loss` as the debug/research path
 - Eval model forward chunking and eval backtest chunking are intentionally decoupled:
   - keep model chunk sizing VRAM-driven, often `eval_model_chunk_rows: auto`
   - use larger `eval_backtest_chunk_rows`, currently `512`, to reduce `run_backtest_torch()` calls without skipping any val/test curve rows
