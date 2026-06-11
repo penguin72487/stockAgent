@@ -50,6 +50,7 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
+from stockagent.training.fused_loss import fused_log_utility_loss_tensor
 from stockagent.training.loss import get_loss_runtime_stats, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -307,6 +308,40 @@ class _CompiledLossFallback:
         return self._disabled
 
 
+class _CompiledFusedLossFallback:
+    def __init__(
+        self,
+        compiled_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+        eager_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+        *,
+        label: str,
+    ) -> None:
+        self._compiled_fn = compiled_fn
+        self._eager_fn = eager_fn
+        self._label = label
+        self._disabled = False
+        self._warned = False
+
+    def __call__(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._disabled:
+            return self._eager_fn(*args, **kwargs)
+        try:
+            return self._compiled_fn(*args, **kwargs)
+        except Exception as exc:
+            self._disabled = True
+            if not self._warned:
+                print(
+                    f"[{self._label}] torch.compile fused log-utility loss failed; "
+                    f"falling back to eager fused loss: {type(exc).__name__}: {str(exc)[:300]}"
+                )
+                self._warned = True
+            return self._eager_fn(*args, **kwargs)
+
+    @property
+    def disabled(self) -> bool:
+        return self._disabled
+
+
 def _env_truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "on", "yes"}
 
@@ -360,6 +395,7 @@ def _profile_single_train_step(
     *,
     model: nn.Module,
     loss_fn,
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
     batch: dict[str, torch.Tensor],
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -406,43 +442,55 @@ def _profile_single_train_step(
         with _autocast_context(device, amp_dtype):
             model_output = model(batch["x"], batch["tradable_mask"])
             weights, aux_outputs = _extract_weights_and_aux(model_output)
-            loss = loss_fn(
-                weights,
-                batch["future_log_returns"],
-                batch["tradable_mask"],
-                benchmark_returns=batch.get("benchmark"),
-                can_buy_mask=batch["can_buy_mask"],
-                can_sell_mask=batch["can_sell_mask"],
-                sample_mask=batch.get("sample_mask"),
-                long_only=long_only,
-                buy_fee_rate=buy_fee_rate,
-                sell_fee_rate=sell_fee_rate,
-                max_turnover_ratio=max_turnover_ratio,
-                gross_leverage=gross_leverage,
-                gamma_sharpe=gamma_sharpe,
-                gamma_excess=gamma_excess,
-                gamma_cvar=gamma_cvar,
-                cvar_alpha=cvar_alpha,
-                gamma_drawdown=gamma_drawdown,
-                drawdown_target=drawdown_target,
-                gamma_turnover=gamma_turnover,
-                gamma_underperformance=gamma_underperformance,
-                excess_target=excess_target,
-                cvar_budget=cvar_budget,
-                drawdown_budget=drawdown_budget,
-                turnover_budget=turnover_budget,
-                gamma_cvar_budget=gamma_cvar_budget,
-                gamma_drawdown_budget=gamma_drawdown_budget,
-                gamma_turnover_budget=gamma_turnover_budget,
-                objective=objective,
-                aux_outputs=aux_outputs,
-                rank_ic_weight=rank_ic_weight,
-                direction_weight=direction_weight,
-                volatility_regime_weight=volatility_regime_weight,
-                concentration_weight=concentration_weight,
-                regime_up_threshold=regime_up_threshold,
-                regime_down_threshold=regime_down_threshold,
-            )
+            if fused_loss_fn is not None and _is_log_utility_objective(objective):
+                loss, _ = _run_fused_log_utility_loss(
+                    fused_loss_fn,
+                    weights,
+                    batch["future_log_returns"],
+                    batch["tradable_mask"],
+                    batch["can_buy_mask"],
+                    batch["can_sell_mask"],
+                    batch.get("sample_mask"),
+                    None,
+                )
+            else:
+                loss = loss_fn(
+                    weights,
+                    batch["future_log_returns"],
+                    batch["tradable_mask"],
+                    benchmark_returns=batch.get("benchmark"),
+                    can_buy_mask=batch["can_buy_mask"],
+                    can_sell_mask=batch["can_sell_mask"],
+                    sample_mask=batch.get("sample_mask"),
+                    long_only=long_only,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
+                    max_turnover_ratio=max_turnover_ratio,
+                    gross_leverage=gross_leverage,
+                    gamma_sharpe=gamma_sharpe,
+                    gamma_excess=gamma_excess,
+                    gamma_cvar=gamma_cvar,
+                    cvar_alpha=cvar_alpha,
+                    gamma_drawdown=gamma_drawdown,
+                    drawdown_target=drawdown_target,
+                    gamma_turnover=gamma_turnover,
+                    gamma_underperformance=gamma_underperformance,
+                    excess_target=excess_target,
+                    cvar_budget=cvar_budget,
+                    drawdown_budget=drawdown_budget,
+                    turnover_budget=turnover_budget,
+                    gamma_cvar_budget=gamma_cvar_budget,
+                    gamma_drawdown_budget=gamma_drawdown_budget,
+                    gamma_turnover_budget=gamma_turnover_budget,
+                    objective=objective,
+                    aux_outputs=aux_outputs,
+                    rank_ic_weight=rank_ic_weight,
+                    direction_weight=direction_weight,
+                    volatility_regime_weight=volatility_regime_weight,
+                    concentration_weight=concentration_weight,
+                    regime_up_threshold=regime_up_threshold,
+                    regime_down_threshold=regime_down_threshold,
+                )
         if torch.isfinite(loss).all():
             loss.backward()
 
@@ -589,6 +637,39 @@ def _is_return_series_objective(objective: str) -> bool:
     }
 
 
+def _is_log_utility_objective(objective: str) -> bool:
+    return objective.strip().lower() in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}
+
+
+def _run_fused_log_utility_loss(
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    sample_mask: torch.Tensor | None,
+    initial_weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sample_mask is None:
+        sample_mask = torch.ones((weights.size(0),), device=weights.device, dtype=torch.bool)
+    else:
+        sample_mask = sample_mask.to(device=weights.device, dtype=torch.bool)
+    if initial_weights is None:
+        initial_weights = torch.zeros((weights.size(1),), device=weights.device, dtype=weights.dtype)
+    else:
+        initial_weights = initial_weights.to(device=weights.device, dtype=weights.dtype)
+    return fused_loss_fn(
+        weights,
+        future_returns,
+        tradable_mask,
+        can_buy_mask,
+        can_sell_mask,
+        sample_mask,
+        initial_weights,
+    )
+
+
 def _loss_from_backtest_result(
     backtest: BacktestResultTensor,
     config: ExperimentConfig,
@@ -682,7 +763,14 @@ def _batched_loss_from_backtest_segments(
     gamma_turnover_budget: float,
     objective: str = "sharpe",
 ) -> torch.Tensor:
-    """Compute one validation/test loss per fold without per-fold CPU round trips."""
+    """Compute one validation/test loss per fold without per-fold CPU round trips.
+
+    For ``log_utility`` this is intentionally the same fee-adjusted return and
+    turnover reduction used by the fused training loss, applied to already
+    materialized canonical backtest curves. The full curves are still needed for
+    equity/risk plots and metrics; this reduction must not introduce a separate
+    validation/test loss formula.
+    """
     segment_count = max(0, len(offsets) - 1)
     if segment_count <= 0:
         return strategy_returns.new_empty((0,), dtype=torch.float32)
@@ -3995,7 +4083,38 @@ def _resolve_host_compilers() -> tuple[str | None, str | None]:
     return _resolve(cc_candidates), _resolve(cxx_candidates)
 
 
+def _runtime_cache_path(value: object) -> Path | None:
+    raw = str(value or "").strip()
+    if raw.lower() in {"", "0", "false", "off", "no", "none"}:
+        return None
+    return Path(os.path.expandvars(raw)).expanduser()
+
+
+def _configure_compile_cache_paths(
+    *,
+    torchinductor_cache_dir: object = "~/.cache/torchinductor",
+    triton_cache_dir: object = "~/.cache/triton",
+    cuda_cache_path: object = "~/.cache/nv_cuda",
+    force: bool = False,
+) -> None:
+    for env_name, raw_path in (
+        ("TORCHINDUCTOR_CACHE_DIR", torchinductor_cache_dir),
+        ("TRITON_CACHE_DIR", triton_cache_dir),
+        ("CUDA_CACHE_PATH", cuda_cache_path),
+    ):
+        path = _runtime_cache_path(raw_path)
+        if path is None:
+            continue
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        if force or not os.environ.get(env_name):
+            os.environ[env_name] = str(path)
+
+
 def _prepend_compile_toolchain_paths() -> None:
+    _configure_compile_cache_paths()
     entries: list[str] = []
     env_bin = Path(sys.executable).resolve().parent
     env_root = env_bin.parent
@@ -4004,6 +4123,12 @@ def _prepend_compile_toolchain_paths() -> None:
     if ptxas_path.exists():
         os.environ.setdefault("TRITON_PTXAS_PATH", str(ptxas_path))
         os.environ.setdefault("TRITON_PTXAS_BLACKWELL_PATH", str(ptxas_path))
+    cc_path = env_bin / "x86_64-conda-linux-gnu-gcc"
+    cxx_path = env_bin / "x86_64-conda-linux-gnu-g++"
+    if cc_path.exists():
+        os.environ.setdefault("CC", str(cc_path))
+    if cxx_path.exists():
+        os.environ.setdefault("CXX", str(cxx_path))
     entries.append(str(env_bin))
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
@@ -4046,10 +4171,20 @@ def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
 
 def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     training = config.training
+    _configure_compile_cache_paths(
+        torchinductor_cache_dir=getattr(training, "torchinductor_cache_dir", "~/.cache/torchinductor"),
+        triton_cache_dir=getattr(training, "triton_cache_dir", "~/.cache/triton"),
+        cuda_cache_path=getattr(training, "cuda_cache_path", "~/.cache/nv_cuda"),
+        force=True,
+    )
+    _prepend_compile_toolchain_paths()
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if bool(training.backtest_autotune) else "0"
     os.environ["STOCKAGENT_BACKTEST_COMPILE"] = "1" if bool(training.backtest_compile) else "0"
     os.environ["STOCKAGENT_BACKTEST_COMPILE_STATEFUL"] = (
         "1" if bool(training.backtest_compile_stateful) else "0"
+    )
+    os.environ["STOCKAGENT_BACKTEST_COMPILE_DYNAMIC"] = (
+        "1" if bool(getattr(training, "backtest_compile_dynamic", False)) else "0"
     )
     os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
@@ -4486,6 +4621,7 @@ def _split_batch_size(dataset_size: int, cap: int) -> int:
 def _train_epoch(
     model: nn.Module,
     loss_fn: Callable[..., torch.Tensor],
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -4529,6 +4665,7 @@ def _train_epoch(
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
     sequential_return_objective = _is_return_series_objective(objective)
+    use_fused_log_utility = fused_loss_fn is not None and _is_log_utility_objective(objective)
     portfolio_prev_weights: torch.Tensor | None = None
 
     timing = TimingBreakdown()
@@ -4583,49 +4720,62 @@ def _train_epoch(
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
-            if sequential_return_objective:
+            fused_next_prev: torch.Tensor | None = None
+            if sequential_return_objective and not use_fused_log_utility:
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
-                loss = loss_fn(
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    benchmark_returns=batch.get("benchmark"),
-                    can_buy_mask=batch["can_buy_mask"],
-                    can_sell_mask=batch["can_sell_mask"],
-                    sample_mask=batch.get("sample_mask"),
-                    long_only=long_only,
-                    buy_fee_rate=buy_fee_rate,
-                    sell_fee_rate=sell_fee_rate,
-                    max_turnover_ratio=max_turnover_ratio,
-                    gross_leverage=gross_leverage,
-                    gamma_sharpe=gamma_sharpe,
-                    gamma_excess=gamma_excess,
-                    gamma_cvar=gamma_cvar,
-                    cvar_alpha=cvar_alpha,
-                    gamma_drawdown=gamma_drawdown,
-                    drawdown_target=drawdown_target,
-                    gamma_turnover=gamma_turnover,
-                    gamma_underperformance=gamma_underperformance,
-                    excess_target=excess_target,
-                    cvar_budget=cvar_budget,
-                    drawdown_budget=drawdown_budget,
-                    turnover_budget=turnover_budget,
-                    gamma_cvar_budget=gamma_cvar_budget,
-                    gamma_drawdown_budget=gamma_drawdown_budget,
-                    gamma_turnover_budget=gamma_turnover_budget,
-                    objective=objective,
-                    aux_outputs=aux_outputs,
-                    rank_ic_weight=rank_ic_weight,
-                    direction_weight=direction_weight,
-                    volatility_regime_weight=volatility_regime_weight,
-                    concentration_weight=concentration_weight,
-                    regime_up_threshold=regime_up_threshold,
-                    regime_down_threshold=regime_down_threshold,
-                )
+                if use_fused_log_utility and fused_loss_fn is not None:
+                    loss, fused_next_prev = _run_fused_log_utility_loss(
+                        fused_loss_fn,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        batch["can_buy_mask"],
+                        batch["can_sell_mask"],
+                        batch.get("sample_mask"),
+                        portfolio_prev_weights,
+                    )
+                else:
+                    loss = loss_fn(
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        benchmark_returns=batch.get("benchmark"),
+                        can_buy_mask=batch["can_buy_mask"],
+                        can_sell_mask=batch["can_sell_mask"],
+                        sample_mask=batch.get("sample_mask"),
+                        long_only=long_only,
+                        buy_fee_rate=buy_fee_rate,
+                        sell_fee_rate=sell_fee_rate,
+                        max_turnover_ratio=max_turnover_ratio,
+                        gross_leverage=gross_leverage,
+                        gamma_sharpe=gamma_sharpe,
+                        gamma_excess=gamma_excess,
+                        gamma_cvar=gamma_cvar,
+                        cvar_alpha=cvar_alpha,
+                        gamma_drawdown=gamma_drawdown,
+                        drawdown_target=drawdown_target,
+                        gamma_turnover=gamma_turnover,
+                        gamma_underperformance=gamma_underperformance,
+                        excess_target=excess_target,
+                        cvar_budget=cvar_budget,
+                        drawdown_budget=drawdown_budget,
+                        turnover_budget=turnover_budget,
+                        gamma_cvar_budget=gamma_cvar_budget,
+                        gamma_drawdown_budget=gamma_drawdown_budget,
+                        gamma_turnover_budget=gamma_turnover_budget,
+                        objective=objective,
+                        aux_outputs=aux_outputs,
+                        rank_ic_weight=rank_ic_weight,
+                        direction_weight=direction_weight,
+                        volatility_regime_weight=volatility_regime_weight,
+                        concentration_weight=concentration_weight,
+                        regime_up_threshold=regime_up_threshold,
+                        regime_down_threshold=regime_down_threshold,
+                    )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
         should_check_finite = _should_check_finite(batch_no, finite_check_interval_steps)
@@ -4638,13 +4788,17 @@ def _train_epoch(
                     _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite loss")
                 optimizer.zero_grad(set_to_none=True)
                 continue
-        if sequential_return_objective and aux_outputs is not None:
+        if use_fused_log_utility:
+            next_prev = fused_next_prev
+        elif sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
-            if next_prev is not None:
-                state_start = time.perf_counter()
-                portfolio_prev_weights = _detach_portfolio_state(next_prev)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.portfolio_state_s += time.perf_counter() - state_start
+        else:
+            next_prev = None
+        if next_prev is not None:
+            state_start = time.perf_counter()
+            portfolio_prev_weights = _detach_portfolio_state(next_prev)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.portfolio_state_s += time.perf_counter() - state_start
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -4753,6 +4907,7 @@ def _train_epoch(
 def _train_epoch_tensor(
     model: nn.Module,
     loss_fn: Callable[..., torch.Tensor],
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
     x: torch.Tensor,
     future_log_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
@@ -4806,6 +4961,7 @@ def _train_epoch_tensor(
 
     num_batches = total_rows // batch_size
     sequential_return_objective = _is_return_series_objective(objective)
+    use_fused_log_utility = fused_loss_fn is not None and _is_log_utility_objective(objective)
     batch_order = list(range(num_batches)) if sequential_return_objective else torch.randperm(num_batches).tolist()
     portfolio_prev_weights: torch.Tensor | None = None
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -4865,49 +5021,62 @@ def _train_epoch_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
-            if sequential_return_objective:
+            fused_next_prev: torch.Tensor | None = None
+            if sequential_return_objective and not use_fused_log_utility:
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
-                loss = loss_fn(
-                    weights,
-                    batch_ret,
-                    batch_mask,
-                    benchmark_returns=batch_bench,
-                    can_buy_mask=batch_buy_mask,
-                    can_sell_mask=batch_sell_mask,
-                    sample_mask=batch_sample_mask,
-                    long_only=long_only,
-                    buy_fee_rate=buy_fee_rate,
-                    sell_fee_rate=sell_fee_rate,
-                    max_turnover_ratio=max_turnover_ratio,
-                    gross_leverage=gross_leverage,
-                    gamma_sharpe=gamma_sharpe,
-                    gamma_excess=gamma_excess,
-                    gamma_cvar=gamma_cvar,
-                    cvar_alpha=cvar_alpha,
-                    gamma_drawdown=gamma_drawdown,
-                    drawdown_target=drawdown_target,
-                    gamma_turnover=gamma_turnover,
-                    gamma_underperformance=gamma_underperformance,
-                    excess_target=excess_target,
-                    cvar_budget=cvar_budget,
-                    drawdown_budget=drawdown_budget,
-                    turnover_budget=turnover_budget,
-                    gamma_cvar_budget=gamma_cvar_budget,
-                    gamma_drawdown_budget=gamma_drawdown_budget,
-                    gamma_turnover_budget=gamma_turnover_budget,
-                    objective=objective,
-                    aux_outputs=aux_outputs,
-                    rank_ic_weight=rank_ic_weight,
-                    direction_weight=direction_weight,
-                    volatility_regime_weight=volatility_regime_weight,
-                    concentration_weight=concentration_weight,
-                    regime_up_threshold=regime_up_threshold,
-                    regime_down_threshold=regime_down_threshold,
-                )
+                if use_fused_log_utility and fused_loss_fn is not None:
+                    loss, fused_next_prev = _run_fused_log_utility_loss(
+                        fused_loss_fn,
+                        weights,
+                        batch_ret,
+                        batch_mask,
+                        batch_buy_mask,
+                        batch_sell_mask,
+                        batch_sample_mask,
+                        portfolio_prev_weights,
+                    )
+                else:
+                    loss = loss_fn(
+                        weights,
+                        batch_ret,
+                        batch_mask,
+                        benchmark_returns=batch_bench,
+                        can_buy_mask=batch_buy_mask,
+                        can_sell_mask=batch_sell_mask,
+                        sample_mask=batch_sample_mask,
+                        long_only=long_only,
+                        buy_fee_rate=buy_fee_rate,
+                        sell_fee_rate=sell_fee_rate,
+                        max_turnover_ratio=max_turnover_ratio,
+                        gross_leverage=gross_leverage,
+                        gamma_sharpe=gamma_sharpe,
+                        gamma_excess=gamma_excess,
+                        gamma_cvar=gamma_cvar,
+                        cvar_alpha=cvar_alpha,
+                        gamma_drawdown=gamma_drawdown,
+                        drawdown_target=drawdown_target,
+                        gamma_turnover=gamma_turnover,
+                        gamma_underperformance=gamma_underperformance,
+                        excess_target=excess_target,
+                        cvar_budget=cvar_budget,
+                        drawdown_budget=drawdown_budget,
+                        turnover_budget=turnover_budget,
+                        gamma_cvar_budget=gamma_cvar_budget,
+                        gamma_drawdown_budget=gamma_drawdown_budget,
+                        gamma_turnover_budget=gamma_turnover_budget,
+                        objective=objective,
+                        aux_outputs=aux_outputs,
+                        rank_ic_weight=rank_ic_weight,
+                        direction_weight=direction_weight,
+                        volatility_regime_weight=volatility_regime_weight,
+                        concentration_weight=concentration_weight,
+                        regime_up_threshold=regime_up_threshold,
+                        regime_down_threshold=regime_down_threshold,
+                    )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
         should_check_finite = _should_check_finite(step_idx, finite_check_interval_steps)
@@ -4920,13 +5089,17 @@ def _train_epoch_tensor(
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite loss")
                 optimizer.zero_grad(set_to_none=True)
                 continue
-        if sequential_return_objective and aux_outputs is not None:
+        if use_fused_log_utility:
+            next_prev = fused_next_prev
+        elif sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
-            if next_prev is not None:
-                state_start = time.perf_counter()
-                portfolio_prev_weights = _detach_portfolio_state(next_prev)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.portfolio_state_s += time.perf_counter() - state_start
+        else:
+            next_prev = None
+        if next_prev is not None:
+            state_start = time.perf_counter()
+            portfolio_prev_weights = _detach_portfolio_state(next_prev)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.portfolio_state_s += time.perf_counter() - state_start
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -5035,6 +5208,7 @@ def _train_epoch_tensor(
 def _train_epoch_windowed_tensor(
     model: nn.Module,
     loss_fn: Callable[..., torch.Tensor],
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
     split: WindowedSplitTensors,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -5082,6 +5256,7 @@ def _train_epoch_windowed_tensor(
 
     num_batches = (total_rows + batch_size - 1) // batch_size
     sequential_return_objective = _is_return_series_objective(objective)
+    use_fused_log_utility = fused_loss_fn is not None and _is_log_utility_objective(objective)
     batch_order = list(range(num_batches)) if sequential_return_objective else torch.randperm(num_batches).tolist()
     portfolio_prev_weights: torch.Tensor | None = None
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -5138,49 +5313,62 @@ def _train_epoch_windowed_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.factor_aug_s += time.perf_counter() - factor_aug_start
 
-            if sequential_return_objective:
+            fused_next_prev: torch.Tensor | None = None
+            if sequential_return_objective and not use_fused_log_utility:
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
-                loss = loss_fn(
-                    weights,
-                    batch_ret,
-                    batch_mask,
-                    benchmark_returns=batch_bench,
-                    can_buy_mask=batch_buy_mask,
-                    can_sell_mask=batch_sell_mask,
-                    sample_mask=batch_sample_mask,
-                    long_only=long_only,
-                    buy_fee_rate=buy_fee_rate,
-                    sell_fee_rate=sell_fee_rate,
-                    max_turnover_ratio=max_turnover_ratio,
-                    gross_leverage=gross_leverage,
-                    gamma_sharpe=gamma_sharpe,
-                    gamma_excess=gamma_excess,
-                    gamma_cvar=gamma_cvar,
-                    cvar_alpha=cvar_alpha,
-                    gamma_drawdown=gamma_drawdown,
-                    drawdown_target=drawdown_target,
-                    gamma_turnover=gamma_turnover,
-                    gamma_underperformance=gamma_underperformance,
-                    excess_target=excess_target,
-                    cvar_budget=cvar_budget,
-                    drawdown_budget=drawdown_budget,
-                    turnover_budget=turnover_budget,
-                    gamma_cvar_budget=gamma_cvar_budget,
-                    gamma_drawdown_budget=gamma_drawdown_budget,
-                    gamma_turnover_budget=gamma_turnover_budget,
-                    objective=objective,
-                    aux_outputs=aux_outputs,
-                    rank_ic_weight=rank_ic_weight,
-                    direction_weight=direction_weight,
-                    volatility_regime_weight=volatility_regime_weight,
-                    concentration_weight=concentration_weight,
-                    regime_up_threshold=regime_up_threshold,
-                    regime_down_threshold=regime_down_threshold,
-                )
+                if use_fused_log_utility and fused_loss_fn is not None:
+                    loss, fused_next_prev = _run_fused_log_utility_loss(
+                        fused_loss_fn,
+                        weights,
+                        batch_ret,
+                        batch_mask,
+                        batch_buy_mask,
+                        batch_sell_mask,
+                        batch_sample_mask,
+                        portfolio_prev_weights,
+                    )
+                else:
+                    loss = loss_fn(
+                        weights,
+                        batch_ret,
+                        batch_mask,
+                        benchmark_returns=batch_bench,
+                        can_buy_mask=batch_buy_mask,
+                        can_sell_mask=batch_sell_mask,
+                        sample_mask=batch_sample_mask,
+                        long_only=long_only,
+                        buy_fee_rate=buy_fee_rate,
+                        sell_fee_rate=sell_fee_rate,
+                        max_turnover_ratio=max_turnover_ratio,
+                        gross_leverage=gross_leverage,
+                        gamma_sharpe=gamma_sharpe,
+                        gamma_excess=gamma_excess,
+                        gamma_cvar=gamma_cvar,
+                        cvar_alpha=cvar_alpha,
+                        gamma_drawdown=gamma_drawdown,
+                        drawdown_target=drawdown_target,
+                        gamma_turnover=gamma_turnover,
+                        gamma_underperformance=gamma_underperformance,
+                        excess_target=excess_target,
+                        cvar_budget=cvar_budget,
+                        drawdown_budget=drawdown_budget,
+                        turnover_budget=turnover_budget,
+                        gamma_cvar_budget=gamma_cvar_budget,
+                        gamma_drawdown_budget=gamma_drawdown_budget,
+                        gamma_turnover_budget=gamma_turnover_budget,
+                        objective=objective,
+                        aux_outputs=aux_outputs,
+                        rank_ic_weight=rank_ic_weight,
+                        direction_weight=direction_weight,
+                        volatility_regime_weight=volatility_regime_weight,
+                        concentration_weight=concentration_weight,
+                        regime_up_threshold=regime_up_threshold,
+                        regime_down_threshold=regime_down_threshold,
+                    )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
 
@@ -5192,13 +5380,17 @@ def _train_epoch_windowed_tensor(
             if not loss_is_finite:
                 optimizer.zero_grad(set_to_none=True)
                 continue
-        if sequential_return_objective and aux_outputs is not None:
+        if use_fused_log_utility:
+            next_prev = fused_next_prev
+        elif sequential_return_objective and aux_outputs is not None:
             next_prev = aux_outputs.get("_final_weights")
-            if next_prev is not None:
-                state_start = time.perf_counter()
-                portfolio_prev_weights = _detach_portfolio_state(next_prev)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.portfolio_state_s += time.perf_counter() - state_start
+        else:
+            next_prev = None
+        if next_prev is not None:
+            state_start = time.perf_counter()
+            portfolio_prev_weights = _detach_portfolio_state(next_prev)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.portfolio_state_s += time.perf_counter() - state_start
         _maybe_sync_cuda(device, profile_timing)
         timing.forward_s += time.perf_counter() - forward_start
 
@@ -6342,6 +6534,20 @@ def run_training(
         compiled_train_model: nn.Module = model
         eval_model: nn.Module = model
         compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
+        use_fused_log_utility_loss = bool(getattr(config.training, "fused_log_utility_loss", True)) and _is_log_utility_objective(loss_objective)
+        fused_log_utility_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
+        if use_fused_log_utility_loss:
+            fused_log_utility_loss_fn = partial(
+                fused_log_utility_loss_tensor,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                long_only=config.trading.long_only,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
+                gamma_sharpe=config.evaluation.gamma_sharpe,
+                gamma_turnover=config.evaluation.gamma_turnover,
+                concentration_weight=config.training.multitask_loss.concentration_weight,
+            )
 
         if device.type == "cuda":
             try:
@@ -6526,7 +6732,31 @@ def run_training(
                     )
                     model_compile_status = f"enabled:{compile_source}"
 
-                    if compile_loss:
+                    if compile_loss and fused_log_utility_loss_fn is not None:
+                        try:
+                            raw_compiled_fused_loss_fn = torch.compile(
+                                fused_log_utility_loss_fn,
+                                dynamic=False,
+                                fullgraph=True,
+                                options={"triton.cudagraphs": False},
+                            )
+                            fused_log_utility_loss_fn = _CompiledFusedLossFallback(
+                                raw_compiled_fused_loss_fn,
+                                fused_log_utility_loss_fn,
+                                label=f"Train {train_years}",
+                            )
+                            print(
+                                f"[Train {train_years}] torch.compile fused log-utility loss enabled "
+                                "(fullgraph=True, dynamic=False, cudagraphs=False)"
+                            )
+                            loss_compile_status = "enabled:fused_log_utility"
+                        except Exception as e:
+                            loss_compile_status = "fallback:fused_eager"
+                            print(
+                                f"[Train {train_years}] torch.compile fused log-utility loss setup failed, "
+                                f"falling back to eager fused loss: {e}"
+                            )
+                    elif compile_loss:
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                             raw_compiled_loss_fn = torch.compile(
@@ -6549,7 +6779,7 @@ def run_training(
                             loss_compile_status = "fallback:eager"
                             print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
                     else:
-                        loss_compile_status = "off:eager"
+                        loss_compile_status = "off:fused_eager" if fused_log_utility_loss_fn is not None else "off:eager"
                     if profile_timing:
                         _log_timing(
                             f"Train {train_years} setup.torch_compile",
@@ -6566,14 +6796,16 @@ def run_training(
         elif compile_loss:
             loss_compile_status = "off:model_compile_disabled"
         else:
-            loss_compile_status = "off:eager"
+            loss_compile_status = "off:fused_eager" if fused_log_utility_loss_fn is not None else "off:eager"
         print(
             f"[Train {train_years}] optimization status: "
             f"model_compile={model_compile_status}; "
             f"eval_model={'compiled' if eval_model is compiled_train_model and compiled_train_model is not model else 'eager'}; "
             f"loss_compile={loss_compile_status}; "
+            f"fused_log_utility_loss={bool(fused_log_utility_loss_fn is not None)}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
+            f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
             f"backtest_prep_compile={_env_truthy('STOCKAGENT_BACKTEST_COMPILE_PREP', '1')}; "
             f"backtest_cpp_ext={bool(config.training.backtest_cpp_ext)}; "
             f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
@@ -6815,6 +7047,7 @@ def run_training(
                     _profile_single_train_step(
                         model=compiled_train_model,
                         loss_fn=compiled_loss_fn,
+                        fused_loss_fn=fused_log_utility_loss_fn,
                         batch=profile_batch,
                         device=device,
                         amp_dtype=amp_dtype,
@@ -6881,6 +7114,7 @@ def run_training(
                 return _train_epoch(
                     train_model,
                     compiled_loss_fn,
+                    fused_log_utility_loss_fn,
                     train_loader,
                     optimizer,
                     scaler,
@@ -6923,6 +7157,7 @@ def run_training(
                 return _train_epoch_windowed_tensor(
                     train_model,
                     compiled_loss_fn,
+                    fused_log_utility_loss_fn,
                     train_windowed,
                     optimizer,
                     scaler,
@@ -6965,6 +7200,7 @@ def run_training(
             return _train_epoch_tensor(
                 train_model,
                 compiled_loss_fn,
+                fused_log_utility_loss_fn,
                 train_x,
                 train_returns,
                 train_masks,
@@ -7047,6 +7283,7 @@ def run_training(
                 )
                 loss_compile_fallback = int(
                     isinstance(compiled_loss_fn, _CompiledLossFallback) and compiled_loss_fn.disabled
+                    or isinstance(fused_log_utility_loss_fn, _CompiledFusedLossFallback) and fused_log_utility_loss_fn.disabled
                 )
                 epoch_pbar.set_postfix(
                     {

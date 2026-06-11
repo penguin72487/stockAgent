@@ -268,6 +268,29 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _runtime_cache_path(value: object) -> Path | None:
+    raw = str(value or "").strip()
+    if raw.lower() in {"", "0", "false", "off", "no", "none"}:
+        return None
+    return Path(os.path.expandvars(raw)).expanduser()
+
+
+def _configure_compile_cache_paths() -> None:
+    for env_name, default_path in (
+        ("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor"),
+        ("TRITON_CACHE_DIR", "~/.cache/triton"),
+        ("CUDA_CACHE_PATH", "~/.cache/nv_cuda"),
+    ):
+        path = _runtime_cache_path(os.environ.get(env_name, default_path))
+        if path is None:
+            continue
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        os.environ.setdefault(env_name, str(path))
+
+
 def _torch_dynamo_is_compiling() -> bool:
     compiler = getattr(torch, "compiler", None)
     compiler_is_compiling = getattr(compiler, "is_compiling", None)
@@ -289,6 +312,7 @@ def _torch_dynamo_is_compiling() -> bool:
 
 
 def _prepend_cuda_toolchain_paths() -> None:
+    _configure_compile_cache_paths()
     env_bin = Path(sys.executable).resolve().parent
     env_root = env_bin.parent
     os.environ.setdefault("CONDA_PREFIX", str(env_root))
@@ -333,6 +357,10 @@ def _compile_enabled() -> bool:
 
 def _compile_stateful_enabled() -> bool:
     return _env_flag("STOCKAGENT_BACKTEST_COMPILE_STATEFUL", "1")
+
+
+def _compile_dynamic_enabled() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_COMPILE_DYNAMIC", "0")
 
 
 def _compile_prep_enabled() -> bool:
@@ -495,6 +523,7 @@ def _scan_compile_key(
         int(scan_chunk_size),
         bool(record_weights_history),
         bool(stateful_initial),
+        bool(_compile_dynamic_enabled()),
     )
 
 
@@ -559,6 +588,7 @@ def _reduced_scan_compile_key(
         float(gross_budget),
         int(scan_chunk_size),
         bool(stateful_initial),
+        bool(_compile_dynamic_enabled()),
         "log_utility",
     )
 
@@ -649,9 +679,10 @@ def _resolve_reduced_scan_runner(
     try:
         _mark_static_shape(weights, [1])
         _configure_inductor_cudagraphs()
+        compile_dynamic = _compile_dynamic_enabled()
         compiled = torch.compile(
             base_runner,
-            dynamic=True,
+            dynamic=compile_dynamic,
             options={"triton.cudagraphs": False},
         )
         _REDUCED_COMPILED_CACHE[key] = compiled
@@ -664,7 +695,7 @@ def _resolve_reduced_scan_runner(
             print(
                 "[backtest reduced compile] compile failed, falling back to eager for "
                 f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, "
-                f"long_only={long_only}, scan_chunk={scan_chunk_size}, stateful={stateful_initial})"
+                f"long_only={long_only}, scan_chunk={scan_chunk_size}, stateful={stateful_initial}, dynamic={compile_dynamic})"
             )
         return base_runner
 
@@ -804,20 +835,21 @@ def _resolve_scan_runner(
         _SCAN_COMPILE_STATS["misses"] += 1
         # Keep symbol axis static while allowing varying time/batch length.
         _mark_static_shape(weights, [1])
+        compile_dynamic = _compile_dynamic_enabled()
         if _compile_verbose():
             print(
                 "[backtest compile] compiling fixed-shape runner for "
-                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial})"
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial}, dynamic={compile_dynamic})"
             )
         _configure_inductor_cudagraphs()
         if stateful_initial:
             compiled = torch.compile(
                 base_runner,
-                dynamic=True,
+                dynamic=compile_dynamic,
                 options={"triton.cudagraphs": False},
             )
         else:
-            compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=True)
+            compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=compile_dynamic)
         _SCAN_COMPILED_CACHE[key] = compiled
         return compiled
     except Exception:
@@ -825,7 +857,7 @@ def _resolve_scan_runner(
         _SCAN_COMPILE_STATS["failures"] += 1
         print(
             "[backtest compile] compile failed, falling back to eager for "
-            f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial})"
+            f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, long_only={long_only}, scan_chunk={scan_chunk_size}, record_weights={record_weights_history}, stateful={stateful_initial}, dynamic={compile_dynamic})"
         )
         return base_runner
 
@@ -1369,6 +1401,7 @@ def _prepare_compile_key(
         str(can_sell_mask.dtype),
         bool(long_only),
         float(gross_budget),
+        bool(_compile_dynamic_enabled()),
     )
 
 
@@ -1382,6 +1415,11 @@ def _resolve_prepare_runner(
     gross_budget: float,
 ):
     base_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+    # When an outer torch.compile is tracing risk_aware_loss, do not create a
+    # nested compiled prepare runner and do not mutate compile stats. Stats dict
+    # mutation becomes a Dynamo guard and can force repeated loss recompiles.
+    if _torch_dynamo_is_compiling():
+        return base_runner
     if (
         not _compile_prep_enabled()
         or not _compile_enabled()
@@ -1414,9 +1452,10 @@ def _resolve_prepare_runner(
     try:
         _PREP_COMPILE_STATS["misses"] += 1
         _configure_inductor_cudagraphs()
+        compile_dynamic = _compile_dynamic_enabled()
         compiled = torch.compile(
             base_runner,
-            dynamic=True,
+            dynamic=compile_dynamic,
             options={"triton.cudagraphs": False},
         )
         _PREP_COMPILED_CACHE[key] = compiled
@@ -1429,7 +1468,7 @@ def _resolve_prepare_runner(
         if _compile_verbose():
             print(
                 "[backtest prep compile] compile failed, falling back to eager for "
-                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}): "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, dynamic={compile_dynamic}): "
                 f"{type(e).__name__}: {str(e)[:300]}"
             )
         return base_runner

@@ -8,7 +8,9 @@ import stockagent.backtest.simulator as simulator
 from stockagent.data.panel import PanelData
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.loss import _dense_masked_clean_mean, get_loss_runtime_stats, risk_aware_loss
+from stockagent.training.fused_loss import fused_log_utility_loss_tensor
 from stockagent.training.trainer import (
+    _batched_loss_from_backtest_segments,
     _CompiledLossFallback,
     _dataset_to_tensors,
     _detach_portfolio_state,
@@ -755,7 +757,7 @@ def test_log_utility_loss_sample_mask_dense_path_matches_canonical_backtest_retu
     assert stats["log_utility_calls"] >= 1
 
 
-def test_reduced_log_utility_matches_canonical_curve_loss_and_gradients() -> None:
+def test_reduced_and_fused_log_utility_match_canonical_curve_loss_and_gradients() -> None:
     torch.manual_seed(888)
     rows, symbols = 7, 5
     base_weights = torch.randn(rows, symbols, dtype=torch.float32)
@@ -817,13 +819,241 @@ def test_reduced_log_utility_matches_canonical_curve_loss_and_gradients() -> Non
     )
     reduced.loss.backward()
 
+    fused_weights = base_weights.clone().requires_grad_(True)
+    fused_loss, fused_final = fused_log_utility_loss_tensor(
+        fused_weights,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        sample_mask,
+        initial_weights,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=False,
+        max_turnover_ratio=0.6,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=gamma_turnover,
+    )
+    fused_loss.backward()
+
     assert torch.allclose(reduced.loss, old_loss, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(fused_loss, old_loss, atol=1e-7, rtol=1e-6)
     assert old_bt.final_weights is not None
     assert reduced.final_weights is not None
     assert torch.allclose(reduced.final_weights, old_bt.final_weights, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(fused_final, old_bt.final_weights, atol=1e-7, rtol=1e-6)
     assert old_weights.grad is not None
     assert new_weights.grad is not None
+    assert fused_weights.grad is not None
     assert torch.allclose(new_weights.grad, old_weights.grad, atol=1e-7, rtol=1e-5)
+    assert torch.allclose(fused_weights.grad, old_weights.grad, atol=1e-7, rtol=1e-5)
+
+
+def test_fused_log_utility_loss_matches_canonical_backtest_and_gradients() -> None:
+    torch.manual_seed(2026)
+    rows, symbols = 11, 9
+    base_weights = torch.randn(rows, symbols, dtype=torch.float32)
+    returns = torch.randn(rows, symbols, dtype=torch.float32) * 0.01
+    tradable = torch.rand(rows, symbols) > 0.10
+    can_buy = torch.rand(rows, symbols) > 0.15
+    can_sell = torch.rand(rows, symbols) > 0.15
+    tradable[0] = True
+    can_buy[0] = True
+    can_sell[0] = True
+    benchmark = returns.mean(dim=1)
+    sample_mask = torch.tensor([True, True, False, True, False, True, True, False, True, True, True])
+    initial_weights = torch.randn(symbols).mul(0.03)
+    buy_fee_rate = 0.0005
+    sell_fee_rate = 0.0005
+    gamma_turnover = 0.15
+
+    ref_weights = base_weights.clone().requires_grad_(True)
+    backtest = run_backtest_torch(
+        ref_weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=False,
+        max_turnover_ratio=0.8,
+        gross_leverage=1.0,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        return_weights_history=False,
+        initial_weights=initial_weights,
+    )
+    valid_f = sample_mask.to(dtype=torch.float32)
+    denom = valid_f.sum().clamp_min(1.0)
+    expected_returns = torch.nan_to_num(backtest.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    expected_turnovers = torch.nan_to_num(backtest.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    expected_loss = -252.0 * (expected_returns * valid_f).sum() / denom
+    expected_loss = expected_loss + gamma_turnover * (expected_turnovers * valid_f).sum() / denom
+    expected_loss.backward()
+
+    fused_weights = base_weights.clone().requires_grad_(True)
+    fused_loss, fused_final = fused_log_utility_loss_tensor(
+        fused_weights,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        sample_mask,
+        initial_weights,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=False,
+        max_turnover_ratio=0.8,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=gamma_turnover,
+    )
+    fused_loss.backward()
+
+    assert torch.allclose(fused_loss, expected_loss, atol=1e-7, rtol=1e-6)
+    assert backtest.final_weights is not None
+    assert torch.allclose(fused_final, backtest.final_weights, atol=1e-7, rtol=1e-6)
+    assert ref_weights.grad is not None
+    assert fused_weights.grad is not None
+    assert torch.allclose(fused_weights.grad, ref_weights.grad, atol=1e-7, rtol=1e-5)
+
+
+def test_segmented_log_utility_eval_loss_matches_fused_backtest_rules() -> None:
+    torch.manual_seed(2028)
+    rows, symbols = 13, 8
+    offsets = [0, 4, 9, rows]
+    base_weights = torch.randn(rows, symbols, dtype=torch.float32)
+    returns = torch.randn(rows, symbols, dtype=torch.float32) * 0.012
+    tradable = torch.rand(rows, symbols) > 0.12
+    can_buy = torch.rand(rows, symbols) > 0.18
+    can_sell = torch.rand(rows, symbols) > 0.16
+    for start in offsets[:-1]:
+        tradable[start] = True
+        can_buy[start] = True
+        can_sell[start] = True
+    benchmark = returns.mean(dim=1)
+    buy_fee_rate = 0.0007
+    sell_fee_rate = 0.0011
+    gamma_turnover = 0.08
+
+    strategy_parts = []
+    benchmark_parts = []
+    turnover_parts = []
+    fused_losses = []
+    for start, end in zip(offsets[:-1], offsets[1:]):
+        segment_weights = base_weights[start:end].clone().requires_grad_(True)
+        segment_returns = returns[start:end]
+        segment_tradable = tradable[start:end]
+        segment_can_buy = can_buy[start:end]
+        segment_can_sell = can_sell[start:end]
+        segment_benchmark = benchmark[start:end]
+        sample_mask = torch.ones(end - start, dtype=torch.bool)
+        initial_weights = torch.zeros(symbols, dtype=torch.float32)
+
+        backtest = run_backtest_torch(
+            segment_weights,
+            segment_returns,
+            segment_tradable,
+            segment_benchmark,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            long_only=False,
+            max_turnover_ratio=0.75,
+            gross_leverage=1.0,
+            can_buy_mask=segment_can_buy,
+            can_sell_mask=segment_can_sell,
+            return_weights_history=False,
+            initial_weights=initial_weights,
+        )
+        fused_loss, fused_final = fused_log_utility_loss_tensor(
+            segment_weights,
+            segment_returns,
+            segment_tradable,
+            segment_can_buy,
+            segment_can_sell,
+            sample_mask,
+            initial_weights,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            long_only=False,
+            max_turnover_ratio=0.75,
+            gross_leverage=1.0,
+            gamma_sharpe=1.0,
+            gamma_turnover=gamma_turnover,
+        )
+
+        assert backtest.final_weights is not None
+        assert torch.allclose(fused_final, backtest.final_weights, atol=1e-7, rtol=1e-6)
+        strategy_parts.append(backtest.strategy_returns.detach())
+        benchmark_parts.append(backtest.benchmark_returns.detach())
+        turnover_parts.append(backtest.turnovers.detach())
+        fused_losses.append(fused_loss.detach())
+
+    eval_losses = _batched_loss_from_backtest_segments(
+        torch.cat(strategy_parts, dim=0),
+        torch.cat(benchmark_parts, dim=0),
+        torch.cat(turnover_parts, dim=0),
+        offsets,
+        gamma_sharpe=1.0,
+        gamma_excess=0.0,
+        gamma_cvar=0.0,
+        cvar_alpha=0.05,
+        gamma_drawdown=0.0,
+        drawdown_target=0.0,
+        gamma_turnover=gamma_turnover,
+        gamma_underperformance=0.0,
+        excess_target=0.0,
+        cvar_budget=0.0,
+        drawdown_budget=0.0,
+        turnover_budget=0.0,
+        gamma_cvar_budget=0.0,
+        gamma_drawdown_budget=0.0,
+        gamma_turnover_budget=0.0,
+        objective="log_utility",
+    )
+    assert torch.allclose(eval_losses, torch.stack(fused_losses), atol=1e-7, rtol=1e-6)
+
+
+def test_fused_log_utility_loss_compile_fullgraph_smoke() -> None:
+    if not torch.cuda.is_available() or not hasattr(torch, "compile"):
+        return
+    torch.manual_seed(2027)
+    rows, symbols = 8, 6
+    device = torch.device("cuda")
+    weights = torch.randn(rows, symbols, device=device, dtype=torch.float32, requires_grad=True)
+    returns = torch.randn(rows, symbols, device=device, dtype=torch.float32) * 0.01
+    mask = torch.ones(rows, symbols, device=device, dtype=torch.bool)
+    sample_mask = torch.ones(rows, device=device, dtype=torch.bool)
+    initial = torch.zeros(symbols, device=device, dtype=torch.float32)
+    compiled = torch.compile(
+        fused_log_utility_loss_tensor,
+        dynamic=False,
+        fullgraph=True,
+        options={"triton.cudagraphs": False},
+    )
+    loss, final_weights = compiled(
+        weights,
+        returns,
+        mask,
+        mask,
+        mask,
+        sample_mask,
+        initial,
+        buy_fee_rate=0.0005,
+        sell_fee_rate=0.0005,
+        long_only=False,
+        max_turnover_ratio=50.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+    )
+    assert torch.isfinite(loss)
+    assert final_weights.shape == (symbols,)
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
 
 
 def test_dense_fast_path_detector_requires_all_masks_true_and_no_turnover_cap() -> None:
