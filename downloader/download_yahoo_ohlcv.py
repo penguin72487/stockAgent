@@ -262,6 +262,12 @@ class RepairCheck:
     message: str | None = None
 
 
+@dataclass(slots=True)
+class SymbolResolution:
+    active_records: list[SymbolRecord]
+    manifest_records: list[SymbolRecord]
+
+
 def _blacklist_file_path(output_dir: Path) -> Path:
     return output_dir / "yahoo_blacklist.txt"
 
@@ -494,6 +500,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Only for --mode daily-update: merge fresh stock listings and delisted candidates "
             "from upstream symbol sources into the local tracked universe."
+        ),
+    )
+    parser.add_argument(
+        "--daily-retry-known-missing-symbols",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Only for --mode daily-update: retry symbols that are already present in symbols.csv "
+            "but still have no local parquet/whitelist entry. Default false prevents repeated "
+            "downloads of known Yahoo-unavailable candidates."
+        ),
+    )
+    parser.add_argument(
+        "--retry-blacklisted-repair-symbols",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Retry symbols in yahoo_blacklist.txt during repair/daily-update by clearing them "
+            "from the blacklist before download. Default false keeps unavailable symbols stable."
         ),
     )
     return parser.parse_args()
@@ -779,6 +804,51 @@ def _record_from_input(asset_class: str, raw_symbol: str) -> SymbolRecord:
     return SymbolRecord(code=upper_value, name=upper_value, market=asset_class, yahoo_symbol=upper_value)
 
 
+def _record_from_local_code(asset_class: str, code: str) -> SymbolRecord:
+    normalized = code.strip().upper()
+    if asset_class == "tw_stocks" and TW_GENERIC_CODE_PATTERN.fullmatch(normalized):
+        return SymbolRecord(code=normalized, name=normalized, market=asset_class, yahoo_symbol=f"{normalized}.TW,{normalized}.TWO")
+    return _record_from_input(asset_class, normalized)
+
+
+def _candidate_symbols_for_record(asset_class: str, record: SymbolRecord) -> list[str]:
+    candidates = [symbol.strip() for symbol in YAHOO_SYMBOL_SPLIT_PATTERN.split(record.yahoo_symbol.strip()) if symbol.strip()]
+    if not candidates:
+        candidates = [record.yahoo_symbol.strip()]
+
+    if asset_class == "forex":
+        forex_candidates = [symbol.upper() for symbol in candidates if FOREX_TICKER_PATTERN.match(symbol.upper())]
+        for symbol in forex_candidates:
+            pair = symbol.replace("=X", "")
+            if len(pair) != 6:
+                continue
+            inverse = f"{pair[3:]}{pair[:3]}=X"
+            if inverse not in candidates:
+                candidates.append(inverse)
+
+    return candidates
+
+
+def _available_candidate_symbols(
+    asset_class: str,
+    record: SymbolRecord,
+    blacklist_symbols: set[str] | None,
+) -> list[str]:
+    candidates = _candidate_symbols_for_record(asset_class, record)
+    if blacklist_symbols is None:
+        return candidates
+    return [symbol for symbol in candidates if symbol.upper() not in blacklist_symbols]
+
+
+def _all_candidate_symbols_blacklisted(
+    asset_class: str,
+    record: SymbolRecord,
+    blacklist_symbols: set[str],
+) -> bool:
+    candidates = _candidate_symbols_for_record(asset_class, record)
+    return bool(candidates) and not _available_candidate_symbols(asset_class, record, blacklist_symbols)
+
+
 def _load_tw_symbols_from_local_manifest() -> list[SymbolRecord]:
     manifest_path = Path("data_parquet") / "symbols.csv"
     if not manifest_path.exists():
@@ -1054,7 +1124,16 @@ def _load_local_tracked_records(asset_class: str, output_dir: Path, cached: list
         cached_record = by_code.get(code)
         if cached_record is not None:
             records.append(cached_record)
-            seen_codes.add(code)
+        else:
+            if asset_class == "forex":
+                # data_yahoo/forex may contain Frankfurter cross-rate files
+                # from older daily scripts; do not treat them as Yahoo tickers.
+                continue
+            try:
+                records.append(_record_from_local_code(asset_class, code))
+            except Exception:
+                continue
+        seen_codes.add(code)
 
     whitelist_symbols = _load_whitelist(_whitelist_file_path(output_dir))
     for yahoo_symbol in sorted(whitelist_symbols):
@@ -1274,54 +1353,83 @@ def _dedupe_records_by_code(records: list[SymbolRecord]) -> list[SymbolRecord]:
     return deduped
 
 
-def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolRecord]:
+def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> SymbolResolution:
     if args.symbols_file:
         records = _load_symbols_from_file(asset_class, args.symbols_file)
+        deduped = _dedupe_records_by_code(records)
+        if args.limit is not None:
+            deduped = deduped[: args.limit]
+        return SymbolResolution(active_records=deduped, manifest_records=deduped)
     elif args.symbols:
         records = [_record_from_input(asset_class, symbol) for symbol in args.symbols]
+        deduped = _dedupe_records_by_code(records)
+        if args.limit is not None:
+            deduped = deduped[: args.limit]
+        return SymbolResolution(active_records=deduped, manifest_records=deduped)
     else:
         output_dir = _resolve_asset_output_dir(args, asset_class)
         cached = _resolve_cached_manifest(output_dir, asset_class)
         is_daily_update = getattr(args, "mode", "") == "daily-update"
 
         if is_daily_update:
-            tracked_records = _load_local_tracked_records(asset_class, output_dir, cached)
-            if tracked_records:
-                tracked_records.extend(_records_from_defaults(asset_class))
-                # Also include any new symbols from the repo fallback manifest
-                # that aren't yet tracked locally, so new listings get added.
-                repo_new = _load_repo_symbol_fallback(asset_class)
-                tracked_before = {r.code for r in tracked_records}
-                new_from_repo = [r for r in repo_new if r.code not in tracked_before]
-                if new_from_repo:
-                    print(
-                        f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
-                        f"from repo fallback manifest for {asset_class}"
-                    )
-                    tracked_records.extend(new_from_repo)
-                    tracked_before.update(r.code for r in new_from_repo)
+            active_records = _load_local_tracked_records(asset_class, output_dir, cached)
+            active_records.extend(_records_from_defaults(asset_class))
+            if not active_records and cached:
+                # Manifest-only output dirs are partial bootstraps. Process them
+                # once instead of leaving the asset permanently inert.
+                active_records.extend(cached)
 
-                if getattr(args, "daily_discover_symbols", True) and asset_class in {"tw_stocks", "us_stocks"}:
-                    try:
-                        discovered = _discover_daily_stock_records(asset_class, args, cached)
-                    except Exception as exc:
-                        print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
-                    else:
-                        new_from_discovery = [r for r in discovered if r.code not in tracked_before]
-                        if new_from_discovery:
-                            print(
-                                f"[symbols] daily-update: adding {len(new_from_discovery)} new symbols "
-                                f"from upstream discovery for {asset_class}"
-                            )
-                            tracked_records.extend(new_from_discovery)
-                deduped = _dedupe_records_by_code(tracked_records)
+            manifest_records = list(cached)
+            manifest_records.extend(active_records)
+            known_before = {record.code for record in manifest_records}
+
+            if getattr(args, "daily_retry_known_missing_symbols", False):
+                active_codes = {record.code for record in active_records}
+                known_missing = [record for record in cached if record.code not in active_codes]
+                if known_missing:
+                    print(
+                        f"[symbols] daily-update: retrying {len(known_missing)} known missing "
+                        f"{asset_class} symbols from cached manifest"
+                    )
+                    active_records.extend(known_missing)
+
+            repo_candidates = _load_repo_symbol_fallback(asset_class)
+            new_from_repo = [record for record in repo_candidates if record.code not in known_before]
+            if new_from_repo:
                 print(
-                    f"[symbols] daily-update: local tracked {asset_class} "
-                    f"({len(deduped)} symbols, parquet+whitelist+defaults+repo_new+discovery)"
+                    f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
+                    f"from repo fallback manifest for {asset_class}"
                 )
-                if args.limit is not None:
-                    deduped = deduped[: args.limit]
-                return deduped
+                active_records.extend(new_from_repo)
+                manifest_records.extend(new_from_repo)
+                known_before.update(record.code for record in new_from_repo)
+
+            if getattr(args, "daily_discover_symbols", True) and asset_class in {"tw_stocks", "us_stocks"}:
+                try:
+                    discovered = _discover_daily_stock_records(asset_class, args, cached)
+                except Exception as exc:
+                    print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
+                else:
+                    new_from_discovery = [record for record in discovered if record.code not in known_before]
+                    if new_from_discovery:
+                        print(
+                            f"[symbols] daily-update: adding {len(new_from_discovery)} new symbols "
+                            f"from upstream discovery for {asset_class}"
+                        )
+                        active_records.extend(new_from_discovery)
+                        manifest_records.extend(new_from_discovery)
+
+            active_deduped = _dedupe_records_by_code(active_records)
+            manifest_deduped = _dedupe_records_by_code(manifest_records)
+            if args.limit is not None:
+                active_deduped = active_deduped[: args.limit]
+                manifest_deduped = manifest_deduped[: args.limit]
+            print(
+                f"[symbols] daily-update: active tracked {asset_class} "
+                f"({len(active_deduped)} active, {len(manifest_deduped)} known; "
+                "parquet+whitelist+defaults+new_discovery)"
+            )
+            return SymbolResolution(active_records=active_deduped, manifest_records=manifest_deduped)
 
         if asset_class == "tw_stocks":
             records = _resolve_tw_symbols(args, cached)
@@ -1338,7 +1446,11 @@ def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolR
 
     if args.limit is not None:
         deduped = deduped[: args.limit]
-    return deduped
+    return SymbolResolution(active_records=deduped, manifest_records=deduped)
+
+
+def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolRecord]:
+    return _resolve_symbol_resolution(asset_class, args).active_records
 
 
 def _download_symbol(
@@ -1358,21 +1470,7 @@ def _download_symbol(
     whitelist_lock: threading.Lock | None = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    candidate_symbols = [symbol for symbol in YAHOO_SYMBOL_SPLIT_PATTERN.split(record.yahoo_symbol.strip()) if symbol]
-    if not candidate_symbols:
-        candidate_symbols = [record.yahoo_symbol.strip()]
-
-    if asset_class == "forex":
-        forex_candidates = [symbol.upper() for symbol in candidate_symbols if FOREX_TICKER_PATTERN.match(symbol.upper())]
-        for symbol in forex_candidates:
-            pair = symbol.replace("=X", "")
-            if len(pair) != 6:
-                continue
-            inverse = f"{pair[3:]}{pair[:3]}=X"
-            if inverse not in candidate_symbols:
-                candidate_symbols.append(inverse)
-
-    candidates_to_try = [symbol for symbol in candidate_symbols if (blacklist_symbols is None or symbol.upper() not in blacklist_symbols)]
+    candidates_to_try = _available_candidate_symbols(asset_class, record, blacklist_symbols)
     if not candidates_to_try:
         return DownloadResult(
             asset_class=asset_class,
@@ -1533,7 +1631,7 @@ def _download_symbol(
 
 def _write_symbol_manifest(output_dir: Path, records: list[SymbolRecord]) -> None:
     manifest_path = output_dir / "symbols.csv"
-    frame = pd.DataFrame([asdict(record) for record in records])
+    frame = pd.DataFrame([asdict(record) for record in _dedupe_records_by_code(records)])
     frame.to_csv(manifest_path, index=False)
 
 
@@ -1689,6 +1787,24 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
     blacklist_path = _blacklist_file_path(output_dir)
     blacklist_symbols = _load_blacklist(blacklist_path)
     blacklist_lock = threading.Lock()
+    retry_blacklisted = bool(getattr(args, "retry_blacklisted_repair_symbols", False))
+
+    def _blacklisted_skip(
+        record: SymbolRecord,
+        output_path: Path,
+        first_date: str | None,
+        last_date: str | None,
+    ) -> RepairCheck:
+        return RepairCheck(
+            record=record,
+            status="blacklisted_skip",
+            output_path=output_path,
+            first_date=first_date,
+            last_date=last_date,
+            repair_start_date=None,
+            merge_existing=False,
+            message="All candidate Yahoo symbols are in blacklist.",
+        )
 
     progress = tqdm(records, desc=f"precheck:{asset_class}", unit="symbol")
     try:
@@ -1733,6 +1849,9 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                 )
                 continue
             if error == "missing":
+                if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
+                    checks.append(_blacklisted_skip(record, output_path, None, None))
+                    continue
                 checks.append(
                     RepairCheck(
                         record=record,
@@ -1775,6 +1894,9 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
 
             missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
             if missing_required:
+                if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
+                    checks.append(_blacklisted_skip(record, output_path, first_date, last_date))
+                    continue
                 checks.append(
                     RepairCheck(
                         record=record,
@@ -1821,6 +1943,10 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                         repair_start_date=None,
                     )
                 )
+                continue
+
+            if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
+                checks.append(_blacklisted_skip(record, output_path, first_date, last_date))
                 continue
 
             repair_start_dt = max(_parse_date(args.start_date).date(), local_last_dt - timedelta(days=overlap))
@@ -1915,37 +2041,38 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     blacklist_lock = threading.Lock()
     whitelist_lock = threading.Lock()
 
-    records = _resolve_symbols(asset_class, args)
+    resolution = _resolve_symbol_resolution(asset_class, args)
+    records = resolution.active_records
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
-    _write_symbol_manifest(output_dir, records)
+    _write_symbol_manifest(output_dir, resolution.manifest_records)
     checks = _resolve_repair_plan(asset_class, args, records, output_dir)
     status_counts: dict[str, int] = {}
     pending = [check for check in checks if check.repair_start_date is not None]
     for check in checks:
         status_counts[check.status] = status_counts.get(check.status, 0) + 1
 
-    # For symbols that require repair, clear candidates from blacklist so daily
-    # update does not get stuck in repeated 'blacklisted_skip' loops.
-    retry_candidates: set[str] = set()
-    for check in checks:
-        if check.repair_start_date is not None:
-            for cand in YAHOO_SYMBOL_SPLIT_PATTERN.split(check.record.yahoo_symbol.strip()):
-                if cand:
-                    retry_candidates.add(cand.upper())
-    _clear_blacklist_candidates(
-        blacklist_symbols=blacklist_symbols,
-        blacklist_path=blacklist_path,
-        candidates=retry_candidates,
-        reason="pending repair symbols",
-    )
+    if getattr(args, "retry_blacklisted_repair_symbols", False):
+        retry_candidates: set[str] = set()
+        for check in checks:
+            if check.repair_start_date is not None:
+                for cand in _candidate_symbols_for_record(asset_class, check.record):
+                    if cand:
+                        retry_candidates.add(cand.upper())
+        _clear_blacklist_candidates(
+            blacklist_symbols=blacklist_symbols,
+            blacklist_path=blacklist_path,
+            candidates=retry_candidates,
+            reason="pending repair symbols",
+        )
 
     print(
         f"[repair] asset={asset_class} current={status_counts.get('current', 0)} "
         f"missing={status_counts.get('missing', 0)} stale={status_counts.get('stale', 0)} "
         f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)} "
-        f"lagging_skip={status_counts.get('lagging_skip', 0)}"
+        f"lagging_skip={status_counts.get('lagging_skip', 0)} "
+        f"blacklisted_skip={status_counts.get('blacklisted_skip', 0)}"
     )
     target_end = args.end_date or _today_str()
     oldest_date, newest_date, lag_days, tracked = _summarize_repair_coverage(checks, target_end)
@@ -2056,11 +2183,12 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
     blacklist_lock = threading.Lock()
     whitelist_lock = threading.Lock()
 
-    records = _resolve_symbols(asset_class, args)
+    resolution = _resolve_symbol_resolution(asset_class, args)
+    records = resolution.active_records
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
-    _write_symbol_manifest(output_dir, records)
+    _write_symbol_manifest(output_dir, resolution.manifest_records)
     download_tasks = [(record, args.start_date, args.refresh, False, None) for record in records]
     results = _run_parallel_symbol_downloads(
         asset_class=asset_class,

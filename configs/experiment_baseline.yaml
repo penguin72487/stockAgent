@@ -79,7 +79,7 @@ training:
   batch_size_train: 32
   batch_size_eval: 16
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.05
+  early_stopping_no_improve_ratio: 0.2
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true
