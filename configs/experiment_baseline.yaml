@@ -7,7 +7,6 @@ runner:
   resume: true
   post_train_infer: false
   start_fold: 1
-
 environment:
   conda_env: fintech
   device: cuda
@@ -16,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_okx
-  benchmark_name: "BTCUSDTSWAP"
+  parquet_root: data_yahoo/tw_stocks
+  benchmark_name: "2330"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -25,8 +24,8 @@ data:
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
-  # tradable_mode: tw_limit_guard
-  tradable_mode: tradable
+  tradable_mode: tw_limit_guard
+  # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -35,8 +34,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0005
-  sell_fee_rate: 0.0005
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -79,7 +78,7 @@ training:
   batch_size_train: 32
   batch_size_eval: 16
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.05
+  early_stopping_no_improve_ratio: 0.2
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true

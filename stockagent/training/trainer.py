@@ -2180,7 +2180,15 @@ def _load_previous_fold_neural_model(
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
     ).to(device)
-    _load_state_dict(previous_model, previous_state_dict)
+    try:
+        _load_state_dict(previous_model, previous_state_dict)
+    except RuntimeError as exc:
+        print(
+            f"[warmup] fold {fold_id - 1} model incompatible with current panel "
+            f"(num_symbols={panel.num_symbols}), skipping warmup: {exc}"
+        )
+        del previous_model
+        return None
     previous_model.eval()
     return previous_model
 

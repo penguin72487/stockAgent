@@ -3,6 +3,12 @@ from __future__ import annotations
 import torch
 
 
+def finite_mask_fill_value(values: torch.Tensor) -> float:
+    if not values.dtype.is_floating_point:
+        return -1e9
+    return float(torch.finfo(values.dtype).min)
+
+
 def masked_cross_sectional_mean(values: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
     if mask is None:

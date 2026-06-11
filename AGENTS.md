@@ -45,6 +45,9 @@ Implementation expectations:
 - Main train/eval/profile model forward and loss computation should run inside `_autocast_context(device, amp_dtype)`.
 - BF16 AMP should leave `GradScaler` disabled. `GradScaler` is only for FP16:
   - `GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)`
+- Masked score/logit sentinels must be dtype-safe. Do not use fixed `-1e9`
+  in model hotpaths, because it overflows FP16 AMP; use a representable finite
+  mask fill such as `finite_mask_fill_value(scores)`.
 - It is normal and desirable that some tensors remain FP32:
   - model parameters
   - input storage tensors
@@ -245,6 +248,9 @@ Rules:
 Compile/runtime rules:
 
 - Use CUDA 13 ptxas for the current PyTorch CUDA 13 environment. Prefer mamba/conda packages such as `cuda-nvcc` / `cuda-nvvm-tools` in the `fintech` env; do not leave a CUDA 12 pip `nvidia-cuda-nvcc-cu12` package around as a fallback ptxas source.
+- RTX 5070 Ti (`sm_120a`) native NVFP4 uses source-built NVIDIA Transformer Engine, not bitsandbytes NF4 or fake quantization. The verified build is Transformer Engine `2.16.0+4220403`, CUDA 13.3 `nvcc`/`ptxas`, CUDA 13 runtime libraries, and cuDNN 9 in the `fintech` env.
+- Build Transformer Engine for Blackwell consumer GPUs with `NVTE_CUDA_ARCHS=120a` / `CMAKE_CUDA_ARCHITECTURES=120a`, and force CUDA library discovery to the conda env. Do not let `libtransformer_engine.so` link to system CUDA 12 libraries; set RPATH or `LD_LIBRARY_PATH` so `libcublas.so.13`, `libcudart.so.13`, `libcublasLt.so.13`, and `libcudnn.so.9` resolve from the `fintech` env.
+- On RTX 5070 Ti, NVFP4 stochastic rounding is not supported by ptxas for `sm_120a` (`cvt.rs.satfinite.e2m1x4.f32` rejects `.rs`). Use native deterministic NVFP4 recipes such as `NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)` for project benchmarks and training probes.
 - When invoking `/home/user/miniforge3/envs/fintech/bin/python` directly, PATH may not include the env `bin`. Compile helpers must prepend that path so Triton can find `/home/user/miniforge3/envs/fintech/bin/ptxas`.
 - Compile cache paths should be stable and persistent across runs:
   - `TORCHINDUCTOR_CACHE_DIR=~/.cache/torchinductor`
