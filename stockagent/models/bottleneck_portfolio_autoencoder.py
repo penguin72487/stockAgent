@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from stockagent.models.efficient_tcn_tabular_set_portfolio import LiteISAB
-from stockagent.models.normalization import masked_softmax
+from stockagent.models.normalization import finite_mask_fill_value, masked_softmax
 
 
 class CausalTCNBlock(nn.Module):
@@ -242,7 +242,7 @@ class BottleneckPortfolioAutoencoder(nn.Module):
         decoded = self.decoder(z)
         decoded = decoded.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
         scores = self.weight_head(decoded).squeeze(-1)
-        masked_scores = scores.masked_fill(~mask_bool, -1e9)
+        masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if self.long_short:
             weights = self._long_short_weights(scores, mask_bool)

@@ -5,7 +5,12 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-from stockagent.models.normalization import dual_branch_softmax, masked_cross_sectional_mean, masked_softmax
+from stockagent.models.normalization import (
+    dual_branch_softmax,
+    finite_mask_fill_value,
+    masked_cross_sectional_mean,
+    masked_softmax,
+)
 
 
 class CausalDepthwiseSeparableTCNBlock(nn.Module):
@@ -382,7 +387,7 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         z_fused = self.fusion(z)
         z_set = self.set_branch(z_fused, mask_bool) if self.set_branch is not None else z_fused
         scores = self.score_head(z_set).squeeze(-1)
-        masked_scores = scores.masked_fill(~mask_bool, -1e9)
+        masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if temperature is None:
             temp = masked_scores.new_tensor(self.default_temperature)

@@ -8,7 +8,12 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from stockagent.models.latent_factor_market_token_portfolio import _safe_attention_mask
-from stockagent.models.normalization import dual_branch_softmax, masked_cross_sectional_mean, masked_softmax
+from stockagent.models.normalization import (
+    dual_branch_softmax,
+    finite_mask_fill_value,
+    masked_cross_sectional_mean,
+    masked_softmax,
+)
 
 
 class PortfolioRMSNorm(nn.Module):
@@ -942,7 +947,7 @@ class TransformerBasePortfolioModel(nn.Module):
 
         z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
         scores = self.score_head(z_stock).squeeze(-1)
-        masked_scores = scores.masked_fill(~mask_bool, -1e9)
+        masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if temperature is None:
             temp = masked_scores.new_tensor(self.default_temperature)

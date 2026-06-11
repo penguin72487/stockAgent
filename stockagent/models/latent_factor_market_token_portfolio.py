@@ -6,7 +6,12 @@ import torch
 from torch import nn
 
 from stockagent.models.efficient_tcn_tabular_set_portfolio import MAB, TabularResNetBranch, TemporalTCNBranch
-from stockagent.models.normalization import dual_branch_softmax, masked_cross_sectional_mean, masked_softmax
+from stockagent.models.normalization import (
+    dual_branch_softmax,
+    finite_mask_fill_value,
+    masked_cross_sectional_mean,
+    masked_softmax,
+)
 
 
 def _safe_attention_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -224,7 +229,7 @@ class LatentFactorMarketTokenPortfolioModel(nn.Module):
         z_portfolio = self.portfolio_fusion(torch.cat([z_stock, z_factor_context, z_market_context], dim=-1))
         z_portfolio = z_portfolio.masked_fill(~valid, 0.0)
         scores = self.score_head(z_portfolio).squeeze(-1)
-        masked_scores = scores.masked_fill(~mask_bool, -1e9)
+        masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if temperature is None:
             temp = masked_scores.new_tensor(self.default_temperature)
