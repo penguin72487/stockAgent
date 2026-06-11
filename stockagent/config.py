@@ -360,7 +360,11 @@ class TrainingConfig:
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
+    torchinductor_cache_dir: str = "~/.cache/torchinductor"
+    triton_cache_dir: str = "~/.cache/triton"
+    cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
+    fused_log_utility_loss: bool = True
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
     eval_model_chunk_rows: int | str = "auto"
@@ -373,6 +377,7 @@ class TrainingConfig:
     backtest_autotune: bool = True
     backtest_compile: bool = True
     backtest_compile_stateful: bool = True
+    backtest_compile_dynamic: bool = False
     backtest_cpp_ext: bool = False
     backtest_verbose: bool = False
     backtest_checkpoint_chunk_rows: int = 0
@@ -521,7 +526,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("enable_torch_compile", True)
     training.setdefault("auto_torch_compile_sharpe", False)
     training.setdefault("torch_compile_mode", "reduce-overhead")
+    training.setdefault("torchinductor_cache_dir", "~/.cache/torchinductor")
+    training.setdefault("triton_cache_dir", "~/.cache/triton")
+    training.setdefault("cuda_cache_path", "~/.cache/nv_cuda")
     training.setdefault("compile_loss", None)
+    training.setdefault("fused_log_utility_loss", True)
     training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
     training.setdefault("eval_model_chunk_rows", "auto")
@@ -534,6 +543,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("backtest_autotune", True)
     training.setdefault("backtest_compile", True)
     training.setdefault("backtest_compile_stateful", True)
+    training.setdefault("backtest_compile_dynamic", False)
     training.setdefault("backtest_cpp_ext", False)
     training.setdefault("backtest_verbose", False)
     training.setdefault("backtest_checkpoint_chunk_rows", 0)
@@ -1009,7 +1019,11 @@ def load_config(path: str | Path) -> ExperimentConfig:
             enable_torch_compile=training_raw["enable_torch_compile"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],
+            torchinductor_cache_dir=training_raw["torchinductor_cache_dir"],
+            triton_cache_dir=training_raw["triton_cache_dir"],
+            cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
+            fused_log_utility_loss=training_raw["fused_log_utility_loss"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
             eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],
@@ -1022,6 +1036,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             backtest_autotune=training_raw["backtest_autotune"],
             backtest_compile=training_raw["backtest_compile"],
             backtest_compile_stateful=training_raw["backtest_compile_stateful"],
+            backtest_compile_dynamic=training_raw["backtest_compile_dynamic"],
             backtest_cpp_ext=training_raw["backtest_cpp_ext"],
             backtest_verbose=training_raw["backtest_verbose"],
             backtest_checkpoint_chunk_rows=training_raw["backtest_checkpoint_chunk_rows"],
