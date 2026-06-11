@@ -79,7 +79,7 @@ def _torch_is_compiling() -> bool:
 
 
 def _reduced_log_utility_enabled() -> bool:
-    return os.environ.get("STOCKAGENT_LOSS_REDUCED_LOG_UTILITY", "0").strip().lower() in {
+    return os.environ.get("STOCKAGENT_LOSS_REDUCED_LOG_UTILITY", "1").strip().lower() in {
         "1",
         "true",
         "on",

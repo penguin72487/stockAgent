@@ -51,7 +51,11 @@ training:
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
-  compile_loss: false
+  torchinductor_cache_dir: ~/.cache/torchinductor
+  triton_cache_dir: ~/.cache/triton
+  cuda_cache_path: ~/.cache/nv_cuda
+  compile_loss: true
+  fused_log_utility_loss: true
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
@@ -65,10 +69,11 @@ training:
   backtest_autotune: true
   backtest_compile: true
   backtest_compile_stateful: true
+  backtest_compile_dynamic: false
   backtest_verbose: false
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
-  allow_dynamic_symbols: true
+  allow_dynamic_symbols: false
   lookback: 32
   batch_size: 32
   batch_size_train: 32
@@ -123,7 +128,7 @@ training:
   finite_check_interval_steps: 0
   loss_type: log_utility
   min_batch_size: 1
-  auto_batch_size: true
+  auto_batch_size: false
   vram_budget_gb: 16
   vram_safety_margin_gb: 0.7
   target_vram_fraction: 0.9
@@ -382,7 +387,7 @@ evaluation:
   cvar_alpha: 0.95
   gamma_drawdown: 0.5
   drawdown_target: 0.2
-  gamma_turnover: 0.005
+  gamma_turnover: 0
   gamma_underperformance: 2.0
   excess_target: 0.0
   cvar_budget: 0.03
