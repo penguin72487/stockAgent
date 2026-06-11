@@ -144,10 +144,18 @@ def test_modern_components_and_dynamic_token_aux() -> None:
     assert aux["dynamic_latent_queries"].shape == (2, 4, 24)
     assert aux["dynamic_market_delta"].shape == (2, 2, 24)
     assert aux["dynamic_market_queries"].shape == (2, 2, 24)
-    assert aux["dynamic_latent_summary_parts"].shape == (2, 2, 24)
-    assert aux["dynamic_market_summary_parts"].shape == (2, 2, 24)
+    assert aux["dynamic_latent_summary_parts"].shape == (2, 3, 24)
+    assert aux["dynamic_market_summary_parts"].shape == (2, 3, 24)
     assert 0.0 < float(aux["dynamic_latent_gate"].item()) < 1.0
     assert 0.0 < float(aux["dynamic_market_gate"].item()) < 1.0
+    assert aux["stock_market_gate"].shape == (2, 13, 1)
+    assert aux["z_market_delta"].shape == (2, 13, 24)
+    assert aux["alpha_mu"].shape == (2, 13)
+    assert aux["risk_sigma"].shape == (2, 13)
+    assert aux["confidence"].shape == (2, 13)
+    assert torch.isfinite(aux["risk_sigma"]).all()
+    assert bool((aux["risk_sigma"] > 0.0).all().item())
+    assert bool(((aux["confidence"] >= 0.0) & (aux["confidence"] <= 1.0)).all().item())
 
 
 def test_aux_details_false_keeps_training_output_light() -> None:
@@ -160,13 +168,24 @@ def test_aux_details_false_keeps_training_output_light() -> None:
         light_out = model(x, mask)
         weights, scores, aux = model(x, mask, return_aux=True)
 
-    assert set(light_out) == {"weights", "scores", "score_logits", "rank_logits"}
+    assert set(light_out) == {
+        "weights",
+        "scores",
+        "score_logits",
+        "rank_logits",
+        "centered_score_logits",
+        "alpha_mu",
+        "risk_sigma",
+        "confidence_logits",
+        "confidence",
+    }
     assert "aux" not in light_out
     assert torch.allclose(light_out["weights"], weights, atol=1e-6, rtol=1e-6)
     assert torch.allclose(light_out["scores"], scores, atol=1e-6, rtol=1e-6)
     assert aux["token_embedding"].shape == (2, 6, 13, 24)
     assert aux["dynamic_latent_delta"].shape == (2, 4, 24)
     assert aux["dynamic_market_delta"].shape == (2, 2, 24)
+    assert aux["stock_market_gate"].shape == (2, 13, 1)
 
 
 @pytest.mark.parametrize("mode", ["axial", "latent", "market_token", "temporal_only"])

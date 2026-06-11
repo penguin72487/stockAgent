@@ -139,6 +139,16 @@ Notes:
 - `batch_size_train: 32` improves steady-state epoch throughput versus 16 on the current benchmark, but first-epoch compile/warmup time is higher; use it for long training runs, and re-benchmark before reducing it.
 - `temporal_pooling: last` is the active user preference. It is slightly faster than attention pooling but relies on temporal blocks to carry useful history into the final token; re-check validation/test metrics after changing it.
 - For `temporal_pooling: last`, the model has a last-query temporal fast path when `return_aux_details=false`: all but the final temporal block run on the full lookback, and the final temporal block computes only the final-day query against the full context. Keep `return_aux=True` / detailed aux paths full-length for explainability parity.
+- The active `market_token` architecture should follow this low-complexity flow:
+  - input `[B,L,S,F]` -> feature projection -> shared temporal encoder per stock -> `z_base [B,S,D]`
+  - masked market summary is `mean + std + mean absolute dispersion`, shape `[B,3,D]`
+  - dynamic market tokens are `static_anchor + sigmoid(gate) * delta(summary)`, with `num_market_tokens` usually `4` or `6`
+  - market tokens read stocks through cross-attention with stock masks
+  - stocks read updated market tokens through cross-attention
+  - stock-level market gate applies `z = RMSNorm(z_base_or_factor + sigmoid(g_i) * market_delta)`
+  - portfolio head uses three scalar heads: `mu`, `sigma`, `confidence`
+  - score is `mu / softplus(sigma) * sigmoid(confidence)`, then masked de-mean for long/short, then tanh + L1 portfolio normalization
+- Keep `alpha_mu`, `risk_sigma`, `confidence`, `stock_market_gate`, `z_market_delta`, dynamic token queries/deltas/gates, and market summary parts available in aux outputs when detailed explainability is requested.
 
 Modern Transformer module contract:
 
@@ -148,7 +158,7 @@ Modern Transformer module contract:
 - Keep PyTorch SDPA/Flash path enabled and keep `sdpa_batch_limit` for large `batch * symbols` temporal attention.
 - Dynamic latent/market tokens should be gated deltas around static token anchors:
   - `dynamic_token = static_query + sigmoid(gate) * input_conditioned_delta`
-  - use market-summary inputs such as masked stock embedding mean/std
+  - use market-summary inputs from masked stock embedding mean/std/dispersion
   - keep dynamic gates small at initialization, e.g. `dynamic_token_gate_init: 0.1`
 - When `return_aux_details` is true, expose dynamic token query/delta/gate/summary tensors so explainability can detect token collapse, over-concentration, or strange liquidity/price-level rules.
 
