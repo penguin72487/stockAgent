@@ -63,7 +63,7 @@ def test_daily_resolution_preserves_known_manifest_without_retrying_missing(tmp_
 
     resolution = yahoo._resolve_symbol_resolution("tw_stocks", _base_args(tmp_path))
 
-    assert [record.code for record in resolution.active_records] == ["1111", "2222", "3333"]
+    assert [record.code for record in resolution.scheduled_records] == ["1111", "2222", "3333"]
     assert [record.code for record in resolution.manifest_records] == ["1111", "9999", "2222", "3333"]
 
 
@@ -74,7 +74,7 @@ def test_blacklisted_missing_symbols_skip_repair_until_forced(tmp_path):
     record = yahoo.SymbolRecord("9999", "known_missing", "tw_stocks", "9999.TW")
 
     checks = yahoo._resolve_repair_plan("tw_stocks", _base_args(tmp_path), [record], output_dir)
-    assert [(check.status, check.repair_start_date) for check in checks] == [("blacklisted_skip", None)]
+    assert [(check.status, check.repair_start_date) for check in checks] == [("not_found_skip", None)]
 
     forced = yahoo._resolve_repair_plan(
         "tw_stocks",
@@ -83,6 +83,26 @@ def test_blacklisted_missing_symbols_skip_repair_until_forced(tmp_path):
         output_dir,
     )
     assert [(check.status, check.repair_start_date) for check in forced] == [("missing", "2000-01-01")]
+
+
+def test_repair_plan_separates_new_symbols_and_delisted_symbols(tmp_path):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    new_record = yahoo.SymbolRecord("2222", "new_listing", "tw_stocks", "2222.TW")
+    delisted_record = yahoo.SymbolRecord("1111_TW", "delisted", "tw_delisted", "1111.TW")
+
+    checks = yahoo._resolve_repair_plan(
+        "tw_stocks",
+        _base_args(tmp_path),
+        [new_record, delisted_record],
+        output_dir,
+        new_codes={"2222"},
+    )
+
+    assert [(check.record.code, check.status, check.repair_start_date) for check in checks] == [
+        ("2222", "new_symbol", "2000-01-01"),
+        ("1111_TW", "delisted_skip", None),
+    ]
 
 
 def test_yahoo_forex_ignores_orphan_frankfurter_parquets(tmp_path, monkeypatch):
@@ -101,5 +121,5 @@ def test_yahoo_forex_ignores_orphan_frankfurter_parquets(tmp_path, monkeypatch):
     args = _base_args(tmp_path, asset="forex", output_root=str(tmp_path), daily_discover_symbols=False)
     resolution = yahoo._resolve_symbol_resolution("forex", args)
 
-    assert [record.code for record in resolution.active_records] == ["EURUSD"]
+    assert [record.code for record in resolution.scheduled_records] == ["EURUSD"]
     assert [record.code for record in resolution.manifest_records] == ["EURUSD"]

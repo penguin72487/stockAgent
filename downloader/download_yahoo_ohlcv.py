@@ -264,8 +264,13 @@ class RepairCheck:
 
 @dataclass(slots=True)
 class SymbolResolution:
-    active_records: list[SymbolRecord]
+    scheduled_records: list[SymbolRecord]
     manifest_records: list[SymbolRecord]
+    new_codes: set[str]
+
+    @property
+    def active_records(self) -> list[SymbolRecord]:
+        return self.scheduled_records
 
 
 def _blacklist_file_path(output_dir: Path) -> Path:
@@ -849,6 +854,14 @@ def _all_candidate_symbols_blacklisted(
     return bool(candidates) and not _available_candidate_symbols(asset_class, record, blacklist_symbols)
 
 
+def _is_delisted_record(record: SymbolRecord) -> bool:
+    return "delisted" in record.market.lower()
+
+
+def _skip_status_for_unavailable_record(record: SymbolRecord) -> str:
+    return "delisted_skip" if _is_delisted_record(record) else "not_found_skip"
+
+
 def _load_tw_symbols_from_local_manifest() -> list[SymbolRecord]:
     manifest_path = Path("data_parquet") / "symbols.csv"
     if not manifest_path.exists():
@@ -1359,13 +1372,13 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         deduped = _dedupe_records_by_code(records)
         if args.limit is not None:
             deduped = deduped[: args.limit]
-        return SymbolResolution(active_records=deduped, manifest_records=deduped)
+        return SymbolResolution(scheduled_records=deduped, manifest_records=deduped, new_codes=set())
     elif args.symbols:
         records = [_record_from_input(asset_class, symbol) for symbol in args.symbols]
         deduped = _dedupe_records_by_code(records)
         if args.limit is not None:
             deduped = deduped[: args.limit]
-        return SymbolResolution(active_records=deduped, manifest_records=deduped)
+        return SymbolResolution(scheduled_records=deduped, manifest_records=deduped, new_codes=set())
     else:
         output_dir = _resolve_asset_output_dir(args, asset_class)
         cached = _resolve_cached_manifest(output_dir, asset_class)
@@ -1382,6 +1395,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
             manifest_records = list(cached)
             manifest_records.extend(active_records)
             known_before = {record.code for record in manifest_records}
+            new_codes: set[str] = set()
 
             if getattr(args, "daily_retry_known_missing_symbols", False):
                 active_codes = {record.code for record in active_records}
@@ -1402,6 +1416,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 )
                 active_records.extend(new_from_repo)
                 manifest_records.extend(new_from_repo)
+                new_codes.update(record.code for record in new_from_repo)
                 known_before.update(record.code for record in new_from_repo)
 
             if getattr(args, "daily_discover_symbols", True) and asset_class in {"tw_stocks", "us_stocks"}:
@@ -1418,6 +1433,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                         )
                         active_records.extend(new_from_discovery)
                         manifest_records.extend(new_from_discovery)
+                        new_codes.update(record.code for record in new_from_discovery)
 
             active_deduped = _dedupe_records_by_code(active_records)
             manifest_deduped = _dedupe_records_by_code(manifest_records)
@@ -1425,11 +1441,15 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 active_deduped = active_deduped[: args.limit]
                 manifest_deduped = manifest_deduped[: args.limit]
             print(
-                f"[symbols] daily-update: active tracked {asset_class} "
-                f"({len(active_deduped)} active, {len(manifest_deduped)} known; "
+                f"[symbols] daily-update: scheduled {asset_class} "
+                f"({len(active_deduped)} scheduled, {len(manifest_deduped)} known; "
                 "parquet+whitelist+defaults+new_discovery)"
             )
-            return SymbolResolution(active_records=active_deduped, manifest_records=manifest_deduped)
+            return SymbolResolution(
+                scheduled_records=active_deduped,
+                manifest_records=manifest_deduped,
+                new_codes=new_codes,
+            )
 
         if asset_class == "tw_stocks":
             records = _resolve_tw_symbols(args, cached)
@@ -1446,11 +1466,11 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
 
     if args.limit is not None:
         deduped = deduped[: args.limit]
-    return SymbolResolution(active_records=deduped, manifest_records=deduped)
+    return SymbolResolution(scheduled_records=deduped, manifest_records=deduped, new_codes=set())
 
 
 def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolRecord]:
-    return _resolve_symbol_resolution(asset_class, args).active_records
+    return _resolve_symbol_resolution(asset_class, args).scheduled_records
 
 
 def _download_symbol(
@@ -1477,7 +1497,7 @@ def _download_symbol(
             code=record.code,
             yahoo_symbol=record.yahoo_symbol,
             market=record.market,
-            status="blacklisted_skip",
+            status=_skip_status_for_unavailable_record(record),
             rows=0,
             output_path=str(output_path) if output_path.exists() else None,
             message="All candidate Yahoo symbols are in blacklist.",
@@ -1778,8 +1798,15 @@ def _summarize_post_repair_coverage(
     return oldest.isoformat(), newest.isoformat(), lag_days, len(last_dates)
 
 
-def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: list[SymbolRecord], output_dir: Path) -> list[RepairCheck]:
+def _resolve_repair_plan(
+    asset_class: str,
+    args: argparse.Namespace,
+    records: list[SymbolRecord],
+    output_dir: Path,
+    new_codes: set[str] | None = None,
+) -> list[RepairCheck]:
     checks: list[RepairCheck] = []
+    new_codes = new_codes or set()
     target_end = args.end_date or _today_str()
     target_end_dt = _parse_date(target_end).date()
     overlap = max(1, args.repair_overlap_days)
@@ -1789,7 +1816,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
     blacklist_lock = threading.Lock()
     retry_blacklisted = bool(getattr(args, "retry_blacklisted_repair_symbols", False))
 
-    def _blacklisted_skip(
+    def _unavailable_skip(
         record: SymbolRecord,
         output_path: Path,
         first_date: str | None,
@@ -1797,7 +1824,7 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
     ) -> RepairCheck:
         return RepairCheck(
             record=record,
-            status="blacklisted_skip",
+            status=_skip_status_for_unavailable_record(record),
             output_path=output_path,
             first_date=first_date,
             last_date=last_date,
@@ -1849,13 +1876,16 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                 )
                 continue
             if error == "missing":
+                if _is_delisted_record(record):
+                    checks.append(_unavailable_skip(record, output_path, None, None))
+                    continue
                 if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
-                    checks.append(_blacklisted_skip(record, output_path, None, None))
+                    checks.append(_unavailable_skip(record, output_path, None, None))
                     continue
                 checks.append(
                     RepairCheck(
                         record=record,
-                        status="missing",
+                        status="new_symbol" if record.code in new_codes else "missing",
                         output_path=output_path,
                         first_date=None,
                         last_date=None,
@@ -1865,6 +1895,9 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                 )
                 continue
             if error is not None:
+                if _is_delisted_record(record):
+                    checks.append(_unavailable_skip(record, output_path, None, None))
+                    continue
                 checks.append(
                     RepairCheck(
                         record=record,
@@ -1879,6 +1912,9 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                 )
                 continue
             if last_date is None:
+                if _is_delisted_record(record):
+                    checks.append(_unavailable_skip(record, output_path, None, None))
+                    continue
                 checks.append(
                     RepairCheck(
                         record=record,
@@ -1894,8 +1930,11 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
 
             missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
             if missing_required:
+                if _is_delisted_record(record):
+                    checks.append(_unavailable_skip(record, output_path, first_date, last_date))
+                    continue
                 if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
-                    checks.append(_blacklisted_skip(record, output_path, first_date, last_date))
+                    checks.append(_unavailable_skip(record, output_path, first_date, last_date))
                     continue
                 checks.append(
                     RepairCheck(
@@ -1912,6 +1951,14 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                 continue
 
             local_last_dt = _parse_date(last_date).date()
+            if _is_delisted_record(record):
+                checks.append(_unavailable_skip(record, output_path, first_date, last_date))
+                continue
+
+            if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
+                checks.append(_unavailable_skip(record, output_path, first_date, last_date))
+                continue
+
             if args.mode == "daily-update" and args.daily_stale_max_lag_days > 0:
                 lag_days = (target_end_dt - local_last_dt).days
                 if lag_days > args.daily_stale_max_lag_days:
@@ -1943,10 +1990,6 @@ def _resolve_repair_plan(asset_class: str, args: argparse.Namespace, records: li
                         repair_start_date=None,
                     )
                 )
-                continue
-
-            if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
-                checks.append(_blacklisted_skip(record, output_path, first_date, last_date))
                 continue
 
             repair_start_dt = max(_parse_date(args.start_date).date(), local_last_dt - timedelta(days=overlap))
@@ -2042,12 +2085,12 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     whitelist_lock = threading.Lock()
 
     resolution = _resolve_symbol_resolution(asset_class, args)
-    records = resolution.active_records
+    records = resolution.scheduled_records
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
     _write_symbol_manifest(output_dir, resolution.manifest_records)
-    checks = _resolve_repair_plan(asset_class, args, records, output_dir)
+    checks = _resolve_repair_plan(asset_class, args, records, output_dir, new_codes=resolution.new_codes)
     status_counts: dict[str, int] = {}
     pending = [check for check in checks if check.repair_start_date is not None]
     for check in checks:
@@ -2067,12 +2110,18 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
             reason="pending repair symbols",
         )
 
+    needs_update = sum(
+        status_counts.get(status, 0)
+        for status in ("missing", "new_symbol", "stale", "empty", "broken", "schema_mismatch")
+    )
     print(
-        f"[repair] asset={asset_class} current={status_counts.get('current', 0)} "
-        f"missing={status_counts.get('missing', 0)} stale={status_counts.get('stale', 0)} "
+        f"[repair] asset={asset_class} up_to_date={status_counts.get('current', 0)} "
+        f"needs_update={needs_update} stale={status_counts.get('stale', 0)} "
+        f"missing={status_counts.get('missing', 0)} new_symbol={status_counts.get('new_symbol', 0)} "
         f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)} "
-        f"lagging_skip={status_counts.get('lagging_skip', 0)} "
-        f"blacklisted_skip={status_counts.get('blacklisted_skip', 0)}"
+        f"delisted_skip={status_counts.get('delisted_skip', 0)} "
+        f"not_found_skip={status_counts.get('not_found_skip', 0)} "
+        f"lagging_skip={status_counts.get('lagging_skip', 0)}"
     )
     target_end = args.end_date or _today_str()
     oldest_date, newest_date, lag_days, tracked = _summarize_repair_coverage(checks, target_end)
@@ -2102,10 +2151,14 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         check = meta
         assert isinstance(check, RepairCheck)
         if result.status == "updated":
-            if check.status == "schema_mismatch":
+            if check.status == "new_symbol":
+                result.status = "new_symbol_repaired"
+            elif check.status == "schema_mismatch":
                 result.status = "schema_repaired"
             else:
                 result.status = "repaired"
+        elif result.status == "failed" and result.message and BLACKLIST_TRIGGER_TEXT in result.message.lower():
+            result.status = "not_found"
         elif result.status == "empty":
             result.status = "still_stale"
             if check.last_date:
@@ -2184,7 +2237,7 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
     whitelist_lock = threading.Lock()
 
     resolution = _resolve_symbol_resolution(asset_class, args)
-    records = resolution.active_records
+    records = resolution.scheduled_records
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
