@@ -49,11 +49,15 @@ training:
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
   enable_torch_compile: true
-  auto_torch_compile_sharpe: true
+  auto_torch_compile_sharpe: false
+  torch_compile_mode: reduce-overhead
   compile_loss: false
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
+  eval_model_chunk_rows: auto
+  eval_backtest_chunk_rows: 512
+  eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 16
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true

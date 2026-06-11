@@ -65,7 +65,14 @@ training:
   batch_size_train: 32
   batch_size_eval: 16
   enable_torch_compile: true
+  auto_torch_compile_sharpe: false
+  torch_compile_mode: reduce-overhead
   compile_loss: false
+  eval_model_chunk_rows: auto
+  eval_backtest_chunk_rows: 512
+  eval_backtest_chunk_rows_auto: true
+  backtest_compile: true
+  backtest_compile_stateful: true
   loss_type: log_utility
 
   transformer_base_portfolio:
@@ -218,6 +225,7 @@ Rules:
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
 - Keep curve plotting async where possible.
+- When comparing throughput after compile, chunking, or cache changes, use the second epoch or later steady-state numbers. Do not choose defaults from the first epoch, because compile/autotune/warmup can dominate it.
 - GPU tensor caching is allowed when transfer dominates and VRAM checks pass:
   - prefer `cache_train_tensors_on_gpu: true` for transfer-bound long-year runs
   - keep `cache_eval_tensors_on_gpu: true` for lazy windowed tensor runs when train/val/test can reuse the same cached base panel tensors
@@ -231,17 +239,38 @@ Compile/runtime rules:
 
 - Use CUDA 13 ptxas for the current PyTorch CUDA 13 environment. Prefer mamba/conda packages such as `cuda-nvcc` / `cuda-nvvm-tools` in the `fintech` env; do not leave a CUDA 12 pip `nvidia-cuda-nvcc-cu12` package around as a fallback ptxas source.
 - When invoking `/home/user/miniforge3/envs/fintech/bin/python` directly, PATH may not include the env `bin`. Compile helpers must prepend that path so Triton can find `/home/user/miniforge3/envs/fintech/bin/ptxas`.
-- Current benchmark result: model `torch.compile` is worthwhile for `transformer_base_portfolio` lookback32/batch16, but `compile_loss: true` is slower for the canonical log-utility backtest path. Keep model compile on and loss compile off unless a fresh benchmark proves otherwise.
+- Current benchmark result for the active `data_okx` lookback32 run: compare only epoch 2 or later. The fastest measured compile combination is model compile plus stateful tensor backtest compile:
+  - `enable_torch_compile: true`
+  - `backtest_compile: true`
+  - `backtest_compile_stateful: true`
+  - `compile_loss: false`
+  - epoch 2 wall time improved from about `67.54s` with all compile off to about `19.54s`.
+- Compile mode benchmark result:
+  - keep `torch_compile_mode: reduce-overhead`
+  - `default` and `max-autotune` were slower on epoch 2 for the active `data_okx` lookback32 shape
+- Current chunk/batch benchmark result:
+  - keep `eval_model_chunk_rows: auto` with `eval_auto_chunk_rows_cap: 16`
+  - keep `eval_backtest_chunk_rows: 512`; larger compiled backtest chunks such as 1024/2048 stalled compilation and did not produce epoch 2 within the manual test window
+  - keep `batch_size_train: 32`; `batch_size_train: 64` was only marginally faster in one epoch-2 run and changes optimizer batch granularity
+  - keep `backtest_autotune: true`; disabling it was only noise-level faster in one epoch-2 run and can hurt other shapes
+  - keep backtest prep compile enabled; `STOCKAGENT_BACKTEST_COMPILE_PREP=0` was not faster on epoch 2
 - Trainer compile checks should discover `/home/user/miniforge3/envs/fintech/bin/ptxas` and the conda compilers `x86_64-conda-linux-gnu-gcc/g++` even when the parent shell PATH is sparse.
-- Actual-shape compile probes on the 2000-2024 checkpoint showed:
+- Historical actual-shape compile probes on the 2000-2024 TW checkpoint showed:
   - compiled `transformer_base_portfolio` model forward is beneficial
   - compiled tensor backtest is beneficial and may use fallback on unsupported graph states
   - isolated compiled loss has small benefit, but compiled model plus compiled loss was unstable in the actual-shape probe
 - Current safe baseline preference:
   - `enable_torch_compile: true`
+  - `auto_torch_compile_sharpe: false`
   - `backtest_compile: true`
+  - `backtest_compile_stateful: true`
   - `backtest_autotune: true`
   - `compile_loss: false`
+- Eval model forward chunking and eval backtest chunking are intentionally decoupled:
+  - keep model chunk sizing VRAM-driven, often `eval_model_chunk_rows: auto`
+  - use larger `eval_backtest_chunk_rows`, currently `512`, to reduce `run_backtest_torch()` calls without skipping any val/test curve rows
+  - preserve `prev_weights` continuation across backtest chunks and reset only at fold/segment boundaries
+- `run_backtest_torch_reduced(..., reduction="log_utility")` exists for exact in-loop log utility reduction, but it is opt-in via `STOCKAGENT_LOSS_REDUCED_LOG_UTILITY=1` until a stateful compiled/Triton/C++ path benchmarks faster. The eager reduced loop was slower, and independent reduced runner compile warmup stalled in testing.
 
 ## Crypto Downloader Baseline
 

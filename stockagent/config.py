@@ -357,11 +357,15 @@ class TrainingConfig:
     batch_mode: str
     non_blocking_transfer: bool
     model_name: str
-    enable_torch_compile: bool = False
-    auto_torch_compile_sharpe: bool = True
+    enable_torch_compile: bool = True
+    auto_torch_compile_sharpe: bool = False
+    torch_compile_mode: str = "reduce-overhead"
     compile_loss: bool | None = None
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
+    eval_model_chunk_rows: int | str = "auto"
+    eval_backtest_chunk_rows: int = 512
+    eval_backtest_chunk_rows_auto: bool = True
     eval_auto_chunk_rows_cap: int = 16
     train_symbol_subsample_ratio: float = 1.0
     detach_prev_state: bool = True
@@ -514,11 +518,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("batch_size_eval", training.get("batch_size", 32))
     training.setdefault("min_batch_size", 1)
     training.setdefault("auto_batch_size", False)
-    training.setdefault("enable_torch_compile", False)
-    training.setdefault("auto_torch_compile_sharpe", True)
+    training.setdefault("enable_torch_compile", True)
+    training.setdefault("auto_torch_compile_sharpe", False)
+    training.setdefault("torch_compile_mode", "reduce-overhead")
     training.setdefault("compile_loss", None)
     training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
+    training.setdefault("eval_model_chunk_rows", "auto")
+    training.setdefault("eval_backtest_chunk_rows", 512)
+    training.setdefault("eval_backtest_chunk_rows_auto", True)
     training.setdefault("eval_auto_chunk_rows_cap", 16)
     training.setdefault("train_symbol_subsample_ratio", 1.0)
     training.setdefault("detach_prev_state", True)
@@ -1000,9 +1008,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
             model_name=training_raw["model_name"],
             enable_torch_compile=training_raw["enable_torch_compile"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
+            torch_compile_mode=training_raw["torch_compile_mode"],
             compile_loss=training_raw["compile_loss"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
+            eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],
+            eval_backtest_chunk_rows=training_raw["eval_backtest_chunk_rows"],
+            eval_backtest_chunk_rows_auto=training_raw["eval_backtest_chunk_rows_auto"],
             eval_auto_chunk_rows_cap=training_raw["eval_auto_chunk_rows_cap"],
             train_symbol_subsample_ratio=training_raw["train_symbol_subsample_ratio"],
             detach_prev_state=training_raw["detach_prev_state"],

@@ -2347,6 +2347,417 @@ def _should_log_eval_chunk(chunk_idx: int, total_chunks: int) -> bool:
     return int(chunk_idx) == 1 or int(chunk_idx) == total_chunks or int(chunk_idx) % interval == 0
 
 
+def _eval_ranges_by_reset(
+    total_rows: int,
+    chunk_rows: int,
+    reset_at_rows: Sequence[int] | None,
+) -> list[tuple[int, int, bool]]:
+    total_rows = int(total_rows)
+    chunk_rows = max(1, int(chunk_rows))
+    reset_points = {0, total_rows}
+    if reset_at_rows is not None:
+        reset_points.update(int(value) for value in reset_at_rows if 0 <= int(value) <= total_rows)
+    reset_points_sorted = sorted(reset_points)
+    ranges: list[tuple[int, int, bool]] = []
+    for segment_start, segment_end in zip(reset_points_sorted[:-1], reset_points_sorted[1:]):
+        if segment_end <= segment_start:
+            continue
+        for start in range(segment_start, segment_end, chunk_rows):
+            end = min(start + chunk_rows, segment_end)
+            ranges.append((start, end, start == segment_start))
+    return ranges
+
+
+def _finalize_ic_summary_from_series(
+    ic_series: torch.Tensor,
+    *,
+    device: torch.device,
+    profile_timing: bool,
+    timing: TimingBreakdown,
+) -> dict[str, float]:
+    ic_finite = torch.isfinite(ic_series)
+    ic_clean64 = torch.nan_to_num(ic_series, nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    ic_mask64 = ic_finite.to(torch.float64)
+    cpu_gpu_sync_start = time.perf_counter()
+    ic_count, ic_sum, ic_sumsq, ic_pos = (
+        torch.stack(
+            [
+                ic_mask64.sum(),
+                (ic_clean64 * ic_mask64).sum(),
+                (ic_clean64 * ic_clean64 * ic_mask64).sum(),
+                ((ic_clean64 > 0).to(torch.float64) * ic_mask64).sum(),
+            ]
+        )
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    _maybe_sync_cuda(device, profile_timing)
+    timing.cpu_gpu_sync_s += time.perf_counter() - cpu_gpu_sync_start
+    if ic_count <= 0:
+        return {"ic_mean": 0.0, "ic_std": 0.0, "ic_ir": 0.0, "ic_positive_ratio": 0.0}
+    ic_n = float(ic_count)
+    ic_mean = ic_sum / ic_n
+    ic_var = max(0.0, ic_sumsq / ic_n - ic_mean * ic_mean)
+    ic_std = (ic_var ** 0.5) + 1e-8
+    return {
+        "ic_mean": ic_mean,
+        "ic_std": ic_std,
+        "ic_ir": float(ic_mean / ic_std * np.sqrt(252.0)),
+        "ic_positive_ratio": ic_pos / ic_n,
+    }
+
+
+def _compute_eval_metrics_like_legacy_online(
+    strategy_returns: torch.Tensor,
+    benchmark_returns: torch.Tensor,
+    turnovers: torch.Tensor,
+) -> dict[str, float]:
+    r = torch.nan_to_num(strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    b = torch.nan_to_num(benchmark_returns.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    t = torch.nan_to_num(turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0).to(torch.float64)
+    if r.numel() == 0:
+        return {
+            "cumulative_return": 0.0,
+            "annualized_return": 0.0,
+            "cagr": 0.0,
+            "sharpe": 0.0,
+            "baseline_sharpe": 0.0,
+            "sortino": 0.0,
+            "baseline_sortino": 0.0,
+            "max_drawdown": 0.0,
+            "calmar": 0.0,
+            "turnover": 0.0,
+            "daily_hit_rate": 0.0,
+            "excess_return_vs_universe_average": 0.0,
+            "cumulative_benchmark": 0.0,
+        }
+
+    n = float(r.numel())
+    sum_r = float(r.sum().item())
+    sum_b = float(b.sum().item())
+    sumsq_r = float((r * r).sum().item())
+    sumsq_b = float((b * b).sum().item())
+    mean_r = sum_r / n
+    mean_b = sum_b / n
+    var_r = max(0.0, sumsq_r / n - mean_r * mean_r)
+    var_b = max(0.0, sumsq_b / n - mean_b * mean_b)
+    std_r = var_r ** 0.5
+    std_b = var_b ** 0.5
+    cum_r = float(math.expm1(sum_r))
+    cum_b = float(math.expm1(sum_b))
+    ann_r = float(math.expm1(mean_r * 252.0))
+    downside_dev = float((torch.minimum(r, torch.zeros_like(r)).pow(2).sum().item() / n) ** 0.5)
+    downside_dev_b = float((torch.minimum(b, torch.zeros_like(b)).pow(2).sum().item() / n) ** 0.5)
+    cum_log = torch.cumsum(r, dim=0)
+    running_max_log = torch.maximum(torch.cummax(cum_log, dim=0).values, torch.zeros((), device=r.device, dtype=r.dtype))
+    dd = torch.expm1(torch.clamp(cum_log - running_max_log, min=-745.0, max=0.0))
+    max_dd = float(dd.min().item()) if dd.numel() else 0.0
+    return {
+        "cumulative_return": cum_r,
+        "annualized_return": ann_r,
+        "cagr": ann_r,
+        "sharpe": float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0,
+        "baseline_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
+        "sortino": float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0,
+        "baseline_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
+        "max_drawdown": max_dd,
+        "calmar": ann_r / abs(max_dd) if max_dd < 0.0 else 0.0,
+        "turnover": float(t.sum().item()) / n,
+        "daily_hit_rate": float((r > 0).to(torch.float64).sum().item()) / n,
+        "excess_return_vs_universe_average": cum_r - cum_b,
+        "cumulative_benchmark": cum_b,
+    }
+
+
+def _run_eval_backtest_from_weight_buffers(
+    weights_all: torch.Tensor,
+    future_log_returns_all: torch.Tensor,
+    tradable_mask_all: torch.Tensor,
+    can_buy_mask_all: torch.Tensor,
+    can_sell_mask_all: torch.Tensor,
+    benchmark_all: torch.Tensor,
+    *,
+    device: torch.device,
+    non_blocking: bool,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    backtest_chunk_rows: int,
+    compute_metrics_summary: bool,
+    return_weights_history: bool,
+    profile_timing: bool,
+    progress_label: str | None,
+    timing: TimingBreakdown,
+    reset_at_rows: Sequence[int] | None,
+) -> tuple[BacktestResultTensor, dict[str, float]]:
+    total_rows = int(weights_all.size(0))
+    num_symbols = int(weights_all.size(1))
+    if total_rows <= 0:
+        empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_weights = torch.empty((0, num_symbols), device=device, dtype=torch.float32)
+        return (
+            BacktestResultTensor(
+                strategy_returns=empty_returns,
+                benchmark_returns=empty_returns.clone(),
+                turnovers=empty_returns.clone(),
+                weights_history=empty_weights,
+            ),
+            {},
+        )
+
+    backtest_chunk_rows = max(1, int(backtest_chunk_rows))
+    backtest_ranges = _eval_ranges_by_reset(total_rows, backtest_chunk_rows, reset_at_rows)
+    total_backtest_chunks = max(1, len(backtest_ranges))
+    strategy_returns_out = torch.empty((total_rows,), device=device, dtype=weights_all.dtype)
+    benchmark_returns_out = torch.empty((total_rows,), device=device, dtype=weights_all.dtype)
+    turnovers_out = torch.empty((total_rows,), device=device, dtype=weights_all.dtype)
+    if return_weights_history:
+        weights_history_out = torch.empty((total_rows, num_symbols), device=device, dtype=weights_all.dtype)
+    else:
+        weights_history_out = torch.empty((0, num_symbols), device=device, dtype=weights_all.dtype)
+
+    prev_weights: torch.Tensor | None = None
+    for chunk_idx, (start, end, reset_state) in enumerate(backtest_ranges, start=1):
+        if reset_state:
+            prev_weights = None
+        log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_backtest_chunks)
+        if log_chunk_progress:
+            _progress(f"{progress_label}: backtest chunk {chunk_idx}/{total_backtest_chunks} rows=[{start},{end})")
+
+        backtest_start = time.perf_counter()
+        backtest_prepare_start = time.perf_counter()
+        weights_chunk = weights_all[start:end]
+        returns_chunk = future_log_returns_all[start:end].to(device=device, non_blocking=non_blocking)
+        mask_chunk = tradable_mask_all[start:end].to(device=device, non_blocking=non_blocking)
+        buy_mask_chunk = can_buy_mask_all[start:end].to(device=device, non_blocking=non_blocking)
+        sell_mask_chunk = can_sell_mask_all[start:end].to(device=device, non_blocking=non_blocking)
+        bench_chunk = benchmark_all[start:end].to(device=device, non_blocking=non_blocking)
+        (
+            weights_chunk,
+            returns_chunk,
+            mask_chunk,
+            buy_mask_chunk,
+            sell_mask_chunk,
+            bench_chunk,
+            valid_rows,
+        ) = _pad_eval_chunk_first_dim(
+            weights_chunk,
+            returns_chunk,
+            mask_chunk,
+            buy_mask_chunk,
+            sell_mask_chunk,
+            bench_chunk,
+            target_rows=backtest_chunk_rows,
+        )
+        initial_weights_chunk = prev_weights
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
+
+        backtest_runner_start = time.perf_counter()
+        backtest_chunk = run_backtest_torch(
+            weights_chunk,
+            returns_chunk,
+            mask_chunk,
+            bench_chunk,
+            buy_fee_rate,
+            sell_fee_rate,
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            can_buy_mask=buy_mask_chunk,
+            can_sell_mask=sell_mask_chunk,
+            return_weights_history=return_weights_history,
+            initial_weights=initial_weights_chunk,
+        )
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
+
+        backtest_finalize_start = time.perf_counter()
+        prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
+        strategy_returns_out[start:end].copy_(backtest_chunk.strategy_returns[:valid_rows])
+        benchmark_returns_out[start:end].copy_(backtest_chunk.benchmark_returns[:valid_rows])
+        turnovers_out[start:end].copy_(backtest_chunk.turnovers[:valid_rows])
+        if return_weights_history:
+            weights_history_out[start:end].copy_(backtest_chunk.weights_history[:valid_rows])
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
+        timing.backtest_s += time.perf_counter() - backtest_start
+
+    backtest = BacktestResultTensor(
+        strategy_returns=strategy_returns_out,
+        benchmark_returns=benchmark_returns_out,
+        turnovers=turnovers_out,
+        weights_history=weights_history_out,
+        final_weights=prev_weights,
+    )
+    metrics_start = time.perf_counter()
+    metrics = (
+        _compute_eval_metrics_like_legacy_online(strategy_returns_out, benchmark_returns_out, turnovers_out)
+        if compute_metrics_summary
+        else {}
+    )
+    _maybe_sync_cuda(device, profile_timing)
+    timing.metrics_s += time.perf_counter() - metrics_start
+    timing.batches = int(total_backtest_chunks)
+    return backtest, metrics
+
+
+def _evaluate_tensor_batch_decoupled(
+    model: nn.Module,
+    x: torch.Tensor,
+    future_log_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    benchmark: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    model_chunk_rows: int,
+    backtest_chunk_rows: int,
+    compute_ic: bool = True,
+    compute_metrics_summary: bool = True,
+    return_weights_history: bool = True,
+    profile_timing: bool = False,
+    progress_label: str | None = None,
+    timing_out: TimingBreakdown | None = None,
+    reset_at_rows: Sequence[int] | None = None,
+) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
+    model.eval()
+    timing = TimingBreakdown()
+    overall_start = time.perf_counter()
+    total_rows = int(x.size(0))
+    num_symbols = int(future_log_returns.size(1))
+    if total_rows <= 0:
+        empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_weights = torch.empty((0, num_symbols), device=device, dtype=torch.float32)
+        backtest = BacktestResultTensor(
+            strategy_returns=empty_returns,
+            benchmark_returns=empty_returns.clone(),
+            turnovers=empty_returns.clone(),
+            weights_history=empty_weights,
+        )
+        return backtest, {}, {}
+
+    model_chunk_rows = max(1, int(model_chunk_rows))
+    backtest_chunk_rows = max(1, int(backtest_chunk_rows))
+    model_ranges = [(start, min(start + model_chunk_rows, total_rows)) for start in range(0, total_rows, model_chunk_rows)]
+    if progress_label:
+        _progress(
+            f"{progress_label}: start eval rows={total_rows} "
+            f"model_chunk_rows={model_chunk_rows} backtest_chunk_rows={backtest_chunk_rows}"
+        )
+
+    static_start = time.perf_counter()
+    future_returns_all = future_log_returns.to(device=device, non_blocking=non_blocking)
+    tradable_mask_all = tradable_mask.to(device=device, non_blocking=non_blocking)
+    can_buy_mask_all = can_buy_mask.to(device=device, non_blocking=non_blocking)
+    can_sell_mask_all = can_sell_mask.to(device=device, non_blocking=non_blocking)
+    benchmark_all = benchmark.to(device=device, non_blocking=non_blocking)
+    _maybe_sync_cuda(device, profile_timing)
+    timing.transfer_s += time.perf_counter() - static_start
+
+    weights_all: torch.Tensor | None = None
+    with torch.inference_mode():
+        for chunk_idx, (start, end) in enumerate(model_ranges, start=1):
+            _maybe_cudagraph_step_begin()
+            log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, len(model_ranges))
+            if log_chunk_progress:
+                _progress(f"{progress_label}: model chunk {chunk_idx}/{len(model_ranges)} rows=[{start},{end})")
+            chunk_start = time.perf_counter()
+            x_chunk = x[start:end].to(device=device, non_blocking=non_blocking)
+            returns_chunk = future_returns_all[start:end]
+            mask_chunk = tradable_mask_all[start:end]
+            buy_mask_chunk = can_buy_mask_all[start:end]
+            sell_mask_chunk = can_sell_mask_all[start:end]
+            bench_chunk = benchmark_all[start:end]
+            (
+                x_chunk,
+                returns_chunk_padded,
+                mask_chunk_padded,
+                buy_mask_chunk_padded,
+                sell_mask_chunk_padded,
+                bench_chunk_padded,
+                valid_rows,
+            ) = _pad_eval_chunk_first_dim(
+                x_chunk,
+                returns_chunk,
+                mask_chunk,
+                buy_mask_chunk,
+                sell_mask_chunk,
+                bench_chunk,
+                target_rows=model_chunk_rows,
+            )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.transfer_s += time.perf_counter() - chunk_start
+
+            forward_start = time.perf_counter()
+            with _autocast_context(device, amp_dtype):
+                model_output_chunk = model(x_chunk, mask_chunk_padded)
+                weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
+            _maybe_sync_cuda(device, profile_timing)
+            forward_elapsed = time.perf_counter() - forward_start
+            timing.forward_s += forward_elapsed
+            timing.model_forward_s += forward_elapsed
+
+            if weights_all is None:
+                weights_all = torch.empty((total_rows, int(weights_chunk.size(1))), device=device, dtype=weights_chunk.dtype)
+            weights_all[start:end].copy_(weights_chunk[:valid_rows])
+            del returns_chunk_padded, buy_mask_chunk_padded, sell_mask_chunk_padded, bench_chunk_padded
+
+        if weights_all is None:
+            raise RuntimeError("eval produced no model weights")
+
+        backtest, metrics = _run_eval_backtest_from_weight_buffers(
+            weights_all,
+            future_returns_all,
+            tradable_mask_all,
+            can_buy_mask_all,
+            can_sell_mask_all,
+            benchmark_all,
+            device=device,
+            non_blocking=non_blocking,
+            long_only=long_only,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            backtest_chunk_rows=backtest_chunk_rows,
+            compute_metrics_summary=compute_metrics_summary,
+            return_weights_history=return_weights_history,
+            profile_timing=profile_timing,
+            progress_label=progress_label,
+            timing=timing,
+            reset_at_rows=reset_at_rows,
+        )
+
+        ic_start = time.perf_counter()
+        if compute_ic:
+            ic_series = compute_ic_series_torch(weights_all, future_returns_all, tradable_mask_all)
+            _maybe_sync_cuda(device, profile_timing)
+            ic = _finalize_ic_summary_from_series(ic_series, device=device, profile_timing=profile_timing, timing=timing)
+        else:
+            ic = {}
+        timing.ic_s += time.perf_counter() - ic_start
+
+    timing.total_s = time.perf_counter() - overall_start
+    if progress_label:
+        _progress(f"{progress_label}: eval done total={timing.total_s:.1f}s backtest_chunks={timing.batches}")
+    if profile_timing:
+        _log_timing("eval.decoupled", timing)
+    if timing_out is not None:
+        _add_timing(timing_out, timing)
+    return backtest, ic, metrics
+
+
 def _evaluate_tensor_batch(
     model: nn.Module,
     x: torch.Tensor,
@@ -2364,6 +2775,7 @@ def _evaluate_tensor_batch(
     max_turnover_ratio: float,
     gross_leverage: float,
     chunk_rows: int,
+    backtest_chunk_rows: int | None = None,
     compute_ic: bool = True,
     compute_metrics_summary: bool = True,
     return_weights_history: bool = True,
@@ -2372,6 +2784,34 @@ def _evaluate_tensor_batch(
     timing_out: TimingBreakdown | None = None,
     reset_at_rows: Sequence[int] | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
+    effective_backtest_chunk_rows = int(backtest_chunk_rows) if backtest_chunk_rows is not None else int(chunk_rows)
+    if effective_backtest_chunk_rows != int(chunk_rows):
+        return _evaluate_tensor_batch_decoupled(
+            model,
+            x,
+            future_log_returns,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            benchmark,
+            device,
+            amp_dtype,
+            non_blocking,
+            long_only,
+            buy_fee_rate,
+            sell_fee_rate,
+            max_turnover_ratio,
+            gross_leverage,
+            model_chunk_rows=chunk_rows,
+            backtest_chunk_rows=effective_backtest_chunk_rows,
+            compute_ic=compute_ic,
+            compute_metrics_summary=compute_metrics_summary,
+            return_weights_history=return_weights_history,
+            profile_timing=profile_timing,
+            progress_label=progress_label,
+            timing_out=timing_out,
+            reset_at_rows=reset_at_rows,
+        )
     model.eval()
     weights_chunks: list[torch.Tensor] = []
     strategy_chunks: list[torch.Tensor] = []
@@ -2698,6 +3138,167 @@ def _evaluate_tensor_batch(
     return backtest, ic, metrics
 
 
+def _evaluate_windowed_tensor_batch_decoupled(
+    model: nn.Module,
+    split: WindowedSplitTensors,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    model_chunk_rows: int,
+    backtest_chunk_rows: int,
+    compute_ic: bool = True,
+    compute_metrics_summary: bool = True,
+    return_weights_history: bool = True,
+    profile_timing: bool = False,
+    progress_label: str | None = None,
+    timing_out: TimingBreakdown | None = None,
+    reset_at_rows: Sequence[int] | None = None,
+) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
+    model.eval()
+    total_rows = len(split)
+    if total_rows <= 0:
+        empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_weights = torch.empty((0, split.num_symbols), device=device, dtype=torch.float32)
+        backtest = BacktestResultTensor(
+            strategy_returns=empty_returns,
+            benchmark_returns=empty_returns.clone(),
+            turnovers=empty_returns.clone(),
+            weights_history=empty_weights,
+        )
+        return backtest, {}, {}
+
+    timing = TimingBreakdown()
+    overall_start = time.perf_counter()
+    model_chunk_rows = max(1, int(model_chunk_rows))
+    backtest_chunk_rows = max(1, int(backtest_chunk_rows))
+    model_ranges = [(start, min(start + model_chunk_rows, total_rows)) for start in range(0, total_rows, model_chunk_rows)]
+    if progress_label:
+        _progress(
+            f"{progress_label}: start eval mode=windowed rows={total_rows} "
+            f"model_chunk_rows={model_chunk_rows} backtest_chunk_rows={backtest_chunk_rows}"
+        )
+
+    weights_all: torch.Tensor | None = None
+    returns_all: torch.Tensor | None = None
+    mask_all: torch.Tensor | None = None
+    buy_mask_all: torch.Tensor | None = None
+    sell_mask_all: torch.Tensor | None = None
+    benchmark_all: torch.Tensor | None = None
+
+    with torch.inference_mode():
+        for chunk_idx, (start, end) in enumerate(model_ranges, start=1):
+            _maybe_cudagraph_step_begin()
+            log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, len(model_ranges))
+            if log_chunk_progress:
+                _progress(f"{progress_label}: model chunk {chunk_idx}/{len(model_ranges)} rows=[{start},{end})")
+            chunk_start = time.perf_counter()
+            batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+            x_chunk = batch["x"]
+            returns_chunk = batch["future_log_returns"]
+            mask_chunk = batch["tradable_mask"]
+            buy_mask_chunk = batch["can_buy_mask"]
+            sell_mask_chunk = batch["can_sell_mask"]
+            bench_chunk = batch["benchmark"]
+            (
+                x_chunk,
+                returns_chunk_padded,
+                mask_chunk_padded,
+                buy_mask_chunk_padded,
+                sell_mask_chunk_padded,
+                bench_chunk_padded,
+                valid_rows,
+            ) = _pad_eval_chunk_first_dim(
+                x_chunk,
+                returns_chunk,
+                mask_chunk,
+                buy_mask_chunk,
+                sell_mask_chunk,
+                bench_chunk,
+                target_rows=model_chunk_rows,
+            )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.transfer_s += time.perf_counter() - chunk_start
+
+            forward_start = time.perf_counter()
+            with _autocast_context(device, amp_dtype):
+                model_output_chunk = model(x_chunk, mask_chunk_padded)
+                weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
+            _maybe_sync_cuda(device, profile_timing)
+            forward_elapsed = time.perf_counter() - forward_start
+            timing.forward_s += forward_elapsed
+            timing.model_forward_s += forward_elapsed
+
+            if weights_all is None:
+                weights_all = torch.empty((total_rows, int(weights_chunk.size(1))), device=device, dtype=weights_chunk.dtype)
+                returns_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=returns_chunk.dtype)
+                mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=mask_chunk.dtype)
+                buy_mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=buy_mask_chunk.dtype)
+                sell_mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=sell_mask_chunk.dtype)
+                benchmark_all = torch.empty((total_rows,), device=device, dtype=bench_chunk.dtype)
+            weights_all[start:end].copy_(weights_chunk[:valid_rows])
+            returns_all[start:end].copy_(returns_chunk_padded[:valid_rows])
+            mask_all[start:end].copy_(mask_chunk_padded[:valid_rows])
+            buy_mask_all[start:end].copy_(buy_mask_chunk_padded[:valid_rows])
+            sell_mask_all[start:end].copy_(sell_mask_chunk_padded[:valid_rows])
+            benchmark_all[start:end].copy_(bench_chunk_padded[:valid_rows])
+
+        if (
+            weights_all is None
+            or returns_all is None
+            or mask_all is None
+            or buy_mask_all is None
+            or sell_mask_all is None
+            or benchmark_all is None
+        ):
+            raise RuntimeError("windowed eval produced no buffers")
+
+        backtest, metrics = _run_eval_backtest_from_weight_buffers(
+            weights_all,
+            returns_all,
+            mask_all,
+            buy_mask_all,
+            sell_mask_all,
+            benchmark_all,
+            device=device,
+            non_blocking=non_blocking,
+            long_only=long_only,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            backtest_chunk_rows=backtest_chunk_rows,
+            compute_metrics_summary=compute_metrics_summary,
+            return_weights_history=return_weights_history,
+            profile_timing=profile_timing,
+            progress_label=progress_label,
+            timing=timing,
+            reset_at_rows=reset_at_rows,
+        )
+
+        ic_start = time.perf_counter()
+        if compute_ic:
+            ic_series = compute_ic_series_torch(weights_all, returns_all, mask_all)
+            _maybe_sync_cuda(device, profile_timing)
+            ic = _finalize_ic_summary_from_series(ic_series, device=device, profile_timing=profile_timing, timing=timing)
+        else:
+            ic = {}
+        timing.ic_s += time.perf_counter() - ic_start
+
+    timing.total_s = time.perf_counter() - overall_start
+    if progress_label:
+        _progress(f"{progress_label}: eval done total={timing.total_s:.1f}s backtest_chunks={timing.batches}")
+    if profile_timing:
+        _log_timing("eval.windowed.decoupled", timing)
+    if timing_out is not None:
+        _add_timing(timing_out, timing)
+    return backtest, ic, metrics
+
+
 def _evaluate_windowed_tensor_batch(
     model: nn.Module,
     split: WindowedSplitTensors,
@@ -2710,6 +3311,7 @@ def _evaluate_windowed_tensor_batch(
     max_turnover_ratio: float,
     gross_leverage: float,
     chunk_rows: int,
+    backtest_chunk_rows: int | None = None,
     compute_ic: bool = True,
     compute_metrics_summary: bool = True,
     return_weights_history: bool = True,
@@ -2718,6 +3320,29 @@ def _evaluate_windowed_tensor_batch(
     timing_out: TimingBreakdown | None = None,
     reset_at_rows: Sequence[int] | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
+    effective_backtest_chunk_rows = int(backtest_chunk_rows) if backtest_chunk_rows is not None else int(chunk_rows)
+    if effective_backtest_chunk_rows != int(chunk_rows):
+        return _evaluate_windowed_tensor_batch_decoupled(
+            model,
+            split,
+            device,
+            amp_dtype,
+            non_blocking,
+            long_only,
+            buy_fee_rate,
+            sell_fee_rate,
+            max_turnover_ratio,
+            gross_leverage,
+            model_chunk_rows=chunk_rows,
+            backtest_chunk_rows=effective_backtest_chunk_rows,
+            compute_ic=compute_ic,
+            compute_metrics_summary=compute_metrics_summary,
+            return_weights_history=return_weights_history,
+            profile_timing=profile_timing,
+            progress_label=progress_label,
+            timing_out=timing_out,
+            reset_at_rows=reset_at_rows,
+        )
     model.eval()
     total_rows_for_eval = len(split)
     if total_rows_for_eval <= 0:
@@ -5800,10 +6425,11 @@ def run_training(
         curve_plot_request_interval = max(1, int(config.training.curve_plot_interval))
         combined_val_rows = len(combined_val_windowed) if combined_val_windowed is not None else int(combined_val_x.size(0))
         eval_auto_chunk_rows_cap = int(getattr(config.training, "eval_auto_chunk_rows_cap", 16))
+        eval_model_chunk_rows_config = getattr(config.training, "eval_model_chunk_rows", "auto")
 
         if config.training.chunk_rows > 0:
             eval_chunk_rows = min(config.training.chunk_rows, combined_val_rows)
-            print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (manual)")
+            print(f"[Train {train_years}] eval model_chunk_rows={eval_chunk_rows} (manual chunk_rows)")
         else:
             measured_free_bytes: int | None = None
             if train_batch_used_bytes > 0:
@@ -5853,6 +6479,20 @@ def run_training(
                     max_chunk_rows=eval_auto_chunk_rows_cap,
                 )
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
+        if str(eval_model_chunk_rows_config).strip().lower() not in {"", "auto"}:
+            eval_chunk_rows = max(1, min(int(eval_model_chunk_rows_config), combined_val_rows))
+            print(f"[Train {train_years}] eval model_chunk_rows={eval_chunk_rows} (manual eval_model_chunk_rows)")
+
+        eval_backtest_chunk_rows_config = int(getattr(config.training, "eval_backtest_chunk_rows", 512))
+        if bool(getattr(config.training, "eval_backtest_chunk_rows_auto", True)):
+            eval_backtest_chunk_rows = max(eval_chunk_rows, eval_backtest_chunk_rows_config)
+        else:
+            eval_backtest_chunk_rows = max(1, eval_backtest_chunk_rows_config)
+        eval_backtest_chunk_rows = max(1, eval_backtest_chunk_rows)
+        print(
+            f"[Train {train_years}] eval chunks: "
+            f"model_chunk_rows={eval_chunk_rows}, backtest_chunk_rows={eval_backtest_chunk_rows}"
+        )
 
         config_auto_compile_risk = bool(getattr(config.training, "auto_torch_compile_sharpe", True))
         auto_compile_risk = (
@@ -5874,13 +6514,15 @@ def run_training(
             if can_compile:
                 try:
                     compile_start = time.perf_counter()
+                    compile_mode = str(getattr(config.training, "torch_compile_mode", "reduce-overhead") or "default")
+                    compile_mode_arg = None if compile_mode == "default" else compile_mode
                     print(f"[Train {train_years}] compile warmup may take extra time at epoch 0")
-                    compiled_train_model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+                    compiled_train_model = torch.compile(model, mode=compile_mode_arg, dynamic=False)
                     eval_model = compiled_train_model
                     compile_source = f"auto({loss_objective})" if (auto_compile_risk and not config.training.enable_torch_compile) else "config"
                     print(
                         f"[Train {train_years}] torch.compile enabled "
-                        f"(mode=reduce-overhead, dynamic=False, source={compile_source}, {reason})"
+                        f"(mode={compile_mode}, dynamic=False, source={compile_source}, {reason})"
                     )
                     model_compile_status = f"enabled:{compile_source}"
 
@@ -6567,6 +7209,7 @@ def run_training(
                         config.trading.max_turnover_ratio,
                         config.trading.gross_leverage,
                         chunk_rows=eval_chunk_rows,
+                        backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
                         return_weights_history=False,
@@ -6592,6 +7235,7 @@ def run_training(
                         config.trading.max_turnover_ratio,
                         config.trading.gross_leverage,
                         chunk_rows=eval_chunk_rows,
+                        backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
                         return_weights_history=False,
@@ -6704,6 +7348,7 @@ def run_training(
                             config.trading.max_turnover_ratio,
                             config.trading.gross_leverage,
                             chunk_rows=eval_chunk_rows,
+                            backtest_chunk_rows=eval_backtest_chunk_rows,
                             compute_ic=False,
                             compute_metrics_summary=False,
                             return_weights_history=False,
@@ -6729,6 +7374,7 @@ def run_training(
                             config.trading.max_turnover_ratio,
                             config.trading.gross_leverage,
                             chunk_rows=eval_chunk_rows,
+                            backtest_chunk_rows=eval_backtest_chunk_rows,
                             compute_ic=False,
                             compute_metrics_summary=False,
                             return_weights_history=False,
@@ -6980,6 +7626,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
                     progress_label=f"[Train {train_years} final-val]",
                     reset_at_rows=val_offsets,
@@ -7002,6 +7649,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
                     progress_label=f"[Train {train_years} final-val]",
                     reset_at_rows=val_offsets,
@@ -7067,6 +7715,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
                 )
                 test_date_idx = test_windowed.valid_indices.to(
@@ -7107,6 +7756,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
                 )
             test_eval_total = time.perf_counter() - test_eval_start
