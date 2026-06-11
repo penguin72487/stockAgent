@@ -34,10 +34,14 @@ DAILY_STALE_MAX_LAG_DAYS="${DAILY_STALE_MAX_LAG_DAYS:-14}"
 PRECHECK_FILE_TIMEOUT_SECONDS="${PRECHECK_FILE_TIMEOUT_SECONDS:-20}"
 REPAIR_SYMBOL_TIMEOUT_SECONDS="${REPAIR_SYMBOL_TIMEOUT_SECONDS:-90}"
 YAHOO_DAILY_DISCOVER_SYMBOLS="${YAHOO_DAILY_DISCOVER_SYMBOLS:-1}"
+YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS="${YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS:-0}"
+YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS="${YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS:-0}"
 YAHOO_INCLUDE_TW_DELISTED="${YAHOO_INCLUDE_TW_DELISTED:-1}"
 YAHOO_INCLUDE_US_DELISTED="${YAHOO_INCLUDE_US_DELISTED:-1}"
 FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
+FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_forex_frankfurter}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
+FRANKFURTER_SKIP_MANIFEST="${FRANKFURTER_SKIP_MANIFEST:-0}"
 RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-1}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
@@ -48,6 +52,7 @@ BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
 BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
+RUN_YAHOO="${RUN_YAHOO:-1}"
 YAHOO_ASSETS="${YAHOO_ASSETS:-tw_stocks us_stocks crypto forex}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-0}"  # 0 disables timeout
 RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-1}"
@@ -205,12 +210,18 @@ run_yahoo_incremental_assets() {
 run_yahoo_incremental() {
   local today
   local asset
+  local rc=0
   local -a assets=()
   local -a base_cmd=()
   local -a run_cmd=()
   local -a yahoo_flags=()
 
   today="$(date +%F)"
+  if [[ "$RUN_YAHOO" != "1" ]]; then
+    log "skip=yahoo_incremental reason=RUN_YAHOO=${RUN_YAHOO}"
+    return 0
+  fi
+
   read -r -a assets <<< "$YAHOO_ASSETS"
   if (( ${#assets[@]} == 0 )); then
     log "skip=yahoo_incremental reason=empty_YAHOO_ASSETS"
@@ -221,6 +232,16 @@ run_yahoo_incremental() {
     yahoo_flags+=(--daily-discover-symbols)
   else
     yahoo_flags+=(--no-daily-discover-symbols)
+  fi
+  if [[ "$YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS" == "1" ]]; then
+    yahoo_flags+=(--daily-retry-known-missing-symbols)
+  else
+    yahoo_flags+=(--no-daily-retry-known-missing-symbols)
+  fi
+  if [[ "$YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS" == "1" ]]; then
+    yahoo_flags+=(--retry-blacklisted-repair-symbols)
+  else
+    yahoo_flags+=(--no-retry-blacklisted-repair-symbols)
   fi
   if [[ "$YAHOO_INCLUDE_TW_DELISTED" == "1" ]]; then
     yahoo_flags+=(--include-tw-delisted)
@@ -258,23 +279,29 @@ run_yahoo_incremental() {
       fi
     fi
 
-    run_step "yahoo_${asset}_daily_update" "${run_cmd[@]}"
+    run_step "yahoo_${asset}_daily_update" "${run_cmd[@]}" || rc=1
   done
+  return "$rc"
 }
 
 run_frankfurter_incremental() {
   local today
+  local -a cmd=()
   today="$(date +%F)"
   if [[ -f "$FRANKFURTER_SYMBOLS_FILE" ]]; then
-    run_step frankfurter_forex_incremental \
-      "$PYTHON_BIN" downloader/download_forex_frankfurter.py \
-      --mode daily-update \
-      --output-dir data_yahoo/forex \
-      --symbols-file "$FRANKFURTER_SYMBOLS_FILE" \
-      --end-date "$today" \
-      --workers "$WORKERS" \
-      --timeout "$FRANKFURTER_TIMEOUT" \
-      --skip-manifest
+    cmd=(
+      "$PYTHON_BIN" downloader/download_forex_frankfurter.py
+      --mode daily-update
+      --output-dir "$FRANKFURTER_OUTPUT_DIR"
+      --symbols-file "$FRANKFURTER_SYMBOLS_FILE"
+      --end-date "$today"
+      --workers "$WORKERS"
+      --timeout "$FRANKFURTER_TIMEOUT"
+    )
+    if [[ "$FRANKFURTER_SKIP_MANIFEST" == "1" ]]; then
+      cmd+=(--skip-manifest)
+    fi
+    run_step frankfurter_forex_incremental "${cmd[@]}"
   else
     log "skip=frankfurter_forex_incremental reason=missing_symbols_file file=${FRANKFURTER_SYMBOLS_FILE}"
   fi
@@ -299,6 +326,7 @@ run_pepperstone_incremental() {
 
 run_cex_incremental() {
   local today
+  local rc=0
   local -a bybit_categories=()
 
   today="$(date +%F)"
@@ -313,7 +341,7 @@ run_cex_incremental() {
     --end-date "$today" \
     --workers "$OKX_WORKERS" \
     --request-interval "$OKX_REQUEST_INTERVAL" \
-    --max-retries "$OKX_MAX_RETRIES"
+    --max-retries "$OKX_MAX_RETRIES" || rc=1
 
   read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
   run_step bybit_perp_daily_update \
@@ -323,7 +351,8 @@ run_cex_incremental() {
     --workers "$BYBIT_WORKERS" \
     --request-interval "$BYBIT_REQUEST_INTERVAL" \
     --max-retries "$BYBIT_MAX_RETRIES" \
-    --categories "${bybit_categories[@]}"
+    --categories "${bybit_categories[@]}" || rc=1
+  return "$rc"
 }
 
 run_data_quality_audit() {
@@ -502,6 +531,14 @@ validate_settings() {
     echo "[daily] YAHOO_DAILY_DISCOVER_SYMBOLS must be 0 or 1" >&2
     exit 2
   fi
+  if [[ "$YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS" != "0" && "$YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS" != "1" ]]; then
+    echo "[daily] YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS" != "0" && "$YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS" != "1" ]]; then
+    echo "[daily] YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS must be 0 or 1" >&2
+    exit 2
+  fi
   if [[ "$YAHOO_INCLUDE_TW_DELISTED" != "0" && "$YAHOO_INCLUDE_TW_DELISTED" != "1" ]]; then
     echo "[daily] YAHOO_INCLUDE_TW_DELISTED must be 0 or 1" >&2
     exit 2
@@ -512,6 +549,14 @@ validate_settings() {
   fi
   if [[ "$RUN_DATA_QUALITY_AUDIT" != "0" && "$RUN_DATA_QUALITY_AUDIT" != "1" ]]; then
     echo "[daily] RUN_DATA_QUALITY_AUDIT must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_YAHOO" != "0" && "$RUN_YAHOO" != "1" ]]; then
+    echo "[daily] RUN_YAHOO must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$FRANKFURTER_SKIP_MANIFEST" != "0" && "$FRANKFURTER_SKIP_MANIFEST" != "1" ]]; then
+    echo "[daily] FRANKFURTER_SKIP_MANIFEST must be 0 or 1" >&2
     exit 2
   fi
   if ! [[ "$YAHOO_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then

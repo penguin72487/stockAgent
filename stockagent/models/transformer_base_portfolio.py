@@ -161,7 +161,8 @@ def _masked_market_summary_parts(z_stock: torch.Tensor, mask: torch.Tensor) -> t
     centered = (z_stock - mean.unsqueeze(1)) * weights
     variance = centered.float().pow(2).sum(dim=1) / denom.float()
     std = torch.sqrt(variance.clamp_min(0.0) + 1e-6).to(dtype=z_stock.dtype)
-    return torch.stack([mean, std], dim=1)
+    dispersion = centered.abs().sum(dim=1) / denom
+    return torch.stack([mean, std, dispersion], dim=1)
 
 
 def _gate_logit(init_value: float) -> float:
@@ -186,7 +187,7 @@ class DynamicTokenGenerator(nn.Module):
         super().__init__()
         self.dim = int(dim)
         self.num_tokens = max(1, int(num_tokens))
-        summary_dim = self.dim * 2
+        summary_dim = self.dim * 3
         hidden_dim = max(self.dim, _round_up_to_multiple(self.dim * max(1, int(hidden_mult)), 8))
         self.summary_norm = _make_norm(summary_dim, norm_type)
         self.summary_proj = GatedProjection(summary_dim, hidden_dim, dropout, ffn_type)
@@ -646,22 +647,24 @@ class TransformerBasePortfolioModel(nn.Module):
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
         self.output_norm = _make_norm(self.d_model, self.norm_type)
-        self.portfolio_fusion = nn.Sequential(
-            GatedProjection(self.d_model * 3, self.d_model, float(dropout), self.ffn_type),
-            _make_norm(self.d_model, self.norm_type),
+        self.stock_market_gate = nn.Sequential(
+            GatedProjection(self.d_model * 2, self.d_model, float(dropout), self.ffn_type),
+            nn.Linear(self.d_model, 1),
         )
+        self.stock_market_norm = _make_norm(self.d_model, self.norm_type)
 
-        head: list[nn.Module] = []
-        in_dim = self.d_model
-        for _ in range(max(0, int(head_layers))):
-            head.extend(
-                [
-                    GatedProjection(in_dim, int(head_hidden_dim), float(dropout), self.ffn_type),
-                ]
-            )
-            in_dim = int(head_hidden_dim)
-        head.append(nn.Linear(in_dim, 1))
-        self.score_head = nn.Sequential(*head)
+        def make_scalar_head() -> nn.Sequential:
+            head: list[nn.Module] = []
+            in_dim = self.d_model
+            for _ in range(max(0, int(head_layers))):
+                head.append(GatedProjection(in_dim, int(head_hidden_dim), float(dropout), self.ffn_type))
+                in_dim = int(head_hidden_dim)
+            head.append(nn.Linear(in_dim, 1))
+            return nn.Sequential(*head)
+
+        self.mu_head = make_scalar_head()
+        self.sigma_head = make_scalar_head()
+        self.confidence_head = make_scalar_head()
 
     @staticmethod
     def _normalize_attention_mode(attention_mode: str) -> str:
@@ -799,6 +802,32 @@ class TransformerBasePortfolioModel(nn.Module):
             pooled = (h.permute(0, 2, 1, 3) * weights.unsqueeze(-1)).sum(dim=2)
         return self.output_norm(pooled).masked_fill(~mask_bool.unsqueeze(-1), 0.0)
 
+    def _apply_stock_market_gate(
+        self,
+        z_base: torch.Tensor,
+        z_market_context: torch.Tensor,
+        safe_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        market_delta = z_market_context - z_base
+        gate_logits = self.stock_market_gate(torch.cat([z_base, z_market_context], dim=-1))
+        gate = torch.sigmoid(gate_logits)
+        z_stock = self.stock_market_norm(z_base + gate * market_delta)
+        z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
+        return z_stock, gate.masked_fill(~safe_mask.unsqueeze(-1), 0.0), market_delta
+
+    def _risk_adjusted_scores(
+        self,
+        z_stock: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu = self.mu_head(z_stock).squeeze(-1)
+        sigma_raw = self.sigma_head(z_stock).squeeze(-1)
+        confidence_logit = self.confidence_head(z_stock).squeeze(-1)
+        sigma = F.softplus(sigma_raw).clamp_min(1e-4)
+        confidence = torch.sigmoid(confidence_logit)
+        scores = mu / sigma * confidence
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        return scores, mu, sigma, confidence_logit, confidence
+
     def _forward_full(
         self,
         h: torch.Tensor,
@@ -876,11 +905,13 @@ class TransformerBasePortfolioModel(nn.Module):
             z_factor_context = z_base
             for block in self.stock_read_latent_blocks:
                 z_factor_context = self._run_block(block, z_factor_context, latent, None)
+            z_gate_base = z_factor_context
         else:
             latent = z_base.new_empty(bsz, 0, self.d_model)
             market_context = z_base
             market_key_mask = safe_mask
             z_factor_context = z_base
+            z_gate_base = z_base
 
         if self.dynamic_market_generator is not None:
             market_tokens, dynamic_aux = self.dynamic_market_generator(
@@ -900,8 +931,11 @@ class TransformerBasePortfolioModel(nn.Module):
         for block in self.stock_read_market_blocks:
             z_market_context = self._run_block(block, z_market_context, market_tokens, None)
 
-        z_stock = self.portfolio_fusion(torch.cat([z_base, z_factor_context, z_market_context], dim=-1))
-        z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
+        z_stock, stock_market_gate, z_market_delta = self._apply_stock_market_gate(
+            z_gate_base,
+            z_market_context,
+            safe_mask,
+        )
         if collect_aux:
             aux.update({
                 "token_embedding": h,
@@ -910,6 +944,8 @@ class TransformerBasePortfolioModel(nn.Module):
                 "market_tokens": market_tokens,
                 "z_factor_context": z_factor_context,
                 "z_market_context": z_market_context,
+                "z_market_delta": z_market_delta,
+                "stock_market_gate": stock_market_gate,
             })
         return z_stock, aux
 
@@ -941,7 +977,7 @@ class TransformerBasePortfolioModel(nn.Module):
             z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
 
         z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
-        scores = self.score_head(z_stock).squeeze(-1)
+        scores, alpha_mu, risk_sigma, confidence_logits, confidence = self._risk_adjusted_scores(z_stock)
         masked_scores = scores.masked_fill(~mask_bool, -1e9)
 
         if temperature is None:
@@ -954,9 +990,10 @@ class TransformerBasePortfolioModel(nn.Module):
 
         if self.portfolio_mode == "long_only":
             weights = masked_softmax(masked_scores / temp, mask_bool)
+            centered_scores = scores
         else:
-            relative_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            weights = dual_branch_softmax(relative_scores / temp, mask_bool)
+            centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
+            weights = dual_branch_softmax(centered_scores / temp, mask_bool)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
         if return_aux is True:
@@ -966,6 +1003,11 @@ class TransformerBasePortfolioModel(nn.Module):
                     "z_stock": z_stock,
                     "score_logits": scores,
                     "rank_logits": scores,
+                    "centered_score_logits": centered_scores,
+                    "alpha_mu": alpha_mu,
+                    "risk_sigma": risk_sigma,
+                    "confidence_logits": confidence_logits,
+                    "confidence": confidence,
                 }
             )
             return weights, masked_scores, aux
@@ -975,6 +1017,11 @@ class TransformerBasePortfolioModel(nn.Module):
                 "scores": masked_scores,
                 "score_logits": scores,
                 "rank_logits": scores,
+                "centered_score_logits": centered_scores,
+                "alpha_mu": alpha_mu,
+                "risk_sigma": risk_sigma,
+                "confidence_logits": confidence_logits,
+                "confidence": confidence,
             }
             if self.return_aux_details:
                 aux = dict(aux)
@@ -983,6 +1030,11 @@ class TransformerBasePortfolioModel(nn.Module):
                         "z_stock": z_stock,
                         "score_logits": scores,
                         "rank_logits": scores,
+                        "centered_score_logits": centered_scores,
+                        "alpha_mu": alpha_mu,
+                        "risk_sigma": risk_sigma,
+                        "confidence_logits": confidence_logits,
+                        "confidence": confidence,
                     }
                 )
                 output["aux"] = aux
