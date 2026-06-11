@@ -3,7 +3,7 @@ import math
 import torch
 from torch import nn
 
-from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.simulator import run_backtest_torch, run_backtest_torch_reduced
 import stockagent.backtest.simulator as simulator
 from stockagent.data.panel import PanelData
 from stockagent.training.dataset import CrossSectionalDataset
@@ -286,6 +286,79 @@ def test_evaluate_tensor_batch_ragged_chunk_padding_matches_full_long_short_back
     assert torch.allclose(actual.weights_history.cpu(), expected.weights_history, atol=1e-7, rtol=1e-6)
 
 
+def test_evaluate_tensor_batch_decoupled_backtest_chunk_matches_old_chunking() -> None:
+    torch.manual_seed(777)
+    rows, symbols = 19, 8
+    raw_weights = torch.randn(rows, symbols)
+    x = raw_weights[:, None, :, None].contiguous()
+    returns = torch.randn(rows, symbols) * 0.01
+    tradable = torch.rand(rows, symbols) > 0.08
+    can_buy = torch.rand(rows, symbols) > 0.15
+    can_sell = torch.rand(rows, symbols) > 0.18
+    tradable[0] = True
+    can_buy[0] = True
+    can_sell[0] = True
+    tradable[9] = True
+    can_buy[9] = True
+    can_sell[9] = True
+    benchmark = returns.mean(dim=1)
+    reset_rows = [0, 9, rows]
+
+    simulator.get_backtest_runtime_stats(reset=True)
+    old, old_ic, old_metrics = _evaluate_tensor_batch(
+        _EchoWeightModel(),
+        x,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        benchmark,
+        torch.device("cpu"),
+        None,
+        False,
+        False,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=4,
+        reset_at_rows=reset_rows,
+    )
+    old_calls = int(simulator.get_backtest_runtime_stats(reset=True)["calls"])
+    new, new_ic, new_metrics = _evaluate_tensor_batch(
+        _EchoWeightModel(),
+        x,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        benchmark,
+        torch.device("cpu"),
+        None,
+        False,
+        False,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=4,
+        backtest_chunk_rows=11,
+        reset_at_rows=reset_rows,
+    )
+    new_calls = int(simulator.get_backtest_runtime_stats(reset=True)["calls"])
+
+    assert torch.allclose(new.strategy_returns.cpu(), old.strategy_returns.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(new.benchmark_returns.cpu(), old.benchmark_returns.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(new.turnovers.cpu(), old.turnovers.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(new.weights_history.cpu(), old.weights_history.cpu(), atol=1e-7, rtol=1e-6)
+    for key, value in old_metrics.items():
+        assert math.isclose(new_metrics[key], value, rel_tol=1e-6, abs_tol=1e-8), key
+    for key, value in old_ic.items():
+        assert math.isclose(new_ic[key], value, rel_tol=1e-6, abs_tol=1e-8), key
+    assert old_calls == 6
+    assert new_calls == 2
+
+
 def _make_panel(rows: int = 8, symbols: int = 4, features: int = 3) -> PanelData:
     values = torch.arange(rows * symbols * features, dtype=torch.float32).reshape(rows, symbols, features)
     returns = torch.linspace(-0.02, 0.02, rows * symbols, dtype=torch.float32).reshape(rows, symbols)
@@ -407,6 +480,51 @@ def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     assert torch.allclose(windowed_bt.strategy_returns.cpu(), materialized_bt.strategy_returns.cpu())
     assert torch.allclose(windowed_bt.turnovers.cpu(), materialized_bt.turnovers.cpu())
     assert torch.allclose(windowed_bt.weights_history.cpu(), materialized_bt.weights_history.cpu())
+
+
+def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=1)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+    split = dataset_to_windowed_tensors(dataset)
+
+    old, old_ic, old_metrics = _evaluate_windowed_tensor_batch(
+        _EchoWeightModel(),
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+        reset_at_rows=[0, 5, len(split)],
+    )
+    new, new_ic, new_metrics = _evaluate_windowed_tensor_batch(
+        _EchoWeightModel(),
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+        backtest_chunk_rows=8,
+        reset_at_rows=[0, 5, len(split)],
+    )
+
+    assert torch.allclose(new.strategy_returns.cpu(), old.strategy_returns.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(new.benchmark_returns.cpu(), old.benchmark_returns.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(new.turnovers.cpu(), old.turnovers.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(new.weights_history.cpu(), old.weights_history.cpu(), atol=1e-7, rtol=1e-6)
+    for key, value in old_metrics.items():
+        assert math.isclose(new_metrics[key], value, rel_tol=1e-6, abs_tol=1e-8), key
+    for key, value in old_ic.items():
+        assert math.isclose(new_ic[key], value, rel_tol=1e-6, abs_tol=1e-8), key
 
 
 def test_sortino_loss_uses_canonical_tensor_backtest_returns() -> None:
@@ -635,6 +753,95 @@ def test_log_utility_loss_sample_mask_dense_path_matches_canonical_backtest_retu
     assert stats["prepare_inputs_calls"] >= 1
     assert stats["backtest_calls"] >= 1
     assert stats["log_utility_calls"] >= 1
+
+
+def test_reduced_log_utility_matches_canonical_curve_loss_and_gradients() -> None:
+    torch.manual_seed(888)
+    rows, symbols = 7, 5
+    base_weights = torch.randn(rows, symbols, dtype=torch.float32)
+    returns = torch.randn(rows, symbols, dtype=torch.float32) * 0.01
+    tradable = torch.rand(rows, symbols) > 0.10
+    can_buy = torch.rand(rows, symbols) > 0.15
+    can_sell = torch.rand(rows, symbols) > 0.15
+    tradable[0] = True
+    can_buy[0] = True
+    can_sell[0] = True
+    benchmark = returns.mean(dim=1)
+    sample_mask = torch.tensor([True, False, True, True, False, True, True])
+    initial_weights = torch.randn(symbols).mul(0.05)
+    buy_fee_rate = 0.000855
+    sell_fee_rate = 0.003855
+    gamma_turnover = 0.2
+
+    old_weights = base_weights.clone().requires_grad_(True)
+    old_bt = run_backtest_torch(
+        old_weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=False,
+        max_turnover_ratio=0.6,
+        gross_leverage=1.0,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        return_weights_history=False,
+        initial_weights=initial_weights,
+    )
+    valid_f = sample_mask.to(dtype=torch.float32)
+    old_returns = torch.nan_to_num(old_bt.strategy_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    old_turnovers = torch.nan_to_num(old_bt.turnovers.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    denom = valid_f.sum().clamp_min(1.0)
+    old_loss = -(old_returns * valid_f).sum() / denom * 252.0 + gamma_turnover * (old_turnovers * valid_f).sum() / denom
+    old_loss.backward()
+
+    new_weights = base_weights.clone().requires_grad_(True)
+    reduced = run_backtest_torch_reduced(
+        new_weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+        long_only=False,
+        max_turnover_ratio=0.6,
+        gross_leverage=1.0,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        sample_mask=sample_mask,
+        initial_weights=initial_weights,
+        reduction="log_utility",
+        gamma_sharpe=1.0,
+        gamma_turnover=gamma_turnover,
+    )
+    reduced.loss.backward()
+
+    assert torch.allclose(reduced.loss, old_loss, atol=1e-7, rtol=1e-6)
+    assert old_bt.final_weights is not None
+    assert reduced.final_weights is not None
+    assert torch.allclose(reduced.final_weights, old_bt.final_weights, atol=1e-7, rtol=1e-6)
+    assert old_weights.grad is not None
+    assert new_weights.grad is not None
+    assert torch.allclose(new_weights.grad, old_weights.grad, atol=1e-7, rtol=1e-5)
+
+
+def test_dense_fast_path_detector_requires_all_masks_true_and_no_turnover_cap() -> None:
+    all_true = torch.ones(4, 3, dtype=torch.bool)
+    assert simulator.can_use_dense_fast_path(all_true, all_true, all_true, 0.0)
+    assert not simulator.can_use_dense_fast_path(all_true, all_true, all_true, 0.1)
+
+    tradable = all_true.clone()
+    tradable[1, 2] = False
+    assert not simulator.can_use_dense_fast_path(tradable, all_true, all_true, 0.0)
+
+    can_buy = all_true.clone()
+    can_buy[2, 1] = False
+    assert not simulator.can_use_dense_fast_path(all_true, can_buy, all_true, 0.0)
+
+    can_sell = all_true.clone()
+    can_sell[3, 0] = False
+    assert not simulator.can_use_dense_fast_path(all_true, all_true, can_sell, 0.0)
 
 
 def test_sortino_loss_accepts_initial_weights_for_stateful_batches() -> None:

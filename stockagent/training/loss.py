@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import time
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.simulator import run_backtest_torch, run_backtest_torch_reduced
 from stockagent.models.normalization import dual_branch_softmax
 
 
@@ -75,6 +76,15 @@ def _torch_is_compiling() -> bool:
         except Exception:
             return False
     return False
+
+
+def _reduced_log_utility_enabled() -> bool:
+    return os.environ.get("STOCKAGENT_LOSS_REDUCED_LOG_UTILITY", "0").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
 
 
 def _clone_portfolio_state_for_loss(tensor: Tensor, *, stat_prefix: str) -> Tensor:
@@ -779,6 +789,53 @@ def risk_aware_loss(
                 initial_weights,
                 stat_prefix="initial_weights_clone",
             )
+
+    if (
+        objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}
+        and _reduced_log_utility_enabled()
+    ):
+        backtest_start = _loss_timer_start()
+        reduced = run_backtest_torch_reduced(
+            weights,
+            returns,
+            tradable,
+            benchmark,
+            buy_fee_rate,
+            sell_fee_rate,
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_leverage=gross_leverage,
+            can_buy_mask=can_buy,
+            can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
+            sample_mask=sample_mask.to(device=weights.device, dtype=torch.bool) if sample_mask is not None else None,
+            initial_weights=initial_weights,
+            reduction=objective_norm,
+            gamma_sharpe=gamma_sharpe,
+            gamma_turnover=gamma_turnover,
+        )
+        _loss_timer_stop("backtest", backtest_start)
+
+        if aux_outputs is not None and reduced.final_weights is not None:
+            state_update_start = _loss_timer_start()
+            aux_outputs["_final_weights"] = _clone_portfolio_state_for_loss(
+                reduced.final_weights,
+                stat_prefix="final_weights_clone",
+            )
+            _loss_timer_stop("state_update", state_update_start)
+
+        reduce_start = _loss_timer_start()
+        total_loss = reduced.loss
+        _loss_timer_stop("reduce", reduce_start)
+        log_utility_start = _loss_timer_start()
+        total_loss = total_loss + weights.new_zeros(())
+        _loss_timer_stop("log_utility", log_utility_start)
+        if concentration_weight > 0.0:
+            weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+            tradable_f = tradable.to(dtype=weights_safe.dtype)
+            active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+            concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
+            total_loss = total_loss + float(concentration_weight) * concentration
+        return total_loss
 
     backtest_start = _loss_timer_start()
     backtest = run_backtest_torch(

@@ -38,8 +38,16 @@ _SCAN_COMPILED_CACHE: dict[
         ],
     ],
 ] = {}
+_REDUCED_COMPILED_CACHE: dict[
+    tuple,
+    Callable[
+        ...,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
+] = {}
 _PREP_COMPILED_CACHE: dict[tuple, Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
 _SCAN_COMPILE_FAILED: set[tuple] = set()
+_REDUCED_COMPILE_FAILED: set[tuple] = set()
 _PREP_COMPILE_FAILED: set[tuple] = set()
 _SCAN_COMPILE_STATS: dict[str, int] = {
     "hits": 0,
@@ -88,6 +96,10 @@ _BACKTEST_RUNTIME_STATS: dict[str, float] = {
     "nonstateful_eager_runner_calls": 0.0,
     "runtime_fallback_calls": 0.0,
     "return_weights_history_calls": 0.0,
+    "reduced_calls": 0.0,
+    "compiled_reduced_runner_calls": 0.0,
+    "eager_reduced_runner_calls": 0.0,
+    "reduced_runtime_fallback_calls": 0.0,
 }
 _BACKTEST_PENDING_CUDA_EVENTS: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
@@ -225,6 +237,25 @@ def _apply_turnover_cap_torch(
     return prev_weights + deltas * scale
 
 
+def can_use_dense_fast_path(
+    tradable: torch.Tensor,
+    can_buy: torch.Tensor,
+    can_sell: torch.Tensor,
+    effective_max_turnover_ratio: float,
+) -> bool:
+    """Return true only when the recurrent trading state cannot change semantics."""
+    if float(effective_max_turnover_ratio) > 0.0:
+        return False
+    try:
+        return bool(
+            torch.all(tradable.to(dtype=torch.bool)).detach().cpu().item()
+            and torch.all(can_buy.to(dtype=torch.bool)).detach().cpu().item()
+            and torch.all(can_sell.to(dtype=torch.bool)).detach().cpu().item()
+        )
+    except Exception:
+        return False
+
+
 def _env_flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
 
@@ -306,6 +337,10 @@ def _compile_stateful_enabled() -> bool:
 
 def _compile_prep_enabled() -> bool:
     return _env_flag("STOCKAGENT_BACKTEST_COMPILE_PREP", "1")
+
+
+def _compile_reduced_enabled() -> bool:
+    return _env_flag("STOCKAGENT_BACKTEST_COMPILE_REDUCED", "0")
 
 
 def _compile_verbose() -> bool:
@@ -505,6 +540,133 @@ def _scan_runner_factory(
         )
 
     return _runner
+
+
+def _reduced_scan_compile_key(
+    weights: torch.Tensor,
+    long_only: bool,
+    max_turnover_ratio: float,
+    gross_budget: float,
+    scan_chunk_size: int,
+    stateful_initial: bool = False,
+) -> tuple:
+    return (
+        str(weights.device),
+        int(weights.size(1)),
+        str(weights.dtype),
+        bool(long_only),
+        float(max_turnover_ratio),
+        float(gross_budget),
+        int(scan_chunk_size),
+        bool(stateful_initial),
+        "log_utility",
+    )
+
+
+def _reduced_scan_runner_factory(
+    *,
+    long_only: bool,
+    max_turnover_ratio: float,
+    gross_budget: float,
+    scan_chunk_size: int,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+):
+    def _runner(
+        weights: torch.Tensor,
+        future_returns: torch.Tensor,
+        tradable_mask: torch.Tensor,
+        can_buy_mask: torch.Tensor | None,
+        can_sell_mask: torch.Tensor | None,
+        sample_mask: torch.Tensor | None,
+        prev_init: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _vectorized_backtest_torch_scan_log_utility_reduced(
+            weights,
+            future_returns,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            sample_mask,
+            prev_init,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            long_only=long_only,
+            max_turnover_ratio=max_turnover_ratio,
+            gross_budget=gross_budget,
+            scan_chunk_size=scan_chunk_size,
+        )
+
+    return _runner
+
+
+def _resolve_reduced_scan_runner(
+    weights: torch.Tensor,
+    *,
+    long_only: bool,
+    max_turnover_ratio: float,
+    gross_budget: float,
+    scan_chunk_size: int,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    stateful_initial: bool = False,
+):
+    base_runner = _reduced_scan_runner_factory(
+        long_only=long_only,
+        max_turnover_ratio=max_turnover_ratio,
+        gross_budget=gross_budget,
+        scan_chunk_size=scan_chunk_size,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
+    )
+    if _torch_dynamo_is_compiling():
+        return base_runner
+    if (
+        not _compile_reduced_enabled()
+        or not _compile_enabled()
+        or weights.device.type != "cuda"
+        or not hasattr(torch, "compile")
+    ):
+        _add_backtest_runtime_stat("eager_reduced_runner_calls")
+        return base_runner
+
+    key = _reduced_scan_compile_key(
+        weights,
+        long_only,
+        max_turnover_ratio,
+        gross_budget,
+        scan_chunk_size,
+        stateful_initial,
+    )
+    if key in _REDUCED_COMPILE_FAILED:
+        _add_backtest_runtime_stat("eager_reduced_runner_calls")
+        return base_runner
+    cached = _REDUCED_COMPILED_CACHE.get(key)
+    if cached is not None:
+        _add_backtest_runtime_stat("compiled_reduced_runner_calls")
+        return cached
+
+    try:
+        _mark_static_shape(weights, [1])
+        _configure_inductor_cudagraphs()
+        compiled = torch.compile(
+            base_runner,
+            dynamic=True,
+            options={"triton.cudagraphs": False},
+        )
+        _REDUCED_COMPILED_CACHE[key] = compiled
+        _add_backtest_runtime_stat("compiled_reduced_runner_calls")
+        return compiled
+    except Exception:
+        _REDUCED_COMPILE_FAILED.add(key)
+        _add_backtest_runtime_stat("eager_reduced_runner_calls")
+        if _compile_verbose():
+            print(
+                "[backtest reduced compile] compile failed, falling back to eager for "
+                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, "
+                f"long_only={long_only}, scan_chunk={scan_chunk_size}, stateful={stateful_initial})"
+            )
+        return base_runner
 
 
 def _autotune_scan_chunk_size(
@@ -733,6 +895,88 @@ class BacktestResultTensor:
             benchmark_returns=self.benchmark_returns.detach().cpu().numpy().astype(np.float32),
             turnovers=self.turnovers.detach().cpu().numpy().astype(np.float32),
             weights_history=self.weights_history.detach().cpu().numpy().astype(np.float32),
+        )
+
+
+@dataclass(slots=True)
+class BacktestStaticInputs:
+    future_returns: torch.Tensor
+    tradable_mask: torch.Tensor
+    can_buy_mask: torch.Tensor
+    can_sell_mask: torch.Tensor
+    benchmark: torch.Tensor
+    sample_mask: torch.Tensor | None
+    buy_fee_rate: float
+    sell_fee_rate: float
+    long_only: bool
+    max_turnover_ratio: float
+    gross_leverage: float
+
+
+@dataclass(slots=True)
+class BacktestReducedResult:
+    loss: torch.Tensor
+    return_sum: torch.Tensor
+    turnover_sum: torch.Tensor
+    valid_count: torch.Tensor
+    final_weights: torch.Tensor | None = None
+
+
+class DifferentiableBacktestExecutor(torch.nn.Module):
+    """Single torch entry point for train loss and eval curve backtests."""
+
+    def forward_curve(
+        self,
+        weights: torch.Tensor,
+        static: BacktestStaticInputs,
+        *,
+        initial_weights: torch.Tensor | None = None,
+        return_weights_history: bool = True,
+        dense_mask_constraints: bool = False,
+    ) -> BacktestResultTensor:
+        return run_backtest_torch(
+            weights,
+            static.future_returns,
+            static.tradable_mask,
+            static.benchmark,
+            static.buy_fee_rate,
+            static.sell_fee_rate,
+            long_only=static.long_only,
+            max_turnover_ratio=static.max_turnover_ratio,
+            gross_leverage=static.gross_leverage,
+            can_buy_mask=static.can_buy_mask,
+            can_sell_mask=static.can_sell_mask,
+            return_weights_history=return_weights_history,
+            dense_mask_constraints=dense_mask_constraints,
+            initial_weights=initial_weights,
+        )
+
+    def forward_log_utility_reduced(
+        self,
+        weights: torch.Tensor,
+        static: BacktestStaticInputs,
+        *,
+        initial_weights: torch.Tensor | None = None,
+        gamma_sharpe: float = 1.0,
+        gamma_turnover: float = 0.0,
+    ) -> BacktestReducedResult:
+        return run_backtest_torch_reduced(
+            weights,
+            static.future_returns,
+            static.tradable_mask,
+            static.benchmark,
+            static.buy_fee_rate,
+            static.sell_fee_rate,
+            long_only=static.long_only,
+            max_turnover_ratio=static.max_turnover_ratio,
+            gross_leverage=static.gross_leverage,
+            can_buy_mask=static.can_buy_mask,
+            can_sell_mask=static.can_sell_mask,
+            sample_mask=static.sample_mask,
+            initial_weights=initial_weights,
+            reduction="log_utility",
+            gamma_sharpe=gamma_sharpe,
+            gamma_turnover=gamma_turnover,
         )
 
 
@@ -980,6 +1224,107 @@ def _vectorized_backtest_torch_scan_long_short(
     return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev
 
 
+def _vectorized_backtest_torch_scan_log_utility_reduced(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor | None,
+    can_sell_mask: torch.Tensor | None,
+    sample_mask: torch.Tensor | None,
+    prev_init: torch.Tensor,
+    *,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    long_only: bool,
+    max_turnover_ratio: float = 0.0,
+    gross_budget: float = 1.0,
+    scan_chunk_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
+    target_weights = weights
+    tradable = tradable_mask
+    buy_mask = tradable if can_buy_mask is None else can_buy_mask
+    sell_mask = tradable if can_sell_mask is None else can_sell_mask
+
+    t_len, _ = target_weights.shape
+    dtype = target_weights.dtype
+    device = target_weights.device
+    prev = prev_init.to(device=device, dtype=dtype)
+    if sample_mask is None:
+        valid_mask = torch.ones((t_len,), device=device, dtype=torch.bool)
+    else:
+        valid_mask = sample_mask.to(device=device, dtype=torch.bool)
+
+    cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
+    gross_cap = torch.as_tensor(gross_budget, device=device, dtype=dtype)
+    chunk_size = max(1, int(scan_chunk_size))
+    one = torch.ones((), device=device, dtype=dtype)
+    return_sum = torch.zeros((), device=device, dtype=torch.float32)
+    turnover_sum = torch.zeros((), device=device, dtype=torch.float32)
+    valid_count = torch.zeros((), device=device, dtype=torch.float32)
+
+    for start in range(0, t_len, chunk_size):
+        end = min(start + chunk_size, t_len)
+        target_chunk = target_weights[start:end]
+        tradable_chunk = tradable[start:end]
+        buy_chunk = buy_mask[start:end]
+        sell_chunk = sell_mask[start:end]
+
+        for offset in range(end - start):
+            idx = start + offset
+            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            delta = target_t - prev
+            buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
+            sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
+
+            if long_only:
+                base_after_sells = prev + sell_delta
+                buy_sum = buy_delta.sum()
+                buy_capacity = (one - base_after_sells.sum()).clamp_min(0.0)
+                buy_scale = torch.minimum(
+                    torch.ones_like(buy_sum),
+                    buy_capacity / buy_sum.clamp_min(1e-12),
+                )
+                delta = sell_delta + buy_delta * buy_scale
+            else:
+                delta = sell_delta + buy_delta
+
+            next_weights = prev + delta
+            if max_turnover_ratio > 0.0:
+                turnover_raw = delta.abs().sum()
+                turnover_scale = torch.minimum(
+                    torch.ones_like(turnover_raw),
+                    cap / turnover_raw.clamp_min(1e-12),
+                )
+                next_weights = prev + delta * turnover_scale
+                delta = next_weights - prev
+
+            if not long_only:
+                gross_next = next_weights.abs().sum()
+                gross_scale = torch.minimum(
+                    torch.ones_like(gross_next),
+                    gross_cap / gross_next.clamp_min(1e-12),
+                )
+                next_weights = next_weights * gross_scale
+                delta = next_weights - prev
+
+            buy_turnover = delta.clamp_min(0.0).sum()
+            sell_turnover = (-delta).clamp_min(0.0).sum()
+            turnover = buy_turnover + sell_turnover
+            gross_return = (next_weights * future_returns_t[idx]).sum()
+            strategy_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
+
+            valid_f = valid_mask[idx].to(dtype=torch.float32)
+            clean_return = torch.nan_to_num(strategy_return.to(dtype).float(), nan=0.0, posinf=0.0, neginf=0.0)
+            clean_turnover = torch.nan_to_num(turnover.to(dtype).float(), nan=0.0, posinf=0.0, neginf=0.0)
+            return_sum = return_sum + clean_return * valid_f
+            turnover_sum = turnover_sum + clean_turnover * valid_f
+            valid_count = valid_count + valid_f
+            prev = next_weights
+
+    return return_sum, turnover_sum, valid_count, prev
+
+
 def _prepare_runner_factory(
     *,
     long_only: bool,
@@ -1198,7 +1543,12 @@ def _vectorized_backtest_torch(
     # Fast path: no tradability/side restrictions and no turnover cap.
     # In this case, each day's realised target equals model target, so we can
     # compute turnover/returns via pure tensor ops without recurrent scan.
-    use_dense_fast_path = effective_max_turnover_ratio <= 0.0 and bool(dense_mask_constraints)
+    use_dense_fast_path = bool(dense_mask_constraints) and can_use_dense_fast_path(
+        prepped_tradable,
+        prepped_buy,
+        prepped_sell,
+        effective_max_turnover_ratio,
+    )
     if use_dense_fast_path:
         _add_backtest_runtime_stat("dense_fast_path_calls")
         dense_start = _runtime_stat_start()
@@ -1496,6 +1846,173 @@ def run_backtest(
         benchmark_returns=benchmark_returns.astype(np.float32),
         turnovers=turnovers,
         weights_history=weights_history,
+    )
+
+
+def run_backtest_torch_reduced(
+    weights: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    benchmark_returns: torch.Tensor | None,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    long_only: bool = True,
+    max_turnover_ratio: float = 0.0,
+    gross_leverage: float = 1.0,
+    can_buy_mask: torch.Tensor | None = None,
+    can_sell_mask: torch.Tensor | None = None,
+    sample_mask: torch.Tensor | None = None,
+    initial_weights: torch.Tensor | None = None,
+    scan_chunk_size: int | None = None,
+    reduction: str = "log_utility",
+    gamma_sharpe: float = 1.0,
+    gamma_turnover: float = 0.0,
+) -> BacktestReducedResult:
+    """Run the canonical recurrent backtest and reduce log-utility loss in-loop."""
+    reduction_norm = str(reduction).strip().lower()
+    if reduction_norm not in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
+        raise ValueError(f"unsupported reduced backtest reduction: {reduction}")
+
+    total_start = _runtime_stat_start()
+    _add_backtest_runtime_stat("reduced_calls")
+    _add_backtest_runtime_stat("calls")
+    if initial_weights is not None:
+        _add_backtest_runtime_stat("stateful_calls")
+
+    with _CudaRuntimeTimer("total_cuda_s", weights):
+        gross_budget = _resolve_exposure_budget(gross_leverage)
+        effective_max_turnover_ratio = float(max_turnover_ratio)
+        max_possible_turnover = 2.0 * gross_budget
+        if effective_max_turnover_ratio >= max_possible_turnover:
+            effective_max_turnover_ratio = 0.0
+
+        prep_start = _runtime_stat_start()
+        with _CudaRuntimeTimer("prep_cuda_s", weights):
+            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
+                weights,
+                tradable_mask,
+                can_buy_mask,
+                can_sell_mask,
+                long_only,
+                gross_leverage,
+            )
+        _add_backtest_elapsed_stat("prep_s", prep_start)
+
+        prev_init_start = _runtime_stat_start()
+        with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
+            prev_init = (
+                torch.nan_to_num(
+                    initial_weights.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if initial_weights is not None
+                else torch.zeros_like(prepped_weights[0])
+            )
+        _add_backtest_elapsed_stat("prev_init_s", prev_init_start)
+
+        resolved_chunk = (
+            int(scan_chunk_size)
+            if scan_chunk_size is not None and int(scan_chunk_size) > 0
+            else 256
+            if _torch_dynamo_is_compiling()
+            else _autotune_scan_chunk_size(
+                prepped_weights,
+                future_returns,
+                prepped_tradable,
+                prepped_buy,
+                prepped_sell,
+                long_only,
+                effective_max_turnover_ratio,
+                gross_budget,
+            )
+        )
+
+        runner = _resolve_reduced_scan_runner(
+            prepped_weights,
+            long_only=long_only,
+            max_turnover_ratio=effective_max_turnover_ratio,
+            gross_budget=gross_budget,
+            scan_chunk_size=resolved_chunk,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            stateful_initial=initial_weights is not None,
+        )
+
+        try:
+            runner_call_start = _runtime_stat_start()
+            with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
+                return_sum, turnover_sum, valid_count, final_weights = runner(
+                    prepped_weights,
+                    future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                    prepped_tradable,
+                    prepped_buy,
+                    prepped_sell,
+                    sample_mask,
+                    prev_init,
+                )
+            _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
+        except Exception as e:
+            if _torch_dynamo_is_compiling() or not (
+                _compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")
+            ):
+                raise
+            _add_backtest_runtime_stat("reduced_runtime_fallback_calls")
+            key = _reduced_scan_compile_key(
+                prepped_weights,
+                long_only,
+                effective_max_turnover_ratio,
+                gross_budget,
+                resolved_chunk,
+                initial_weights is not None,
+            )
+            _REDUCED_COMPILE_FAILED.add(key)
+            _REDUCED_COMPILED_CACHE.pop(key, None)
+            if _compile_verbose():
+                print(
+                    "[backtest reduced compile] runtime failed, falling back to eager for "
+                    f"shape=(T={int(prepped_weights.size(0))}, S={int(prepped_weights.size(1))}, "
+                    f"dtype={prepped_weights.dtype}): {type(e).__name__}: {str(e)[:300]}"
+                )
+            eager_runner = _reduced_scan_runner_factory(
+                long_only=long_only,
+                max_turnover_ratio=effective_max_turnover_ratio,
+                gross_budget=gross_budget,
+                scan_chunk_size=resolved_chunk,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+            )
+            _add_backtest_runtime_stat("eager_reduced_runner_calls")
+            runner_call_start = _runtime_stat_start()
+            with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
+                return_sum, turnover_sum, valid_count, final_weights = eager_runner(
+                    prepped_weights,
+                    future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                    prepped_tradable,
+                    prepped_buy,
+                    prepped_sell,
+                    sample_mask,
+                    prev_init,
+                )
+            _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
+
+    finalize_start = _runtime_stat_start()
+    denom = valid_count.clamp_min(1.0)
+    mean_return = return_sum / denom
+    mean_turnover = turnover_sum / denom
+    annualizer = torch.as_tensor(252.0, device=mean_return.device, dtype=mean_return.dtype)
+    loss = -float(gamma_sharpe) * (mean_return * annualizer)
+    if float(gamma_turnover) != 0.0:
+        loss = loss + float(gamma_turnover) * mean_turnover
+    _add_backtest_elapsed_stat("finalize_s", finalize_start)
+    _add_backtest_elapsed_stat("total_s", total_start)
+    return BacktestReducedResult(
+        loss=loss,
+        return_sum=return_sum,
+        turnover_sum=turnover_sum,
+        valid_count=valid_count,
+        final_weights=final_weights,
     )
 
 
