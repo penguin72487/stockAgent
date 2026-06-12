@@ -61,7 +61,7 @@ training:
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
-  eval_auto_chunk_rows_cap: 16
+  eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
@@ -121,7 +121,7 @@ training:
   hidden_dim: 1024
   hidden_layers: 1
   dropout: 0.1
-  num_workers: 16
+  num_workers: 0
   weight_decay: 0.1
   grad_clip_norm: 0.0
   finite_check_interval_steps: 0
@@ -240,14 +240,14 @@ training:
     sdpa_batch_limit: 16384
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: true
+    qk_norm: false
     rope_temporal: true
     rope_base: 10000.0
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: full_then_last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -259,18 +259,18 @@ training:
     num_market_tokens: 4
     market_layers: 1
     dynamic_latent_tokens: false
-    dynamic_market_tokens: true
+    dynamic_market_tokens: false
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
-    dynamic_token_dropout: 0.1
+    dynamic_token_dropout: 0.0
     head_hidden_dim: 32
     head_layers: 1
-    dropout: 0.2
+    dropout: 0.1
     default_temperature: 1.0
     portfolio_mode: long_short
     max_full_tokens: 16384
     checkpoint_blocks: false
-    return_aux: true
+    return_aux: false
     return_aux_details: false
      # return_aux_details: whether to return detailed aux outputs for analysis, such as attention weights and latent factors. Setting this to true may increase memory usage and reduce training speed, so it is typically set to false during training and true during inference or analysis.
   bottleneck_portfolio_autoencoder:

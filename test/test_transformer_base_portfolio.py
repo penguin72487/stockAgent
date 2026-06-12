@@ -439,6 +439,9 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.dynamic_latent_tokens == cfg.training.transformer_base_portfolio.dynamic_latent_tokens
     assert model.dynamic_market_tokens == cfg.training.transformer_base_portfolio.dynamic_market_tokens
     if model.attention_mode == "market_token":
-        assert model.dynamic_market_generator is not None
+        if cfg.training.transformer_base_portfolio.dynamic_market_tokens:
+            assert model.dynamic_market_generator is not None
+        else:
+            assert model.dynamic_market_generator is None
         assert model.dynamic_latent_generator is None
         assert len(model.latent_blocks) == 0
