@@ -133,6 +133,10 @@ def test_modern_components_and_dynamic_token_aux() -> None:
     assert model.rope_temporal is True
     assert model.dynamic_latent_generator is not None
     assert model.dynamic_market_generator is not None
+    assert hasattr(model, "score_head")
+    assert not hasattr(model, "mu_head")
+    assert not hasattr(model, "sigma_head")
+    assert not hasattr(model, "confidence_head")
 
     x = torch.randn(2, 6, 13, 11, device=device)
     mask = torch.ones(2, 13, dtype=torch.bool, device=device)
@@ -150,12 +154,8 @@ def test_modern_components_and_dynamic_token_aux() -> None:
     assert 0.0 < float(aux["dynamic_market_gate"].item()) < 1.0
     assert aux["stock_market_gate"].shape == (2, 13, 1)
     assert aux["z_market_delta"].shape == (2, 13, 24)
-    assert aux["alpha_mu"].shape == (2, 13)
-    assert aux["risk_sigma"].shape == (2, 13)
-    assert aux["confidence"].shape == (2, 13)
-    assert torch.isfinite(aux["risk_sigma"]).all()
-    assert bool((aux["risk_sigma"] > 0.0).all().item())
-    assert bool(((aux["confidence"] >= 0.0) & (aux["confidence"] <= 1.0)).all().item())
+    assert aux["score_logits"].shape == (2, 13)
+    assert aux["rank_logits"].shape == (2, 13)
 
 
 def test_aux_details_false_keeps_training_output_light() -> None:
@@ -174,10 +174,6 @@ def test_aux_details_false_keeps_training_output_light() -> None:
         "score_logits",
         "rank_logits",
         "centered_score_logits",
-        "alpha_mu",
-        "risk_sigma",
-        "confidence_logits",
-        "confidence",
     }
     assert "aux" not in light_out
     assert torch.allclose(light_out["weights"], weights, atol=1e-6, rtol=1e-6)
