@@ -18,6 +18,7 @@ from stockagent.training.trainer import (
     _evaluate_tensor_batch,
     _evaluate_windowed_tensor_batch,
     _maybe_share_windowed_base_from_cached,
+    _PanelSlabForwardWrapper,
     _prepare_windowed_split,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
@@ -27,6 +28,35 @@ class _EchoWeightModel(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         del mask
         return x[:, -1, :, 0]
+
+
+class _EchoPanelWeightModel(_EchoWeightModel):
+    def __init__(self, lookback: int) -> None:
+        super().__init__()
+        self.lookback = int(lookback)
+
+    def forward_from_panel(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+        mask: torch.Tensor,
+        return_aux: bool | None = None,
+    ) -> torch.Tensor:
+        del return_aux
+        date_indices = date_indices.to(device=features.device, dtype=torch.long)
+        offsets = torch.arange(self.lookback - 1, -1, -1, device=features.device, dtype=torch.long)
+        x = features[date_indices[:, None] - offsets[None, :]]
+        return self.forward(x.to(device=mask.device), mask)
+
+    def forward_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor,
+        return_aux: bool | None = None,
+    ) -> torch.Tensor:
+        del return_aux
+        x = feature_slab.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
+        return self.forward(x.to(device=mask.device), mask)
 
 
 def test_detach_portfolio_state_clones_independent_buffer() -> None:
@@ -523,6 +553,7 @@ def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     )
     windowed_bt, _, _ = _evaluate_windowed_tensor_batch(
         _EchoWeightModel(),
+        None,
         split,
         torch.device("cpu"),
         None,
@@ -540,6 +571,46 @@ def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     assert torch.allclose(windowed_bt.weights_history.cpu(), materialized_bt.weights_history.cpu())
 
 
+def test_evaluate_windowed_tensor_batch_panel_slab_wrapper_matches_generic_panel() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=2)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+    split = dataset_to_windowed_tensors(dataset)
+    model = _EchoPanelWeightModel(lookback=2)
+
+    generic_bt, _, _ = _evaluate_windowed_tensor_batch(
+        model,
+        None,
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+    slab_bt, _, _ = _evaluate_windowed_tensor_batch(
+        model,
+        _PanelSlabForwardWrapper(model),
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+
+    assert torch.allclose(slab_bt.strategy_returns.cpu(), generic_bt.strategy_returns.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(slab_bt.turnovers.cpu(), generic_bt.turnovers.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(slab_bt.weights_history.cpu(), generic_bt.weights_history.cpu(), atol=1e-7, rtol=1e-6)
+
+
 def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None:
     panel = _make_panel(rows=14, symbols=5, features=1)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
@@ -547,6 +618,7 @@ def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None
 
     old, old_ic, old_metrics = _evaluate_windowed_tensor_batch(
         _EchoWeightModel(),
+        None,
         split,
         torch.device("cpu"),
         None,
@@ -561,6 +633,7 @@ def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None
     )
     new, new_ic, new_metrics = _evaluate_windowed_tensor_batch(
         _EchoWeightModel(),
+        None,
         split,
         torch.device("cpu"),
         None,

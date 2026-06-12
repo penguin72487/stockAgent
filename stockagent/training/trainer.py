@@ -15,7 +15,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -1731,6 +1731,103 @@ def _panel_forward_module(model: nn.Module) -> nn.Module | None:
 
 def _model_supports_panel_forward(model: nn.Module) -> bool:
     return _panel_forward_module(model) is not None
+
+
+def _panel_slab_forward_module(model: nn.Module) -> nn.Module | None:
+    if hasattr(model, "forward_from_panel_slab"):
+        return model
+    unwrapped = _unwrap_model(model)
+    return unwrapped if hasattr(unwrapped, "forward_from_panel_slab") else None
+
+
+def _model_supports_panel_slab_forward(model: nn.Module) -> bool:
+    return _panel_slab_forward_module(model) is not None
+
+
+class _PanelSlabForwardWrapper(nn.Module):
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        slab_model = _panel_slab_forward_module(model)
+        if slab_model is None:
+            raise ValueError("model does not support forward_from_panel_slab")
+        self.model = slab_model
+
+    def forward(self, feature_slab: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_from_panel_slab(feature_slab, mask, return_aux=False)
+
+
+def _metadata_rows_are_contiguous(batch: Mapping[str, torch.Tensor]) -> bool:
+    flag = batch.get("rows_are_contiguous")
+    if flag is not None:
+        return bool(flag.detach().cpu().item())
+    date_indices = batch.get("date_indices")
+    if date_indices is None or int(date_indices.numel()) <= 1:
+        return True
+    diffs = date_indices[1:] - date_indices[:-1]
+    return bool(torch.all(diffs == 1).detach().cpu().item())
+
+
+def _feature_slab_from_metadata(
+    split: WindowedSplitTensors,
+    batch: Mapping[str, torch.Tensor],
+    device: torch.device,
+    non_blocking: bool,
+    *,
+    rows: int | None = None,
+) -> torch.Tensor | None:
+    if not _metadata_rows_are_contiguous(batch):
+        return None
+    date_start_tensor = batch.get("date_start")
+    if date_start_tensor is None:
+        date_indices = batch.get("date_indices")
+        if date_indices is None or int(date_indices.numel()) == 0:
+            return None
+        date_start_tensor = date_indices[:1]
+    if int(date_start_tensor.numel()) == 0:
+        return None
+    batch_rows = int(rows) if rows is not None else int(batch["date_indices"].numel())
+    if batch_rows <= 0:
+        return None
+    date_start = int(date_start_tensor.reshape(-1)[0].detach().cpu().item())
+    feature_start = date_start - int(split.lookback) + 1
+    slab_rows = batch_rows + int(split.lookback) - 1
+    if feature_start < 0 or feature_start + slab_rows > int(split.features.size(0)):
+        return None
+    feature_slab = split.features.narrow(0, feature_start, slab_rows)
+    if feature_slab.device != device:
+        feature_slab = feature_slab.to(device=device, non_blocking=non_blocking)
+    return feature_slab
+
+
+def _call_panel_forward_for_batch(
+    *,
+    panel_forward_model: nn.Module,
+    panel_slab_model: nn.Module | None,
+    split: WindowedSplitTensors,
+    batch: Mapping[str, torch.Tensor],
+    mask: torch.Tensor,
+    device: torch.device,
+    non_blocking: bool,
+    return_aux: bool | None,
+    allow_slab: bool = True,
+    rows: int | None = None,
+):
+    if allow_slab and panel_slab_model is not None and return_aux is False:
+        feature_slab = _feature_slab_from_metadata(
+            split,
+            batch,
+            device,
+            non_blocking,
+            rows=rows,
+        )
+        if feature_slab is not None:
+            return panel_slab_model(feature_slab, mask)
+    return panel_forward_model.forward_from_panel(
+        split.features,
+        batch["date_indices"],
+        mask,
+        return_aux=return_aux,
+    )
 
 
 def _training_needs_aux(objective: str, factor_aug_kwargs: dict[str, float] | None = None) -> bool:
@@ -3788,6 +3885,7 @@ def _evaluate_tensor_batch(
 
 def _evaluate_windowed_tensor_batch_decoupled(
     model: nn.Module,
+    panel_slab_model: nn.Module | None,
     split: WindowedSplitTensors,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -3808,6 +3906,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
     reset_at_rows: Sequence[int] | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
+    if panel_slab_model is not None:
+        panel_slab_model.eval()
     total_rows = len(split)
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
@@ -3875,6 +3975,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     bench_chunk,
                     target_rows=model_chunk_rows,
                 )
+                panel_batch_for_forward = dict(batch)
+                panel_batch_for_forward["date_indices"] = date_indices_chunk
             else:
                 (
                     x_chunk,
@@ -3899,11 +4001,17 @@ def _evaluate_windowed_tensor_batch_decoupled(
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 if panel_forward_model is not None:
-                    model_output_chunk = panel_forward_model.forward_from_panel(
-                        split.features,
-                        date_indices_chunk,
-                        mask_chunk_padded,
+                    model_output_chunk = _call_panel_forward_for_batch(
+                        panel_forward_model=panel_forward_model,
+                        panel_slab_model=panel_slab_model,
+                        split=split,
+                        batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
+                        mask=mask_chunk_padded,
+                        device=device,
+                        non_blocking=non_blocking,
                         return_aux=False,
+                        allow_slab=int(valid_rows) == int(model_chunk_rows),
+                        rows=int(valid_rows),
                     )
                 else:
                     model_output_chunk = _call_model(model, x_chunk, mask_chunk_padded, return_aux=False)
@@ -3981,6 +4089,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
 
 def _evaluate_windowed_tensor_batch(
     model: nn.Module,
+    panel_slab_model: nn.Module | None,
     split: WindowedSplitTensors,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -4004,6 +4113,7 @@ def _evaluate_windowed_tensor_batch(
     if effective_backtest_chunk_rows != int(chunk_rows):
         return _evaluate_windowed_tensor_batch_decoupled(
             model,
+            panel_slab_model,
             split,
             device,
             amp_dtype,
@@ -4024,6 +4134,8 @@ def _evaluate_windowed_tensor_batch(
             reset_at_rows=reset_at_rows,
         )
     model.eval()
+    if panel_slab_model is not None:
+        panel_slab_model.eval()
     total_rows_for_eval = len(split)
     if total_rows_for_eval <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
@@ -4117,6 +4229,8 @@ def _evaluate_windowed_tensor_batch(
                     bench_chunk,
                     target_rows=chunk_rows,
                 )
+                panel_batch_for_forward = dict(batch)
+                panel_batch_for_forward["date_indices"] = date_indices_chunk
             else:
                 (
                     x_chunk,
@@ -4141,11 +4255,17 @@ def _evaluate_windowed_tensor_batch(
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 if panel_forward_model is not None:
-                    model_output_chunk = panel_forward_model.forward_from_panel(
-                        split.features,
-                        date_indices_chunk,
-                        mask_chunk,
+                    model_output_chunk = _call_panel_forward_for_batch(
+                        panel_forward_model=panel_forward_model,
+                        panel_slab_model=panel_slab_model,
+                        split=split,
+                        batch=batch if int(valid_rows) == int(chunk_rows) else panel_batch_for_forward,
+                        mask=mask_chunk,
+                        device=device,
+                        non_blocking=non_blocking,
                         return_aux=False,
+                        allow_slab=int(valid_rows) == int(chunk_rows),
+                        rows=int(valid_rows),
                     )
                 else:
                     model_output_chunk = _call_model(model, x_chunk, mask_chunk, return_aux=False)
@@ -5832,6 +5952,7 @@ def _train_epoch_tensor(
 
 def _train_epoch_windowed_tensor(
     model: nn.Module,
+    panel_slab_model: nn.Module | None,
     loss_fn: Callable[..., torch.Tensor],
     fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
     split: WindowedSplitTensors,
@@ -5875,6 +5996,8 @@ def _train_epoch_windowed_tensor(
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
+    if panel_slab_model is not None:
+        panel_slab_model.train()
     total_rows = len(split)
     if total_rows == 0:
         return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
@@ -5931,10 +6054,14 @@ def _train_epoch_windowed_tensor(
                 if use_panel_forward:
                     if panel_forward_model is None:
                         raise RuntimeError("panel forward model unexpectedly unavailable")
-                    model_output = panel_forward_model.forward_from_panel(
-                        split.features,
-                        batch["date_indices"],
-                        batch_mask,
+                    model_output = _call_panel_forward_for_batch(
+                        panel_forward_model=panel_forward_model,
+                        panel_slab_model=panel_slab_model,
+                        split=split,
+                        batch=batch,
+                        mask=batch_mask,
+                        device=device,
+                        non_blocking=non_blocking,
                         return_aux=model_return_aux,
                     )
                 else:
@@ -7306,6 +7433,11 @@ def run_training(
 
         compiled_train_model: nn.Module = model
         eval_model: nn.Module = model
+        panel_slab_model: nn.Module | None = None
+        panel_slab_compile_status = "off"
+        if use_windowed_tensors and _model_supports_panel_slab_forward(model):
+            panel_slab_model = _PanelSlabForwardWrapper(model)
+            panel_slab_compile_status = "eager"
         compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
         use_fused_log_utility_loss = bool(getattr(config.training, "fused_log_utility_loss", True)) and _is_log_utility_objective(loss_objective)
         fused_log_utility_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -7518,6 +7650,20 @@ def run_training(
                         f"(mode={compile_mode}, dynamic=False, source={compile_source}, {reason})"
                     )
                     model_compile_status = f"enabled:{compile_source}"
+                    if panel_slab_model is not None:
+                        try:
+                            panel_slab_model = torch.compile(panel_slab_model, mode=compile_mode_arg, dynamic=False)
+                            panel_slab_compile_status = "compiled"
+                            print(
+                                f"[Train {train_years}] torch.compile panel-slab forward enabled "
+                                f"(mode={compile_mode}, dynamic=False)"
+                            )
+                        except Exception as e:
+                            panel_slab_compile_status = "fallback:eager"
+                            print(
+                                f"[Train {train_years}] torch.compile panel-slab forward failed, "
+                                f"falling back to eager slab forward: {e}"
+                            )
 
                     if compile_loss and fused_log_utility_loss_fn is not None:
                         try:
@@ -7574,6 +7720,8 @@ def run_training(
                         )
                 except Exception as e:
                     model_compile_status = "fallback:eager"
+                    if panel_slab_model is not None:
+                        panel_slab_compile_status = "eager"
                     loss_compile_status = "eager"
                     print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
@@ -7588,6 +7736,7 @@ def run_training(
             f"[Train {train_years}] optimization status: "
             f"model_compile={model_compile_status}; "
             f"eval_model={'compiled' if eval_model is compiled_train_model and compiled_train_model is not model else 'eager'}; "
+            f"panel_slab_forward={panel_slab_compile_status}; "
             f"loss_compile={loss_compile_status}; "
             f"fused_log_utility_loss={bool(fused_log_utility_loss_fn is not None)}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
@@ -7943,6 +8092,7 @@ def run_training(
             if train_windowed is not None:
                 return _train_epoch_windowed_tensor(
                     train_model,
+                    panel_slab_model,
                     compiled_loss_fn,
                     fused_log_utility_loss_fn,
                     train_windowed,
@@ -8223,6 +8373,7 @@ def run_training(
                 if combined_val_windowed is not None:
                     val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                         eval_model,
+                        panel_slab_model,
                         combined_val_windowed,
                         device,
                         amp_dtype,
@@ -8362,6 +8513,7 @@ def run_training(
                     if combined_test_windowed is not None:
                         test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                             eval_model,
+                            panel_slab_model,
                             combined_test_windowed,
                             device,
                             amp_dtype,
@@ -8640,6 +8792,7 @@ def run_training(
             if combined_val_windowed is not None:
                 val_backtest, _, _ = _evaluate_windowed_tensor_batch(
                     eval_model,
+                    panel_slab_model,
                     combined_val_windowed,
                     device,
                     amp_dtype,
@@ -8734,6 +8887,7 @@ def run_training(
                 )
                 test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
                     eval_model,
+                    panel_slab_model,
                     test_windowed,
                     device,
                     amp_dtype,
