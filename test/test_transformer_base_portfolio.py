@@ -221,6 +221,35 @@ def test_forward_from_panel_equivalence(date_values: list[int]) -> None:
     assert torch.allclose(aux_a["score_logits"], aux_b["score_logits"], atol=1e-5, rtol=1e-5)
 
 
+def test_forward_from_panel_slab_equivalence_for_contiguous_rows() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_layers=2,
+        return_aux=True,
+        return_aux_details=False,
+    ).eval()
+    features = torch.randn(14, 13, 11)
+    date_indices = torch.tensor([5, 6, 7], dtype=torch.long, device=device)
+    feature_slab = features.narrow(0, 0, 8)
+    x = _windows_from_panel(features, date_indices, model.lookback).to(device=device)
+    mask = torch.ones(3, 13, dtype=torch.bool, device=device)
+    mask[-1, 10:] = False
+
+    with torch.no_grad():
+        weights_x, scores_x, aux_x = model(x, mask, return_aux=True)
+        weights_panel, scores_panel, aux_panel = model.forward_from_panel(features, date_indices, mask, return_aux=True)
+        weights_slab, scores_slab, aux_slab = model.forward_from_panel_slab(feature_slab, mask, return_aux=True)
+
+    assert torch.allclose(weights_x, weights_panel, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(scores_x, scores_panel, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_x["score_logits"], aux_panel["score_logits"], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(weights_x, weights_slab, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(scores_x, scores_slab, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_x["score_logits"], aux_slab["score_logits"], atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("mode", ["axial", "latent", "market_token", "temporal_only"])
 def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
     device = _device()
@@ -316,9 +345,13 @@ def test_windowed_metadata_batch_has_no_x() -> None:
 
     assert "x" not in batch
     assert batch["date_indices"].tolist() == [3, 4]
+    assert batch["date_start"].tolist() == [3]
+    assert bool(batch["rows_are_contiguous"].item()) is True
     assert batch["sample_mask"].tolist() == [False, True]
     assert "x" not in indexed
     assert indexed["date_indices"].tolist() == [2, 6]
+    assert indexed["date_start"].tolist() == [2]
+    assert bool(indexed["rows_are_contiguous"].item()) is False
 
 
 def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:

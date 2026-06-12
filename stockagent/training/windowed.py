@@ -165,12 +165,18 @@ class WindowedSplitTensors:
         source_device = self.valid_indices.device
         row_indices = row_indices.to(device=source_device, dtype=torch.long)
         date_idx = self.valid_indices[row_indices]
+        if int(date_idx.numel()) <= 1:
+            rows_are_contiguous = torch.ones((), dtype=torch.bool, device=source_device)
+        else:
+            rows_are_contiguous = torch.all((date_idx[1:] - date_idx[:-1]) == 1)
         if self.sample_mask is None:
             sample_mask = torch.ones(int(row_indices.numel()), dtype=torch.bool, device=source_device)
         else:
             sample_mask = self.sample_mask[row_indices]
         return {
             "date_indices": date_idx.to(device=device, non_blocking=non_blocking),
+            "date_start": date_idx[:1].detach().to(device=torch.device("cpu")),
+            "rows_are_contiguous": rows_are_contiguous.detach().to(device=torch.device("cpu")),
             "future_log_returns": self.future_log_returns[date_idx].to(device=device, non_blocking=non_blocking),
             "tradable_mask": self.tradable_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "can_buy_mask": self.can_buy_mask[date_idx].to(device=device, non_blocking=non_blocking),
@@ -233,8 +239,15 @@ class WindowedSplitTensors:
         else:
             sample_mask = self.sample_mask.narrow(0, int(start), rows)
         date_indices = torch.arange(date_start, date_start + rows, dtype=torch.long, device=source_device)
+        date_start_control = (
+            torch.empty((0,), dtype=torch.long)
+            if rows <= 0
+            else torch.tensor([date_start], dtype=torch.long)
+        )
         return {
             "date_indices": date_indices.to(device=device, non_blocking=non_blocking),
+            "date_start": date_start_control,
+            "rows_are_contiguous": torch.ones((), dtype=torch.bool),
             "future_log_returns": self.future_log_returns.narrow(0, date_start, rows).to(
                 device=device,
                 non_blocking=non_blocking,

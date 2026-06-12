@@ -781,6 +781,21 @@ class TransformerBasePortfolioModel(nn.Module):
         if max_idx >= int(features.size(0)):
             raise ValueError(f"date_indices must be < T ({int(features.size(0))}), got max={max_idx}")
 
+    def _check_panel_slab_shapes(self, feature_slab: torch.Tensor, mask: torch.Tensor | None) -> None:
+        if feature_slab.dim() != 3:
+            raise ValueError(f"Expected feature_slab shape [U,S,F], got ndim={feature_slab.dim()}")
+        if int(feature_slab.size(0)) < self.lookback:
+            raise ValueError(
+                f"Expected feature_slab rows >= lookback={self.lookback}, got {int(feature_slab.size(0))}"
+            )
+        if (not self.allow_dynamic_symbols) and int(feature_slab.size(1)) != self.num_symbols:
+            raise ValueError(f"Expected num_symbols={self.num_symbols}, got {int(feature_slab.size(1))}")
+        if int(feature_slab.size(2)) != self.num_features:
+            raise ValueError(f"Expected num_features={self.num_features}, got {int(feature_slab.size(2))}")
+        batch_rows = int(feature_slab.size(0)) - self.lookback + 1
+        if mask is not None and tuple(mask.shape) != (batch_rows, int(feature_slab.size(1))):
+            raise ValueError(f"Expected mask shape {(batch_rows, int(feature_slab.size(1)))}, got {tuple(mask.shape)}")
+
     def _run_block(self, block: TransformerPortfolioBlock, *args) -> torch.Tensor:
         if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
             return activation_checkpoint(block, *args, use_reentrant=False)
@@ -816,6 +831,13 @@ class TransformerBasePortfolioModel(nn.Module):
             h = h + self._symbol_position(int(x.size(2)))
         return self.input_dropout(h)
 
+    def _add_window_positions(self, h: torch.Tensor, n_symbols: int) -> torch.Tensor:
+        if self.use_time_pos:
+            h = h + self.time_position[:, : self.lookback, :, :]
+        if self.use_symbol_pos:
+            h = h + self._symbol_position(int(n_symbols))
+        return self.input_dropout(h)
+
     def _project_panel_rows(self, features: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
         model_device = self.feature_proj.weight.device
         row_indices = row_indices.to(device=features.device, dtype=torch.long)
@@ -823,6 +845,13 @@ class TransformerBasePortfolioModel(nn.Module):
         selected = torch.nan_to_num(selected, nan=0.0, posinf=0.0, neginf=0.0)
         selected = selected.to(device=model_device, dtype=self.feature_proj.weight.dtype)
         return self.feature_proj(selected)
+
+    def _embed_windowed_from_panel_slab(self, feature_slab: torch.Tensor) -> torch.Tensor:
+        clean = torch.nan_to_num(feature_slab, nan=0.0, posinf=0.0, neginf=0.0)
+        clean = clean.to(device=self.feature_proj.weight.device, dtype=self.feature_proj.weight.dtype)
+        projected = self.feature_proj(clean)
+        h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
+        return self._add_window_positions(h, int(feature_slab.size(1)))
 
     def _embed_windowed_from_panel(
         self,
@@ -844,9 +873,7 @@ class TransformerBasePortfolioModel(nn.Module):
             if is_contiguous:
                 start = int(date_indices_source[0].detach().cpu().item()) - self.lookback + 1
                 end = int(date_indices_source[-1].detach().cpu().item()) + 1
-                slab_indices = torch.arange(start, end, device=features.device, dtype=torch.long)
-                projected = self._project_panel_rows(features, slab_indices)
-                h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
+                return self._embed_windowed_from_panel_slab(features.narrow(0, start, end - start))
             else:
                 offsets = torch.arange(
                     self.lookback - 1,
@@ -861,11 +888,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 h = projected.index_select(0, inverse.to(device=projected.device, dtype=torch.long))
                 h = h.reshape(batch_rows, self.lookback, int(features.size(1)), self.d_model).contiguous()
 
-        if self.use_time_pos:
-            h = h + self.time_position[:, : self.lookback, :, :]
-        if self.use_symbol_pos:
-            h = h + self._symbol_position(int(features.size(1)))
-        return self.input_dropout(h)
+        return self._add_window_positions(h, int(features.size(1)))
 
     def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
@@ -1228,6 +1251,26 @@ class TransformerBasePortfolioModel(nn.Module):
     ):
         self._check_panel_shapes(features, date_indices, mask)
         h = self._embed_windowed_from_panel(features, date_indices)
+        if mask is None:
+            mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
+        else:
+            mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        return self._forward_embedded(
+            h,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
+
+    def forward_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+    ):
+        self._check_panel_slab_shapes(feature_slab, mask)
+        h = self._embed_windowed_from_panel_slab(feature_slab)
         if mask is None:
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
