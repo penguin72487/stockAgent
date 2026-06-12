@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 6
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -15,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_okx
-  benchmark_name: "BTCUSDTSWAP"
+  parquet_root: data_yahoo/us_stocks
+  benchmark_name: "SPY"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -34,8 +34,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0005
-  sell_fee_rate: 0.0005
+  buy_fee_rate: 0.0001
+  sell_fee_rate: 0.0001
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -269,7 +269,8 @@ training:
     portfolio_mode: long_short
     max_full_tokens: 16384
     checkpoint_blocks: false
-    return_aux: true
+    return_aux: false
+     # return_aux: whether to return auxiliary outputs for analysis, such as attention weights and latent factors. Setting this to true may increase memory usage and reduce training speed, so it is typically set to false during training and true during inference or analysis.
     return_aux_details: false
      # return_aux_details: whether to return detailed aux outputs for analysis, such as attention weights and latent factors. Setting this to true may increase memory usage and reduce training speed, so it is typically set to false during training and true during inference or analysis.
   bottleneck_portfolio_autoencoder:
