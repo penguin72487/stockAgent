@@ -667,9 +667,7 @@ class TransformerBasePortfolioModel(nn.Module):
             head.append(nn.Linear(in_dim, 1))
             return nn.Sequential(*head)
 
-        self.mu_head = make_scalar_head()
-        self.sigma_head = make_scalar_head()
-        self.confidence_head = make_scalar_head()
+        self.score_head = make_scalar_head()
 
     @staticmethod
     def _normalize_attention_mode(attention_mode: str) -> str:
@@ -820,19 +818,6 @@ class TransformerBasePortfolioModel(nn.Module):
         z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
         return z_stock, gate.masked_fill(~safe_mask.unsqueeze(-1), 0.0), market_delta
 
-    def _risk_adjusted_scores(
-        self,
-        z_stock: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu = self.mu_head(z_stock).squeeze(-1)
-        sigma_raw = self.sigma_head(z_stock).squeeze(-1)
-        confidence_logit = self.confidence_head(z_stock).squeeze(-1)
-        sigma = F.softplus(sigma_raw).clamp_min(1e-4)
-        confidence = torch.sigmoid(confidence_logit)
-        scores = mu / sigma * confidence
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-        return scores, mu, sigma, confidence_logit, confidence
-
     def _forward_full(
         self,
         h: torch.Tensor,
@@ -982,8 +967,9 @@ class TransformerBasePortfolioModel(nn.Module):
             z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
 
         z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
-        scores, alpha_mu, risk_sigma, confidence_logits, confidence = self._risk_adjusted_scores(z_stock)
-        masked_scores = scores.masked_fill(~mask_bool, -1e9)
+        scores = self.score_head(z_stock).squeeze(-1)
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if temperature is None:
             temp = masked_scores.new_tensor(self.default_temperature)
@@ -1009,10 +995,6 @@ class TransformerBasePortfolioModel(nn.Module):
                     "score_logits": scores,
                     "rank_logits": scores,
                     "centered_score_logits": centered_scores,
-                    "alpha_mu": alpha_mu,
-                    "risk_sigma": risk_sigma,
-                    "confidence_logits": confidence_logits,
-                    "confidence": confidence,
                 }
             )
             return weights, masked_scores, aux
@@ -1023,10 +1005,6 @@ class TransformerBasePortfolioModel(nn.Module):
                 "score_logits": scores,
                 "rank_logits": scores,
                 "centered_score_logits": centered_scores,
-                "alpha_mu": alpha_mu,
-                "risk_sigma": risk_sigma,
-                "confidence_logits": confidence_logits,
-                "confidence": confidence,
             }
             if self.return_aux_details:
                 aux = dict(aux)
@@ -1036,10 +1014,6 @@ class TransformerBasePortfolioModel(nn.Module):
                         "score_logits": scores,
                         "rank_logits": scores,
                         "centered_score_logits": centered_scores,
-                        "alpha_mu": alpha_mu,
-                        "risk_sigma": risk_sigma,
-                        "confidence_logits": confidence_logits,
-                        "confidence": confidence,
                     }
                 )
                 output["aux"] = aux
