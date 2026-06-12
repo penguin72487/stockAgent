@@ -14,6 +14,7 @@ from stockagent.models.transformer_base_portfolio import (
     TransformerBasePortfolioModel,
 )
 from stockagent.training.trainer import _extract_weights_and_aux
+from stockagent.training.windowed import WindowedSplitTensors
 
 
 def _device() -> torch.device:
@@ -44,6 +45,7 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
         "temporal_heads": 2,
         "temporal_ffn_mult": 1,
         "temporal_pooling": "attention",
+        "temporal_query_mode": "full_then_last",
         "cross_layers": 1,
         "cross_heads": 2,
         "cross_ffn_mult": 1,
@@ -184,6 +186,70 @@ def test_aux_details_false_keeps_training_output_light() -> None:
     assert aux["stock_market_gate"].shape == (2, 13, 1)
 
 
+def _windows_from_panel(features: torch.Tensor, date_indices: torch.Tensor, lookback: int) -> torch.Tensor:
+    return torch.stack(
+        [
+            features[int(idx.item()) - lookback + 1 : int(idx.item()) + 1]
+            for idx in date_indices.detach().cpu()
+        ],
+        dim=0,
+    )
+
+
+@pytest.mark.parametrize("date_values", [[5, 6, 7], [5, 8, 10]])
+def test_forward_from_panel_equivalence(date_values: list[int]) -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_layers=2,
+        return_aux=True,
+        return_aux_details=False,
+    ).eval()
+    features = torch.randn(14, 13, 11)
+    date_indices = torch.tensor(date_values, dtype=torch.long, device=device)
+    x = _windows_from_panel(features, date_indices, model.lookback).to(device=device)
+    mask = torch.ones(len(date_values), 13, dtype=torch.bool, device=device)
+    mask[-1, 10:] = False
+
+    with torch.no_grad():
+        weights_a, scores_a, aux_a = model(x, mask, return_aux=True)
+        weights_b, scores_b, aux_b = model.forward_from_panel(features, date_indices, mask, return_aux=True)
+
+    assert torch.allclose(weights_a, weights_b, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(scores_a, scores_b, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_a["score_logits"], aux_b["score_logits"], atol=1e-5, rtol=1e-5)
+
+
+def test_forward_from_panel_slab_equivalence_for_contiguous_rows() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_layers=2,
+        return_aux=True,
+        return_aux_details=False,
+    ).eval()
+    features = torch.randn(14, 13, 11)
+    date_indices = torch.tensor([5, 6, 7], dtype=torch.long, device=device)
+    feature_slab = features.narrow(0, 0, 8)
+    x = _windows_from_panel(features, date_indices, model.lookback).to(device=device)
+    mask = torch.ones(3, 13, dtype=torch.bool, device=device)
+    mask[-1, 10:] = False
+
+    with torch.no_grad():
+        weights_x, scores_x, aux_x = model(x, mask, return_aux=True)
+        weights_panel, scores_panel, aux_panel = model.forward_from_panel(features, date_indices, mask, return_aux=True)
+        weights_slab, scores_slab, aux_slab = model.forward_from_panel_slab(feature_slab, mask, return_aux=True)
+
+    assert torch.allclose(weights_x, weights_panel, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(scores_x, scores_panel, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_x["score_logits"], aux_panel["score_logits"], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(weights_x, weights_slab, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(scores_x, scores_slab, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_x["score_logits"], aux_slab["score_logits"], atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("mode", ["axial", "latent", "market_token", "temporal_only"])
 def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
     device = _device()
@@ -206,6 +272,86 @@ def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
     assert full_aux["token_embedding"].shape == (2, 6, 13, 24)
     assert torch.allclose(fast_out["weights"], full_weights, atol=1e-5, rtol=1e-5)
     assert torch.allclose(fast_out["scores"], full_scores, atol=1e-5, rtol=1e-5)
+
+
+def test_last_only_temporal_shapes_and_finite() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_layers=2,
+        temporal_query_mode="last_only",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    x = torch.randn(3, 6, 13, 11, device=device)
+    mask = torch.ones(3, 13, dtype=torch.bool, device=device)
+    mask[0, 9:] = False
+
+    with torch.no_grad():
+        weights = model(x, mask, return_aux=False)
+
+    assert weights.shape == (3, 13)
+    assert torch.isfinite(weights).all()
+    assert weights[0, 9:].abs().max().item() < 1e-6
+
+
+def test_market_token_fast_path_matches_generic_branch() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_layers=2,
+        return_aux=True,
+        return_aux_details=True,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 11:] = False
+    safe_mask = mask.clone()
+    h = model._embed_inputs(x)
+
+    with torch.no_grad():
+        z_fast, aux_fast = model._forward_market_token_fast(h, safe_mask, collect_aux=True)
+        z_generic, aux_generic = model._forward_latent_or_market(
+            h,
+            safe_mask,
+            use_latent=False,
+            collect_aux=True,
+        )
+
+    assert torch.allclose(z_fast, z_generic, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_fast["market_tokens"], aux_generic["market_tokens"], atol=1e-5, rtol=1e-5)
+    assert "latent_factors" not in aux_fast
+
+
+def test_windowed_metadata_batch_has_no_x() -> None:
+    features = torch.randn(8, 4, 3)
+    valid_indices = torch.tensor([2, 3, 4, 6], dtype=torch.long)
+    split = WindowedSplitTensors(
+        features=features,
+        valid_indices=valid_indices,
+        future_log_returns=torch.randn(8, 4),
+        tradable_mask=torch.ones(8, 4, dtype=torch.bool),
+        can_buy_mask=torch.ones(8, 4, dtype=torch.bool),
+        can_sell_mask=torch.ones(8, 4, dtype=torch.bool),
+        benchmark=torch.randn(8),
+        lookback=3,
+        sample_mask=torch.tensor([True, False, True, True]),
+    )
+
+    batch = split.batch_metadata_by_rows(1, 3, torch.device("cpu"), non_blocking=False)
+    indexed = split.batch_metadata_by_batch_indices(torch.tensor([0, 3]), torch.device("cpu"), non_blocking=False)
+
+    assert "x" not in batch
+    assert batch["date_indices"].tolist() == [3, 4]
+    assert batch["date_start"].tolist() == [3]
+    assert bool(batch["rows_are_contiguous"].item()) is True
+    assert batch["sample_mask"].tolist() == [False, True]
+    assert "x" not in indexed
+    assert indexed["date_indices"].tolist() == [2, 6]
+    assert indexed["date_start"].tolist() == [2]
+    assert bool(indexed["rows_are_contiguous"].item()) is False
 
 
 def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:
@@ -289,5 +435,10 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.ffn_type == cfg.training.transformer_base_portfolio.ffn_type
     assert model.qk_norm == cfg.training.transformer_base_portfolio.qk_norm
     assert model.rope_temporal == cfg.training.transformer_base_portfolio.rope_temporal
+    assert model.temporal_query_mode == cfg.training.transformer_base_portfolio.temporal_query_mode
     assert model.dynamic_latent_tokens == cfg.training.transformer_base_portfolio.dynamic_latent_tokens
     assert model.dynamic_market_tokens == cfg.training.transformer_base_portfolio.dynamic_market_tokens
+    if model.attention_mode == "market_token":
+        assert model.dynamic_market_generator is not None
+        assert model.dynamic_latent_generator is None
+        assert len(model.latent_blocks) == 0

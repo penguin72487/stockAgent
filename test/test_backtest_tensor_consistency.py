@@ -18,6 +18,8 @@ from stockagent.training.trainer import (
     _evaluate_tensor_batch,
     _evaluate_windowed_tensor_batch,
     _maybe_share_windowed_base_from_cached,
+    _PanelSlabForwardWrapper,
+    _prepare_windowed_split,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -26,6 +28,35 @@ class _EchoWeightModel(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         del mask
         return x[:, -1, :, 0]
+
+
+class _EchoPanelWeightModel(_EchoWeightModel):
+    def __init__(self, lookback: int) -> None:
+        super().__init__()
+        self.lookback = int(lookback)
+
+    def forward_from_panel(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+        mask: torch.Tensor,
+        return_aux: bool | None = None,
+    ) -> torch.Tensor:
+        del return_aux
+        date_indices = date_indices.to(device=features.device, dtype=torch.long)
+        offsets = torch.arange(self.lookback - 1, -1, -1, device=features.device, dtype=torch.long)
+        x = features[date_indices[:, None] - offsets[None, :]]
+        return self.forward(x.to(device=mask.device), mask)
+
+    def forward_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor,
+        return_aux: bool | None = None,
+    ) -> torch.Tensor:
+        del return_aux
+        x = feature_slab.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
+        return self.forward(x.to(device=mask.device), mask)
 
 
 def test_detach_portfolio_state_clones_independent_buffer() -> None:
@@ -442,6 +473,61 @@ def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> 
         assert torch.equal(actual[key], expected[key]), key
 
 
+def test_prepare_windowed_split_reuses_prepared_shared_base() -> None:
+    panel = _make_panel(rows=12, symbols=4, features=3)
+    first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
+    first = _prepare_windowed_split(
+        dataset_to_windowed_tensors(first_ds),
+        torch.device("cpu"),
+        non_blocking=False,
+        name="first",
+    )
+    second_raw = dataset_to_windowed_tensors(second_ds)
+    second = _prepare_windowed_split(
+        second_raw,
+        torch.device("cpu"),
+        non_blocking=False,
+        shared_base=first,
+        name="second",
+    )
+
+    assert second.features.data_ptr() == first.features.data_ptr()
+    assert second.future_log_returns.data_ptr() == first.future_log_returns.data_ptr()
+    assert second.tradable_mask.data_ptr() == first.tradable_mask.data_ptr()
+    assert second.valid_indices.data_ptr() != first.valid_indices.data_ptr()
+
+    expected = second_raw.batch_by_rows(0, len(second_raw), torch.device("cpu"), non_blocking=False)
+    actual = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
+    for key in expected:
+        assert torch.equal(actual[key], expected[key]), key
+
+
+def test_prepare_windowed_split_reuses_gpu_shared_base_with_device_metadata() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    panel = _make_panel(rows=12, symbols=4, features=3)
+    first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
+    first = dataset_to_windowed_tensors(first_ds).to_device_cache(device, non_blocking=False)
+    second = _prepare_windowed_split(
+        dataset_to_windowed_tensors(second_ds),
+        device,
+        non_blocking=False,
+        shared_base=first,
+        name="second gpu",
+    )
+
+    assert second.features.device.type == "cuda"
+    assert second.valid_indices.device.type == "cuda"
+    assert second.features.data_ptr() == first.features.data_ptr()
+    batch = second.batch_metadata_by_rows(0, len(second), device, non_blocking=False)
+    assert "x" not in batch
+    assert batch["date_indices"].device.type == "cuda"
+    assert batch["future_log_returns"].device.type == "cuda"
+
+
 def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     panel = _make_panel(rows=9, symbols=5, features=1)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
@@ -467,6 +553,7 @@ def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     )
     windowed_bt, _, _ = _evaluate_windowed_tensor_batch(
         _EchoWeightModel(),
+        None,
         split,
         torch.device("cpu"),
         None,
@@ -484,6 +571,46 @@ def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:
     assert torch.allclose(windowed_bt.weights_history.cpu(), materialized_bt.weights_history.cpu())
 
 
+def test_evaluate_windowed_tensor_batch_panel_slab_wrapper_matches_generic_panel() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=2)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+    split = dataset_to_windowed_tensors(dataset)
+    model = _EchoPanelWeightModel(lookback=2)
+
+    generic_bt, _, _ = _evaluate_windowed_tensor_batch(
+        model,
+        None,
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+    slab_bt, _, _ = _evaluate_windowed_tensor_batch(
+        model,
+        _PanelSlabForwardWrapper(model),
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+    )
+
+    assert torch.allclose(slab_bt.strategy_returns.cpu(), generic_bt.strategy_returns.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(slab_bt.turnovers.cpu(), generic_bt.turnovers.cpu(), atol=1e-7, rtol=1e-6)
+    assert torch.allclose(slab_bt.weights_history.cpu(), generic_bt.weights_history.cpu(), atol=1e-7, rtol=1e-6)
+
+
 def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None:
     panel = _make_panel(rows=14, symbols=5, features=1)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
@@ -491,6 +618,7 @@ def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None
 
     old, old_ic, old_metrics = _evaluate_windowed_tensor_batch(
         _EchoWeightModel(),
+        None,
         split,
         torch.device("cpu"),
         None,
@@ -505,6 +633,7 @@ def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None
     )
     new, new_ic, new_metrics = _evaluate_windowed_tensor_batch(
         _EchoWeightModel(),
+        None,
         split,
         torch.device("cpu"),
         None,
