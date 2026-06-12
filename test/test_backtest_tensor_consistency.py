@@ -18,6 +18,7 @@ from stockagent.training.trainer import (
     _evaluate_tensor_batch,
     _evaluate_windowed_tensor_batch,
     _maybe_share_windowed_base_from_cached,
+    _prepare_windowed_split,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -440,6 +441,61 @@ def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> 
     actual = shared.batch_by_rows(0, len(shared), torch.device("cpu"), non_blocking=False)
     for key in expected:
         assert torch.equal(actual[key], expected[key]), key
+
+
+def test_prepare_windowed_split_reuses_prepared_shared_base() -> None:
+    panel = _make_panel(rows=12, symbols=4, features=3)
+    first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
+    first = _prepare_windowed_split(
+        dataset_to_windowed_tensors(first_ds),
+        torch.device("cpu"),
+        non_blocking=False,
+        name="first",
+    )
+    second_raw = dataset_to_windowed_tensors(second_ds)
+    second = _prepare_windowed_split(
+        second_raw,
+        torch.device("cpu"),
+        non_blocking=False,
+        shared_base=first,
+        name="second",
+    )
+
+    assert second.features.data_ptr() == first.features.data_ptr()
+    assert second.future_log_returns.data_ptr() == first.future_log_returns.data_ptr()
+    assert second.tradable_mask.data_ptr() == first.tradable_mask.data_ptr()
+    assert second.valid_indices.data_ptr() != first.valid_indices.data_ptr()
+
+    expected = second_raw.batch_by_rows(0, len(second_raw), torch.device("cpu"), non_blocking=False)
+    actual = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
+    for key in expected:
+        assert torch.equal(actual[key], expected[key]), key
+
+
+def test_prepare_windowed_split_reuses_gpu_shared_base_with_device_metadata() -> None:
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    panel = _make_panel(rows=12, symbols=4, features=3)
+    first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    second_ds = CrossSectionalDataset(panel, torch.arange(4, 12).numpy(), lookback=3)
+    first = dataset_to_windowed_tensors(first_ds).to_device_cache(device, non_blocking=False)
+    second = _prepare_windowed_split(
+        dataset_to_windowed_tensors(second_ds),
+        device,
+        non_blocking=False,
+        shared_base=first,
+        name="second gpu",
+    )
+
+    assert second.features.device.type == "cuda"
+    assert second.valid_indices.device.type == "cuda"
+    assert second.features.data_ptr() == first.features.data_ptr()
+    batch = second.batch_metadata_by_rows(0, len(second), device, non_blocking=False)
+    assert "x" not in batch
+    assert batch["date_indices"].device.type == "cuda"
+    assert batch["future_log_returns"].device.type == "cuda"
 
 
 def test_evaluate_windowed_tensor_batch_matches_materialized_eval() -> None:

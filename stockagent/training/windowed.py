@@ -156,6 +156,29 @@ class WindowedSplitTensors:
             "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
         }
 
+    def _batch_metadata_from_row_indices(
+        self,
+        row_indices: torch.Tensor,
+        device: torch.device,
+        non_blocking: bool,
+    ) -> dict[str, torch.Tensor]:
+        source_device = self.valid_indices.device
+        row_indices = row_indices.to(device=source_device, dtype=torch.long)
+        date_idx = self.valid_indices[row_indices]
+        if self.sample_mask is None:
+            sample_mask = torch.ones(int(row_indices.numel()), dtype=torch.bool, device=source_device)
+        else:
+            sample_mask = self.sample_mask[row_indices]
+        return {
+            "date_indices": date_idx.to(device=device, non_blocking=non_blocking),
+            "future_log_returns": self.future_log_returns[date_idx].to(device=device, non_blocking=non_blocking),
+            "tradable_mask": self.tradable_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "can_buy_mask": self.can_buy_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "can_sell_mask": self.can_sell_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "benchmark": self.benchmark[date_idx].to(device=device, non_blocking=non_blocking),
+            "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
+        }
+
     def _batch_from_contiguous_rows(
         self,
         start: int,
@@ -193,6 +216,45 @@ class WindowedSplitTensors:
             "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
         }
 
+    def _batch_metadata_from_contiguous_rows(
+        self,
+        start: int,
+        end: int,
+        device: torch.device,
+        non_blocking: bool,
+    ) -> dict[str, torch.Tensor]:
+        rows = int(end) - int(start)
+        date_start = self._first_valid_index + int(start)
+        source_device = self.valid_indices.device
+        if rows < 0:
+            raise ValueError("end must be >= start")
+        if self.sample_mask is None:
+            sample_mask = torch.ones(rows, dtype=torch.bool, device=source_device)
+        else:
+            sample_mask = self.sample_mask.narrow(0, int(start), rows)
+        date_indices = torch.arange(date_start, date_start + rows, dtype=torch.long, device=source_device)
+        return {
+            "date_indices": date_indices.to(device=device, non_blocking=non_blocking),
+            "future_log_returns": self.future_log_returns.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "tradable_mask": self.tradable_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "can_buy_mask": self.can_buy_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "can_sell_mask": self.can_sell_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "benchmark": self.benchmark.narrow(0, date_start, rows).to(device=device, non_blocking=non_blocking),
+            "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
+        }
+
     def batch_by_rows(
         self,
         start: int,
@@ -207,6 +269,20 @@ class WindowedSplitTensors:
         rows = torch.arange(int(start), int(end), dtype=torch.long, device=self.valid_indices.device)
         return self._batch_from_row_indices(rows, device, non_blocking)
 
+    def batch_metadata_by_rows(
+        self,
+        start: int,
+        end: int,
+        device: torch.device,
+        non_blocking: bool,
+    ) -> dict[str, torch.Tensor]:
+        if end < start:
+            raise ValueError("end must be >= start")
+        if self._valid_indices_are_contiguous:
+            return self._batch_metadata_from_contiguous_rows(start, end, device, non_blocking)
+        rows = torch.arange(int(start), int(end), dtype=torch.long, device=self.valid_indices.device)
+        return self._batch_metadata_from_row_indices(rows, device, non_blocking)
+
     def batch_by_batch_indices(
         self,
         batch_indices: torch.Tensor,
@@ -214,6 +290,14 @@ class WindowedSplitTensors:
         non_blocking: bool,
     ) -> dict[str, torch.Tensor]:
         return self._batch_from_row_indices(batch_indices.reshape(-1), device, non_blocking)
+
+    def batch_metadata_by_batch_indices(
+        self,
+        batch_indices: torch.Tensor,
+        device: torch.device,
+        non_blocking: bool,
+    ) -> dict[str, torch.Tensor]:
+        return self._batch_metadata_from_row_indices(batch_indices.reshape(-1), device, non_blocking)
 
     def materialize_windows(
         self,
