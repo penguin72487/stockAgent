@@ -351,7 +351,7 @@ class FlashSDPAAttention(nn.Module):
         attn_mask = None
         if key_mask is not None:
             key_mask = key_mask.to(device=query.device, dtype=torch.bool)
-            attn_mask = key_mask[:, None, None, :].expand(bsz, self.num_heads, query_steps, key_steps)
+            attn_mask = key_mask[:, None, None, :]
 
         if self.use_flash_attention:
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
@@ -498,6 +498,7 @@ class TransformerBasePortfolioModel(nn.Module):
         temporal_heads: int = 4,
         temporal_ffn_mult: int = 2,
         temporal_pooling: str = "attention",
+        temporal_query_mode: str = "full_then_last",
         cross_layers: int = 1,
         cross_heads: int = 4,
         cross_ffn_mult: int = 2,
@@ -532,6 +533,7 @@ class TransformerBasePortfolioModel(nn.Module):
         self.d_model = int(d_model)
         self.attention_mode = self._normalize_attention_mode(attention_mode)
         self.temporal_pooling = self._normalize_pooling(temporal_pooling)
+        self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
         self.max_full_tokens = int(max_full_tokens)
@@ -587,18 +589,30 @@ class TransformerBasePortfolioModel(nn.Module):
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(0, int(cross_layers)))
             ]
+            if self.attention_mode == "axial"
+            else []
         )
         self.joint_blocks = nn.ModuleList(
             [
                 make_block(int(joint_heads), int(joint_ffn_mult))
                 for _ in range(max(0, int(joint_layers)))
             ]
+            if self.attention_mode == "full"
+            else []
         )
 
         latent_count = max(1, int(num_latent_factors))
         market_count = max(1, int(num_market_tokens))
-        self.latent_queries = nn.Parameter(torch.randn(1, latent_count, self.d_model) * 0.02)
-        self.market_queries = nn.Parameter(torch.randn(1, market_count, self.d_model) * 0.02)
+        self.latent_queries = (
+            nn.Parameter(torch.randn(1, latent_count, self.d_model) * 0.02)
+            if self.attention_mode == "latent"
+            else None
+        )
+        self.market_queries = (
+            nn.Parameter(torch.randn(1, market_count, self.d_model) * 0.02)
+            if self.attention_mode in {"latent", "market_token"}
+            else None
+        )
         self.dynamic_latent_generator = (
             DynamicTokenGenerator(
                 dim=self.d_model,
@@ -609,7 +623,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 norm_type=self.norm_type,
                 ffn_type=self.ffn_type,
             )
-            if self.dynamic_latent_tokens
+            if self.attention_mode == "latent" and self.dynamic_latent_tokens
             else None
         )
         self.dynamic_market_generator = (
@@ -622,7 +636,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 norm_type=self.norm_type,
                 ffn_type=self.ffn_type,
             )
-            if self.dynamic_market_tokens
+            if self.attention_mode in {"latent", "market_token"} and self.dynamic_market_tokens
             else None
         )
         self.latent_blocks = nn.ModuleList(
@@ -630,24 +644,32 @@ class TransformerBasePortfolioModel(nn.Module):
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(latent_layers)))
             ]
+            if self.attention_mode == "latent"
+            else []
         )
         self.market_blocks = nn.ModuleList(
             [
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
+            if self.attention_mode in {"latent", "market_token"}
+            else []
         )
         self.stock_read_latent_blocks = nn.ModuleList(
             [
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
+            if self.attention_mode == "latent"
+            else []
         )
         self.stock_read_market_blocks = nn.ModuleList(
             [
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
+            if self.attention_mode in {"latent", "market_token"}
+            else []
         )
 
         self.temporal_pool_score = nn.Linear(self.d_model, 1) if self.temporal_pooling == "attention" else None
@@ -700,6 +722,15 @@ class TransformerBasePortfolioModel(nn.Module):
         raise ValueError("temporal_pooling must be one of: last, mean, attention")
 
     @staticmethod
+    def _normalize_temporal_query_mode(mode: str) -> str:
+        normalized = str(mode).strip().lower().replace("-", "_")
+        if normalized in {"full_then_last", "default", "current"}:
+            return "full_then_last"
+        if normalized in {"last_only", "last_query_only"}:
+            return "last_only"
+        raise ValueError("temporal_query_mode must be 'full_then_last' or 'last_only'")
+
+    @staticmethod
     def _normalize_portfolio_mode(portfolio_mode: str) -> str:
         normalized = str(portfolio_mode).strip().lower().replace("-", "_")
         if normalized in {"long", "long_only", "longonly"}:
@@ -719,6 +750,36 @@ class TransformerBasePortfolioModel(nn.Module):
             raise ValueError(f"Expected num_features={self.num_features}, got {int(x.size(3))}")
         if mask is not None and tuple(mask.shape) != (int(x.size(0)), int(x.size(2))):
             raise ValueError(f"Expected mask shape {(int(x.size(0)), int(x.size(2)))}, got {tuple(mask.shape)}")
+
+    def _check_panel_shapes(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> None:
+        if features.dim() != 3:
+            raise ValueError(f"Expected features shape [T,S,F], got ndim={features.dim()}")
+        if date_indices.dim() != 1:
+            raise ValueError(f"Expected date_indices shape [B], got ndim={date_indices.dim()}")
+        if (not self.allow_dynamic_symbols) and int(features.size(1)) != self.num_symbols:
+            raise ValueError(f"Expected num_symbols={self.num_symbols}, got {int(features.size(1))}")
+        if int(features.size(2)) != self.num_features:
+            raise ValueError(f"Expected num_features={self.num_features}, got {int(features.size(2))}")
+        if mask is not None and tuple(mask.shape) != (int(date_indices.numel()), int(features.size(1))):
+            raise ValueError(
+                f"Expected mask shape {(int(date_indices.numel()), int(features.size(1)))}, got {tuple(mask.shape)}"
+            )
+        if int(date_indices.numel()) == 0:
+            return
+        idx_cpu = date_indices.detach().to(device="cpu", dtype=torch.long)
+        min_idx = int(idx_cpu.min().item())
+        max_idx = int(idx_cpu.max().item())
+        if min_idx < self.lookback - 1:
+            raise ValueError(
+                f"date_indices must be >= lookback - 1 ({self.lookback - 1}), got min={min_idx}"
+            )
+        if max_idx >= int(features.size(0)):
+            raise ValueError(f"date_indices must be < T ({int(features.size(0))}), got max={max_idx}")
 
     def _run_block(self, block: TransformerPortfolioBlock, *args) -> torch.Tensor:
         if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
@@ -755,10 +816,81 @@ class TransformerBasePortfolioModel(nn.Module):
             h = h + self._symbol_position(int(x.size(2)))
         return self.input_dropout(h)
 
+    def _project_panel_rows(self, features: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
+        model_device = self.feature_proj.weight.device
+        row_indices = row_indices.to(device=features.device, dtype=torch.long)
+        selected = features.index_select(0, row_indices)
+        selected = torch.nan_to_num(selected, nan=0.0, posinf=0.0, neginf=0.0)
+        selected = selected.to(device=model_device, dtype=self.feature_proj.weight.dtype)
+        return self.feature_proj(selected)
+
+    def _embed_windowed_from_panel(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        date_indices_source = date_indices.to(device=features.device, dtype=torch.long)
+        batch_rows = int(date_indices_source.numel())
+        if batch_rows <= 0:
+            h = self.feature_proj.weight.new_empty(
+                (0, self.lookback, int(features.size(1)), self.d_model)
+            )
+        else:
+            is_contiguous = True
+            if batch_rows > 1:
+                diffs = date_indices_source[1:] - date_indices_source[:-1]
+                is_contiguous = bool(torch.all(diffs == 1).detach().cpu().item())
+
+            if is_contiguous:
+                start = int(date_indices_source[0].detach().cpu().item()) - self.lookback + 1
+                end = int(date_indices_source[-1].detach().cpu().item()) + 1
+                slab_indices = torch.arange(start, end, device=features.device, dtype=torch.long)
+                projected = self._project_panel_rows(features, slab_indices)
+                h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
+            else:
+                offsets = torch.arange(
+                    self.lookback - 1,
+                    -1,
+                    -1,
+                    device=features.device,
+                    dtype=torch.long,
+                )
+                window_idx = date_indices_source[:, None] - offsets[None, :]
+                unique_idx, inverse = torch.unique(window_idx.reshape(-1), sorted=True, return_inverse=True)
+                projected = self._project_panel_rows(features, unique_idx)
+                h = projected.index_select(0, inverse.to(device=projected.device, dtype=torch.long))
+                h = h.reshape(batch_rows, self.lookback, int(features.size(1)), self.d_model).contiguous()
+
+        if self.use_time_pos:
+            h = h + self.time_position[:, : self.lookback, :, :]
+        if self.use_symbol_pos:
+            h = h + self._symbol_position(int(features.size(1)))
+        return self.input_dropout(h)
+
     def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
         seq = h.permute(0, 2, 1, 3).contiguous().reshape(bsz * n_symbols, steps, dim)
         rope_positions = self._temporal_rope_positions(steps, h.device)
+        if (
+            self.temporal_query_mode == "last_only"
+            and self.temporal_pooling == "last"
+            and not bool(keep_all_steps)
+            and len(self.temporal_blocks) > 0
+            and steps > 1
+        ):
+            last_query = seq[:, -1:, :]
+            last_pos = None if rope_positions is None else rope_positions[-1:]
+            for block in self.temporal_blocks:
+                last_query = self._run_block(
+                    block,
+                    last_query,
+                    seq,
+                    None,
+                    rope_positions,
+                    last_pos,
+                    rope_positions,
+                )
+            return last_query.reshape(bsz, n_symbols, 1, dim).permute(0, 2, 1, 3).contiguous()
         use_last_query_fast_path = (
             self.temporal_pooling == "last"
             and not bool(keep_all_steps)
@@ -939,22 +1071,67 @@ class TransformerBasePortfolioModel(nn.Module):
             })
         return z_stock, aux
 
-    def forward(
+    def _forward_market_token_fast(
         self,
-        x: torch.Tensor,
-        mask: torch.Tensor | None = None,
+        h: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
+        z_base = self._pool_temporal(h, safe_mask)
+        bsz = int(h.size(0))
+        aux: dict[str, torch.Tensor] = {}
+
+        if self.market_queries is None:
+            raise RuntimeError("market_queries are required for attention_mode=market_token")
+        if self.dynamic_market_generator is not None:
+            market_tokens, dynamic_aux = self.dynamic_market_generator(
+                self.market_queries,
+                z_base,
+                safe_mask,
+                collect_aux=collect_aux,
+            )
+            if collect_aux:
+                aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
+        else:
+            market_tokens = self.market_queries.expand(bsz, -1, -1)
+
+        for block in self.market_blocks:
+            market_tokens = self._run_block(block, market_tokens, z_base, safe_mask)
+
+        z_market_context = z_base
+        for block in self.stock_read_market_blocks:
+            z_market_context = self._run_block(block, z_market_context, market_tokens, None)
+
+        z_stock, stock_market_gate, z_market_delta = self._apply_stock_market_gate(
+            z_base,
+            z_market_context,
+            safe_mask,
+        )
+        if collect_aux:
+            aux.update(
+                {
+                    "token_embedding": h,
+                    "stock_embedding": z_base,
+                    "market_tokens": market_tokens,
+                    "z_market_context": z_market_context,
+                    "z_market_delta": z_market_delta,
+                    "stock_market_gate": stock_market_gate,
+                }
+            )
+        return z_stock, aux
+
+    def _forward_embedded(
+        self,
+        h: torch.Tensor,
+        mask_bool: torch.Tensor,
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
     ):
-        self._check_shapes(x, mask)
-        if mask is None:
-            mask_bool = torch.ones(x.size(0), x.size(2), dtype=torch.bool, device=x.device)
-        else:
-            mask_bool = mask.to(device=x.device, dtype=torch.bool)
         safe_mask = _safe_attention_mask(mask_bool)
         collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
 
-        h = self._embed_inputs(x)
         if self.attention_mode == "full":
             z_stock, aux = self._forward_full(h, safe_mask, collect_aux=collect_aux)
         elif self.attention_mode == "axial":
@@ -962,7 +1139,7 @@ class TransformerBasePortfolioModel(nn.Module):
         elif self.attention_mode == "latent":
             z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=True, collect_aux=collect_aux)
         elif self.attention_mode == "market_token":
-            z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=False, collect_aux=collect_aux)
+            z_stock, aux = self._forward_market_token_fast(h, safe_mask, collect_aux=collect_aux)
         else:
             z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
 
@@ -1020,3 +1197,44 @@ class TransformerBasePortfolioModel(nn.Module):
                 output.update(aux)
             return output
         return weights
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+    ):
+        self._check_shapes(x, mask)
+        if mask is None:
+            mask_bool = torch.ones(x.size(0), x.size(2), dtype=torch.bool, device=x.device)
+        else:
+            mask_bool = mask.to(device=x.device, dtype=torch.bool)
+        h = self._embed_inputs(x)
+        return self._forward_embedded(
+            h,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
+
+    def forward_from_panel(
+        self,
+        features: torch.Tensor,
+        date_indices: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+    ):
+        self._check_panel_shapes(features, date_indices, mask)
+        h = self._embed_windowed_from_panel(features, date_indices)
+        if mask is None:
+            mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
+        else:
+            mask_bool = mask.to(device=h.device, dtype=torch.bool)
+        return self._forward_embedded(
+            h,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
