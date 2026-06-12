@@ -21,6 +21,7 @@ class WindowedSplitTensors:
     _window_offsets: torch.Tensor = field(init=False, repr=False)
     _valid_indices_are_contiguous: bool = field(init=False, repr=False)
     _first_valid_index: int = field(init=False, repr=False)
+    _contiguous_prefix_len: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.lookback = int(self.lookback)
@@ -40,18 +41,24 @@ class WindowedSplitTensors:
         if int(self.valid_indices.numel()) == 0:
             self._valid_indices_are_contiguous = True
             self._first_valid_index = 0
+            self._contiguous_prefix_len = 0
         else:
             self._first_valid_index = int(self.valid_indices[0].detach().cpu().item())
             if int(self.valid_indices.numel()) == 1:
                 self._valid_indices_are_contiguous = True
+                self._contiguous_prefix_len = 1
             else:
                 expected_last = self._first_valid_index + int(self.valid_indices.numel()) - 1
                 actual_last = int(self.valid_indices[-1].detach().cpu().item())
-                if actual_last != expected_last:
-                    self._valid_indices_are_contiguous = False
+                diffs = self.valid_indices[1:] - self.valid_indices[:-1]
+                contiguous_diffs = (diffs == 1).detach().cpu()
+                if bool(torch.all(contiguous_diffs).item()):
+                    self._valid_indices_are_contiguous = actual_last == expected_last
+                    self._contiguous_prefix_len = int(self.valid_indices.numel())
                 else:
-                    diffs = self.valid_indices[1:] - self.valid_indices[:-1]
-                    self._valid_indices_are_contiguous = bool(torch.all(diffs == 1).detach().cpu().item())
+                    first_break = int((~contiguous_diffs).nonzero(as_tuple=False)[0].item())
+                    self._valid_indices_are_contiguous = False
+                    self._contiguous_prefix_len = first_break + 1
 
     def __len__(self) -> int:
         return int(self.valid_indices.numel())
@@ -277,7 +284,7 @@ class WindowedSplitTensors:
     ) -> dict[str, torch.Tensor]:
         if end < start:
             raise ValueError("end must be >= start")
-        if self._valid_indices_are_contiguous:
+        if int(start) >= 0 and int(end) <= self._contiguous_prefix_len:
             return self._batch_from_contiguous_rows(start, end, device, non_blocking)
         rows = torch.arange(int(start), int(end), dtype=torch.long, device=self.valid_indices.device)
         return self._batch_from_row_indices(rows, device, non_blocking)
@@ -291,7 +298,7 @@ class WindowedSplitTensors:
     ) -> dict[str, torch.Tensor]:
         if end < start:
             raise ValueError("end must be >= start")
-        if self._valid_indices_are_contiguous:
+        if int(start) >= 0 and int(end) <= self._contiguous_prefix_len:
             return self._batch_metadata_from_contiguous_rows(start, end, device, non_blocking)
         rows = torch.arange(int(start), int(end), dtype=torch.long, device=self.valid_indices.device)
         return self._batch_metadata_from_row_indices(rows, device, non_blocking)

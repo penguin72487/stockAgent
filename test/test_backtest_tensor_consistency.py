@@ -19,7 +19,9 @@ from stockagent.training.trainer import (
     _evaluate_windowed_tensor_batch,
     _maybe_share_windowed_base_from_cached,
     _PanelSlabForwardWrapper,
+    _pad_windowed_training_split,
     _prepare_windowed_split,
+    TimingBreakdown,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -446,6 +448,27 @@ def test_windowed_contiguous_fast_path_matches_indexed_path() -> None:
         assert torch.equal(fast[key], indexed[key]), key
 
 
+def test_padded_windowed_training_split_keeps_contiguous_prefix_fast_path() -> None:
+    panel = _make_panel(rows=10, symbols=4, features=3)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+    split = _pad_windowed_training_split(dataset_to_windowed_tensors(dataset), batch_size=4)
+
+    assert not split._valid_indices_are_contiguous
+    assert split._contiguous_prefix_len == len(dataset)
+
+    first_batch = split.batch_metadata_by_rows(0, 4, torch.device("cpu"), non_blocking=False)
+    tail_batch = split.batch_metadata_by_rows(8, 12, torch.device("cpu"), non_blocking=False)
+
+    assert first_batch["date_indices"].tolist() == [1, 2, 3, 4]
+    assert first_batch["date_start"].tolist() == [1]
+    assert bool(first_batch["rows_are_contiguous"].item()) is True
+    assert first_batch["sample_mask"].tolist() == [True, True, True, True]
+    assert tail_batch["date_indices"].tolist() == [9, 9, 9, 9]
+    assert tail_batch["date_start"].tolist() == [9]
+    assert bool(tail_batch["rows_are_contiguous"].item()) is False
+    assert tail_batch["sample_mask"].tolist() == [True, False, False, False]
+
+
 def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> None:
     panel = _make_panel(rows=12, symbols=4, features=3)
     first_ds = CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
@@ -609,6 +632,34 @@ def test_evaluate_windowed_tensor_batch_panel_slab_wrapper_matches_generic_panel
     assert torch.allclose(slab_bt.strategy_returns.cpu(), generic_bt.strategy_returns.cpu(), atol=1e-7, rtol=1e-6)
     assert torch.allclose(slab_bt.turnovers.cpu(), generic_bt.turnovers.cpu(), atol=1e-7, rtol=1e-6)
     assert torch.allclose(slab_bt.weights_history.cpu(), generic_bt.weights_history.cpu(), atol=1e-7, rtol=1e-6)
+
+
+def test_windowed_eval_timing_breaks_out_batch_prepare_and_h2d() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=1)
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+    split = dataset_to_windowed_tensors(dataset)
+    timing = TimingBreakdown()
+
+    _evaluate_windowed_tensor_batch(
+        _EchoWeightModel(),
+        None,
+        split,
+        torch.device("cpu"),
+        None,
+        False,
+        True,
+        0.001,
+        0.003,
+        0.55,
+        1.0,
+        chunk_rows=3,
+        timing_out=timing,
+    )
+
+    assert timing.batch_prepare_s > 0.0
+    assert timing.window_materialize_s > 0.0
+    assert timing.h2d_transfer_s >= 0.0
+    assert timing.transfer_s + 1e-9 >= timing.batch_prepare_s + timing.h2d_transfer_s
 
 
 def test_evaluate_windowed_tensor_batch_decoupled_matches_old_chunking() -> None:
