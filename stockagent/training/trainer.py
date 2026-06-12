@@ -10,11 +10,12 @@ import subprocess
 import sys
 import time
 import gc
+import inspect
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -361,13 +362,47 @@ def _profile_trace_dir() -> Path:
     return path
 
 
-def _extract_weights_and_aux(model_output: torch.Tensor | dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+def _extract_weights_and_aux(
+    model_output: torch.Tensor | dict[str, torch.Tensor] | tuple[Any, ...],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
     if isinstance(model_output, dict):
         if "weights" not in model_output:
             raise ValueError("Model output dict must include 'weights'")
         weights = model_output["weights"]
         return weights, model_output
+    if isinstance(model_output, tuple):
+        weights = model_output[0]
+        aux = model_output[2] if len(model_output) >= 3 and isinstance(model_output[2], dict) else None
+        return weights, aux
     return model_output, None
+
+
+def _model_accepts_return_aux(model: nn.Module) -> bool:
+    target = _unwrap_model(model)
+    cached = getattr(target, "_stockagent_accepts_return_aux", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        accepts = "return_aux" in inspect.signature(target.forward).parameters
+    except (TypeError, ValueError):
+        accepts = hasattr(target, "return_aux")
+    try:
+        setattr(target, "_stockagent_accepts_return_aux", bool(accepts))
+    except Exception:
+        pass
+    return bool(accepts)
+
+
+def _call_model(
+    model: nn.Module,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    return_aux: bool | None = None,
+):
+    if return_aux is None or not _model_accepts_return_aux(model):
+        return model(x, mask)
+    return model(x, mask, return_aux=return_aux)
 
 
 def _print_backward_top10(prof_obj: profile) -> None:
@@ -1687,6 +1722,124 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return getattr(model, "_orig_mod", model)
 
 
+def _panel_forward_module(model: nn.Module) -> nn.Module | None:
+    if hasattr(model, "forward_from_panel"):
+        return model
+    unwrapped = _unwrap_model(model)
+    return unwrapped if hasattr(unwrapped, "forward_from_panel") else None
+
+
+def _model_supports_panel_forward(model: nn.Module) -> bool:
+    return _panel_forward_module(model) is not None
+
+
+def _panel_slab_forward_module(model: nn.Module) -> nn.Module | None:
+    if hasattr(model, "forward_from_panel_slab"):
+        return model
+    unwrapped = _unwrap_model(model)
+    return unwrapped if hasattr(unwrapped, "forward_from_panel_slab") else None
+
+
+def _model_supports_panel_slab_forward(model: nn.Module) -> bool:
+    return _panel_slab_forward_module(model) is not None
+
+
+class _PanelSlabForwardWrapper(nn.Module):
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        slab_model = _panel_slab_forward_module(model)
+        if slab_model is None:
+            raise ValueError("model does not support forward_from_panel_slab")
+        self.model = slab_model
+
+    def forward(self, feature_slab: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_from_panel_slab(feature_slab, mask, return_aux=False)
+
+
+def _metadata_rows_are_contiguous(batch: Mapping[str, torch.Tensor]) -> bool:
+    flag = batch.get("rows_are_contiguous")
+    if flag is not None:
+        return bool(flag.detach().cpu().item())
+    date_indices = batch.get("date_indices")
+    if date_indices is None or int(date_indices.numel()) <= 1:
+        return True
+    diffs = date_indices[1:] - date_indices[:-1]
+    return bool(torch.all(diffs == 1).detach().cpu().item())
+
+
+def _feature_slab_from_metadata(
+    split: WindowedSplitTensors,
+    batch: Mapping[str, torch.Tensor],
+    device: torch.device,
+    non_blocking: bool,
+    *,
+    rows: int | None = None,
+) -> torch.Tensor | None:
+    if not _metadata_rows_are_contiguous(batch):
+        return None
+    date_start_tensor = batch.get("date_start")
+    if date_start_tensor is None:
+        date_indices = batch.get("date_indices")
+        if date_indices is None or int(date_indices.numel()) == 0:
+            return None
+        date_start_tensor = date_indices[:1]
+    if int(date_start_tensor.numel()) == 0:
+        return None
+    batch_rows = int(rows) if rows is not None else int(batch["date_indices"].numel())
+    if batch_rows <= 0:
+        return None
+    date_start = int(date_start_tensor.reshape(-1)[0].detach().cpu().item())
+    feature_start = date_start - int(split.lookback) + 1
+    slab_rows = batch_rows + int(split.lookback) - 1
+    if feature_start < 0 or feature_start + slab_rows > int(split.features.size(0)):
+        return None
+    feature_slab = split.features.narrow(0, feature_start, slab_rows)
+    if feature_slab.device != device:
+        feature_slab = feature_slab.to(device=device, non_blocking=non_blocking)
+    return feature_slab
+
+
+def _call_panel_forward_for_batch(
+    *,
+    panel_forward_model: nn.Module,
+    panel_slab_model: nn.Module | None,
+    split: WindowedSplitTensors,
+    batch: Mapping[str, torch.Tensor],
+    mask: torch.Tensor,
+    device: torch.device,
+    non_blocking: bool,
+    return_aux: bool | None,
+    allow_slab: bool = True,
+    rows: int | None = None,
+):
+    if allow_slab and panel_slab_model is not None and return_aux is False:
+        feature_slab = _feature_slab_from_metadata(
+            split,
+            batch,
+            device,
+            non_blocking,
+            rows=rows,
+        )
+        if feature_slab is not None:
+            return panel_slab_model(feature_slab, mask)
+    return panel_forward_model.forward_from_panel(
+        split.features,
+        batch["date_indices"],
+        mask,
+        return_aux=return_aux,
+    )
+
+
+def _training_needs_aux(objective: str, factor_aug_kwargs: dict[str, float] | None = None) -> bool:
+    objective_norm = str(objective).strip().lower()
+    return objective_norm in {
+        "rank_ic",
+        "pure_rank",
+        "factor_generalization",
+        "portfolio_autoencoder",
+    } or bool(factor_aug_kwargs)
+
+
 def _state_dict_for_save(model: nn.Module) -> dict[str, torch.Tensor]:
     return _unwrap_model(model).state_dict()
 
@@ -1718,7 +1871,46 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
     cleaned_state_dict = {
         key.removeprefix("_orig_mod."): value for key, value in state_dict.items()
     }
-    _unwrap_model(model).load_state_dict(cleaned_state_dict)
+    target = _unwrap_model(model)
+    try:
+        target.load_state_dict(cleaned_state_dict)
+        return
+    except RuntimeError as exc:
+        message = str(exc)
+        if not (hasattr(target, "forward_from_panel") and "Unexpected key(s)" in message):
+            raise
+
+    incompatible = target.load_state_dict(cleaned_state_dict, strict=False)
+    allowed_prefixes = (
+        "cross_blocks.",
+        "joint_blocks.",
+        "latent_queries",
+        "market_queries",
+        "dynamic_latent_generator.",
+        "dynamic_market_generator.",
+        "latent_blocks.",
+        "market_blocks.",
+        "stock_read_latent_blocks.",
+        "stock_read_market_blocks.",
+    )
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+    missing = list(getattr(incompatible, "missing_keys", []))
+    disallowed_unexpected = [
+        key for key in unexpected if not any(key.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+    if missing or disallowed_unexpected:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:8]}")
+        if disallowed_unexpected:
+            details.append(f"unexpected={disallowed_unexpected[:8]}")
+        raise RuntimeError("Checkpoint is incompatible with model state_dict: " + ", ".join(details))
+    if unexpected:
+        _progress(
+            "Loaded checkpoint with strict=False; ignored unused TransformerBasePortfolioModel keys: "
+            + ", ".join(unexpected[:8])
+            + (" ..." if len(unexpected) > 8 else "")
+        )
 
 
 def _save_fold_checkpoint(
@@ -2612,8 +2804,33 @@ def _prepare_windowed_split(
     split: WindowedSplitTensors,
     device: torch.device,
     non_blocking: bool,
+    *,
+    shared_base: WindowedSplitTensors | None = None,
+    name: str | None = None,
 ) -> WindowedSplitTensors:
     pin_memory = device.type == "cuda" and non_blocking
+    if shared_base is not None and _windowed_base_compatible(split, shared_base):
+        if name:
+            _progress(f"[windowed base] reused prepared shared base tensors for {name}")
+        if _tensor_on_requested_device(shared_base.features, device):
+            valid_indices = split.valid_indices.to(device=device, non_blocking=non_blocking)
+            sample_mask = None
+            if split.sample_mask is not None:
+                sample_mask = split.sample_mask.to(device=device, non_blocking=non_blocking)
+        else:
+            valid_indices = _prepare_host_tensor(split.valid_indices, pin_memory)
+            sample_mask = None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory)
+        return WindowedSplitTensors(
+            features=shared_base.features,
+            valid_indices=valid_indices,
+            future_log_returns=shared_base.future_log_returns,
+            tradable_mask=shared_base.tradable_mask,
+            can_buy_mask=shared_base.can_buy_mask,
+            can_sell_mask=shared_base.can_sell_mask,
+            benchmark=shared_base.benchmark,
+            lookback=split.lookback,
+            sample_mask=sample_mask,
+        )
     return WindowedSplitTensors(
         features=_prepare_host_tensor(split.features, pin_memory),
         valid_indices=_prepare_host_tensor(split.valid_indices, pin_memory),
@@ -2627,6 +2844,97 @@ def _prepare_windowed_split(
     )
 
 
+def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor, ...]:
+    return (
+        split.features,
+        split.future_log_returns,
+        split.tradable_mask,
+        split.can_buy_mask,
+        split.can_sell_mask,
+        split.benchmark,
+    )
+
+
+def _windowed_metadata_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor, ...]:
+    if split.sample_mask is None:
+        return (split.valid_indices,)
+    return (split.valid_indices, split.sample_mask)
+
+
+def _with_windowed_base(
+    split: WindowedSplitTensors,
+    base_tensors: tuple[torch.Tensor, ...],
+) -> WindowedSplitTensors:
+    return WindowedSplitTensors(
+        features=base_tensors[0],
+        valid_indices=split.valid_indices,
+        future_log_returns=base_tensors[1],
+        tradable_mask=base_tensors[2],
+        can_buy_mask=base_tensors[3],
+        can_sell_mask=base_tensors[4],
+        benchmark=base_tensors[5],
+        lookback=split.lookback,
+        sample_mask=split.sample_mask,
+    )
+
+
+def _with_windowed_metadata(
+    split: WindowedSplitTensors,
+    metadata_tensors: tuple[torch.Tensor, ...],
+) -> WindowedSplitTensors:
+    return WindowedSplitTensors(
+        features=split.features,
+        valid_indices=metadata_tensors[0],
+        future_log_returns=split.future_log_returns,
+        tradable_mask=split.tradable_mask,
+        can_buy_mask=split.can_buy_mask,
+        can_sell_mask=split.can_sell_mask,
+        benchmark=split.benchmark,
+        lookback=split.lookback,
+        sample_mask=None if split.sample_mask is None else metadata_tensors[1],
+    )
+
+
+def _maybe_cache_windowed_base_on_device(
+    *,
+    name: str,
+    split: WindowedSplitTensors,
+    device: torch.device,
+    enabled: bool,
+    target_fraction: float,
+    safety_margin_gb: float,
+) -> WindowedSplitTensors:
+    moved = _maybe_cache_tensors_on_device(
+        name=f"{name} shared base",
+        tensors=_windowed_base_tensors(split),
+        device=device,
+        enabled=enabled,
+        target_fraction=target_fraction,
+        safety_margin_gb=safety_margin_gb,
+    )
+    return _with_windowed_base(split, moved)
+
+
+def _maybe_cache_windowed_metadata_on_device(
+    *,
+    name: str,
+    split: WindowedSplitTensors,
+    device: torch.device,
+    enabled: bool,
+    target_fraction: float,
+    safety_margin_gb: float,
+) -> WindowedSplitTensors:
+    moved = _maybe_cache_tensors_on_device(
+        name=f"{name} metadata",
+        tensors=_windowed_metadata_tensors(split),
+        device=device,
+        enabled=enabled,
+        target_fraction=target_fraction,
+        safety_margin_gb=safety_margin_gb,
+    )
+    return _with_windowed_metadata(split, moved)
+
+
 def _maybe_cache_windowed_split_on_device(
     *,
     name: str,
@@ -2636,46 +2944,21 @@ def _maybe_cache_windowed_split_on_device(
     target_fraction: float,
     safety_margin_gb: float,
 ) -> WindowedSplitTensors:
-    tensors: tuple[torch.Tensor, ...]
-    if split.sample_mask is None:
-        tensors = (
-            split.features,
-            split.valid_indices,
-            split.future_log_returns,
-            split.tradable_mask,
-            split.can_buy_mask,
-            split.can_sell_mask,
-            split.benchmark,
-        )
-    else:
-        tensors = (
-            split.features,
-            split.valid_indices,
-            split.future_log_returns,
-            split.tradable_mask,
-            split.can_buy_mask,
-            split.can_sell_mask,
-            split.benchmark,
-            split.sample_mask,
-        )
-    moved = _maybe_cache_tensors_on_device(
+    split = _maybe_cache_windowed_base_on_device(
         name=name,
-        tensors=tensors,
+        split=split,
         device=device,
         enabled=enabled,
         target_fraction=target_fraction,
         safety_margin_gb=safety_margin_gb,
     )
-    return WindowedSplitTensors(
-        features=moved[0],
-        valid_indices=moved[1],
-        future_log_returns=moved[2],
-        tradable_mask=moved[3],
-        can_buy_mask=moved[4],
-        can_sell_mask=moved[5],
-        benchmark=moved[6],
-        lookback=split.lookback,
-        sample_mask=None if split.sample_mask is None else moved[7],
+    return _maybe_cache_windowed_metadata_on_device(
+        name=name,
+        split=split,
+        device=device,
+        enabled=enabled,
+        target_fraction=target_fraction,
+        safety_margin_gb=safety_margin_gb,
     )
 
 
@@ -2761,6 +3044,39 @@ def _pad_eval_chunk_first_dim(
     benchmark_pad = benchmark.new_zeros((pad_rows,) + tuple(benchmark.shape[1:]))
     return (
         torch.cat((x, x_pad), dim=0),
+        torch.cat((returns, returns_pad), dim=0),
+        torch.cat((tradable_mask, tradable_pad), dim=0),
+        torch.cat((can_buy_mask, buy_pad), dim=0),
+        torch.cat((can_sell_mask, sell_pad), dim=0),
+        torch.cat((benchmark, benchmark_pad), dim=0),
+        valid_rows,
+    )
+
+
+def _pad_eval_metadata_first_dim(
+    date_indices: torch.Tensor,
+    returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    benchmark: torch.Tensor,
+    *,
+    target_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    valid_rows = int(date_indices.size(0))
+    target_rows = int(target_rows)
+    if valid_rows <= 0 or valid_rows >= target_rows:
+        return date_indices, returns, tradable_mask, can_buy_mask, can_sell_mask, benchmark, valid_rows
+
+    pad_rows = target_rows - valid_rows
+    date_pad = date_indices[-1:].expand(pad_rows)
+    returns_pad = returns.new_zeros((pad_rows,) + tuple(returns.shape[1:]))
+    tradable_pad = tradable_mask.new_zeros((pad_rows,) + tuple(tradable_mask.shape[1:]))
+    buy_pad = can_buy_mask.new_zeros((pad_rows,) + tuple(can_buy_mask.shape[1:]))
+    sell_pad = can_sell_mask.new_zeros((pad_rows,) + tuple(can_sell_mask.shape[1:]))
+    benchmark_pad = benchmark.new_zeros((pad_rows,) + tuple(benchmark.shape[1:]))
+    return (
+        torch.cat((date_indices, date_pad), dim=0),
         torch.cat((returns, returns_pad), dim=0),
         torch.cat((tradable_mask, tradable_pad), dim=0),
         torch.cat((can_buy_mask, buy_pad), dim=0),
@@ -3130,7 +3446,7 @@ def _evaluate_tensor_batch_decoupled(
 
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
-                model_output_chunk = model(x_chunk, mask_chunk_padded)
+                model_output_chunk = _call_model(model, x_chunk, mask_chunk_padded, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
             forward_elapsed = time.perf_counter() - forward_start
@@ -3325,7 +3641,7 @@ def _evaluate_tensor_batch(
                 _progress(f"{progress_label}: chunk {chunk_idx}/{total_chunks} forward model")
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
-                model_output_chunk = model(x_chunk, mask_chunk)
+                model_output_chunk = _call_model(model, x_chunk, mask_chunk, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
             chunk_forward_elapsed = time.perf_counter() - forward_start
@@ -3569,6 +3885,7 @@ def _evaluate_tensor_batch(
 
 def _evaluate_windowed_tensor_batch_decoupled(
     model: nn.Module,
+    panel_slab_model: nn.Module | None,
     split: WindowedSplitTensors,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -3589,6 +3906,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
     reset_at_rows: Sequence[int] | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
+    if panel_slab_model is not None:
+        panel_slab_model.eval()
     total_rows = len(split)
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
@@ -3618,6 +3937,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
     buy_mask_all: torch.Tensor | None = None
     sell_mask_all: torch.Tensor | None = None
     benchmark_all: torch.Tensor | None = None
+    panel_forward_model = _panel_forward_module(model)
 
     with torch.inference_mode():
         for chunk_idx, (start, end) in enumerate(model_ranges, start=1):
@@ -3626,36 +3946,75 @@ def _evaluate_windowed_tensor_batch_decoupled(
             if log_chunk_progress:
                 _progress(f"{progress_label}: model chunk {chunk_idx}/{len(model_ranges)} rows=[{start},{end})")
             chunk_start = time.perf_counter()
-            batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
-            x_chunk = batch["x"]
+            if panel_forward_model is not None:
+                batch = split.batch_metadata_by_rows(start, end, device=device, non_blocking=non_blocking)
+                date_indices_chunk = batch["date_indices"]
+            else:
+                batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+                x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
-            (
-                x_chunk,
-                returns_chunk_padded,
-                mask_chunk_padded,
-                buy_mask_chunk_padded,
-                sell_mask_chunk_padded,
-                bench_chunk_padded,
-                valid_rows,
-            ) = _pad_eval_chunk_first_dim(
-                x_chunk,
-                returns_chunk,
-                mask_chunk,
-                buy_mask_chunk,
-                sell_mask_chunk,
-                bench_chunk,
-                target_rows=model_chunk_rows,
-            )
+            if panel_forward_model is not None:
+                (
+                    date_indices_chunk,
+                    returns_chunk_padded,
+                    mask_chunk_padded,
+                    buy_mask_chunk_padded,
+                    sell_mask_chunk_padded,
+                    bench_chunk_padded,
+                    valid_rows,
+                ) = _pad_eval_metadata_first_dim(
+                    date_indices_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    target_rows=model_chunk_rows,
+                )
+                panel_batch_for_forward = dict(batch)
+                panel_batch_for_forward["date_indices"] = date_indices_chunk
+            else:
+                (
+                    x_chunk,
+                    returns_chunk_padded,
+                    mask_chunk_padded,
+                    buy_mask_chunk_padded,
+                    sell_mask_chunk_padded,
+                    bench_chunk_padded,
+                    valid_rows,
+                ) = _pad_eval_chunk_first_dim(
+                    x_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    target_rows=model_chunk_rows,
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.transfer_s += time.perf_counter() - chunk_start
 
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
-                model_output_chunk = model(x_chunk, mask_chunk_padded)
+                if panel_forward_model is not None:
+                    model_output_chunk = _call_panel_forward_for_batch(
+                        panel_forward_model=panel_forward_model,
+                        panel_slab_model=panel_slab_model,
+                        split=split,
+                        batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
+                        mask=mask_chunk_padded,
+                        device=device,
+                        non_blocking=non_blocking,
+                        return_aux=False,
+                        allow_slab=int(valid_rows) == int(model_chunk_rows),
+                        rows=int(valid_rows),
+                    )
+                else:
+                    model_output_chunk = _call_model(model, x_chunk, mask_chunk_padded, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
             forward_elapsed = time.perf_counter() - forward_start
@@ -3730,6 +4089,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
 
 def _evaluate_windowed_tensor_batch(
     model: nn.Module,
+    panel_slab_model: nn.Module | None,
     split: WindowedSplitTensors,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -3753,6 +4113,7 @@ def _evaluate_windowed_tensor_batch(
     if effective_backtest_chunk_rows != int(chunk_rows):
         return _evaluate_windowed_tensor_batch_decoupled(
             model,
+            panel_slab_model,
             split,
             device,
             amp_dtype,
@@ -3773,6 +4134,8 @@ def _evaluate_windowed_tensor_batch(
             reset_at_rows=reset_at_rows,
         )
     model.eval()
+    if panel_slab_model is not None:
+        panel_slab_model.eval()
     total_rows_for_eval = len(split)
     if total_rows_for_eval <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
@@ -3828,6 +4191,7 @@ def _evaluate_windowed_tensor_batch(
             f"chunk_rows={chunk_rows} chunks={total_chunks}"
         )
 
+    panel_forward_model = _panel_forward_module(model)
     with torch.inference_mode():
         prev_weights: torch.Tensor | None = None
         for chunk_idx, (start, end, reset_state) in enumerate(eval_ranges, start=1):
@@ -3836,36 +4200,75 @@ def _evaluate_windowed_tensor_batch(
             _maybe_cudagraph_step_begin()
             log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_chunks)
             chunk_start = time.perf_counter()
-            batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
-            x_chunk = batch["x"]
+            if panel_forward_model is not None:
+                batch = split.batch_metadata_by_rows(start, end, device=device, non_blocking=non_blocking)
+                date_indices_chunk = batch["date_indices"]
+            else:
+                batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+                x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
-            (
-                x_chunk,
-                returns_chunk,
-                mask_chunk,
-                buy_mask_chunk,
-                sell_mask_chunk,
-                bench_chunk,
-                valid_rows,
-            ) = _pad_eval_chunk_first_dim(
-                x_chunk,
-                returns_chunk,
-                mask_chunk,
-                buy_mask_chunk,
-                sell_mask_chunk,
-                bench_chunk,
-                target_rows=chunk_rows,
-            )
+            if panel_forward_model is not None:
+                (
+                    date_indices_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    valid_rows,
+                ) = _pad_eval_metadata_first_dim(
+                    date_indices_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    target_rows=chunk_rows,
+                )
+                panel_batch_for_forward = dict(batch)
+                panel_batch_for_forward["date_indices"] = date_indices_chunk
+            else:
+                (
+                    x_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    valid_rows,
+                ) = _pad_eval_chunk_first_dim(
+                    x_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    buy_mask_chunk,
+                    sell_mask_chunk,
+                    bench_chunk,
+                    target_rows=chunk_rows,
+                )
             _maybe_sync_cuda(device, profile_timing)
             timing.transfer_s += time.perf_counter() - chunk_start
 
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
-                model_output_chunk = model(x_chunk, mask_chunk)
+                if panel_forward_model is not None:
+                    model_output_chunk = _call_panel_forward_for_batch(
+                        panel_forward_model=panel_forward_model,
+                        panel_slab_model=panel_slab_model,
+                        split=split,
+                        batch=batch if int(valid_rows) == int(chunk_rows) else panel_batch_for_forward,
+                        mask=mask_chunk,
+                        device=device,
+                        non_blocking=non_blocking,
+                        return_aux=False,
+                        allow_slab=int(valid_rows) == int(chunk_rows),
+                        rows=int(valid_rows),
+                    )
+                else:
+                    model_output_chunk = _call_model(model, x_chunk, mask_chunk, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
             _maybe_sync_cuda(device, profile_timing)
             chunk_forward_elapsed = time.perf_counter() - forward_start
@@ -5304,6 +5707,7 @@ def _train_epoch_tensor(
     sequential_return_objective = _is_return_series_objective(objective)
     use_fused_log_utility = fused_loss_fn is not None and _is_log_utility_objective(objective)
     batch_order = list(range(num_batches)) if sequential_return_objective else torch.randperm(num_batches).tolist()
+    model_return_aux = None if _training_needs_aux(objective, factor_aug_kwargs) else False
     portfolio_prev_weights: torch.Tensor | None = None
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
@@ -5345,7 +5749,7 @@ def _train_epoch_tensor(
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
             with _cuda_timing(timing, "model_forward_cuda_s", device):
-                model_output = model(batch_x, batch_mask)
+                model_output = _call_model(model, batch_x, batch_mask, return_aux=model_return_aux)
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
@@ -5548,6 +5952,7 @@ def _train_epoch_tensor(
 
 def _train_epoch_windowed_tensor(
     model: nn.Module,
+    panel_slab_model: nn.Module | None,
     loss_fn: Callable[..., torch.Tensor],
     fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
     split: WindowedSplitTensors,
@@ -5591,6 +5996,8 @@ def _train_epoch_windowed_tensor(
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
+    if panel_slab_model is not None:
+        panel_slab_model.train()
     total_rows = len(split)
     if total_rows == 0:
         return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
@@ -5599,6 +6006,9 @@ def _train_epoch_windowed_tensor(
     sequential_return_objective = _is_return_series_objective(objective)
     use_fused_log_utility = fused_loss_fn is not None and _is_log_utility_objective(objective)
     batch_order = list(range(num_batches)) if sequential_return_objective else torch.randperm(num_batches).tolist()
+    panel_forward_model = _panel_forward_module(model)
+    use_panel_forward = panel_forward_model is not None and not bool(factor_aug_kwargs)
+    model_return_aux = None if _training_needs_aux(objective, factor_aug_kwargs) else False
     portfolio_prev_weights: torch.Tensor | None = None
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
     steps = 0
@@ -5620,8 +6030,12 @@ def _train_epoch_windowed_tensor(
         timing.fetch_s += time.perf_counter() - batch_start
 
         transfer_start = time.perf_counter()
-        batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
-        batch_x = batch["x"]
+        if use_panel_forward:
+            batch = split.batch_metadata_by_rows(start, end, device=device, non_blocking=non_blocking)
+            batch_x = None
+        else:
+            batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+            batch_x = batch["x"]
         batch_ret = batch["future_log_returns"]
         batch_mask = batch["tradable_mask"]
         batch_buy_mask = batch["can_buy_mask"]
@@ -5637,7 +6051,23 @@ def _train_epoch_windowed_tensor(
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
             with _cuda_timing(timing, "model_forward_cuda_s", device):
-                model_output = model(batch_x, batch_mask)
+                if use_panel_forward:
+                    if panel_forward_model is None:
+                        raise RuntimeError("panel forward model unexpectedly unavailable")
+                    model_output = _call_panel_forward_for_batch(
+                        panel_forward_model=panel_forward_model,
+                        panel_slab_model=panel_slab_model,
+                        split=split,
+                        batch=batch,
+                        mask=batch_mask,
+                        device=device,
+                        non_blocking=non_blocking,
+                        return_aux=model_return_aux,
+                    )
+                else:
+                    if batch_x is None:
+                        raise RuntimeError("window tensor batch unexpectedly unavailable")
+                    model_output = _call_model(model, batch_x, batch_mask, return_aux=model_return_aux)
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
@@ -6781,7 +7211,12 @@ def run_training(
         if use_windowed_tensors:
             _progress(f"[Train {train_years}] setup train tensors: lazy windowed split")
             train_windowed = _pad_windowed_training_split(dataset_to_windowed_tensors(train_ds), train_batch_size)
-            train_windowed = _prepare_windowed_split(train_windowed, device, non_blocking)
+            train_windowed = _prepare_windowed_split(
+                train_windowed,
+                device,
+                non_blocking,
+                name=f"train windowed tensors {train_years}",
+            )
             train_x = None
             train_returns = None
             train_masks = None
@@ -6877,7 +7312,13 @@ def run_training(
         if use_windowed_tensors:
             _progress(f"[Train {train_years}] setup validation tensors: lazy windowed split")
             combined_val_windowed, val_lengths = _combine_datasets_to_windowed(val_datasets)
-            combined_val_windowed = _prepare_windowed_split(combined_val_windowed, device, non_blocking)
+            combined_val_windowed = _prepare_windowed_split(
+                combined_val_windowed,
+                device,
+                non_blocking,
+                shared_base=train_windowed,
+                name=f"validation windowed tensors {train_years}",
+            )
             combined_val_x = None
             combined_val_returns = None
             combined_val_masks = None
@@ -6928,7 +7369,13 @@ def run_training(
         if use_windowed_tensors:
             _progress(f"[Train {train_years}] setup test tensors: lazy windowed split")
             combined_test_windowed, test_lengths = _combine_datasets_to_windowed(test_datasets)
-            combined_test_windowed = _prepare_windowed_split(combined_test_windowed, device, non_blocking)
+            combined_test_windowed = _prepare_windowed_split(
+                combined_test_windowed,
+                device,
+                non_blocking,
+                shared_base=train_windowed if train_windowed is not None else combined_val_windowed,
+                name=f"test windowed tensors {train_years}",
+            )
             combined_test_x = None
             combined_test_returns = None
             combined_test_masks = None
@@ -6986,6 +7433,11 @@ def run_training(
 
         compiled_train_model: nn.Module = model
         eval_model: nn.Module = model
+        panel_slab_model: nn.Module | None = None
+        panel_slab_compile_status = "off"
+        if use_windowed_tensors and _model_supports_panel_slab_forward(model):
+            panel_slab_model = _PanelSlabForwardWrapper(model)
+            panel_slab_compile_status = "eager"
         compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
         use_fused_log_utility_loss = bool(getattr(config.training, "fused_log_utility_loss", True)) and _is_log_utility_objective(loss_objective)
         fused_log_utility_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -7198,6 +7650,20 @@ def run_training(
                         f"(mode={compile_mode}, dynamic=False, source={compile_source}, {reason})"
                     )
                     model_compile_status = f"enabled:{compile_source}"
+                    if panel_slab_model is not None:
+                        try:
+                            panel_slab_model = torch.compile(panel_slab_model, mode=compile_mode_arg, dynamic=False)
+                            panel_slab_compile_status = "compiled"
+                            print(
+                                f"[Train {train_years}] torch.compile panel-slab forward enabled "
+                                f"(mode={compile_mode}, dynamic=False)"
+                            )
+                        except Exception as e:
+                            panel_slab_compile_status = "fallback:eager"
+                            print(
+                                f"[Train {train_years}] torch.compile panel-slab forward failed, "
+                                f"falling back to eager slab forward: {e}"
+                            )
 
                     if compile_loss and fused_log_utility_loss_fn is not None:
                         try:
@@ -7254,6 +7720,8 @@ def run_training(
                         )
                 except Exception as e:
                     model_compile_status = "fallback:eager"
+                    if panel_slab_model is not None:
+                        panel_slab_compile_status = "eager"
                     loss_compile_status = "eager"
                     print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
@@ -7268,6 +7736,7 @@ def run_training(
             f"[Train {train_years}] optimization status: "
             f"model_compile={model_compile_status}; "
             f"eval_model={'compiled' if eval_model is compiled_train_model and compiled_train_model is not model else 'eager'}; "
+            f"panel_slab_forward={panel_slab_compile_status}; "
             f"loss_compile={loss_compile_status}; "
             f"fused_log_utility_loss={bool(fused_log_utility_loss_fn is not None)}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
@@ -7623,6 +8092,7 @@ def run_training(
             if train_windowed is not None:
                 return _train_epoch_windowed_tensor(
                     train_model,
+                    panel_slab_model,
                     compiled_loss_fn,
                     fused_log_utility_loss_fn,
                     train_windowed,
@@ -7903,6 +8373,7 @@ def run_training(
                 if combined_val_windowed is not None:
                     val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                         eval_model,
+                        panel_slab_model,
                         combined_val_windowed,
                         device,
                         amp_dtype,
@@ -8042,6 +8513,7 @@ def run_training(
                     if combined_test_windowed is not None:
                         test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                             eval_model,
+                            panel_slab_model,
                             combined_test_windowed,
                             device,
                             amp_dtype,
@@ -8320,6 +8792,7 @@ def run_training(
             if combined_val_windowed is not None:
                 val_backtest, _, _ = _evaluate_windowed_tensor_batch(
                     eval_model,
+                    panel_slab_model,
                     combined_val_windowed,
                     device,
                     amp_dtype,
@@ -8402,13 +8875,19 @@ def run_training(
 
             test_eval_start = time.perf_counter()
             if use_windowed_tensors:
+                shared_test_base = train_windowed if train_windowed is not None else combined_val_windowed
+                if shared_test_base is None:
+                    shared_test_base = combined_test_windowed
                 test_windowed = _prepare_windowed_split(
                     dataset_to_windowed_tensors(context.test_ds),
                     device,
                     non_blocking,
+                    shared_base=shared_test_base,
+                    name=f"fold {fold.fold_id} final-test windowed tensors",
                 )
                 test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
                     eval_model,
+                    panel_slab_model,
                     test_windowed,
                     device,
                     amp_dtype,

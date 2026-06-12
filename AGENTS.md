@@ -102,6 +102,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -112,7 +113,7 @@ training:
     num_latent_factors: 16
     num_market_tokens: 4
     market_layers: 1
-    dynamic_latent_tokens: true
+    dynamic_latent_tokens: false
     dynamic_market_tokens: true
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
@@ -139,6 +140,9 @@ Notes:
 - `batch_size_train: 32` improves steady-state epoch throughput versus 16 on the current benchmark, but first-epoch compile/warmup time is higher; use it for long training runs, and re-benchmark before reducing it.
 - `temporal_pooling: last` is the active user preference. It is slightly faster than attention pooling but relies on temporal blocks to carry useful history into the final token; re-check validation/test metrics after changing it.
 - For `temporal_pooling: last`, the model has a last-query temporal fast path when `return_aux_details=false`: all but the final temporal block run on the full lookback, and the final temporal block computes only the final-day query against the full context. Keep `return_aux=True` / detailed aux paths full-length for explainability parity.
+- `TransformerBasePortfolioModel.forward_from_panel(features, date_indices, mask, ...)` is the preferred lazy-window path for `WindowedSplitTensors`: it projects each unique panel date once and gathers projected `[B,L,S,D]` windows before running the same downstream temporal/market-token/score path. Preserve old `forward(x, mask, ...)` API compatibility.
+- `TransformerBasePortfolioModel.forward_from_panel_slab(feature_slab, mask, ...)` is the compile-friendly fast path for contiguous lazy-window batches: pass `[B+lookback-1,S,F]` panel slabs and keep `date_indices` / gather metadata outside the compiled model graph. It must remain numerically equivalent to materialized windows and generic `forward_from_panel` for contiguous rows.
+- Keep `temporal_query_mode: full_then_last` as the exact-ish baseline. `temporal_query_mode: last_only` is available as a faster ablation for `temporal_pooling: last`, but it changes temporal encoder semantics and must be benchmarked against validation/test metrics before becoming baseline.
 - The active `market_token` architecture should follow this low-complexity flow:
   - input `[B,L,S,F]` -> feature projection -> shared temporal encoder per stock -> `z_base [B,S,D]`
   - masked market summary is `mean + std + mean absolute dispersion`, shape `[B,3,D]`
@@ -250,6 +254,8 @@ Rules:
   - prefer `cache_train_tensors_on_gpu: true` for transfer-bound long-year runs
   - keep `cache_eval_tensors_on_gpu: true` for lazy windowed tensor runs when train/val/test can reuse the same cached base panel tensors
   - do not duplicate full `[T,S,F]` panel tensors for train/val/test windowed splits on GPU; cache the base tensors once and share them, moving only split-specific `valid_indices` / `sample_mask`
+  - prepare lazy train/val/test windowed splits with a shared base so large `[T,S,F]` tensors are not repeatedly pinned or copied before GPU caching; only split metadata should be prepared separately
+  - prefer the panel-slab forward wrapper for contiguous train/eval lazy-window batches so `torch.compile` sees fixed slab tensors instead of dynamic date-index gathers; use generic panel forward for non-contiguous rows, factor-augmented/detailed-aux paths, and padded final eval chunks
   - `_maybe_cache_tensors_on_device` must keep the VRAM safety check and skip caching if it does not fit
   - keep `eval_auto_chunk_rows_cap: 16` as the compile-safe auto-eval default unless a benchmark proves a larger compiled eval chunk is faster and stable
   - eval chunk code pads only the final ragged chunk to the configured chunk size and trims outputs back to valid rows; keep this to avoid extra compile shapes without changing canonical returns

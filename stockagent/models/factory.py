@@ -298,6 +298,7 @@ def build_model(
             temporal_heads=tbp_cfg.temporal_heads,
             temporal_ffn_mult=tbp_cfg.temporal_ffn_mult,
             temporal_pooling=tbp_cfg.temporal_pooling,
+            temporal_query_mode=tbp_cfg.temporal_query_mode,
             cross_layers=tbp_cfg.cross_layers,
             cross_heads=tbp_cfg.cross_heads,
             cross_ffn_mult=tbp_cfg.cross_ffn_mult,

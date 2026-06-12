@@ -212,6 +212,7 @@ class TransformerBasePortfolioModelConfig:
     temporal_heads: int = 4
     temporal_ffn_mult: int = 2
     temporal_pooling: str = "attention"
+    temporal_query_mode: str = "full_then_last"
     cross_layers: int = 1
     cross_heads: int = 4
     cross_ffn_mult: int = 2
@@ -732,6 +733,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("temporal_heads", 4)
     transformer_base_portfolio.setdefault("temporal_ffn_mult", 2)
     transformer_base_portfolio.setdefault("temporal_pooling", "attention")
+    transformer_base_portfolio.setdefault("temporal_query_mode", "full_then_last")
     transformer_base_portfolio.setdefault("cross_layers", 1)
     transformer_base_portfolio.setdefault("cross_heads", 4)
     transformer_base_portfolio.setdefault("cross_ffn_mult", 2)
