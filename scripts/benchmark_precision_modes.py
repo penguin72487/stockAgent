@@ -140,12 +140,12 @@ def precision_plan(mode: str) -> PrecisionPlan:
             use_grad_scaler=False,
             transformer_engine=True,
             native_backend="transformer_engine_fp8",
-            compute_label="Transformer Engine native FP8 Linear where shape-supported; BF16 fallback otherwise",
+            compute_label="Transformer Engine native FP8 Linear with padding adapter where needed; BF16 fallback otherwise",
             effective_weight_bits=8.0,
             native_amp=False,
             reason=(
-                "Native mode uses Transformer Engine FP8 kernels with dequantized backward for supported Linear shapes. "
-                "Layers with unsupported TE shape constraints remain high precision and are counted as fallback calls."
+                "Native mode uses Transformer Engine FP8 kernels with dequantized backward. "
+                "The adapter pads unsupported Linear dimensions to TE-friendly multiples and slices outputs back."
             ),
         )
     if normalized == "fp4":
@@ -157,12 +157,12 @@ def precision_plan(mode: str) -> PrecisionPlan:
             use_grad_scaler=False,
             transformer_engine=True,
             native_backend="transformer_engine_nvfp4",
-            compute_label="Transformer Engine native NVFP4 Linear where shape-supported; BF16 fallback otherwise",
+            compute_label="Transformer Engine native NVFP4 Linear with padding adapter where needed; BF16 fallback otherwise",
             effective_weight_bits=4.0,
             native_amp=False,
             reason=(
-                "Native mode uses Transformer Engine NVFP4 kernels for supported Linear shapes. "
-                "Layers with unsupported TE shape constraints remain high precision and are counted as fallback calls."
+                "Native mode uses Transformer Engine NVFP4 kernels. The adapter pads in/features, leading rows, "
+                "and out/features to TE-friendly multiples and slices outputs back."
             ),
         )
     if normalized == "nf4":
@@ -223,6 +223,12 @@ def _autocast_context(device: torch.device, dtype: torch.dtype | None):
     return autocast(device_type="cuda", enabled=True, dtype=dtype)
 
 
+def _ceil_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 1:
+        return int(value)
+    return int(math.ceil(int(value) / float(multiple)) * multiple)
+
+
 class TransformerEngineLinearCompat(nn.Module):
     def __init__(self, source: nn.Linear, backend: str) -> None:
         super().__init__()
@@ -231,19 +237,37 @@ class TransformerEngineLinearCompat(nn.Module):
         self.in_features = int(source.in_features)
         self.out_features = int(source.out_features)
         self.backend = str(backend)
+        if self.backend == "transformer_engine_nvfp4":
+            # TE NVFP4 accepts FP4 tensor elements at 16-wide granularity, but
+            # te.Linear kernels on Blackwell reject common FFN K=48 shapes.
+            # Padding K to 32 keeps every project Linear on the native path.
+            self.native_in_multiple = 32
+            self.native_out_multiple = 32
+            self.native_leading_multiple = 32
+        else:
+            self.native_in_multiple = 16
+            self.native_out_multiple = 8
+            self.native_leading_multiple = 8
+        self.native_in_features = _ceil_to_multiple(self.in_features, self.native_in_multiple)
+        self.native_out_features = _ceil_to_multiple(self.out_features, self.native_out_multiple)
         self.te_linear = te.Linear(
-            self.in_features,
-            self.out_features,
+            self.native_in_features,
+            self.native_out_features,
             bias=source.bias is not None,
             params_dtype=source.weight.dtype,
             device=source.weight.device,
         )
         with torch.no_grad():
-            self.te_linear.weight.copy_(source.weight)
+            self.te_linear.weight.zero_()
+            self.te_linear.weight[: self.out_features, : self.in_features].copy_(source.weight)
             if source.bias is not None and self.te_linear.bias is not None:
-                self.te_linear.bias.copy_(source.bias)
+                self.te_linear.bias.zero_()
+                self.te_linear.bias[: self.out_features].copy_(source.bias)
         self.native_calls = 0
         self.fallback_calls = 0
+        self.input_pad_calls = 0
+        self.leading_pad_calls = 0
+        self.output_slice_calls = 0
 
     @property
     def weight(self) -> torch.nn.Parameter:
@@ -254,25 +278,50 @@ class TransformerEngineLinearCompat(nn.Module):
         return self.te_linear.bias
 
     def _shape_can_use_native(self, x: torch.Tensor) -> bool:
-        if x.dim() == 0:
+        if x.dim() == 0 or not x.is_cuda:
             return False
-        leading = int(x.numel() // max(1, x.shape[-1]))
-        if not x.is_cuda or x.shape[-1] % 16 != 0:
+        if int(x.shape[-1]) != self.in_features:
             return False
-        if self.backend == "transformer_engine_nvfp4":
-            return leading % 32 == 0 and self.out_features % 32 == 0
-        return leading % 8 == 0 and self.out_features % 8 == 0
+        return (
+            self.native_in_features % self.native_in_multiple == 0
+            and self.native_out_features % self.native_out_multiple == 0
+        )
+
+    def _fallback_linear(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.te_linear.weight[: self.out_features, : self.in_features]
+        bias = self.te_linear.bias[: self.out_features] if self.te_linear.bias is not None else None
+        return F.linear(x, weight, bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._shape_can_use_native(x):
             try:
                 self.native_calls += 1
-                return self.te_linear(x)
+                original_shape = tuple(x.shape[:-1])
+                y_in = x
+                if self.native_in_features != self.in_features:
+                    self.input_pad_calls += 1
+                    y_in = F.pad(y_in, (0, self.native_in_features - self.in_features))
+                leading = int(y_in.numel() // max(1, self.native_in_features))
+                y_2d = y_in.reshape(leading, self.native_in_features)
+                leading_pad = (
+                    self.native_leading_multiple - leading % self.native_leading_multiple
+                ) % self.native_leading_multiple
+                if leading_pad:
+                    self.leading_pad_calls += 1
+                    y_2d = F.pad(y_2d, (0, 0, 0, leading_pad))
+                out_2d = self.te_linear(y_2d)
+                if leading_pad:
+                    out_2d = out_2d[:leading]
+                out = out_2d.reshape(*original_shape, self.native_out_features)
+                if self.native_out_features != self.out_features:
+                    self.output_slice_calls += 1
+                    out = out[..., : self.out_features]
+                return out
             except Exception:  # noqa: BLE001 - runtime shape/backend fallback.
                 self.fallback_calls += 1
         else:
             self.fallback_calls += 1
-        return F.linear(x, self.te_linear.weight, self.te_linear.bias)
+        return self._fallback_linear(x)
 
 
 def _replace_linear_modules(module: nn.Module, plan: PrecisionPlan) -> dict[str, int]:
@@ -280,7 +329,7 @@ def _replace_linear_modules(module: nn.Module, plan: PrecisionPlan) -> dict[str,
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
             stats["linear_total"] += 1
-            if plan.transformer_engine and te is not None and child.in_features % 16 == 0:
+            if plan.transformer_engine and te is not None:
                 setattr(module, name, TransformerEngineLinearCompat(child, plan.native_backend or "transformer_engine"))
                 stats["te_linear"] += 1
                 continue
@@ -304,6 +353,9 @@ def _precision_module_stats(module: nn.Module) -> dict[str, int]:
             stats["linear_total"] += 1
             stats["native_low_precision_calls"] += int(child.native_calls)
             stats["high_precision_fallback_calls"] += int(child.fallback_calls)
+            stats["input_pad_calls"] = stats.get("input_pad_calls", 0) + int(child.input_pad_calls)
+            stats["leading_pad_calls"] = stats.get("leading_pad_calls", 0) + int(child.leading_pad_calls)
+            stats["output_slice_calls"] = stats.get("output_slice_calls", 0) + int(child.output_slice_calls)
         elif isinstance(child, nn.Linear):
             stats["linear_total"] += 1
     return stats
@@ -335,11 +387,16 @@ def _te_recipe(plan: PrecisionPlan):
 
 
 def _precision_context(device: torch.device, plan: PrecisionPlan):
-    fp8_ctx = (
-        te.fp8_autocast(enabled=True, fp8_recipe=_te_recipe(plan))
-        if plan.transformer_engine and te is not None and device.type == "cuda"
-        else nullcontext()
-    )
+    recipe = _te_recipe(plan) if plan.transformer_engine and te is not None and device.type == "cuda" else None
+    if recipe is not None:
+        te_autocast = getattr(te, "autocast", None)
+        fp8_ctx = (
+            te_autocast(enabled=True, recipe=recipe)
+            if te_autocast is not None
+            else te.fp8_autocast(enabled=True, fp8_recipe=recipe)
+        )
+    else:
+        fp8_ctx = nullcontext()
     autocast_ctx = _autocast_context(device, plan.autocast_dtype)
     return _NestedContext(fp8_ctx, autocast_ctx)
 
