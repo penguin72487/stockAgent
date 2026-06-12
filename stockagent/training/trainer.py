@@ -85,6 +85,9 @@ class TimingBreakdown:
     total_s: float = 0.0
     fetch_s: float = 0.0
     transfer_s: float = 0.0
+    batch_prepare_s: float = 0.0
+    window_materialize_s: float = 0.0
+    h2d_transfer_s: float = 0.0
     forward_s: float = 0.0
     model_forward_s: float = 0.0
     model_forward_cuda_s: float = 0.0
@@ -123,6 +126,9 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
     for name in (
         "fetch_s",
         "transfer_s",
+        "batch_prepare_s",
+        "window_materialize_s",
+        "h2d_transfer_s",
         "forward_s",
         "model_forward_s",
         "model_forward_cuda_s",
@@ -162,6 +168,9 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "total_s",
         "fetch_s",
         "transfer_s",
+        "batch_prepare_s",
+        "window_materialize_s",
+        "h2d_transfer_s",
         "forward_s",
         "model_forward_s",
         "model_forward_cuda_s",
@@ -1490,6 +1499,9 @@ def _timing_curve_payload(
         "train_total_ms_per_batch": _avg_ms(train_timing.total_s),
         "train_fetch_ms_per_batch": _avg_ms(train_timing.fetch_s),
         "train_transfer_ms_per_batch": _avg_ms(train_timing.transfer_s),
+        "train_batch_prepare_ms_per_batch": _avg_ms(train_timing.batch_prepare_s),
+        "train_window_materialize_ms_per_batch": _avg_ms(train_timing.window_materialize_s),
+        "train_h2d_transfer_ms_per_batch": _avg_ms(train_timing.h2d_transfer_s),
         "train_forward_ms_per_batch": _avg_ms(train_timing.forward_s),
         "train_model_forward_ms_per_batch": _avg_ms(train_timing.model_forward_s),
         "train_model_forward_cuda_ms_per_batch": _avg_ms(train_timing.model_forward_cuda_s),
@@ -1539,6 +1551,12 @@ def _timing_curve_payload(
         "val_eval_s": float(val_eval_s),
         "val_transfer_s": float(val_timing.transfer_s),
         "val_eval_transfer_to_gpu_s": float(val_timing.transfer_s),
+        "val_batch_prepare_s": float(val_timing.batch_prepare_s),
+        "val_eval_batch_prepare_s": float(val_timing.batch_prepare_s),
+        "val_window_materialize_s": float(val_timing.window_materialize_s),
+        "val_eval_window_materialize_s": float(val_timing.window_materialize_s),
+        "val_h2d_transfer_s": float(val_timing.h2d_transfer_s),
+        "val_eval_h2d_transfer_s": float(val_timing.h2d_transfer_s),
         "val_forward_s": float(val_timing.forward_s),
         "val_eval_model_forward_s": float(val_timing.model_forward_s),
         "val_model_forward_s": float(val_timing.model_forward_s),
@@ -1559,6 +1577,12 @@ def _timing_curve_payload(
         "test_curve_loss_s": float(test_curve_loss_s),
         "test_curve_transfer_s": float(test_curve_timing.transfer_s),
         "test_curve_eval_transfer_to_gpu_s": float(test_curve_timing.transfer_s),
+        "test_curve_batch_prepare_s": float(test_curve_timing.batch_prepare_s),
+        "test_curve_eval_batch_prepare_s": float(test_curve_timing.batch_prepare_s),
+        "test_curve_window_materialize_s": float(test_curve_timing.window_materialize_s),
+        "test_curve_eval_window_materialize_s": float(test_curve_timing.window_materialize_s),
+        "test_curve_h2d_transfer_s": float(test_curve_timing.h2d_transfer_s),
+        "test_curve_eval_h2d_transfer_s": float(test_curve_timing.h2d_transfer_s),
         "test_curve_forward_s": float(test_curve_timing.forward_s),
         "test_curve_model_forward_s": float(test_curve_timing.model_forward_s),
         "test_curve_eval_model_forward_s": float(test_curve_timing.model_forward_s),
@@ -1694,10 +1718,26 @@ def _timing_curve_payload(
         "epoch_step_test_curve_transfer_percent": _epoch_percent(test_curve_timing.transfer_s),
         "epoch_step_test_curve_transfer_calls": int(test_curve_timing.batches),
         "epoch_step_test_curve_transfer_ms_per_call": _timing_ms_per_call(test_curve_timing.transfer_s, test_curve_timing.batches),
+        "epoch_step_test_curve_batch_prepare_total_time_s": float(test_curve_timing.batch_prepare_s),
+        "epoch_step_test_curve_batch_prepare_percent": _epoch_percent(test_curve_timing.batch_prepare_s),
+        "epoch_step_test_curve_batch_prepare_calls": int(test_curve_timing.batches),
+        "epoch_step_test_curve_batch_prepare_ms_per_call": _timing_ms_per_call(test_curve_timing.batch_prepare_s, test_curve_timing.batches),
+        "epoch_step_test_curve_h2d_transfer_total_time_s": float(test_curve_timing.h2d_transfer_s),
+        "epoch_step_test_curve_h2d_transfer_percent": _epoch_percent(test_curve_timing.h2d_transfer_s),
+        "epoch_step_test_curve_h2d_transfer_calls": int(test_curve_timing.batches),
+        "epoch_step_test_curve_h2d_transfer_ms_per_call": _timing_ms_per_call(test_curve_timing.h2d_transfer_s, test_curve_timing.batches),
         "epoch_step_val_transfer_total_time_s": float(val_timing.transfer_s),
         "epoch_step_val_transfer_percent": _epoch_percent(val_timing.transfer_s),
         "epoch_step_val_transfer_calls": int(val_timing.batches),
         "epoch_step_val_transfer_ms_per_call": _timing_ms_per_call(val_timing.transfer_s, val_timing.batches),
+        "epoch_step_val_batch_prepare_total_time_s": float(val_timing.batch_prepare_s),
+        "epoch_step_val_batch_prepare_percent": _epoch_percent(val_timing.batch_prepare_s),
+        "epoch_step_val_batch_prepare_calls": int(val_timing.batches),
+        "epoch_step_val_batch_prepare_ms_per_call": _timing_ms_per_call(val_timing.batch_prepare_s, val_timing.batches),
+        "epoch_step_val_h2d_transfer_total_time_s": float(val_timing.h2d_transfer_s),
+        "epoch_step_val_h2d_transfer_percent": _epoch_percent(val_timing.h2d_transfer_s),
+        "epoch_step_val_h2d_transfer_calls": int(val_timing.batches),
+        "epoch_step_val_h2d_transfer_ms_per_call": _timing_ms_per_call(val_timing.h2d_transfer_s, val_timing.batches),
     }
 
 
@@ -1797,6 +1837,29 @@ def _feature_slab_from_metadata(
     if feature_slab.device != device:
         feature_slab = feature_slab.to(device=device, non_blocking=non_blocking)
     return feature_slab
+
+
+_WINDOWED_CONTROL_KEYS = frozenset({"date_start", "rows_are_contiguous"})
+
+
+def _windowed_prepare_device(split: WindowedSplitTensors, target_device: torch.device) -> torch.device:
+    if split.features.device == target_device:
+        return target_device
+    return split.features.device
+
+
+def _move_windowed_batch_to_device(
+    batch: Mapping[str, torch.Tensor],
+    device: torch.device,
+    non_blocking: bool,
+) -> dict[str, torch.Tensor]:
+    moved: dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if key in _WINDOWED_CONTROL_KEYS:
+            moved[key] = value
+        else:
+            moved[key] = value.to(device=device, non_blocking=non_blocking)
+    return moved
 
 
 def _call_panel_forward_for_batch(
@@ -3945,18 +4008,37 @@ def _evaluate_windowed_tensor_batch_decoupled(
             log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, len(model_ranges))
             if log_chunk_progress:
                 _progress(f"{progress_label}: model chunk {chunk_idx}/{len(model_ranges)} rows=[{start},{end})")
-            chunk_start = time.perf_counter()
+            prepare_device = _windowed_prepare_device(split, device)
+            batch_prepare_start = time.perf_counter()
             if panel_forward_model is not None:
-                batch = split.batch_metadata_by_rows(start, end, device=device, non_blocking=non_blocking)
+                batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
                 date_indices_chunk = batch["date_indices"]
             else:
-                batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+                window_materialize_start = time.perf_counter()
+                batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+                _maybe_sync_cuda(prepare_device, profile_timing)
+                timing.window_materialize_s += time.perf_counter() - window_materialize_start
+                x_chunk = batch["x"]
+            _maybe_sync_cuda(prepare_device, profile_timing)
+            batch_prepare_elapsed = time.perf_counter() - batch_prepare_start
+            timing.batch_prepare_s += batch_prepare_elapsed
+
+            h2d_start = time.perf_counter()
+            batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+            if panel_forward_model is not None:
+                date_indices_chunk = batch["date_indices"]
+            else:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
+            _maybe_sync_cuda(device, profile_timing)
+            h2d_elapsed = time.perf_counter() - h2d_start
+            timing.h2d_transfer_s += h2d_elapsed
+
+            pad_start = time.perf_counter()
             if panel_forward_model is not None:
                 (
                     date_indices_chunk,
@@ -3996,7 +4078,9 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     target_rows=model_chunk_rows,
                 )
             _maybe_sync_cuda(device, profile_timing)
-            timing.transfer_s += time.perf_counter() - chunk_start
+            pad_elapsed = time.perf_counter() - pad_start
+            timing.batch_prepare_s += pad_elapsed
+            timing.transfer_s += batch_prepare_elapsed + h2d_elapsed + pad_elapsed
 
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
@@ -4199,18 +4283,37 @@ def _evaluate_windowed_tensor_batch(
                 prev_weights = None
             _maybe_cudagraph_step_begin()
             log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_chunks)
-            chunk_start = time.perf_counter()
+            prepare_device = _windowed_prepare_device(split, device)
+            batch_prepare_start = time.perf_counter()
             if panel_forward_model is not None:
-                batch = split.batch_metadata_by_rows(start, end, device=device, non_blocking=non_blocking)
+                batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
                 date_indices_chunk = batch["date_indices"]
             else:
-                batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+                window_materialize_start = time.perf_counter()
+                batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+                _maybe_sync_cuda(prepare_device, profile_timing)
+                timing.window_materialize_s += time.perf_counter() - window_materialize_start
+                x_chunk = batch["x"]
+            _maybe_sync_cuda(prepare_device, profile_timing)
+            batch_prepare_elapsed = time.perf_counter() - batch_prepare_start
+            timing.batch_prepare_s += batch_prepare_elapsed
+
+            h2d_start = time.perf_counter()
+            batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+            if panel_forward_model is not None:
+                date_indices_chunk = batch["date_indices"]
+            else:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
+            _maybe_sync_cuda(device, profile_timing)
+            h2d_elapsed = time.perf_counter() - h2d_start
+            timing.h2d_transfer_s += h2d_elapsed
+
+            pad_start = time.perf_counter()
             if panel_forward_model is not None:
                 (
                     date_indices_chunk,
@@ -4250,7 +4353,9 @@ def _evaluate_windowed_tensor_batch(
                     target_rows=chunk_rows,
                 )
             _maybe_sync_cuda(device, profile_timing)
-            timing.transfer_s += time.perf_counter() - chunk_start
+            pad_elapsed = time.perf_counter() - pad_start
+            timing.batch_prepare_s += pad_elapsed
+            timing.transfer_s += batch_prepare_elapsed + h2d_elapsed + pad_elapsed
 
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
@@ -6029,12 +6134,24 @@ def _train_epoch_windowed_tensor(
         _maybe_sync_cuda(device, profile_timing)
         timing.fetch_s += time.perf_counter() - batch_start
 
-        transfer_start = time.perf_counter()
+        prepare_device = _windowed_prepare_device(split, device)
+        batch_prepare_start = time.perf_counter()
         if use_panel_forward:
-            batch = split.batch_metadata_by_rows(start, end, device=device, non_blocking=non_blocking)
+            batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
             batch_x = None
         else:
-            batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+            window_materialize_start = time.perf_counter()
+            batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+            _maybe_sync_cuda(prepare_device, profile_timing)
+            timing.window_materialize_s += time.perf_counter() - window_materialize_start
+            batch_x = batch["x"]
+        _maybe_sync_cuda(prepare_device, profile_timing)
+        batch_prepare_elapsed = time.perf_counter() - batch_prepare_start
+        timing.batch_prepare_s += batch_prepare_elapsed
+
+        h2d_start = time.perf_counter()
+        batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        if batch_x is not None:
             batch_x = batch["x"]
         batch_ret = batch["future_log_returns"]
         batch_mask = batch["tradable_mask"]
@@ -6043,7 +6160,9 @@ def _train_epoch_windowed_tensor(
         batch_bench = batch["benchmark"]
         batch_sample_mask = batch["sample_mask"]
         _maybe_sync_cuda(device, profile_timing)
-        timing.transfer_s += time.perf_counter() - transfer_start
+        h2d_elapsed = time.perf_counter() - h2d_start
+        timing.h2d_transfer_s += h2d_elapsed
+        timing.transfer_s += batch_prepare_elapsed + h2d_elapsed
 
         _maybe_cudagraph_step_begin()
         optimizer.zero_grad(set_to_none=True)
@@ -7652,11 +7771,15 @@ def run_training(
                     model_compile_status = f"enabled:{compile_source}"
                     if panel_slab_model is not None:
                         try:
-                            panel_slab_model = torch.compile(panel_slab_model, mode=compile_mode_arg, dynamic=False)
-                            panel_slab_compile_status = "compiled"
+                            panel_slab_model = torch.compile(
+                                panel_slab_model,
+                                dynamic=False,
+                                options={"triton.cudagraphs": False},
+                            )
+                            panel_slab_compile_status = "compiled:cudagraphs_false"
                             print(
                                 f"[Train {train_years}] torch.compile panel-slab forward enabled "
-                                f"(mode={compile_mode}, dynamic=False)"
+                                "(mode=default, dynamic=False, cudagraphs=False)"
                             )
                         except Exception as e:
                             panel_slab_compile_status = "fallback:eager"

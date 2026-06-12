@@ -80,6 +80,8 @@ training:
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
+  eval_auto_chunk_rows_cap: 64
+  num_workers: 0
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
@@ -95,14 +97,14 @@ training:
     sdpa_batch_limit: 16384
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: true
+    qk_norm: false
     rope_temporal: true
     rope_base: 10000.0
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: full_then_last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -114,18 +116,18 @@ training:
     num_market_tokens: 4
     market_layers: 1
     dynamic_latent_tokens: false
-    dynamic_market_tokens: true
+    dynamic_market_tokens: false
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
-    dynamic_token_dropout: 0.1
+    dynamic_token_dropout: 0.0
     head_hidden_dim: 32
     head_layers: 1
-    dropout: 0.2
+    dropout: 0.1
     default_temperature: 1.0
     portfolio_mode: long_short
     max_full_tokens: 16384
     checkpoint_blocks: false
-    return_aux: true
+    return_aux: false
     return_aux_details: false
 ```
 
@@ -139,14 +141,15 @@ Notes:
 - Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 32`, `batch_size_eval: 16`, and `temporal_pooling: last`.
 - `batch_size_train: 32` improves steady-state epoch throughput versus 16 on the current benchmark, but first-epoch compile/warmup time is higher; use it for long training runs, and re-benchmark before reducing it.
 - `temporal_pooling: last` is the active user preference. It is slightly faster than attention pooling but relies on temporal blocks to carry useful history into the final token; re-check validation/test metrics after changing it.
-- For `temporal_pooling: last`, the model has a last-query temporal fast path when `return_aux_details=false`: all but the final temporal block run on the full lookback, and the final temporal block computes only the final-day query against the full context. Keep `return_aux=True` / detailed aux paths full-length for explainability parity.
+- For `temporal_pooling: last`, the active speed ablation uses `temporal_query_mode: last_only` to shrink the temporal autograd graph. `full_then_last` remains available as the more exact-ish path for validation ablations when metrics regress.
+- The active speed ablation sets `qk_norm: false`, `dropout: 0.1`, and `dynamic_token_dropout: 0.0` to trim attention/FFN dropout and Q/K RMS-normalization autograd nodes. Treat this as a speed baseline, not proof that the regularized model is worse; re-check validation/test metrics before making investment-quality conclusions.
 - `TransformerBasePortfolioModel.forward_from_panel(features, date_indices, mask, ...)` is the preferred lazy-window path for `WindowedSplitTensors`: it projects each unique panel date once and gathers projected `[B,L,S,D]` windows before running the same downstream temporal/market-token/score path. Preserve old `forward(x, mask, ...)` API compatibility.
 - `TransformerBasePortfolioModel.forward_from_panel_slab(feature_slab, mask, ...)` is the compile-friendly fast path for contiguous lazy-window batches: pass `[B+lookback-1,S,F]` panel slabs and keep `date_indices` / gather metadata outside the compiled model graph. It must remain numerically equivalent to materialized windows and generic `forward_from_panel` for contiguous rows.
-- Keep `temporal_query_mode: full_then_last` as the exact-ish baseline. `temporal_query_mode: last_only` is available as a faster ablation for `temporal_pooling: last`, but it changes temporal encoder semantics and must be benchmarked against validation/test metrics before becoming baseline.
+- Keep training `return_aux: false` and `return_aux_details: false` unless the objective explicitly needs aux tensors; enable aux for explainability/inference runs rather than the tight VRAM training path.
 - The active `market_token` architecture should follow this low-complexity flow:
   - input `[B,L,S,F]` -> feature projection -> shared temporal encoder per stock -> `z_base [B,S,D]`
   - masked market summary is `mean + std + mean absolute dispersion`, shape `[B,3,D]`
-  - dynamic market tokens are `static_anchor + sigmoid(gate) * delta(summary)`, with `num_market_tokens` usually `4` or `6`
+  - when dynamic market tokens are enabled, they are `static_anchor + sigmoid(gate) * delta(summary)`, with `num_market_tokens` usually `4` or `6`; the current speed ablation sets `dynamic_market_tokens: false` and uses learned static market-token anchors
   - market tokens read stocks through cross-attention with stock masks
   - stocks read updated market tokens through cross-attention
   - stock-level market gate applies `z = RMSNorm(z_base_or_factor + sigmoid(g_i) * market_delta)`
@@ -157,10 +160,10 @@ Notes:
 Modern Transformer module contract:
 
 - Keep residual connections and Pre-Norm.
-- Default modern block settings are `norm_type: rmsnorm`, `ffn_type: swiglu`, `qk_norm: true`, `rope_temporal: true`.
+- Default modern block settings are `norm_type: rmsnorm`, `ffn_type: swiglu`, `qk_norm: true`, `rope_temporal: true`; the current speed ablation deliberately overrides `qk_norm: false`.
 - Apply RoPE only to temporal attention by default. Do not apply RoPE over the stock axis unless stock order is deliberately made meaningful.
 - Keep PyTorch SDPA/Flash path enabled and keep `sdpa_batch_limit` for large `batch * symbols` temporal attention.
-- Dynamic latent/market tokens should be gated deltas around static token anchors:
+- When dynamic latent/market tokens are enabled, they should be gated deltas around static token anchors:
   - `dynamic_token = static_query + sigmoid(gate) * input_conditioned_delta`
   - use market-summary inputs from masked stock embedding mean/std/dispersion
   - keep dynamic gates small at initialization, e.g. `dynamic_token_gate_init: 0.1`
@@ -256,8 +259,9 @@ Rules:
   - do not duplicate full `[T,S,F]` panel tensors for train/val/test windowed splits on GPU; cache the base tensors once and share them, moving only split-specific `valid_indices` / `sample_mask`
   - prepare lazy train/val/test windowed splits with a shared base so large `[T,S,F]` tensors are not repeatedly pinned or copied before GPU caching; only split metadata should be prepared separately
   - prefer the panel-slab forward wrapper for contiguous train/eval lazy-window batches so `torch.compile` sees fixed slab tensors instead of dynamic date-index gathers; use generic panel forward for non-contiguous rows, factor-augmented/detailed-aux paths, and padded final eval chunks
+  - compile the panel-slab forward wrapper with `dynamic=False` and `options={"triton.cudagraphs": False}` rather than `mode="reduce-overhead"`; the reduce-overhead/cudagraphs variant was observed to segfault on the second compiled slab backward for the active RTX 4070 Ti SUPER CUDA environment
   - `_maybe_cache_tensors_on_device` must keep the VRAM safety check and skip caching if it does not fit
-  - keep `eval_auto_chunk_rows_cap: 16` as the compile-safe auto-eval default unless a benchmark proves a larger compiled eval chunk is faster and stable
+  - keep `eval_auto_chunk_rows_cap: 64` for the current speed ablation to reduce validation/test chunk overhead; re-check VRAM and epoch 2+ timing before raising it to 128
   - eval chunk code pads only the final ragged chunk to the configured chunk size and trims outputs back to valid rows; keep this to avoid extra compile shapes without changing canonical returns
   - `eval_auto_chunk_rows_cap: 32` and `batch_size_train: 64` were tested on the current single-fold lookback32 benchmark and were not adopted; cap32 had worse warmup/final eval, batch64 had worse warmup and slower steady epoch
 
@@ -286,7 +290,7 @@ Compile/runtime rules:
   - keep `torch_compile_mode: reduce-overhead`
   - `default` and `max-autotune` were slower on epoch 2 for the active `data_okx` lookback32 shape
 - Current chunk/batch benchmark result:
-  - keep `eval_model_chunk_rows: auto` with `eval_auto_chunk_rows_cap: 16`
+  - keep `eval_model_chunk_rows: auto` with `eval_auto_chunk_rows_cap: 64`
   - keep `eval_backtest_chunk_rows: 512`; larger compiled backtest chunks such as 1024/2048 stalled compilation and did not produce epoch 2 within the manual test window
   - keep `batch_size_train: 32`; `batch_size_train: 64` was only marginally faster in one epoch-2 run and changes optimizer batch granularity
   - keep `backtest_autotune: true`; disabling it was only noise-level faster in one epoch-2 run and can hurt other shapes
