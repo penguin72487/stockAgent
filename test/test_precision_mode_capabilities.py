@@ -1,7 +1,15 @@
 import torch
 import pytest
+from torch import nn
 
-from scripts.benchmark_precision_modes import _forward_loss, _make_batch, _make_model, precision_plan
+from scripts.benchmark_precision_modes import (
+    TransformerEngineLinearCompat,
+    _forward_loss,
+    _make_batch,
+    _make_model,
+    _precision_context,
+    precision_plan,
+)
 from types import SimpleNamespace
 from stockagent.training.trainer import _resolve_amp_dtype
 
@@ -48,6 +56,35 @@ def test_precision_benchmark_uses_native_low_bit_backends_only() -> None:
         assert plan.runnable is False
         assert plan.native_backend is None
         assert "native" in plan.reason.lower() or "training" in plan.reason.lower()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 padding adapter smoke requires CUDA")
+def test_nvfp4_adapter_pads_project_linear_shapes_without_fallback() -> None:
+    pytest.importorskip("transformer_engine")
+    device = torch.device("cuda")
+    plan = precision_plan("fp4")
+
+    cases = [
+        (24, 1, (7, 24)),
+        (48, 32, (3, 5, 48)),
+    ]
+    for in_features, out_features, shape in cases:
+        source = nn.Linear(in_features, out_features, device=device)
+        layer = TransformerEngineLinearCompat(source, plan.native_backend or "transformer_engine").train()
+        x = torch.randn(*shape, device=device, dtype=torch.float32, requires_grad=True)
+
+        with _precision_context(device, plan):
+            y = layer(x)
+            loss = y.float().square().mean()
+        loss.backward()
+        torch.cuda.synchronize(device)
+
+        assert tuple(y.shape) == tuple(shape[:-1]) + (out_features,)
+        assert layer.native_calls == 1
+        assert layer.fallback_calls == 0
+        assert layer.input_pad_calls >= 1
+        assert torch.isfinite(y.detach()).all().item()
+        assert torch.isfinite(x.grad.detach()).all().item()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA AMP smoke requires CUDA")
