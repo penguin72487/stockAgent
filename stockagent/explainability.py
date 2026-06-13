@@ -5,8 +5,9 @@ import gc
 import inspect
 import json
 import math
+import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -258,6 +259,84 @@ def _device_from_config(config: ExperimentConfig, override: str | None = None) -
 
 def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     return {key: value.to(device=device, non_blocking=(device.type == "cuda")) for key, value in batch.items()}
+
+
+def _slice_batch_rows(batch: dict[str, torch.Tensor], start: int, end: int) -> dict[str, torch.Tensor]:
+    start = max(0, int(start))
+    end = max(start, int(end))
+    sliced: dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and int(value.size(0)) >= end:
+            sliced[key] = value[start:end]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def _cuda_mem_get_info(device: torch.device) -> tuple[int, int] | None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.mem_get_info(device)
+    except TypeError:
+        return torch.cuda.mem_get_info()
+
+
+def _auto_explain_row_chunk_size(
+    batch: dict[str, torch.Tensor],
+    settings: ExplainabilitySettings,
+    device: torch.device,
+) -> tuple[int, dict[str, Any]]:
+    x = batch.get("x")
+    if not torch.is_tensor(x) or x.ndim != 4:
+        return 1, {"reason": "missing_x"}
+    n_rows = int(x.size(0))
+    if n_rows <= 1:
+        return max(1, n_rows), {"reason": "single_row", "rows": n_rows}
+    override = os.environ.get("STOCKAGENT_EXPLAIN_ROW_CHUNK_SIZE")
+    if override:
+        try:
+            value = max(1, min(n_rows, int(override)))
+            return value, {"reason": "env_override", "rows": n_rows, "row_chunk_size": value}
+        except ValueError:
+            pass
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return n_rows, {"reason": "non_cuda", "rows": n_rows, "row_chunk_size": n_rows}
+
+    lookback = int(x.size(1))
+    n_symbols = int(x.size(2))
+    n_features = int(x.size(3))
+    bytes_per_row = max(1, lookback * n_symbols * n_features * 4)
+    mem_info = _cuda_mem_get_info(device)
+    free_bytes, total_bytes = mem_info if mem_info is not None else (0, 0)
+    gib = 1024**3
+    # Empirical full-universe profiling on this model shows attribution activations
+    # cost roughly 45-50x the raw input row. Keep a fixed workspace reserve for
+    # the model, CUDA kernels, UMAP, and allocator fragmentation.
+    activation_multiplier = 48.0
+    if int(settings.ig_steps) <= 0 and not bool(settings.perturb):
+        activation_multiplier = 28.0
+    workspace_reserve = 3.0 * gib
+    usable_bytes = max(0.0, min(float(free_bytes) * 0.70, float(total_bytes) * 0.65) - workspace_reserve)
+    estimated = int(max(1.0, usable_bytes / (bytes_per_row * activation_multiplier)))
+    if n_symbols >= 10_000:
+        estimated = min(estimated, 4)
+    elif n_symbols >= 4_000:
+        estimated = min(estimated, 8)
+    row_chunk_size = max(1, min(n_rows, estimated))
+    return row_chunk_size, {
+        "reason": "cuda_budget",
+        "rows": n_rows,
+        "row_chunk_size": row_chunk_size,
+        "lookback": lookback,
+        "symbols": n_symbols,
+        "features": n_features,
+        "bytes_per_row": int(bytes_per_row),
+        "activation_multiplier": activation_multiplier,
+        "free_gb": float(free_bytes) / gib,
+        "total_gb": float(total_bytes) / gib,
+        "workspace_reserve_gb": float(workspace_reserve) / gib,
+    }
 
 
 def _call_model(
@@ -894,19 +973,21 @@ def _stock_contribution_frame(
     mean_abs_weight = weights.detach().float().abs().mean(dim=0)
     total_contribution = contribution.sum(dim=0)
     active_count = mask.detach().bool().sum(dim=0).clamp_min(1)
-    rows = []
-    for idx, symbol in enumerate(symbols):
-        rows.append(
-            {
-                "symbol": symbol,
-                "mean_weight": float(mean_weight[idx].cpu()),
-                "mean_abs_weight": float(mean_abs_weight[idx].cpu()),
-                "total_gross_contribution": float(total_contribution[idx].cpu()),
-                "mean_contribution_when_active": float((total_contribution[idx] / active_count[idx]).cpu()),
-                "active_count": int(active_count[idx].cpu()),
-            }
-        )
-    return pd.DataFrame(rows).sort_values("mean_abs_weight", ascending=False)
+    n_symbols = int(mean_weight.numel())
+    symbol_values = list(symbols[:n_symbols])
+    if len(symbol_values) < n_symbols:
+        symbol_values.extend(str(idx) for idx in range(len(symbol_values), n_symbols))
+    frame = pd.DataFrame(
+        {
+            "symbol": symbol_values,
+            "mean_weight": mean_weight.cpu().numpy(),
+            "mean_abs_weight": mean_abs_weight.cpu().numpy(),
+            "total_gross_contribution": total_contribution.cpu().numpy(),
+            "mean_contribution_when_active": (total_contribution / active_count).cpu().numpy(),
+            "active_count": active_count.cpu().numpy().astype(np.int64, copy=False),
+        }
+    )
+    return frame.sort_values("mean_abs_weight", ascending=False)
 
 
 def _make_warnings(
@@ -1479,7 +1560,396 @@ def explain_batch(
         },
         "aux_dim_frames": aux_dim_frames,
         "aux_projection_frames": aux_projection_frames,
+        "_core": {
+            "weights": weights.detach().cpu(),
+            "scores": scores.detach().cpu(),
+            "returns": returns.detach().cpu(),
+            "mask": mask.detach().cpu(),
+        },
     }
+
+
+def _weighted_feature_time_from_chunks(
+    chunk_results: list[tuple[dict[str, Any], int]],
+    frame_name: str,
+    metric_names: tuple[str, ...],
+    total_rows: int,
+) -> pd.DataFrame:
+    pieces: list[pd.DataFrame] = []
+    for result, rows in chunk_results:
+        frame = result.get("frames", {}).get(frame_name, pd.DataFrame())
+        if frame is None or frame.empty:
+            continue
+        data = frame.copy()
+        for metric_name in metric_names:
+            if metric_name in data.columns:
+                data[metric_name] = pd.to_numeric(data[metric_name], errors="coerce").fillna(0.0) * float(rows)
+        pieces.append(data)
+    if not pieces:
+        return pd.DataFrame()
+    combined = pd.concat(pieces, ignore_index=True)
+    group_cols = [
+        col
+        for col in ("lookback_index", "lookback_from_end", "feature", "feature_group", "feature_label")
+        if col in combined.columns
+    ]
+    value_cols = [col for col in metric_names if col in combined.columns]
+    if not group_cols or not value_cols:
+        return combined
+    out = combined.groupby(group_cols, as_index=False)[value_cols].sum()
+    denom = max(1.0, float(total_rows))
+    for metric_name in value_cols:
+        out[metric_name] = out[metric_name] / denom
+    return out
+
+
+def _combine_perturbation_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    value_cols = [col for col in ("weight_abs_delta", "score_abs_delta") if col in frame.columns]
+    if not value_cols:
+        return pd.DataFrame()
+    summary = frame.groupby("feature", as_index=False)[value_cols].sum()
+    summary["feature_group"] = summary["feature"].map(_feature_group)
+    summary["feature_label"] = summary["feature"].map(_feature_label)
+    total = float(summary["weight_abs_delta"].sum()) if "weight_abs_delta" in summary.columns else 0.0
+    summary["weight_delta_share"] = summary["weight_abs_delta"] / total if total > 0.0 else 0.0
+    return summary.sort_values("weight_abs_delta", ascending=False)
+
+
+def _combine_shap_feature_from_chunks(
+    chunk_results: list[tuple[dict[str, Any], int]],
+    total_rows: int,
+) -> pd.DataFrame:
+    pieces: list[pd.DataFrame] = []
+    for result, rows in chunk_results:
+        frame = result.get("frames", {}).get("feature_importance_shap", pd.DataFrame())
+        if frame is None or frame.empty or "feature" not in frame.columns or "shap_abs" not in frame.columns:
+            continue
+        data = frame.copy()
+        data["shap_abs"] = pd.to_numeric(data["shap_abs"], errors="coerce").fillna(0.0) * float(rows)
+        pieces.append(data)
+    if not pieces:
+        return pd.DataFrame()
+    combined = pd.concat(pieces, ignore_index=True)
+    summary = combined.groupby("feature", as_index=False)["shap_abs"].sum()
+    summary["shap_abs"] = summary["shap_abs"] / max(1.0, float(total_rows))
+    summary["feature_group"] = summary["feature"].map(_feature_group)
+    summary["feature_label"] = summary["feature"].map(_feature_label)
+    total = float(summary["shap_abs"].sum())
+    summary["share"] = summary["shap_abs"] / total if total > 0.0 else 0.0
+    return summary.sort_values("shap_abs", ascending=False)
+
+
+def _concat_chunk_frame(
+    chunk_results: list[tuple[dict[str, Any], int]],
+    frame_name: str,
+    *,
+    add_chunk_id: bool = False,
+) -> pd.DataFrame:
+    pieces: list[pd.DataFrame] = []
+    for chunk_id, (result, _) in enumerate(chunk_results):
+        frame = result.get("frames", {}).get(frame_name, pd.DataFrame())
+        if frame is None or frame.empty:
+            continue
+        data = frame.copy()
+        if add_chunk_id:
+            data.insert(0, "explain_chunk_id", int(chunk_id))
+        pieces.append(data)
+    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+
+
+def _combine_aux_summary_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> pd.DataFrame:
+    pieces: list[pd.DataFrame] = []
+    for result, rows in chunk_results:
+        frame = result.get("frames", {}).get("aux_summary", pd.DataFrame())
+        if frame is None or frame.empty or "name" not in frame.columns:
+            continue
+        data = frame.copy()
+        data["_rows"] = float(rows)
+        pieces.append(data)
+    if not pieces:
+        return pd.DataFrame()
+    combined = pd.concat(pieces, ignore_index=True)
+    rows: list[dict[str, Any]] = []
+    weighted_cols = ["mean", "std", "mean_abs", "zero_fraction", "finite_fraction"]
+    for name, group in combined.groupby("name", dropna=False):
+        weight = pd.to_numeric(group["_rows"], errors="coerce").fillna(0.0)
+        denom = float(weight.sum()) or 1.0
+        row: dict[str, Any] = {"name": name, "shape": str(group["shape"].iloc[0]) if "shape" in group else ""}
+        for col in weighted_cols:
+            if col in group.columns:
+                values = pd.to_numeric(group[col], errors="coerce").fillna(0.0)
+                row[col] = float((values * weight).sum() / denom)
+        if "max_abs" in group.columns:
+            row["max_abs"] = float(pd.to_numeric(group["max_abs"], errors="coerce").fillna(0.0).max())
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    return out.sort_values("mean_abs", ascending=False) if "mean_abs" in out.columns else out
+
+
+def _combine_aux_dim_frames_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, pd.DataFrame]:
+    by_name: dict[str, list[pd.DataFrame]] = {}
+    for result, rows in chunk_results:
+        for name, frame in result.get("aux_dim_frames", {}).items():
+            if frame is None or frame.empty or "dim" not in frame.columns:
+                continue
+            data = frame.copy()
+            data["_rows"] = float(rows)
+            by_name.setdefault(str(name), []).append(data)
+    out: dict[str, pd.DataFrame] = {}
+    for name, pieces in by_name.items():
+        combined = pd.concat(pieces, ignore_index=True)
+        rows = []
+        for dim, group in combined.groupby("dim", dropna=False):
+            weight = pd.to_numeric(group["_rows"], errors="coerce").fillna(0.0)
+            denom = float(weight.sum()) or 1.0
+            mean_abs = float((pd.to_numeric(group["mean_abs"], errors="coerce").fillna(0.0) * weight).sum() / denom)
+            rows.append({"dim": int(dim), "mean_abs": mean_abs})
+        frame = pd.DataFrame(rows).sort_values("mean_abs", ascending=False)
+        total = float(frame["mean_abs"].sum())
+        frame["share"] = frame["mean_abs"] / total if total > 0.0 else 0.0
+        out[name] = frame
+    return out
+
+
+def _sum_chunk_timings(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    for result, _ in chunk_results:
+        for key, value in result.get("summary", {}).get("timing", {}).items():
+            try:
+                timings[key] = timings.get(key, 0.0) + float(value)
+            except (TypeError, ValueError):
+                continue
+    return timings
+
+
+def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, Any]:
+    merged = {
+        "num_perturbations": 0,
+        "requested_batch_size": 0,
+        "max_auto_batch_size": 0,
+        "max_input_elements": 0,
+        "chunk_size": 0,
+        "final_chunk_size": 0,
+        "forward_batches": 0,
+        "attempted_forward_batches": 0,
+        "oom_retries": 0,
+        "oom_chunk_sizes": [],
+    }
+    for result, _ in chunk_results:
+        diag = result.get("summary", {}).get("perturb_diagnostics", {})
+        merged["num_perturbations"] = max(int(merged["num_perturbations"]), int(diag.get("num_perturbations", 0) or 0))
+        for key in ("requested_batch_size", "max_auto_batch_size", "max_input_elements", "chunk_size", "final_chunk_size"):
+            merged[key] = max(int(merged[key]), int(diag.get(key, 0) or 0))
+        for key in ("forward_batches", "attempted_forward_batches", "oom_retries"):
+            merged[key] = int(merged[key]) + int(diag.get(key, 0) or 0)
+        merged["oom_chunk_sizes"].extend(int(v) for v in diag.get("oom_chunk_sizes", []) or [])
+    return merged
+
+
+def _combine_chunked_explainability_results(
+    chunk_results: list[tuple[dict[str, Any], int]],
+    *,
+    batch: dict[str, torch.Tensor],
+    feature_names: list[str],
+    symbols: list[str],
+    dates: list[str],
+    settings: ExplainabilitySettings,
+    row_chunk_diagnostics: dict[str, Any],
+    total_elapsed_s: float,
+) -> dict[str, Any]:
+    total_rows = max(1, len(dates))
+    grad_ft = _weighted_feature_time_from_chunks(
+        chunk_results,
+        "feature_time_gradient",
+        ("grad_x_input_abs",),
+        total_rows,
+    )
+    ig_ft = _weighted_feature_time_from_chunks(
+        chunk_results,
+        "feature_time_integrated_gradients",
+        ("integrated_gradients_abs",),
+        total_rows,
+    )
+    perturb_ft = _weighted_feature_time_from_chunks(
+        chunk_results,
+        "feature_time_perturbation",
+        ("weight_abs_delta", "score_abs_delta"),
+        total_rows,
+    )
+    grad_feature = _feature_summary_frame(grad_ft, "grad_x_input_abs")
+    grad_time = _time_summary_frame(grad_ft, "grad_x_input_abs")
+    ig_feature = _feature_summary_frame(ig_ft, "integrated_gradients_abs")
+    ig_time = _time_summary_frame(ig_ft, "integrated_gradients_abs")
+    perturb_feature = _combine_perturbation_summary(perturb_ft)
+    shap_feature = _combine_shap_feature_from_chunks(chunk_results, total_rows)
+
+    weights = torch.cat([result["_core"]["weights"] for result, _ in chunk_results], dim=0)
+    scores = torch.cat([result["_core"]["scores"] for result, _ in chunk_results], dim=0)
+    returns = torch.cat([result["_core"]["returns"] for result, _ in chunk_results], dim=0)
+    mask = torch.cat([result["_core"]["mask"] for result, _ in chunk_results], dim=0).bool()
+    x_cpu = torch.nan_to_num(batch["x"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    corr = _feature_correlations(x_cpu, scores, weights, mask, feature_names)
+    decisions = _decision_rows(weights, scores, returns, mask, dates, symbols, settings.top_k)
+    stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
+    portfolio = _portfolio_summary(weights, returns, mask)
+    daily = _daily_portfolio_frame(weights, returns, mask, dates)
+    regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pd.DataFrame()
+    case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
+    aux_frame = _combine_aux_summary_from_chunks(chunk_results)
+    aux_dim_frames = _combine_aux_dim_frames_from_chunks(chunk_results)
+    first_result = chunk_results[0][0]
+    aux_projection_frames = {
+        name: frame
+        for name, frame in first_result.get("aux_projection_frames", {}).items()
+        if frame is not None and not frame.empty
+    }
+
+    warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
+    warnings.append(
+        "Explainability ran with row microbatching to fit the full stock universe in GPU memory; aux UMAP projections use the first row chunk because UMAP coordinates are not additive across chunks."
+    )
+    for result, _ in chunk_results:
+        warnings.extend(str(item) for item in result.get("summary", {}).get("warnings", []) if str(item) not in warnings)
+
+    trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
+    attribution_lookback = 0
+    if not grad_ft.empty and "lookback_from_end" in grad_ft.columns:
+        attribution_lookback = int(pd.to_numeric(grad_ft["lookback_from_end"], errors="coerce").max() + 1)
+
+    timing = _sum_chunk_timings(chunk_results)
+    timing["total_s"] = float(total_elapsed_s)
+    timing["row_microbatch_chunks"] = float(len(chunk_results))
+
+    shap_components = _concat_chunk_frame(chunk_results, "shap_components", add_chunk_id=True)
+    aux_projection_summary = first_result.get("summary", {}).get("aux_projection_summary", [])
+    aux_projection_timing = first_result.get("summary", {}).get("aux_projection_timing", {})
+    perturb_diagnostics = _merge_perturb_diagnostics(chunk_results)
+
+    return {
+        "summary": {
+            "portfolio": portfolio,
+            "rows": len(dates),
+            "top_k": int(settings.top_k),
+            "ig_steps": int(settings.ig_steps),
+            "ig_batch_size": int(settings.ig_batch_size),
+            "report_style": _normalize_report_style(settings.report_style),
+            "plot_theme": _normalize_plot_theme(settings.plot_theme),
+            "standard_plots": bool(settings.standard_plots),
+            "interactive_plots": bool(settings.interactive_plots),
+            "shap_enabled": bool(settings.shap_enabled),
+            "perturb_batch_size": int(settings.perturb_batch_size),
+            "perturb_max_auto_batch_size": int(settings.perturb_max_auto_batch_size),
+            "perturb_max_input_elements": int(settings.perturb_max_input_elements),
+            "perturb_diagnostics": perturb_diagnostics,
+            "shap_mode": _normalize_shap_mode(settings.shap_mode),
+            "shap_info": {"mode": "row_microbatch_combined", "chunks": int(len(chunk_results))},
+            "case_study_top_k": int(settings.case_study_top_k),
+            "regime_analysis": bool(settings.regime_analysis),
+            "fold_stability": bool(settings.fold_stability),
+            "attribution_lookback": attribution_lookback,
+            "umap_enabled": bool(settings.umap_enabled),
+            "umap_max_points": int(settings.umap_max_points),
+            "umap_max_projections": int(settings.umap_max_projections),
+            "umap_method": "cuml_umap",
+            "aux_projection_summary": aux_projection_summary,
+            "aux_projection_timing": aux_projection_timing,
+            "row_chunking": row_chunk_diagnostics,
+            "timing": timing,
+            "warnings": warnings,
+        },
+        "frames": {
+            "feature_time_gradient": grad_ft,
+            "feature_importance_gradient": grad_feature,
+            "time_importance_gradient": grad_time,
+            "feature_time_integrated_gradients": ig_ft,
+            "feature_importance_integrated_gradients": ig_feature,
+            "time_importance_integrated_gradients": ig_time,
+            "feature_time_perturbation": perturb_ft,
+            "feature_importance_perturbation": perturb_feature,
+            "feature_importance_shap": shap_feature,
+            "shap_components": shap_components,
+            "top_feature_time_gradient_cells": _feature_time_top_cells(grad_ft, "grad_x_input_abs"),
+            "top_feature_time_integrated_gradients_cells": _feature_time_top_cells(ig_ft, "integrated_gradients_abs"),
+            "top_feature_time_perturbation_cells": _feature_time_top_cells(perturb_ft, "weight_abs_delta"),
+            "feature_correlations": corr,
+            "top_decisions": decisions,
+            "daily_portfolio": daily,
+            "regime_analysis": regime,
+            "decision_case_studies": case_studies,
+            "trust_checks": trust_checks,
+            "stock_contributions": stock_contrib,
+            "aux_summary": aux_frame,
+        },
+        "aux_dim_frames": aux_dim_frames,
+        "aux_projection_frames": aux_projection_frames,
+    }
+
+
+def explain_batch_row_chunked(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+    *,
+    feature_names: list[str],
+    symbols: list[str],
+    dates: list[str],
+    settings: ExplainabilitySettings,
+    device: torch.device,
+) -> dict[str, Any]:
+    total_start = time.perf_counter()
+    n_rows = int(batch["x"].size(0))
+    row_chunk_size, diagnostics = _auto_explain_row_chunk_size(batch, settings, device)
+    if row_chunk_size >= n_rows:
+        result = explain_batch(
+            model,
+            batch,
+            feature_names=feature_names,
+            symbols=symbols,
+            dates=dates,
+            settings=settings,
+            device=device,
+        )
+        result["summary"]["row_chunking"] = diagnostics
+        return result
+
+    print(
+        "[explain] row microbatching enabled: "
+        f"rows={n_rows}, row_chunk_size={row_chunk_size}, symbols={diagnostics.get('symbols')}, "
+        f"free_gb={diagnostics.get('free_gb', 0.0):.2f}"
+    )
+    chunk_results: list[tuple[dict[str, Any], int]] = []
+    for chunk_id, start in enumerate(range(0, n_rows, row_chunk_size), start=1):
+        end = min(n_rows, start + row_chunk_size)
+        chunk_settings = settings if chunk_id == 1 else replace(settings, umap_enabled=False)
+        chunk = _slice_batch_rows(batch, start, end)
+        chunk_dates = dates[start:end]
+        result = explain_batch(
+            model,
+            chunk,
+            feature_names=feature_names,
+            symbols=symbols,
+            dates=chunk_dates,
+            settings=chunk_settings,
+            device=device,
+        )
+        chunk_results.append((result, end - start))
+        del chunk, result
+        _clear_explainability_runtime_cache()
+        print(f"[explain] completed row chunk {chunk_id}: rows {start}:{end}")
+
+    diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
+    return _combine_chunked_explainability_results(
+        chunk_results,
+        batch=batch,
+        feature_names=feature_names,
+        symbols=symbols,
+        dates=dates,
+        settings=settings,
+        row_chunk_diagnostics=diagnostics,
+        total_elapsed_s=float(time.perf_counter() - total_start),
+    )
 
 
 def _write_markdown_report(
@@ -2748,6 +3218,7 @@ def _plot_all_explanation_figures(
     if plot_timing is not None:
         plot_timing["backend"] = "rapids_datashader" if use_datashader else "matplotlib"
         plot_timing["estimated_points"] = int(estimated_points)
+        plot_timing.setdefault("datashader_fallbacks", [])
     try:
         import matplotlib
 
@@ -2806,9 +3277,11 @@ def _plot_all_explanation_figures(
         if use_datashader:
             try:
                 _plot_feature_time_heatmap_datashader(frame, output_path=out, value_col=value_col, title=title)
-            except Exception:
-                if normalized_backend == "rapids_datashader":
-                    raise
+            except Exception as exc:
+                if plot_timing is not None:
+                    plot_timing.setdefault("datashader_fallbacks", []).append(
+                        {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
+                    )
                 _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
         else:
             _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
@@ -2831,9 +3304,11 @@ def _plot_all_explanation_figures(
     if use_datashader:
         try:
             _plot_decision_exposure_datashader(decision_frame, out)
-        except Exception:
-            if normalized_backend == "rapids_datashader":
-                raise
+        except Exception as exc:
+            if plot_timing is not None:
+                plot_timing.setdefault("datashader_fallbacks", []).append(
+                    {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
+                )
             _plot_decision_exposure(decision_frame, out)
     else:
         _plot_decision_exposure(decision_frame, out)
@@ -2849,9 +3324,11 @@ def _plot_all_explanation_figures(
         if use_datashader:
             try:
                 _plot_aux_dim_datashader(frame, output_path=out, title=f"Aux Dimension Profile: {name}")
-            except Exception:
-                if normalized_backend == "rapids_datashader":
-                    raise
+            except Exception as exc:
+                if plot_timing is not None:
+                    plot_timing.setdefault("datashader_fallbacks", []).append(
+                        {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
+                    )
                 _plot_barh(
                     frame,
                     output_path=out,
@@ -2879,11 +3356,30 @@ def _plot_all_explanation_figures(
     for name, frame in (aux_projection_frames or {}).items():
         out = projection_plot_dir / f"{_safe_plot_filename(name)}.png"
         if use_datashader:
-            _plot_aux_projection_datashader(
-                frame,
-                output_path=out,
-                title=f"cuML UMAP Projection: {name}",
-            )
+            try:
+                _plot_aux_projection_datashader(
+                    frame,
+                    output_path=out,
+                    title=f"cuML UMAP Projection: {name}",
+                )
+            except Exception as exc:
+                if plot_timing is not None:
+                    plot_timing.setdefault("datashader_fallbacks", []).append(
+                        {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
+                    )
+                if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
+                    continue
+                import matplotlib.pyplot as plt
+
+                fig, ax = plt.subplots(figsize=(8, 6), dpi=130)
+                ax.scatter(frame["umap_x"], frame["umap_y"], s=4, alpha=0.5)
+                ax.set_title(f"cuML UMAP Projection: {name}")
+                ax.set_xlabel("umap_x")
+                ax.set_ylabel("umap_y")
+                fig.tight_layout()
+                out.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(out)
+                plt.close(fig)
         else:
             if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
                 continue
@@ -3246,7 +3742,7 @@ def run_checkpoint_explanation(
     )
     batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
     dates = [str(np.datetime_as_string(context.panel.dates[int(idx)], unit="D")) for idx in date_indices]
-    result = explain_batch(
+    result = explain_batch_row_chunked(
         model,
         batch,
         feature_names=context.panel.feature_names,
