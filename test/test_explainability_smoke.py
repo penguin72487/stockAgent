@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import shutil
 
+import numpy as np
 import torch
 
 from stockagent.explainability import (
@@ -18,9 +19,11 @@ class ToyExplainableModel(torch.nn.Module):
     def __init__(self, num_features: int) -> None:
         super().__init__()
         self.coef = torch.nn.Parameter(torch.arange(1, num_features + 1, dtype=torch.float32))
+        self.forward_calls = 0
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, return_aux: bool | None = None):
         del return_aux
+        self.forward_calls += 1
         scores = (x[:, -1] * self.coef).sum(dim=-1).masked_fill(~mask, -1e9)
         weights = torch.softmax(scores, dim=1).masked_fill(~mask, 0.0)
         return {
@@ -70,6 +73,58 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert summary["plots_generated"]
     assert summary["paper_plots"]
     assert list((out_dir / "plots").glob("*.png"))
+
+
+def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards() -> None:
+    torch.manual_seed(11)
+    rows, lookback, symbols, features = 3, 4, 5, 3
+    batch = {
+        "x": torch.randn(rows, lookback, symbols, features),
+        "future_log_returns": torch.randn(rows, symbols) * 0.01,
+        "tradable_mask": torch.ones(rows, symbols, dtype=torch.bool),
+    }
+    common = dict(
+        top_k=2,
+        max_rows=rows,
+        ig_steps=4,
+        perturb=True,
+        shap_enabled=False,
+        regime_analysis=False,
+        umap_enabled=False,
+    )
+    serial_model = ToyExplainableModel(features)
+    serial = explain_batch(
+        serial_model,
+        batch,
+        feature_names=[f"f{i}" for i in range(features)],
+        symbols=[f"S{i}" for i in range(symbols)],
+        dates=[f"2026-03-0{i + 1}" for i in range(rows)],
+        settings=ExplainabilitySettings(**common, ig_batch_size=1, perturb_batch_size=1),
+        device=torch.device("cpu"),
+    )
+    chunked_model = ToyExplainableModel(features)
+    chunked = explain_batch(
+        chunked_model,
+        batch,
+        feature_names=[f"f{i}" for i in range(features)],
+        symbols=[f"S{i}" for i in range(symbols)],
+        dates=[f"2026-03-0{i + 1}" for i in range(rows)],
+        settings=ExplainabilitySettings(**common, ig_batch_size=2, perturb_batch_size=4),
+        device=torch.device("cpu"),
+    )
+
+    for frame_name, value_col in (
+        ("feature_time_integrated_gradients", "integrated_gradients_abs"),
+        ("feature_time_perturbation", "weight_abs_delta"),
+    ):
+        left = serial["frames"][frame_name].sort_values(["lookback_index", "feature"]).reset_index(drop=True)
+        right = chunked["frames"][frame_name].sort_values(["lookback_index", "feature"]).reset_index(drop=True)
+        assert left[["lookback_index", "lookback_from_end", "feature"]].equals(
+            right[["lookback_index", "lookback_from_end", "feature"]]
+        )
+        np.testing.assert_allclose(left[value_col].to_numpy(), right[value_col].to_numpy(), rtol=1e-5, atol=1e-7)
+
+    assert chunked_model.forward_calls < serial_model.forward_calls
 
 
 def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path: Path) -> None:

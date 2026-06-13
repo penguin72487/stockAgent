@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+_CURVE_FILENAMES = ("epoch_curve.parquet", "epoch_curve.jsonl", "epoch_curve.csv")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -16,13 +19,13 @@ def _parse_args() -> argparse.Namespace:
         "--artifacts-root",
         type=str,
         default="artifacts",
-        help="Root directory to recursively search for epoch_curve.jsonl when --curve-file is omitted.",
+        help="Root directory to recursively search for epoch_curve.parquet/jsonl/csv when --curve-file is omitted.",
     )
     parser.add_argument(
         "--curve-file",
         type=str,
         default="",
-        help="Optional single epoch_curve.jsonl. If omitted, plot every curve under --artifacts-root.",
+        help="Optional single epoch_curve.parquet/jsonl/csv. If omitted, plot every curve under --artifacts-root.",
     )
     parser.add_argument(
         "--output",
@@ -42,17 +45,46 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Sampling interval by epoch (default: 1)",
     )
+    parser.add_argument(
+        "--write-parquet-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When reading jsonl/csv, also write <curve_dir>/epoch_curve.parquet for faster reloads.",
+    )
     return parser.parse_args()
 
 
 def _find_curve_files(root: Path) -> list[Path]:
-    candidates = sorted(root.rglob("epoch_curve.jsonl"), key=lambda p: (p.parent.as_posix(), p.stat().st_mtime))
+    candidates: list[Path] = []
+    for filename in _CURVE_FILENAMES:
+        candidates.extend(root.rglob(filename))
     if not candidates:
-        raise FileNotFoundError(f"No epoch_curve.jsonl found under {root}")
-    return candidates
+        raise FileNotFoundError(f"No epoch_curve.parquet/jsonl/csv found under {root}")
+
+    priority = {".parquet": 0, ".jsonl": 1, ".csv": 2}
+    selected: dict[Path, Path] = {}
+    for candidate in candidates:
+        key = candidate.with_suffix("")
+        current = selected.get(key)
+        if current is None:
+            selected[key] = candidate
+            continue
+        try:
+            candidate_mtime = candidate.stat().st_mtime
+        except OSError:
+            candidate_mtime = 0.0
+        try:
+            current_mtime = current.stat().st_mtime
+        except OSError:
+            current_mtime = 0.0
+        if candidate_mtime > current_mtime:
+            selected[key] = candidate
+        elif candidate_mtime == current_mtime and priority.get(candidate.suffix, 99) < priority.get(current.suffix, 99):
+            selected[key] = candidate
+    return sorted(selected.values(), key=lambda p: (p.parent.as_posix(), p.stat().st_mtime))
 
 
-def _load_curve(curve_path: Path) -> list[dict]:
+def _load_jsonl_curve(curve_path: Path) -> list[dict]:
     rows: list[dict] = []
     with curve_path.open("r", encoding="utf-8") as handle:
         for raw in handle:
@@ -63,6 +95,40 @@ def _load_curve(curve_path: Path) -> list[dict]:
     if not rows:
         raise ValueError(f"Curve file is empty: {curve_path}")
     return rows
+
+
+def _load_curve(curve_path: Path) -> list[dict]:
+    suffix = curve_path.suffix.lower()
+    if suffix == ".jsonl":
+        return _load_jsonl_curve(curve_path)
+    if suffix not in {".csv", ".parquet"}:
+        raise ValueError(f"Unsupported curve file extension: {curve_path}")
+
+    import pandas as pd
+
+    if suffix == ".csv":
+        frame = pd.read_csv(curve_path)
+    else:
+        frame = pd.read_parquet(curve_path)
+    if frame.empty:
+        raise ValueError(f"Curve file is empty: {curve_path}")
+    if "epoch" not in frame.columns:
+        raise ValueError(f"Curve file is missing required column 'epoch': {curve_path}")
+    frame = frame.where(pd.notnull(frame), None)
+    return frame.to_dict(orient="records")
+
+
+def _write_curve_parquet_cache(curve_path: Path, rows: list[dict]) -> tuple[Path | None, float]:
+    if curve_path.suffix.lower() == ".parquet":
+        return None, 0.0
+    start = time.perf_counter()
+    import pandas as pd
+
+    parquet_path = curve_path.with_suffix(".parquet")
+    frame = pd.DataFrame(rows)
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(parquet_path, index=False, engine="pyarrow", compression="snappy")
+    return parquet_path, float(time.perf_counter() - start)
 
 
 def _sample_rows(rows: list[dict], interval: int) -> list[dict]:
@@ -92,7 +158,7 @@ def _has_finite(values: np.ndarray) -> bool:
     return bool(np.isfinite(values).any())
 
 
-def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, interval: int) -> None:
+def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, interval: int, *, quiet: bool = False) -> None:
     epochs = np.asarray([int(row.get("epoch", 0)) for row in rows], dtype=np.int64)
     train_loss = _to_float_array(rows, "train_loss")
     val_mean = _to_float_array(rows, "val_mean")
@@ -122,12 +188,13 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     fig.savefig(output_path)
     plt.close(fig)
 
-    print(f"curve_file: {curve_path}")
-    print(f"output: {output_path}")
-    print(f"points: {len(epochs)}")
+    if not quiet:
+        print(f"curve_file: {curve_path}")
+        print(f"output: {output_path}")
+        print(f"points: {len(epochs)}")
 
 
-def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, interval: int) -> None:
+def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, interval: int, *, quiet: bool = False) -> None:
     epochs = np.asarray([int(row.get("epoch", 0)) for row in rows], dtype=np.int64)
     batch_series = [
         ("train_fetch_ms_per_batch", "fetch"),
@@ -182,7 +249,8 @@ def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, in
 
     has_timing = any(_has_finite(_to_float_array(rows, key)) for key, _ in batch_series + epoch_series)
     if not has_timing:
-        print(f"timing skipped: {curve_path} has no timing fields yet")
+        if not quiet:
+            print(f"timing skipped: {curve_path} has no timing fields yet")
         return
 
     synced = _to_float_array(rows, "timing_synchronized")
@@ -197,7 +265,9 @@ def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, in
     )
     ax_batch.set_ylabel("ms / batch")
     ax_batch.grid(True, alpha=0.25)
-    ax_batch.legend(ncol=4, fontsize=8)
+    handles, labels = ax_batch.get_legend_handles_labels()
+    if handles:
+        ax_batch.legend(handles, labels, ncol=4, fontsize=8)
 
     for key, label in epoch_series:
         values = _to_float_array(rows, key)
@@ -207,13 +277,68 @@ def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, in
     ax_epoch.set_xlabel("Epoch")
     ax_epoch.set_ylabel("seconds")
     ax_epoch.grid(True, alpha=0.25)
-    ax_epoch.legend(ncol=3, fontsize=8)
+    handles, labels = ax_epoch.get_legend_handles_labels()
+    if handles:
+        ax_epoch.legend(handles, labels, ncol=3, fontsize=8)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
-    print(f"timing_output: {output_path}")
+    if not quiet:
+        print(f"timing_output: {output_path}")
+
+
+def plot_curve_file(
+    curve_path: Path,
+    *,
+    interval: int,
+    output_path: Path | None = None,
+    timing_output_path: Path | None = None,
+    write_parquet_cache: bool = False,
+    quiet: bool = False,
+) -> tuple[Path, Path, dict[str, float | int | str]]:
+    total_start = time.perf_counter()
+    load_start = time.perf_counter()
+    loaded_rows = _load_curve(curve_path)
+    load_s = time.perf_counter() - load_start
+    parquet_cache_path: Path | None = None
+    parquet_cache_s = 0.0
+    if write_parquet_cache:
+        parquet_cache_path, parquet_cache_s = _write_curve_parquet_cache(curve_path, loaded_rows)
+    sample_start = time.perf_counter()
+    rows = _sample_rows(loaded_rows, interval)
+    sample_s = time.perf_counter() - sample_start
+    if output_path is None:
+        output_path = curve_path.parent / f"epoch_curve_every{max(1, int(interval))}.png"
+    if timing_output_path is None:
+        timing_output_path = curve_path.parent / f"epoch_timing_every{max(1, int(interval))}.png"
+    loss_start = time.perf_counter()
+    _plot_loss_curve(rows, curve_path, output_path, interval, quiet=quiet)
+    loss_plot_s = time.perf_counter() - loss_start
+    timing_start = time.perf_counter()
+    _plot_timing_curve(rows, curve_path, timing_output_path, interval, quiet=quiet)
+    timing_plot_s = time.perf_counter() - timing_start
+    timing = {
+        "curve_file": str(curve_path),
+        "output": str(output_path),
+        "timing_output": str(timing_output_path),
+        "interval": int(max(1, int(interval))),
+        "loaded_rows": int(len(loaded_rows)),
+        "plotted_rows": int(len(rows)),
+        "load_s": float(load_s),
+        "parquet_cache_s": float(parquet_cache_s),
+        "sample_s": float(sample_s),
+        "loss_plot_s": float(loss_plot_s),
+        "timing_plot_s": float(timing_plot_s),
+        "total_s": float(time.perf_counter() - total_start),
+    }
+    if parquet_cache_path is not None:
+        timing["parquet_cache"] = str(parquet_cache_path)
+    timing_json = curve_path.parent / f"epoch_curve_plot_timing_every{max(1, int(interval))}.json"
+    timing_json.write_text(json.dumps(timing, indent=2, ensure_ascii=False), encoding="utf-8")
+    timing["timing_json"] = str(timing_json)
+    return output_path, timing_output_path, timing
 
 
 def main() -> None:
@@ -226,20 +351,22 @@ def main() -> None:
         print(f"plotting all curve files under {args.artifacts_root}: {len(curve_paths)} found")
 
     for curve_path in curve_paths:
-        rows = _load_curve(curve_path)
-        rows = _sample_rows(rows, args.interval)
-
         if args.output and len(curve_paths) == 1:
             output_path = Path(args.output)
         else:
             output_path = curve_path.parent / f"epoch_curve_every{max(1, int(args.interval))}.png"
-        _plot_loss_curve(rows, curve_path, output_path, args.interval)
 
         if args.timing_output and len(curve_paths) == 1:
             timing_output_path = Path(args.timing_output)
         else:
             timing_output_path = curve_path.parent / f"epoch_timing_every{max(1, int(args.interval))}.png"
-        _plot_timing_curve(rows, curve_path, timing_output_path, args.interval)
+        plot_curve_file(
+            curve_path,
+            interval=args.interval,
+            output_path=output_path,
+            timing_output_path=timing_output_path,
+            write_parquet_cache=bool(args.write_parquet_cache),
+        )
 
 
 if __name__ == "__main__":

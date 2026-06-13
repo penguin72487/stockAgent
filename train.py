@@ -72,12 +72,204 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Start from this fold id (inclusive), e.g. --start-fold 7",
     )
+    parser.add_argument("--max-folds", type=int, default=None, help="Run at most this many folds after --start-fold filtering.")
+    parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs for benchmark/smoke runs.")
+    parser.add_argument(
+        "--explain-after-each-fold",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_after_each_fold.",
+    )
+    parser.add_argument("--explain-max-rows", type=int, default=None, help="Override training.explain_max_rows.")
+    parser.add_argument("--explain-ig-steps", type=int, default=None, help="Override training.explain_ig_steps.")
+    parser.add_argument("--explain-ig-batch-size", type=int, default=None, help="Override training.explain_ig_batch_size.")
+    parser.add_argument(
+        "--explain-perturb",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_perturb.",
+    )
+    parser.add_argument(
+        "--explain-perturb-batch-size",
+        type=int,
+        default=None,
+        help="Override training.explain_perturb_batch_size.",
+    )
+    parser.add_argument(
+        "--explain-perturb-max-auto-batch-size",
+        type=int,
+        default=None,
+        help="Override training.explain_perturb_max_auto_batch_size.",
+    )
+    parser.add_argument(
+        "--explain-perturb-max-input-elements",
+        type=int,
+        default=None,
+        help="Override training.explain_perturb_max_input_elements.",
+    )
+    parser.add_argument(
+        "--explain-umap",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_umap_enabled.",
+    )
+    parser.add_argument("--explain-umap-max-points", type=int, default=None, help="Override training.explain_umap_max_points.")
+    parser.add_argument(
+        "--explain-umap-max-projections",
+        type=int,
+        default=None,
+        help="Override training.explain_umap_max_projections; 0 means no projection-count limit.",
+    )
+    parser.add_argument(
+        "--explain-write-plots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_write_plots.",
+    )
+    parser.add_argument(
+        "--explain-standard-plots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_standard_plots.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_cross_asset_enabled.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-max-sources",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_max_sources.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-max-targets",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_max_targets.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-source-chunk-size",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_source_chunk_size.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-shocks",
+        default=None,
+        help="Comma-separated override for training.explain_cross_asset_shocks.",
+    )
+    parser.add_argument(
+        "--save-daily-weights-csv",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compatibility alias for training.save_daily_weights_table.",
+    )
+    parser.add_argument(
+        "--save-integer-share-heavy-csv",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compatibility alias for writing integer daily weights and holdings detail tables.",
+    )
+    parser.add_argument(
+        "--save-daily-weights-table",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.save_daily_weights_table.",
+    )
+    parser.add_argument(
+        "--save-integer-share-detail-tables",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.save_integer_share_daily_weights_table and save_integer_share_holdings_table.",
+    )
+    parser.add_argument(
+        "--table-output-format",
+        choices=("csv", "parquet"),
+        default=None,
+        help="Override training.table_output_format for large fold detail tables.",
+    )
+    parser.add_argument(
+        "--backtest-artifact-compression",
+        choices=("none", "compressed"),
+        default=None,
+        help="Override training.backtest_artifact_compression for .npz backtest artifacts.",
+    )
+    parser.add_argument(
+        "--defer-epoch-curve-plot-until-end",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.defer_epoch_curve_plot_until_end.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.epochs is not None:
+        if args.epochs < 1:
+            raise ValueError(f"--epochs must be >= 1, got {args.epochs}")
+        config.training.epochs = int(args.epochs)
+    if args.explain_after_each_fold is not None:
+        config.training.explain_after_each_fold = bool(args.explain_after_each_fold)
+    if args.explain_max_rows is not None:
+        config.training.explain_max_rows = max(1, int(args.explain_max_rows))
+    if args.explain_ig_steps is not None:
+        config.training.explain_ig_steps = max(0, int(args.explain_ig_steps))
+    if args.explain_ig_batch_size is not None:
+        config.training.explain_ig_batch_size = max(0, int(args.explain_ig_batch_size))
+    if args.explain_perturb is not None:
+        config.training.explain_perturb = bool(args.explain_perturb)
+    if args.explain_perturb_batch_size is not None:
+        config.training.explain_perturb_batch_size = max(0, int(args.explain_perturb_batch_size))
+    if args.explain_perturb_max_auto_batch_size is not None:
+        config.training.explain_perturb_max_auto_batch_size = max(1, int(args.explain_perturb_max_auto_batch_size))
+    if args.explain_perturb_max_input_elements is not None:
+        config.training.explain_perturb_max_input_elements = max(1, int(args.explain_perturb_max_input_elements))
+    if args.explain_umap is not None:
+        config.training.explain_umap_enabled = bool(args.explain_umap)
+    if args.explain_umap_max_points is not None:
+        config.training.explain_umap_max_points = max(0, int(args.explain_umap_max_points))
+    if args.explain_umap_max_projections is not None:
+        config.training.explain_umap_max_projections = max(0, int(args.explain_umap_max_projections))
+    if args.explain_write_plots is not None:
+        config.training.explain_write_plots = bool(args.explain_write_plots)
+    if args.explain_standard_plots is not None:
+        config.training.explain_standard_plots = bool(args.explain_standard_plots)
+    if args.explain_cross_asset is not None:
+        config.training.explain_cross_asset_enabled = bool(args.explain_cross_asset)
+    if args.explain_cross_asset_max_sources is not None:
+        config.training.explain_cross_asset_max_sources = max(1, int(args.explain_cross_asset_max_sources))
+    if args.explain_cross_asset_max_targets is not None:
+        config.training.explain_cross_asset_max_targets = max(1, int(args.explain_cross_asset_max_targets))
+    if args.explain_cross_asset_source_chunk_size is not None:
+        config.training.explain_cross_asset_source_chunk_size = max(1, int(args.explain_cross_asset_source_chunk_size))
+    if args.explain_cross_asset_shocks is not None:
+        config.training.explain_cross_asset_shocks = [
+            value.strip().lower() for value in str(args.explain_cross_asset_shocks).split(",") if value.strip()
+        ]
+    if args.save_daily_weights_csv is not None:
+        config.training.save_daily_weights_csv = bool(args.save_daily_weights_csv)
+        config.training.save_daily_weights_table = bool(args.save_daily_weights_csv)
+    if args.save_integer_share_heavy_csv is not None:
+        config.training.save_integer_share_daily_weights_csv = bool(args.save_integer_share_heavy_csv)
+        config.training.save_integer_share_holdings_csv = bool(args.save_integer_share_heavy_csv)
+        config.training.save_integer_share_daily_weights_table = bool(args.save_integer_share_heavy_csv)
+        config.training.save_integer_share_holdings_table = bool(args.save_integer_share_heavy_csv)
+    if args.save_daily_weights_table is not None:
+        config.training.save_daily_weights_table = bool(args.save_daily_weights_table)
+    if args.save_integer_share_detail_tables is not None:
+        config.training.save_integer_share_daily_weights_table = bool(args.save_integer_share_detail_tables)
+        config.training.save_integer_share_holdings_table = bool(args.save_integer_share_detail_tables)
+    if args.table_output_format is not None:
+        config.training.table_output_format = str(args.table_output_format)
+    if args.backtest_artifact_compression is not None:
+        config.training.backtest_artifact_compression = str(args.backtest_artifact_compression)
+    if args.defer_epoch_curve_plot_until_end is not None:
+        config.training.defer_epoch_curve_plot_until_end = bool(args.defer_epoch_curve_plot_until_end)
     _configure_cuda_runtime()
 
     # Keep runtime switches consistent with YAML config.
@@ -132,6 +324,12 @@ def main() -> None:
         print(
             f"[runner] start_fold={start_fold}: selected {len(folds)}/{total_folds} folds"
         )
+    if args.max_folds is not None:
+        if args.max_folds < 1:
+            raise ValueError(f"--max-folds must be >= 1, got {args.max_folds}")
+        original_count = len(folds)
+        folds = folds[: int(args.max_folds)]
+        print(f"[runner] max_folds={args.max_folds}: selected {len(folds)}/{original_count} folds")
     if mode == "infer":
         results = run_inference(panel, folds, config, output_dir)
     else:
