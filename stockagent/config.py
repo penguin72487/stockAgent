@@ -402,7 +402,7 @@ class TrainingConfig:
     curve_plot_async: bool = True
     plot_backend: str = "auto"
     epoch_test_curve: bool = True
-    defer_epoch_curve_plot_until_end: bool = False
+    defer_epoch_curve_plot_until_end: bool = True
     input_pipeline_ab_test: bool = True
     input_pipeline_ab_test_steps: int = 20
     explain_after_each_fold: bool = False
@@ -410,11 +410,14 @@ class TrainingConfig:
     explain_top_k: int = 20
     explain_max_rows: int = 32
     explain_ig_steps: int = 8
+    explain_ig_batch_size: int = 0
     explain_sample_method: str = "even"
     explain_perturb: bool = True
+    explain_perturb_batch_size: int = 0
     explain_write_plots: bool = True
     explain_report_style: str = "paper"
     explain_plot_theme: str = "paper"
+    explain_standard_plots: bool = True
     explain_interactive_plots: bool = False
     explain_shap_enabled: bool = True
     explain_shap_mode: str = "score_head_surrogate"
@@ -425,6 +428,13 @@ class TrainingConfig:
     explain_umap_max_points: int = 10000
     explain_umap_n_neighbors: int = 15
     explain_umap_min_dist: float = 0.1
+    table_output_format: str = "csv"
+    save_daily_weights_table: bool = True
+    save_integer_share_daily_weights_table: bool = True
+    save_integer_share_holdings_table: bool = True
+    save_integer_share_daily_weights_csv: bool = True
+    save_integer_share_holdings_csv: bool = True
+    save_daily_weights_csv: bool = True
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -562,7 +572,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("curve_plot_async", True)
     training.setdefault("plot_backend", "auto")
     training.setdefault("epoch_test_curve", True)
-    training.setdefault("defer_epoch_curve_plot_until_end", False)
+    training.setdefault("defer_epoch_curve_plot_until_end", True)
     training.setdefault("input_pipeline_ab_test", True)
     training.setdefault("input_pipeline_ab_test_steps", 20)
     training.setdefault("explain_after_each_fold", False)
@@ -570,11 +580,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_top_k", 20)
     training.setdefault("explain_max_rows", 32)
     training.setdefault("explain_ig_steps", 8)
+    training.setdefault("explain_ig_batch_size", 0)
     training.setdefault("explain_sample_method", "even")
     training.setdefault("explain_perturb", True)
+    training.setdefault("explain_perturb_batch_size", 0)
     training.setdefault("explain_write_plots", True)
     training.setdefault("explain_report_style", "paper")
     training.setdefault("explain_plot_theme", "paper")
+    training.setdefault("explain_standard_plots", True)
     training.setdefault("explain_interactive_plots", False)
     training.setdefault("explain_shap_enabled", True)
     training.setdefault("explain_shap_mode", "score_head_surrogate")
@@ -585,6 +598,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_umap_max_points", 10000)
     training.setdefault("explain_umap_n_neighbors", 15)
     training.setdefault("explain_umap_min_dist", 0.1)
+    training.setdefault("table_output_format", "csv")
+    training.setdefault("save_integer_share_daily_weights_csv", True)
+    training.setdefault("save_integer_share_holdings_csv", True)
+    training.setdefault("save_daily_weights_csv", True)
+    training.setdefault("save_daily_weights_table", training["save_daily_weights_csv"])
+    training.setdefault(
+        "save_integer_share_daily_weights_table",
+        training["save_integer_share_daily_weights_csv"],
+    )
+    training.setdefault("save_integer_share_holdings_table", training["save_integer_share_holdings_csv"])
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -976,6 +999,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"training.explain_shap_mode must be one of {sorted(valid_shap_modes)}")
     training["explain_shap_mode"] = shap_mode
     training["explain_case_study_top_k"] = max(1, int(training.get("explain_case_study_top_k", 5)))
+    training["explain_ig_batch_size"] = max(0, int(training.get("explain_ig_batch_size", 0)))
+    training["explain_perturb_batch_size"] = max(0, int(training.get("explain_perturb_batch_size", 0)))
     training["explain_umap_max_points"] = max(0, int(training.get("explain_umap_max_points", 10000)))
     training["explain_umap_n_neighbors"] = max(2, int(training.get("explain_umap_n_neighbors", 15)))
     training["explain_umap_min_dist"] = max(0.0, float(training.get("explain_umap_min_dist", 0.1)))
@@ -1070,11 +1095,14 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_top_k=training_raw["explain_top_k"],
             explain_max_rows=training_raw["explain_max_rows"],
             explain_ig_steps=training_raw["explain_ig_steps"],
+            explain_ig_batch_size=training_raw["explain_ig_batch_size"],
             explain_sample_method=training_raw["explain_sample_method"],
             explain_perturb=training_raw["explain_perturb"],
+            explain_perturb_batch_size=training_raw["explain_perturb_batch_size"],
             explain_write_plots=training_raw["explain_write_plots"],
             explain_report_style=training_raw["explain_report_style"],
             explain_plot_theme=training_raw["explain_plot_theme"],
+            explain_standard_plots=training_raw["explain_standard_plots"],
             explain_interactive_plots=training_raw["explain_interactive_plots"],
             explain_shap_enabled=training_raw["explain_shap_enabled"],
             explain_shap_mode=training_raw["explain_shap_mode"],
@@ -1085,6 +1113,13 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_umap_max_points=training_raw["explain_umap_max_points"],
             explain_umap_n_neighbors=training_raw["explain_umap_n_neighbors"],
             explain_umap_min_dist=training_raw["explain_umap_min_dist"],
+            table_output_format=training_raw["table_output_format"],
+            save_daily_weights_table=training_raw["save_daily_weights_table"],
+            save_integer_share_daily_weights_table=training_raw["save_integer_share_daily_weights_table"],
+            save_integer_share_holdings_table=training_raw["save_integer_share_holdings_table"],
+            save_integer_share_daily_weights_csv=training_raw["save_integer_share_daily_weights_csv"],
+            save_integer_share_holdings_csv=training_raw["save_integer_share_holdings_csv"],
+            save_daily_weights_csv=training_raw["save_daily_weights_csv"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],
