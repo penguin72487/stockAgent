@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -26,6 +27,8 @@ class CrossAssetTransmissionSettings:
     max_targets: int = 32
     top_edges: int = 200
     source_chunk_size: int = 4
+    row_chunk_size: int = 0
+    max_repeated_rows: int = 8
     perturb_scale: float = 1.0
     shocks: tuple[str, ...] = DEFAULT_SHOCKS
     attention_flow: bool = True
@@ -39,6 +42,34 @@ class CrossAssetTransmissionSettings:
 def _is_cuda_oom(exc: BaseException) -> bool:
     message = str(exc).lower()
     return isinstance(exc, RuntimeError) and "out of memory" in message and ("cuda" in message or "cublas" in message)
+
+
+def _auto_row_chunk_size(n_rows: int, n_symbols: int, settings: CrossAssetTransmissionSettings) -> tuple[int, dict[str, Any]]:
+    n_rows = max(1, int(n_rows))
+    override = os.environ.get("STOCKAGENT_CROSS_ASSET_ROW_CHUNK_SIZE")
+    if override:
+        try:
+            value = max(1, min(n_rows, int(override)))
+            return value, {"reason": "env_override", "row_chunk_size": value, "rows": n_rows}
+        except ValueError:
+            pass
+    requested = int(settings.row_chunk_size)
+    if requested > 0:
+        value = max(1, min(n_rows, requested))
+        return value, {"reason": "settings", "row_chunk_size": value, "rows": n_rows}
+    source_chunk = max(1, int(settings.source_chunk_size))
+    max_repeated_rows = max(1, int(settings.max_repeated_rows))
+    value = max(1, min(n_rows, max_repeated_rows // source_chunk))
+    if int(n_symbols) >= 10_000:
+        value = min(value, 4)
+    return value, {
+        "reason": "repeated_row_budget",
+        "row_chunk_size": value,
+        "rows": n_rows,
+        "symbols": int(n_symbols),
+        "source_chunk_size": source_chunk,
+        "max_repeated_rows": max_repeated_rows,
+    }
 
 
 def _sanitize_tensor(value: torch.Tensor) -> torch.Tensor:
@@ -387,27 +418,59 @@ def abstract_cross_asset_transmission(
 
     total_start = time.perf_counter()
     device = device or next(model.parameters()).device
-    x = torch.nan_to_num(batch["x"].to(device=device).float(), nan=0.0, posinf=0.0, neginf=0.0)
-    mask = batch["tradable_mask"].to(device=device, dtype=torch.bool)
-    returns = torch.zeros_like(mask, dtype=torch.float32)
+    x_cpu = torch.nan_to_num(batch["x"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    mask_cpu = batch["tradable_mask"].detach().to(dtype=torch.bool)
+    returns_cpu = torch.zeros_like(mask_cpu, dtype=torch.float32)
     if "future_log_returns" in batch:
-        returns = torch.nan_to_num(batch["future_log_returns"].to(device=device).float(), nan=0.0, posinf=0.0, neginf=0.0)
-    n_rows, lookback, n_symbols, n_features = (int(x.size(0)), int(x.size(1)), int(x.size(2)), int(x.size(3)))
+        returns_cpu = torch.nan_to_num(batch["future_log_returns"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    n_rows, lookback, n_symbols, n_features = (
+        int(x_cpu.size(0)),
+        int(x_cpu.size(1)),
+        int(x_cpu.size(2)),
+        int(x_cpu.size(3)),
+    )
     warnings: list[str] = []
+    row_chunk_size, row_chunk_info = _auto_row_chunk_size(n_rows, n_symbols, settings)
+    if row_chunk_size < n_rows:
+        warnings.append(
+            f"Cross-asset transmission used row microbatching: row_chunk_size={row_chunk_size}, rows={n_rows}."
+        )
 
     was_training = model.training
     model.eval()
+    weight_parts: list[torch.Tensor] = []
+    score_parts: list[torch.Tensor] = []
+    rank_parts: list[torch.Tensor] = []
+    aux: dict[str, torch.Tensor] = {}
     with torch.no_grad():
-        base_weights, base_scores, base_rank, _base_centered, aux = _forward_outputs(model, x, mask, return_aux=True)
+        for row_start in range(0, n_rows, row_chunk_size):
+            row_end = min(n_rows, row_start + row_chunk_size)
+            x_row = x_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+            mask_row = mask_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+            weights_row, scores_row, rank_row, _centered_row, aux_row = _forward_outputs(
+                model,
+                x_row,
+                mask_row,
+                return_aux=not bool(aux),
+            )
+            weight_parts.append(weights_row.detach().cpu())
+            score_parts.append(scores_row.detach().cpu())
+            rank_parts.append(rank_row.detach().cpu())
+            if not aux:
+                aux = {str(key): value.detach().cpu() for key, value in aux_row.items() if torch.is_tensor(value)}
+            del x_row, mask_row, weights_row, scores_row, rank_row, aux_row
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     if was_training:
         model.train()
-    base_weights = base_weights.masked_fill(~mask, 0.0)
-    base_scores = base_scores.masked_fill(~mask, 0.0)
-    base_rank_pos = _rank_positions(base_rank, mask)
+    base_weights = torch.cat(weight_parts, dim=0).masked_fill(~mask_cpu, 0.0)
+    base_scores = torch.cat(score_parts, dim=0).masked_fill(~mask_cpu, 0.0)
+    base_rank = torch.cat(rank_parts, dim=0)
+    base_rank_pos = _rank_positions(base_rank, mask_cpu)
     source_idx, target_idx, importance = _select_symbols(
         base_weights,
         base_scores,
-        mask,
+        mask_cpu,
         max_sources=settings.max_sources,
         max_targets=settings.max_targets,
     )
@@ -416,18 +479,24 @@ def abstract_cross_asset_transmission(
     if not source_idx or not target_idx:
         warnings.append("No active source/target symbols were available.")
 
-    feature_std = x.detach().float().std(dim=(0, 1, 2)).clamp_min(1e-6)
+    feature_std = x_cpu.detach().float().std(dim=(0, 1, 2)).clamp_min(1e-6)
     attention_flow = None
     attention_rows: list[dict[str, Any]] = []
     if bool(settings.attention_flow):
+        attention_rows_n = max(1, min(n_rows, int(settings.attention_capture_rows), row_chunk_size))
+        x_attention = x_cpu[:attention_rows_n].to(device=device, non_blocking=(device.type == "cuda"))
+        mask_attention = mask_cpu[:attention_rows_n].to(device=device, non_blocking=(device.type == "cuda"))
         attention_flow, attention_rows, attention_warnings = _capture_attention_flow(
             model,
-            x,
-            mask,
+            x_attention,
+            mask_attention,
             n_symbols=n_symbols,
-            rows=settings.attention_capture_rows,
+            rows=attention_rows_n,
             max_elements=settings.attention_capture_max_elements,
         )
+        del x_attention, mask_attention
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         warnings.extend(attention_warnings)
     if attention_flow is None:
         attention_selected = np.zeros((len(source_idx), len(target_idx)), dtype=np.float32)
@@ -454,68 +523,120 @@ def abstract_cross_asset_transmission(
         while source_pos < len(source_idx):
             chunk_sources = source_idx[source_pos : source_pos + chunk_size]
             repeats = len(chunk_sources)
-            try:
-                with torch.no_grad():
-                    x_rep = x.detach().unsqueeze(0).expand((repeats,) + tuple(x.shape)).clone()
-                    for local_idx, source_symbol_idx in enumerate(chunk_sources):
-                        _apply_shock(
-                            x_rep,
-                            local_idx,
-                            source_symbol_idx,
-                            feature_idx,
-                            shock=shock,
-                            scale=float(settings.perturb_scale),
-                            feature_std=feature_std,
+            sl = slice(source_pos, source_pos + repeats)
+            selected_targets = torch.as_tensor(target_idx, device=device, dtype=torch.long)
+            accum = {name: np.zeros((repeats, len(target_idx)), dtype=np.float64) for name in buffers}
+            row_weight_total = 0.0
+            retry_source_chunk = False
+            for row_start in range(0, n_rows, row_chunk_size):
+                row_end = min(n_rows, row_start + row_chunk_size)
+                row_count = row_end - row_start
+                try:
+                    with torch.no_grad():
+                        x_row = x_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                        mask_row = mask_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                        returns_row = returns_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                        base_weights_row = base_weights[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                        base_scores_row = base_scores[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                        base_rank_pos_row = base_rank_pos[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                        feature_std_row = feature_std.to(device=device, non_blocking=(device.type == "cuda"))
+                        x_rep = x_row.detach().unsqueeze(0).expand((repeats,) + tuple(x_row.shape)).clone()
+                        for local_idx, source_symbol_idx in enumerate(chunk_sources):
+                            _apply_shock(
+                                x_rep,
+                                local_idx,
+                                source_symbol_idx,
+                                feature_idx,
+                                shock=shock,
+                                scale=float(settings.perturb_scale),
+                                feature_std=feature_std_row,
+                            )
+                        x_rep = x_rep.reshape(repeats * row_count, lookback, n_symbols, n_features)
+                        mask_rep = mask_row.unsqueeze(0).expand(repeats, *tuple(mask_row.shape)).reshape(
+                            repeats * row_count,
+                            n_symbols,
                         )
-                    x_rep = x_rep.reshape(repeats * n_rows, lookback, n_symbols, n_features)
-                    mask_rep = mask.unsqueeze(0).expand(repeats, *tuple(mask.shape)).reshape(repeats * n_rows, n_symbols)
-                    weights_p, scores_p, rank_p, _centered_p, _aux_p = _forward_outputs(
-                        model,
-                        x_rep,
-                        mask_rep,
-                        return_aux=False,
-                    )
-                    weights_p = weights_p.reshape(repeats, n_rows, n_symbols)
-                    scores_p = scores_p.reshape(repeats, n_rows, n_symbols)
-                    rank_p = rank_p.reshape(repeats, n_rows, n_symbols)
-            except RuntimeError as exc:
-                if not _is_cuda_oom(exc) or chunk_size <= 1:
-                    raise
-                oom_retries += 1
-                chunk_size = max(1, chunk_size // 2)
+                        weights_p, scores_p, rank_p, _centered_p, _aux_p = _forward_outputs(
+                            model,
+                            x_rep,
+                            mask_rep,
+                            return_aux=False,
+                        )
+                        weights_p = weights_p.reshape(repeats, row_count, n_symbols)
+                        scores_p = scores_p.reshape(repeats, row_count, n_symbols)
+                        rank_p = rank_p.reshape(repeats, row_count, n_symbols)
+                except RuntimeError as exc:
+                    if not _is_cuda_oom(exc) or chunk_size <= 1:
+                        raise
+                    oom_retries += 1
+                    chunk_size = max(1, chunk_size // 2)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    retry_source_chunk = True
+                    break
+                forward_batches += 1
+                score_delta = scores_p - base_scores_row.unsqueeze(0)
+                weight_delta = weights_p - base_weights_row.unsqueeze(0)
+                pert_rank_pos = _rank_positions(rank_p.reshape(repeats * row_count, n_symbols), mask_rep).reshape(
+                    repeats,
+                    row_count,
+                    n_symbols,
+                )
+                rank_delta = pert_rank_pos - base_rank_pos_row.unsqueeze(0)
+
+                norm_scores = base_scores_row.unsqueeze(0).expand(repeats, -1, -1).clone()
+                for local_idx, source_symbol_idx in enumerate(chunk_sources):
+                    norm_scores[local_idx, :, source_symbol_idx] = scores_p[local_idx, :, source_symbol_idx]
+                norm_weights = _portfolio_weights_from_scores(
+                    model,
+                    norm_scores.reshape(repeats * row_count, n_symbols),
+                    mask_rep,
+                ).reshape(repeats, row_count, n_symbols)
+                realloc_delta = norm_weights - base_weights_row.unsqueeze(0)
+                residual_delta = weight_delta - realloc_delta
+                row_weight = float(row_count)
+                accum["score_abs"] += row_weight * _mean_over_batch(score_delta.index_select(2, selected_targets).abs())
+                accum["score_signed"] += row_weight * _mean_over_batch(score_delta.index_select(2, selected_targets))
+                accum["weight_total_abs"] += row_weight * _mean_over_batch(
+                    weight_delta.index_select(2, selected_targets).abs()
+                )
+                accum["weight_total_signed"] += row_weight * _mean_over_batch(weight_delta.index_select(2, selected_targets))
+                accum["weight_reallocation_abs"] += row_weight * _mean_over_batch(
+                    realloc_delta.index_select(2, selected_targets).abs()
+                )
+                accum["weight_residual_abs"] += row_weight * _mean_over_batch(
+                    residual_delta.index_select(2, selected_targets).abs()
+                )
+                accum["rank_abs"] += row_weight * _mean_over_batch(rank_delta.index_select(2, selected_targets).abs())
+                base_target_weight = base_weights_row.index_select(1, selected_targets).unsqueeze(0)
+                pert_target_weight = weights_p.index_select(2, selected_targets)
+                accum["flip_prob"] += row_weight * _mean_over_batch((base_target_weight * pert_target_weight < 0).float())
+                target_returns = returns_row.index_select(1, selected_targets).unsqueeze(0)
+                accum["transmission_pnl"] += row_weight * _mean_over_batch(
+                    weight_delta.index_select(2, selected_targets) * target_returns
+                )
+                row_weight_total += row_weight
+                del (
+                    x_row,
+                    mask_row,
+                    returns_row,
+                    base_weights_row,
+                    base_scores_row,
+                    base_rank_pos_row,
+                    feature_std_row,
+                    x_rep,
+                    mask_rep,
+                    weights_p,
+                    scores_p,
+                    rank_p,
+                )
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+            if retry_source_chunk:
                 continue
-            forward_batches += 1
-            score_delta = scores_p - base_scores.unsqueeze(0)
-            weight_delta = weights_p - base_weights.unsqueeze(0)
-            pert_rank_pos = _rank_positions(rank_p.reshape(repeats * n_rows, n_symbols), mask_rep).reshape(repeats, n_rows, n_symbols)
-            rank_delta = pert_rank_pos - base_rank_pos.unsqueeze(0)
-
-            norm_scores = base_scores.unsqueeze(0).expand(repeats, -1, -1).clone()
-            for local_idx, source_symbol_idx in enumerate(chunk_sources):
-                norm_scores[local_idx, :, source_symbol_idx] = scores_p[local_idx, :, source_symbol_idx]
-            norm_weights = _portfolio_weights_from_scores(
-                model,
-                norm_scores.reshape(repeats * n_rows, n_symbols),
-                mask_rep,
-            ).reshape(repeats, n_rows, n_symbols)
-            realloc_delta = norm_weights - base_weights.unsqueeze(0)
-            residual_delta = weight_delta - realloc_delta
-            selected_targets = torch.as_tensor(target_idx, device=device, dtype=torch.long)
-            sl = slice(source_pos, source_pos + repeats)
-            buffers["score_abs"][sl, :] = _mean_over_batch(score_delta.index_select(2, selected_targets).abs())
-            buffers["score_signed"][sl, :] = _mean_over_batch(score_delta.index_select(2, selected_targets))
-            buffers["weight_total_abs"][sl, :] = _mean_over_batch(weight_delta.index_select(2, selected_targets).abs())
-            buffers["weight_total_signed"][sl, :] = _mean_over_batch(weight_delta.index_select(2, selected_targets))
-            buffers["weight_reallocation_abs"][sl, :] = _mean_over_batch(realloc_delta.index_select(2, selected_targets).abs())
-            buffers["weight_residual_abs"][sl, :] = _mean_over_batch(residual_delta.index_select(2, selected_targets).abs())
-            buffers["rank_abs"][sl, :] = _mean_over_batch(rank_delta.index_select(2, selected_targets).abs())
-            base_target_weight = base_weights.index_select(1, selected_targets).unsqueeze(0)
-            pert_target_weight = weights_p.index_select(2, selected_targets)
-            buffers["flip_prob"][sl, :] = _mean_over_batch((base_target_weight * pert_target_weight < 0).float())
-            target_returns = returns.index_select(1, selected_targets).unsqueeze(0)
-            buffers["transmission_pnl"][sl, :] = _mean_over_batch(weight_delta.index_select(2, selected_targets) * target_returns)
+            denom = max(1.0, row_weight_total)
+            for metric_name, values in accum.items():
+                buffers[metric_name][sl, :] = (values / denom).astype(np.float32, copy=False)
             source_pos += repeats
 
         perturbation_evidence = _normalize_matrix(buffers["weight_residual_abs"])
@@ -550,6 +671,7 @@ def abstract_cross_asset_transmission(
                 "shock": shock,
                 "matched_features": [feature_names[idx] for idx in feature_idx],
                 "source_chunk_size_final": int(chunk_size),
+                "row_chunk_size": int(row_chunk_size),
                 "forward_batches": int(forward_batches),
                 "oom_retries": int(oom_retries),
                 "max_validated_transmission": float(validated.max()) if validated.size else 0.0,
@@ -608,6 +730,7 @@ def abstract_cross_asset_transmission(
         "targets": int(len(target_idx)),
         "shocks": list(requested_shocks),
         "settings": asdict(settings),
+        "row_chunking": row_chunk_info,
         "shock_summaries": shock_summaries,
         "attention_available": bool(attention_flow is not None),
         "attention_capture_rows": attention_rows,
