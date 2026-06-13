@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if [[ -f "$ROOT_DIR/scripts/runtime_env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/scripts/runtime_env.sh"
+fi
+
 ACTION="${1:-start}"
 ENV_FILE="${DAILY_DOWNLOADER_ENV_FILE:-configs/daily_downloader.env}"
 
@@ -48,7 +53,8 @@ has_own_session() {
 }
 
 export_default_runtime() {
-  export PYTHON_BIN="${PYTHON_BIN:-/home/user/miniforge3/envs/fintech/bin/python}"
+  prepend_fintech_path
+  export PYTHON_BIN="${PYTHON_BIN:-$(resolve_fintech_python 2>/dev/null || true)}"
   export RUN_MODE="${RUN_MODE:-market-daemon}"
   export MARKET_CHECK_INTERVAL_SECONDS="${MARKET_CHECK_INTERVAL_SECONDS:-300}"
   export MAX_CYCLES="${MAX_CYCLES:-0}"

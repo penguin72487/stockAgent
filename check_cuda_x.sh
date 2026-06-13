@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -e
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$ROOT_DIR/scripts/runtime_env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/scripts/runtime_env.sh"
+  prepend_fintech_path
+fi
+
+PYTHON_BIN="${PYTHON_BIN:-$(resolve_fintech_python 2>/dev/null || true)}"
+if [[ -x "$FINTECH_MAMBA_BIN" ]]; then
+  CONDA_LIST=("$FINTECH_MAMBA_BIN" list -p "$FINTECH_ENV_PATH")
+elif command -v mamba >/dev/null 2>&1; then
+  CONDA_LIST=(mamba list -p "$FINTECH_ENV_PATH")
+elif command -v conda >/dev/null 2>&1; then
+  CONDA_LIST=(conda list -p "$FINTECH_ENV_PATH")
+else
+  echo "Neither micromamba, mamba, nor conda found." >&2
+  exit 2
+fi
+
 echo "========== CUDA-X Package Check =========="
 
 need=(
@@ -31,7 +50,7 @@ need=(
 missing=()
 
 for p in "${need[@]}"; do
-  if conda list "$p" | awk 'NR>3 {print $1}' | grep -qx "$p"; then
+  if "${CONDA_LIST[@]}" | awk 'NR>3 {print $1}' | grep -qx "$p"; then
     echo "[OK]      $p"
   else
     echo "[MISSING] $p"
@@ -42,7 +61,7 @@ done
 echo
 echo "========== Python Import Check =========="
 
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import importlib.util
 
 def has_module(name):

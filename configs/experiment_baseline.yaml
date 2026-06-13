@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 25
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -15,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/us_stocks
-  benchmark_name: "SPY"
+  parquet_root: data_okx
+  benchmark_name: "BTCUSDTSWAP"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -34,8 +34,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0001
-  sell_fee_rate: 0.0001
+  buy_fee_rate: 0.0005
+  sell_fee_rate: 0.0005
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
