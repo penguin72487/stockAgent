@@ -13,7 +13,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -59,8 +59,16 @@ FOREX_TICKER_PATTERN = re.compile(r"^[A-Z]{6}=X$")
 CRYPTO_SYMBOL_PATTERN = re.compile(r"^[a-z]{2,8}$")
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
-REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose"}
+REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose", "Trading_Volume"}
 BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
+UNAVAILABLE_TRIGGER_TEXTS = (
+    BLACKLIST_TRIGGER_TEXT,
+    "possibly delisted",
+    "no price data found",
+    "no data found, symbol may be delisted",
+    "quote not found",
+    "unavailable or delisted",
+)
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
 YF_CRYPTO_INTRADAY_INTERVAL = "15m"
 YF_CRYPTO_INTRADAY_SECONDS = 15 * 60
@@ -267,6 +275,7 @@ class SymbolResolution:
     scheduled_records: list[SymbolRecord]
     manifest_records: list[SymbolRecord]
     new_codes: set[str]
+    active_discovery_symbols: set[str] = field(default_factory=set)
 
     @property
     def active_records(self) -> list[SymbolRecord]:
@@ -626,7 +635,7 @@ class PrecheckLoader:
             self._process = None
 
 
-def _normalize_download_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def _normalize_download_frame(frame: pd.DataFrame, *, keep_zero_volume: bool = True) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=BASE_OUTPUT_COLUMNS)
 
@@ -671,8 +680,14 @@ def _normalize_download_frame(frame: pd.DataFrame) -> pd.DataFrame:
         normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
 
     normalized = normalized.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
-    normalized = normalized.dropna(axis=1, how="all")
-    if "Trading_Volume" in normalized.columns:
+    empty_extra_columns = [
+        column
+        for column in normalized.columns
+        if column not in set(BASE_OUTPUT_COLUMNS) and normalized[column].isna().all()
+    ]
+    if empty_extra_columns:
+        normalized = normalized.drop(columns=empty_extra_columns)
+    if not keep_zero_volume and "Trading_Volume" in normalized.columns:
         volume = pd.to_numeric(normalized["Trading_Volume"], errors="coerce")
         if volume.isna().all() or volume.fillna(0).eq(0).all():
             normalized = normalized.drop(columns=["Trading_Volume"])
@@ -860,6 +875,62 @@ def _is_delisted_record(record: SymbolRecord) -> bool:
 
 def _skip_status_for_unavailable_record(record: SymbolRecord) -> str:
     return "delisted_skip" if _is_delisted_record(record) else "not_found_skip"
+
+
+def _delisted_market_for_asset(asset_class: str) -> str:
+    if asset_class == "tw_stocks":
+        return "tw_delisted"
+    if asset_class == "us_stocks":
+        return "us_delisted"
+    return f"{asset_class}_delisted"
+
+
+def _candidate_symbol_keys(asset_class: str, record: SymbolRecord) -> set[str]:
+    return {symbol.upper() for symbol in _candidate_symbols_for_record(asset_class, record) if symbol}
+
+
+def _record_overlaps_symbols(asset_class: str, record: SymbolRecord, symbols: set[str]) -> bool:
+    return bool(_candidate_symbol_keys(asset_class, record) & symbols)
+
+
+def _is_delisted_archive_record(record: SymbolRecord) -> bool:
+    return record.code.upper().endswith(("_DL", "_TW", "_TWO"))
+
+
+def _with_market(record: SymbolRecord, market: str) -> SymbolRecord:
+    if record.market == market:
+        return record
+    return SymbolRecord(code=record.code, name=record.name, market=market, yahoo_symbol=record.yahoo_symbol)
+
+
+def _apply_daily_listing_state(
+    asset_class: str,
+    records: list[SymbolRecord],
+    active_symbols: set[str],
+    delisted_symbols: set[str],
+) -> list[SymbolRecord]:
+    if asset_class not in {"tw_stocks", "us_stocks"} or (not active_symbols and not delisted_symbols):
+        return records
+
+    delisted_market = _delisted_market_for_asset(asset_class)
+    updated: list[SymbolRecord] = []
+    for record in records:
+        overlaps_active = _record_overlaps_symbols(asset_class, record, active_symbols)
+        overlaps_delisted = _record_overlaps_symbols(asset_class, record, delisted_symbols)
+        if _is_delisted_record(record):
+            if overlaps_active and not _is_delisted_archive_record(record):
+                updated.append(_with_market(record, asset_class))
+            else:
+                updated.append(record)
+        elif overlaps_delisted and not overlaps_active:
+            updated.append(_with_market(record, delisted_market))
+        else:
+            updated.append(record)
+    return updated
+
+
+def _captured_indicates_unavailable(captured: str) -> bool:
+    return any(trigger in captured for trigger in UNAVAILABLE_TRIGGER_TEXTS)
 
 
 def _load_tw_symbols_from_local_manifest() -> list[SymbolRecord]:
@@ -1382,6 +1453,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
     else:
         output_dir = _resolve_asset_output_dir(args, asset_class)
         cached = _resolve_cached_manifest(output_dir, asset_class)
+        blacklist_symbols = _load_blacklist(_blacklist_file_path(output_dir))
         is_daily_update = getattr(args, "mode", "") == "daily-update"
 
         if is_daily_update:
@@ -1395,7 +1467,11 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
             manifest_records = list(cached)
             manifest_records.extend(active_records)
             known_before = {record.code for record in manifest_records}
+            known_symbol_keys: set[str] = set()
+            for record in manifest_records:
+                known_symbol_keys.update(_candidate_symbol_keys(asset_class, record))
             new_codes: set[str] = set()
+            active_discovery_symbols: set[str] = set()
 
             if getattr(args, "daily_retry_known_missing_symbols", False):
                 active_codes = {record.code for record in active_records}
@@ -1425,7 +1501,46 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 except Exception as exc:
                     print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
                 else:
-                    new_from_discovery = [record for record in discovered if record.code not in known_before]
+                    discovered_active_symbols: set[str] = set()
+                    discovered_delisted_symbols: set[str] = set()
+                    for record in discovered:
+                        target = discovered_delisted_symbols if _is_delisted_record(record) else discovered_active_symbols
+                        target.update(_candidate_symbol_keys(asset_class, record))
+                    for record in [*active_records, *manifest_records]:
+                        if (
+                            _is_delisted_record(record)
+                            and not _is_delisted_archive_record(record)
+                            and _record_overlaps_symbols(asset_class, record, discovered_active_symbols)
+                        ):
+                            active_discovery_symbols.update(_candidate_symbol_keys(asset_class, record) & discovered_active_symbols)
+                    active_records = _apply_daily_listing_state(
+                        asset_class,
+                        active_records,
+                        discovered_active_symbols,
+                        discovered_delisted_symbols,
+                    )
+                    manifest_records = _apply_daily_listing_state(
+                        asset_class,
+                        manifest_records,
+                        discovered_active_symbols,
+                        discovered_delisted_symbols,
+                    )
+                    known_symbol_keys = set()
+                    for record in manifest_records:
+                        known_symbol_keys.update(_candidate_symbol_keys(asset_class, record))
+
+                    new_from_discovery = [
+                        record
+                        for record in discovered
+                        if record.code not in known_before
+                        and not (
+                            _is_delisted_record(record)
+                            and (
+                                _candidate_symbol_keys(asset_class, record) & known_symbol_keys
+                                or _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols)
+                            )
+                        )
+                    ]
                     if new_from_discovery:
                         print(
                             f"[symbols] daily-update: adding {len(new_from_discovery)} new symbols "
@@ -1434,6 +1549,10 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                         active_records.extend(new_from_discovery)
                         manifest_records.extend(new_from_discovery)
                         new_codes.update(record.code for record in new_from_discovery)
+                        for record in new_from_discovery:
+                            known_symbol_keys.update(_candidate_symbol_keys(asset_class, record))
+                            if not _is_delisted_record(record):
+                                active_discovery_symbols.update(_candidate_symbol_keys(asset_class, record) & discovered_active_symbols)
 
             active_deduped = _dedupe_records_by_code(active_records)
             manifest_deduped = _dedupe_records_by_code(manifest_records)
@@ -1449,6 +1568,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 scheduled_records=active_deduped,
                 manifest_records=manifest_deduped,
                 new_codes=new_codes,
+                active_discovery_symbols=active_discovery_symbols,
             )
 
         if asset_class == "tw_stocks":
@@ -1595,11 +1715,11 @@ def _download_symbol(
                         _download_frame,
                         timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
                     )
-                normalized = _normalize_download_frame(frame)
+                normalized = _normalize_download_frame(frame, keep_zero_volume=asset_class != "forex")
                 captured = f"{std_capture.getvalue()}\n{err_capture.getvalue()}".lower()
-                if BLACKLIST_TRIGGER_TEXT in captured:
+                if _captured_indicates_unavailable(captured):
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
-                    last_error = f"{candidate_symbol}: {BLACKLIST_TRIGGER_TEXT}"
+                    last_error = f"{candidate_symbol}: unavailable or delisted"
                     break
                 if normalized.empty:
                     last_error = f"{candidate_symbol}: Yahoo returned no rows."
@@ -1612,7 +1732,7 @@ def _download_symbol(
                     normalized = pd.concat([existing_frame, normalized], ignore_index=True)
                     normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce").dt.tz_localize(None)
                     normalized = normalized.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
-                    if "Trading_Volume" in normalized.columns:
+                    if asset_class == "forex" and "Trading_Volume" in normalized.columns:
                         volume = pd.to_numeric(normalized["Trading_Volume"], errors="coerce")
                         if volume.isna().all() or volume.fillna(0).eq(0).all():
                             normalized = normalized.drop(columns=["Trading_Volume"])
@@ -1631,7 +1751,7 @@ def _download_symbol(
                 )
             except Exception as exc:
                 last_error = f"{candidate_symbol}: {exc}"
-                if BLACKLIST_TRIGGER_TEXT in str(exc).lower():
+                if _captured_indicates_unavailable(str(exc).lower()):
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
                     break
                 if attempt < retries:
@@ -1833,6 +1953,39 @@ def _resolve_repair_plan(
             message="All candidate Yahoo symbols are in blacklist.",
         )
 
+    def _delisted_no_history(
+        record: SymbolRecord,
+        output_path: Path,
+        reason: str,
+    ) -> RepairCheck:
+        removed = False
+        if output_path.exists():
+            try:
+                output_path.unlink()
+                removed = True
+            except Exception as exc:
+                return RepairCheck(
+                    record=record,
+                    status="broken",
+                    output_path=output_path,
+                    first_date=None,
+                    last_date=None,
+                    repair_start_date=None,
+                    merge_existing=False,
+                    message=f"failed to remove delisted no-history file: {exc}",
+                )
+        _blacklist_record_symbols(record.yahoo_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
+        return RepairCheck(
+            record=record,
+            status="delisted_removed" if removed else "delisted_no_history",
+            output_path=output_path,
+            first_date=None,
+            last_date=None,
+            repair_start_date=None,
+            merge_existing=False,
+            message=reason,
+        )
+
     progress = tqdm(records, desc=f"precheck:{asset_class}", unit="symbol")
     try:
         for record in progress:
@@ -1877,7 +2030,7 @@ def _resolve_repair_plan(
                 continue
             if error == "missing":
                 if _is_delisted_record(record):
-                    checks.append(_unavailable_skip(record, output_path, None, None))
+                    checks.append(_delisted_no_history(record, output_path, "confirmed delisted with no local history"))
                     continue
                 if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
                     checks.append(_unavailable_skip(record, output_path, None, None))
@@ -1896,7 +2049,10 @@ def _resolve_repair_plan(
                 continue
             if error is not None:
                 if _is_delisted_record(record):
-                    checks.append(_unavailable_skip(record, output_path, None, None))
+                    if error in {"empty", "no_valid_date"}:
+                        checks.append(_delisted_no_history(record, output_path, f"confirmed delisted with no usable history: {error}"))
+                    else:
+                        checks.append(_unavailable_skip(record, output_path, None, None))
                     continue
                 checks.append(
                     RepairCheck(
@@ -1913,7 +2069,7 @@ def _resolve_repair_plan(
                 continue
             if last_date is None:
                 if _is_delisted_record(record):
-                    checks.append(_unavailable_skip(record, output_path, None, None))
+                    checks.append(_delisted_no_history(record, output_path, "confirmed delisted with no valid dates"))
                     continue
                 checks.append(
                     RepairCheck(
@@ -2090,7 +2246,33 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
     _write_symbol_manifest(output_dir, resolution.manifest_records)
+    if resolution.active_discovery_symbols:
+        active_listing_candidates: set[str] = set()
+        for record in records:
+            if _is_delisted_record(record):
+                continue
+            candidates = _candidate_symbol_keys(asset_class, record)
+            if candidates & resolution.active_discovery_symbols:
+                active_listing_candidates.update(candidates)
+        _clear_blacklist_candidates(
+            blacklist_symbols=blacklist_symbols,
+            blacklist_path=blacklist_path,
+            candidates=active_listing_candidates,
+            reason="active listing discovery",
+        )
+
     checks = _resolve_repair_plan(asset_class, args, records, output_dir, new_codes=resolution.new_codes)
+    removed_delisted_codes = {
+        check.record.code
+        for check in checks
+        if check.status in {"delisted_no_history", "delisted_removed"}
+    }
+    if removed_delisted_codes:
+        _write_symbol_manifest(
+            output_dir,
+            [record for record in resolution.manifest_records if record.code not in removed_delisted_codes],
+        )
+
     status_counts: dict[str, int] = {}
     pending = [check for check in checks if check.repair_start_date is not None]
     for check in checks:
@@ -2120,6 +2302,8 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         f"missing={status_counts.get('missing', 0)} new_symbol={status_counts.get('new_symbol', 0)} "
         f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)} "
         f"delisted_skip={status_counts.get('delisted_skip', 0)} "
+        f"delisted_no_history={status_counts.get('delisted_no_history', 0)} "
+        f"delisted_removed={status_counts.get('delisted_removed', 0)} "
         f"not_found_skip={status_counts.get('not_found_skip', 0)} "
         f"lagging_skip={status_counts.get('lagging_skip', 0)}"
     )
@@ -2157,7 +2341,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
                 result.status = "schema_repaired"
             else:
                 result.status = "repaired"
-        elif result.status == "failed" and result.message and BLACKLIST_TRIGGER_TEXT in result.message.lower():
+        elif result.status == "failed" and result.message and _captured_indicates_unavailable(result.message.lower()):
             result.status = "not_found"
         elif result.status == "empty":
             result.status = "still_stale"

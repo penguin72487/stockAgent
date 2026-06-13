@@ -101,7 +101,7 @@ def test_repair_plan_separates_new_symbols_and_delisted_symbols(tmp_path):
 
     assert [(check.record.code, check.status, check.repair_start_date) for check in checks] == [
         ("2222", "new_symbol", "2000-01-01"),
-        ("1111_TW", "delisted_skip", None),
+        ("1111_TW", "delisted_no_history", None),
     ]
 
 
@@ -123,3 +123,111 @@ def test_yahoo_forex_ignores_orphan_frankfurter_parquets(tmp_path, monkeypatch):
 
     assert [record.code for record in resolution.scheduled_records] == ["EURUSD"]
     assert [record.code for record in resolution.manifest_records] == ["EURUSD"]
+
+
+def test_normalize_preserves_zero_volume_for_stock_like_assets():
+    frame = pd.DataFrame(
+        {
+            "Open": [10.0, 10.5],
+            "High": [11.0, 11.0],
+            "Low": [9.5, 10.0],
+            "Close": [10.5, 10.2],
+            "Adj Close": [10.5, 10.2],
+            "Volume": [0, 0],
+        },
+        index=pd.to_datetime(["2026-06-10", "2026-06-11"]),
+    )
+
+    normalized = yahoo._normalize_download_frame(frame, keep_zero_volume=True)
+
+    assert "Trading_Volume" in normalized.columns
+    assert normalized["Trading_Volume"].tolist() == [0, 0]
+
+
+def test_normalize_can_drop_zero_volume_for_assets_without_meaningful_volume():
+    frame = pd.DataFrame(
+        {
+            "Open": [1.1, 1.2],
+            "High": [1.2, 1.3],
+            "Low": [1.0, 1.1],
+            "Close": [1.15, 1.25],
+            "Adj Close": [1.15, 1.25],
+            "Volume": [0, 0],
+        },
+        index=pd.to_datetime(["2026-06-10", "2026-06-11"]),
+    )
+
+    normalized = yahoo._normalize_download_frame(frame, keep_zero_volume=False)
+
+    assert "Trading_Volume" not in normalized.columns
+
+
+def test_daily_resolution_marks_cached_active_symbol_as_delisted(tmp_path, monkeypatch):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    pd.DataFrame(
+        [
+            {"code": "OLDW", "name": "old warrant", "market": "us_stocks", "yahoo_symbol": "OLDW"},
+        ]
+    ).to_csv(output_dir / "symbols.csv", index=False)
+    (output_dir / "OLDW_features.parquet").write_text("placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda asset_class: [])
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda asset_class: [])
+    monkeypatch.setattr(
+        yahoo,
+        "_discover_daily_stock_records",
+        lambda asset_class, args, cached: [
+            yahoo.SymbolRecord("OLDW_DL", "old warrant", "us_delisted", "OLDW"),
+        ],
+    )
+
+    resolution = yahoo._resolve_symbol_resolution("us_stocks", _base_args(tmp_path, asset="us_stocks"))
+
+    assert [(record.code, record.market, record.yahoo_symbol) for record in resolution.scheduled_records] == [
+        ("OLDW", "us_delisted", "OLDW"),
+    ]
+    assert [(record.code, record.market, record.yahoo_symbol) for record in resolution.manifest_records] == [
+        ("OLDW", "us_delisted", "OLDW"),
+    ]
+
+
+def test_repair_plan_removes_delisted_file_without_usable_history(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "OLDW_features.parquet"
+    pd.DataFrame({"close": [1.0]}).to_parquet(output_path, index=False)
+
+    record = yahoo.SymbolRecord("OLDW", "old warrant", "us_delisted", "OLDW")
+    checks = yahoo._resolve_repair_plan("us_stocks", _base_args(tmp_path, asset="us_stocks"), [record], output_dir)
+
+    assert [(check.record.code, check.status, check.repair_start_date) for check in checks] == [
+        ("OLDW", "delisted_removed", None),
+    ]
+    assert not output_path.exists()
+    assert (output_dir / "yahoo_blacklist.txt").read_text(encoding="utf-8").strip() == "OLDW"
+
+
+def test_repair_plan_keeps_delisted_file_with_history_without_refetch(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "OLDW_features.parquet"
+    pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+            "open": [1.0, 1.1],
+            "max": [1.2, 1.2],
+            "min": [0.9, 1.0],
+            "close": [1.1, 1.0],
+            "adjclose": [1.1, 1.0],
+            "Trading_Volume": [100, 0],
+        }
+    ).to_parquet(output_path, index=False)
+
+    record = yahoo.SymbolRecord("OLDW", "old warrant", "us_delisted", "OLDW")
+    checks = yahoo._resolve_repair_plan("us_stocks", _base_args(tmp_path, asset="us_stocks"), [record], output_dir)
+
+    assert [(check.record.code, check.status, check.repair_start_date) for check in checks] == [
+        ("OLDW", "delisted_skip", None),
+    ]
+    assert output_path.exists()

@@ -4,10 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/user/miniforge3/envs/fintech/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(command -v python3 || command -v python || true)"
+if [[ -f "$ROOT_DIR/scripts/runtime_env.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/scripts/runtime_env.sh"
+  prepend_fintech_path
 fi
+
+PYTHON_BIN="${PYTHON_BIN:-$(resolve_fintech_python 2>/dev/null || true)}"
 if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
   echo "[daily] python not found in PATH" >&2
   exit 2
