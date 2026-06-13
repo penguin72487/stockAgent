@@ -1006,7 +1006,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["tradable_mode"] = mode
     panel_backend = str(data.get("panel_backend", "auto")).strip().lower()
-    valid_panel_backends = {"auto", "pandas", "polars", "pyarrow", "duckdb"}
+    valid_panel_backends = {"auto", "pandas", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
     if panel_backend not in valid_panel_backends:
         raise ValueError(
             f"data.panel_backend must be one of {sorted(valid_panel_backends)}, got {data.get('panel_backend')!r}"

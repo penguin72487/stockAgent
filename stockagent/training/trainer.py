@@ -2329,7 +2329,14 @@ def _save_daily_weights_table(
             data = {"date": np.asarray(dates)}
             data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            pl.DataFrame(data).write_parquet(output_path, compression="snappy")
+            lazy = pl.LazyFrame(data)
+            if hasattr(lazy, "sink_parquet"):
+                try:
+                    lazy.sink_parquet(output_path, compression="snappy", engine="streaming")
+                except TypeError:
+                    lazy.sink_parquet(output_path, compression="snappy")
+            else:
+                lazy.collect(engine="streaming").write_parquet(output_path, compression="snappy")
             return
         except Exception as exc:
             print(f"[artifact] Polars daily weights parquet write failed; falling back to pandas: {exc}")

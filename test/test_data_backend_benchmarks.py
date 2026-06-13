@@ -56,6 +56,22 @@ def _write_symbol_nan_range(path: Path, offset: float) -> None:
     frame.to_parquet(path, index=False)
 
 
+def _write_tw_limit_symbol(path: Path) -> None:
+    close = np.asarray([100.0, 110.0, 99.0, 100.0], dtype=np.float64)
+    frame = pd.DataFrame(
+        {
+            "date": pd.date_range("2024-01-01", periods=len(close), freq="D"),
+            "open": close,
+            "max": close,
+            "min": close,
+            "close": close,
+            "adjclose": close,
+            "Trading_Volume": np.full(len(close), 1000.0),
+        }
+    )
+    frame.to_parquet(path, index=False)
+
+
 def test_scan_data_processing_hotspots_finds_panel_and_table_outputs() -> None:
     module = _load_benchmark_module()
     root = Path(__file__).resolve().parents[1]
@@ -74,9 +90,8 @@ def test_feature_prep_benchmark_runs_on_synthetic_parquet(tmp_path: Path) -> Non
 
     backends = ["pandas", "pyarrow"]
     if module._module_available("polars"):
-        backends.append("polars")
-    if module._module_available("duckdb"):
-        backends.append("duckdb")
+        backends.append("polars_lazy")
+        backends.append("polars_streaming")
 
     results = module.benchmark_feature_prep(
         tmp_path,
@@ -132,42 +147,15 @@ def test_pyarrow_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Pat
     assert np.allclose(pyarrow_panel.benchmark_returns, pandas_panel.benchmark_returns, equal_nan=True)
 
 
-def test_panel_build_benchmark_runs_duckdb_on_synthetic_parquet(tmp_path: Path) -> None:
+def test_polars_lazy_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Path) -> None:
     module = _load_benchmark_module()
-    if not module._module_available("duckdb"):
-        return
-
-    _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
-    _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
-
-    results = module.benchmark_panel_build(
-        tmp_path,
-        backends=["duckdb"],
-        max_symbols=2,
-        panel_load_workers=1,
-        benchmark_name="universe_average_return",
-    )
-
-    assert len(results) == 1
-    result = results[0]
-    assert result.backend == "duckdb"
-    assert result.error is None
-    assert result.available
-    assert result.files == 2
-    assert result.rows == 16
-    assert result.elapsed_s is not None and result.elapsed_s >= 0.0
-    assert result.checksum is not None
-
-
-def test_duckdb_panel_builder_matches_pandas_on_synthetic_parquet(tmp_path: Path) -> None:
-    module = _load_benchmark_module()
-    if not module._module_available("duckdb"):
-        return
     from stockagent.data.panel import build_panel
 
+    if not module._module_available("polars"):
+        return
+
     _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
     _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
-    _write_symbol_nan_range(tmp_path / "CCC_features.parquet", 2.0)
 
     pandas_panel = build_panel(
         tmp_path,
@@ -176,32 +164,33 @@ def test_duckdb_panel_builder_matches_pandas_on_synthetic_parquet(tmp_path: Path
         panel_backend="pandas",
         panel_load_workers=1,
     )
-    duckdb_panel = module._build_panel_duckdb(
+    polars_panel = build_panel(
         tmp_path,
-        sorted(tmp_path.glob("*_features.parquet")),
+        use_rapids=False,
         benchmark_name="universe_average_return",
-        threads=1,
+        panel_backend="polars_lazy",
+        panel_load_workers=1,
     )
 
-    assert duckdb_panel.symbols == pandas_panel.symbols
-    assert duckdb_panel.feature_names == pandas_panel.feature_names
-    assert np.array_equal(duckdb_panel.dates, pandas_panel.dates)
-    assert np.allclose(duckdb_panel.features, pandas_panel.features, equal_nan=True, atol=1e-6)
-    assert np.allclose(duckdb_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True, atol=1e-7)
-    assert np.array_equal(duckdb_panel.tradable_mask, pandas_panel.tradable_mask)
-    assert np.array_equal(duckdb_panel.alive_mask, pandas_panel.alive_mask)
-    assert np.allclose(duckdb_panel.benchmark_returns, pandas_panel.benchmark_returns, equal_nan=True, atol=1e-7)
+    assert polars_panel.symbols == pandas_panel.symbols
+    assert polars_panel.feature_names == pandas_panel.feature_names
+    assert np.array_equal(polars_panel.dates, pandas_panel.dates)
+    assert np.allclose(polars_panel.features, pandas_panel.features, equal_nan=True, atol=1e-6)
+    assert np.allclose(polars_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True, atol=1e-7)
+    assert np.array_equal(polars_panel.tradable_mask, pandas_panel.tradable_mask)
+    assert np.array_equal(polars_panel.can_buy_mask, pandas_panel.can_buy_mask)
+    assert np.array_equal(polars_panel.can_sell_mask, pandas_panel.can_sell_mask)
 
 
-def test_runtime_duckdb_panel_backend_matches_pandas(tmp_path: Path) -> None:
+def test_polars_streaming_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Path) -> None:
     module = _load_benchmark_module()
-    if not module._module_available("duckdb"):
-        return
     from stockagent.data.panel import build_panel
+
+    if not module._module_available("polars"):
+        return
 
     _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
     _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
-    _write_symbol_nan_range(tmp_path / "CCC_features.parquet", 2.0)
 
     pandas_panel = build_panel(
         tmp_path,
@@ -210,29 +199,30 @@ def test_runtime_duckdb_panel_backend_matches_pandas(tmp_path: Path) -> None:
         panel_backend="pandas",
         panel_load_workers=1,
     )
-    duckdb_panel = build_panel(
+    polars_panel = build_panel(
         tmp_path,
         use_rapids=False,
         benchmark_name="universe_average_return",
-        panel_backend="duckdb",
+        panel_backend="polars_streaming",
         panel_load_workers=1,
     )
 
-    assert duckdb_panel.symbols == pandas_panel.symbols
-    assert duckdb_panel.feature_names == pandas_panel.feature_names
-    assert np.array_equal(duckdb_panel.dates, pandas_panel.dates)
-    assert np.allclose(duckdb_panel.features, pandas_panel.features, equal_nan=True, atol=1e-6)
-    assert np.allclose(duckdb_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True, atol=1e-7)
-    assert np.array_equal(duckdb_panel.tradable_mask, pandas_panel.tradable_mask)
+    assert polars_panel.symbols == pandas_panel.symbols
+    assert polars_panel.feature_names == pandas_panel.feature_names
+    assert np.array_equal(polars_panel.dates, pandas_panel.dates)
+    assert np.allclose(polars_panel.features, pandas_panel.features, equal_nan=True, atol=1e-6)
+    assert np.allclose(polars_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True, atol=1e-7)
+    assert np.array_equal(polars_panel.tradable_mask, pandas_panel.tradable_mask)
+    assert np.array_equal(polars_panel.can_buy_mask, pandas_panel.can_buy_mask)
+    assert np.array_equal(polars_panel.can_sell_mask, pandas_panel.can_sell_mask)
 
 
 def test_wide_write_benchmark_reports_fastest_backend() -> None:
     module = _load_benchmark_module()
     backends = ["pandas", "pyarrow"]
     if module._module_available("polars"):
-        backends.append("polars")
-    if module._module_available("duckdb"):
-        backends.append("duckdb")
+        backends.append("polars_lazy")
+        backends.append("polars_streaming")
 
     results = module.benchmark_wide_write(
         backends=backends,
