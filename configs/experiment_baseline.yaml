@@ -98,6 +98,8 @@ training:
   explain_sample_method: even
   explain_perturb: true
   explain_perturb_batch_size: 0
+  explain_perturb_max_auto_batch_size: 5
+  explain_perturb_max_input_elements: 32000000
   explain_write_plots: true
   explain_report_style: paper
   explain_plot_theme: paper
@@ -109,9 +111,21 @@ training:
   explain_regime_analysis: true
   explain_fold_stability: true
   explain_umap_enabled: true
-  explain_umap_max_points: 10000
+  explain_umap_max_points: 4096
+  explain_umap_max_projections: 2
   explain_umap_n_neighbors: 15
   explain_umap_min_dist: 0.1
+  explain_cross_asset_enabled: true
+  explain_cross_asset_max_sources: 24
+  explain_cross_asset_max_targets: 24
+  explain_cross_asset_top_edges: 150
+  explain_cross_asset_source_chunk_size: 2
+  explain_cross_asset_perturb_scale: 1.0
+  explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
+  explain_cross_asset_attention_flow: true
+  explain_cross_asset_attention_capture_rows: 4
+  explain_cross_asset_validated_transmission: true
+  explain_cross_asset_role_embedding: true
   table_output_format: parquet
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true

@@ -6,7 +6,7 @@ import inspect
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,8 @@ class ExplainabilitySettings:
     ig_batch_size: int = 0
     perturb: bool = True
     perturb_batch_size: int = 0
+    perturb_max_auto_batch_size: int = 5
+    perturb_max_input_elements: int = 32_000_000
     sample_method: str = "even"
     first_test_year_only: bool = True
     report_style: str = "paper"
@@ -103,8 +105,22 @@ class ExplainabilitySettings:
     fold_stability: bool = True
     umap_enabled: bool = True
     umap_max_points: int = 10000
+    umap_max_projections: int = 0
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
+    cross_asset_enabled: bool = True
+    cross_asset_max_sources: int = 24
+    cross_asset_max_targets: int = 24
+    cross_asset_top_edges: int = 150
+    cross_asset_source_chunk_size: int = 2
+    cross_asset_perturb_scale: float = 1.0
+    cross_asset_shocks: tuple[str, ...] = field(
+        default_factory=lambda: ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
+    )
+    cross_asset_attention_flow: bool = True
+    cross_asset_attention_capture_rows: int = 4
+    cross_asset_validated_transmission: bool = True
+    cross_asset_role_embedding: bool = True
 
 
 @dataclass(slots=True)
@@ -116,6 +132,25 @@ class LoadedExplanationContext:
     split: str
     checkpoint_path: Path
     output_dir: Path
+
+
+def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
+    from stockagent.explainability_cross_asset import CrossAssetTransmissionSettings
+
+    shocks = tuple(str(value).strip().lower() for value in settings.cross_asset_shocks if str(value).strip())
+    return CrossAssetTransmissionSettings(
+        enabled=bool(settings.cross_asset_enabled),
+        max_sources=max(1, int(settings.cross_asset_max_sources)),
+        max_targets=max(1, int(settings.cross_asset_max_targets)),
+        top_edges=max(1, int(settings.cross_asset_top_edges)),
+        source_chunk_size=max(1, int(settings.cross_asset_source_chunk_size)),
+        perturb_scale=float(settings.cross_asset_perturb_scale),
+        shocks=shocks or ("zero", "momentum", "gap", "volume", "volatility", "liquidity"),
+        attention_flow=bool(settings.cross_asset_attention_flow),
+        attention_capture_rows=max(1, int(settings.cross_asset_attention_capture_rows)),
+        validated_transmission=bool(settings.cross_asset_validated_transmission),
+        role_embedding=bool(settings.cross_asset_role_embedding),
+    )
 
 
 def _to_builtin(value: Any) -> Any:
@@ -338,6 +373,11 @@ def _repeat_first_dim(tensor: torch.Tensor, repeats: int) -> torch.Tensor:
     )
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return isinstance(exc, RuntimeError) and "out of memory" in msg and ("cuda" in msg or "cublas" in msg)
+
+
 def _integrated_gradients_attribution(
     model: nn.Module,
     x: torch.Tensor,
@@ -429,39 +469,70 @@ def _perturbation_importance(
     base_scores: torch.Tensor,
     feature_names: list[str],
     batch_size: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    *,
+    max_auto_batch_size: int = 16,
+    max_input_elements: int = 96_000_000,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     perturbations = [
         (time_idx, feat_idx, feature)
         for time_idx in range(int(x.size(1)))
         for feat_idx, feature in enumerate(feature_names)
     ]
+    diagnostics: dict[str, Any] = {
+        "num_perturbations": int(len(perturbations)),
+        "requested_batch_size": int(batch_size),
+        "max_auto_batch_size": int(max_auto_batch_size),
+        "max_input_elements": int(max_input_elements),
+        "chunk_size": 0,
+        "final_chunk_size": 0,
+        "forward_batches": 0,
+        "attempted_forward_batches": 0,
+        "oom_retries": 0,
+        "oom_chunk_sizes": [],
+    }
     if not perturbations:
         frame = pd.DataFrame(rows)
-        return frame, pd.DataFrame()
+        return frame, pd.DataFrame(), diagnostics
     chunk_size = _auto_repeat_chunk_size(
         x,
         len(perturbations),
         int(batch_size),
-        max_auto=16,
-        max_input_elements=32_000_000,
+        max_auto=max(1, int(max_auto_batch_size)),
+        max_input_elements=max(1, int(max_input_elements)),
     )
+    diagnostics["chunk_size"] = int(chunk_size)
     base_weights = base_weights.detach()
     base_scores = base_scores.detach()
     with torch.no_grad():
-        for start in range(0, len(perturbations), chunk_size):
+        start = 0
+        while start < len(perturbations):
             chunk = perturbations[start : start + chunk_size]
             repeats = len(chunk)
-            x_perturbed = x.detach().unsqueeze(0).expand((repeats,) + tuple(x.shape)).clone()
-            for local_idx, (time_idx, feat_idx, _) in enumerate(chunk):
-                x_perturbed[local_idx, :, time_idx, :, feat_idx] = 0.0
-            x_perturbed = x_perturbed.reshape(repeats * int(x.size(0)), *tuple(x.shape[1:]))
-            mask_perturbed = _repeat_first_dim(mask, repeats)
-            weights_p, scores_p, _ = _forward_outputs(model, x_perturbed, mask_perturbed, return_aux=False)
-            weights_p = weights_p.reshape(repeats, *tuple(base_weights.shape))
-            scores_p = scores_p.reshape(repeats, *tuple(base_scores.shape))
-            weight_deltas = (weights_p - base_weights.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
-            score_deltas = (scores_p - base_scores.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+            try:
+                diagnostics["attempted_forward_batches"] = int(diagnostics["attempted_forward_batches"]) + 1
+                x_perturbed = x.detach().unsqueeze(0).expand((repeats,) + tuple(x.shape)).clone()
+                for local_idx, (time_idx, feat_idx, _) in enumerate(chunk):
+                    x_perturbed[local_idx, :, time_idx, :, feat_idx] = 0.0
+                x_perturbed = x_perturbed.reshape(repeats * int(x.size(0)), *tuple(x.shape[1:]))
+                mask_perturbed = _repeat_first_dim(mask, repeats)
+                weights_p, scores_p, _ = _forward_outputs(model, x_perturbed, mask_perturbed, return_aux=False)
+                weights_p = weights_p.reshape(repeats, *tuple(base_weights.shape))
+                scores_p = scores_p.reshape(repeats, *tuple(base_scores.shape))
+                weight_deltas = (weights_p - base_weights.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+                score_deltas = (scores_p - base_scores.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+            except RuntimeError as exc:
+                if not _is_cuda_oom(exc) or chunk_size <= 1:
+                    raise
+                diagnostics["oom_retries"] = int(diagnostics["oom_retries"]) + 1
+                diagnostics["oom_chunk_sizes"].append(int(chunk_size))
+                chunk_size = max(1, int(chunk_size) // 2)
+                diagnostics["final_chunk_size"] = int(chunk_size)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            diagnostics["forward_batches"] = int(diagnostics["forward_batches"]) + 1
+            diagnostics["final_chunk_size"] = int(chunk_size)
             for local_idx, (time_idx, _, feature) in enumerate(chunk):
                 rows.append(
                     {
@@ -474,16 +545,17 @@ def _perturbation_importance(
                         "score_abs_delta": float(score_deltas[local_idx]),
                     }
                 )
+            start += repeats
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return frame, pd.DataFrame()
+        return frame, pd.DataFrame(), diagnostics
     summary = frame.groupby("feature", as_index=False)[["weight_abs_delta", "score_abs_delta"]].sum()
     summary["feature_group"] = summary["feature"].map(_feature_group)
     summary["feature_label"] = summary["feature"].map(_feature_label)
     total = float(summary["weight_abs_delta"].sum())
     summary["weight_delta_share"] = summary["weight_abs_delta"] / total if total > 0.0 else 0.0
     summary = summary.sort_values("weight_abs_delta", ascending=False)
-    return frame, summary
+    return frame, summary, diagnostics
 
 
 def _feature_correlations(
@@ -681,37 +753,67 @@ def _aux_umap_projection_frames(
     dates: list[str],
     settings: ExplainabilitySettings,
     device: torch.device,
-) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]], list[str], dict[str, Any]]:
+    timing: dict[str, Any] = {
+        "enabled": bool(settings.umap_enabled),
+        "eligible_tensors": 0,
+        "projected_tensors": 0,
+        "skipped_by_projection_limit": 0,
+        "max_points": int(settings.umap_max_points),
+        "max_projections": int(settings.umap_max_projections),
+        "per_projection_s": {},
+    }
     if not bool(settings.umap_enabled):
-        return {}, [], ["cuML UMAP projections disabled by settings."]
+        return {}, [], ["cuML UMAP projections disabled by settings."], timing
     if device.type != "cuda":
-        return {}, [], ["cuML UMAP projections require CUDA; skipped because explainability device is not CUDA."]
+        return {}, [], ["cuML UMAP projections require CUDA; skipped because explainability device is not CUDA."], timing
 
     max_points = max(0, int(settings.umap_max_points))
+    timing["max_points"] = int(max_points)
     if max_points < 4:
-        return {}, [], ["cuML UMAP projections skipped because explain_umap_max_points < 4."]
+        return {}, [], ["cuML UMAP projections skipped because explain_umap_max_points < 4."], timing
 
     projection_frames: dict[str, pd.DataFrame] = {}
     summaries: list[dict[str, Any]] = []
     warnings: list[str] = []
-    preferred_names = {
+    preferred_order = (
         "stock_embedding",
-        "z_stock",
-        "latent_factors",
         "market_tokens",
-        "dynamic_latent_queries",
-        "dynamic_market_queries",
-        "dynamic_latent_delta",
-        "dynamic_market_delta",
-        "z_factor_context",
+        "latent_factors",
+        "z_stock",
         "z_market_context",
         "token_embedding",
-    }
+        "z_factor_context",
+        "dynamic_market_queries",
+        "dynamic_latent_queries",
+        "dynamic_market_delta",
+        "dynamic_latent_delta",
+    )
+    preferred_names = set(preferred_order)
+    eligible: list[tuple[str, torch.Tensor]] = []
+    for name in preferred_order:
+        value = aux.get(name)
+        if torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[-1]) >= 2:
+            eligible.append((name, value))
     for name, value in sorted(aux.items()):
-        if name not in preferred_names:
+        if name in preferred_names:
             continue
         if not torch.is_tensor(value) or value.ndim < 3 or int(value.shape[-1]) < 2:
             continue
+        eligible.append((name, value))
+    timing["eligible_tensors"] = int(len(eligible))
+    max_projections = int(settings.umap_max_projections)
+    if max_projections > 0 and len(eligible) > max_projections:
+        timing["skipped_by_projection_limit"] = int(len(eligible) - max_projections)
+        skipped_names = [name for name, _ in eligible[max_projections:]]
+        warnings.append(
+            "cuML UMAP projection limit skipped aux tensors: "
+            + ", ".join(skipped_names[:8])
+            + ("..." if len(skipped_names) > 8 else "")
+        )
+        eligible = eligible[:max_projections]
+    for name, value in eligible:
+        projection_start = time.perf_counter()
         tensor = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
         original_shape = tuple(int(dim) for dim in tensor.shape)
         flat = tensor.reshape(-1, original_shape[-1])
@@ -737,6 +839,7 @@ def _aux_umap_projection_frames(
             )
         except Exception as exc:
             warnings.append(f"{name}: cuML UMAP failed: {type(exc).__name__}: {exc}")
+            timing["per_projection_s"][name] = float(time.perf_counter() - projection_start)
             continue
         sample_idx_cpu = sample_idx.detach().cpu().numpy().astype(np.int64, copy=False)
         embedding_cpu = embedding.get()
@@ -769,11 +872,13 @@ def _aux_umap_projection_frames(
                 "near_collapsed": bool(max(x_std, y_std) < 1e-4),
             }
         )
+        timing["projected_tensors"] = int(timing["projected_tensors"]) + 1
+        timing["per_projection_s"][name] = float(time.perf_counter() - projection_start)
         if max(x_std, y_std) < 1e-4:
             warnings.append(f"{name}: cuML UMAP projection is nearly collapsed; inspect aux tensor and token gates.")
     if not projection_frames and not warnings:
         warnings.append("No eligible transformer aux tensors were found for cuML UMAP projection.")
-    return projection_frames, summaries, warnings
+    return projection_frames, summaries, warnings, timing
 
 
 def _stock_contribution_frame(
@@ -1242,7 +1347,7 @@ def explain_batch(
 
     stage_start = time.perf_counter()
     if settings.perturb:
-        perturb_ft, perturb_feature = _perturbation_importance(
+        perturb_ft, perturb_feature, perturb_diagnostics = _perturbation_importance(
             model,
             x,
             mask,
@@ -1250,10 +1355,24 @@ def explain_batch(
             scores,
             feature_names,
             settings.perturb_batch_size,
+            max_auto_batch_size=settings.perturb_max_auto_batch_size,
+            max_input_elements=settings.perturb_max_input_elements,
         )
     else:
         perturb_ft = pd.DataFrame()
         perturb_feature = pd.DataFrame()
+        perturb_diagnostics = {
+            "num_perturbations": 0,
+            "requested_batch_size": int(settings.perturb_batch_size),
+            "max_auto_batch_size": int(settings.perturb_max_auto_batch_size),
+            "max_input_elements": int(settings.perturb_max_input_elements),
+            "chunk_size": 0,
+            "final_chunk_size": 0,
+            "forward_batches": 0,
+            "attempted_forward_batches": 0,
+            "oom_retries": 0,
+            "oom_chunk_sizes": [],
+        }
     _mark_elapsed(timing, "perturbation_s", stage_start)
 
     stage_start = time.perf_counter()
@@ -1279,7 +1398,7 @@ def explain_batch(
 
     stage_start = time.perf_counter()
     aux_frame, aux_dim_frames = _aux_summary(aux)
-    aux_projection_frames, aux_projection_summary, aux_projection_warnings = _aux_umap_projection_frames(
+    aux_projection_frames, aux_projection_summary, aux_projection_warnings, aux_projection_timing = _aux_umap_projection_frames(
         aux,
         symbols=symbols,
         dates=dates,
@@ -1315,6 +1434,9 @@ def explain_batch(
             "interactive_plots": bool(settings.interactive_plots),
             "shap_enabled": bool(settings.shap_enabled),
             "perturb_batch_size": int(settings.perturb_batch_size),
+            "perturb_max_auto_batch_size": int(settings.perturb_max_auto_batch_size),
+            "perturb_max_input_elements": int(settings.perturb_max_input_elements),
+            "perturb_diagnostics": perturb_diagnostics,
             "shap_mode": _normalize_shap_mode(settings.shap_mode),
             "shap_info": shap_info,
             "case_study_top_k": int(settings.case_study_top_k),
@@ -1322,8 +1444,11 @@ def explain_batch(
             "fold_stability": bool(settings.fold_stability),
             "attribution_lookback": attribution_lookback,
             "umap_enabled": bool(settings.umap_enabled),
+            "umap_max_points": int(settings.umap_max_points),
+            "umap_max_projections": int(settings.umap_max_projections),
             "umap_method": "cuml_umap",
             "aux_projection_summary": aux_projection_summary,
+            "aux_projection_timing": aux_projection_timing,
             "timing": timing,
             "warnings": warnings,
         },
@@ -3094,6 +3219,19 @@ def run_checkpoint_explanation(
         report_style=settings.report_style,
         plot_theme=settings.plot_theme,
     )
+    if bool(settings.cross_asset_enabled):
+        from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
+
+        abstract_cross_asset_transmission(
+            model,
+            batch,
+            feature_names=context.panel.feature_names,
+            symbols=context.panel.symbols,
+            dates=dates,
+            output_dir=destination,
+            settings=_cross_asset_settings_from_explainability(settings),
+            device=device,
+        )
     destination_out = destination
     del result, batch, dataset, model
     _clear_explainability_runtime_cache()
@@ -3117,6 +3255,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
     parser.add_argument("--no-perturb", action="store_true", help="Skip feature perturbation sensitivity.")
     parser.add_argument("--perturb-batch-size", default=0, type=int, help="Batch feature-day perturbations together; 0 selects an automatic safe chunk size.")
+    parser.add_argument("--perturb-max-auto-batch-size", default=16, type=int)
+    parser.add_argument("--perturb-max-input-elements", default=32_000_000, type=int)
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")
     parser.add_argument("--report-style", default="paper", choices=("paper", "standard", "none"))
     parser.add_argument("--plot-theme", default="paper", choices=("paper", "standard"))
@@ -3140,8 +3280,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-umap", action="store_true", help="Skip cuML UMAP aux projections.")
     parser.add_argument("--umap-max-points", default=10000, type=int)
+    parser.add_argument("--umap-max-projections", default=0, type=int, help="Maximum aux tensors to project with UMAP; 0 means no limit.")
     parser.add_argument("--umap-n-neighbors", default=15, type=int)
     parser.add_argument("--umap-min-dist", default=0.1, type=float)
+    parser.add_argument(
+        "--cross-asset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write abstract_cross_asset_transmission outputs. Use --no-cross-asset to disable.",
+    )
+    parser.add_argument("--cross-asset-max-sources", default=24, type=int)
+    parser.add_argument("--cross-asset-max-targets", default=24, type=int)
+    parser.add_argument("--cross-asset-top-edges", default=150, type=int)
+    parser.add_argument("--cross-asset-source-chunk-size", default=2, type=int)
+    parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
+    parser.add_argument(
+        "--cross-asset-shocks",
+        default="zero,momentum,gap,volume,volatility,liquidity",
+        help="Comma-separated abstract shocks to run.",
+    )
+    parser.add_argument(
+        "--cross-asset-attention-flow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use captured attention as transmission evidence when available.",
+    )
+    parser.add_argument("--cross-asset-attention-capture-rows", default=4, type=int)
+    parser.add_argument(
+        "--cross-asset-validated-transmission",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Multiply perturbation evidence by attention evidence when available.",
+    )
+    parser.add_argument(
+        "--cross-asset-role-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write latent role embedding table and plot when aux tensors are available.",
+    )
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
     return parser.parse_args(argv)
 
@@ -3155,6 +3331,8 @@ def main(argv: list[str] | None = None) -> None:
         ig_batch_size=args.ig_batch_size,
         perturb=not args.no_perturb,
         perturb_batch_size=args.perturb_batch_size,
+        perturb_max_auto_batch_size=args.perturb_max_auto_batch_size,
+        perturb_max_input_elements=args.perturb_max_input_elements,
         sample_method=args.sample_method,
         first_test_year_only=not args.all_test_years,
         report_style=args.report_style,
@@ -3168,8 +3346,22 @@ def main(argv: list[str] | None = None) -> None:
         fold_stability=not args.no_fold_stability,
         umap_enabled=not args.no_umap,
         umap_max_points=args.umap_max_points,
+        umap_max_projections=args.umap_max_projections,
         umap_n_neighbors=args.umap_n_neighbors,
         umap_min_dist=args.umap_min_dist,
+        cross_asset_enabled=bool(args.cross_asset),
+        cross_asset_max_sources=max(1, int(args.cross_asset_max_sources)),
+        cross_asset_max_targets=max(1, int(args.cross_asset_max_targets)),
+        cross_asset_top_edges=max(1, int(args.cross_asset_top_edges)),
+        cross_asset_source_chunk_size=max(1, int(args.cross_asset_source_chunk_size)),
+        cross_asset_perturb_scale=float(args.cross_asset_perturb_scale),
+        cross_asset_shocks=tuple(
+            value.strip().lower() for value in str(args.cross_asset_shocks).split(",") if value.strip()
+        ),
+        cross_asset_attention_flow=bool(args.cross_asset_attention_flow),
+        cross_asset_attention_capture_rows=max(1, int(args.cross_asset_attention_capture_rows)),
+        cross_asset_validated_transmission=bool(args.cross_asset_validated_transmission),
+        cross_asset_role_embedding=bool(args.cross_asset_role_embedding),
     )
     # Default behavior: if neither --fold nor --checkpoint is provided,
     # run explainability for all folds that have checkpoint_best.pt.

@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--explain-max-rows", type=int, default=None, help="Override training.explain_max_rows.")
     parser.add_argument("--explain-ig-steps", type=int, default=None, help="Override training.explain_ig_steps.")
+    parser.add_argument("--explain-ig-batch-size", type=int, default=None, help="Override training.explain_ig_batch_size.")
     parser.add_argument(
         "--explain-perturb",
         action=argparse.BooleanOptionalAction,
@@ -89,10 +90,35 @@ def parse_args() -> argparse.Namespace:
         help="Override training.explain_perturb.",
     )
     parser.add_argument(
+        "--explain-perturb-batch-size",
+        type=int,
+        default=None,
+        help="Override training.explain_perturb_batch_size.",
+    )
+    parser.add_argument(
+        "--explain-perturb-max-auto-batch-size",
+        type=int,
+        default=None,
+        help="Override training.explain_perturb_max_auto_batch_size.",
+    )
+    parser.add_argument(
+        "--explain-perturb-max-input-elements",
+        type=int,
+        default=None,
+        help="Override training.explain_perturb_max_input_elements.",
+    )
+    parser.add_argument(
         "--explain-umap",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override training.explain_umap_enabled.",
+    )
+    parser.add_argument("--explain-umap-max-points", type=int, default=None, help="Override training.explain_umap_max_points.")
+    parser.add_argument(
+        "--explain-umap-max-projections",
+        type=int,
+        default=None,
+        help="Override training.explain_umap_max_projections; 0 means no projection-count limit.",
     )
     parser.add_argument(
         "--explain-write-plots",
@@ -105,6 +131,35 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override training.explain_standard_plots.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_cross_asset_enabled.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-max-sources",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_max_sources.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-max-targets",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_max_targets.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-source-chunk-size",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_source_chunk_size.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-shocks",
+        default=None,
+        help="Comma-separated override for training.explain_cross_asset_shocks.",
     )
     parser.add_argument(
         "--save-daily-weights-csv",
@@ -158,14 +213,38 @@ def main() -> None:
         config.training.explain_max_rows = max(1, int(args.explain_max_rows))
     if args.explain_ig_steps is not None:
         config.training.explain_ig_steps = max(0, int(args.explain_ig_steps))
+    if args.explain_ig_batch_size is not None:
+        config.training.explain_ig_batch_size = max(0, int(args.explain_ig_batch_size))
     if args.explain_perturb is not None:
         config.training.explain_perturb = bool(args.explain_perturb)
+    if args.explain_perturb_batch_size is not None:
+        config.training.explain_perturb_batch_size = max(0, int(args.explain_perturb_batch_size))
+    if args.explain_perturb_max_auto_batch_size is not None:
+        config.training.explain_perturb_max_auto_batch_size = max(1, int(args.explain_perturb_max_auto_batch_size))
+    if args.explain_perturb_max_input_elements is not None:
+        config.training.explain_perturb_max_input_elements = max(1, int(args.explain_perturb_max_input_elements))
     if args.explain_umap is not None:
         config.training.explain_umap_enabled = bool(args.explain_umap)
+    if args.explain_umap_max_points is not None:
+        config.training.explain_umap_max_points = max(0, int(args.explain_umap_max_points))
+    if args.explain_umap_max_projections is not None:
+        config.training.explain_umap_max_projections = max(0, int(args.explain_umap_max_projections))
     if args.explain_write_plots is not None:
         config.training.explain_write_plots = bool(args.explain_write_plots)
     if args.explain_standard_plots is not None:
         config.training.explain_standard_plots = bool(args.explain_standard_plots)
+    if args.explain_cross_asset is not None:
+        config.training.explain_cross_asset_enabled = bool(args.explain_cross_asset)
+    if args.explain_cross_asset_max_sources is not None:
+        config.training.explain_cross_asset_max_sources = max(1, int(args.explain_cross_asset_max_sources))
+    if args.explain_cross_asset_max_targets is not None:
+        config.training.explain_cross_asset_max_targets = max(1, int(args.explain_cross_asset_max_targets))
+    if args.explain_cross_asset_source_chunk_size is not None:
+        config.training.explain_cross_asset_source_chunk_size = max(1, int(args.explain_cross_asset_source_chunk_size))
+    if args.explain_cross_asset_shocks is not None:
+        config.training.explain_cross_asset_shocks = [
+            value.strip().lower() for value in str(args.explain_cross_asset_shocks).split(",") if value.strip()
+        ]
     if args.save_daily_weights_csv is not None:
         config.training.save_daily_weights_csv = bool(args.save_daily_weights_csv)
         config.training.save_daily_weights_table = bool(args.save_daily_weights_csv)

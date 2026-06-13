@@ -414,6 +414,8 @@ class TrainingConfig:
     explain_sample_method: str = "even"
     explain_perturb: bool = True
     explain_perturb_batch_size: int = 0
+    explain_perturb_max_auto_batch_size: int = 5
+    explain_perturb_max_input_elements: int = 32_000_000
     explain_write_plots: bool = True
     explain_report_style: str = "paper"
     explain_plot_theme: str = "paper"
@@ -426,8 +428,22 @@ class TrainingConfig:
     explain_fold_stability: bool = True
     explain_umap_enabled: bool = True
     explain_umap_max_points: int = 10000
+    explain_umap_max_projections: int = 0
     explain_umap_n_neighbors: int = 15
     explain_umap_min_dist: float = 0.1
+    explain_cross_asset_enabled: bool = True
+    explain_cross_asset_max_sources: int = 24
+    explain_cross_asset_max_targets: int = 24
+    explain_cross_asset_top_edges: int = 150
+    explain_cross_asset_source_chunk_size: int = 2
+    explain_cross_asset_perturb_scale: float = 1.0
+    explain_cross_asset_shocks: list[str] = field(
+        default_factory=lambda: ["zero", "momentum", "gap", "volume", "volatility", "liquidity"]
+    )
+    explain_cross_asset_attention_flow: bool = True
+    explain_cross_asset_attention_capture_rows: int = 4
+    explain_cross_asset_validated_transmission: bool = True
+    explain_cross_asset_role_embedding: bool = True
     table_output_format: str = "csv"
     save_daily_weights_table: bool = True
     save_integer_share_daily_weights_table: bool = True
@@ -584,6 +600,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_sample_method", "even")
     training.setdefault("explain_perturb", True)
     training.setdefault("explain_perturb_batch_size", 0)
+    training.setdefault("explain_perturb_max_auto_batch_size", 5)
+    training.setdefault("explain_perturb_max_input_elements", 32_000_000)
     training.setdefault("explain_write_plots", True)
     training.setdefault("explain_report_style", "paper")
     training.setdefault("explain_plot_theme", "paper")
@@ -596,8 +614,23 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_fold_stability", True)
     training.setdefault("explain_umap_enabled", True)
     training.setdefault("explain_umap_max_points", 10000)
+    training.setdefault("explain_umap_max_projections", 0)
     training.setdefault("explain_umap_n_neighbors", 15)
     training.setdefault("explain_umap_min_dist", 0.1)
+    training.setdefault("explain_cross_asset_enabled", True)
+    training.setdefault("explain_cross_asset_max_sources", 24)
+    training.setdefault("explain_cross_asset_max_targets", 24)
+    training.setdefault("explain_cross_asset_top_edges", 150)
+    training.setdefault("explain_cross_asset_source_chunk_size", 2)
+    training.setdefault("explain_cross_asset_perturb_scale", 1.0)
+    training.setdefault(
+        "explain_cross_asset_shocks",
+        ["zero", "momentum", "gap", "volume", "volatility", "liquidity"],
+    )
+    training.setdefault("explain_cross_asset_attention_flow", True)
+    training.setdefault("explain_cross_asset_attention_capture_rows", 4)
+    training.setdefault("explain_cross_asset_validated_transmission", True)
+    training.setdefault("explain_cross_asset_role_embedding", True)
     training.setdefault("table_output_format", "csv")
     training.setdefault("save_integer_share_daily_weights_csv", True)
     training.setdefault("save_integer_share_holdings_csv", True)
@@ -1001,9 +1034,39 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_case_study_top_k"] = max(1, int(training.get("explain_case_study_top_k", 5)))
     training["explain_ig_batch_size"] = max(0, int(training.get("explain_ig_batch_size", 0)))
     training["explain_perturb_batch_size"] = max(0, int(training.get("explain_perturb_batch_size", 0)))
+    training["explain_perturb_max_auto_batch_size"] = max(
+        1, int(training.get("explain_perturb_max_auto_batch_size", 5))
+    )
+    training["explain_perturb_max_input_elements"] = max(
+        1, int(training.get("explain_perturb_max_input_elements", 32_000_000))
+    )
     training["explain_umap_max_points"] = max(0, int(training.get("explain_umap_max_points", 10000)))
+    training["explain_umap_max_projections"] = max(0, int(training.get("explain_umap_max_projections", 0)))
     training["explain_umap_n_neighbors"] = max(2, int(training.get("explain_umap_n_neighbors", 15)))
     training["explain_umap_min_dist"] = max(0.0, float(training.get("explain_umap_min_dist", 0.1)))
+    training["explain_cross_asset_max_sources"] = max(1, int(training.get("explain_cross_asset_max_sources", 24)))
+    training["explain_cross_asset_max_targets"] = max(1, int(training.get("explain_cross_asset_max_targets", 24)))
+    training["explain_cross_asset_top_edges"] = max(1, int(training.get("explain_cross_asset_top_edges", 150)))
+    training["explain_cross_asset_source_chunk_size"] = max(
+        1, int(training.get("explain_cross_asset_source_chunk_size", 2))
+    )
+    training["explain_cross_asset_perturb_scale"] = float(training.get("explain_cross_asset_perturb_scale", 1.0))
+    raw_cross_shocks = training.get("explain_cross_asset_shocks", [])
+    if isinstance(raw_cross_shocks, str):
+        cross_shocks = [value.strip().lower() for value in raw_cross_shocks.split(",") if value.strip()]
+    else:
+        cross_shocks = [str(value).strip().lower() for value in raw_cross_shocks if str(value).strip()]
+    training["explain_cross_asset_shocks"] = cross_shocks or [
+        "zero",
+        "momentum",
+        "gap",
+        "volume",
+        "volatility",
+        "liquidity",
+    ]
+    training["explain_cross_asset_attention_capture_rows"] = max(
+        1, int(training.get("explain_cross_asset_attention_capture_rows", 4))
+    )
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
@@ -1099,6 +1162,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_sample_method=training_raw["explain_sample_method"],
             explain_perturb=training_raw["explain_perturb"],
             explain_perturb_batch_size=training_raw["explain_perturb_batch_size"],
+            explain_perturb_max_auto_batch_size=training_raw["explain_perturb_max_auto_batch_size"],
+            explain_perturb_max_input_elements=training_raw["explain_perturb_max_input_elements"],
             explain_write_plots=training_raw["explain_write_plots"],
             explain_report_style=training_raw["explain_report_style"],
             explain_plot_theme=training_raw["explain_plot_theme"],
@@ -1111,8 +1176,20 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_fold_stability=training_raw["explain_fold_stability"],
             explain_umap_enabled=training_raw["explain_umap_enabled"],
             explain_umap_max_points=training_raw["explain_umap_max_points"],
+            explain_umap_max_projections=training_raw["explain_umap_max_projections"],
             explain_umap_n_neighbors=training_raw["explain_umap_n_neighbors"],
             explain_umap_min_dist=training_raw["explain_umap_min_dist"],
+            explain_cross_asset_enabled=training_raw["explain_cross_asset_enabled"],
+            explain_cross_asset_max_sources=training_raw["explain_cross_asset_max_sources"],
+            explain_cross_asset_max_targets=training_raw["explain_cross_asset_max_targets"],
+            explain_cross_asset_top_edges=training_raw["explain_cross_asset_top_edges"],
+            explain_cross_asset_source_chunk_size=training_raw["explain_cross_asset_source_chunk_size"],
+            explain_cross_asset_perturb_scale=training_raw["explain_cross_asset_perturb_scale"],
+            explain_cross_asset_shocks=training_raw["explain_cross_asset_shocks"],
+            explain_cross_asset_attention_flow=training_raw["explain_cross_asset_attention_flow"],
+            explain_cross_asset_attention_capture_rows=training_raw["explain_cross_asset_attention_capture_rows"],
+            explain_cross_asset_validated_transmission=training_raw["explain_cross_asset_validated_transmission"],
+            explain_cross_asset_role_embedding=training_raw["explain_cross_asset_role_embedding"],
             table_output_format=training_raw["table_output_format"],
             save_daily_weights_table=training_raw["save_daily_weights_table"],
             save_integer_share_daily_weights_table=training_raw["save_integer_share_daily_weights_table"],
