@@ -5,7 +5,7 @@ channels:
 dependencies:
   - _openmp_mutex=4.5
   - _python_abi3_support=1.0
-  - accelerate=1.13.0
+  - accelerate=1.14.0
   - aiohappyeyeballs=2.6.2
   - aiohttp=3.14.1
   - aiosignal=1.4.0
@@ -127,7 +127,7 @@ dependencies:
   - cudf=26.04.00
   - cudf-polars=26.04.00
   - cudf_kafka=26.04.00
-  - cudnn=9.23.0.39
+  - cudnn=9.23.1.3
   - cugraph=26.04.00
   - cuml=26.04.00
   - cupy=14.1.1
@@ -259,8 +259,8 @@ dependencies:
   - libcucim=26.04.00
   - libcudf=26.04.00
   - libcudf_kafka=26.04.00
-  - libcudnn=9.23.0.39
-  - libcudnn-dev=9.23.0.39
+  - libcudnn=9.23.1.3
+  - libcudnn-dev=9.23.1.3
   - libcudss=0.7.1.4
   - libcufft=12.3.0.29
   - libcufft-dev=12.3.0.29
@@ -539,7 +539,7 @@ dependencies:
   - scipy=1.16.3
   - send2trash=2.1.0
   - setuptools=82.0.1
-  - shap=0.51.0
+  - shap=0.52.0
   - shapely=2.1.2
   - shellingham=1.5.4
   - simpervisor=1.0.0

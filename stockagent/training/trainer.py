@@ -2670,6 +2670,20 @@ def _maybe_cache_tensors_on_device(
     required_bytes = sum(_tensor_nbytes(tensor) for tensor in tensors if tensor.device.type != "cuda")
     free_mem, total_mem = torch.cuda.mem_get_info(device)
     margin_bytes = int(max(0.0, float(safety_margin_gb)) * 1024**3)
+    min_post_cache_free_bytes = 0
+    if required_bytes >= 4 * 1024**3:
+        # Large shared panels can fit by a static free-memory check but still
+        # starve compiled eval/train workspaces on 16GB cards.
+        min_post_cache_free_bytes = int(8 * 1024**3)
+    post_cache_free_bytes = int(free_mem) - int(required_bytes)
+    if min_post_cache_free_bytes > 0 and post_cache_free_bytes < min_post_cache_free_bytes:
+        print(
+            f"[gpu cache] skipped {name}: need={required_bytes/1024**3:.2f}GB "
+            f"post_free={post_cache_free_bytes/1024**3:.2f}GB "
+            f"min_post_free={min_post_cache_free_bytes/1024**3:.2f}GB "
+            f"(free={free_mem/1024**3:.2f}GB total={total_mem/1024**3:.2f}GB)"
+        )
+        return tensors
     usable_bytes = int(max(0, int(free_mem) - margin_bytes) * max(0.0, float(target_fraction)))
     if required_bytes > usable_bytes:
         print(
@@ -2987,6 +3001,9 @@ def _maybe_cache_windowed_metadata_on_device(
     target_fraction: float,
     safety_margin_gb: float,
 ) -> WindowedSplitTensors:
+    if not _tensor_on_requested_device(split.features, device):
+        _progress(f"[gpu cache] skipped {name} metadata: shared base remains on {split.features.device.type}")
+        return split
     moved = _maybe_cache_tensors_on_device(
         name=f"{name} metadata",
         tensors=_windowed_metadata_tensors(split),
@@ -3216,6 +3233,15 @@ def _finalize_ic_summary_from_series(
     }
 
 
+def _safe_expm1(log_sum: float) -> float:
+    # Keep conversion from cumulative log-return to arithmetic return numerically safe.
+    if log_sum >= 709.78:
+        return math.inf
+    if log_sum <= -745.13:
+        return -1.0
+    return math.expm1(log_sum)
+
+
 def _compute_eval_metrics_like_legacy_online(
     strategy_returns: torch.Tensor,
     benchmark_returns: torch.Tensor,
@@ -3252,9 +3278,9 @@ def _compute_eval_metrics_like_legacy_online(
     var_b = max(0.0, sumsq_b / n - mean_b * mean_b)
     std_r = var_r ** 0.5
     std_b = var_b ** 0.5
-    cum_r = float(math.expm1(sum_r))
-    cum_b = float(math.expm1(sum_b))
-    ann_r = float(math.expm1(mean_r * 252.0))
+    cum_r = _safe_expm1(sum_r)
+    cum_b = _safe_expm1(sum_b)
+    ann_r = _safe_expm1(mean_r * 252.0)
     downside_dev = float((torch.minimum(r, torch.zeros_like(r)).pow(2).sum().item() / n) ** 0.5)
     downside_dev_b = float((torch.minimum(b, torch.zeros_like(b)).pow(2).sum().item() / n) ** 0.5)
     cum_log = torch.cumsum(r, dim=0)
@@ -3881,9 +3907,9 @@ def _evaluate_tensor_batch(
             var_b = max(0.0, sumsq_b / n - mean_b * mean_b)
             std_r = var_r ** 0.5
             std_b = var_b ** 0.5
-            cum_r = float(math.expm1(sum_r))
-            cum_b = float(math.expm1(sum_b))
-            ann_r = float(math.expm1(mean_r * 252.0))
+            cum_r = _safe_expm1(sum_r)
+            cum_b = _safe_expm1(sum_b)
+            ann_r = _safe_expm1(mean_r * 252.0)
             sharpe = float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0
             baseline_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
             downside_dev = float((sum_downside_sq_r / n) ** 0.5)
@@ -4537,9 +4563,9 @@ def _evaluate_windowed_tensor_batch(
             var_b = max(0.0, sumsq_b / n - mean_b * mean_b)
             std_r = var_r ** 0.5
             std_b = var_b ** 0.5
-            cum_r = float(math.expm1(sum_r))
-            cum_b = float(math.expm1(sum_b))
-            ann_r = float(math.expm1(mean_r * 252.0))
+            cum_r = _safe_expm1(sum_r)
+            cum_b = _safe_expm1(sum_b)
+            ann_r = _safe_expm1(mean_r * 252.0)
             downside_dev = float((sum_down_r / n) ** 0.5)
             downside_dev_b = float((sum_down_b / n) ** 0.5)
             metrics = {
@@ -4664,6 +4690,8 @@ def _auto_chunk_rows(
         f"bytes_per_row={bytes_per_row/1024**2:.2f}MiB usable={usable_bytes/1024**3:.2f}GB "
         f"chunk_rows={chunk_rows}{cap_label}"
     )
+    del probe_output, x_probe, mask_probe
+    _release_cuda_memory(device)
 
     return chunk_rows
 
