@@ -414,8 +414,8 @@ class TrainingConfig:
     explain_sample_method: str = "even"
     explain_perturb: bool = True
     explain_perturb_batch_size: int = 0
-    explain_perturb_max_auto_batch_size: int = 5
-    explain_perturb_max_input_elements: int = 32_000_000
+    explain_perturb_max_auto_batch_size: int = 8
+    explain_perturb_max_input_elements: int = 64_000_000
     explain_write_plots: bool = True
     explain_report_style: str = "paper"
     explain_plot_theme: str = "paper"
@@ -601,8 +601,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_sample_method", "even")
     training.setdefault("explain_perturb", True)
     training.setdefault("explain_perturb_batch_size", 0)
-    training.setdefault("explain_perturb_max_auto_batch_size", 5)
-    training.setdefault("explain_perturb_max_input_elements", 32_000_000)
+    training.setdefault("explain_perturb_max_auto_batch_size", 8)
+    training.setdefault("explain_perturb_max_input_elements", 64_000_000)
     training.setdefault("explain_write_plots", True)
     training.setdefault("explain_report_style", "paper")
     training.setdefault("explain_plot_theme", "paper")
@@ -1037,10 +1037,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_ig_batch_size"] = max(0, int(training.get("explain_ig_batch_size", 0)))
     training["explain_perturb_batch_size"] = max(0, int(training.get("explain_perturb_batch_size", 0)))
     training["explain_perturb_max_auto_batch_size"] = max(
-        1, int(training.get("explain_perturb_max_auto_batch_size", 5))
+        1, int(training.get("explain_perturb_max_auto_batch_size", 8))
     )
     training["explain_perturb_max_input_elements"] = max(
-        1, int(training.get("explain_perturb_max_input_elements", 32_000_000))
+        1, int(training.get("explain_perturb_max_input_elements", 64_000_000))
     )
     training["explain_umap_max_points"] = max(0, int(training.get("explain_umap_max_points", 10000)))
     training["explain_umap_max_projections"] = max(0, int(training.get("explain_umap_max_projections", 0)))

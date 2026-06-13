@@ -86,7 +86,7 @@ training:
   curve_plot_async: true
   plot_backend: auto
   epoch_test_curve: true
-  defer_epoch_curve_plot_until_end: true
+  defer_epoch_curve_plot_until_end: false
   input_pipeline_ab_test: false
   input_pipeline_ab_test_steps: 20
   explain_after_each_fold: false
@@ -98,12 +98,12 @@ training:
   explain_sample_method: even
   explain_perturb: true
   explain_perturb_batch_size: 0
-  explain_perturb_max_auto_batch_size: 5
-  explain_perturb_max_input_elements: 32000000
+  explain_perturb_max_auto_batch_size: 8
+  explain_perturb_max_input_elements: 64000000
   explain_write_plots: true
   explain_report_style: paper
   explain_plot_theme: paper
-  explain_standard_plots: false
+  explain_standard_plots: true
   explain_interactive_plots: false
   explain_shap_enabled: true
   explain_shap_mode: score_head_surrogate

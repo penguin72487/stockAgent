@@ -235,7 +235,7 @@ def _lookback_label(value: Any) -> str:
     return f"t-{offset}"
 
 
-def _use_datashader_for_explainability(plot_backend: str) -> bool:
+def _use_datashader_for_explainability(plot_backend: str, *, estimated_points: int = 0) -> bool:
     normalized = _normalize_plot_backend(plot_backend)
     if normalized == "matplotlib":
         return False
@@ -244,6 +244,8 @@ def _use_datashader_for_explainability(plot_backend: str) -> bool:
         raise RuntimeError(
             "RAPIDS/cuDF/Datashader with CUDA was requested for explainability, but it is unavailable."
         )
+    if normalized == "auto" and int(estimated_points) < 100_000:
+        return False
     return bool(available)
 
 
@@ -2736,9 +2738,16 @@ def _plot_all_explanation_figures(
     *,
     aux_projection_frames: dict[str, pd.DataFrame] | None = None,
     plot_backend: str = "auto",
+    plot_timing: dict[str, Any] | None = None,
 ) -> list[str]:
     normalized_backend = _normalize_plot_backend(plot_backend)
-    use_datashader = _use_datashader_for_explainability(normalized_backend)
+    estimated_points = sum(len(frame) for frame in frames.values() if frame is not None)
+    estimated_points += sum(len(frame) for frame in aux_dim_frames.values() if frame is not None)
+    estimated_points += sum(len(frame) for frame in (aux_projection_frames or {}).values() if frame is not None)
+    use_datashader = _use_datashader_for_explainability(normalized_backend, estimated_points=estimated_points)
+    if plot_timing is not None:
+        plot_timing["backend"] = "rapids_datashader" if use_datashader else "matplotlib"
+        plot_timing["estimated_points"] = int(estimated_points)
     try:
         import matplotlib
 
@@ -2752,6 +2761,7 @@ def _plot_all_explanation_figures(
     plot_dir = output_dir / "plots"
     generated: list[Path] = []
 
+    stage_start = time.perf_counter()
     specs = [
         ("feature_importance_gradient", "feature", "grad_x_input_abs", "Gradient x Input Feature Importance"),
         ("feature_importance_integrated_gradients", "feature", "integrated_gradients_abs", "Integrated Gradients Feature Importance"),
@@ -2767,7 +2777,10 @@ def _plot_all_explanation_figures(
         _plot_barh(frame, output_path=out, label_col=label_col, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
+    if plot_timing is not None:
+        plot_timing["bar_specs_s"] = float(time.perf_counter() - stage_start)
 
+    stage_start = time.perf_counter()
     time_specs = [
         ("time_importance_gradient", "grad_x_input_abs", "Gradient x Input By Lookback Day"),
         ("time_importance_integrated_gradients", "integrated_gradients_abs", "Integrated Gradients By Lookback Day"),
@@ -2777,7 +2790,10 @@ def _plot_all_explanation_figures(
         _plot_time_importance(frames.get(frame_name, pd.DataFrame()), output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
+    if plot_timing is not None:
+        plot_timing["time_specs_s"] = float(time.perf_counter() - stage_start)
 
+    stage_start = time.perf_counter()
     heatmap_specs = [
         ("feature_time_gradient", "grad_x_input_abs", "Gradient x Input Feature-Time Heatmap"),
         ("feature_time_integrated_gradients", "integrated_gradients_abs", "Integrated Gradients Feature-Time Heatmap"),
@@ -2798,12 +2814,18 @@ def _plot_all_explanation_figures(
             _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
+    if plot_timing is not None:
+        plot_timing["heatmap_specs_s"] = float(time.perf_counter() - stage_start)
 
+    stage_start = time.perf_counter()
     out = plot_dir / "feature_correlations.png"
     _plot_feature_correlations(frames.get("feature_correlations", pd.DataFrame()), out)
     if out.exists():
         generated.append(out)
+    if plot_timing is not None:
+        plot_timing["feature_correlations_s"] = float(time.perf_counter() - stage_start)
 
+    stage_start = time.perf_counter()
     out = plot_dir / "top_decisions_exposure_by_side.png"
     decision_frame = frames.get("top_decisions", pd.DataFrame())
     if use_datashader:
@@ -2817,7 +2839,10 @@ def _plot_all_explanation_figures(
         _plot_decision_exposure(decision_frame, out)
     if out.exists():
         generated.append(out)
+    if plot_timing is not None:
+        plot_timing["decision_exposure_s"] = float(time.perf_counter() - stage_start)
 
+    stage_start = time.perf_counter()
     aux_plot_dir = plot_dir / "aux_dims"
     for name, frame in aux_dim_frames.items():
         out = aux_plot_dir / f"{_safe_plot_filename(name)}.png"
@@ -2846,7 +2871,10 @@ def _plot_all_explanation_figures(
             )
         if out.exists():
             generated.append(out)
+    if plot_timing is not None:
+        plot_timing["aux_dims_s"] = float(time.perf_counter() - stage_start)
 
+    stage_start = time.perf_counter()
     projection_plot_dir = plot_dir / "aux_umap"
     for name, frame in (aux_projection_frames or {}).items():
         out = projection_plot_dir / f"{_safe_plot_filename(name)}.png"
@@ -2872,6 +2900,8 @@ def _plot_all_explanation_figures(
             plt.close(fig)
         if out.exists():
             generated.append(out)
+    if plot_timing is not None:
+        plot_timing["aux_umap_s"] = float(time.perf_counter() - stage_start)
 
     return [str(path.relative_to(output_dir)) for path in generated]
 
@@ -2911,6 +2941,7 @@ def write_explanation_outputs(
             frame.to_csv(projection_dir / f"{safe_name}.csv", index=False)
     _mark_elapsed(write_timing, "csv_s", stage_start)
     stage_start = time.perf_counter()
+    standard_plot_details: dict[str, Any] = {}
     plots_generated = (
         _plot_all_explanation_figures(
             frames,
@@ -2918,11 +2949,13 @@ def write_explanation_outputs(
             output_dir,
             aux_projection_frames=aux_projection_frames,
             plot_backend=plot_backend,
+            plot_timing=standard_plot_details,
         )
         if write_plots and write_standard_plots
         else []
     )
     _mark_elapsed(write_timing, "plots_s", stage_start)
+    write_timing["standard_plot_details"] = standard_plot_details
     resolved_report_style = _normalize_report_style(report_style or result["summary"].get("report_style", "paper"))
     resolved_plot_theme = _normalize_plot_theme(plot_theme or result["summary"].get("plot_theme", "paper"))
     summary = {
