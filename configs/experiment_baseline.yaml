@@ -1,4 +1,4 @@
-experiment_name: tw-stock-bottleneck-backtest
+experiment_name: us-stock-full-universe-benchmark
 
 runner:
   output_dir: artifacts
@@ -61,7 +61,7 @@ training:
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
-  eval_auto_chunk_rows_cap: 64
+  eval_auto_chunk_rows_cap: 16
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
@@ -74,11 +74,11 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 32
-  batch_size_train: 32
-  batch_size_eval: 16
+  batch_size: 8
+  batch_size_train: 8
+  batch_size_eval: 8
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.2
+  early_stopping_no_improve_ratio: 0.05
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true
@@ -89,7 +89,7 @@ training:
   defer_epoch_curve_plot_until_end: false
   input_pipeline_ab_test: false
   input_pipeline_ab_test_steps: 20
-  explain_after_each_fold: false
+  explain_after_each_fold: true
   explain_first_test_year_only: true
   explain_top_k: 20
   explain_max_rows: 32
@@ -129,8 +129,8 @@ training:
   min_batch_size: 1
   auto_batch_size: false
   vram_budget_gb: 16
-  vram_safety_margin_gb: 0.7
-  target_vram_fraction: 0.9
+  vram_safety_margin_gb: 1.5
+  target_vram_fraction: 0.85
   mlp:
     hidden_dim: 1024
     hidden_layers: 2
