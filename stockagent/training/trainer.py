@@ -1313,9 +1313,9 @@ def _epoch_curve_plot_paths(curve_path: Path, interval: int) -> tuple[Path, Path
     )
 
 
-def _epoch_curve_plot_command(curve_path: Path, interval: int) -> list[str]:
+def _epoch_curve_plot_command(curve_path: Path, interval: int, *, write_parquet_cache: bool = False) -> list[str]:
     output_path, timing_output_path = _epoch_curve_plot_paths(curve_path, interval)
-    return [
+    command = [
         sys.executable,
         str(_epoch_curve_plot_script()),
         "--curve-file",
@@ -1327,22 +1327,53 @@ def _epoch_curve_plot_command(curve_path: Path, interval: int) -> list[str]:
         "--timing-output",
         str(timing_output_path),
     ]
+    if not write_parquet_cache:
+        command.append("--no-write-parquet-cache")
+    return command
 
 
-def _run_epoch_curve_plot_once(curve_path: Path, interval: int) -> None:
+def _run_epoch_curve_plot_once(
+    curve_path: Path,
+    interval: int,
+    *,
+    write_parquet_cache: bool = True,
+) -> dict[str, float | int | str]:
     script_path = _epoch_curve_plot_script()
     if not script_path.exists():
+        return {}
+    try:
+        from plot_epoch_curves import plot_curve_file
+
+        output_path, timing_output_path = _epoch_curve_plot_paths(curve_path, interval)
+        _, _, timing = plot_curve_file(
+            curve_path,
+            interval=max(1, int(interval)),
+            output_path=output_path,
+            timing_output_path=timing_output_path,
+            write_parquet_cache=bool(write_parquet_cache),
+            quiet=True,
+        )
+        return timing
+    except Exception as exc:
+        print(f"[curve plot] failed for {curve_path}: {type(exc).__name__}: {exc}")
+        return {}
+
+
+def _log_curve_plot_timing(label: str, timing: Mapping[str, Any]) -> None:
+    if not timing:
         return
-    proc = subprocess.run(
-        _epoch_curve_plot_command(curve_path, interval),
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        stderr_tail = (proc.stderr or "").strip()[-1000:]
-        print(f"[curve plot] failed for {curve_path}: {stderr_tail}")
+    parts = [f"[profile] {label}: total={float(timing.get('total_s', 0.0)):.3f}s"]
+    for key in ("load_s", "parquet_cache_s", "sample_s", "loss_plot_s", "timing_plot_s"):
+        value = float(timing.get(key, 0.0))
+        if value > 0:
+            parts.append(f"{key[:-2]}={value:.3f}s")
+    rows = timing.get("plotted_rows")
+    if rows is not None:
+        parts.append(f"rows={rows}")
+    timing_json = timing.get("timing_json")
+    if timing_json:
+        parts.append(f"json={timing_json}")
+    print(" ".join(parts))
 
 
 class _AsyncEpochCurvePlotter:
@@ -1359,7 +1390,7 @@ class _AsyncEpochCurvePlotter:
         if not self.curve_path.exists():
             return
         if not self.async_enabled:
-            _run_epoch_curve_plot_once(self.curve_path, self.interval)
+            _run_epoch_curve_plot_once(self.curve_path, self.interval, write_parquet_cache=False)
             return
         self._reap_finished()
         if self._proc is None:
@@ -1385,7 +1416,7 @@ class _AsyncEpochCurvePlotter:
         if not script_path.exists():
             return
         self._proc = subprocess.Popen(
-            _epoch_curve_plot_command(self.curve_path, self.interval),
+            _epoch_curve_plot_command(self.curve_path, self.interval, write_parquet_cache=False),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -2208,29 +2239,53 @@ def _save_backtest_artifact(output_path: Path, result: BacktestResult, dates: np
     )
 
 
-def _save_holdings_csv(
+def _normalize_table_output_format(value: str | None) -> str:
+    fmt = str(value or "csv").strip().lower()
+    if fmt not in {"csv", "parquet"}:
+        raise ValueError(f"Unsupported table_output_format={value!r}; expected 'csv' or 'parquet'")
+    return fmt
+
+
+def _table_path(base_path: Path, table_output_format: str) -> Path:
+    return base_path.with_suffix("." + _normalize_table_output_format(table_output_format))
+
+
+def _unlink_table_variants(base_path: Path) -> None:
+    for suffix in (".csv", ".parquet"):
+        candidate = base_path.with_suffix(suffix)
+        if candidate.exists():
+            candidate.unlink()
+
+
+def _write_dataframe_table(df: Any, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix.lower() == ".parquet":
+        df.to_parquet(output_path, index=False, engine="pyarrow", compression="snappy")
+    elif output_path.suffix.lower() == ".csv":
+        df.to_csv(output_path, index=False)
+    else:
+        raise ValueError(f"Unsupported table output extension: {output_path}")
+
+
+def _save_holdings_table(
     output_path: Path,
     holdings: list[HoldingsRecord],
 ) -> None:
     """Save daily holdings detail sorted by holding ratio."""
     import pandas as pd  # already a transitive dependency
 
-    rows = [
+    df = pd.DataFrame(
         {
-            "date": row.date,
-            "symbol": row.symbol,
-            "shares": int(row.shares),
-            "price": float(row.price),
-            "market_value": float(row.market_value),
-            "holding_ratio": float(row.holding_ratio),
-            "is_cash": bool(row.is_cash),
+            "date": [row.date for row in holdings],
+            "symbol": [row.symbol for row in holdings],
+            "shares": [int(row.shares) for row in holdings],
+            "price": [float(row.price) for row in holdings],
+            "market_value": [float(row.market_value) for row in holdings],
+            "holding_ratio": [float(row.holding_ratio) for row in holdings],
+            "is_cash": [bool(row.is_cash) for row in holdings],
         }
-        for row in holdings
-    ]
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(["date", "holding_ratio", "symbol"], ascending=[True, False, True])
-    df.to_csv(output_path, index=False)
+    )
+    _write_dataframe_table(df, output_path)
 
 
 def _save_daily_portfolio_returns_csv(
@@ -2253,7 +2308,7 @@ def _save_daily_portfolio_returns_csv(
     df.to_csv(output_path, index=False)
 
 
-def _save_daily_weights_csv(
+def _save_daily_weights_table(
     output_path: Path,
     dates: np.ndarray,
     symbols: list[str],
@@ -2264,7 +2319,27 @@ def _save_daily_weights_csv(
     weights = np.asarray(weights_history, dtype=np.float64)
     df = pd.DataFrame(weights, columns=list(symbols))
     df.insert(0, "date", np.asarray(dates))
-    df.to_csv(output_path, index=False)
+    _write_dataframe_table(df, output_path)
+
+
+def _maybe_save_daily_weights_table(
+    base_path: Path,
+    dates: np.ndarray,
+    symbols: list[str],
+    weights_history: np.ndarray,
+    *,
+    enabled: bool,
+    table_output_format: str,
+) -> None:
+    if enabled:
+        output_path = _table_path(base_path, table_output_format)
+        _save_daily_weights_table(output_path, dates, symbols, weights_history)
+        for suffix in (".csv", ".parquet"):
+            stale_path = base_path.with_suffix(suffix)
+            if stale_path != output_path and stale_path.exists():
+                stale_path.unlink()
+        return
+    _unlink_table_variants(base_path)
 
 
 def _save_integer_share_audit_artifacts(
@@ -2273,8 +2348,24 @@ def _save_integer_share_audit_artifacts(
     dates: np.ndarray,
     symbols: list[str],
     holdings: list[HoldingsRecord],
-) -> None:
+    *,
+    write_daily_weights_table: bool = True,
+    write_holdings_table: bool = True,
+    table_output_format: str = "csv",
+) -> dict[str, float | bool | str]:
+    table_output_format = _normalize_table_output_format(table_output_format)
+    timing: dict[str, float | bool | str] = {
+        "table_output_format": table_output_format,
+        "write_daily_weights_table": bool(write_daily_weights_table),
+        "write_holdings_table": bool(write_holdings_table),
+        "write_daily_weights_csv": bool(write_daily_weights_table and table_output_format == "csv"),
+        "write_holdings_csv": bool(write_holdings_table and table_output_format == "csv"),
+    }
+    total_start = time.perf_counter()
+    stage_start = time.perf_counter()
     _save_backtest_artifact(_integer_backtest_path(fold_dir), result, dates)
+    timing["npz_s"] = float(time.perf_counter() - stage_start)
+    stage_start = time.perf_counter()
     _save_daily_portfolio_returns_csv(
         fold_dir / "integer_share_daily_portfolio_returns.csv",
         dates,
@@ -2282,15 +2373,54 @@ def _save_integer_share_audit_artifacts(
         result.benchmark_returns,
         result.turnovers,
     )
-    _save_daily_weights_csv(
-        fold_dir / "integer_share_daily_weights.csv",
-        dates,
-        symbols,
-        result.weights_history,
-    )
+    timing["daily_returns_csv_s"] = float(time.perf_counter() - stage_start)
+    daily_weights_base = fold_dir / "integer_share_daily_weights"
+    if write_daily_weights_table:
+        stage_start = time.perf_counter()
+        daily_weights_path = _table_path(daily_weights_base, table_output_format)
+        _save_daily_weights_table(
+            daily_weights_path,
+            dates,
+            symbols,
+            result.weights_history,
+        )
+        elapsed = float(time.perf_counter() - stage_start)
+        timing["daily_weights_table_s"] = elapsed
+        timing["daily_weights_csv_s"] = elapsed if table_output_format == "csv" else 0.0
+        timing["daily_weights_parquet_s"] = elapsed if table_output_format == "parquet" else 0.0
+        for suffix in (".csv", ".parquet"):
+            stale_path = daily_weights_base.with_suffix(suffix)
+            if stale_path != daily_weights_path and stale_path.exists():
+                stale_path.unlink()
+    else:
+        timing["daily_weights_table_s"] = 0.0
+        timing["daily_weights_csv_s"] = 0.0
+        timing["daily_weights_parquet_s"] = 0.0
+        _unlink_table_variants(daily_weights_base)
+    stage_start = time.perf_counter()
     with (fold_dir / "integer_share_annual_report.txt").open("w", encoding="utf-8") as f:
         f.write(generate_annual_report(result, dates))
-    _save_holdings_csv(fold_dir / "holdings.csv", holdings)
+    timing["annual_report_s"] = float(time.perf_counter() - stage_start)
+    holdings_base = fold_dir / "holdings"
+    if write_holdings_table:
+        stage_start = time.perf_counter()
+        holdings_path = _table_path(holdings_base, table_output_format)
+        _save_holdings_table(holdings_path, holdings)
+        elapsed = float(time.perf_counter() - stage_start)
+        timing["holdings_table_s"] = elapsed
+        timing["holdings_csv_s"] = elapsed if table_output_format == "csv" else 0.0
+        timing["holdings_parquet_s"] = elapsed if table_output_format == "parquet" else 0.0
+        for suffix in (".csv", ".parquet"):
+            stale_path = holdings_base.with_suffix(suffix)
+            if stale_path != holdings_path and stale_path.exists():
+                stale_path.unlink()
+    else:
+        timing["holdings_table_s"] = 0.0
+        timing["holdings_csv_s"] = 0.0
+        timing["holdings_parquet_s"] = 0.0
+        _unlink_table_variants(holdings_base)
+    timing["total_s"] = float(time.perf_counter() - total_start)
+    return timing
 
 
 def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarray]:
@@ -4762,6 +4892,11 @@ def _run_fold_explainability(
 ) -> Path | None:
     if not bool(getattr(config.training, "explain_after_each_fold", False)):
         return None
+    total_start = time.perf_counter()
+    timing: dict[str, float | str | int | bool] = {
+        "fold_id": int(fold.fold_id),
+        "enabled": True,
+    }
 
     from stockagent.explainability import (
         ExplainabilitySettings,
@@ -4775,16 +4910,20 @@ def _run_fold_explainability(
     first_year_only = bool(getattr(config.training, "explain_first_test_year_only", True))
     if first_year_only:
         test_indices = _first_year_indices(panel, test_indices)
+    sample_start = time.perf_counter()
     dataset = CrossSectionalDataset(panel, test_indices, config.training.lookback)
     settings = ExplainabilitySettings(
         top_k=int(getattr(config.training, "explain_top_k", 20)),
         max_rows=int(getattr(config.training, "explain_max_rows", 32)),
         ig_steps=int(getattr(config.training, "explain_ig_steps", 8)),
+        ig_batch_size=int(getattr(config.training, "explain_ig_batch_size", 0)),
         perturb=bool(getattr(config.training, "explain_perturb", True)),
+        perturb_batch_size=int(getattr(config.training, "explain_perturb_batch_size", 0)),
         sample_method=str(getattr(config.training, "explain_sample_method", "even")),
         first_test_year_only=first_year_only,
         report_style=str(getattr(config.training, "explain_report_style", "paper")),
         plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
+        standard_plots=bool(getattr(config.training, "explain_standard_plots", True)),
         interactive_plots=bool(getattr(config.training, "explain_interactive_plots", False)),
         shap_enabled=bool(getattr(config.training, "explain_shap_enabled", True)),
         shap_mode=str(getattr(config.training, "explain_shap_mode", "score_head_surrogate")),
@@ -4798,8 +4937,14 @@ def _run_fold_explainability(
     )
     batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
     dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
+    timing["sample_s"] = float(time.perf_counter() - sample_start)
+    timing["sample_rows"] = int(len(dates))
+    timing["ig_steps"] = int(settings.ig_steps)
+    timing["perturb"] = bool(settings.perturb)
+    timing["write_plots"] = bool(getattr(config.training, "explain_write_plots", True))
     was_training = model.training
     model.eval()
+    compute_start = time.perf_counter()
     try:
         result = explain_batch(
             model,
@@ -4813,6 +4958,8 @@ def _run_fold_explainability(
     finally:
         if was_training:
             model.train()
+    timing["compute_s"] = float(time.perf_counter() - compute_start)
+    compute_timing = result.get("summary", {}).get("timing", {})
 
     destination = output_path / "explainability" / f"fold_{int(fold.fold_id):02d}_test"
     metadata = {
@@ -4827,24 +4974,54 @@ def _run_fold_explainability(
         "date_start": dates[0] if dates else None,
         "date_end": dates[-1] if dates else None,
     }
+    write_start = time.perf_counter()
     write_explanation_outputs(
         result,
         destination,
         metadata=metadata,
         write_plots=bool(getattr(config.training, "explain_write_plots", True)),
+        write_standard_plots=bool(getattr(config.training, "explain_standard_plots", True)),
         plot_backend=str(getattr(config.training, "plot_backend", "auto")),
         report_style=str(getattr(config.training, "explain_report_style", "paper")),
         plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
     )
+    timing["write_s"] = float(time.perf_counter() - write_start)
+    write_timing = result.get("summary", {}).get("write_timing", {})
     if bool(getattr(config.training, "explain_fold_stability", True)):
+        stability_start = time.perf_counter()
         try:
             from stockagent.explainability import write_fold_stability_outputs
 
             write_fold_stability_outputs(output_path / "explainability")
         except Exception as exc:
             print(f"[Fold {fold.fold_id}] fold stability explainability skipped: {type(exc).__name__}: {exc}")
+        timing["fold_stability_s"] = float(time.perf_counter() - stability_start)
+    else:
+        timing["fold_stability_s"] = 0.0
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    timing["total_s"] = float(time.perf_counter() - total_start)
+    timing_path = destination / "train_explainability_timing.json"
+    timing_path.write_text(
+        json.dumps(
+            {
+                **timing,
+                "compute_timing": compute_timing,
+                "write_timing": write_timing,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"[Fold {fold.fold_id}] explainability timing: "
+        f"total={float(timing['total_s']):.3f}s "
+        f"compute={float(timing['compute_s']):.3f}s "
+        f"write={float(timing['write_s']):.3f}s "
+        f"stability={float(timing['fold_stability_s']):.3f}s "
+        f"json={timing_path}"
+    )
     return destination
 
 
@@ -6648,7 +6825,20 @@ def _run_training_tree_models(
                 test_bt.benchmark_returns,
                 test_bt.turnovers,
             )
-            _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
+            _maybe_save_daily_weights_table(
+                fold_dir / "daily_weights.csv",
+                test_dates,
+                panel.symbols,
+                test_bt.weights_history,
+                enabled=bool(
+                    getattr(
+                        config.training,
+                        "save_daily_weights_table",
+                        getattr(config.training, "save_daily_weights_csv", True),
+                    )
+                ),
+                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+            )
             report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
@@ -6666,6 +6856,21 @@ def _run_training_tree_models(
                 test_dates,
                 panel.symbols,
                 holdings_records,
+                write_daily_weights_table=bool(
+                    getattr(
+                        config.training,
+                        "save_integer_share_daily_weights_table",
+                        getattr(config.training, "save_integer_share_daily_weights_csv", True),
+                    )
+                ),
+                write_holdings_table=bool(
+                    getattr(
+                        config.training,
+                        "save_integer_share_holdings_table",
+                        getattr(config.training, "save_integer_share_holdings_csv", True),
+                    )
+                ),
+                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
             )
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -6850,7 +7055,20 @@ def _run_inference_tree_models(
             test_bt.benchmark_returns,
             test_bt.turnovers,
         )
-        _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
+        _maybe_save_daily_weights_table(
+            fold_dir / "daily_weights.csv",
+            test_dates,
+            panel.symbols,
+            test_bt.weights_history,
+            enabled=bool(
+                getattr(
+                    config.training,
+                    "save_daily_weights_table",
+                    getattr(config.training, "save_daily_weights_csv", True),
+                )
+            ),
+            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+        )
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
@@ -6867,6 +7085,21 @@ def _run_inference_tree_models(
             test_dates,
             panel.symbols,
             holdings_records,
+            write_daily_weights_table=bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_daily_weights_table",
+                    getattr(config.training, "save_integer_share_daily_weights_csv", True),
+                )
+            ),
+            write_holdings_table=bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_holdings_table",
+                    getattr(config.training, "save_integer_share_holdings_csv", True),
+                )
+            ),
+            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
         )
 
     if results_by_fold:
@@ -7109,7 +7342,20 @@ def _run_inference_neural_models(
             test_bt.benchmark_returns,
             test_bt.turnovers,
         )
-        _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
+        _maybe_save_daily_weights_table(
+            fold_dir / "daily_weights.csv",
+            test_dates,
+            panel.symbols,
+            test_bt.weights_history,
+            enabled=bool(
+                getattr(
+                    config.training,
+                    "save_daily_weights_table",
+                    getattr(config.training, "save_daily_weights_csv", True),
+                )
+            ),
+            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+        )
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
@@ -7126,6 +7372,21 @@ def _run_inference_neural_models(
             test_dates,
             panel.symbols,
             holdings_records,
+            write_daily_weights_table=bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_daily_weights_table",
+                    getattr(config.training, "save_integer_share_daily_weights_csv", True),
+                )
+            ),
+            write_holdings_table=bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_holdings_table",
+                    getattr(config.training, "save_integer_share_holdings_csv", True),
+                )
+            ),
+            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
         )
 
     if results_by_fold:
@@ -7650,7 +7911,7 @@ def run_training(
             print(f"[Train {train_years}] epoch curve recording disabled")
         run_epoch_test_curve = bool(getattr(config.training, "epoch_test_curve", True))
         defer_epoch_curve_plot_until_end = bool(
-            getattr(config.training, "defer_epoch_curve_plot_until_end", False)
+            getattr(config.training, "defer_epoch_curve_plot_until_end", True)
         )
         if not run_epoch_test_curve:
             print(f"[Train {train_years}] epoch-level test curve disabled; final test runs after training")
@@ -8897,16 +9158,19 @@ def run_training(
                     break
 
         curve_flush_start = time.perf_counter()
+        curve_plot_timing: dict[str, float | int | str] = {}
         if curve_plotter is not None:
             if defer_epoch_curve_plot_until_end:
-                curve_plotter.request()
-            curve_plotter.flush()
+                curve_plot_timing = _run_epoch_curve_plot_once(group_curve_path, curve_plot_request_interval)
+            else:
+                curve_plotter.flush()
         curve_flush_total = time.perf_counter() - curve_flush_start
         if profile_timing and curve_flush_total > 0.0:
             _log_timing(
                 f"Train {train_years} setup.curve_plot_flush",
                 TimingBreakdown(plot_s=curve_flush_total, total_s=curve_flush_total),
             )
+            _log_curve_plot_timing(f"Train {train_years} epoch_curve_plot", curve_plot_timing)
 
         # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
         # the epoch loop does not run; compute validation backtest once for reporting.
@@ -9195,27 +9459,88 @@ def run_training(
                 test_bt.benchmark_returns,
                 test_bt.turnovers,
             )
-            _save_daily_weights_csv(fold_dir / "daily_weights.csv", test_dates, panel.symbols, test_bt.weights_history)
+            _maybe_save_daily_weights_table(
+                fold_dir / "daily_weights.csv",
+                test_dates,
+                panel.symbols,
+                test_bt.weights_history,
+                enabled=bool(
+                    getattr(
+                        config.training,
+                        "save_daily_weights_table",
+                        getattr(config.training, "save_daily_weights_csv", True),
+                    )
+                ),
+                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+            )
             report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
 
             plot_start = time.perf_counter()
-            plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
-            plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
-            plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
-            plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
-            _save_integer_share_audit_artifacts(
+            plot_timing: dict[str, float | str] = {}
+
+            def _time_plot(name: str, fn: Callable[..., Any], *args: Any) -> None:
+                item_start = time.perf_counter()
+                fn(*args)
+                plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
+
+            _time_plot("equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "equity_curve.png")
+            _time_plot("equity_curve_log", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            _time_plot("annual_performance", plot_annual_performance, test_bt, test_dates, fold_dir / "annual_performance.png")
+            _time_plot("leverage_equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
+            _time_plot(
+                "leverage_equity_curve_log",
+                plot_equity_curve_log,
+                test_bt,
+                test_dates,
+                fold_dir / "leverage_equity_curve_log.png",
+            )
+            _time_plot(
+                "leverage_annual_performance",
+                plot_annual_performance,
+                test_bt,
+                test_dates,
+                fold_dir / "leverage_annual_performance.png",
+            )
+            audit_start = time.perf_counter()
+            integer_audit_timing = _save_integer_share_audit_artifacts(
                 fold_dir,
                 test_integer_bt,
                 test_dates,
                 panel.symbols,
                 holdings_records,
+                write_daily_weights_table=bool(
+                    getattr(
+                        config.training,
+                        "save_integer_share_daily_weights_table",
+                        getattr(config.training, "save_integer_share_daily_weights_csv", True),
+                    )
+                ),
+                write_holdings_table=bool(
+                    getattr(
+                        config.training,
+                        "save_integer_share_holdings_table",
+                        getattr(config.training, "save_integer_share_holdings_csv", True),
+                    )
+                ),
+                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
             )
+            plot_timing["integer_share_audit_s"] = float(time.perf_counter() - audit_start)
+            for key, value in integer_audit_timing.items():
+                if isinstance(value, bool):
+                    plot_timing[f"integer_share_audit_{key}"] = float(1 if value else 0)
+                elif isinstance(value, str):
+                    plot_timing[f"integer_share_audit_{key}"] = value
+                else:
+                    plot_timing[f"integer_share_audit_{key}"] = float(value)
             plot_total = time.perf_counter() - plot_start
+            plot_timing["total_s"] = float(plot_total)
+            (fold_dir / "plot_timing.json").write_text(
+                json.dumps(plot_timing, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
             explain_start = time.perf_counter()

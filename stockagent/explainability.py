@@ -5,7 +5,9 @@ import gc
 import inspect
 import json
 import math
+import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -85,11 +87,14 @@ class ExplainabilitySettings:
     top_k: int = 20
     max_rows: int = 32
     ig_steps: int = 8
+    ig_batch_size: int = 0
     perturb: bool = True
+    perturb_batch_size: int = 0
     sample_method: str = "even"
     first_test_year_only: bool = True
     report_style: str = "paper"
     plot_theme: str = "paper"
+    standard_plots: bool = True
     interactive_plots: bool = False
     shap_enabled: bool = True
     shap_mode: str = "score_head_surrogate"
@@ -127,6 +132,10 @@ def _to_builtin(value: Any) -> Any:
             return value.detach().cpu().item()
         return value.detach().cpu().tolist()
     return value
+
+
+def _mark_elapsed(timing: dict[str, float], key: str, start: float) -> None:
+    timing[key] = float(time.perf_counter() - start)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -298,10 +307,35 @@ def _gradient_x_input_attribution(
 ) -> torch.Tensor:
     model.zero_grad(set_to_none=True)
     x_grad = x.detach().clone().requires_grad_(True)
-    _, scores, _ = _forward_outputs(model, x_grad, mask, return_aux=True)
+    _, scores, _ = _forward_outputs(model, x_grad, mask, return_aux=False)
     target = _decision_target(scores, selected, direction)
     grad = torch.autograd.grad(target, x_grad, retain_graph=False, create_graph=False)[0]
     return torch.nan_to_num((grad * x_grad).detach(), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _auto_repeat_chunk_size(
+    x: torch.Tensor,
+    total_items: int,
+    requested: int,
+    *,
+    max_auto: int,
+    max_input_elements: int,
+) -> int:
+    total_items = max(1, int(total_items))
+    requested = int(requested)
+    if requested > 0:
+        return max(1, min(total_items, requested))
+    per_item_elements = max(1, int(x.numel()))
+    by_budget = max(1, int(max_input_elements) // per_item_elements)
+    return max(1, min(total_items, int(max_auto), by_budget))
+
+
+def _repeat_first_dim(tensor: torch.Tensor, repeats: int) -> torch.Tensor:
+    repeats = max(1, int(repeats))
+    return tensor.unsqueeze(0).expand((repeats,) + tuple(tensor.shape)).reshape(
+        repeats * int(tensor.size(0)),
+        *tuple(tensor.shape[1:]),
+    )
 
 
 def _integrated_gradients_attribution(
@@ -311,20 +345,38 @@ def _integrated_gradients_attribution(
     selected: torch.Tensor,
     direction: torch.Tensor,
     steps: int,
+    batch_size: int = 0,
 ) -> torch.Tensor:
     steps = max(0, int(steps))
     if steps <= 0:
         return torch.zeros_like(x)
-    baseline = torch.zeros_like(x)
+    chunk_size = _auto_repeat_chunk_size(
+        x,
+        steps,
+        int(batch_size),
+        max_auto=4,
+        max_input_elements=16_000_000,
+    )
     total_grad = torch.zeros_like(x)
-    for step in range(1, steps + 1):
-        alpha = float(step) / float(steps)
-        x_step = (baseline + alpha * (x - baseline)).detach().requires_grad_(True)
-        _, scores, _ = _forward_outputs(model, x_step, mask, return_aux=True)
-        target = _decision_target(scores, selected, direction)
+    for start in range(1, steps + 1, chunk_size):
+        end = min(steps, start + chunk_size - 1)
+        alpha = torch.arange(start, end + 1, device=x.device, dtype=x.dtype) / float(steps)
+        repeats = int(alpha.numel())
+        model.zero_grad(set_to_none=True)
+        x_step = (alpha.view(repeats, 1, 1, 1, 1) * x.detach().unsqueeze(0)).reshape(
+            repeats * int(x.size(0)),
+            *tuple(x.shape[1:]),
+        )
+        x_step = x_step.detach().requires_grad_(True)
+        mask_step = _repeat_first_dim(mask, repeats)
+        selected_step = _repeat_first_dim(selected, repeats)
+        direction_step = _repeat_first_dim(direction, repeats)
+        _, scores, _ = _forward_outputs(model, x_step, mask_step, return_aux=False)
+        target = _decision_target(scores, selected_step, direction_step) * float(repeats)
         grad = torch.autograd.grad(target, x_step, retain_graph=False, create_graph=False)[0]
-        total_grad = total_grad + torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
-    return (x - baseline) * (total_grad / float(steps))
+        grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        total_grad = total_grad + grad.reshape(repeats, *tuple(x.shape)).sum(dim=0)
+    return x * (total_grad / float(steps))
 
 
 def _feature_time_frame(
@@ -376,14 +428,41 @@ def _perturbation_importance(
     base_weights: torch.Tensor,
     base_scores: torch.Tensor,
     feature_names: list[str],
+    batch_size: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict[str, Any]] = []
+    perturbations = [
+        (time_idx, feat_idx, feature)
+        for time_idx in range(int(x.size(1)))
+        for feat_idx, feature in enumerate(feature_names)
+    ]
+    if not perturbations:
+        frame = pd.DataFrame(rows)
+        return frame, pd.DataFrame()
+    chunk_size = _auto_repeat_chunk_size(
+        x,
+        len(perturbations),
+        int(batch_size),
+        max_auto=16,
+        max_input_elements=32_000_000,
+    )
+    base_weights = base_weights.detach()
+    base_scores = base_scores.detach()
     with torch.no_grad():
-        for time_idx in range(int(x.size(1))):
-            for feat_idx, feature in enumerate(feature_names):
-                x_perturbed = x.clone()
-                x_perturbed[:, time_idx, :, feat_idx] = 0.0
-                weights_p, scores_p, _ = _forward_outputs(model, x_perturbed, mask, return_aux=False)
+        for start in range(0, len(perturbations), chunk_size):
+            chunk = perturbations[start : start + chunk_size]
+            repeats = len(chunk)
+            x_perturbed = x.detach().unsqueeze(0).expand((repeats,) + tuple(x.shape)).clone()
+            for local_idx, (time_idx, feat_idx, _) in enumerate(chunk):
+                x_perturbed[local_idx, :, time_idx, :, feat_idx] = 0.0
+            x_perturbed = x_perturbed.reshape(repeats * int(x.size(0)), *tuple(x.shape[1:]))
+            mask_perturbed = _repeat_first_dim(mask, repeats)
+            weights_p, scores_p, _ = _forward_outputs(model, x_perturbed, mask_perturbed, return_aux=False)
+            weights_p = weights_p.reshape(repeats, *tuple(base_weights.shape))
+            scores_p = scores_p.reshape(repeats, *tuple(base_scores.shape))
+            weight_deltas = (weights_p - base_weights.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+            score_deltas = (scores_p - base_scores.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+            for local_idx, (time_idx, _, feature) in enumerate(chunk):
                 rows.append(
                     {
                         "lookback_index": int(time_idx),
@@ -391,8 +470,8 @@ def _perturbation_importance(
                         "feature": feature,
                         "feature_group": _feature_group(feature),
                         "feature_label": _feature_label(feature),
-                        "weight_abs_delta": float((weights_p - base_weights).abs().mean().detach().cpu()),
-                        "score_abs_delta": float((scores_p - base_scores).abs().mean().detach().cpu()),
+                        "weight_abs_delta": float(weight_deltas[local_idx]),
+                        "score_abs_delta": float(score_deltas[local_idx]),
                     }
                 )
     frame = pd.DataFrame(rows)
@@ -1006,13 +1085,6 @@ def _score_head_surrogate_shap(
     if not enabled or mode in {"off", "none"}:
         return pd.DataFrame(), pd.DataFrame(), {"enabled": bool(enabled), "method": "skipped"}, []
     warnings: list[str] = []
-    try:
-        from sklearn.linear_model import Ridge
-        from sklearn.metrics import r2_score
-    except Exception as exc:
-        return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "error": str(exc)}, [
-            f"SHAP skipped because scikit-learn is unavailable: {type(exc).__name__}: {exc}"
-        ]
 
     x_cpu = x.detach().float().cpu()
     scores_cpu = scores.detach().float().cpu()
@@ -1053,25 +1125,25 @@ def _score_head_surrogate_shap(
     if target_std < 1e-10:
         message = "SHAP skipped because score targets are nearly constant."
         return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
-    model = Ridge(alpha=1e-3)
-    model.fit(design_z, target_fit)
-    pred = model.predict(design_z)
-    r2 = _safe_float(r2_score(target_fit, pred))
+    target_mean = float(np.mean(target_fit))
+    target_centered = target_fit - target_mean
+    alpha = 1e-3
+    xtx = design_z.T @ design_z
+    rhs = design_z.T @ target_centered
+    try:
+        coef = np.linalg.solve(xtx + alpha * np.eye(xtx.shape[0], dtype=np.float64), rhs)
+    except np.linalg.LinAlgError:
+        coef = np.linalg.lstsq(xtx + alpha * np.eye(xtx.shape[0], dtype=np.float64), rhs, rcond=None)[0]
+    pred = design_z @ coef + target_mean
+    ss_res = float(np.sum((target_fit - pred) ** 2))
+    ss_tot = float(np.sum((target_fit - target_mean) ** 2))
+    r2 = _safe_float(1.0 - ss_res / ss_tot if ss_tot > 1e-20 else 0.0)
     sample_rows = min(5000, int(design_z.shape[0]))
     sample_idx = np.linspace(0, design_z.shape[0] - 1, sample_rows).round().astype(np.int64)
     sample_z = design_z[sample_idx]
     background = design_z[np.linspace(0, design_z.shape[0] - 1, min(1024, int(design_z.shape[0]))).round().astype(np.int64)]
     method = "linear_surrogate_closed_form"
-    try:
-        import shap
-
-        explainer = shap.LinearExplainer(model, background)
-        values = explainer(sample_z)
-        shap_values = np.asarray(getattr(values, "values", values), dtype=np.float64)
-        method = "shap_linear_explainer"
-    except Exception as exc:
-        warnings.append(f"SHAP LinearExplainer fallback used: {type(exc).__name__}: {exc}")
-        shap_values = (sample_z - background.mean(axis=0, keepdims=True)) * np.asarray(model.coef_, dtype=np.float64)
+    shap_values = (sample_z - background.mean(axis=0, keepdims=True)) * coef.reshape(1, -1)
     component_rows: list[dict[str, Any]] = []
     abs_values = np.nan_to_num(np.abs(shap_values), nan=0.0, posinf=0.0, neginf=0.0).mean(axis=0)
     for idx, (source, feature) in enumerate(component_meta):
@@ -1082,7 +1154,7 @@ def _score_head_surrogate_shap(
                 "feature_group": _feature_group(feature),
                 "feature_label": _feature_label(feature),
                 "shap_abs": float(abs_values[idx]),
-                "surrogate_coef": float(np.asarray(model.coef_).reshape(-1)[idx]),
+                "surrogate_coef": float(coef.reshape(-1)[idx]),
             }
         )
     component_frame = pd.DataFrame(component_rows).sort_values("shap_abs", ascending=False)
@@ -1123,25 +1195,42 @@ def explain_batch(
     settings: ExplainabilitySettings | None = None,
     device: torch.device | None = None,
 ) -> dict[str, Any]:
+    total_start = time.perf_counter()
+    timing: dict[str, float] = {}
     settings = settings or ExplainabilitySettings()
     device = device or next(model.parameters()).device
     model.eval()
+    stage_start = time.perf_counter()
     batch = _move_batch(batch, device)
     x = torch.nan_to_num(batch["x"].float(), nan=0.0, posinf=0.0, neginf=0.0)
     returns = torch.nan_to_num(batch["future_log_returns"].float(), nan=0.0, posinf=0.0, neginf=0.0)
     mask = batch["tradable_mask"].to(device=device, dtype=torch.bool)
+    _mark_elapsed(timing, "prepare_batch_s", stage_start)
 
+    stage_start = time.perf_counter()
     with torch.no_grad():
         weights, scores, aux = _forward_outputs(model, x, mask, return_aux=True)
     selected, direction = _selection_from_weights(weights.detach(), mask, settings.top_k)
+    _mark_elapsed(timing, "base_forward_s", stage_start)
 
+    stage_start = time.perf_counter()
     grad_attr = _gradient_x_input_attribution(model, x, mask, selected, direction)
     grad_ft = _feature_time_frame(grad_attr, feature_names, "grad_x_input_abs")
     grad_feature = _feature_summary_frame(grad_ft, "grad_x_input_abs")
     grad_time = _time_summary_frame(grad_ft, "grad_x_input_abs")
+    _mark_elapsed(timing, "gradient_s", stage_start)
 
+    stage_start = time.perf_counter()
     if int(settings.ig_steps) > 0:
-        ig_attr = _integrated_gradients_attribution(model, x, mask, selected, direction, settings.ig_steps)
+        ig_attr = _integrated_gradients_attribution(
+            model,
+            x,
+            mask,
+            selected,
+            direction,
+            settings.ig_steps,
+            settings.ig_batch_size,
+        )
         ig_ft = _feature_time_frame(ig_attr, feature_names, "integrated_gradients_abs")
         ig_feature = _feature_summary_frame(ig_ft, "integrated_gradients_abs")
         ig_time = _time_summary_frame(ig_ft, "integrated_gradients_abs")
@@ -1149,13 +1238,25 @@ def explain_batch(
         ig_ft = pd.DataFrame()
         ig_feature = pd.DataFrame()
         ig_time = pd.DataFrame()
+    _mark_elapsed(timing, "integrated_gradients_s", stage_start)
 
+    stage_start = time.perf_counter()
     if settings.perturb:
-        perturb_ft, perturb_feature = _perturbation_importance(model, x, mask, weights, scores, feature_names)
+        perturb_ft, perturb_feature = _perturbation_importance(
+            model,
+            x,
+            mask,
+            weights,
+            scores,
+            feature_names,
+            settings.perturb_batch_size,
+        )
     else:
         perturb_ft = pd.DataFrame()
         perturb_feature = pd.DataFrame()
+    _mark_elapsed(timing, "perturbation_s", stage_start)
 
+    stage_start = time.perf_counter()
     shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap(
         x,
         scores,
@@ -1164,7 +1265,9 @@ def explain_batch(
         enabled=bool(settings.shap_enabled),
         mode=str(settings.shap_mode),
     )
+    _mark_elapsed(timing, "surrogate_shap_s", stage_start)
 
+    stage_start = time.perf_counter()
     corr = _feature_correlations(x, scores, weights, mask, feature_names)
     decisions = _decision_rows(weights, scores, returns, mask, dates, symbols, settings.top_k)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
@@ -1172,6 +1275,9 @@ def explain_batch(
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pd.DataFrame()
     case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
+    _mark_elapsed(timing, "tabular_diagnostics_s", stage_start)
+
+    stage_start = time.perf_counter()
     aux_frame, aux_dim_frames = _aux_summary(aux)
     aux_projection_frames, aux_projection_summary, aux_projection_warnings = _aux_umap_projection_frames(
         aux,
@@ -1180,6 +1286,9 @@ def explain_batch(
         settings=settings,
         device=device,
     )
+    _mark_elapsed(timing, "aux_diagnostics_s", stage_start)
+
+    stage_start = time.perf_counter()
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
     warnings.extend(aux_projection_warnings)
     warnings.extend(shap_warnings)
@@ -1190,6 +1299,8 @@ def explain_batch(
     attribution_lookback = 0
     if not grad_ft.empty and "lookback_from_end" in grad_ft.columns:
         attribution_lookback = int(pd.to_numeric(grad_ft["lookback_from_end"], errors="coerce").max() + 1)
+    _mark_elapsed(timing, "postprocess_s", stage_start)
+    timing["total_s"] = float(time.perf_counter() - total_start)
 
     return {
         "summary": {
@@ -1197,10 +1308,13 @@ def explain_batch(
             "rows": len(dates),
             "top_k": int(settings.top_k),
             "ig_steps": int(settings.ig_steps),
+            "ig_batch_size": int(settings.ig_batch_size),
             "report_style": _normalize_report_style(settings.report_style),
             "plot_theme": _normalize_plot_theme(settings.plot_theme),
+            "standard_plots": bool(settings.standard_plots),
             "interactive_plots": bool(settings.interactive_plots),
             "shap_enabled": bool(settings.shap_enabled),
+            "perturb_batch_size": int(settings.perturb_batch_size),
             "shap_mode": _normalize_shap_mode(settings.shap_mode),
             "shap_info": shap_info,
             "case_study_top_k": int(settings.case_study_top_k),
@@ -1210,6 +1324,7 @@ def explain_batch(
             "umap_enabled": bool(settings.umap_enabled),
             "umap_method": "cuml_umap",
             "aux_projection_summary": aux_projection_summary,
+            "timing": timing,
             "warnings": warnings,
         },
         "frames": {
@@ -1297,7 +1412,7 @@ def _write_markdown_report(
             "- Batch artifacts are static PNG/CSV. Datashader is used for dense explainability visuals when available.",
             "- cuML UMAP is the dimensionality-reduction method for aux projections. If CUDA/cuML is unavailable, projection tables are not fabricated.",
             "- Plotly is best reserved for interactive dashboards. PyQtGraph is best for live training curves from scalar streams, not fold artifact generation.",
-            "- SHAP is not used by default because the current tensor portfolio model and full-market lookback windows make exact SHAP expensive; gradient/IG/perturbation stay tensor-friendly.",
+            "- Surrogate SHAP is computed from a fitted score-head linear surrogate; exact model SHAP is avoided because full-market tensor windows make it expensive.",
         ]
     )
     lines.append("")
@@ -1342,6 +1457,7 @@ def _write_markdown_report(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+@lru_cache(maxsize=1)
 def _setup_paper_plotting() -> tuple[Any, Any]:
     import matplotlib
 
@@ -2615,15 +2731,19 @@ def write_explanation_outputs(
     *,
     metadata: dict[str, Any] | None = None,
     write_plots: bool = True,
+    write_standard_plots: bool = True,
     plot_backend: str = "auto",
     report_style: str | None = None,
     plot_theme: str | None = None,
 ) -> None:
+    write_start = time.perf_counter()
+    write_timing: dict[str, float] = {}
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = metadata or {}
     frames: dict[str, pd.DataFrame] = result["frames"]
     aux_dim_frames: dict[str, pd.DataFrame] = result.get("aux_dim_frames", {})
     aux_projection_frames: dict[str, pd.DataFrame] = result.get("aux_projection_frames", {})
+    stage_start = time.perf_counter()
     for name, frame in frames.items():
         if frame is not None and not frame.empty:
             frame.to_csv(output_dir / f"{name}.csv", index=False)
@@ -2638,6 +2758,8 @@ def write_explanation_outputs(
             projection_dir.mkdir(parents=True, exist_ok=True)
             safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
             frame.to_csv(projection_dir / f"{safe_name}.csv", index=False)
+    _mark_elapsed(write_timing, "csv_s", stage_start)
+    stage_start = time.perf_counter()
     plots_generated = (
         _plot_all_explanation_figures(
             frames,
@@ -2646,9 +2768,10 @@ def write_explanation_outputs(
             aux_projection_frames=aux_projection_frames,
             plot_backend=plot_backend,
         )
-        if write_plots
+        if write_plots and write_standard_plots
         else []
     )
+    _mark_elapsed(write_timing, "plots_s", stage_start)
     resolved_report_style = _normalize_report_style(report_style or result["summary"].get("report_style", "paper"))
     resolved_plot_theme = _normalize_plot_theme(plot_theme or result["summary"].get("plot_theme", "paper"))
     summary = {
@@ -2657,18 +2780,23 @@ def write_explanation_outputs(
         "plot_backend": _normalize_plot_backend(plot_backend),
         "report_style": resolved_report_style,
         "plot_theme": resolved_plot_theme,
+        "standard_plots": bool(write_standard_plots),
         "plots_generated": plots_generated,
+        "write_timing": write_timing,
     }
     paper_tables: dict[str, str] = {}
     paper_plots: list[str] = []
     if resolved_report_style == "paper":
+        stage_start = time.perf_counter()
         paper_tables = _write_paper_tables(
             output_dir,
             frames=frames,
             summary=summary,
             metadata=metadata,
         )
+        _mark_elapsed(write_timing, "paper_tables_s", stage_start)
         if write_plots:
+            stage_start = time.perf_counter()
             paper_plots = _plot_all_paper_figures(
                 output_dir,
                 frames=frames,
@@ -2676,19 +2804,22 @@ def write_explanation_outputs(
                 metadata=metadata,
                 paper_tables=paper_tables,
             )
+            _mark_elapsed(write_timing, "paper_plots_s", stage_start)
         summary["paper_tables"] = paper_tables
         summary["paper_plots"] = paper_plots
-    (output_dir / "summary.json").write_text(
-        json.dumps(_to_builtin(summary), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    else:
+        write_timing["paper_tables_s"] = 0.0
+        write_timing["paper_plots_s"] = 0.0
+    stage_start = time.perf_counter()
     _write_markdown_report(
         output_dir / "report.md",
         metadata=metadata,
         summary=summary,
         frames=frames,
     )
+    _mark_elapsed(write_timing, "report_md_s", stage_start)
     if resolved_report_style == "paper":
+        stage_start = time.perf_counter()
         _write_paper_report(
             output_dir / "paper_explainability_report.md",
             metadata=metadata,
@@ -2697,6 +2828,8 @@ def write_explanation_outputs(
             paper_tables=paper_tables,
             paper_plots=paper_plots,
         )
+        _mark_elapsed(write_timing, "paper_report_md_s", stage_start)
+        stage_start = time.perf_counter()
         _write_paper_summary(
             output_dir / "paper_explainability_summary.json",
             metadata=metadata,
@@ -2704,6 +2837,23 @@ def write_explanation_outputs(
             paper_tables=paper_tables,
             paper_plots=paper_plots,
         )
+        _mark_elapsed(write_timing, "paper_summary_json_s", stage_start)
+    else:
+        write_timing["paper_report_md_s"] = 0.0
+        write_timing["paper_summary_json_s"] = 0.0
+    write_timing["total_s"] = float(time.perf_counter() - write_start)
+    stage_start = time.perf_counter()
+    (output_dir / "summary.json").write_text(
+        json.dumps(_to_builtin(summary), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _mark_elapsed(write_timing, "summary_json_s", stage_start)
+    write_timing["total_s"] = float(time.perf_counter() - write_start)
+    result["summary"]["write_timing"] = write_timing
+    (output_dir / "explainability_timing.json").write_text(
+        json.dumps(_to_builtin({"compute_timing": result["summary"].get("timing", {}), "write_timing": write_timing}), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def _strip_orig_mod_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -2939,6 +3089,7 @@ def run_checkpoint_explanation(
         destination,
         metadata=metadata,
         write_plots=write_plots,
+        write_standard_plots=bool(settings.standard_plots),
         plot_backend=resolved_plot_backend,
         report_style=settings.report_style,
         plot_theme=settings.plot_theme,
@@ -2961,12 +3112,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-k", default=20, type=int)
     parser.add_argument("--max-rows", default=32, type=int)
     parser.add_argument("--ig-steps", default=8, type=int)
+    parser.add_argument("--ig-batch-size", default=0, type=int, help="Batch IG alpha steps together; 0 selects an automatic safe chunk size.")
     parser.add_argument("--sample-method", default="even", choices=("even", "first", "last"))
     parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
     parser.add_argument("--no-perturb", action="store_true", help="Skip feature perturbation sensitivity.")
+    parser.add_argument("--perturb-batch-size", default=0, type=int, help="Batch feature-day perturbations together; 0 selects an automatic safe chunk size.")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")
     parser.add_argument("--report-style", default="paper", choices=("paper", "standard", "none"))
     parser.add_argument("--plot-theme", default="paper", choices=("paper", "standard"))
+    parser.add_argument(
+        "--standard-plots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write the legacy plots/ PNG set in addition to paper plots.",
+    )
     parser.add_argument("--no-interactive-plots", action="store_true", help="Keep explainability output static only.")
     parser.add_argument("--no-shap", action="store_true", help="Skip score-head surrogate SHAP.")
     parser.add_argument("--shap-mode", default="score_head_surrogate", choices=("score_head_surrogate", "off", "none"))
@@ -2993,11 +3152,14 @@ def main(argv: list[str] | None = None) -> None:
         top_k=args.top_k,
         max_rows=args.max_rows,
         ig_steps=args.ig_steps,
+        ig_batch_size=args.ig_batch_size,
         perturb=not args.no_perturb,
+        perturb_batch_size=args.perturb_batch_size,
         sample_method=args.sample_method,
         first_test_year_only=not args.all_test_years,
         report_style=args.report_style,
         plot_theme=args.plot_theme,
+        standard_plots=bool(args.standard_plots),
         interactive_plots=not args.no_interactive_plots,
         shap_enabled=not args.no_shap,
         shap_mode=args.shap_mode,
