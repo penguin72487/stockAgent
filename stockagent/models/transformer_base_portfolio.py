@@ -264,6 +264,12 @@ class FlashSDPAAttention(nn.Module):
         rope_cos, rope_sin = _build_rope_cache(int(max_rope_steps), self.head_dim, self.rope_base)
         self.register_buffer("rope_cos_cached", rope_cos, persistent=False)
         self.register_buffer("rope_sin_cached", rope_sin, persistent=False)
+        self.capture_attention = False
+        self.capture_name = ""
+        self.capture_max_rows = 4
+        self.capture_max_elements = 2_000_000
+        self.captured_attention: torch.Tensor | None = None
+        self.captured_attention_shape: tuple[int, ...] | None = None
 
     def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         bsz, steps, _ = tensor.shape
@@ -352,6 +358,22 @@ class FlashSDPAAttention(nn.Module):
         if key_mask is not None:
             key_mask = key_mask.to(device=query.device, dtype=torch.bool)
             attn_mask = key_mask[:, None, None, :]
+
+        self.captured_attention = None
+        self.captured_attention_shape = None
+        if bool(self.capture_attention):
+            cap_rows = max(1, min(int(self.capture_max_rows), int(q.size(0))))
+            capture_elements = cap_rows * int(query_steps) * int(key_steps)
+            if capture_elements <= max(1, int(self.capture_max_elements)):
+                capture_scores = torch.matmul(q[:cap_rows], k[:cap_rows].transpose(-2, -1)) * self.scale
+                if attn_mask is not None:
+                    capture_scores = capture_scores.masked_fill(
+                        ~attn_mask[:cap_rows],
+                        torch.finfo(capture_scores.dtype).min,
+                    )
+                capture_attn = torch.softmax(capture_scores, dim=-1)
+                self.captured_attention = capture_attn.mean(dim=1).detach().float().cpu()
+                self.captured_attention_shape = tuple(int(dim) for dim in capture_attn.shape)
 
         if self.use_flash_attention:
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
@@ -795,6 +817,38 @@ class TransformerBasePortfolioModel(nn.Module):
         batch_rows = int(feature_slab.size(0)) - self.lookback + 1
         if mask is not None and tuple(mask.shape) != (batch_rows, int(feature_slab.size(1))):
             raise ValueError(f"Expected mask shape {(batch_rows, int(feature_slab.size(1)))}, got {tuple(mask.shape)}")
+
+    def configure_attention_capture(
+        self,
+        enabled: bool,
+        *,
+        max_rows: int = 4,
+        max_elements: int = 2_000_000,
+    ) -> None:
+        """Opt-in attention capture for explainability without changing normal training."""
+        for name, module in self.named_modules():
+            if isinstance(module, FlashSDPAAttention):
+                module.capture_attention = bool(enabled)
+                module.capture_name = str(name)
+                module.capture_max_rows = max(1, int(max_rows))
+                module.capture_max_elements = max(1, int(max_elements))
+                module.captured_attention = None
+                module.captured_attention_shape = None
+
+    def pop_attention_capture(self) -> list[dict[str, object]]:
+        captures: list[dict[str, object]] = []
+        for name, module in self.named_modules():
+            if isinstance(module, FlashSDPAAttention) and module.captured_attention is not None:
+                captures.append(
+                    {
+                        "name": module.capture_name or name,
+                        "attention": module.captured_attention,
+                        "shape": module.captured_attention_shape,
+                    }
+                )
+                module.captured_attention = None
+                module.captured_attention_shape = None
+        return captures
 
     def _run_block(self, block: TransformerPortfolioBlock, *args) -> torch.Tensor:
         if self.checkpoint_blocks and self.training and torch.is_grad_enabled():

@@ -4900,6 +4900,7 @@ def _run_fold_explainability(
 
     from stockagent.explainability import (
         ExplainabilitySettings,
+        _cross_asset_settings_from_explainability,
         _first_year_indices,
         _sample_dataset,
         explain_batch,
@@ -4932,9 +4933,25 @@ def _run_fold_explainability(
         fold_stability=bool(getattr(config.training, "explain_fold_stability", True)),
         umap_enabled=bool(getattr(config.training, "explain_umap_enabled", True)),
         umap_max_points=int(getattr(config.training, "explain_umap_max_points", 10000)),
+        umap_max_projections=int(getattr(config.training, "explain_umap_max_projections", 0)),
         umap_n_neighbors=int(getattr(config.training, "explain_umap_n_neighbors", 15)),
         umap_min_dist=float(getattr(config.training, "explain_umap_min_dist", 0.1)),
+        cross_asset_enabled=bool(getattr(config.training, "explain_cross_asset_enabled", True)),
+        cross_asset_max_sources=int(getattr(config.training, "explain_cross_asset_max_sources", 24)),
+        cross_asset_max_targets=int(getattr(config.training, "explain_cross_asset_max_targets", 24)),
+        cross_asset_top_edges=int(getattr(config.training, "explain_cross_asset_top_edges", 150)),
+        cross_asset_source_chunk_size=int(getattr(config.training, "explain_cross_asset_source_chunk_size", 2)),
+        cross_asset_perturb_scale=float(getattr(config.training, "explain_cross_asset_perturb_scale", 1.0)),
+        cross_asset_shocks=tuple(getattr(config.training, "explain_cross_asset_shocks", [])),
+        cross_asset_attention_flow=bool(getattr(config.training, "explain_cross_asset_attention_flow", True)),
+        cross_asset_attention_capture_rows=int(getattr(config.training, "explain_cross_asset_attention_capture_rows", 4)),
+        cross_asset_validated_transmission=bool(
+            getattr(config.training, "explain_cross_asset_validated_transmission", True)
+        ),
+        cross_asset_role_embedding=bool(getattr(config.training, "explain_cross_asset_role_embedding", True)),
     )
+    settings.perturb_max_auto_batch_size = int(getattr(config.training, "explain_perturb_max_auto_batch_size", 16))
+    settings.perturb_max_input_elements = int(getattr(config.training, "explain_perturb_max_input_elements", 96_000_000))
     batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
     dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
     timing["sample_s"] = float(time.perf_counter() - sample_start)
@@ -4987,6 +5004,27 @@ def _run_fold_explainability(
     )
     timing["write_s"] = float(time.perf_counter() - write_start)
     write_timing = result.get("summary", {}).get("write_timing", {})
+    if bool(settings.cross_asset_enabled):
+        cross_asset_start = time.perf_counter()
+        try:
+            from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
+
+            abstract_cross_asset_transmission(
+                model,
+                batch,
+                feature_names=panel.feature_names,
+                symbols=panel.symbols,
+                dates=dates,
+                output_dir=destination,
+                settings=_cross_asset_settings_from_explainability(settings),
+                device=device,
+            )
+        except Exception as exc:
+            print(f"[Fold {fold.fold_id}] cross-asset explainability skipped: {type(exc).__name__}: {exc}")
+            timing["cross_asset_error"] = f"{type(exc).__name__}: {exc}"
+        timing["cross_asset_s"] = float(time.perf_counter() - cross_asset_start)
+    else:
+        timing["cross_asset_s"] = 0.0
     if bool(getattr(config.training, "explain_fold_stability", True)):
         stability_start = time.perf_counter()
         try:
@@ -5019,6 +5057,7 @@ def _run_fold_explainability(
         f"total={float(timing['total_s']):.3f}s "
         f"compute={float(timing['compute_s']):.3f}s "
         f"write={float(timing['write_s']):.3f}s "
+        f"cross_asset={float(timing['cross_asset_s']):.3f}s "
         f"stability={float(timing['fold_stability_s']):.3f}s "
         f"json={timing_path}"
     )
