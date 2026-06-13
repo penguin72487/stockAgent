@@ -11,11 +11,6 @@ import numpy as np
 import pandas as pd
 
 try:
-    import cudf
-except Exception:  # pragma: no cover - optional GPU dependency
-    cudf = None
-
-try:
     import polars as pl
 except Exception:  # pragma: no cover - optional parquet reader
     pl = None
@@ -24,11 +19,6 @@ try:
     import pyarrow.parquet as pq
 except Exception:  # pragma: no cover - optional parquet reader
     pq = None
-
-try:
-    import duckdb
-except Exception:  # pragma: no cover - optional panel backend
-    duckdb = None
 
 from stockagent.data.panel_cache import (
     legacy_panel_cache_path,
@@ -381,54 +371,6 @@ def _load_symbol_frame(path: Path) -> pd.DataFrame:
     return _prepare_symbol_frame(pd.read_parquet(path), path)
 
 
-def _load_symbol_frame_polars(path: Path) -> pd.DataFrame:
-    if pl is None:
-        raise RuntimeError("Polars is not available")
-    return _prepare_symbol_frame(pl.read_parquet(path).to_pandas(), path)
-
-
-def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
-    if cudf is None:
-        raise RuntimeError("cuDF is not available")
-
-    gdf = cudf.read_parquet(path)
-    gdf["date"] = cudf.to_datetime(gdf["date"])
-    gdf = gdf.sort_values("date").reset_index(drop=True)
-    gdf["symbol"] = _symbol_name_from_path(path)
-    price_decimals = _price_decimals_for_path(path)
-    for col in ["open", "max", "min", "close"]:
-        if col in gdf.columns:
-            gdf[col] = gdf[col].round(price_decimals)
-    if "adjclose" in gdf.columns:
-        gdf["adjclose"] = gdf["adjclose"].round(price_decimals)
-    gdf["close_raw"] = gdf["close"].astype("float32")
-
-    frame = gdf.to_pandas()
-    frame = _add_derived_features(frame)
-
-    return_price_col = _return_price_column(frame, path)
-    frame["return_1d"] = _safe_log_ratio(frame[return_price_col].shift(-1), frame[return_price_col])
-    frame["tradable"] = _compute_tradable_from_frame(frame)
-
-    _apply_prev_day_log_returns(frame, ["open", "max", "min", "close"])
-
-    if "Trading_Volume" in frame.columns:
-        vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
-        frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]] = _safe_log_ratio(vol, vol.shift(1))
-
-    if "Trading_Volume" in frame.columns:
-        volume_log_delta = pd.to_numeric(
-            frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]], errors="coerce"
-        )
-        signed_intraday = np.sign(pd.to_numeric(frame["intraday_return_co"], errors="coerce"))
-        frame["signed_vol"] = signed_intraday * volume_log_delta
-    else:
-        _warn_missing_trading_volume(path)
-
-    _ensure_feature_columns(frame, LOG_RETURN_FEATURE_COLUMNS)
-    return frame
-
-
 def _coerce_arrow_numeric_column(table, name: str, rows: int) -> np.ndarray:
     if name not in table.column_names:
         return np.full(rows, np.nan, dtype=np.float64)
@@ -461,11 +403,84 @@ def _shift_array(values: np.ndarray, periods: int) -> np.ndarray:
     return out
 
 
+def _safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    num = np.asarray(numerator, dtype=np.float64)
+    den = np.asarray(denominator, dtype=np.float64)
+    out = np.full(num.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(num) & np.isfinite(den) & (num > 0.0) & (den > 0.0)
+    np.divide(num, den, out=out, where=valid)
+    np.log(out, out=out, where=valid)
+    out[~valid] = np.nan
+    return out
+
+
+def _polars_safe_log(num, den):
+    if pl is None:
+        raise RuntimeError("Polars is not available")
+    return (
+        pl.when(num.is_finite() & den.is_finite() & (num > 0.0) & (den > 0.0))
+        .then((num / den).log())
+        .otherwise(None)
+    )
+
+
+def _polars_round_half_up(expr, decimals: int):
+    factor = float(10**int(decimals))
+    return (
+        pl.when(expr.is_null() | expr.is_nan())
+        .then(None)
+        .when(expr >= 0.0)
+        .then(((expr * factor) + 0.5).floor() / factor)
+        .otherwise(((expr * factor) - 0.5).ceil() / factor)
+    )
+
+
+def _collect_polars_lazy_frame(lazy, *, engine: str = "auto"):
+    engine = str(engine or "auto").strip().lower()
+    if engine not in {"auto", "streaming"}:
+        raise ValueError(f"Unsupported Polars collect engine: {engine!r}")
+    try:
+        return lazy.collect(engine=engine)
+    except TypeError:
+        if engine == "streaming":
+            return lazy.collect(streaming=True)
+        return lazy.collect()
+
+
+def _polars_not_nan_or_null(expr):
+    return expr.is_not_null() & ~expr.is_nan().fill_null(False)
+
+
+def _tw_limit_masks_from_arrays(
+    close_raw: np.ndarray,
+    tradable: np.ndarray,
+    dividends: np.ndarray,
+    stock_splits: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    close = _round_half_up(np.asarray(close_raw, dtype=np.float64), decimals=2)
+    prev_close = _shift_array(close, 1)
+    reference = np.asarray(prev_close, dtype=np.float64).copy()
+
+    div = np.nan_to_num(np.asarray(dividends, dtype=np.float64), nan=0.0)
+    reference = reference - div
+
+    splits = np.asarray(stock_splits, dtype=np.float64)
+    valid_split = np.isfinite(splits) & (splits > 0.0) & (splits != 1.0)
+    reference[valid_split] = reference[valid_split] / splits[valid_split]
+    reference = np.where(reference > 0.0, reference, np.nan)
+
+    limit_up = _tw_limit_price(pd.Series(reference), 1.10).to_numpy(dtype=np.float64)
+    limit_down = _tw_limit_price(pd.Series(reference), 0.90).to_numpy(dtype=np.float64)
+
+    base = np.asarray(tradable, dtype=bool)
+    is_limit_up = np.isfinite(reference) & (close >= (limit_up - 1e-9))
+    is_limit_down = np.isfinite(reference) & (close <= (limit_down + 1e-9))
+    return base & ~is_limit_up, base & ~is_limit_down
+
+
 def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> _SymbolPanelArrays:
     if pq is None:
         raise RuntimeError("PyArrow is not available")
-    if tradable_mode != "tradable":
-        raise RuntimeError("PyArrow panel backend currently supports tradable_mode='tradable' only")
 
     table = pq.read_table(path)
     rows = int(table.num_rows)
@@ -501,7 +516,7 @@ def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> 
 
     spread = np.clip(high_px - low_px, 0.0, None)
     denom = spread + EPSILON
-    intraday_return_co = _safe_log_ratio(pd.Series(close_px), pd.Series(open_px)).to_numpy(dtype=np.float64)
+    intraday_return_co = _safe_log_ratio_array(close_px, open_px)
     body_ratio = np.abs(close_px - open_px) / denom
     signed_body_ratio = (close_px - open_px) / denom
     clv = (close_px - low_px) / denom
@@ -513,18 +528,12 @@ def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> 
     delta_body_ratio = body_ratio - _shift_array(body_ratio, 1)
 
     return_price = adjclose if "adjclose" in table.column_names else close_px
-    return_1d = _safe_log_ratio(
-        pd.Series(_shift_array(return_price, -1)),
-        pd.Series(return_price),
-    ).to_numpy(dtype=np.float64)
-    open_logret_1d = _safe_log_ratio(pd.Series(open_px), pd.Series(_shift_array(open_px, 1))).to_numpy(dtype=np.float64)
-    max_logret_1d = _safe_log_ratio(pd.Series(high_px), pd.Series(_shift_array(high_px, 1))).to_numpy(dtype=np.float64)
-    min_logret_1d = _safe_log_ratio(pd.Series(low_px), pd.Series(_shift_array(low_px, 1))).to_numpy(dtype=np.float64)
-    close_logret_1d = _safe_log_ratio(pd.Series(close_px), pd.Series(_shift_array(close_px, 1))).to_numpy(dtype=np.float64)
-    trading_volume_logret_1d = _safe_log_ratio(
-        pd.Series(volume),
-        pd.Series(_shift_array(volume, 1)),
-    ).to_numpy(dtype=np.float64)
+    return_1d = _safe_log_ratio_array(_shift_array(return_price, -1), return_price)
+    open_logret_1d = _safe_log_ratio_array(open_px, _shift_array(open_px, 1))
+    max_logret_1d = _safe_log_ratio_array(high_px, _shift_array(high_px, 1))
+    min_logret_1d = _safe_log_ratio_array(low_px, _shift_array(low_px, 1))
+    close_logret_1d = _safe_log_ratio_array(close_px, _shift_array(close_px, 1))
+    trading_volume_logret_1d = _safe_log_ratio_array(volume, _shift_array(volume, 1))
     signed_vol = np.sign(intraday_return_co) * trading_volume_logret_1d
 
     if "Trading_Volume" not in table.column_names:
@@ -568,6 +577,18 @@ def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> 
         close_notna = close_notna[valid_dates]
 
     tradable = np.asarray(tradable, dtype=bool)
+    if tradable_mode == "tw_limit_guard":
+        dividends = col("Dividends") if "Dividends" in table.column_names else np.full(tradable.shape, np.nan)
+        stock_splits = col("Stock Splits") if "Stock Splits" in table.column_names else np.full(tradable.shape, np.nan)
+        if not bool(valid_dates.all()):
+            dividends = dividends[valid_dates]
+            stock_splits = stock_splits[valid_dates]
+        can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(close_px, tradable, dividends, stock_splits)
+    elif tradable_mode == "tradable":
+        can_buy_mask = tradable.copy()
+        can_sell_mask = tradable.copy()
+    else:
+        raise RuntimeError(f"Unsupported tradable_mode for PyArrow panel backend: {tradable_mode!r}")
     return _SymbolPanelArrays(
         symbol=_symbol_name_from_path(path),
         dates=dates,
@@ -575,8 +596,154 @@ def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> 
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
         tradable_mask=tradable,
-        can_buy_mask=tradable.copy(),
-        can_sell_mask=tradable.copy(),
+        can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
+        can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
+        alive_mask=np.asarray(close_notna, dtype=bool),
+    )
+
+
+def _load_symbol_arrays_polars_lazy(
+    path: Path,
+    tradable_mode: str = "tradable",
+    *,
+    collect_engine: str = "auto",
+) -> _SymbolPanelArrays:
+    if pl is None:
+        raise RuntimeError("Polars is not available")
+
+    lazy = pl.scan_parquet(path).sort("date")
+    schema_names = set(lazy.collect_schema().names())
+    price_decimals = _price_decimals_for_path(path)
+
+    def num(name: str):
+        if name in schema_names:
+            return pl.col(name).cast(pl.Float64, strict=False)
+        return pl.lit(None, dtype=pl.Float64)
+
+    price_columns = [
+        _polars_round_half_up(num("open"), price_decimals).alias("_open"),
+        _polars_round_half_up(num("max"), price_decimals).alias("_max"),
+        _polars_round_half_up(num("min"), price_decimals).alias("_min"),
+        _polars_round_half_up(num("close"), price_decimals).alias("_close"),
+        _polars_round_half_up(num("adjclose"), price_decimals).alias("_adjclose"),
+        num("Trading_Volume").alias("_volume"),
+    ]
+    if tradable_mode == "tw_limit_guard":
+        price_columns.extend(
+            [
+                num("Dividends").alias("_dividends"),
+                num("Stock Splits").alias("_stock_splits"),
+            ]
+        )
+    lazy = lazy.with_columns(price_columns)
+    spread = (pl.col("_max") - pl.col("_min")).clip(0.0, None)
+    denom = spread + EPSILON
+    return_price = pl.col("_adjclose") if "adjclose" in schema_names else pl.col("_close")
+    close_valid = _polars_not_nan_or_null(pl.col("_close"))
+    if "Trading_Volume" in schema_names:
+        volume_missing = pl.col("_volume").is_null() | pl.col("_volume").is_nan().fill_null(False)
+        tradable_expr = close_valid & (
+            (pl.col("_volume").fill_nan(0.0).fill_null(0.0) > 0.0) | volume_missing
+        )
+    else:
+        tradable_expr = close_valid
+
+    lazy = lazy.with_columns(
+        [
+            _polars_safe_log(pl.col("_close"), pl.col("_open")).alias("intraday_return_co"),
+            ((pl.col("_close") - pl.col("_open")).abs() / denom).alias("body_ratio"),
+            ((pl.col("_close") - pl.col("_open")) / denom).alias("signed_body_ratio"),
+            ((pl.col("_close") - pl.col("_min")) / denom).alias("clv"),
+            ((pl.col("_max") - pl.max_horizontal("_open", "_close")) / denom).alias("upper_shadow"),
+            ((pl.min_horizontal("_open", "_close") - pl.col("_min")) / denom).alias("lower_shadow"),
+            _polars_safe_log(return_price.shift(-1), return_price).alias("return_1d"),
+            _polars_safe_log(pl.col("_open"), pl.col("_open").shift(1)).alias("open_logret_1d"),
+            _polars_safe_log(pl.col("_max"), pl.col("_max").shift(1)).alias("max_logret_1d"),
+            _polars_safe_log(pl.col("_min"), pl.col("_min").shift(1)).alias("min_logret_1d"),
+            _polars_safe_log(pl.col("_close"), pl.col("_close").shift(1)).alias("close_logret_1d"),
+            _polars_safe_log(pl.col("_volume"), pl.col("_volume").shift(1)).alias("trading_volume_logret_1d"),
+            tradable_expr.alias("tradable"),
+        ]
+    )
+    lazy = lazy.with_columns(
+        [
+            (pl.col("clv") - 0.5).alias("clv_centered"),
+            (pl.col("upper_shadow") - pl.col("lower_shadow")).alias("shadow_imbalance"),
+            (pl.col("clv") - pl.col("clv").shift(1)).alias("delta_clv"),
+            (pl.col("body_ratio") - pl.col("body_ratio").shift(1)).alias("delta_body_ratio"),
+            (pl.col("intraday_return_co").sign() * pl.col("trading_volume_logret_1d")).alias("signed_vol"),
+        ]
+    )
+    selected_columns = [
+        pl.col("date").cast(pl.Datetime("ns"), strict=False),
+        pl.col("_close").alias("close_px"),
+        pl.col("return_1d"),
+        pl.col("tradable"),
+        *[pl.col(name) for name in LOG_RETURN_FEATURE_COLUMNS],
+    ]
+    if tradable_mode == "tw_limit_guard":
+        selected_columns[2:2] = [
+            pl.col("_dividends").alias("dividends"),
+            pl.col("_stock_splits").alias("stock_splits"),
+        ]
+    out = _collect_polars_lazy_frame(lazy.select(selected_columns), engine=collect_engine)
+
+    rows = int(out.height)
+    if rows == 0:
+        empty_1d = np.empty((0,), dtype=np.float32)
+        empty_mask = np.empty((0,), dtype=bool)
+        return _SymbolPanelArrays(
+            symbol=_symbol_name_from_path(path),
+            dates=np.empty((0,), dtype="datetime64[ns]"),
+            features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
+            returns_1d=empty_1d,
+            close_prices=empty_1d,
+            tradable_mask=empty_mask,
+            can_buy_mask=empty_mask,
+            can_sell_mask=empty_mask,
+            alive_mask=empty_mask,
+        )
+
+    dates = out["date"].to_numpy().astype("datetime64[ns]", copy=False)
+    close_px = out["close_px"].to_numpy().astype(np.float64, copy=False)
+    return_1d = out["return_1d"].to_numpy().astype(np.float64, copy=False)
+    tradable = out["tradable"].to_numpy().astype(bool, copy=False)
+    features = np.column_stack(
+        [out[name].to_numpy().astype(np.float64, copy=False) for name in LOG_RETURN_FEATURE_COLUMNS]
+    ).astype(np.float32, copy=False)
+    close_notna = ~np.isnan(close_px)
+
+    valid_dates = ~np.isnat(dates)
+    if not bool(valid_dates.all()):
+        dates = dates[valid_dates]
+        features = features[valid_dates]
+        return_1d = return_1d[valid_dates]
+        close_px = close_px[valid_dates]
+        tradable = tradable[valid_dates]
+        close_notna = close_notna[valid_dates]
+
+    if tradable_mode == "tw_limit_guard":
+        dividends = out["dividends"].to_numpy().astype(np.float64, copy=False)
+        stock_splits = out["stock_splits"].to_numpy().astype(np.float64, copy=False)
+        if not bool(valid_dates.all()):
+            dividends = dividends[valid_dates]
+            stock_splits = stock_splits[valid_dates]
+        can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(close_px, tradable, dividends, stock_splits)
+    elif tradable_mode == "tradable":
+        can_buy_mask = tradable.copy()
+        can_sell_mask = tradable.copy()
+    else:
+        raise RuntimeError(f"Unsupported tradable_mode for Polars Lazy panel backend: {tradable_mode!r}")
+
+    return _SymbolPanelArrays(
+        symbol=_symbol_name_from_path(path),
+        dates=dates,
+        features=features,
+        returns_1d=return_1d.astype(np.float32, copy=False),
+        close_prices=close_px.astype(np.float32, copy=False),
+        tradable_mask=np.asarray(tradable, dtype=bool),
+        can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
+        can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
         alive_mask=np.asarray(close_notna, dtype=bool),
     )
 
@@ -646,229 +813,6 @@ def _build_panel_from_symbol_arrays(
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
-        alive_mask=alive_mask,
-        benchmark_returns=benchmark_returns,
-        close_prices=close_prices,
-    )
-
-
-def _duckdb_quote(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _duckdb_column_or_null(schema_names: set[str], name: str) -> str:
-    if name in schema_names:
-        return f"try_cast({_duckdb_quote(name)} AS DOUBLE)"
-    return "NULL::DOUBLE"
-
-
-def _duckdb_safe_log(num: str, den: str) -> str:
-    return f"CASE WHEN {num} > 0.0 AND {den} > 0.0 THEN ln({num} / {den}) ELSE NULL END"
-
-
-def _duckdb_union_schema_names(paths: list[Path]) -> set[str]:
-    if pq is None:
-        raise RuntimeError("DuckDB panel backend requires pyarrow for parquet schema inspection")
-    names: set[str] = set()
-    for path in paths:
-        names.update(pq.read_schema(path).names)
-    return names
-
-
-def _duckdb_arrow_column(table, name: str, dtype) -> np.ndarray:
-    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
-    return np.asarray(values, dtype=dtype)
-
-
-def _build_panel_from_duckdb(
-    parquet_root: Path,
-    parquet_paths: list[Path],
-    *,
-    benchmark_name: str,
-    panel_load_workers: int,
-) -> PanelData:
-    if duckdb is None:
-        raise RuntimeError("data.panel_backend='duckdb' requires the duckdb package")
-    if pq is None:
-        raise RuntimeError("data.panel_backend='duckdb' requires the pyarrow package")
-
-    symbols = [_symbol_name_from_path(path) for path in parquet_paths]
-    symbol_map = pd.DataFrame(
-        {
-            "symbol": symbols,
-            "symbol_idx": np.arange(len(symbols), dtype=np.int32),
-        }
-    )
-    schema_names = _duckdb_union_schema_names(parquet_paths)
-    decimals_by_path = {_price_decimals_for_path(path) for path in parquet_paths}
-    if len(decimals_by_path) != 1:
-        raise RuntimeError("DuckDB panel backend currently requires one market price precision")
-    decimals = int(next(iter(decimals_by_path)))
-    return_source = "adjclose_px" if "adjclose" in schema_names else "close_px"
-    volume_expr = "volume_px"
-    tradable_expr = (
-        "close_px IS NOT NULL AND (volume_px > 0.0 OR volume_px IS NULL)"
-        if "Trading_Volume" in schema_names
-        else "close_px IS NOT NULL"
-    )
-    pattern = (parquet_root / f"*{FEATURE_FILE_SUFFIX}").as_posix()
-
-    con = duckdb.connect(database=":memory:")
-    try:
-        con.execute(f"PRAGMA threads={max(1, int(panel_load_workers))}")
-        con.register("symbol_map_df", symbol_map)
-        con.execute("CREATE TEMP TABLE symbol_map AS SELECT * FROM symbol_map_df")
-        con.execute(
-            f"""
-            CREATE TEMP TABLE computed AS
-            WITH raw AS (
-                SELECT
-                    m.symbol_idx,
-                    m.symbol,
-                    CAST(date AS TIMESTAMP) AS date_key,
-                    round({_duckdb_column_or_null(schema_names, "open")}, {decimals}) AS open_px,
-                    round({_duckdb_column_or_null(schema_names, "max")}, {decimals}) AS max_px,
-                    round({_duckdb_column_or_null(schema_names, "min")}, {decimals}) AS min_px,
-                    round({_duckdb_column_or_null(schema_names, "close")}, {decimals}) AS close_px,
-                    round({_duckdb_column_or_null(schema_names, "adjclose")}, {decimals}) AS adjclose_px,
-                    {_duckdb_column_or_null(schema_names, "Trading_Volume")} AS volume_px
-                FROM read_parquet(?, filename=true, union_by_name=true) AS r
-                JOIN symbol_map AS m
-                  ON m.symbol = regexp_extract(r.filename, '([^/\\\\]+)_features\\.parquet$', 1)
-            ),
-            calc1 AS (
-                SELECT
-                    *,
-                    CASE
-                        WHEN max_px IS NULL OR min_px IS NULL THEN NULL
-                        ELSE greatest(max_px - min_px, 0.0) + {EPSILON}
-                    END AS denom,
-                    {_duckdb_safe_log("close_px", "open_px")} AS intraday_return_co
-                FROM raw
-                WHERE date_key IS NOT NULL
-            ),
-            calc2 AS (
-                SELECT
-                    *,
-                    abs(close_px - open_px) / denom AS body_ratio,
-                    (close_px - open_px) / denom AS signed_body_ratio,
-                    (close_px - min_px) / denom AS clv,
-                    (max_px - greatest(open_px, close_px)) / denom AS upper_shadow,
-                    (least(open_px, close_px) - min_px) / denom AS lower_shadow,
-                    {_duckdb_safe_log(f"lead({return_source}) OVER (PARTITION BY symbol_idx ORDER BY date_key)", return_source)} AS return_1d,
-                    {_duckdb_safe_log("open_px", "lag(open_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS open_logret_1d,
-                    {_duckdb_safe_log("max_px", "lag(max_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS max_logret_1d,
-                    {_duckdb_safe_log("min_px", "lag(min_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS min_logret_1d,
-                    {_duckdb_safe_log("close_px", "lag(close_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS close_logret_1d,
-                    {_duckdb_safe_log(volume_expr, f"lag({volume_expr}) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS trading_volume_logret_1d,
-                    {tradable_expr} AS tradable,
-                    close_px IS NOT NULL AS alive
-                FROM calc1
-            ),
-            calc3 AS (
-                SELECT
-                    symbol_idx,
-                    symbol,
-                    date_key,
-                    close_px,
-                    return_1d,
-                    tradable,
-                    alive,
-                    open_logret_1d,
-                    max_logret_1d,
-                    min_logret_1d,
-                    close_logret_1d,
-                    trading_volume_logret_1d,
-                    sign(intraday_return_co) * trading_volume_logret_1d AS signed_vol,
-                    body_ratio,
-                    signed_body_ratio,
-                    body_ratio - lag(body_ratio) OVER (PARTITION BY symbol_idx ORDER BY date_key) AS delta_body_ratio,
-                    clv,
-                    clv - 0.5 AS clv_centered,
-                    clv - lag(clv) OVER (PARTITION BY symbol_idx ORDER BY date_key) AS delta_clv,
-                    upper_shadow,
-                    lower_shadow,
-                    upper_shadow - lower_shadow AS shadow_imbalance
-                FROM calc2
-            )
-            SELECT * FROM calc3
-            """,
-            [pattern],
-        )
-        con.execute(
-            """
-            CREATE TEMP TABLE date_map AS
-            SELECT date_key, row_number() OVER (ORDER BY date_key) - 1 AS date_idx
-            FROM (SELECT DISTINCT date_key FROM computed)
-            """
-        )
-        dates_table = con.execute("SELECT date_key FROM date_map ORDER BY date_idx").to_arrow_table()
-        dates = _duckdb_arrow_column(dates_table, "date_key", "datetime64[ns]")
-        num_dates = int(dates.size)
-        num_symbols = len(symbols)
-        num_features = len(LOG_RETURN_FEATURE_COLUMNS)
-        features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
-        returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-        close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-        tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-        alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-
-        select_cols = ", ".join(
-            [
-                "dm.date_idx",
-                "c.symbol_idx",
-                "c.return_1d",
-                "c.close_px",
-                "c.tradable",
-                "c.alive",
-                *[f"c.{name}" for name in LOG_RETURN_FEATURE_COLUMNS],
-            ]
-        )
-        final_table = con.execute(
-            f"""
-            SELECT {select_cols}
-            FROM computed AS c
-            JOIN date_map AS dm USING (date_key)
-            ORDER BY c.symbol_idx, dm.date_idx
-            """
-        ).to_arrow_table()
-    finally:
-        con.close()
-
-    row_idx = _duckdb_arrow_column(final_table, "date_idx", np.int64)
-    sym_idx = _duckdb_arrow_column(final_table, "symbol_idx", np.int64)
-    returns_1d[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "return_1d", np.float32)
-    close_prices[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "close_px", np.float32)
-    tradable_mask[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "tradable", bool)
-    alive_mask[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "alive", bool)
-    for feat_idx, name in enumerate(LOG_RETURN_FEATURE_COLUMNS):
-        features[row_idx, sym_idx, feat_idx] = _duckdb_arrow_column(final_table, name, np.float32)
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
-    if benchmark_symbol_index is None:
-        valid_returns = np.isfinite(returns_1d)
-        n_valid = valid_returns.sum(axis=1)
-        sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
-        benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
-        np.divide(sum_ret, n_valid, out=benchmark_returns, where=n_valid > 0)
-    else:
-        benchmark_returns = np.nan_to_num(
-            returns_1d[:, benchmark_symbol_index],
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32, copy=False)
-
-    return PanelData(
-        dates=np.asarray(dates, dtype="datetime64[ns]"),
-        symbols=symbols,
-        feature_names=list(LOG_RETURN_FEATURE_COLUMNS),
-        features=features,
-        returns_1d=returns_1d,
-        tradable_mask=tradable_mask,
-        can_buy_mask=tradable_mask.copy(),
-        can_sell_mask=tradable_mask.copy(),
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
@@ -1148,11 +1092,10 @@ def build_panel(
             raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
 
     panel_backend = str(panel_backend).strip().lower()
-    valid_backends = {"auto", "pandas", "polars", "pyarrow", "duckdb"}
+    valid_backends = {"auto", "pandas", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
     if panel_backend not in valid_backends:
         raise ValueError(f"panel_backend must be one of {sorted(valid_backends)}, got {panel_backend!r}")
     panel_load_workers = max(0, int(panel_load_workers))
-    use_cudf = bool(use_rapids) and cudf is not None and panel_backend == "auto"
     if buy_tradable_mode is not None or sell_tradable_mode is not None:
         buy_mode = str(buy_tradable_mode if buy_tradable_mode is not None else tradable_mode).strip().lower()
         sell_mode = str(sell_tradable_mode if sell_tradable_mode is not None else tradable_mode).strip().lower()
@@ -1169,34 +1112,20 @@ def build_panel(
             f"tradable_mode must be one of {sorted(valid_tradable_modes)}, got {tradable_mode!r}"
         )
 
-    if use_cudf:
-        selected_backend = "cudf"
-    elif panel_backend == "duckdb":
-        if duckdb is None:
-            raise RuntimeError("data.panel_backend='duckdb' requires the duckdb package")
-        selected_backend = "duckdb"
-    elif panel_backend == "pyarrow":
+    if panel_backend == "pyarrow":
         if pq is None:
             raise RuntimeError("data.panel_backend='pyarrow' requires the pyarrow package")
         selected_backend = "pyarrow"
-    elif panel_backend == "polars":
+    elif panel_backend in {"polars", "polars_lazy", "polars_streaming"}:
         if pl is None:
-            raise RuntimeError("data.panel_backend='polars' requires the polars package")
-        selected_backend = "polars"
-    elif panel_backend == "auto" and duckdb is not None and pq is not None and tradable_mode == "tradable":
-        selected_backend = "duckdb"
-    elif panel_backend == "auto" and pq is not None and tradable_mode == "tradable":
-        selected_backend = "pyarrow"
+            raise RuntimeError(f"data.panel_backend={panel_backend!r} requires the polars package")
+        selected_backend = "polars_streaming" if panel_backend == "polars_streaming" else "polars_lazy"
     elif panel_backend == "auto" and pl is not None:
-        selected_backend = "polars"
+        selected_backend = "polars_lazy"
+    elif panel_backend == "auto" and pq is not None:
+        selected_backend = "pyarrow"
     else:
         selected_backend = "pandas"
-    if selected_backend in {"duckdb", "pyarrow"} and tradable_mode != "tradable":
-        if panel_backend in {"duckdb", "pyarrow"}:
-            raise RuntimeError(
-                f"data.panel_backend={panel_backend!r} currently requires data.tradable_mode='tradable'"
-            )
-        selected_backend = "polars" if pl is not None else "pandas"
 
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
@@ -1213,22 +1142,19 @@ def build_panel(
         f"[panel] building from {len(parquet_paths)} parquet files "
         f"(backend={selected_backend}, workers={panel_load_workers})..."
     )
-    if selected_backend == "duckdb":
-        panel = _build_panel_from_duckdb(
-            parquet_root,
-            parquet_paths,
-            benchmark_name=benchmark_name,
-            panel_load_workers=panel_load_workers,
-        )
-        _save_panel_cache(parquet_root, panel, source_hash, backend_key)
-        print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
-        _print_feature_overview(panel)
-        return panel
+    if selected_backend in {"pyarrow", "polars_lazy", "polars_streaming"}:
+        polars_collect_engine = "streaming" if selected_backend == "polars_streaming" else "auto"
 
-    if selected_backend == "pyarrow":
-        def _load_one_pyarrow(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
+        def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
             try:
-                arrays = _load_symbol_arrays_pyarrow(path, tradable_mode=tradable_mode)
+                if selected_backend == "pyarrow":
+                    arrays = _load_symbol_arrays_pyarrow(path, tradable_mode=tradable_mode)
+                else:
+                    arrays = _load_symbol_arrays_polars_lazy(
+                        path,
+                        tradable_mode=tradable_mode,
+                        collect_engine=polars_collect_engine,
+                    )
                 if int(arrays.dates.size) == 0:
                     raise ValueError(f"Symbol file is empty: {path.name}")
                 return path, arrays, None
@@ -1237,12 +1163,12 @@ def build_panel(
 
         if panel_load_workers > 1 and len(parquet_paths) > 1:
             with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
-                loaded_pyarrow = list(executor.map(_load_one_pyarrow, parquet_paths))
+                loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
         else:
-            loaded_pyarrow = [_load_one_pyarrow(path) for path in parquet_paths]
+            loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
 
         valid_arrays: list[_SymbolPanelArrays] = []
-        for path, arrays, exc in loaded_pyarrow:
+        for path, arrays, exc in loaded_arrays:
             if exc is not None:
                 print(f"[panel] SKIP {path.name}: {exc}")
                 continue
@@ -1254,56 +1180,12 @@ def build_panel(
         _print_feature_overview(panel)
         return panel
 
-    if use_cudf:
-        try:
-            symbol_frames_cudf: list[pd.DataFrame] = []
-            valid_paths_cudf: list[Path] = []
-            for path in parquet_paths:
-                frame = _load_symbol_frame_cudf(path)
-                if len(frame) == 0:
-                    continue
-                use_tw_limit_guard = tradable_mode == "tw_limit_guard"
-                if use_tw_limit_guard:
-                    can_buy_limit, can_sell_limit = _compute_tw_limit_masks(frame)
-                    frame["can_buy"] = can_buy_limit
-                    frame["can_sell"] = can_sell_limit
-                else:
-                    frame["can_buy"] = frame["tradable"].astype(bool)
-                    frame["can_sell"] = frame["tradable"].astype(bool)
-                symbol_frames_cudf.append(frame)
-                valid_paths_cudf.append(path)
-
-            if symbol_frames_cudf:
-                symbols_cudf = [_symbol_name_from_path(path) for path in valid_paths_cudf]
-                frame_all_cudf = pd.concat(symbol_frames_cudf, ignore_index=True)
-                panel = _build_panel_from_frame(
-                    frame_all_cudf,
-                    symbols_cudf,
-                    benchmark_name=benchmark_name,
-                )
-                _save_panel_cache(parquet_root, panel, source_hash, backend_key)
-                print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)} (cuDF path)")
-                _print_feature_overview(panel)
-                return panel
-        except Exception as exc:
-            print(f"[panel] cuDF path failed, fallback to pandas: {exc}")
-            selected_backend = "pandas"
-            backend_key = (
-                f"pandas|benchmark={benchmark_name}|"
-                f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}"
-            )
-            panel = _load_valid_panel_cache(parquet_root, parquet_paths, backend_key, source_hash)
-            if panel is not None:
-                _print_feature_overview(panel)
-                return panel
-    
     symbol_frames: list[pd.DataFrame] = []
     valid_paths: list[Path] = []
-    load_frame = _load_symbol_frame_polars if selected_backend == "polars" else _load_symbol_frame
 
     def _load_one(path: Path) -> tuple[Path, pd.DataFrame | None, Exception | None]:
         try:
-            frame = load_frame(path)
+            frame = _load_symbol_frame(path)
             if len(frame) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
             use_tw_limit_guard = tradable_mode == "tw_limit_guard"

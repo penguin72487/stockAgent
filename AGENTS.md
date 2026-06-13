@@ -64,27 +64,31 @@ choosing defaults.
 Rules:
 
 - `scripts/benchmark_data_backends.py` is the reproducible scanner/benchmark for
-  data-processing hotspots across pandas, Polars, DuckDB, PyArrow, and cuDF.
-- Do not skip DuckDB `panel_build`; it is an allowed dense panel backend for the
-  `tradable` path.
+  data-processing hotspots. Its active optimization scope is PyArrow plus Polars
+  Lazy/Streaming; pandas is kept only as the compatibility/reference path.
+- Do not add DuckDB or cuDF back to the panel/runtime benchmark set unless a new
+  request explicitly reopens those candidates.
 - For full US daily parquet (`16811` files, `S≈16811`) with
-  `tradable_mode: tradable`, cold runtime `build_panel(... panel_backend="auto")`
-  should select DuckDB when `duckdb` and `pyarrow` are installed.
-- Foreground full-US runtime result after the DuckDB backend change:
-  `build_panel` built a `6651 x 16811 x 15` panel in `52.05s`, max RSS about
-  `30.1GB`, and cache reload was `0.267s`.
-- Foreground full-US benchmark result for `panel_build`: DuckDB `62.10s` versus
-  PyArrow `215.55s`, with matching checksums. Earlier full all-backend artifact
-  measured pandas `441.74s`, Polars `420.53s`, and cuDF `454.41s` for the same
-  workload class.
-- Wide full-US daily weight parquet output (`512 x 16811`) should prefer Polars:
-  foreground benchmark measured Polars `0.457s`, PyArrow `0.739s`, pandas
-  `1.50s`, DuckDB `2.63s`, and cuDF `45.88s`; keep pandas as fallback for
-  optional dependency failures.
-- Feature-prep proxy benchmarks can favor PyArrow because they read only a few
-  columns per symbol, but end-to-end dense panel construction favors DuckDB
-  because it pushes union, calendar alignment, feature expressions, and ordering
-  into one SQL pipeline instead of materializing per-file Python frames.
+  `tradable_mode: tradable`, runtime `build_panel(... panel_backend="auto")`
+  should select Polars Lazy when available, then PyArrow, then pandas. Explicit
+  `panel_backend="polars"` is an alias for `polars_lazy`; explicit
+  `panel_backend="polars_streaming"` is available for measurement but is not the
+  current auto default.
+- Foreground full-US PyArrow+Polars benchmark after narrowing the scope:
+  `panel_build` measured Polars Lazy `69.36s`, Polars Streaming `86.55s`, and
+  PyArrow `195.85s` on recheck. PyArrow checksum was
+  `8707711790994.017`; Polars Lazy differed by about `913` in feature checksum
+  on very large OHLC anomaly-derived ratios, while returns and masks matched in
+  spot checks. Use `panel_backend="pyarrow"` when bitwise checksum parity is more
+  important than panel-build speed.
+- Wide full-US daily weight parquet output (`512 x 16811`) should prefer Polars
+  Streaming sink among active native backends: repeat-5 foreground benchmark
+  measured Polars Streaming `1.81s`, Polars Lazy `2.13s`, and PyArrow `4.02s`.
+- Feature-prep proxy benchmarks favor PyArrow because they use direct Arrow to
+  NumPy arrays: PyArrow `29.58s` on recheck, Polars Lazy `206.41s`, and Polars
+  Streaming `296.95s`. For the current many-small-files US layout, PyArrow's
+  single-pass full-table read is faster than adding a per-file schema projection
+  pass.
 
 ## Current Main Model Contract
 

@@ -28,7 +28,7 @@ from stockagent.data.panel import (  # noqa: E402
     LOG_RETURN_FEATURE_COLUMNS,
     PanelData,
     build_panel,
-    _load_symbol_frame_cudf,
+    _load_symbol_arrays_polars_lazy,
     _prepare_symbol_frame,
     _price_decimals_for_path,
     _resolve_benchmark_index,
@@ -168,11 +168,6 @@ def _stats_from_pandas_frame(frame: pd.DataFrame) -> SymbolStats:
 
 def _bench_pandas_file(path: Path) -> SymbolStats:
     frame = _prepare_symbol_frame(pd.read_parquet(path), path)
-    return _stats_from_pandas_frame(frame)
-
-
-def _bench_cudf_file(path: Path) -> SymbolStats:
-    frame = _load_symbol_frame_cudf(path)
     return _stats_from_pandas_frame(frame)
 
 
@@ -387,320 +382,33 @@ def _bench_polars_file(path: Path) -> SymbolStats:
     )
 
 
-def _duckdb_quote(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _duckdb_safe_log(num: str, den: str) -> str:
-    return f"CASE WHEN {num} > 0.0 AND {den} > 0.0 THEN ln({num} / {den}) ELSE NULL END"
-
-
-def _bench_duckdb_file(path: Path) -> SymbolStats:
-    import duckdb
-    import pyarrow.parquet as pq
-
-    names = set(pq.read_schema(path).names)
-
-    def col(name: str) -> str:
-        if name in names:
-            return f"try_cast({_duckdb_quote(name)} AS DOUBLE)"
-        return "NULL::DOUBLE"
-
-    decimals = _price_decimals_for_path(path)
-    return_source = "adjclose_px" if "adjclose" in names else "close_px"
-    volume_expr = "volume_px"
-    tradable_expr = (
-        "close_px IS NOT NULL AND (volume_px > 0.0 OR volume_px IS NULL)"
-        if "Trading_Volume" in names
-        else "close_px IS NOT NULL"
-    )
-    feature_terms = " + ".join(f"coalesce({name}, 0.0)" for name in LOG_RETURN_FEATURE_COLUMNS)
-    sql = f"""
-    WITH base AS (
-        SELECT
-            CAST(date AS TIMESTAMP) AS date_key,
-            round({col("open")}, {decimals}) AS open_px,
-            round({col("max")}, {decimals}) AS max_px,
-            round({col("min")}, {decimals}) AS min_px,
-            round({col("close")}, {decimals}) AS close_px,
-            round({col("adjclose")}, {decimals}) AS adjclose_px,
-            {col("Trading_Volume")} AS volume_px
-        FROM read_parquet(?)
-    ),
-    calc1 AS (
-        SELECT
-            *,
-            CASE
-                WHEN max_px IS NULL OR min_px IS NULL THEN NULL
-                ELSE greatest(max_px - min_px, 0.0) + {EPSILON}
-            END AS denom,
-            {_duckdb_safe_log("close_px", "open_px")} AS intraday_return_co
-        FROM base
-    ),
-    calc2 AS (
-        SELECT
-            *,
-            abs(close_px - open_px) / denom AS body_ratio,
-            (close_px - open_px) / denom AS signed_body_ratio,
-            (close_px - min_px) / denom AS clv,
-            (max_px - greatest(open_px, close_px)) / denom AS upper_shadow,
-            (least(open_px, close_px) - min_px) / denom AS lower_shadow,
-            {_duckdb_safe_log(f"lead({return_source}) OVER (ORDER BY date_key)", return_source)} AS return_1d,
-            {_duckdb_safe_log("open_px", "lag(open_px) OVER (ORDER BY date_key)")} AS open_logret_1d,
-            {_duckdb_safe_log("max_px", "lag(max_px) OVER (ORDER BY date_key)")} AS max_logret_1d,
-            {_duckdb_safe_log("min_px", "lag(min_px) OVER (ORDER BY date_key)")} AS min_logret_1d,
-            {_duckdb_safe_log("close_px", "lag(close_px) OVER (ORDER BY date_key)")} AS close_logret_1d,
-            {_duckdb_safe_log(volume_expr, f"lag({volume_expr}) OVER (ORDER BY date_key)")} AS trading_volume_logret_1d,
-            {tradable_expr} AS tradable
-        FROM calc1
-    ),
-    calc3 AS (
-        SELECT
-            *,
-            clv - 0.5 AS clv_centered,
-            upper_shadow - lower_shadow AS shadow_imbalance,
-            clv - lag(clv) OVER (ORDER BY date_key) AS delta_clv,
-            body_ratio - lag(body_ratio) OVER (ORDER BY date_key) AS delta_body_ratio,
-            sign(intraday_return_co) * trading_volume_logret_1d AS signed_vol
-        FROM calc2
-    )
-    SELECT
-        count(*) AS rows,
-        sum({feature_terms}) AS feature_sum,
-        sum(coalesce(return_1d, 0.0)) AS return_sum,
-        sum(CASE WHEN tradable THEN 1 ELSE 0 END) AS tradable_count
-    FROM calc3
-    """
-    con = duckdb.connect(database=":memory:")
-    try:
-        row = con.execute(sql, [str(path)]).fetchone()
-    finally:
-        con.close()
+def _bench_polars_lazy_file(path: Path) -> SymbolStats:
+    arrays = _load_symbol_arrays_polars_lazy(path, tradable_mode="tradable")
     return SymbolStats(
-        rows=int(row[0] or 0),
-        feature_sum=float(row[1] or 0.0),
-        return_sum=float(row[2] or 0.0),
-        tradable_count=int(row[3] or 0),
+        rows=int(arrays.dates.size),
+        feature_sum=float(np.nansum(arrays.features, dtype=np.float64)),
+        return_sum=float(np.nansum(arrays.returns_1d, dtype=np.float64)),
+        tradable_count=int(arrays.tradable_mask.sum()),
     )
 
 
-def _duckdb_union_schema_names(paths: list[Path]) -> set[str]:
-    import pyarrow.parquet as pq
-
-    names: set[str] = set()
-    for path in paths:
-        names.update(pq.read_schema(path).names)
-    return names
-
-
-def _duckdb_arrow_column(table: Any, name: str, dtype: Any) -> np.ndarray:
-    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
-    return np.asarray(values, dtype=dtype)
-
-
-def _build_panel_duckdb(
-    parquet_root: Path,
-    paths: list[Path],
-    *,
-    benchmark_name: str,
-    threads: int,
-) -> PanelData:
-    import duckdb
-
-    symbols = [_symbol_name_from_path(path) for path in paths]
-    symbol_map = pd.DataFrame(
-        {
-            "symbol": symbols,
-            "symbol_idx": np.arange(len(symbols), dtype=np.int32),
-        }
+def _bench_polars_streaming_file(path: Path) -> SymbolStats:
+    arrays = _load_symbol_arrays_polars_lazy(path, tradable_mode="tradable", collect_engine="streaming")
+    return SymbolStats(
+        rows=int(arrays.dates.size),
+        feature_sum=float(np.nansum(arrays.features, dtype=np.float64)),
+        return_sum=float(np.nansum(arrays.returns_1d, dtype=np.float64)),
+        tradable_count=int(arrays.tradable_mask.sum()),
     )
-    schema_names = _duckdb_union_schema_names(paths)
-    decimals_by_path = {_price_decimals_for_path(path) for path in paths}
-    if len(decimals_by_path) != 1:
-        raise RuntimeError("DuckDB panel benchmark currently requires one market price precision")
-    decimals = int(next(iter(decimals_by_path)))
-    return_source = "adjclose_px" if "adjclose" in schema_names else "close_px"
-    volume_expr = "volume_px"
-    tradable_expr = (
-        "close_px IS NOT NULL AND (volume_px > 0.0 OR volume_px IS NULL)"
-        if "Trading_Volume" in schema_names
-        else "close_px IS NOT NULL"
-    )
-    feature_names_sql = ",\n            ".join(LOG_RETURN_FEATURE_COLUMNS)
-    pattern = (parquet_root / f"*{FEATURE_FILE_SUFFIX}").as_posix()
-
-    con = duckdb.connect(database=":memory:")
-    try:
-        con.execute(f"PRAGMA threads={max(1, int(threads))}")
-        con.register("symbol_map_df", symbol_map)
-        con.execute("CREATE TEMP TABLE symbol_map AS SELECT * FROM symbol_map_df")
-        sql = f"""
-        CREATE TEMP TABLE computed AS
-        WITH raw AS (
-            SELECT
-                m.symbol_idx,
-                m.symbol,
-                CAST(date AS TIMESTAMP) AS date_key,
-                round({_duckdb_column_or_null(schema_names, "open")}, {decimals}) AS open_px,
-                round({_duckdb_column_or_null(schema_names, "max")}, {decimals}) AS max_px,
-                round({_duckdb_column_or_null(schema_names, "min")}, {decimals}) AS min_px,
-                round({_duckdb_column_or_null(schema_names, "close")}, {decimals}) AS close_px,
-                round({_duckdb_column_or_null(schema_names, "adjclose")}, {decimals}) AS adjclose_px,
-                {_duckdb_column_or_null(schema_names, "Trading_Volume")} AS volume_px
-            FROM read_parquet(?, filename=true, union_by_name=true) AS r
-            JOIN symbol_map AS m
-              ON m.symbol = regexp_extract(r.filename, '([^/\\\\]+)_features\\.parquet$', 1)
-        ),
-        calc1 AS (
-            SELECT
-                *,
-                CASE
-                    WHEN max_px IS NULL OR min_px IS NULL THEN NULL
-                    ELSE greatest(max_px - min_px, 0.0) + {EPSILON}
-                END AS denom,
-                {_duckdb_safe_log("close_px", "open_px")} AS intraday_return_co
-            FROM raw
-            WHERE date_key IS NOT NULL
-        ),
-        calc2 AS (
-            SELECT
-                *,
-                abs(close_px - open_px) / denom AS body_ratio,
-                (close_px - open_px) / denom AS signed_body_ratio,
-                (close_px - min_px) / denom AS clv,
-                (max_px - greatest(open_px, close_px)) / denom AS upper_shadow,
-                (least(open_px, close_px) - min_px) / denom AS lower_shadow,
-                {_duckdb_safe_log(f"lead({return_source}) OVER (PARTITION BY symbol_idx ORDER BY date_key)", return_source)} AS return_1d,
-                {_duckdb_safe_log("open_px", "lag(open_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS open_logret_1d,
-                {_duckdb_safe_log("max_px", "lag(max_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS max_logret_1d,
-                {_duckdb_safe_log("min_px", "lag(min_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS min_logret_1d,
-                {_duckdb_safe_log("close_px", "lag(close_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS close_logret_1d,
-                {_duckdb_safe_log(volume_expr, f"lag({volume_expr}) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS trading_volume_logret_1d,
-                {tradable_expr} AS tradable,
-                close_px IS NOT NULL AS alive
-            FROM calc1
-        ),
-        calc3 AS (
-            SELECT
-                symbol_idx,
-                symbol,
-                date_key,
-                close_px,
-                return_1d,
-                tradable,
-                alive,
-                open_logret_1d,
-                max_logret_1d,
-                min_logret_1d,
-                close_logret_1d,
-                trading_volume_logret_1d,
-                sign(intraday_return_co) * trading_volume_logret_1d AS signed_vol,
-                body_ratio,
-                signed_body_ratio,
-                body_ratio - lag(body_ratio) OVER (PARTITION BY symbol_idx ORDER BY date_key) AS delta_body_ratio,
-                clv,
-                clv - 0.5 AS clv_centered,
-                clv - lag(clv) OVER (PARTITION BY symbol_idx ORDER BY date_key) AS delta_clv,
-                upper_shadow,
-                lower_shadow,
-                upper_shadow - lower_shadow AS shadow_imbalance
-            FROM calc2
-        )
-        SELECT * FROM calc3
-        """
-        con.execute(sql, [pattern])
-        con.execute(
-            """
-            CREATE TEMP TABLE date_map AS
-            SELECT date_key, row_number() OVER (ORDER BY date_key) - 1 AS date_idx
-            FROM (SELECT DISTINCT date_key FROM computed)
-            """
-        )
-        dates_table = con.execute("SELECT date_key FROM date_map ORDER BY date_idx").to_arrow_table()
-        dates = _duckdb_arrow_column(dates_table, "date_key", "datetime64[ns]")
-        num_dates = int(dates.size)
-        num_symbols = len(symbols)
-        num_features = len(LOG_RETURN_FEATURE_COLUMNS)
-        features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
-        returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-        close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-        tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-        alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-
-        select_cols = ", ".join(
-            [
-                "dm.date_idx",
-                "c.symbol_idx",
-                "c.return_1d",
-                "c.close_px",
-                "c.tradable",
-                "c.alive",
-                *[f"c.{name}" for name in LOG_RETURN_FEATURE_COLUMNS],
-            ]
-        )
-        final_table = con.execute(
-            f"""
-            SELECT {select_cols}
-            FROM computed AS c
-            JOIN date_map AS dm USING (date_key)
-            ORDER BY c.symbol_idx, dm.date_idx
-            """
-        ).to_arrow_table()
-    finally:
-        con.close()
-
-    row_idx = _duckdb_arrow_column(final_table, "date_idx", np.int64)
-    sym_idx = _duckdb_arrow_column(final_table, "symbol_idx", np.int64)
-    returns_1d[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "return_1d", np.float32)
-    close_prices[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "close_px", np.float32)
-    tradable_mask[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "tradable", bool)
-    alive_mask[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "alive", bool)
-    for feat_idx, name in enumerate(LOG_RETURN_FEATURE_COLUMNS):
-        features[row_idx, sym_idx, feat_idx] = _duckdb_arrow_column(final_table, name, np.float32)
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
-    if benchmark_symbol_index is None:
-        valid_returns = np.isfinite(returns_1d)
-        n_valid = valid_returns.sum(axis=1)
-        sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
-        benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
-        np.divide(sum_ret, n_valid, out=benchmark_returns, where=n_valid > 0)
-    else:
-        benchmark_returns = np.nan_to_num(
-            returns_1d[:, benchmark_symbol_index],
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32, copy=False)
-
-    return PanelData(
-        dates=np.asarray(dates, dtype="datetime64[ns]"),
-        symbols=symbols,
-        feature_names=list(LOG_RETURN_FEATURE_COLUMNS),
-        features=features,
-        returns_1d=returns_1d,
-        tradable_mask=tradable_mask,
-        can_buy_mask=tradable_mask.copy(),
-        can_sell_mask=tradable_mask.copy(),
-        alive_mask=alive_mask,
-        benchmark_returns=benchmark_returns,
-        close_prices=close_prices,
-    )
-
-
-def _duckdb_column_or_null(schema_names: set[str], name: str) -> str:
-    if name in schema_names:
-        return f"try_cast({_duckdb_quote(name)} AS DOUBLE)"
-    return "NULL::DOUBLE"
 
 
 FEATURE_PREP_BACKENDS: dict[str, tuple[str, Callable[[Path], SymbolStats]]] = {
     "pandas": ("pandas", _bench_pandas_file),
-    "polars": ("polars", _bench_polars_file),
-    "duckdb": ("duckdb", _bench_duckdb_file),
+    "polars": ("polars", _bench_polars_lazy_file),
+    "polars_eager": ("polars", _bench_polars_file),
+    "polars_lazy": ("polars", _bench_polars_lazy_file),
+    "polars_streaming": ("polars", _bench_polars_streaming_file),
     "pyarrow": ("pyarrow", _bench_pyarrow_file),
-    "cudf": ("cudf", _bench_cudf_file),
 }
 
 
@@ -835,29 +543,29 @@ def benchmark_panel_build(
         bench_paths = sorted(tmp_dir.glob(f"*{FEATURE_FILE_SUFFIX}"))
 
         for backend in backends:
-            if backend == "duckdb" and not _module_available("duckdb"):
+            if backend in {"polars", "polars_eager", "polars_lazy", "polars_streaming"} and not _module_available("polars"):
                 results.append(
                     BenchmarkResult(
                         workload="panel_build",
                         backend=backend,
                         available=False,
                         files=len(paths),
-                        error="missing module duckdb",
+                        error="missing module polars",
                     )
                 )
                 continue
-            if backend == "cudf" and not _module_available("cudf"):
+            if backend == "polars_eager":
                 results.append(
                     BenchmarkResult(
                         workload="panel_build",
                         backend=backend,
-                        available=False,
+                        available=True,
                         files=len(paths),
-                        error="missing module cudf",
+                        error="Polars eager is intentionally not a runtime panel backend; use polars_lazy or polars_streaming.",
                     )
                 )
                 continue
-            if backend in {"polars", "pyarrow"} and not _module_available(backend):
+            if backend == "pyarrow" and not _module_available("pyarrow"):
                 results.append(
                     BenchmarkResult(
                         workload="panel_build",
@@ -871,28 +579,13 @@ def benchmark_panel_build(
 
             start = time.perf_counter()
             try:
-                if backend == "duckdb":
-                    panel = _build_panel_duckdb(
-                        tmp_dir,
-                        bench_paths,
-                        benchmark_name=benchmark_name,
-                        threads=max(1, int(panel_load_workers)),
-                    )
-                    save_panel_cache_v2(
-                        tmp_dir,
-                        panel,
-                        source_hash="benchmark",
-                        backend_key=f"duckdb|benchmark={benchmark_name}",
-                        version=0,
-                    )
-                else:
-                    panel = build_panel(
-                        tmp_dir,
-                        use_rapids=(backend == "cudf"),
-                        benchmark_name=benchmark_name,
-                        panel_backend="auto" if backend == "cudf" else backend,
-                        panel_load_workers=max(0, int(panel_load_workers)),
-                    )
+                panel = build_panel(
+                    tmp_dir,
+                    use_rapids=False,
+                    benchmark_name=benchmark_name,
+                    panel_backend=backend,
+                    panel_load_workers=max(0, int(panel_load_workers)),
+                )
                 elapsed = time.perf_counter() - start
                 dense_cells = int(panel.num_dates * panel.num_symbols)
                 checksum = float(
@@ -963,39 +656,42 @@ def _bench_wide_write_polars(path: Path, dates: np.ndarray, weights: np.ndarray,
     return path.stat().st_size
 
 
-def _bench_wide_write_duckdb(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
-    import duckdb
-    import pyarrow as pa
+def _bench_wide_write_polars_lazy(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
+    import polars as pl
 
-    arrays = [pa.array(dates)]
-    arrays.extend(pa.array(weights[:, idx]) for idx in range(weights.shape[1]))
-    table = pa.Table.from_arrays(arrays, names=["date", *symbols])
-    con = duckdb.connect(database=":memory:")
-    try:
-        con.register("weights_arrow", table)
-        con.execute(f"COPY weights_arrow TO '{path.as_posix()}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
-    finally:
-        con.close()
+    data = {"date": dates}
+    data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
+    lazy = pl.LazyFrame(data)
+    if hasattr(lazy, "sink_parquet"):
+        lazy.sink_parquet(path, compression="snappy")
+    else:
+        lazy.collect().write_parquet(path, compression="snappy")
     return path.stat().st_size
 
 
-def _bench_wide_write_cudf(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
-    import cudf
+def _bench_wide_write_polars_streaming(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
+    import polars as pl
 
-    # Current runtime table output is CPU-originated. This benchmarks the cost of
-    # moving the same CPU arrays into cuDF before parquet write.
     data = {"date": dates}
     data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
-    cudf.DataFrame(data).to_parquet(path, compression="snappy", index=False)
+    lazy = pl.LazyFrame(data)
+    if hasattr(lazy, "sink_parquet"):
+        try:
+            lazy.sink_parquet(path, compression="snappy", engine="streaming")
+        except TypeError:
+            lazy.sink_parquet(path, compression="snappy")
+    else:
+        lazy.collect(engine="streaming").write_parquet(path, compression="snappy")
     return path.stat().st_size
 
 
 WIDE_WRITE_BACKENDS: dict[str, tuple[str, Callable[[Path, np.ndarray, np.ndarray, list[str]], int]]] = {
     "pandas": ("pandas", _bench_wide_write_pandas),
-    "polars": ("polars", _bench_wide_write_polars),
-    "duckdb": ("duckdb", _bench_wide_write_duckdb),
+    "polars": ("polars", _bench_wide_write_polars_lazy),
+    "polars_eager": ("polars", _bench_wide_write_polars),
+    "polars_lazy": ("polars", _bench_wide_write_polars_lazy),
+    "polars_streaming": ("polars", _bench_wide_write_polars_streaming),
     "pyarrow": ("pyarrow", _bench_wide_write_pyarrow),
-    "cudf": ("cudf", _bench_wide_write_cudf),
 }
 
 
@@ -1094,7 +790,7 @@ def _write_outputs(payload: dict[str, Any], output_json: Path | None, output_csv
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark stockAgent data-processing backends.")
     parser.add_argument("--parquet-root", default="data_yahoo/us_stocks")
-    parser.add_argument("--backends", default="pandas,polars,duckdb,pyarrow,cudf")
+    parser.add_argument("--backends", default="pyarrow,polars_lazy,polars_streaming")
     parser.add_argument("--max-symbols", type=int, default=256, help="0 means all parquet files.")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--skip-feature-prep", action="store_true")
@@ -1113,7 +809,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    backends = [item.strip().lower() for item in str(args.backends).split(",") if item.strip()]
+    backends = [
+        item.strip().lower().replace("-", "_").replace(" ", "_")
+        for item in str(args.backends).split(",")
+        if item.strip()
+    ]
     results: list[BenchmarkResult] = []
     parquet_root = (REPO_ROOT / args.parquet_root).resolve() if not Path(args.parquet_root).is_absolute() else Path(args.parquet_root)
     if not args.skip_feature_prep:
