@@ -2321,9 +2321,21 @@ def _save_daily_weights_table(
     symbols: list[str],
     weights_history: np.ndarray,
 ) -> None:
+    weights = np.asarray(weights_history, dtype=np.float64)
+    if output_path.suffix.lower() == ".parquet":
+        try:
+            import polars as pl
+
+            data = {"date": np.asarray(dates)}
+            data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame(data).write_parquet(output_path, compression="snappy")
+            return
+        except Exception as exc:
+            print(f"[artifact] Polars daily weights parquet write failed; falling back to pandas: {exc}")
+
     import pandas as pd
 
-    weights = np.asarray(weights_history, dtype=np.float64)
     df = pd.DataFrame(weights, columns=list(symbols))
     df.insert(0, "date", np.asarray(dates))
     _write_dataframe_table(df, output_path)
