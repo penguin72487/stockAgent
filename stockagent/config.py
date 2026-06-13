@@ -451,6 +451,7 @@ class TrainingConfig:
     save_integer_share_daily_weights_csv: bool = True
     save_integer_share_holdings_csv: bool = True
     save_daily_weights_csv: bool = True
+    backtest_artifact_compression: str = "none"
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -641,6 +642,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         training["save_integer_share_daily_weights_csv"],
     )
     training.setdefault("save_integer_share_holdings_table", training["save_integer_share_holdings_csv"])
+    training.setdefault("backtest_artifact_compression", "none")
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -1067,6 +1069,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_cross_asset_attention_capture_rows"] = max(
         1, int(training.get("explain_cross_asset_attention_capture_rows", 4))
     )
+    backtest_artifact_compression = str(training.get("backtest_artifact_compression", "none")).strip().lower()
+    if backtest_artifact_compression not in {"none", "compressed"}:
+        raise ValueError("training.backtest_artifact_compression must be one of: none, compressed")
+    training["backtest_artifact_compression"] = backtest_artifact_compression
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
@@ -1197,6 +1203,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             save_integer_share_daily_weights_csv=training_raw["save_integer_share_daily_weights_csv"],
             save_integer_share_holdings_csv=training_raw["save_integer_share_holdings_csv"],
             save_daily_weights_csv=training_raw["save_daily_weights_csv"],
+            backtest_artifact_compression=training_raw["backtest_artifact_compression"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],

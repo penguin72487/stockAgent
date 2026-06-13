@@ -2228,8 +2228,15 @@ def _benchmark_windowed_input_pipeline_throughput(
     return dataloader_sps, windowed_sps
 
 
-def _save_backtest_artifact(output_path: Path, result: BacktestResult, dates: np.ndarray) -> None:
-    np.savez_compressed(
+def _save_backtest_artifact(
+    output_path: Path,
+    result: BacktestResult,
+    dates: np.ndarray,
+    *,
+    compression: str = "none",
+) -> None:
+    writer = np.savez_compressed if str(compression).strip().lower() == "compressed" else np.savez
+    writer(
         output_path,
         strategy_returns=result.strategy_returns,
         benchmark_returns=result.benchmark_returns,
@@ -2352,6 +2359,7 @@ def _save_integer_share_audit_artifacts(
     write_daily_weights_table: bool = True,
     write_holdings_table: bool = True,
     table_output_format: str = "csv",
+    backtest_artifact_compression: str = "none",
 ) -> dict[str, float | bool | str]:
     table_output_format = _normalize_table_output_format(table_output_format)
     timing: dict[str, float | bool | str] = {
@@ -2360,10 +2368,16 @@ def _save_integer_share_audit_artifacts(
         "write_holdings_table": bool(write_holdings_table),
         "write_daily_weights_csv": bool(write_daily_weights_table and table_output_format == "csv"),
         "write_holdings_csv": bool(write_holdings_table and table_output_format == "csv"),
+        "backtest_artifact_compression": str(backtest_artifact_compression).strip().lower(),
     }
     total_start = time.perf_counter()
     stage_start = time.perf_counter()
-    _save_backtest_artifact(_integer_backtest_path(fold_dir), result, dates)
+    _save_backtest_artifact(
+        _integer_backtest_path(fold_dir),
+        result,
+        dates,
+        compression=backtest_artifact_compression,
+    )
     timing["npz_s"] = float(time.perf_counter() - stage_start)
     stage_start = time.perf_counter()
     _save_daily_portfolio_returns_csv(
@@ -5004,12 +5018,13 @@ def _run_fold_explainability(
     )
     timing["write_s"] = float(time.perf_counter() - write_start)
     write_timing = result.get("summary", {}).get("write_timing", {})
+    cross_asset_summary: dict[str, Any] = {}
     if bool(settings.cross_asset_enabled):
         cross_asset_start = time.perf_counter()
         try:
             from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
 
-            abstract_cross_asset_transmission(
+            cross_asset_summary = abstract_cross_asset_transmission(
                 model,
                 batch,
                 feature_names=panel.feature_names,
@@ -5046,6 +5061,7 @@ def _run_fold_explainability(
                 **timing,
                 "compute_timing": compute_timing,
                 "write_timing": write_timing,
+                "cross_asset_summary": cross_asset_summary,
             },
             indent=2,
             ensure_ascii=False,
@@ -9486,11 +9502,26 @@ def run_training(
             results_by_fold[fold.fold_id] = fold_result
 
             save_start = time.perf_counter()
+            save_timing: dict[str, float | str] = {}
+            stage_start = time.perf_counter()
             torch.save(_state_dict_for_save(model), _model_path(fold_dir))
+            save_timing["model_checkpoint_s"] = float(time.perf_counter() - stage_start)
+            stage_start = time.perf_counter()
             with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
                 json.dump(asdict(fold_result), f, indent=2)
+            save_timing["metrics_json_s"] = float(time.perf_counter() - stage_start)
 
-            _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
+            stage_start = time.perf_counter()
+            backtest_artifact_compression = str(getattr(config.training, "backtest_artifact_compression", "none"))
+            _save_backtest_artifact(
+                _backtest_path(fold_dir),
+                test_bt,
+                test_dates,
+                compression=backtest_artifact_compression,
+            )
+            save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
+            save_timing["backtest_artifact_compression"] = backtest_artifact_compression
+            stage_start = time.perf_counter()
             _save_daily_portfolio_returns_csv(
                 fold_dir / "daily_portfolio_returns.csv",
                 test_dates,
@@ -9498,6 +9529,8 @@ def run_training(
                 test_bt.benchmark_returns,
                 test_bt.turnovers,
             )
+            save_timing["daily_returns_csv_s"] = float(time.perf_counter() - stage_start)
+            stage_start = time.perf_counter()
             _maybe_save_daily_weights_table(
                 fold_dir / "daily_weights.csv",
                 test_dates,
@@ -9512,10 +9545,21 @@ def run_training(
                 ),
                 table_output_format=str(getattr(config.training, "table_output_format", "csv")),
             )
+            save_timing["daily_weights_table_s"] = float(time.perf_counter() - stage_start)
+            save_timing["table_output_format"] = str(getattr(config.training, "table_output_format", "csv"))
+            stage_start = time.perf_counter()
             report = generate_annual_report(test_bt, test_dates)
+            save_timing["annual_report_compute_s"] = float(time.perf_counter() - stage_start)
             print("\n" + report)
+            stage_start = time.perf_counter()
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
+            save_timing["annual_report_write_s"] = float(time.perf_counter() - stage_start)
+            save_timing["total_s"] = float(time.perf_counter() - save_start)
+            (fold_dir / "save_timing.json").write_text(
+                json.dumps(save_timing, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
             plot_start = time.perf_counter()
             plot_timing: dict[str, float | str] = {}
@@ -9525,22 +9569,25 @@ def run_training(
                 fn(*args)
                 plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
 
+            def _copy_plot(name: str, source: Path, target: Path) -> None:
+                item_start = time.perf_counter()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
+                plot_timing[f"{name}_copied_from"] = str(source.name)
+
             _time_plot("equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "equity_curve.png")
             _time_plot("equity_curve_log", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log.png")
             _time_plot("annual_performance", plot_annual_performance, test_bt, test_dates, fold_dir / "annual_performance.png")
-            _time_plot("leverage_equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-            _time_plot(
+            _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
+            _copy_plot(
                 "leverage_equity_curve_log",
-                plot_equity_curve_log,
-                test_bt,
-                test_dates,
+                fold_dir / "equity_curve_log.png",
                 fold_dir / "leverage_equity_curve_log.png",
             )
-            _time_plot(
+            _copy_plot(
                 "leverage_annual_performance",
-                plot_annual_performance,
-                test_bt,
-                test_dates,
+                fold_dir / "annual_performance.png",
                 fold_dir / "leverage_annual_performance.png",
             )
             audit_start = time.perf_counter()
@@ -9565,6 +9612,7 @@ def run_training(
                     )
                 ),
                 table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+                backtest_artifact_compression=backtest_artifact_compression,
             )
             plot_timing["integer_share_audit_s"] = float(time.perf_counter() - audit_start)
             for key, value in integer_audit_timing.items():
@@ -9581,7 +9629,9 @@ def run_training(
                 encoding="utf-8",
             )
 
+            refresh_start = time.perf_counter()
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+            plot_timing["walkforward_refresh_s"] = float(time.perf_counter() - refresh_start)
             explain_start = time.perf_counter()
             explain_path = _run_fold_explainability(
                 model=model,
@@ -9591,6 +9641,12 @@ def run_training(
                 fold=fold,
                 device=device,
                 checkpoint_path=best_checkpoint_path,
+            )
+            plot_timing["explainability_total_s"] = float(time.perf_counter() - explain_start)
+            plot_timing["post_plot_total_s"] = float(time.perf_counter() - plot_start)
+            (fold_dir / "plot_timing.json").write_text(
+                json.dumps(plot_timing, indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
             if explain_path is not None:
                 print(f"[Fold {fold.fold_id}] explainability output: {explain_path}")

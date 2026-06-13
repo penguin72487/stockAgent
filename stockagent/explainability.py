@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -2030,16 +2030,28 @@ def _plot_all_paper_figures(
     summary: dict[str, Any],
     metadata: dict[str, Any],
     paper_tables: dict[str, str],
+    plot_timing: dict[str, float] | None = None,
 ) -> list[str]:
     plot_dir = output_dir / "plots_paper"
     plot_dir.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
     scope = _paper_scope(metadata, summary)
+
+    def _time_plot(name: str, fn: Callable[[], None], out_path: Path) -> None:
+        item_start = time.perf_counter()
+        fn()
+        if plot_timing is not None:
+            plot_timing[name] = float(time.perf_counter() - item_start)
+        if out_path.exists():
+            generated.append(out_path)
+
     global_table = _global_attribution_table(frames)
     out = plot_dir / "global_feature_attribution.png"
-    _plot_paper_global_attribution(global_table, out, subtitle=f"Share of total attribution by method; {scope}")
-    if out.exists():
-        generated.append(out)
+    _time_plot(
+        "global_feature_attribution_s",
+        lambda: _plot_paper_global_attribution(global_table, out, subtitle=f"Share of total attribution by method; {scope}"),
+        out,
+    )
     heatmap_specs = [
         (
             "feature_time_gradient",
@@ -2062,44 +2074,58 @@ def _plot_all_paper_figures(
     ]
     for frame_name, value_col, title, subtitle in heatmap_specs:
         out = plot_dir / f"{frame_name}_{value_col}_heatmap.png"
-        _plot_paper_feature_time_heatmap(
-            frames.get(frame_name, pd.DataFrame()),
-            output_path=out,
-            value_col=value_col,
-            title=title,
-            subtitle=f"{subtitle} {scope}",
+        _time_plot(
+            f"{frame_name}_{value_col}_heatmap_s",
+            lambda frame_name=frame_name, value_col=value_col, title=title, subtitle=subtitle, out=out: _plot_paper_feature_time_heatmap(
+                frames.get(frame_name, pd.DataFrame()),
+                output_path=out,
+                value_col=value_col,
+                title=title,
+                subtitle=f"{subtitle} {scope}",
+            ),
+            out,
         )
-        if out.exists():
-            generated.append(out)
     out = plot_dir / "time_importance_gradient.png"
-    _plot_paper_time_importance(
-        frames.get("time_importance_gradient", pd.DataFrame()),
-        output_path=out,
-        value_col="grad_x_input_abs",
-        subtitle=f"Share of gradient × input by lookback day; {scope}",
+    _time_plot(
+        "time_importance_gradient_s",
+        lambda: _plot_paper_time_importance(
+            frames.get("time_importance_gradient", pd.DataFrame()),
+            output_path=out,
+            value_col="grad_x_input_abs",
+            subtitle=f"Share of gradient × input by lookback day; {scope}",
+        ),
+        out,
     )
-    if out.exists():
-        generated.append(out)
     out = plot_dir / "feature_correlations_shortcut_checks.png"
-    _plot_paper_feature_correlations(frames.get("feature_correlations", pd.DataFrame()), output_path=out, subtitle=scope)
-    if out.exists():
-        generated.append(out)
+    _time_plot(
+        "feature_correlations_shortcut_checks_s",
+        lambda: _plot_paper_feature_correlations(frames.get("feature_correlations", pd.DataFrame()), output_path=out, subtitle=scope),
+        out,
+    )
     out = plot_dir / "trust_checks.png"
-    _plot_paper_trust_checks(frames.get("trust_checks", pd.DataFrame()), output_path=out, subtitle=scope)
-    if out.exists():
-        generated.append(out)
+    _time_plot(
+        "trust_checks_s",
+        lambda: _plot_paper_trust_checks(frames.get("trust_checks", pd.DataFrame()), output_path=out, subtitle=scope),
+        out,
+    )
     out = plot_dir / "regime_analysis.png"
-    _plot_paper_regime(frames.get("regime_analysis", pd.DataFrame()), output_path=out, subtitle=scope)
-    if out.exists():
-        generated.append(out)
+    _time_plot(
+        "regime_analysis_s",
+        lambda: _plot_paper_regime(frames.get("regime_analysis", pd.DataFrame()), output_path=out, subtitle=scope),
+        out,
+    )
     out = plot_dir / "decision_case_studies.png"
-    _plot_paper_case_studies(frames.get("decision_case_studies", pd.DataFrame()), output_path=out, subtitle=scope)
-    if out.exists():
-        generated.append(out)
+    _time_plot(
+        "decision_case_studies_s",
+        lambda: _plot_paper_case_studies(frames.get("decision_case_studies", pd.DataFrame()), output_path=out, subtitle=scope),
+        out,
+    )
     out = plot_dir / "aux_token_diagnostics.png"
-    _plot_paper_aux_summary(frames.get("aux_summary", pd.DataFrame()), output_path=out, subtitle=scope)
-    if out.exists():
-        generated.append(out)
+    _time_plot(
+        "aux_token_diagnostics_s",
+        lambda: _plot_paper_aux_summary(frames.get("aux_summary", pd.DataFrame()), output_path=out, subtitle=scope),
+        out,
+    )
     return [str(path.relative_to(output_dir)) for path in generated]
 
 
@@ -2862,7 +2888,7 @@ def write_explanation_outputs(
     plot_theme: str | None = None,
 ) -> None:
     write_start = time.perf_counter()
-    write_timing: dict[str, float] = {}
+    write_timing: dict[str, Any] = {}
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = metadata or {}
     frames: dict[str, pd.DataFrame] = result["frames"]
@@ -2922,19 +2948,25 @@ def write_explanation_outputs(
         _mark_elapsed(write_timing, "paper_tables_s", stage_start)
         if write_plots:
             stage_start = time.perf_counter()
+            paper_plot_details: dict[str, float] = {}
             paper_plots = _plot_all_paper_figures(
                 output_dir,
                 frames=frames,
                 summary=summary,
                 metadata=metadata,
                 paper_tables=paper_tables,
+                plot_timing=paper_plot_details,
             )
             _mark_elapsed(write_timing, "paper_plots_s", stage_start)
+            write_timing["paper_plot_details"] = paper_plot_details
+        else:
+            write_timing["paper_plot_details"] = {}
         summary["paper_tables"] = paper_tables
         summary["paper_plots"] = paper_plots
     else:
         write_timing["paper_tables_s"] = 0.0
         write_timing["paper_plots_s"] = 0.0
+        write_timing["paper_plot_details"] = {}
     stage_start = time.perf_counter()
     _write_markdown_report(
         output_dir / "report.md",

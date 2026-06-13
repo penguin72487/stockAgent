@@ -192,6 +192,12 @@ def parse_args() -> argparse.Namespace:
         help="Override training.table_output_format for large fold detail tables.",
     )
     parser.add_argument(
+        "--backtest-artifact-compression",
+        choices=("none", "compressed"),
+        default=None,
+        help="Override training.backtest_artifact_compression for .npz backtest artifacts.",
+    )
+    parser.add_argument(
         "--defer-epoch-curve-plot-until-end",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -260,6 +266,8 @@ def main() -> None:
         config.training.save_integer_share_holdings_table = bool(args.save_integer_share_detail_tables)
     if args.table_output_format is not None:
         config.training.table_output_format = str(args.table_output_format)
+    if args.backtest_artifact_compression is not None:
+        config.training.backtest_artifact_compression = str(args.backtest_artifact_compression)
     if args.defer_epoch_curve_plot_until_end is not None:
         config.training.defer_epoch_curve_plot_until_end = bool(args.defer_epoch_curve_plot_until_end)
     _configure_cuda_runtime()
