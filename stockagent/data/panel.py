@@ -20,6 +20,16 @@ try:
 except Exception:  # pragma: no cover - optional parquet reader
     pl = None
 
+try:
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional parquet reader
+    pq = None
+
+try:
+    import duckdb
+except Exception:  # pragma: no cover - optional panel backend
+    duckdb = None
+
 from stockagent.data.panel_cache import (
     legacy_panel_cache_path,
     legacy_panel_meta_path,
@@ -155,6 +165,19 @@ class PanelData:
     @property
     def num_symbols(self) -> int:
         return int(self.features.shape[1])
+
+
+@dataclass(slots=True)
+class _SymbolPanelArrays:
+    symbol: str
+    dates: np.ndarray
+    features: np.ndarray
+    returns_1d: np.ndarray
+    close_prices: np.ndarray
+    tradable_mask: np.ndarray
+    can_buy_mask: np.ndarray
+    can_sell_mask: np.ndarray
+    alive_mask: np.ndarray
 
 
 def _symbol_name_from_path(path: Path) -> str:
@@ -404,6 +427,452 @@ def _load_symbol_frame_cudf(path: Path) -> pd.DataFrame:
 
     _ensure_feature_columns(frame, LOG_RETURN_FEATURE_COLUMNS)
     return frame
+
+
+def _coerce_arrow_numeric_column(table, name: str, rows: int) -> np.ndarray:
+    if name not in table.column_names:
+        return np.full(rows, np.nan, dtype=np.float64)
+    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
+    try:
+        return np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError):
+        return pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=np.float64)
+
+
+def _coerce_arrow_datetime_ns_column(table, name: str, rows: int) -> np.ndarray:
+    if name not in table.column_names:
+        return np.full(rows, np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
+    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
+    try:
+        return np.asarray(values, dtype="datetime64[ns]")
+    except (TypeError, ValueError):
+        return pd.to_datetime(pd.Series(values), errors="coerce").to_numpy(dtype="datetime64[ns]")
+
+
+def _shift_array(values: np.ndarray, periods: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    if periods > 0:
+        out[periods:] = arr[:-periods]
+    elif periods < 0:
+        out[:periods] = arr[-periods:]
+    else:
+        out[:] = arr
+    return out
+
+
+def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> _SymbolPanelArrays:
+    if pq is None:
+        raise RuntimeError("PyArrow is not available")
+    if tradable_mode != "tradable":
+        raise RuntimeError("PyArrow panel backend currently supports tradable_mode='tradable' only")
+
+    table = pq.read_table(path)
+    rows = int(table.num_rows)
+    if rows == 0:
+        empty_1d = np.empty((0,), dtype=np.float32)
+        empty_mask = np.empty((0,), dtype=bool)
+        return _SymbolPanelArrays(
+            symbol=_symbol_name_from_path(path),
+            dates=np.empty((0,), dtype="datetime64[ns]"),
+            features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
+            returns_1d=empty_1d,
+            close_prices=empty_1d,
+            tradable_mask=empty_mask,
+            can_buy_mask=empty_mask,
+            can_sell_mask=empty_mask,
+            alive_mask=empty_mask,
+        )
+
+    dates = _coerce_arrow_datetime_ns_column(table, "date", rows)
+    order = np.argsort(dates)
+    dates = dates[order]
+
+    def col(name: str) -> np.ndarray:
+        return _coerce_arrow_numeric_column(table, name, rows)[order]
+
+    price_decimals = _price_decimals_for_path(path)
+    open_px = _round_half_up(col("open"), decimals=price_decimals)
+    high_px = _round_half_up(col("max"), decimals=price_decimals)
+    low_px = _round_half_up(col("min"), decimals=price_decimals)
+    close_px = _round_half_up(col("close"), decimals=price_decimals)
+    adjclose = _round_half_up(col("adjclose"), decimals=price_decimals)
+    volume = col("Trading_Volume")
+
+    spread = np.clip(high_px - low_px, 0.0, None)
+    denom = spread + EPSILON
+    intraday_return_co = _safe_log_ratio(pd.Series(close_px), pd.Series(open_px)).to_numpy(dtype=np.float64)
+    body_ratio = np.abs(close_px - open_px) / denom
+    signed_body_ratio = (close_px - open_px) / denom
+    clv = (close_px - low_px) / denom
+    clv_centered = clv - 0.5
+    upper_shadow = (high_px - np.maximum(open_px, close_px)) / denom
+    lower_shadow = (np.minimum(open_px, close_px) - low_px) / denom
+    shadow_imbalance = upper_shadow - lower_shadow
+    delta_clv = clv - _shift_array(clv, 1)
+    delta_body_ratio = body_ratio - _shift_array(body_ratio, 1)
+
+    return_price = adjclose if "adjclose" in table.column_names else close_px
+    return_1d = _safe_log_ratio(
+        pd.Series(_shift_array(return_price, -1)),
+        pd.Series(return_price),
+    ).to_numpy(dtype=np.float64)
+    open_logret_1d = _safe_log_ratio(pd.Series(open_px), pd.Series(_shift_array(open_px, 1))).to_numpy(dtype=np.float64)
+    max_logret_1d = _safe_log_ratio(pd.Series(high_px), pd.Series(_shift_array(high_px, 1))).to_numpy(dtype=np.float64)
+    min_logret_1d = _safe_log_ratio(pd.Series(low_px), pd.Series(_shift_array(low_px, 1))).to_numpy(dtype=np.float64)
+    close_logret_1d = _safe_log_ratio(pd.Series(close_px), pd.Series(_shift_array(close_px, 1))).to_numpy(dtype=np.float64)
+    trading_volume_logret_1d = _safe_log_ratio(
+        pd.Series(volume),
+        pd.Series(_shift_array(volume, 1)),
+    ).to_numpy(dtype=np.float64)
+    signed_vol = np.sign(intraday_return_co) * trading_volume_logret_1d
+
+    if "Trading_Volume" not in table.column_names:
+        _warn_missing_trading_volume(path)
+        trading_volume_logret_1d[:] = np.nan
+        signed_vol[:] = np.nan
+
+    feature_map = {
+        "open_logret_1d": open_logret_1d,
+        "max_logret_1d": max_logret_1d,
+        "min_logret_1d": min_logret_1d,
+        "close_logret_1d": close_logret_1d,
+        "trading_volume_logret_1d": trading_volume_logret_1d,
+        "signed_vol": signed_vol,
+        "body_ratio": body_ratio,
+        "signed_body_ratio": signed_body_ratio,
+        "delta_body_ratio": delta_body_ratio,
+        "clv": clv,
+        "clv_centered": clv_centered,
+        "delta_clv": delta_clv,
+        "upper_shadow": upper_shadow,
+        "lower_shadow": lower_shadow,
+        "shadow_imbalance": shadow_imbalance,
+    }
+    features = np.column_stack([feature_map[name] for name in LOG_RETURN_FEATURE_COLUMNS]).astype(np.float32, copy=False)
+
+    close_notna = ~np.isnan(close_px)
+    if "Trading_Volume" in table.column_names:
+        volume_missing = np.isnan(volume)
+        tradable = close_notna & ((np.nan_to_num(volume, nan=0.0) > 0.0) | volume_missing)
+    else:
+        tradable = close_notna
+
+    valid_dates = ~np.isnat(dates)
+    if not bool(valid_dates.all()):
+        dates = dates[valid_dates]
+        features = features[valid_dates]
+        return_1d = return_1d[valid_dates]
+        close_px = close_px[valid_dates]
+        tradable = tradable[valid_dates]
+        close_notna = close_notna[valid_dates]
+
+    tradable = np.asarray(tradable, dtype=bool)
+    return _SymbolPanelArrays(
+        symbol=_symbol_name_from_path(path),
+        dates=dates,
+        features=features,
+        returns_1d=return_1d.astype(np.float32, copy=False),
+        close_prices=close_px.astype(np.float32, copy=False),
+        tradable_mask=tradable,
+        can_buy_mask=tradable.copy(),
+        can_sell_mask=tradable.copy(),
+        alive_mask=np.asarray(close_notna, dtype=bool),
+    )
+
+
+def _build_panel_from_symbol_arrays(
+    symbol_arrays: list[_SymbolPanelArrays],
+    benchmark_name: str = "universe_average_return",
+) -> PanelData:
+    if not symbol_arrays:
+        raise RuntimeError("No valid parquet files could be loaded.")
+
+    symbols = [item.symbol for item in symbol_arrays]
+    dated_items = [item.dates for item in symbol_arrays if item.dates.size]
+    if not dated_items:
+        raise RuntimeError("No valid dated rows could be loaded.")
+    all_dates = np.unique(np.concatenate(dated_items))
+    all_dates.sort()
+    num_dates = int(all_dates.size)
+    num_symbols = len(symbol_arrays)
+    num_features = len(LOG_RETURN_FEATURE_COLUMNS)
+
+    features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
+    returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    can_buy_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+
+    for sym_idx, item in enumerate(symbol_arrays):
+        if item.dates.size == 0:
+            continue
+        row_idx = np.searchsorted(all_dates, item.dates)
+        valid = (row_idx >= 0) & (row_idx < num_dates) & (all_dates[row_idx] == item.dates)
+        if not bool(valid.all()):
+            row_idx = row_idx[valid]
+        features[row_idx, sym_idx, :] = item.features[valid]
+        returns_1d[row_idx, sym_idx] = item.returns_1d[valid]
+        close_prices[row_idx, sym_idx] = item.close_prices[valid]
+        tradable_mask[row_idx, sym_idx] = item.tradable_mask[valid]
+        can_buy_mask[row_idx, sym_idx] = item.can_buy_mask[valid]
+        can_sell_mask[row_idx, sym_idx] = item.can_sell_mask[valid]
+        alive_mask[row_idx, sym_idx] = item.alive_mask[valid]
+
+    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
+    if benchmark_symbol_index is None:
+        valid_returns = np.isfinite(returns_1d)
+        n_valid = valid_returns.sum(axis=1)
+        sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
+        benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
+        np.divide(sum_ret, n_valid, out=benchmark_returns, where=n_valid > 0)
+    else:
+        benchmark_returns = np.nan_to_num(
+            returns_1d[:, benchmark_symbol_index],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
+
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    return PanelData(
+        dates=np.asarray(all_dates, dtype="datetime64[ns]"),
+        symbols=symbols,
+        feature_names=list(LOG_RETURN_FEATURE_COLUMNS),
+        features=features,
+        returns_1d=returns_1d,
+        tradable_mask=tradable_mask,
+        can_buy_mask=can_buy_mask,
+        can_sell_mask=can_sell_mask,
+        alive_mask=alive_mask,
+        benchmark_returns=benchmark_returns,
+        close_prices=close_prices,
+    )
+
+
+def _duckdb_quote(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _duckdb_column_or_null(schema_names: set[str], name: str) -> str:
+    if name in schema_names:
+        return f"try_cast({_duckdb_quote(name)} AS DOUBLE)"
+    return "NULL::DOUBLE"
+
+
+def _duckdb_safe_log(num: str, den: str) -> str:
+    return f"CASE WHEN {num} > 0.0 AND {den} > 0.0 THEN ln({num} / {den}) ELSE NULL END"
+
+
+def _duckdb_union_schema_names(paths: list[Path]) -> set[str]:
+    if pq is None:
+        raise RuntimeError("DuckDB panel backend requires pyarrow for parquet schema inspection")
+    names: set[str] = set()
+    for path in paths:
+        names.update(pq.read_schema(path).names)
+    return names
+
+
+def _duckdb_arrow_column(table, name: str, dtype) -> np.ndarray:
+    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
+    return np.asarray(values, dtype=dtype)
+
+
+def _build_panel_from_duckdb(
+    parquet_root: Path,
+    parquet_paths: list[Path],
+    *,
+    benchmark_name: str,
+    panel_load_workers: int,
+) -> PanelData:
+    if duckdb is None:
+        raise RuntimeError("data.panel_backend='duckdb' requires the duckdb package")
+    if pq is None:
+        raise RuntimeError("data.panel_backend='duckdb' requires the pyarrow package")
+
+    symbols = [_symbol_name_from_path(path) for path in parquet_paths]
+    symbol_map = pd.DataFrame(
+        {
+            "symbol": symbols,
+            "symbol_idx": np.arange(len(symbols), dtype=np.int32),
+        }
+    )
+    schema_names = _duckdb_union_schema_names(parquet_paths)
+    decimals_by_path = {_price_decimals_for_path(path) for path in parquet_paths}
+    if len(decimals_by_path) != 1:
+        raise RuntimeError("DuckDB panel backend currently requires one market price precision")
+    decimals = int(next(iter(decimals_by_path)))
+    return_source = "adjclose_px" if "adjclose" in schema_names else "close_px"
+    volume_expr = "volume_px"
+    tradable_expr = (
+        "close_px IS NOT NULL AND (volume_px > 0.0 OR volume_px IS NULL)"
+        if "Trading_Volume" in schema_names
+        else "close_px IS NOT NULL"
+    )
+    pattern = (parquet_root / f"*{FEATURE_FILE_SUFFIX}").as_posix()
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(f"PRAGMA threads={max(1, int(panel_load_workers))}")
+        con.register("symbol_map_df", symbol_map)
+        con.execute("CREATE TEMP TABLE symbol_map AS SELECT * FROM symbol_map_df")
+        con.execute(
+            f"""
+            CREATE TEMP TABLE computed AS
+            WITH raw AS (
+                SELECT
+                    m.symbol_idx,
+                    m.symbol,
+                    CAST(date AS TIMESTAMP) AS date_key,
+                    round({_duckdb_column_or_null(schema_names, "open")}, {decimals}) AS open_px,
+                    round({_duckdb_column_or_null(schema_names, "max")}, {decimals}) AS max_px,
+                    round({_duckdb_column_or_null(schema_names, "min")}, {decimals}) AS min_px,
+                    round({_duckdb_column_or_null(schema_names, "close")}, {decimals}) AS close_px,
+                    round({_duckdb_column_or_null(schema_names, "adjclose")}, {decimals}) AS adjclose_px,
+                    {_duckdb_column_or_null(schema_names, "Trading_Volume")} AS volume_px
+                FROM read_parquet(?, filename=true, union_by_name=true) AS r
+                JOIN symbol_map AS m
+                  ON m.symbol = regexp_extract(r.filename, '([^/\\\\]+)_features\\.parquet$', 1)
+            ),
+            calc1 AS (
+                SELECT
+                    *,
+                    CASE
+                        WHEN max_px IS NULL OR min_px IS NULL THEN NULL
+                        ELSE greatest(max_px - min_px, 0.0) + {EPSILON}
+                    END AS denom,
+                    {_duckdb_safe_log("close_px", "open_px")} AS intraday_return_co
+                FROM raw
+                WHERE date_key IS NOT NULL
+            ),
+            calc2 AS (
+                SELECT
+                    *,
+                    abs(close_px - open_px) / denom AS body_ratio,
+                    (close_px - open_px) / denom AS signed_body_ratio,
+                    (close_px - min_px) / denom AS clv,
+                    (max_px - greatest(open_px, close_px)) / denom AS upper_shadow,
+                    (least(open_px, close_px) - min_px) / denom AS lower_shadow,
+                    {_duckdb_safe_log(f"lead({return_source}) OVER (PARTITION BY symbol_idx ORDER BY date_key)", return_source)} AS return_1d,
+                    {_duckdb_safe_log("open_px", "lag(open_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS open_logret_1d,
+                    {_duckdb_safe_log("max_px", "lag(max_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS max_logret_1d,
+                    {_duckdb_safe_log("min_px", "lag(min_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS min_logret_1d,
+                    {_duckdb_safe_log("close_px", "lag(close_px) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS close_logret_1d,
+                    {_duckdb_safe_log(volume_expr, f"lag({volume_expr}) OVER (PARTITION BY symbol_idx ORDER BY date_key)")} AS trading_volume_logret_1d,
+                    {tradable_expr} AS tradable,
+                    close_px IS NOT NULL AS alive
+                FROM calc1
+            ),
+            calc3 AS (
+                SELECT
+                    symbol_idx,
+                    symbol,
+                    date_key,
+                    close_px,
+                    return_1d,
+                    tradable,
+                    alive,
+                    open_logret_1d,
+                    max_logret_1d,
+                    min_logret_1d,
+                    close_logret_1d,
+                    trading_volume_logret_1d,
+                    sign(intraday_return_co) * trading_volume_logret_1d AS signed_vol,
+                    body_ratio,
+                    signed_body_ratio,
+                    body_ratio - lag(body_ratio) OVER (PARTITION BY symbol_idx ORDER BY date_key) AS delta_body_ratio,
+                    clv,
+                    clv - 0.5 AS clv_centered,
+                    clv - lag(clv) OVER (PARTITION BY symbol_idx ORDER BY date_key) AS delta_clv,
+                    upper_shadow,
+                    lower_shadow,
+                    upper_shadow - lower_shadow AS shadow_imbalance
+                FROM calc2
+            )
+            SELECT * FROM calc3
+            """,
+            [pattern],
+        )
+        con.execute(
+            """
+            CREATE TEMP TABLE date_map AS
+            SELECT date_key, row_number() OVER (ORDER BY date_key) - 1 AS date_idx
+            FROM (SELECT DISTINCT date_key FROM computed)
+            """
+        )
+        dates_table = con.execute("SELECT date_key FROM date_map ORDER BY date_idx").to_arrow_table()
+        dates = _duckdb_arrow_column(dates_table, "date_key", "datetime64[ns]")
+        num_dates = int(dates.size)
+        num_symbols = len(symbols)
+        num_features = len(LOG_RETURN_FEATURE_COLUMNS)
+        features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
+        returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+        close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+        tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+        alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+
+        select_cols = ", ".join(
+            [
+                "dm.date_idx",
+                "c.symbol_idx",
+                "c.return_1d",
+                "c.close_px",
+                "c.tradable",
+                "c.alive",
+                *[f"c.{name}" for name in LOG_RETURN_FEATURE_COLUMNS],
+            ]
+        )
+        final_table = con.execute(
+            f"""
+            SELECT {select_cols}
+            FROM computed AS c
+            JOIN date_map AS dm USING (date_key)
+            ORDER BY c.symbol_idx, dm.date_idx
+            """
+        ).to_arrow_table()
+    finally:
+        con.close()
+
+    row_idx = _duckdb_arrow_column(final_table, "date_idx", np.int64)
+    sym_idx = _duckdb_arrow_column(final_table, "symbol_idx", np.int64)
+    returns_1d[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "return_1d", np.float32)
+    close_prices[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "close_px", np.float32)
+    tradable_mask[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "tradable", bool)
+    alive_mask[row_idx, sym_idx] = _duckdb_arrow_column(final_table, "alive", bool)
+    for feat_idx, name in enumerate(LOG_RETURN_FEATURE_COLUMNS):
+        features[row_idx, sym_idx, feat_idx] = _duckdb_arrow_column(final_table, name, np.float32)
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
+    if benchmark_symbol_index is None:
+        valid_returns = np.isfinite(returns_1d)
+        n_valid = valid_returns.sum(axis=1)
+        sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
+        benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
+        np.divide(sum_ret, n_valid, out=benchmark_returns, where=n_valid > 0)
+    else:
+        benchmark_returns = np.nan_to_num(
+            returns_1d[:, benchmark_symbol_index],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
+
+    return PanelData(
+        dates=np.asarray(dates, dtype="datetime64[ns]"),
+        symbols=symbols,
+        feature_names=list(LOG_RETURN_FEATURE_COLUMNS),
+        features=features,
+        returns_1d=returns_1d,
+        tradable_mask=tradable_mask,
+        can_buy_mask=tradable_mask.copy(),
+        can_sell_mask=tradable_mask.copy(),
+        alive_mask=alive_mask,
+        benchmark_returns=benchmark_returns,
+        close_prices=close_prices,
+    )
 
 
 def _resolve_benchmark_index(symbols: list[str], benchmark_name: str) -> int | None:
@@ -679,7 +1148,7 @@ def build_panel(
             raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
 
     panel_backend = str(panel_backend).strip().lower()
-    valid_backends = {"auto", "pandas", "polars"}
+    valid_backends = {"auto", "pandas", "polars", "pyarrow", "duckdb"}
     if panel_backend not in valid_backends:
         raise ValueError(f"panel_backend must be one of {sorted(valid_backends)}, got {panel_backend!r}")
     panel_load_workers = max(0, int(panel_load_workers))
@@ -702,14 +1171,32 @@ def build_panel(
 
     if use_cudf:
         selected_backend = "cudf"
+    elif panel_backend == "duckdb":
+        if duckdb is None:
+            raise RuntimeError("data.panel_backend='duckdb' requires the duckdb package")
+        selected_backend = "duckdb"
+    elif panel_backend == "pyarrow":
+        if pq is None:
+            raise RuntimeError("data.panel_backend='pyarrow' requires the pyarrow package")
+        selected_backend = "pyarrow"
     elif panel_backend == "polars":
         if pl is None:
             raise RuntimeError("data.panel_backend='polars' requires the polars package")
         selected_backend = "polars"
+    elif panel_backend == "auto" and duckdb is not None and pq is not None and tradable_mode == "tradable":
+        selected_backend = "duckdb"
+    elif panel_backend == "auto" and pq is not None and tradable_mode == "tradable":
+        selected_backend = "pyarrow"
     elif panel_backend == "auto" and pl is not None:
         selected_backend = "polars"
     else:
         selected_backend = "pandas"
+    if selected_backend in {"duckdb", "pyarrow"} and tradable_mode != "tradable":
+        if panel_backend in {"duckdb", "pyarrow"}:
+            raise RuntimeError(
+                f"data.panel_backend={panel_backend!r} currently requires data.tradable_mode='tradable'"
+            )
+        selected_backend = "polars" if pl is not None else "pandas"
 
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
@@ -726,6 +1213,47 @@ def build_panel(
         f"[panel] building from {len(parquet_paths)} parquet files "
         f"(backend={selected_backend}, workers={panel_load_workers})..."
     )
+    if selected_backend == "duckdb":
+        panel = _build_panel_from_duckdb(
+            parquet_root,
+            parquet_paths,
+            benchmark_name=benchmark_name,
+            panel_load_workers=panel_load_workers,
+        )
+        _save_panel_cache(parquet_root, panel, source_hash, backend_key)
+        print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
+        _print_feature_overview(panel)
+        return panel
+
+    if selected_backend == "pyarrow":
+        def _load_one_pyarrow(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
+            try:
+                arrays = _load_symbol_arrays_pyarrow(path, tradable_mode=tradable_mode)
+                if int(arrays.dates.size) == 0:
+                    raise ValueError(f"Symbol file is empty: {path.name}")
+                return path, arrays, None
+            except Exception as exc:
+                return path, None, exc
+
+        if panel_load_workers > 1 and len(parquet_paths) > 1:
+            with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
+                loaded_pyarrow = list(executor.map(_load_one_pyarrow, parquet_paths))
+        else:
+            loaded_pyarrow = [_load_one_pyarrow(path) for path in parquet_paths]
+
+        valid_arrays: list[_SymbolPanelArrays] = []
+        for path, arrays, exc in loaded_pyarrow:
+            if exc is not None:
+                print(f"[panel] SKIP {path.name}: {exc}")
+                continue
+            if arrays is not None:
+                valid_arrays.append(arrays)
+        panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
+        _save_panel_cache(parquet_root, panel, source_hash, backend_key)
+        print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
+        _print_feature_overview(panel)
+        return panel
+
     if use_cudf:
         try:
             symbol_frames_cudf: list[pd.DataFrame] = []

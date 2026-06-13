@@ -55,6 +55,37 @@ Implementation expectations:
   - loss/backtest accumulation and numerically sensitive finance metrics
 - Do not force the entire pipeline to permanent BF16 storage just to satisfy "BF16"; use AMP for compute and keep sensitive reductions stable.
 
+## Data Panel Backend Contract
+
+The full US Yahoo universe is a distinct data-processing regime. Benchmark it
+with the actual full parquet directory instead of small synthetic subsets when
+choosing defaults.
+
+Rules:
+
+- `scripts/benchmark_data_backends.py` is the reproducible scanner/benchmark for
+  data-processing hotspots across pandas, Polars, DuckDB, PyArrow, and cuDF.
+- Do not skip DuckDB `panel_build`; it is an allowed dense panel backend for the
+  `tradable` path.
+- For full US daily parquet (`16811` files, `S≈16811`) with
+  `tradable_mode: tradable`, cold runtime `build_panel(... panel_backend="auto")`
+  should select DuckDB when `duckdb` and `pyarrow` are installed.
+- Foreground full-US runtime result after the DuckDB backend change:
+  `build_panel` built a `6651 x 16811 x 15` panel in `52.05s`, max RSS about
+  `30.1GB`, and cache reload was `0.267s`.
+- Foreground full-US benchmark result for `panel_build`: DuckDB `62.10s` versus
+  PyArrow `215.55s`, with matching checksums. Earlier full all-backend artifact
+  measured pandas `441.74s`, Polars `420.53s`, and cuDF `454.41s` for the same
+  workload class.
+- Wide full-US daily weight parquet output (`512 x 16811`) should prefer Polars:
+  foreground benchmark measured Polars `0.457s`, PyArrow `0.739s`, pandas
+  `1.50s`, DuckDB `2.63s`, and cuDF `45.88s`; keep pandas as fallback for
+  optional dependency failures.
+- Feature-prep proxy benchmarks can favor PyArrow because they read only a few
+  columns per symbol, but end-to-end dense panel construction favors DuckDB
+  because it pushes union, calendar alignment, feature expressions, and ordering
+  into one SQL pipeline instead of materializing per-file Python frames.
+
 ## Current Main Model Contract
 
 The active model is `transformer_base_portfolio`.
