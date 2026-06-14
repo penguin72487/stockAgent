@@ -313,6 +313,30 @@ def _frame_to_dict(frame: pl.DataFrame) -> dict[str, list[Any]]:
     return frame.to_dict(as_series=False)
 
 
+def _to_plot_data(frame: pl.DataFrame) -> dict[str, list[Any]]:
+    return frame.to_dict(as_series=False)
+
+
+def _string_list(frame: pl.DataFrame, column: str) -> list[str]:
+    if column not in frame.columns:
+        return []
+    return [str(value) for value in frame.get_column(column).to_list()]
+
+
+def _top_values_by_sum(frame: pl.DataFrame, group_col: str, value_col: str, limit: int) -> list[Any]:
+    if _is_empty_frame(frame) or group_col not in frame.columns or value_col not in frame.columns:
+        return []
+    grouped = (
+        _with_numeric(frame, value_col)
+        .drop_nulls(subset=[group_col, value_col])
+        .group_by(group_col)
+        .agg(pl.col(value_col).sum().alias("__sum"))
+        .sort("__sum", descending=True)
+        .head(limit)
+    )
+    return grouped.get_column(group_col).to_list() if not grouped.is_empty() else []
+
+
 def _render_table_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
     if _is_empty_frame(frame):
         return "_No rows._"
@@ -333,6 +357,38 @@ def _render_table_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
     separator = "| " + " | ".join("---" for _ in columns) + " |"
     body = ["| " + " | ".join(fmt(row.get(column)) for column in columns) + " |" for row in rows]
     return "\n".join([header, separator, *body])
+
+
+def _pivot_sum_matrix(
+    frame: pl.DataFrame,
+    *,
+    index_col: str,
+    column_col: str,
+    value_col: str,
+    index_order: list[Any] | None = None,
+    column_order: list[Any] | None = None,
+) -> tuple[list[Any], list[Any], np.ndarray]:
+    if _is_empty_frame(frame) or not {index_col, column_col, value_col}.issubset(frame.columns):
+        return [], [], np.zeros((0, 0), dtype=np.float64)
+    grouped = (
+        _with_numeric(frame, value_col)
+        .drop_nulls(subset=[index_col, column_col, value_col])
+        .group_by([index_col, column_col])
+        .agg(pl.col(value_col).sum().alias(value_col))
+    )
+    if grouped.is_empty():
+        return [], [], np.zeros((0, 0), dtype=np.float64)
+    index_values = index_order if index_order is not None else grouped.get_column(index_col).unique(maintain_order=True).to_list()
+    column_values = column_order if column_order is not None else sorted(grouped.get_column(column_col).unique().to_list())
+    index_pos = {str(value): idx for idx, value in enumerate(index_values)}
+    column_pos = {str(value): idx for idx, value in enumerate(column_values)}
+    matrix = np.zeros((len(index_values), len(column_values)), dtype=np.float64)
+    for row in grouped.to_dicts():
+        i = index_pos.get(str(row.get(index_col)))
+        j = column_pos.get(str(row.get(column_col)))
+        if i is not None and j is not None:
+            matrix[i, j] += _safe_float(row.get(value_col))
+    return index_values, column_values, matrix
 
 
 def _use_datashader_for_explainability(plot_backend: str, *, estimated_points: int = 0) -> bool:
@@ -621,24 +677,30 @@ def _feature_time_frame(
     return pl.DataFrame(rows)
 
 
+
 def _feature_summary_frame(feature_time: pl.DataFrame, metric_name: str) -> pl.DataFrame:
-    if feature_time.empty:
-        return pl.DataFrame(columns=["feature", "feature_group", "feature_label", metric_name, "share"])
-    summary = feature_time.groupby("feature", as_index=False)[metric_name].sum()
-    summary["feature_group"] = summary["feature"].map(_feature_group)
-    summary["feature_label"] = summary["feature"].map(_feature_label)
-    total = float(summary[metric_name].sum())
-    summary["share"] = summary[metric_name] / total if total > 0.0 else 0.0
-    return summary.sort_values(metric_name, ascending=False)
+    if _is_empty_frame(feature_time):
+        return _empty_frame(["feature", "feature_group", "feature_label", metric_name, "share"])
+    summary = feature_time.group_by("feature").agg(
+        _numeric_expr(metric_name).fill_null(0.0).sum().alias(metric_name)
+    )
+    summary = _with_feature_labels(summary)
+    total = _numeric_sum(summary, metric_name)
+    share_expr = (pl.col(metric_name) / total) if total > 0.0 else pl.lit(0.0)
+    return summary.with_columns(share_expr.alias("share")).sort(metric_name, descending=True)
+
 
 
 def _time_summary_frame(feature_time: pl.DataFrame, metric_name: str) -> pl.DataFrame:
-    if feature_time.empty:
-        return pl.DataFrame(columns=["lookback_index", "lookback_from_end", metric_name, "share"])
-    summary = feature_time.groupby(["lookback_index", "lookback_from_end"], as_index=False)[metric_name].sum()
-    total = float(summary[metric_name].sum())
-    summary["share"] = summary[metric_name] / total if total > 0.0 else 0.0
-    return summary.sort_values("lookback_index")
+    if _is_empty_frame(feature_time):
+        return _empty_frame(["lookback_index", "lookback_from_end", metric_name, "share"])
+    summary = feature_time.group_by(["lookback_index", "lookback_from_end"]).agg(
+        _numeric_expr(metric_name).fill_null(0.0).sum().alias(metric_name)
+    )
+    total = _numeric_sum(summary, metric_name)
+    share_expr = (pl.col(metric_name) / total) if total > 0.0 else pl.lit(0.0)
+    return summary.with_columns(share_expr.alias("share")).sort("lookback_index")
+
 
 
 def _perturbation_importance(
@@ -727,15 +789,20 @@ def _perturbation_importance(
                 )
             start += repeats
     frame = pl.DataFrame(rows)
-    if frame.empty:
+    if frame.is_empty():
         return frame, pl.DataFrame(), diagnostics
-    summary = frame.groupby("feature", as_index=False)[["weight_abs_delta", "score_abs_delta"]].sum()
-    summary["feature_group"] = summary["feature"].map(_feature_group)
-    summary["feature_label"] = summary["feature"].map(_feature_label)
-    total = float(summary["weight_abs_delta"].sum())
-    summary["weight_delta_share"] = summary["weight_abs_delta"] / total if total > 0.0 else 0.0
-    summary = summary.sort_values("weight_abs_delta", ascending=False)
+    summary = frame.group_by("feature").agg(
+        [
+            _numeric_expr("weight_abs_delta").fill_null(0.0).sum().alias("weight_abs_delta"),
+            _numeric_expr("score_abs_delta").fill_null(0.0).sum().alias("score_abs_delta"),
+        ]
+    )
+    summary = _with_feature_labels(summary)
+    total = _numeric_sum(summary, "weight_abs_delta")
+    share_expr = (pl.col("weight_abs_delta") / total) if total > 0.0 else pl.lit(0.0)
+    summary = summary.with_columns(share_expr.alias("weight_delta_share")).sort("weight_abs_delta", descending=True)
     return frame, summary, diagnostics
+
 
 
 def _feature_correlations(
@@ -774,7 +841,9 @@ def _feature_correlations(
                     "abs_weight_corr": abs(weight_corr),
                 }
             )
-    return pl.DataFrame(rows).sort_values(["abs_score_corr", "abs_weight_corr"], ascending=False)
+    frame = pl.DataFrame(rows)
+    return frame.sort(["abs_score_corr", "abs_weight_corr"], descending=[True, True]) if not frame.is_empty() else frame
+
 
 
 def _decision_rows(
@@ -813,6 +882,7 @@ def _decision_rows(
                 }
             )
     return pl.DataFrame(rows)
+
 
 
 def _portfolio_summary(weights: torch.Tensor, returns: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
@@ -868,14 +938,19 @@ def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pl.DataFrame, dict[str, 
         if tensor.ndim >= 3:
             by_dim = abs_tensor.reshape(-1, tensor.shape[-1]).mean(dim=0).cpu().numpy()
             total = float(by_dim.sum())
-            dim_frames[name] = pl.DataFrame(
+            dim_frame = pl.DataFrame(
                 {
                     "dim": np.arange(by_dim.shape[0], dtype=np.int64),
                     "mean_abs": by_dim,
                     "share": by_dim / total if total > 0.0 else np.zeros_like(by_dim),
                 }
-            ).sort_values("mean_abs", ascending=False)
-    return pl.DataFrame(rows).sort_values("mean_abs", ascending=False), dim_frames
+            )
+            dim_frames[name] = dim_frame.sort("mean_abs", descending=True)
+    summary = pl.DataFrame(rows)
+    if not summary.is_empty() and "mean_abs" in summary.columns:
+        summary = summary.sort("mean_abs", descending=True)
+    return summary, dim_frames
+
 
 
 def _aux_point_metadata(
@@ -1030,14 +1105,17 @@ def _aux_umap_projection_frames(
             symbols=symbols,
             dates=dates,
         )
-        frame = pl.DataFrame(meta)
-        frame["umap_x"] = embedding_cpu[:, 0].astype(np.float32, copy=False)
-        frame["umap_y"] = embedding_cpu[:, 1].astype(np.float32, copy=False)
-        frame["sampled_points"] = int(sample_idx_cpu.size)
-        frame["original_points"] = int(n_points)
+        frame = pl.DataFrame(meta).with_columns(
+            [
+                pl.Series("umap_x", embedding_cpu[:, 0].astype(np.float32, copy=False)),
+                pl.Series("umap_y", embedding_cpu[:, 1].astype(np.float32, copy=False)),
+                pl.lit(int(sample_idx_cpu.size)).alias("sampled_points"),
+                pl.lit(int(n_points)).alias("original_points"),
+            ]
+        )
         projection_frames[name] = frame
-        x_std = float(np.nanstd(frame["umap_x"].to_numpy(dtype=np.float64)))
-        y_std = float(np.nanstd(frame["umap_y"].to_numpy(dtype=np.float64)))
+        x_std = float(np.nanstd(_numeric_numpy(frame, "umap_x")))
+        y_std = float(np.nanstd(_numeric_numpy(frame, "umap_y")))
         summaries.append(
             {
                 "name": name,
@@ -1086,7 +1164,8 @@ def _stock_contribution_frame(
             "active_count": active_count.cpu().numpy().astype(np.int64, copy=False),
         }
     )
-    return frame.sort_values("mean_abs_weight", ascending=False)
+    return frame.sort("mean_abs_weight", descending=True)
+
 
 
 def _make_warnings(
@@ -1105,29 +1184,32 @@ def _make_warnings(
         warnings.append("At least one day has a very concentrated single-symbol weight.")
     if portfolio.get("mean_turnover_proxy", 0.0) > 1.5:
         warnings.append("Turnover proxy is high; strategy may be relying on unstable daily flips.")
-    if not feature_summary.empty and float(feature_summary.iloc[0].get("share", 0.0)) > 0.55:
-        warnings.append(
-            f"Feature attribution is dominated by one feature: {feature_summary.iloc[0]['feature']}."
-        )
-    if not time_summary.empty and float(time_summary.iloc[0].get("share", 0.0)) > 0.70:
-        warnings.append("Attribution is dominated by a single lookback day.")
-    if not corr.empty:
-        row = corr.iloc[0]
-        if max(float(row["abs_score_corr"]), float(row["abs_weight_corr"])) > 0.75:
+    if not _is_empty_frame(feature_summary):
+        row = _first_row(feature_summary)
+        if _safe_float(row.get("share", 0.0)) > 0.55:
+            warnings.append(f"Feature attribution is dominated by one feature: {row.get('feature')}.")
+    if not _is_empty_frame(time_summary):
+        row = _first_row(time_summary)
+        if _safe_float(row.get("share", 0.0)) > 0.70:
+            warnings.append("Attribution is dominated by a single lookback day.")
+    if not _is_empty_frame(corr):
+        row = _first_row(corr)
+        if max(_safe_float(row.get("abs_score_corr")), _safe_float(row.get("abs_weight_corr"))) > 0.75:
             warnings.append(
-                f"Strong simple correlation detected: {row['source']}:{row['feature']} "
-                f"(score_corr={row['score_corr']:.3f}, weight_corr={row['weight_corr']:.3f})."
+                f"Strong simple correlation detected: {row.get('source')}:{row.get('feature')} "
+                f"(score_corr={_safe_float(row.get('score_corr')):.3f}, weight_corr={_safe_float(row.get('weight_corr')):.3f})."
             )
-    if not aux_summary.empty:
-        collapsed = aux_summary[aux_summary["zero_fraction"] > 0.95]
-        if not collapsed.empty:
+    if not _is_empty_frame(aux_summary) and "zero_fraction" in aux_summary.columns:
+        collapsed = aux_summary.filter(_numeric_expr("zero_fraction") > 0.95)
+        if not collapsed.is_empty() and "name" in collapsed.columns:
             warnings.append(
                 "Some auxiliary representations are near-zero/collapsed: "
-                + ", ".join(collapsed["name"].astype(str).head(5).tolist())
+                + ", ".join(collapsed.get_column("name").cast(pl.String).head(5).to_list())
             )
     if not warnings:
         warnings.append("No rule-of-thumb anomaly was triggered; inspect tables before trusting the strategy.")
     return warnings
+
 
 
 def _daily_portfolio_frame(
@@ -1169,112 +1251,132 @@ def _daily_portfolio_frame(
     return pl.DataFrame(rows)
 
 
+
 def _regime_analysis_frame(daily: pl.DataFrame) -> pl.DataFrame:
     required = {"market_log_return", "strategy_log_return", "turnover_proxy", "gross_exposure", "net_exposure"}
-    if daily.empty or not required.issubset(daily.columns):
+    if _is_empty_frame(daily) or not required.issubset(daily.columns):
         return pl.DataFrame()
-    data = daily.copy()
-    data["market_direction"] = np.where(
-        data["market_log_return"] > 0.001,
-        "market_up",
-        np.where(data["market_log_return"] < -0.001, "market_down", "market_flat"),
+    data = _with_numeric(daily, *required)
+    data = data.with_columns(
+        pl.when(pl.col("market_log_return") > 0.001)
+        .then(pl.lit("market_up"))
+        .when(pl.col("market_log_return") < -0.001)
+        .then(pl.lit("market_down"))
+        .otherwise(pl.lit("market_flat"))
+        .alias("market_direction")
     )
-    abs_market = data["market_log_return"].abs()
-    if int(abs_market.notna().sum()) >= 3 and float(abs_market.max()) > float(abs_market.min()):
+    abs_market = np.abs(_numeric_numpy(data, "market_log_return", default=np.nan))
+    valid = abs_market[np.isfinite(abs_market)]
+    if valid.size >= 3 and float(np.max(valid)) > float(np.min(valid)):
+        labels = ["low_abs_market_move", "mid_abs_market_move", "high_abs_market_move"]
         try:
-            data["volatility_bucket"] = pd.qcut(
-                abs_market,
-                q=min(3, int(abs_market.notna().sum())),
-                labels=False,
-                duplicates="drop",
-            ).map({0: "low_abs_market_move", 1: "mid_abs_market_move", 2: "high_abs_market_move"})
+            q = min(3, int(valid.size))
+            edges = np.unique(np.quantile(valid, np.linspace(0.0, 1.0, q + 1)))
+            if edges.size <= 2:
+                bucket_values = ["single_vol_bucket"] * data.height
+            else:
+                bins = np.searchsorted(edges[1:-1], abs_market, side="right")
+                bucket_values = [labels[min(int(idx), len(labels) - 1)] if np.isfinite(value) else "single_vol_bucket" for idx, value in zip(bins, abs_market, strict=False)]
         except ValueError:
-            data["volatility_bucket"] = "single_vol_bucket"
+            bucket_values = ["single_vol_bucket"] * data.height
     else:
-        data["volatility_bucket"] = "single_vol_bucket"
-    rows: list[dict[str, Any]] = []
+        bucket_values = ["single_vol_bucket"] * data.height
+    data = data.with_columns(pl.Series("volatility_bucket", bucket_values))
+    summaries: list[pl.DataFrame] = []
     for dimension in ("market_direction", "volatility_bucket"):
-        for regime, group in data.groupby(dimension, dropna=False):
-            rows.append(
-                {
-                    "dimension": dimension,
-                    "regime": str(regime),
-                    "rows": int(len(group)),
-                    "mean_strategy_log_return": float(group["strategy_log_return"].mean()),
-                    "mean_market_log_return": float(group["market_log_return"].mean()),
-                    "mean_turnover_proxy": float(group["turnover_proxy"].mean()),
-                    "mean_gross_exposure": float(group["gross_exposure"].mean()),
-                    "mean_net_exposure": float(group["net_exposure"].mean()),
-                    "hit_rate": float((group["strategy_log_return"] > 0.0).mean()),
-                }
+        grouped = data.group_by(dimension).agg(
+            [
+                pl.len().alias("rows"),
+                pl.col("strategy_log_return").mean().alias("mean_strategy_log_return"),
+                pl.col("market_log_return").mean().alias("mean_market_log_return"),
+                pl.col("turnover_proxy").mean().alias("mean_turnover_proxy"),
+                pl.col("gross_exposure").mean().alias("mean_gross_exposure"),
+                pl.col("net_exposure").mean().alias("mean_net_exposure"),
+                (pl.col("strategy_log_return") > 0.0).mean().alias("hit_rate"),
+            ]
+        )
+        summaries.append(
+            grouped.with_columns(
+                [
+                    pl.lit(dimension).alias("dimension"),
+                    pl.col(dimension).cast(pl.String).alias("regime"),
+                ]
+            ).select(
+                [
+                    "dimension",
+                    "regime",
+                    "rows",
+                    "mean_strategy_log_return",
+                    "mean_market_log_return",
+                    "mean_turnover_proxy",
+                    "mean_gross_exposure",
+                    "mean_net_exposure",
+                    "hit_rate",
+                ]
             )
-    return pl.DataFrame(rows)
+        )
+    return _concat_frames(summaries)
+
 
 
 def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame, top_k: int) -> pl.DataFrame:
-    if decisions.empty or daily.empty or "date" not in decisions.columns:
+    if _is_empty_frame(decisions) or _is_empty_frame(daily) or "date" not in decisions.columns:
         return pl.DataFrame()
     top_k = max(1, int(top_k))
     selected: list[tuple[str, str]] = []
-    if "strategy_log_return" in daily.columns:
-        best = daily.sort_values("strategy_log_return", ascending=False).head(1)
-        worst = daily.sort_values("strategy_log_return", ascending=True).head(1)
-        if not best.empty:
-            selected.append(("best_strategy_day", str(best.iloc[0]["date"])))
-        if not worst.empty:
-            selected.append(("worst_strategy_day", str(worst.iloc[0]["date"])))
-    if "turnover_proxy" in daily.columns:
-        turnover = daily.sort_values("turnover_proxy", ascending=False).head(1)
-        if not turnover.empty:
-            selected.append(("highest_turnover_day", str(turnover.iloc[0]["date"])))
-    if "gross_exposure" in daily.columns:
-        gross = daily.sort_values("gross_exposure", ascending=False).head(1)
-        if not gross.empty:
-            selected.append(("highest_gross_exposure_day", str(gross.iloc[0]["date"])))
+
+    def add_selected(case_type: str, column: str, *, descending: bool) -> None:
+        if column not in daily.columns or daily.is_empty():
+            return
+        row = _first_row(_with_numeric(daily, column).sort(column, descending=descending).head(1))
+        if row:
+            selected.append((case_type, str(row.get("date"))))
+
+    add_selected("best_strategy_day", "strategy_log_return", descending=True)
+    add_selected("worst_strategy_day", "strategy_log_return", descending=False)
+    add_selected("highest_turnover_day", "turnover_proxy", descending=True)
+    add_selected("highest_gross_exposure_day", "gross_exposure", descending=True)
+
     unique_selected: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for item in selected:
         if item not in seen:
             unique_selected.append(item)
             seen.add(item)
-    rows: list[pl.DataFrame] = []
-    daily_small = daily.set_index("date", drop=False)
+    pieces: list[pl.DataFrame] = []
+    daily_rows = {str(row.get("date")): row for row in daily.to_dicts()}
     for case_type, date in unique_selected:
-        chunk = decisions[decisions["date"].astype(str) == date].copy()
-        if chunk.empty:
+        chunk = decisions.filter(pl.col("date").cast(pl.String) == date)
+        if chunk.is_empty():
             continue
-        chunk["abs_weight"] = pd.to_numeric(chunk.get("weight", 0.0), errors="coerce").abs()
-        chunk = chunk.sort_values("abs_weight", ascending=False).head(top_k)
-        chunk.insert(0, "case_type", case_type)
-        if date in daily_small.index:
-            daily_row = daily_small.loc[date]
-            if isinstance(daily_row, pl.DataFrame):
-                daily_row = daily_row.iloc[0]
+        chunk = _with_numeric(chunk, "weight")
+        chunk = chunk.with_columns(pl.col("weight").abs().alias("abs_weight")).sort("abs_weight", descending=True).head(top_k)
+        chunk = chunk.with_columns(pl.lit(case_type).alias("case_type")).select(["case_type", *[col for col in chunk.columns if col != "case_type"]])
+        daily_row = daily_rows.get(date)
+        if daily_row is not None:
             for col in ("strategy_log_return", "market_log_return", "turnover_proxy", "gross_exposure", "net_exposure"):
-                chunk[f"case_{col}"] = daily_row.get(col)
-        rows.append(chunk)
-    if not rows:
-        return pl.DataFrame()
-    return pd.concat(rows, ignore_index=True)
+                chunk = chunk.with_columns(pl.lit(daily_row.get(col)).alias(f"case_{col}"))
+        pieces.append(chunk)
+    return _concat_frames(pieces)
+
 
 
 def _feature_time_top_cells(frame: pl.DataFrame, metric_name: str, top_n: int = 20) -> pl.DataFrame:
     required = {"feature", "lookback_from_end", metric_name}
-    if frame.empty or not required.issubset(frame.columns):
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
         return pl.DataFrame()
-    data = frame.copy()
-    data[metric_name] = pd.to_numeric(data[metric_name], errors="coerce")
-    data = data.dropna(subset=[metric_name]).sort_values(metric_name, ascending=False).head(top_n)
-    if data.empty:
+    data = _with_numeric(frame, metric_name).drop_nulls(subset=[metric_name]).sort(metric_name, descending=True).head(top_n)
+    if data.is_empty():
         return data
-    total = float(pd.to_numeric(frame[metric_name], errors="coerce").fillna(0.0).sum())
-    data["share"] = data[metric_name] / total if total > 0.0 else 0.0
-    data["lookback_label"] = data["lookback_from_end"].map(_lookback_label)
-    if "feature_group" not in data.columns:
-        data["feature_group"] = data["feature"].map(_feature_group)
-    if "feature_label" not in data.columns:
-        data["feature_label"] = data["feature"].map(_feature_label)
-    return data
+    total = _numeric_sum(frame, metric_name)
+    data = data.with_columns(
+        [
+            ((pl.col(metric_name) / total) if total > 0.0 else pl.lit(0.0)).alias("share"),
+            pl.col("lookback_from_end").map_elements(_lookback_label, return_dtype=pl.String).alias("lookback_label"),
+        ]
+    )
+    return _with_feature_labels(data)
+
 
 
 def _trust_check_frame(
@@ -1287,10 +1389,7 @@ def _trust_check_frame(
     rows: list[dict[str, Any]] = []
 
     def add_check(name: str, value: float, threshold: float, comparator: str, interpretation: str) -> None:
-        if comparator == "<=":
-            passed = value <= threshold
-        else:
-            passed = value >= threshold
+        passed = value <= threshold if comparator == "<=" else value >= threshold
         rows.append(
             {
                 "check": name,
@@ -1302,61 +1401,22 @@ def _trust_check_frame(
             }
         )
 
-    add_check(
-        "untradable_abs_weight_sum",
-        float(portfolio.get("untradable_abs_weight_sum", 0.0)),
-        1e-5,
-        "<=",
-        "Should be zero; non-zero means the mask/tradability logic leaked into actual positions.",
-    )
-    add_check(
-        "max_abs_weight_max",
-        float(portfolio.get("max_abs_weight_max", 0.0)),
-        0.35,
-        "<=",
-        "Large single-name weights can indicate shortcut learning or unstable concentration.",
-    )
-    add_check(
-        "mean_turnover_proxy",
-        float(portfolio.get("mean_turnover_proxy", 0.0)),
-        1.5,
-        "<=",
-        "High turnover makes net performance highly fee-sensitive and less trustworthy.",
-    )
-    if not feature_summary.empty and "share" in feature_summary.columns:
-        add_check(
-            "top_feature_attribution_share",
-            float(feature_summary.iloc[0].get("share", 0.0)),
-            0.55,
-            "<=",
-            "A single dominant feature can be a sign that the model learned a narrow rule.",
-        )
-    if not time_summary.empty and "share" in time_summary.columns:
-        add_check(
-            "top_lookback_day_attribution_share",
-            float(time_summary.sort_values("share", ascending=False).iloc[0].get("share", 0.0)),
-            0.70,
-            "<=",
-            "A single dominant day can mean the temporal model is mostly ignoring the lookback window.",
-        )
-    if not corr.empty and {"abs_score_corr", "abs_weight_corr"}.issubset(corr.columns):
-        corr_max = float(np.nanmax(corr[["abs_score_corr", "abs_weight_corr"]].to_numpy(dtype=np.float64)))
-        add_check(
-            "max_simple_feature_score_weight_corr",
-            corr_max,
-            0.75,
-            "<=",
-            "High raw correlation can reveal price-level, liquidity, or other simple shortcut rules.",
-        )
-    if not aux_summary.empty and "zero_fraction" in aux_summary.columns:
-        add_check(
-            "max_aux_zero_fraction",
-            float(pd.to_numeric(aux_summary["zero_fraction"], errors="coerce").fillna(0.0).max()),
-            0.95,
-            "<=",
-            "Near-zero aux tensors can indicate collapsed latent/market token representations.",
-        )
+    add_check("untradable_abs_weight_sum", float(portfolio.get("untradable_abs_weight_sum", 0.0)), 1e-5, "<=", "Should be zero; non-zero means the mask/tradability logic leaked into actual positions.")
+    add_check("max_abs_weight_max", float(portfolio.get("max_abs_weight_max", 0.0)), 0.35, "<=", "Large single-name weights can indicate shortcut learning or unstable concentration.")
+    add_check("mean_turnover_proxy", float(portfolio.get("mean_turnover_proxy", 0.0)), 1.5, "<=", "High turnover makes net performance highly fee-sensitive and less trustworthy.")
+    if not _is_empty_frame(feature_summary) and "share" in feature_summary.columns:
+        add_check("top_feature_attribution_share", _safe_float(_first_row(feature_summary).get("share", 0.0)), 0.55, "<=", "A single dominant feature can be a sign that the model learned a narrow rule.")
+    if not _is_empty_frame(time_summary) and "share" in time_summary.columns:
+        row = _first_row(time_summary.sort("share", descending=True))
+        add_check("top_lookback_day_attribution_share", _safe_float(row.get("share", 0.0)), 0.70, "<=", "A single dominant day can mean the temporal model is mostly ignoring the lookback window.")
+    if not _is_empty_frame(corr) and {"abs_score_corr", "abs_weight_corr"}.issubset(corr.columns):
+        corr_values = corr.select([_numeric_expr("abs_score_corr"), _numeric_expr("abs_weight_corr")]).to_numpy()
+        corr_max = float(np.nanmax(corr_values)) if corr_values.size else 0.0
+        add_check("max_simple_feature_score_weight_corr", corr_max, 0.75, "<=", "High raw correlation can reveal price-level, liquidity, or other simple shortcut rules.")
+    if not _is_empty_frame(aux_summary) and "zero_fraction" in aux_summary.columns:
+        add_check("max_aux_zero_fraction", _numeric_max(aux_summary, "zero_fraction"), 0.95, "<=", "Near-zero aux tensors can indicate collapsed latent/market token representations.")
     return pl.DataFrame(rows)
+
 
 
 def _score_head_surrogate_shap(
@@ -1376,10 +1436,7 @@ def _score_head_surrogate_shap(
     x_cpu = x.detach().float().cpu()
     scores_cpu = scores.detach().float().cpu()
     mask_cpu = mask.detach().bool().cpu()
-    aggregates: list[tuple[str, torch.Tensor]] = [
-        ("last", x_cpu[:, -1]),
-        ("lookback_mean", x_cpu.mean(dim=1)),
-    ]
+    aggregates: list[tuple[str, torch.Tensor]] = [("last", x_cpu[:, -1]), ("lookback_mean", x_cpu.mean(dim=1))]
     if int(x_cpu.size(1)) > 1:
         aggregates.append(("lookback_delta", x_cpu[:, -1] - x_cpu[:, 0]))
     components: list[np.ndarray] = []
@@ -1444,17 +1501,20 @@ def _score_head_surrogate_shap(
                 "surrogate_coef": float(coef.reshape(-1)[idx]),
             }
         )
-    component_frame = pl.DataFrame(component_rows).sort_values("shap_abs", ascending=False)
-    summary = component_frame.groupby("feature", as_index=False)["shap_abs"].sum()
-    summary["feature_group"] = summary["feature"].map(_feature_group)
-    summary["feature_label"] = summary["feature"].map(_feature_label)
-    total = float(summary["shap_abs"].sum())
-    summary["share"] = summary["shap_abs"] / total if total > 0.0 else 0.0
-    if not component_frame.empty:
-        top_source = component_frame.sort_values("shap_abs", ascending=False).drop_duplicates("feature")
-        summary = summary.merge(top_source[["feature", "source"]].rename(columns={"source": "top_source"}), on="feature", how="left")
-    summary["surrogate_r2"] = r2
-    summary["method"] = method
+    component_frame = pl.DataFrame(component_rows).sort("shap_abs", descending=True)
+    summary = component_frame.group_by("feature").agg(pl.col("shap_abs").sum().alias("shap_abs"))
+    summary = _with_feature_labels(summary)
+    total = _numeric_sum(summary, "shap_abs")
+    share_expr = (pl.col("shap_abs") / total) if total > 0.0 else pl.lit(0.0)
+    summary = summary.with_columns(share_expr.alias("share"))
+    if not component_frame.is_empty():
+        top_source = (
+            component_frame.sort("shap_abs", descending=True)
+            .unique(subset=["feature"], keep="first", maintain_order=True)
+            .select(["feature", pl.col("source").alias("top_source")])
+        )
+        summary = summary.join(top_source, on="feature", how="left")
+    summary = summary.with_columns([pl.lit(r2).alias("surrogate_r2"), pl.lit(method).alias("method")])
     info = {
         "enabled": True,
         "method": method,
@@ -1469,7 +1529,8 @@ def _score_head_surrogate_shap(
         warnings.append(
             f"Score-head surrogate SHAP has low R2 ({r2:.3f}); use it as a rough global diagnostic, not a faithful local explanation."
         )
-    return summary.sort_values("shap_abs", ascending=False), component_frame, info, warnings
+    return summary.sort("shap_abs", descending=True), component_frame, info, warnings
+
 
 
 def explain_batch(
@@ -1598,8 +1659,8 @@ def explain_batch(
     ig_top_cells = _feature_time_top_cells(ig_ft, "integrated_gradients_abs")
     perturb_top_cells = _feature_time_top_cells(perturb_ft, "weight_abs_delta")
     attribution_lookback = 0
-    if not grad_ft.empty and "lookback_from_end" in grad_ft.columns:
-        attribution_lookback = int(pd.to_numeric(grad_ft["lookback_from_end"], errors="coerce").max() + 1)
+    if not _is_empty_frame(grad_ft) and "lookback_from_end" in grad_ft.columns:
+        attribution_lookback = int(_numeric_max(grad_ft, "lookback_from_end") + 1)
     _mark_elapsed(timing, "postprocess_s", stage_start)
     timing["total_s"] = float(time.perf_counter() - total_start)
 
@@ -1677,43 +1738,42 @@ def _weighted_feature_time_from_chunks(
     pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
         frame = result.get("frames", {}).get(frame_name, pl.DataFrame())
-        if frame is None or frame.empty:
+        if _is_empty_frame(frame):
             continue
-        data = frame.copy()
+        data = frame.clone()
+        expressions = []
         for metric_name in metric_names:
             if metric_name in data.columns:
-                data[metric_name] = pd.to_numeric(data[metric_name], errors="coerce").fillna(0.0) * float(rows)
+                expressions.append((_numeric_expr(metric_name).fill_null(0.0) * float(rows)).alias(metric_name))
+        if expressions:
+            data = data.with_columns(expressions)
         pieces.append(data)
     if not pieces:
         return pl.DataFrame()
-    combined = pd.concat(pieces, ignore_index=True)
-    group_cols = [
-        col
-        for col in ("lookback_index", "lookback_from_end", "feature", "feature_group", "feature_label")
-        if col in combined.columns
-    ]
+    combined = _concat_frames(pieces)
+    group_cols = [col for col in ("lookback_index", "lookback_from_end", "feature", "feature_group", "feature_label") if col in combined.columns]
     value_cols = [col for col in metric_names if col in combined.columns]
     if not group_cols or not value_cols:
         return combined
-    out = combined.groupby(group_cols, as_index=False)[value_cols].sum()
+    out = combined.group_by(group_cols).agg([_numeric_expr(col).fill_null(0.0).sum().alias(col) for col in value_cols])
     denom = max(1.0, float(total_rows))
-    for metric_name in value_cols:
-        out[metric_name] = out[metric_name] / denom
-    return out
+    return out.with_columns([(pl.col(col) / denom).alias(col) for col in value_cols])
+
 
 
 def _combine_perturbation_summary(frame: pl.DataFrame) -> pl.DataFrame:
-    if frame.empty:
+    if _is_empty_frame(frame):
         return pl.DataFrame()
     value_cols = [col for col in ("weight_abs_delta", "score_abs_delta") if col in frame.columns]
     if not value_cols:
         return pl.DataFrame()
-    summary = frame.groupby("feature", as_index=False)[value_cols].sum()
-    summary["feature_group"] = summary["feature"].map(_feature_group)
-    summary["feature_label"] = summary["feature"].map(_feature_label)
-    total = float(summary["weight_abs_delta"].sum()) if "weight_abs_delta" in summary.columns else 0.0
-    summary["weight_delta_share"] = summary["weight_abs_delta"] / total if total > 0.0 else 0.0
-    return summary.sort_values("weight_abs_delta", ascending=False)
+    summary = frame.group_by("feature").agg([_numeric_expr(col).fill_null(0.0).sum().alias(col) for col in value_cols])
+    summary = _with_feature_labels(summary)
+    total = _numeric_sum(summary, "weight_abs_delta") if "weight_abs_delta" in summary.columns else 0.0
+    share_expr = (pl.col("weight_abs_delta") / total) if total > 0.0 else pl.lit(0.0)
+    summary = summary.with_columns(share_expr.alias("weight_delta_share"))
+    return summary.sort("weight_abs_delta", descending=True) if "weight_abs_delta" in summary.columns else summary
+
 
 
 def _combine_shap_feature_from_chunks(
@@ -1723,21 +1783,19 @@ def _combine_shap_feature_from_chunks(
     pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
         frame = result.get("frames", {}).get("feature_importance_shap", pl.DataFrame())
-        if frame is None or frame.empty or "feature" not in frame.columns or "shap_abs" not in frame.columns:
+        if _is_empty_frame(frame) or "feature" not in frame.columns or "shap_abs" not in frame.columns:
             continue
-        data = frame.copy()
-        data["shap_abs"] = pd.to_numeric(data["shap_abs"], errors="coerce").fillna(0.0) * float(rows)
-        pieces.append(data)
+        pieces.append(frame.with_columns((_numeric_expr("shap_abs").fill_null(0.0) * float(rows)).alias("shap_abs")))
     if not pieces:
         return pl.DataFrame()
-    combined = pd.concat(pieces, ignore_index=True)
-    summary = combined.groupby("feature", as_index=False)["shap_abs"].sum()
-    summary["shap_abs"] = summary["shap_abs"] / max(1.0, float(total_rows))
-    summary["feature_group"] = summary["feature"].map(_feature_group)
-    summary["feature_label"] = summary["feature"].map(_feature_label)
-    total = float(summary["shap_abs"].sum())
-    summary["share"] = summary["shap_abs"] / total if total > 0.0 else 0.0
-    return summary.sort_values("shap_abs", ascending=False)
+    combined = _concat_frames(pieces)
+    summary = combined.group_by("feature").agg(pl.col("shap_abs").sum().alias("shap_abs"))
+    summary = summary.with_columns((pl.col("shap_abs") / max(1.0, float(total_rows))).alias("shap_abs"))
+    summary = _with_feature_labels(summary)
+    total = _numeric_sum(summary, "shap_abs")
+    share_expr = (pl.col("shap_abs") / total) if total > 0.0 else pl.lit(0.0)
+    return summary.with_columns(share_expr.alias("share")).sort("shap_abs", descending=True)
+
 
 
 def _concat_chunk_frame(
@@ -1749,67 +1807,68 @@ def _concat_chunk_frame(
     pieces: list[pl.DataFrame] = []
     for chunk_id, (result, _) in enumerate(chunk_results):
         frame = result.get("frames", {}).get(frame_name, pl.DataFrame())
-        if frame is None or frame.empty:
+        if _is_empty_frame(frame):
             continue
-        data = frame.copy()
+        data = frame.clone()
         if add_chunk_id:
-            data.insert(0, "explain_chunk_id", int(chunk_id))
+            data = data.with_columns(pl.lit(int(chunk_id)).alias("explain_chunk_id")).select(["explain_chunk_id", *data.columns])
         pieces.append(data)
-    return pd.concat(pieces, ignore_index=True) if pieces else pl.DataFrame()
+    return _concat_frames(pieces)
+
 
 
 def _combine_aux_summary_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> pl.DataFrame:
     pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
         frame = result.get("frames", {}).get("aux_summary", pl.DataFrame())
-        if frame is None or frame.empty or "name" not in frame.columns:
+        if _is_empty_frame(frame) or "name" not in frame.columns:
             continue
-        data = frame.copy()
-        data["_rows"] = float(rows)
-        pieces.append(data)
+        pieces.append(frame.with_columns(pl.lit(float(rows)).alias("_rows")))
     if not pieces:
         return pl.DataFrame()
-    combined = pd.concat(pieces, ignore_index=True)
+    combined = _concat_frames(pieces)
     rows: list[dict[str, Any]] = []
     weighted_cols = ["mean", "std", "mean_abs", "zero_fraction", "finite_fraction"]
-    for name, group in combined.groupby("name", dropna=False):
-        weight = pd.to_numeric(group["_rows"], errors="coerce").fillna(0.0)
-        denom = float(weight.sum()) or 1.0
-        row: dict[str, Any] = {"name": name, "shape": str(group["shape"].iloc[0]) if "shape" in group else ""}
+    for group in combined.partition_by("name", as_dict=False):
+        name = _first_row(group).get("name")
+        weights = _numeric_numpy(group, "_rows", default=0.0)
+        denom = float(np.nansum(weights)) or 1.0
+        row: dict[str, Any] = {"name": name, "shape": str(_first_row(group).get("shape", ""))}
         for col in weighted_cols:
             if col in group.columns:
-                values = pd.to_numeric(group[col], errors="coerce").fillna(0.0)
-                row[col] = float((values * weight).sum() / denom)
+                values = _numeric_numpy(group, col, default=0.0)
+                row[col] = float(np.nansum(values * weights) / denom)
         if "max_abs" in group.columns:
-            row["max_abs"] = float(pd.to_numeric(group["max_abs"], errors="coerce").fillna(0.0).max())
+            row["max_abs"] = _numeric_max(group, "max_abs")
         rows.append(row)
     out = pl.DataFrame(rows)
-    return out.sort_values("mean_abs", ascending=False) if "mean_abs" in out.columns else out
+    return out.sort("mean_abs", descending=True) if "mean_abs" in out.columns else out
+
 
 
 def _combine_aux_dim_frames_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, pl.DataFrame]:
     by_name: dict[str, list[pl.DataFrame]] = {}
     for result, rows in chunk_results:
         for name, frame in result.get("aux_dim_frames", {}).items():
-            if frame is None or frame.empty or "dim" not in frame.columns:
+            if _is_empty_frame(frame) or "dim" not in frame.columns:
                 continue
-            data = frame.copy()
-            data["_rows"] = float(rows)
-            by_name.setdefault(str(name), []).append(data)
+            by_name.setdefault(str(name), []).append(frame.with_columns(pl.lit(float(rows)).alias("_rows")))
     out: dict[str, pl.DataFrame] = {}
     for name, pieces in by_name.items():
-        combined = pd.concat(pieces, ignore_index=True)
+        combined = _concat_frames(pieces)
         rows = []
-        for dim, group in combined.groupby("dim", dropna=False):
-            weight = pd.to_numeric(group["_rows"], errors="coerce").fillna(0.0)
-            denom = float(weight.sum()) or 1.0
-            mean_abs = float((pd.to_numeric(group["mean_abs"], errors="coerce").fillna(0.0) * weight).sum() / denom)
-            rows.append({"dim": int(dim), "mean_abs": mean_abs})
-        frame = pl.DataFrame(rows).sort_values("mean_abs", ascending=False)
-        total = float(frame["mean_abs"].sum())
-        frame["share"] = frame["mean_abs"] / total if total > 0.0 else 0.0
-        out[name] = frame
+        for group in combined.partition_by("dim", as_dict=False):
+            row0 = _first_row(group)
+            weights = _numeric_numpy(group, "_rows", default=0.0)
+            values = _numeric_numpy(group, "mean_abs", default=0.0)
+            denom = float(np.nansum(weights)) or 1.0
+            rows.append({"dim": int(row0.get("dim", 0)), "mean_abs": float(np.nansum(values * weights) / denom)})
+        frame = pl.DataFrame(rows).sort("mean_abs", descending=True)
+        total = _numeric_sum(frame, "mean_abs")
+        share_expr = (pl.col("mean_abs") / total) if total > 0.0 else pl.lit(0.0)
+        out[name] = frame.with_columns(share_expr.alias("share"))
     return out
+
 
 
 def _sum_chunk_timings(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, float]:
@@ -1903,7 +1962,7 @@ def _combine_chunked_explainability_results(
     aux_projection_frames = {
         name: frame
         for name, frame in first_result.get("aux_projection_frames", {}).items()
-        if frame is not None and not frame.empty
+        if not _is_empty_frame(frame)
     }
 
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
@@ -1915,8 +1974,8 @@ def _combine_chunked_explainability_results(
 
     trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
     attribution_lookback = 0
-    if not grad_ft.empty and "lookback_from_end" in grad_ft.columns:
-        attribution_lookback = int(pd.to_numeric(grad_ft["lookback_from_end"], errors="coerce").max() + 1)
+    if not _is_empty_frame(grad_ft) and "lookback_from_end" in grad_ft.columns:
+        attribution_lookback = int(_numeric_max(grad_ft, "lookback_from_end") + 1)
 
     timing = _sum_chunk_timings(chunk_results)
     timing["total_s"] = float(total_elapsed_s)
@@ -2059,10 +2118,7 @@ def _write_markdown_report(
     frames: dict[str, pl.DataFrame],
 ) -> None:
     def _render_frame(frame: pl.DataFrame) -> str:
-        try:
-            return frame.head(20).to_markdown(index=False)
-        except ImportError:
-            return "```text\n" + frame.head(20).to_string(index=False) + "\n```"
+        return _render_table_markdown(frame, limit=20)
 
     warnings = summary.get("warnings", [])
     portfolio = summary.get("portfolio", {})
@@ -2144,13 +2200,14 @@ def _write_markdown_report(
         "aux_summary",
     ):
         frame = frames.get(name)
-        if frame is None or frame.empty:
+        if _is_empty_frame(frame):
             continue
         lines.append(f"## {name}")
         lines.append("")
         lines.append(_render_frame(frame))
         lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
 
 
 @lru_cache(maxsize=1)
@@ -2225,22 +2282,22 @@ def _global_attribution_table(frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
 
     def add(frame_name: str, value_col: str, share_col: str, prefix: str) -> None:
         frame = frames.get(frame_name, pl.DataFrame())
-        if frame.empty or "feature" not in frame.columns or value_col not in frame.columns:
+        if _is_empty_frame(frame) or "feature" not in frame.columns or value_col not in frame.columns:
             return
         cols = ["feature", value_col]
         if "share" in frame.columns:
             cols.append("share")
         if "weight_delta_share" in frame.columns:
             cols.append("weight_delta_share")
-        data = frame[cols].copy()
-        data = data.rename(columns={value_col: f"{prefix}_value"})
+        data = frame.select(cols).rename({value_col: f"{prefix}_value"})
         if "share" in data.columns:
-            data = data.rename(columns={"share": f"{prefix}_share"})
+            data = data.rename({"share": f"{prefix}_share"})
         if "weight_delta_share" in data.columns:
-            data = data.rename(columns={"weight_delta_share": f"{prefix}_share"})
+            data = data.rename({"weight_delta_share": f"{prefix}_share"})
         if f"{prefix}_share" not in data.columns:
-            total = float(pd.to_numeric(data[f"{prefix}_value"], errors="coerce").fillna(0.0).sum())
-            data[f"{prefix}_share"] = data[f"{prefix}_value"] / total if total > 0.0 else 0.0
+            total = _numeric_sum(data, f"{prefix}_value")
+            share_expr = (pl.col(f"{prefix}_value") / total) if total > 0.0 else pl.lit(0.0)
+            data = data.with_columns(share_expr.alias(f"{prefix}_share"))
         tables.append(data)
 
     add("feature_importance_gradient", "grad_x_input_abs", "share", "gradient")
@@ -2251,13 +2308,16 @@ def _global_attribution_table(frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
         return pl.DataFrame()
     out = tables[0]
     for table in tables[1:]:
-        out = out.merge(table, on="feature", how="outer")
-    out["feature_group"] = out["feature"].map(_feature_group)
-    out["feature_label"] = out["feature"].map(_feature_label)
+        out = out.join(table, on="feature", how="full", coalesce=True)
+    out = _with_feature_labels(out)
     share_cols = [col for col in out.columns if col.endswith("_share")]
-    out[share_cols] = out[share_cols].fillna(0.0)
-    out["mean_available_share"] = out[share_cols].mean(axis=1) if share_cols else 0.0
-    return out.sort_values("mean_available_share", ascending=False)
+    if share_cols:
+        out = out.with_columns([pl.col(col).fill_null(0.0).alias(col) for col in share_cols])
+        out = out.with_columns(pl.mean_horizontal([pl.col(col) for col in share_cols]).alias("mean_available_share"))
+    else:
+        out = out.with_columns(pl.lit(0.0).alias("mean_available_share"))
+    return out.sort("mean_available_share", descending=True)
+
 
 
 def _write_paper_tables(
@@ -2278,11 +2338,9 @@ def _write_paper_tables(
         ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
     ):
         frame = frames.get(name, pl.DataFrame())
-        if frame is not None and not frame.empty:
-            chunk = frame.copy()
-            chunk.insert(0, "method", method)
-            top_cell_frames.append(chunk)
-    tables["feature_time_top_cells"] = pd.concat(top_cell_frames, ignore_index=True) if top_cell_frames else pl.DataFrame()
+        if not _is_empty_frame(frame):
+            top_cell_frames.append(frame.with_columns(pl.lit(method).alias("method")).select(["method", *frame.columns]))
+    tables["feature_time_top_cells"] = _concat_frames(top_cell_frames)
     for name in (
         "daily_portfolio",
         "regime_analysis",
@@ -2301,25 +2359,24 @@ def _write_paper_tables(
             {
                 "config_lookback": lookback_expected,
                 "attribution_lookback": lookback_observed,
-                "status": "match"
-                if lookback_expected is None or int(lookback_expected) == int(lookback_observed or 0)
-                else "warn",
+                "status": "match" if lookback_expected is None or int(lookback_expected) == int(lookback_observed or 0) else "warn",
                 "interpretation": "Attribution days should match the configured lookback; mismatch means the artifact is not lookback-complete or came from an older run.",
             }
         ]
     )
     written: dict[str, str] = {}
     for name, table in tables.items():
-        if table is None or table.empty:
+        if _is_empty_frame(table):
             continue
         path = table_dir / f"{name}.csv"
-        table.to_csv(path, index=False)
+        _write_csv(table, path)
         written[name] = str(path.relative_to(output_dir))
     return written
 
 
+
 def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, subtitle: str) -> None:
-    if table.empty:
+    if _is_empty_frame(table) or "feature_label" not in table.columns:
         return
     share_cols = [
         ("gradient_share", "Grad x input"),
@@ -2330,16 +2387,25 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
     available = [(col, label) for col, label in share_cols if col in table.columns]
     if not available:
         return
-    data = table.head(14).copy()
-    melted = []
+    data = table.head(14)
+    melted: list[pl.DataFrame] = []
     for col, label in available:
-        chunk = data[["feature_label", col]].copy()
-        chunk["method"] = label
-        chunk = chunk.rename(columns={col: "share"})
-        melted.append(chunk)
-    plot_data = pd.concat(melted, ignore_index=True)
+        melted.append(
+            data.select(
+                [
+                    pl.col("feature_label").cast(pl.String).alias("feature_label"),
+                    _numeric_expr(col).alias("share"),
+                ]
+            )
+            .drop_nulls(subset=["feature_label", "share"])
+            .with_columns(pl.lit(label).alias("method"))
+        )
+    plot_data = _concat_frames(melted)
+    if plot_data.is_empty():
+        return
     plt, sns = _setup_paper_plotting()
-    fig_height = max(5.2, 0.42 * data["feature_label"].nunique() + 2.1)
+    feature_count = int(data.select(pl.col("feature_label").n_unique()).item())
+    fig_height = max(5.2, 0.42 * feature_count + 2.1)
     fig, ax = plt.subplots(figsize=(12.5, fig_height), dpi=160)
     palette = {
         "Grad x input": PAPER_TOKENS["blue_mid"],
@@ -2347,14 +2413,15 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
         "Perturbation": PAPER_TOKENS["orange_mid"],
         "Surrogate SHAP": PAPER_TOKENS["olive_mid"],
     }
-    order = data["feature_label"].tolist()[::-1]
+    order = _string_list(data, "feature_label")[::-1]
+    methods = _string_list(plot_data.select(pl.col("method").unique(maintain_order=True)), "method")
     sns.barplot(
-        data=plot_data,
+        data=_to_plot_data(plot_data),
         y="feature_label",
         x="share",
         hue="method",
         order=order,
-        palette={key: palette[key] for key in plot_data["method"].unique()},
+        palette={key: palette[key] for key in methods if key in palette},
         ax=ax,
     )
     ax.set_xlabel("Attribution share")
@@ -2384,43 +2451,44 @@ def _plot_paper_feature_time_heatmap(
     top_features: int = 24,
 ) -> None:
     required = {"feature", "lookback_from_end", value_col}
-    if frame.empty or not required.issubset(frame.columns):
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
         return
-    data = frame.copy()
-    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
-    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
-    data = data.dropna(subset=[value_col, "lookback_from_end"])
-    if data.empty:
+    data = _with_numeric(frame.select(["feature", "lookback_from_end", value_col]), value_col, "lookback_from_end")
+    data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
+    if data.is_empty():
         return
-    top = data.groupby("feature")[value_col].sum().sort_values(ascending=False).head(top_features).index
-    data = data[data["feature"].isin(top)].copy()
-    data["feature_label"] = data["feature"].map(_feature_label)
-    pivot = data.pivot_table(
-        index="feature_label",
-        columns="lookback_from_end",
-        values=value_col,
-        aggfunc="sum",
-        fill_value=0.0,
+    top = _top_values_by_sum(data, "feature", value_col, top_features)
+    if not top:
+        return
+    data = data.filter(pl.col("feature").is_in(top)).with_columns(
+        pl.col("feature").cast(pl.String).map_elements(_feature_label, return_dtype=pl.String).alias("feature_label")
     )
-    ordered_labels = [_feature_label(feature) for feature in top if _feature_label(feature) in pivot.index]
-    pivot = pivot.loc[ordered_labels]
-    pivot = pivot.reindex(columns=sorted(pivot.columns))
-    if pivot.empty:
+    ordered_labels = [_feature_label(str(feature)) for feature in top]
+    column_order = sorted(data.get_column("lookback_from_end").unique().to_list())
+    labels, columns, matrix = _pivot_sum_matrix(
+        data,
+        index_col="feature_label",
+        column_col="lookback_from_end",
+        value_col=value_col,
+        index_order=ordered_labels,
+        column_order=column_order,
+    )
+    if matrix.size == 0:
         return
     plt, sns = _setup_paper_plotting()
     from matplotlib.colors import LinearSegmentedColormap
 
-    fig_height = max(5.0, 0.38 * len(pivot) + 2.0)
+    fig_height = max(5.0, 0.38 * len(labels) + 2.0)
     fig, ax = plt.subplots(figsize=(12.2, fig_height), dpi=170)
     cmap = LinearSegmentedColormap.from_list(
         "paper_blue_gold",
         [PAPER_TOKENS["blue_xlight"], PAPER_TOKENS["blue_base"], PAPER_TOKENS["blue_dark"], PAPER_TOKENS["gold_mid"]],
     )
-    vmax = float(np.nanpercentile(pivot.to_numpy(dtype=np.float64), 98))
+    vmax = float(np.nanpercentile(matrix, 98))
     if vmax <= 0.0:
         vmax = None
     sns.heatmap(
-        pivot,
+        matrix,
         cmap=cmap,
         vmin=0.0,
         vmax=vmax,
@@ -2428,10 +2496,12 @@ def _plot_paper_feature_time_heatmap(
         linecolor=PAPER_TOKENS["panel"],
         cbar_kws={"label": value_col},
         ax=ax,
+        xticklabels=[_lookback_label(column) for column in columns],
+        yticklabels=[str(label) for label in labels],
     )
     ax.set_xlabel("Lookback day (t-0 = latest day before decision)")
     ax.set_ylabel("")
-    ax.set_xticklabels([_lookback_label(label.get_text()) for label in ax.get_xticklabels()], rotation=0)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
     ax.tick_params(axis="y", labelsize=8)
     _add_paper_header(fig, ax, title, subtitle)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2440,24 +2510,25 @@ def _plot_paper_feature_time_heatmap(
 
 
 def _plot_paper_time_importance(frame: pl.DataFrame, *, output_path: Path, value_col: str, subtitle: str) -> None:
-    if frame.empty or not {"lookback_from_end", value_col}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"lookback_from_end", value_col}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
-    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
-    data = data.dropna(subset=[value_col, "lookback_from_end"]).sort_values("lookback_from_end")
-    if data.empty:
+    numeric_cols = [value_col, "lookback_from_end"]
+    if "share" in frame.columns:
+        numeric_cols.append("share")
+    data = _with_numeric(frame, *numeric_cols).drop_nulls(subset=[value_col, "lookback_from_end"]).sort("lookback_from_end")
+    if data.is_empty():
         return
     plt, sns = _setup_paper_plotting()
     fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=160)
-    sns.barplot(data=data, x="lookback_from_end", y="share" if "share" in data.columns else value_col, color=PAPER_TOKENS["blue_mid"], ax=ax)
+    y_col = "share" if "share" in data.columns else value_col
+    sns.barplot(data=_to_plot_data(data), x="lookback_from_end", y=y_col, color=PAPER_TOKENS["blue_mid"], ax=ax)
     ax.set_xlabel("Lookback day (t-0 = latest)")
     ax.set_ylabel("Attribution share" if "share" in data.columns else value_col)
-    ax.set_xticks(np.arange(len(data)))
-    ax.set_xticklabels([_lookback_label(value) for value in data["lookback_from_end"].tolist()])
+    ax.set_xticks(np.arange(data.height))
+    ax.set_xticklabels([_lookback_label(value) for value in data.get_column("lookback_from_end").to_list()])
     if "share" in data.columns:
         ax.yaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
-        for patch, value in zip(ax.patches, data["share"].to_numpy(dtype=np.float64), strict=False):
+        for patch, value in zip(ax.patches, _numeric_numpy(data, "share"), strict=False):
             ax.text(patch.get_x() + patch.get_width() / 2.0, patch.get_height(), _format_share(value), ha="center", va="bottom", fontsize=8, color=PAPER_TOKENS["ink"])
     _add_paper_header(fig, ax, "Temporal attribution across the lookback window", subtitle)
     _finish_paper_axes(ax)
@@ -2467,24 +2538,29 @@ def _plot_paper_time_importance(frame: pl.DataFrame, *, output_path: Path, value
 
 
 def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
-    if frame.empty or not {"feature", "source", "score_corr", "weight_corr"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"feature", "source", "score_corr", "weight_corr"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["max_abs_corr"] = pd.to_numeric(data[["score_corr", "weight_corr"]].abs().max(axis=1), errors="coerce")
-    data = data.dropna(subset=["max_abs_corr"]).sort_values("max_abs_corr", ascending=False).head(18)
-    if data.empty:
+    data = _with_numeric(frame, "score_corr", "weight_corr").with_columns(
+        pl.max_horizontal(pl.col("score_corr").abs(), pl.col("weight_corr").abs()).alias("max_abs_corr")
+    )
+    data = data.drop_nulls(subset=["max_abs_corr"]).sort("max_abs_corr", descending=True).head(18)
+    if data.is_empty():
         return
-    data["label"] = data["source"].astype(str) + " / " + data["feature"].astype(str)
-    plot = data.melt(id_vars=["label"], value_vars=["score_corr", "weight_corr"], var_name="target", value_name="corr")
+    data = data.with_columns(
+        pl.concat_str([pl.col("source").cast(pl.String), pl.lit(" / "), pl.col("feature").cast(pl.String)]).alias("label")
+    )
+    plot = data.select(["label", "score_corr", "weight_corr"]).unpivot(
+        index=["label"], on=["score_corr", "weight_corr"], variable_name="target", value_name="corr"
+    )
     plt, sns = _setup_paper_plotting()
-    fig_height = max(5.2, 0.36 * data.shape[0] + 2.0)
+    fig_height = max(5.2, 0.36 * data.height + 2.0)
     fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
     sns.barplot(
-        data=plot,
+        data=_to_plot_data(plot),
         y="label",
         x="corr",
         hue="target",
-        order=data["label"].tolist()[::-1],
+        order=_string_list(data, "label")[::-1],
         palette={"score_corr": PAPER_TOKENS["blue_mid"], "weight_corr": PAPER_TOKENS["pink_mid"]},
         ax=ax,
     )
@@ -2500,20 +2576,18 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
 
 
 def _plot_paper_trust_checks(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
-    if frame.empty or not {"check", "value", "status"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"check", "value", "status"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["value"] = pd.to_numeric(data["value"], errors="coerce")
-    data = data.dropna(subset=["value"])
-    if data.empty:
+    data = _with_numeric(frame, "value").drop_nulls(subset=["value"])
+    if data.is_empty():
         return
     plt, sns = _setup_paper_plotting()
-    fig_height = max(4.8, 0.48 * len(data) + 2.0)
+    fig_height = max(4.8, 0.48 * data.height + 2.0)
     fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
     palette = {"pass": PAPER_TOKENS["blue_mid"], "warn": PAPER_TOKENS["orange_mid"]}
-    sns.barplot(data=data, y="check", x="value", hue="status", dodge=False, palette=palette, ax=ax)
-    for row_idx, row in data.reset_index(drop=True).iterrows():
-        ax.text(float(row["value"]), row_idx, f"  {row['rule']}", va="center", ha="left", fontsize=8, color=PAPER_TOKENS["muted"])
+    sns.barplot(data=_to_plot_data(data), y="check", x="value", hue="status", dodge=False, palette=palette, ax=ax)
+    for row_idx, row in enumerate(data.iter_rows(named=True)):
+        ax.text(_safe_float(row.get("value")), row_idx, f"  {row.get('rule', '')}", va="center", ha="left", fontsize=8, color=PAPER_TOKENS["muted"])
     ax.set_xlabel("Measured value")
     ax.set_ylabel("")
     ax.legend(loc="lower right", frameon=True, fontsize=8)
@@ -2525,19 +2599,19 @@ def _plot_paper_trust_checks(frame: pl.DataFrame, *, output_path: Path, subtitle
 
 
 def _plot_paper_regime(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
-    if frame.empty or not {"dimension", "regime", "mean_strategy_log_return"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"dimension", "regime", "mean_strategy_log_return"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["mean_strategy_log_return"] = pd.to_numeric(data["mean_strategy_log_return"], errors="coerce")
-    data = data.dropna(subset=["mean_strategy_log_return"])
-    if data.empty:
+    data = _with_numeric(frame, "mean_strategy_log_return").drop_nulls(subset=["mean_strategy_log_return"])
+    if data.is_empty():
         return
-    data["label"] = data["dimension"].astype(str) + " / " + data["regime"].astype(str)
+    data = data.with_columns(
+        pl.concat_str([pl.col("dimension").cast(pl.String), pl.lit(" / "), pl.col("regime").cast(pl.String)]).alias("label")
+    )
     plt, sns = _setup_paper_plotting()
-    fig_height = max(4.8, 0.42 * len(data) + 2.0)
+    fig_height = max(4.8, 0.42 * data.height + 2.0)
     fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
-    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in data["mean_strategy_log_return"]]
-    sns.barplot(data=data, y="label", x="mean_strategy_log_return", palette=colors, hue="label", legend=False, ax=ax)
+    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in _numeric_numpy(data, "mean_strategy_log_return")]
+    sns.barplot(data=_to_plot_data(data), y="label", x="mean_strategy_log_return", palette=colors, hue="label", legend=False, ax=ax)
     ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
     ax.set_xlabel("Mean strategy log return")
     ax.set_ylabel("")
@@ -2549,20 +2623,19 @@ def _plot_paper_regime(frame: pl.DataFrame, *, output_path: Path, subtitle: str)
 
 
 def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
-    if frame.empty or not {"case_type", "symbol", "gross_contribution"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"case_type", "symbol", "gross_contribution"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["gross_contribution"] = pd.to_numeric(data["gross_contribution"], errors="coerce")
-    data = data.dropna(subset=["gross_contribution"])
-    if data.empty:
+    data = _with_numeric(frame, "gross_contribution").drop_nulls(subset=["gross_contribution"])
+    if data.is_empty():
         return
-    data["label"] = data["case_type"].astype(str) + " / " + data["symbol"].astype(str)
-    data = data.sort_values("gross_contribution")
+    data = data.with_columns(
+        pl.concat_str([pl.col("case_type").cast(pl.String), pl.lit(" / "), pl.col("symbol").cast(pl.String)]).alias("label")
+    ).sort("gross_contribution")
     plt, sns = _setup_paper_plotting()
-    fig_height = max(5.2, 0.28 * len(data) + 2.0)
+    fig_height = max(5.2, 0.28 * data.height + 2.0)
     fig, ax = plt.subplots(figsize=(12, fig_height), dpi=160)
-    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in data["gross_contribution"]]
-    sns.barplot(data=data, y="label", x="gross_contribution", palette=colors, hue="label", legend=False, ax=ax)
+    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in _numeric_numpy(data, "gross_contribution")]
+    sns.barplot(data=_to_plot_data(data), y="label", x="gross_contribution", palette=colors, hue="label", legend=False, ax=ax)
     ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
     ax.set_xlabel("Weight × future log return")
     ax.set_ylabel("")
@@ -2574,17 +2647,15 @@ def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle
 
 
 def _plot_paper_aux_summary(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
-    if frame.empty or not {"name", "mean_abs"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"name", "mean_abs"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["mean_abs"] = pd.to_numeric(data["mean_abs"], errors="coerce")
-    data = data.dropna(subset=["mean_abs"]).sort_values("mean_abs", ascending=False).head(24)
-    if data.empty:
+    data = _with_numeric(frame, "mean_abs").drop_nulls(subset=["mean_abs"]).sort("mean_abs", descending=True).head(24)
+    if data.is_empty():
         return
     plt, sns = _setup_paper_plotting()
-    fig_height = max(4.8, 0.36 * len(data) + 2.0)
+    fig_height = max(4.8, 0.36 * data.height + 2.0)
     fig, ax = plt.subplots(figsize=(11, fig_height), dpi=160)
-    sns.barplot(data=data, y="name", x="mean_abs", color=PAPER_TOKENS["olive_mid"], ax=ax)
+    sns.barplot(data=_to_plot_data(data), y="name", x="mean_abs", color=PAPER_TOKENS["olive_mid"], ax=ax)
     ax.set_xlabel("Mean absolute activation")
     ax.set_ylabel("")
     _add_paper_header(fig, ax, "Latent and market-token diagnostics check whether representations collapse", subtitle)
@@ -2755,12 +2826,8 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
 
 
 def _render_frame_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
-    if frame is None or frame.empty:
-        return "_No rows._"
-    try:
-        return frame.head(limit).to_markdown(index=False)
-    except ImportError:
-        return "```text\n" + frame.head(limit).to_string(index=False) + "\n```"
+    return _render_table_markdown(frame, limit=limit)
+
 
 
 def _paper_executive_summary(
@@ -2772,18 +2839,18 @@ def _paper_executive_summary(
     lines: list[str] = []
     portfolio = summary.get("portfolio", {})
     global_table = _global_attribution_table(frames)
-    if not global_table.empty:
-        top = global_table.iloc[0]
+    if not _is_empty_frame(global_table):
+        top = _first_row(global_table)
         lines.append(
-            f"- The strongest global signal is `{top['feature']}` ({top['feature_group']}); "
+            f"- The strongest global signal is `{top.get('feature')}` ({top.get('feature_group')}); "
             f"mean available attribution share is {_format_share(top.get('mean_available_share', 0.0))}."
         )
     shap = frames.get("feature_importance_shap", pl.DataFrame())
-    if shap is not None and not shap.empty:
-        row = shap.iloc[0]
+    if not _is_empty_frame(shap):
+        row = _first_row(shap)
         r2 = _safe_float(row.get("surrogate_r2", summary.get("shap_info", {}).get("surrogate_r2", 0.0)))
         lines.append(
-            f"- Score-head surrogate SHAP top feature is `{row['feature']}` with surrogate R2={r2:.3f}; "
+            f"- Score-head surrogate SHAP top feature is `{row.get('feature')}` with surrogate R2={r2:.3f}; "
             "treat it as global evidence, not exact full-Transformer SHAP."
         )
     else:
@@ -2810,6 +2877,7 @@ def _paper_executive_summary(
     if not lines:
         lines.append("- No explainability rows were available; inspect data loading and model output hooks.")
     return lines
+
 
 
 def _write_paper_report(
@@ -2858,18 +2926,16 @@ def _write_paper_report(
     lines.append("")
     lines.append("## Top Feature-Time Cells")
     lines.append("")
-    feature_time_tables = []
+    feature_time_tables: list[pl.DataFrame] = []
     for key, method in (
         ("top_feature_time_gradient_cells", "gradient_x_input"),
         ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
         ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
     ):
         frame = frames.get(key, pl.DataFrame())
-        if frame is not None and not frame.empty:
-            chunk = frame.copy()
-            chunk.insert(0, "method", method)
-            feature_time_tables.append(chunk)
-    lines.append(_render_frame_markdown(pd.concat(feature_time_tables, ignore_index=True) if feature_time_tables else pl.DataFrame(), limit=30))
+        if not _is_empty_frame(frame):
+            feature_time_tables.append(frame.with_columns(pl.lit(method).alias("method")).select(["method", *frame.columns]))
+    lines.append(_render_frame_markdown(_concat_frames(feature_time_tables), limit=30))
     lines.append("")
     lines.append("## Regime Analysis")
     lines.append("")
@@ -2888,6 +2954,7 @@ def _write_paper_report(
     lines.extend(f"- `{path}`" for path in paper_tables.values())
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
 
 
 def _write_paper_summary(
@@ -2922,65 +2989,67 @@ def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
             table = pl.read_csv(fallback)
             if "share" not in table.columns:
                 continue
-            table = table.rename(columns={"share": "gradient_share"})
-            table["mean_available_share"] = table["gradient_share"]
-            table["feature_group"] = table["feature"].map(_feature_group)
-            table["feature_label"] = table["feature"].map(_feature_label)
+            table = table.rename({"share": "gradient_share"}).with_columns(
+                [
+                    pl.col("gradient_share").alias("mean_available_share"),
+                    pl.col("feature").cast(pl.String).map_elements(_feature_group, return_dtype=pl.String).alias("feature_group"),
+                    pl.col("feature").cast(pl.String).map_elements(_feature_label, return_dtype=pl.String).alias("feature_label"),
+                ]
+            )
         else:
             table = pl.read_csv(path)
-        if table.empty or "feature" not in table.columns:
+        if table.is_empty() or "feature" not in table.columns:
             continue
         fold_id = fold_dir.name.removeprefix("fold_").removesuffix("_test")
-        table = table.copy()
-        table["fold_id"] = int(fold_id)
-        table["rank"] = table["mean_available_share"].rank(ascending=False, method="min") if "mean_available_share" in table.columns else table.index + 1
+        table = table.with_columns(pl.lit(int(fold_id)).alias("fold_id"))
+        if "mean_available_share" in table.columns:
+            table = table.with_columns(pl.col("mean_available_share").rank(method="min", descending=True).alias("rank"))
+        else:
+            table = table.with_row_index("rank", offset=1)
         rows.append(table)
     if not rows:
         return None
-    combined = pd.concat(rows, ignore_index=True)
+    combined = _concat_frames(rows)
     summary = (
-        combined.groupby("feature", as_index=False)
+        combined.group_by("feature")
         .agg(
-            folds_present=("fold_id", "nunique"),
-            mean_rank=("rank", "mean"),
-            std_rank=("rank", "std"),
-            mean_share=("mean_available_share", "mean"),
-            std_share=("mean_available_share", "std"),
+            [
+                pl.col("fold_id").n_unique().alias("folds_present"),
+                pl.col("rank").mean().alias("mean_rank"),
+                pl.col("rank").std().alias("std_rank"),
+                _numeric_expr("mean_available_share").mean().alias("mean_share"),
+                _numeric_expr("mean_available_share").std().alias("std_share"),
+            ]
         )
-        .sort_values(["mean_rank", "mean_share"], ascending=[True, False])
+        .sort(["mean_rank", "mean_share"], descending=[False, True])
     )
-    summary["feature_group"] = summary["feature"].map(_feature_group)
-    summary["feature_label"] = summary["feature"].map(_feature_label)
+    summary = _with_feature_labels(summary)
     output_dir = root / "paper_fold_stability"
     table_dir = output_dir / "paper_tables"
     plot_dir = output_dir / "plots_paper"
     table_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
-    combined.to_csv(table_dir / "fold_feature_attribution_long.csv", index=False)
-    summary.to_csv(table_dir / "fold_feature_stability.csv", index=False)
+    _write_csv(combined, table_dir / "fold_feature_attribution_long.csv")
+    _write_csv(summary, table_dir / "fold_feature_stability.csv")
     plt, sns = _setup_paper_plotting()
-    data = summary.head(20).copy()
-    if not data.empty:
-        fig_height = max(5.0, 0.36 * len(data) + 2.0)
+    data = summary.head(20)
+    if not data.is_empty():
+        fig_height = max(5.0, 0.36 * data.height + 2.0)
         fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
-        sns.barplot(data=data, y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
+        sns.barplot(data=_frame_to_dict(data), y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
         ax.set_xlabel("Mean attribution share across folds")
         ax.set_ylabel("")
         ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
-        _add_paper_header(
-            fig,
-            ax,
-            "Fold stability shows whether the same features remain important",
-            f"Computed across {combined['fold_id'].nunique()} fold explainability outputs.",
-        )
+        fold_count = int(combined.select(pl.col("fold_id").n_unique()).item())
+        _add_paper_header(fig, ax, "Fold stability shows whether the same features remain important", f"Computed across {fold_count} fold explainability outputs.")
         _finish_paper_axes(ax)
         fig.savefig(plot_dir / "fold_stability_feature_share.png")
         plt.close(fig)
     report = [
         "# Paper Fold Stability Summary",
         "",
-        f"- folds: `{combined['fold_id'].nunique()}`",
-        f"- features: `{summary['feature'].nunique()}`",
+        f"- folds: `{int(combined.select(pl.col('fold_id').n_unique()).item())}`",
+        f"- features: `{int(summary.select(pl.col('feature').n_unique()).item())}`",
         "",
         "## Most Stable Features",
         "",
@@ -2989,6 +3058,7 @@ def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
     ]
     (output_dir / "paper_fold_stability_report.md").write_text("\n".join(report), encoding="utf-8")
     return output_dir
+
 
 
 def _safe_plot_filename(name: str) -> str:
@@ -3004,20 +3074,19 @@ def _plot_barh(
     title: str,
     top_n: int = 30,
 ) -> None:
-    if frame.empty or label_col not in frame.columns or value_col not in frame.columns:
+    if _is_empty_frame(frame) or label_col not in frame.columns or value_col not in frame.columns:
         return
-    data = frame[[label_col, value_col]].dropna().copy()
-    if data.empty:
+    data = _with_numeric(frame.select([label_col, value_col]), value_col)
+    data = data.drop_nulls(subset=[label_col, value_col]).sort(value_col, descending=True).head(top_n)
+    if data.is_empty():
         return
-    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
-    data = data.dropna().sort_values(value_col, ascending=False).head(top_n)
-    if data.empty:
-        return
-    fig_height = max(4.0, 0.28 * len(data) + 1.5)
+    labels = _string_list(data, label_col)
+    values = _numeric_numpy(data, value_col)
+    fig_height = max(4.0, 0.28 * data.height + 1.5)
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(10, fig_height), dpi=130)
-    ax.barh(data[label_col].astype(str)[::-1], data[value_col].to_numpy()[::-1])
+    ax.barh(labels[::-1], values[::-1])
     ax.set_title(title)
     ax.set_xlabel(value_col)
     ax.grid(True, axis="x", alpha=0.25)
@@ -3034,19 +3103,16 @@ def _plot_time_importance(
     value_col: str,
     title: str,
 ) -> None:
-    if frame.empty or value_col not in frame.columns or "lookback_from_end" not in frame.columns:
+    if _is_empty_frame(frame) or value_col not in frame.columns or "lookback_from_end" not in frame.columns:
         return
-    data = frame[["lookback_from_end", value_col]].dropna().copy()
-    if data.empty:
-        return
-    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
-    data = data.dropna().sort_values("lookback_from_end")
-    if data.empty:
+    data = _with_numeric(frame.select(["lookback_from_end", value_col]), "lookback_from_end", value_col)
+    data = data.drop_nulls(subset=["lookback_from_end", value_col]).sort("lookback_from_end")
+    if data.is_empty():
         return
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=130)
-    ax.bar(data["lookback_from_end"].astype(str), data[value_col].to_numpy())
+    ax.bar(_string_list(data, "lookback_from_end"), _numeric_numpy(data, value_col))
     ax.set_title(title)
     ax.set_xlabel("lookback_from_end (0 = latest)")
     ax.set_ylabel(value_col)
@@ -3066,45 +3132,39 @@ def _plot_feature_time_heatmap(
     top_features: int = 30,
 ) -> None:
     required = {"feature", "lookback_from_end", value_col}
-    if frame.empty or not required.issubset(frame.columns):
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
         return
-    data = frame[list(required)].dropna().copy()
-    if data.empty:
+    data = _with_numeric(frame.select(["feature", "lookback_from_end", value_col]), "lookback_from_end", value_col)
+    data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
+    if data.is_empty():
         return
-    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
-    data = data.dropna()
-    if data.empty:
+    top = _top_values_by_sum(data, "feature", value_col, top_features)
+    if not top:
         return
-    top = (
-        data.groupby("feature")[value_col]
-        .sum()
-        .sort_values(ascending=False)
-        .head(top_features)
-        .index
+    data = data.filter(pl.col("feature").is_in(top))
+    column_order = sorted(data.get_column("lookback_from_end").unique().to_list())
+    labels, columns, matrix = _pivot_sum_matrix(
+        data,
+        index_col="feature",
+        column_col="lookback_from_end",
+        value_col=value_col,
+        index_order=top,
+        column_order=column_order,
     )
-    data = data[data["feature"].isin(top)]
-    pivot = data.pivot_table(
-        index="feature",
-        columns="lookback_from_end",
-        values=value_col,
-        aggfunc="sum",
-        fill_value=0.0,
-    )
-    pivot = pivot.loc[top]
-    if pivot.empty:
+    if matrix.size == 0:
         return
     import matplotlib.pyplot as plt
 
-    fig_height = max(4.0, 0.30 * len(pivot) + 1.5)
+    fig_height = max(4.0, 0.30 * len(labels) + 1.5)
     fig, ax = plt.subplots(figsize=(9, fig_height), dpi=130)
-    image = ax.imshow(pivot.to_numpy(), aspect="auto", interpolation="nearest")
+    image = ax.imshow(matrix, aspect="auto", interpolation="nearest")
     ax.set_title(title)
     ax.set_xlabel("lookback_from_end (0 = latest)")
     ax.set_ylabel("feature")
-    ax.set_xticks(np.arange(pivot.shape[1]))
-    ax.set_xticklabels([str(col) for col in pivot.columns])
-    ax.set_yticks(np.arange(pivot.shape[0]))
-    ax.set_yticklabels([str(idx) for idx in pivot.index])
+    ax.set_xticks(np.arange(len(columns)))
+    ax.set_xticklabels([str(col) for col in columns])
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_yticklabels([str(idx) for idx in labels])
     fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3121,35 +3181,28 @@ def _plot_feature_time_heatmap_datashader(
     top_features: int = 40,
 ) -> None:
     required = {"feature", "lookback_from_end", value_col}
-    if frame.empty or not required.issubset(frame.columns):
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
         return
-    data = frame[list(required)].dropna().copy()
-    data[value_col] = pd.to_numeric(data[value_col], errors="coerce")
-    data["lookback_from_end"] = pd.to_numeric(data["lookback_from_end"], errors="coerce")
-    data = data.dropna()
-    if data.empty:
+    data = _with_numeric(frame.select(["feature", "lookback_from_end", value_col]), "lookback_from_end", value_col)
+    data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
+    if data.is_empty():
         return
-    top = (
-        data.groupby("feature")[value_col]
-        .sum()
-        .sort_values(ascending=False)
-        .head(top_features)
-        .index.astype(str)
-        .tolist()
-    )
+    top = [str(value) for value in _top_values_by_sum(data, "feature", value_col, top_features)]
     if not top:
         return
-    data["feature"] = data["feature"].astype(str)
-    data = data[data["feature"].isin(top)].copy()
+    data = data.with_columns(pl.col("feature").cast(pl.String).alias("feature")).filter(pl.col("feature").is_in(top))
     feature_to_y = {feature: len(top) - 1 - idx for idx, feature in enumerate(top)}
-    data["feature_y"] = data["feature"].map(feature_to_y)
-    data = data.dropna(subset=["feature_y"])
-    if data.empty:
+    data = data.with_columns(
+        pl.col("feature")
+        .map_elements(lambda value: feature_to_y.get(str(value)), return_dtype=pl.Int64)
+        .alias("feature_y")
+    ).drop_nulls(subset=["feature_y"])
+    if data.is_empty():
         return
     save_heatmap_points_datashader(
-        data["lookback_from_end"].to_numpy(dtype=np.float64),
-        data["feature_y"].to_numpy(dtype=np.float64),
-        data[value_col].to_numpy(dtype=np.float64),
+        _numeric_numpy(data, "lookback_from_end"),
+        _numeric_numpy(data, "feature_y"),
+        _numeric_numpy(data, value_col),
         output_path=output_path,
         title=title,
         x_label="lookback_from_end (0 = latest)",
@@ -3161,23 +3214,26 @@ def _plot_feature_time_heatmap_datashader(
 
 
 def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
-    if frame.empty or "feature" not in frame.columns:
+    if _is_empty_frame(frame) or "feature" not in frame.columns:
         return
-    data = frame.copy()
+    data = frame
     if "abs_score_corr" not in data.columns:
         return
-    data = data.sort_values("abs_score_corr", ascending=False).head(30)
-    if data.empty:
+    data = _with_numeric(data, "abs_score_corr", "score_corr", "weight_corr").sort("abs_score_corr", descending=True).head(30)
+    if data.is_empty():
         return
     import matplotlib.pyplot as plt
 
-    labels = (data["source"].astype(str) + ":" + data["feature"].astype(str)).to_numpy()
-    y = np.arange(len(data))
-    fig_height = max(4.0, 0.28 * len(data) + 1.5)
+    labels = _string_list(
+        data.with_columns(pl.concat_str([pl.col("source").cast(pl.String), pl.lit(":"), pl.col("feature").cast(pl.String)]).alias("__label")),
+        "__label",
+    )
+    y = np.arange(data.height)
+    fig_height = max(4.0, 0.28 * data.height + 1.5)
     fig, ax = plt.subplots(figsize=(10, fig_height), dpi=130)
-    ax.barh(y - 0.18, data["score_corr"].to_numpy(), height=0.35, label="score_corr")
+    ax.barh(y - 0.18, _numeric_numpy(data, "score_corr"), height=0.35, label="score_corr")
     if "weight_corr" in data.columns:
-        ax.barh(y + 0.18, data["weight_corr"].to_numpy(), height=0.35, label="weight_corr")
+        ax.barh(y + 0.18, _numeric_numpy(data, "weight_corr"), height=0.35, label="weight_corr")
     ax.set_yticks(y)
     ax.set_yticklabels(labels)
     ax.invert_yaxis()
@@ -3193,22 +3249,29 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
 
 
 def _plot_decision_exposure(frame: pl.DataFrame, output_path: Path) -> None:
-    if frame.empty or not {"date", "side", "weight"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"date", "side", "weight"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["abs_weight"] = pd.to_numeric(data["weight"], errors="coerce").abs()
-    pivot = data.pivot_table(index="date", columns="side", values="abs_weight", aggfunc="sum", fill_value=0.0)
-    if pivot.empty:
+    data = _with_numeric(frame.select(["date", "side", "weight"]), "weight")
+    data = data.with_columns(pl.col("weight").abs().alias("abs_weight")).drop_nulls(subset=["date", "side", "abs_weight"]).sort("date")
+    rows, columns, matrix = _pivot_sum_matrix(
+        data,
+        index_col="date",
+        column_col="side",
+        value_col="abs_weight",
+        index_order=data.get_column("date").unique(maintain_order=True).to_list(),
+        column_order=["long", "short", "flat"],
+    )
+    if matrix.size == 0:
         return
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(10, 4.8), dpi=130)
-    bottom = np.zeros(len(pivot))
+    bottom = np.zeros(len(rows))
     for side in ("long", "short", "flat"):
-        if side not in pivot.columns:
+        if side not in columns:
             continue
-        values = pivot[side].to_numpy()
-        ax.bar(np.arange(len(pivot)), values, bottom=bottom, label=side)
+        values = matrix[:, columns.index(side)]
+        ax.bar(np.arange(len(rows)), values, bottom=bottom, label=side)
         bottom = bottom + values
     ax.set_title("Top Decision Absolute Exposure By Side")
     ax.set_xlabel("sampled date index")
@@ -3222,20 +3285,26 @@ def _plot_decision_exposure(frame: pl.DataFrame, output_path: Path) -> None:
 
 
 def _plot_decision_exposure_datashader(frame: pl.DataFrame, output_path: Path) -> None:
-    if frame.empty or not {"date", "side", "weight"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"date", "side", "weight"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["abs_weight"] = pd.to_numeric(data["weight"], errors="coerce").abs()
-    data = data.dropna(subset=["abs_weight"])
-    pivot = data.pivot_table(index="date", columns="side", values="abs_weight", aggfunc="sum", fill_value=0.0)
-    if pivot.empty:
+    data = _with_numeric(frame.select(["date", "side", "weight"]), "weight")
+    data = data.with_columns(pl.col("weight").abs().alias("abs_weight")).drop_nulls(subset=["date", "side", "abs_weight"]).sort("date")
+    rows, columns, matrix = _pivot_sum_matrix(
+        data,
+        index_col="date",
+        column_col="side",
+        value_col="abs_weight",
+        index_order=data.get_column("date").unique(maintain_order=True).to_list(),
+        column_order=["long", "short", "flat"],
+    )
+    if matrix.size == 0:
         return
-    x = np.arange(len(pivot), dtype=np.float64)
+    x = np.arange(len(rows), dtype=np.float64)
     colors = {"long": "#1f77b4", "short": "#d62728", "flat": "#7f7f7f"}
     series = [
-        (side, x, pivot[side].to_numpy(dtype=np.float64), colors[side])
+        (side, x, matrix[:, columns.index(side)], colors[side])
         for side in ("long", "short", "flat")
-        if side in pivot.columns
+        if side in columns
     ]
     if not series:
         return
@@ -3250,16 +3319,14 @@ def _plot_decision_exposure_datashader(frame: pl.DataFrame, output_path: Path) -
 
 
 def _plot_aux_dim_datashader(frame: pl.DataFrame, *, output_path: Path, title: str) -> None:
-    if frame.empty or not {"dim", "mean_abs"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"dim", "mean_abs"}.issubset(frame.columns):
         return
-    data = frame[["dim", "mean_abs"]].dropna().copy()
-    data["dim"] = pd.to_numeric(data["dim"], errors="coerce")
-    data["mean_abs"] = pd.to_numeric(data["mean_abs"], errors="coerce")
-    data = data.dropna().sort_values("dim")
-    if data.empty:
+    data = _with_numeric(frame.select(["dim", "mean_abs"]), "dim", "mean_abs")
+    data = data.drop_nulls(subset=["dim", "mean_abs"]).sort("dim")
+    if data.is_empty():
         return
     save_line_series_datashader(
-        [("mean_abs", data["dim"].to_numpy(dtype=np.float64), data["mean_abs"].to_numpy(dtype=np.float64), "#2171b5")],
+        [("mean_abs", _numeric_numpy(data, "dim"), _numeric_numpy(data, "mean_abs"), "#2171b5")],
         output_path=output_path,
         title=title,
         y_label="mean_abs",
@@ -3269,13 +3336,10 @@ def _plot_aux_dim_datashader(frame: pl.DataFrame, *, output_path: Path, title: s
 
 
 def _plot_aux_projection_datashader(frame: pl.DataFrame, *, output_path: Path, title: str) -> None:
-    if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
+    if _is_empty_frame(frame) or not {"umap_x", "umap_y"}.issubset(frame.columns):
         return
-    data = frame.copy()
-    data["umap_x"] = pd.to_numeric(data["umap_x"], errors="coerce")
-    data["umap_y"] = pd.to_numeric(data["umap_y"], errors="coerce")
-    data = data.dropna(subset=["umap_x", "umap_y"])
-    if data.empty:
+    data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
+    if data.is_empty():
         return
     colors = {
         "stock": "#1f77b4",
@@ -3285,18 +3349,21 @@ def _plot_aux_projection_datashader(frame: pl.DataFrame, *, output_path: Path, t
     }
     series = []
     if "point_type" in data.columns:
-        for point_type, group in data.groupby("point_type"):
+        point_types = data.get_column("point_type").cast(pl.String).unique(maintain_order=True).to_list()
+        typed = data.with_columns(pl.col("point_type").cast(pl.String).alias("point_type"))
+        for point_type in point_types:
+            group = typed.filter(pl.col("point_type") == point_type)
             color = colors.get(str(point_type), "#17becf")
             series.append(
                 (
                     str(point_type),
-                    group["umap_x"].to_numpy(dtype=np.float64),
-                    group["umap_y"].to_numpy(dtype=np.float64),
+                    _numeric_numpy(group, "umap_x"),
+                    _numeric_numpy(group, "umap_y"),
                     color,
                 )
             )
     else:
-        series.append(("points", data["umap_x"].to_numpy(dtype=np.float64), data["umap_y"].to_numpy(dtype=np.float64), "#1f77b4"))
+        series.append(("points", _numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), "#1f77b4"))
     save_scatter_datashader(series, output_path=output_path, title=title, width=1100, height=760)
 
 
@@ -3466,12 +3533,15 @@ def _plot_all_explanation_figures(
                     plot_timing.setdefault("datashader_fallbacks", []).append(
                         {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
                     )
-                if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
+                if _is_empty_frame(frame) or not {"umap_x", "umap_y"}.issubset(frame.columns):
                     continue
                 import matplotlib.pyplot as plt
 
+                data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
+                if data.is_empty():
+                    continue
                 fig, ax = plt.subplots(figsize=(8, 6), dpi=130)
-                ax.scatter(frame["umap_x"], frame["umap_y"], s=4, alpha=0.5)
+                ax.scatter(_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), s=4, alpha=0.5)
                 ax.set_title(f"cuML UMAP Projection: {name}")
                 ax.set_xlabel("umap_x")
                 ax.set_ylabel("umap_y")
@@ -3480,12 +3550,15 @@ def _plot_all_explanation_figures(
                 fig.savefig(out)
                 plt.close(fig)
         else:
-            if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
+            if _is_empty_frame(frame) or not {"umap_x", "umap_y"}.issubset(frame.columns):
                 continue
             import matplotlib.pyplot as plt
 
+            data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
+            if data.is_empty():
+                continue
             fig, ax = plt.subplots(figsize=(8, 6), dpi=130)
-            ax.scatter(frame["umap_x"], frame["umap_y"], s=4, alpha=0.5)
+            ax.scatter(_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), s=4, alpha=0.5)
             ax.set_title(f"cuML UMAP Projection: {name}")
             ax.set_xlabel("umap_x")
             ax.set_ylabel("umap_y")
@@ -3521,19 +3594,19 @@ def write_explanation_outputs(
     aux_projection_frames: dict[str, pl.DataFrame] = result.get("aux_projection_frames", {})
     stage_start = time.perf_counter()
     for name, frame in frames.items():
-        if frame is not None and not frame.empty:
-            frame.to_csv(output_dir / f"{name}.csv", index=False)
+        if not _is_empty_frame(frame):
+            _write_csv(frame, output_dir / f"{name}.csv")
     aux_dir = output_dir / "aux_dims"
     for name, frame in aux_dim_frames.items():
         aux_dir.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
-        frame.to_csv(aux_dir / f"{safe_name}.csv", index=False)
+        _write_csv(frame, aux_dir / f"{safe_name}.csv")
     projection_dir = output_dir / "aux_projections"
     for name, frame in aux_projection_frames.items():
-        if frame is not None and not frame.empty:
+        if not _is_empty_frame(frame):
             projection_dir.mkdir(parents=True, exist_ok=True)
             safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
-            frame.to_csv(projection_dir / f"{safe_name}.csv", index=False)
+            _write_csv(frame, projection_dir / f"{safe_name}.csv")
     _mark_elapsed(write_timing, "csv_s", stage_start)
     stage_start = time.perf_counter()
     standard_plot_details: dict[str, Any] = {}

@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-import pandas as pd
+import polars as pl
+import pyarrow.parquet as pq
 
 
 PRICE_COLUMNS = ("open", "max", "min", "close", "adjclose")
@@ -110,38 +111,84 @@ MANUAL_REVIEW_SYMBOLS: dict[str, str] = {
 
 def _safe_float(value: object) -> float:
     try:
-        if pd.isna(value):
+        if _is_null(value):
             return float("nan")
         return float(value)
     except Exception:
         return float("nan")
 
 
-def _candidate_rows(investigation: pd.DataFrame, min_abs_log_return: float) -> pd.DataFrame:
-    raw = pd.to_numeric(investigation.get("raw_close_logret"), errors="coerce")
-    adj = pd.to_numeric(investigation.get("adjclose_logret"), errors="coerce")
-    extreme = raw.abs().ge(min_abs_log_return) | adj.abs().ge(min_abs_log_return)
+def _is_null(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(np.isnan(value))  # type: ignore[arg-type]
+    except TypeError:
+        return False
 
-    has_action = pd.Series(False, index=investigation.index)
+
+def _format_date(value: object) -> str | None:
+    if _is_null(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError:
+        return text[:10]
+
+
+def _read_parquet(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path))
+
+
+def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    pq.write_table(frame.to_arrow(), path)
+
+
+def _method_counts(frame: pl.DataFrame) -> dict[str, int]:
+    if frame.is_empty() or "repair_method" not in frame.columns:
+        return {}
+    counts = frame.group_by("repair_method").len(name="count").sort("repair_method")
+    return {str(row["repair_method"]): int(row["count"]) for row in counts.iter_rows(named=True)}
+
+
+def _candidate_rows(investigation: pl.DataFrame, min_abs_log_return: float) -> pl.DataFrame:
+    raw_expr = pl.col("raw_close_logret").cast(pl.Float64, strict=False) if "raw_close_logret" in investigation.columns else pl.lit(None)
+    adj_expr = pl.col("adjclose_logret").cast(pl.Float64, strict=False) if "adjclose_logret" in investigation.columns else pl.lit(None)
+    work = investigation.with_columns(
+        [
+            raw_expr.alias("__raw_close_logret"),
+            adj_expr.alias("__adjclose_logret"),
+        ]
+    )
+    extreme = (
+        pl.col("__raw_close_logret").abs().ge(min_abs_log_return).fill_null(False)
+        | pl.col("__adjclose_logret").abs().ge(min_abs_log_return).fill_null(False)
+    )
+
+    has_action = pl.lit(False)
     for col in ("dividends", "stock_splits", "capital_gains"):
-        if col in investigation.columns:
-            has_action = has_action | pd.to_numeric(investigation[col], errors="coerce").fillna(0.0).abs().gt(1e-12)
+        if col in work.columns:
+            has_action = has_action | pl.col(col).cast(pl.Float64, strict=False).fill_null(0.0).abs().gt(1e-12)
 
-    return investigation.loc[extreme & ~has_action].copy()
+    return work.filter(extreme & ~has_action).drop(["__raw_close_logret", "__adjclose_logret"])
 
 
-def _collect_event_targets(candidates: pd.DataFrame) -> pd.DataFrame:
+def _collect_event_targets(candidates: pl.DataFrame) -> pl.DataFrame:
     rows: list[dict[str, object]] = []
-    for _, row in candidates.iterrows():
+    for row in candidates.iter_rows(named=True):
         symbol = str(row["symbol"])
         for endpoint in ("raw_date", "raw_next_date"):
             date_value = row.get(endpoint)
-            if pd.isna(date_value) or not str(date_value).strip():
+            date = _format_date(date_value)
+            if date is None:
                 continue
             rows.append(
                 {
                     "symbol": symbol,
-                    "date": pd.to_datetime(date_value).strftime("%Y-%m-%d"),
+                    "date": date,
                     "source_fold": row.get("fold"),
                     "source_event_date": row.get("date"),
                     "endpoint": endpoint,
@@ -155,39 +202,45 @@ def _collect_event_targets(candidates: pd.DataFrame) -> pd.DataFrame:
                 }
             )
     if not rows:
-        return pd.DataFrame()
-    targets = pd.DataFrame(rows)
-    return targets.drop_duplicates(["symbol", "date"]).sort_values(["symbol", "date"]).reset_index(drop=True)
+        return pl.DataFrame()
+    targets = pl.DataFrame(rows)
+    return targets.unique(subset=["symbol", "date"], maintain_order=True).sort(["symbol", "date"])
 
 
-def _date_series(frame: pd.DataFrame) -> pd.Series:
-    return pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d")
+def _date_values(frame: pl.DataFrame) -> list[str | None]:
+    if "date" not in frame.columns:
+        return []
+    return [_format_date(value) for value in frame.get_column("date").to_list()]
 
 
-def _row_mask(frame: pd.DataFrame, dates: Iterable[str]) -> pd.Series:
+def _row_indices(frame: pl.DataFrame, dates: Iterable[str]) -> list[int]:
     wanted = {str(d) for d in dates}
-    return _date_series(frame).isin(wanted)
+    return [idx for idx, value in enumerate(_date_values(frame)) if value in wanted]
 
 
-def _range_mask(frame: pd.DataFrame, start_date: str | None, end_date: str | None) -> pd.Series:
-    dates = pd.to_datetime(frame["date"])
-    mask = pd.Series(True, index=frame.index)
-    if start_date is not None:
-        mask &= dates.ge(pd.Timestamp(start_date))
-    if end_date is not None:
-        mask &= dates.le(pd.Timestamp(end_date))
-    return mask
+def _range_indices(frame: pl.DataFrame, start_date: str | None, end_date: str | None) -> list[int]:
+    out: list[int] = []
+    for idx, value in enumerate(_date_values(frame)):
+        if value is None:
+            continue
+        if start_date is not None and value < start_date:
+            continue
+        if end_date is not None and value > end_date:
+            continue
+        out.append(idx)
+    return out
 
 
 def _record_values(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     idx: int,
     *,
     action: RepairAction,
     old_values: dict[str, object],
     new_values: dict[str, object],
 ) -> dict[str, object]:
-    date = pd.to_datetime(frame.iloc[idx]["date"]).strftime("%Y-%m-%d")
+    row = frame.row(idx, named=True)
+    date = _format_date(row.get("date")) or str(row.get("date"))
     record: dict[str, object] = {
         "symbol": action.symbol,
         "date": date,
@@ -206,27 +259,27 @@ def _record_values(
             record[f"new_{col}"] = new_values[col]
     for col in CORPORATE_ACTION_COLUMNS:
         if col in frame.columns:
-            record[col] = frame.iloc[idx].get(col)
+            record[col] = row.get(col)
     if "Trading_Volume" in frame.columns:
-        record["Trading_Volume"] = frame.iloc[idx].get("Trading_Volume")
+        record["Trading_Volume"] = row.get("Trading_Volume")
     return record
 
 
-def _interpolated_values(frame: pd.DataFrame, idx: int, columns: Iterable[str]) -> dict[str, float]:
+def _interpolated_values(frame: pl.DataFrame, idx: int, columns: Iterable[str]) -> dict[str, float]:
     out: dict[str, float] = {}
     prev_idx = idx - 1
     next_idx = idx + 1
     for col in columns:
         if col not in frame.columns:
             continue
-        prev_val = _safe_float(frame.iloc[prev_idx].get(col)) if prev_idx >= 0 else float("nan")
-        next_val = _safe_float(frame.iloc[next_idx].get(col)) if next_idx < len(frame) else float("nan")
+        prev_val = _safe_float(frame.row(prev_idx, named=True).get(col)) if prev_idx >= 0 else float("nan")
+        next_val = _safe_float(frame.row(next_idx, named=True).get(col)) if next_idx < frame.height else float("nan")
         vals = [v for v in (prev_val, next_val) if np.isfinite(v)]
         out[col] = float(np.mean(vals)) if vals else float("nan")
     return out
 
 
-def _apply_action(frame: pd.DataFrame, action: RepairAction, *, apply: bool) -> list[dict[str, object]]:
+def _apply_action(frame: pl.DataFrame, action: RepairAction, *, apply: bool) -> tuple[list[dict[str, object]], pl.DataFrame]:
     if "date" not in frame.columns:
         return [
             {
@@ -234,13 +287,12 @@ def _apply_action(frame: pd.DataFrame, action: RepairAction, *, apply: bool) -> 
                 "repair_method": "missing_date_column_no_change",
                 "repair_reason": action.reason,
             }
-        ]
+        ], frame
 
     if action.dates:
-        mask = _row_mask(frame, action.dates)
+        indices = _row_indices(frame, action.dates)
     else:
-        mask = _range_mask(frame, action.start_date, action.end_date)
-    indices = [int(i) for i in np.flatnonzero(mask.to_numpy())]
+        indices = _range_indices(frame, action.start_date, action.end_date)
     if not indices:
         return [
             {
@@ -251,16 +303,18 @@ def _apply_action(frame: pd.DataFrame, action: RepairAction, *, apply: bool) -> 
                 "start_date": action.start_date,
                 "end_date": action.end_date,
             }
-        ]
+        ], frame
 
     records: list[dict[str, object]] = []
+    rows = frame.to_dicts() if apply else []
     for idx in indices:
-        old_values = {col: frame.iloc[idx].get(col) for col in action.columns if col in frame.columns}
+        row = frame.row(idx, named=True)
+        old_values = {col: row.get(col) for col in action.columns if col in frame.columns}
         if action.method.startswith("interpolate_"):
             new_values = _interpolated_values(frame, idx, action.columns)
         elif action.factor is not None:
             new_values = {
-                col: (_safe_float(frame.iloc[idx].get(col)) * float(action.factor))
+                col: (_safe_float(row.get(col)) * float(action.factor))
                 for col in action.columns
                 if col in frame.columns
             }
@@ -270,29 +324,34 @@ def _apply_action(frame: pd.DataFrame, action: RepairAction, *, apply: bool) -> 
         records.append(_record_values(frame, idx, action=action, old_values=old_values, new_values=new_values))
         if apply:
             for col, value in new_values.items():
-                frame.iat[idx, frame.columns.get_loc(col)] = value
-    return records
+                rows[idx][col] = value
+    repaired = pl.DataFrame(rows, schema=frame.schema, orient="row") if apply else frame
+    return records, repaired
 
 
-def _manual_review_records(targets: pd.DataFrame) -> list[dict[str, object]]:
+def _manual_review_records(targets: pl.DataFrame) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     auto_symbols = {a.symbol for a in AUTO_REPAIRS}
-    for symbol, group in targets.groupby("symbol", sort=True):
+    if targets.is_empty() or "symbol" not in targets.columns:
+        return records
+    for symbol in sorted(str(value) for value in targets.get_column("symbol").unique().to_list()):
+        group = targets.filter(pl.col("symbol").cast(pl.String) == symbol)
         if symbol not in MANUAL_REVIEW_SYMBOLS:
             continue
         reason = MANUAL_REVIEW_SYMBOLS[symbol]
-        for _, row in group.iterrows():
-            rec = row.to_dict()
+        for row in group.iter_rows(named=True):
+            rec = dict(row)
             rec["repair_method"] = "manual_review_no_change"
             rec["repair_reason"] = reason
             records.append(rec)
 
     known = auto_symbols | set(MANUAL_REVIEW_SYMBOLS)
-    for symbol, group in targets.groupby("symbol", sort=True):
+    for symbol in sorted(str(value) for value in targets.get_column("symbol").unique().to_list()):
+        group = targets.filter(pl.col("symbol").cast(pl.String) == symbol)
         if symbol in known:
             continue
-        for _, row in group.iterrows():
-            rec = row.to_dict()
+        for row in group.iter_rows(named=True):
+            rec = dict(row)
             rec["repair_method"] = "unclassified_no_change"
             rec["repair_reason"] = "No curated repair rule yet; inspect before mutating source data."
             records.append(rec)
@@ -308,7 +367,7 @@ def repair(
     min_abs_log_return: float,
     apply: bool,
 ) -> Path:
-    investigation = pd.read_csv(investigation_path, dtype={"symbol": str})
+    investigation = pl.read_csv(investigation_path, infer_schema=False).with_columns(pl.col("symbol").cast(pl.String))
     candidates = _candidate_rows(investigation, min_abs_log_return)
     targets = _collect_event_targets(candidates)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -333,8 +392,8 @@ def repair(
             )
             continue
 
-        frame = pd.read_parquet(parquet_path)
-        action_records = _apply_action(frame, action, apply=apply)
+        frame = _read_parquet(parquet_path)
+        action_records, repaired = _apply_action(frame, action, apply=apply)
         records.extend(action_records)
         changed = apply and any(
             rec.get("repair_method") == action.method and any(str(k).startswith("new_") for k in rec)
@@ -343,22 +402,22 @@ def repair(
         if changed:
             symbol_backup_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(parquet_path, symbol_backup_dir / parquet_path.name)
-            frame.to_parquet(parquet_path, index=False)
+            _write_parquet(repaired, parquet_path)
             touched_symbols.append(action.symbol)
 
     records.extend(_manual_review_records(targets))
-    ledger = pd.DataFrame(records)
-    ledger.to_csv(ledger_path, index=False)
+    ledger = pl.DataFrame(records) if records else pl.DataFrame()
+    ledger.write_csv(ledger_path)
 
-    method_counts = ledger["repair_method"].value_counts().to_dict() if "repair_method" in ledger.columns else {}
+    method_counts = _method_counts(ledger)
     lines = [
         "# Fold >10% Daily Return Price Repair Ledger",
         "",
         f"- apply: `{apply}`",
         f"- investigation: `{investigation_path}`",
         f"- min_abs_symbol_log_return: `{min_abs_log_return:.6f}`",
-        f"- candidate extreme contribution rows: `{len(candidates)}`",
-        f"- unique symbol/date event targets: `{len(targets)}`",
+        f"- candidate extreme contribution rows: `{candidates.height}`",
+        f"- unique symbol/date event targets: `{targets.height}`",
         f"- touched parquet symbols: `{len(set(touched_symbols))}`",
         f"- backup_dir: `{symbol_backup_dir}`",
         "",

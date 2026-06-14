@@ -3,8 +3,13 @@ from __future__ import annotations
 import argparse
 
 import polars as pl
+import pyarrow.parquet as pq
 
 from downloader import download_yahoo_ohlcv as yahoo
+
+
+def _write_parquet(frame: pl.DataFrame, path) -> None:
+    pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
 
 
 def _base_args(tmp_path, **overrides):
@@ -269,7 +274,7 @@ def test_repair_plan_removes_delisted_file_without_usable_history(tmp_path):
     output_dir = tmp_path / "us_stocks"
     output_dir.mkdir()
     output_path = output_dir / "OLDW_features.parquet"
-    pl.DataFrame({"close": [1.0]}).write_parquet(output_path)
+    _write_parquet(pl.DataFrame({"close": [1.0]}), output_path)
 
     record = yahoo.SymbolRecord("OLDW", "old warrant", "us_delisted", "OLDW")
     checks = yahoo._resolve_repair_plan("us_stocks", _base_args(tmp_path, asset="us_stocks"), [record], output_dir)
@@ -285,7 +290,7 @@ def test_repair_plan_keeps_delisted_file_with_history_without_refetch(tmp_path):
     output_dir = tmp_path / "us_stocks"
     output_dir.mkdir()
     output_path = output_dir / "OLDW_features.parquet"
-    pl.DataFrame(
+    _write_parquet(pl.DataFrame(
         {
             "date": ["2026-01-01", "2026-01-02"],
             "open": [1.0, 1.1],
@@ -295,7 +300,7 @@ def test_repair_plan_keeps_delisted_file_with_history_without_refetch(tmp_path):
             "adjclose": [1.1, 1.0],
             "Trading_Volume": [100, 0],
         }
-    ).write_parquet(output_path)
+    ), output_path)
 
     record = yahoo.SymbolRecord("OLDW", "old warrant", "us_delisted", "OLDW")
     checks = yahoo._resolve_repair_plan("us_stocks", _base_args(tmp_path, asset="us_stocks"), [record], output_dir)

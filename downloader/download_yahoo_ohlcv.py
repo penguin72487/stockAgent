@@ -691,14 +691,14 @@ def _daily_update_target_adjustment_reason(asset_class: str, requested: date, ef
 def _read_parquet_row_count(output_path: Path) -> int:
     if pq is not None:
         return int(pq.ParquetFile(output_path, memory_map=True).metadata.num_rows)
-    if pl is not None:
-        return int(pl.scan_parquet(str(output_path)).select(pl.len()).collect().item())
-    raise RuntimeError("reading parquet requires pyarrow or polars")
+    raise RuntimeError("reading parquet requires pyarrow")
 
 
 def _read_parquet_frame(output_path: Path) -> object:
     _require_polars()
-    return pl.read_parquet(str(output_path))
+    if pq is None:
+        raise RuntimeError("reading parquet requires pyarrow")
+    return pl.from_arrow(pq.read_table(output_path, memory_map=True))
 
 
 def _date_bounds_from_arrow_table(table: object) -> tuple[str | None, str | None]:
@@ -736,36 +736,6 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
     if first_date is None or last_date is None:
         return ExistingFileInfo(None, None, "no_valid_date", columns, checked_through)
     return ExistingFileInfo(first_date, last_date, None, columns, checked_through)
-
-
-def _load_existing_file_info_polars(output_path: Path) -> ExistingFileInfo | None:
-    if pl is None:
-        return None
-    try:
-        lazy = pl.scan_parquet(str(output_path))
-        schema = lazy.collect_schema()
-        columns = set(schema.names() if hasattr(schema, "names") else schema.keys())
-    except Exception as exc:
-        return ExistingFileInfo(None, None, f"schema_error: {exc}", set())
-
-    if "date" not in columns:
-        return ExistingFileInfo(None, None, "empty", columns)
-
-    try:
-        bounds = lazy.select(
-            pl.col("date").min().alias("first_date"),
-            pl.col("date").max().alias("last_date"),
-        ).collect()
-    except Exception as exc:
-        return ExistingFileInfo(None, None, f"read_error: {exc}", columns)
-    if bounds.is_empty():
-        return ExistingFileInfo(None, None, "empty", columns)
-    row = bounds.to_dicts()[0]
-    first = _coerce_to_date(row.get("first_date"))
-    last = _coerce_to_date(row.get("last_date"))
-    if first is None or last is None:
-        return ExistingFileInfo(None, None, "no_valid_date", columns)
-    return ExistingFileInfo(first.isoformat(), last.isoformat(), None, columns)
 
 
 def _prepare_arrow_table_for_write(frame: object) -> object:
@@ -856,10 +826,8 @@ def _write_feature_parquet_atomic(
                 coerce_timestamps="us",
                 allow_truncated_timestamps=True,
             )
-        elif pl is not None:
-            frame.write_parquet(str(tmp_path), compression="snappy", statistics=True)
         else:
-            raise RuntimeError("writing parquet requires pyarrow or polars")
+            raise RuntimeError("writing parquet requires pyarrow")
         _fsync_file(tmp_path)
         os.replace(tmp_path, output_path)
         _fsync_directory(output_path.parent)
@@ -2358,11 +2326,7 @@ def _load_existing_file_info(output_path: Path) -> ExistingFileInfo:
     if pyarrow_info is not None:
         return pyarrow_info
 
-    polars_info = _load_existing_file_info_polars(output_path)
-    if polars_info is not None:
-        return polars_info
-
-    return ExistingFileInfo(None, None, "read_error: pyarrow/polars not available", set())
+    return ExistingFileInfo(None, None, "read_error: pyarrow not available", set())
 
 
 def _summarize_repair_coverage(checks: list[RepairCheck], target_end: str) -> tuple[str | None, str | None, int | None, int]:

@@ -68,7 +68,7 @@ def test_explainability_cuml_umap_aux_projection_outputs(tmp_path: Path) -> None
 
     assert output["aux_projection_frames"]
     assert "stock_embedding" in output["aux_projection_frames"]
-    assert not output["aux_projection_frames"]["stock_embedding"].empty
+    assert not output["aux_projection_frames"]["stock_embedding"].is_empty()
 
     out_dir = tmp_path / "explain"
     write_explanation_outputs(output, out_dir, metadata={"model_name": "aux"}, plot_backend="rapids_datashader")

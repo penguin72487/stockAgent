@@ -658,9 +658,12 @@ def _load_symbol_arrays_polars_lazy(
 ) -> _SymbolPanelArrays:
     if pl is None:
         raise RuntimeError("Polars is not available")
+    if pq is None:
+        raise RuntimeError("PyArrow is not available")
 
-    lazy = pl.scan_parquet(path).sort("date")
-    schema_names = set(lazy.collect_schema().names())
+    frame = pl.from_arrow(pq.read_table(path, memory_map=True))
+    lazy = frame.lazy().sort("date")
+    schema_names = set(frame.columns)
     price_decimals = _price_decimals_for_path(path)
 
     def num(name: str):
@@ -1073,15 +1076,15 @@ def build_panel(
             raise RuntimeError("data.panel_backend='pyarrow' requires the pyarrow package")
         selected_backend = "pyarrow"
     elif panel_backend in {"polars", "polars_lazy", "polars_streaming"}:
-        if pl is None:
-            raise RuntimeError(f"data.panel_backend={panel_backend!r} requires the polars package")
+        if pl is None or pq is None:
+            raise RuntimeError(f"data.panel_backend={panel_backend!r} requires the polars and pyarrow packages")
         selected_backend = "polars_streaming" if panel_backend == "polars_streaming" else "polars_lazy"
-    elif panel_backend == "auto" and pl is not None:
+    elif panel_backend == "auto" and pl is not None and pq is not None:
         selected_backend = "polars_lazy"
     elif panel_backend == "auto" and pq is not None:
         selected_backend = "pyarrow"
     else:
-        raise RuntimeError("data.panel_backend='auto' requires polars or pyarrow")
+        raise RuntimeError("data.panel_backend='auto' requires pyarrow")
 
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"

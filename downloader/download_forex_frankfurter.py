@@ -7,12 +7,21 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 import requests
 
 from common import resolve_end_date, run_parallel_tasks
 
 API_BASE = "https://api.frankfurter.app"
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
+
+
+def _read_parquet(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path))
+
+
+def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
 
 @dataclass(slots=True)
 class SymbolRecord:
@@ -189,7 +198,7 @@ def _download_pair(
 
     if output_path.exists() and incremental:
         try:
-            existing_frame = pl.read_parquet(output_path)
+            existing_frame = _read_parquet(output_path)
             existing_rows = int(existing_frame.height)
             latest_date = _max_frame_date(existing_frame)
             if latest_date is not None:
@@ -213,7 +222,7 @@ def _download_pair(
 
     if output_path.exists() and not refresh and not incremental:
         try:
-            rows = pl.read_parquet(output_path).height
+            rows = _read_parquet(output_path).height
             return DownloadResult(code=record.code, status="skipped_existing", rows=int(rows), output_path=str(output_path))
         except Exception as exc:
             return DownloadResult(
@@ -265,7 +274,7 @@ def _download_pair(
                 .unique(subset=["date"], keep="last", maintain_order=True)
                 .sort("date")
             )
-            merged.write_parquet(output_path, compression="snappy", statistics=True)
+            _write_parquet(merged, output_path)
             return DownloadResult(
                 code=record.code,
                 status="updated_incremental",
@@ -273,7 +282,7 @@ def _download_pair(
                 output_path=str(output_path),
             )
 
-        frame.write_parquet(output_path, compression="snappy", statistics=True)
+        _write_parquet(frame, output_path)
         return DownloadResult(code=record.code, status="updated", rows=int(frame.height), output_path=str(output_path))
     except Exception as exc:
         return DownloadResult(code=record.code, status="failed", rows=0, output_path=None, message=str(exc))

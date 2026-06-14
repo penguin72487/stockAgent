@@ -54,8 +54,8 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     )
 
     assert output["summary"]["warnings"]
-    assert not output["frames"]["feature_importance_gradient"].empty
-    assert not output["frames"]["top_decisions"].empty
+    assert not output["frames"]["feature_importance_gradient"].is_empty()
+    assert not output["frames"]["top_decisions"].is_empty()
 
     out_dir = tmp_path / "explain"
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -117,12 +117,12 @@ def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards()
         ("feature_time_integrated_gradients", "integrated_gradients_abs"),
         ("feature_time_perturbation", "weight_abs_delta"),
     ):
-        left = serial["frames"][frame_name].sort_values(["lookback_index", "feature"]).reset_index(drop=True)
-        right = chunked["frames"][frame_name].sort_values(["lookback_index", "feature"]).reset_index(drop=True)
-        assert left[["lookback_index", "lookback_from_end", "feature"]].equals(
-            right[["lookback_index", "lookback_from_end", "feature"]]
+        left = serial["frames"][frame_name].sort(["lookback_index", "feature"])
+        right = chunked["frames"][frame_name].sort(["lookback_index", "feature"])
+        assert left.select(["lookback_index", "lookback_from_end", "feature"]).equals(
+            right.select(["lookback_index", "lookback_from_end", "feature"])
         )
-        np.testing.assert_allclose(left[value_col].to_numpy(), right[value_col].to_numpy(), rtol=1e-5, atol=1e-7)
+        np.testing.assert_allclose(left.get_column(value_col).to_numpy(), right.get_column(value_col).to_numpy(), rtol=1e-5, atol=1e-7)
 
     assert chunked_model.forward_calls < serial_model.forward_calls
 
