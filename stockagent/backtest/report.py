@@ -65,6 +65,12 @@ def _safe_expm1(log_sum: float) -> float:
     return math.expm1(log_sum)
 
 
+def _total_log_return(log_returns: np.ndarray) -> float:
+    """Return the finite cumulative log return for summary plots."""
+    clean = np.nan_to_num(np.asarray(log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    return float(clean.sum())
+
+
 def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     """Build a plot-safe equity curve from log returns."""
     clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
@@ -623,20 +629,22 @@ def plot_first_year_fold_metric_bars(
     all_first_year_baseline_log: list[np.ndarray],
     output_path: str | Path | None = None,
 ) -> None:
-    """Plot per-fold first-test-year return/risk metrics."""
+    """Plot per-fold first-test-year log-return/risk metrics."""
     if not fold_ids:
         return
 
     labels = [f"F{int(fold_id):02d}" for fold_id in fold_ids]
     rows: list[dict[str, float]] = []
     for strategy, baseline in zip(all_first_year_strategy_log, all_first_year_baseline_log, strict=False):
+        strategy_log_return = _total_log_return(strategy)
+        baseline_log_return = _total_log_return(baseline)
         result = _build_plot_result(strategy, baseline)
         metrics = compute_metrics(result)
         rows.append(
             {
-                "strategy_return": float(metrics["cumulative_return"]),
-                "baseline_return": float(metrics["cumulative_benchmark"]),
-                "excess_return": float(metrics["excess_return_vs_universe_average"]),
+                "strategy_return": strategy_log_return,
+                "baseline_return": baseline_log_return,
+                "excess_return": strategy_log_return - baseline_log_return,
                 "sharpe": float(metrics["sharpe"]),
                 "sortino": float(metrics["sortino"]),
                 "max_drawdown": float(metrics["max_drawdown"]),
@@ -660,14 +668,14 @@ def plot_first_year_fold_metric_bars(
     ax.bar(x - width / 2, strategy_return, width, label="Strategy")
     ax.bar(x + width / 2, baseline_return, width, label="Baseline")
     ax.axhline(0.0, color="black", linewidth=0.8)
-    ax.set_title("First Test Year Cumulative Return")
-    ax.set_ylabel("Return")
+    ax.set_title("First Test Year Cumulative Log Return")
+    ax.set_ylabel("Log return")
     ax.legend()
 
     ax = axes[0, 1]
     ax.bar(x, excess_return, color=np.where(excess_return >= 0.0, "tab:green", "tab:red"))
     ax.axhline(0.0, color="black", linewidth=0.8)
-    ax.set_title("First Test Year Excess Return")
+    ax.set_title("First Test Year Excess Log Return")
     ax.set_ylabel("Strategy - Baseline")
 
     ax = axes[1, 0]
