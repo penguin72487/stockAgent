@@ -665,39 +665,33 @@ def _bench_wide_write_pyarrow(path: Path, dates: np.ndarray, weights: np.ndarray
 
 def _bench_wide_write_polars(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
     import polars as pl
+    import pyarrow.parquet as pq
 
     data = {"date": dates}
     data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
-    pl.DataFrame(data).write_parquet(path, compression="snappy")
+    pq.write_table(pl.DataFrame(data).to_arrow(), path, compression="snappy")
     return path.stat().st_size
 
 
 def _bench_wide_write_polars_lazy(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
     import polars as pl
+    import pyarrow.parquet as pq
 
     data = {"date": dates}
     data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
     lazy = pl.LazyFrame(data)
-    if hasattr(lazy, "sink_parquet"):
-        lazy.sink_parquet(path, compression="snappy")
-    else:
-        lazy.collect().write_parquet(path, compression="snappy")
+    pq.write_table(lazy.collect().to_arrow(), path, compression="snappy")
     return path.stat().st_size
 
 
 def _bench_wide_write_polars_streaming(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
     import polars as pl
+    import pyarrow.parquet as pq
 
     data = {"date": dates}
     data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
     lazy = pl.LazyFrame(data)
-    if hasattr(lazy, "sink_parquet"):
-        try:
-            lazy.sink_parquet(path, compression="snappy", engine="streaming")
-        except TypeError:
-            lazy.sink_parquet(path, compression="snappy")
-    else:
-        lazy.collect(engine="streaming").write_parquet(path, compression="snappy")
+    pq.write_table(lazy.collect(engine="streaming").to_arrow(), path, compression="snappy")
     return path.stat().st_size
 
 

@@ -101,14 +101,16 @@ def _schema_columns(path: Path) -> set[str] | None:
 
 
 def _read_audit_frame(path: Path) -> tuple[pl.DataFrame, set[str]]:
+    if pq is None:
+        raise RuntimeError("audit parquet reads require pyarrow")
     schema_columns = _schema_columns(path)
     if schema_columns is not None:
         columns = [column for column in READ_COLUMNS if column in schema_columns]
         if not columns:
             return pl.DataFrame(), schema_columns
-        return pl.read_parquet(path, columns=columns), schema_columns
+        return pl.from_arrow(pq.read_table(path, columns=columns)), schema_columns
 
-    frame = pl.read_parquet(path)
+    frame = pl.from_arrow(pq.read_table(path))
     return frame.select([column for column in READ_COLUMNS if column in frame.columns]), set(frame.columns)
 
 

@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
+import pyarrow.parquet as pq
 import requests
 
 
@@ -57,7 +58,52 @@ SOURCE_REPAIRS: tuple[SourceRepair, ...] = (
 )
 
 
-def _fetch_finmind(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _is_null(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(np.isnan(value))  # type: ignore[arg-type]
+    except TypeError:
+        return False
+
+
+def _safe_float(value: object) -> float:
+    if _is_null(value):
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _format_date(value: object) -> str | None:
+    if _is_null(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError:
+        return text[:10]
+
+
+def _read_parquet(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path))
+
+
+def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    pq.write_table(frame.to_arrow(), path)
+
+
+def _method_counts(frame: pl.DataFrame) -> dict[str, int]:
+    if frame.is_empty() or "repair_method" not in frame.columns:
+        return {}
+    counts = frame.group_by("repair_method").len(name="count").sort("repair_method")
+    return {str(row["repair_method"]): int(row["count"]) for row in counts.iter_rows(named=True)}
+
+
+def _fetch_finmind(symbol: str, start_date: str, end_date: str) -> pl.DataFrame:
     response = requests.get(
         "https://api.finmindtrade.com/api/v4/data",
         params={
@@ -73,14 +119,16 @@ def _fetch_finmind(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     if payload.get("status") not in (None, 200) and payload.get("msg") != "success":
         raise RuntimeError(f"FinMind returned non-success payload for {symbol}: {payload!r}")
     data = payload.get("data") or []
-    frame = pd.DataFrame(data)
-    if frame.empty:
+    frame = pl.DataFrame(data)
+    if frame.is_empty():
         return frame
-    frame["date"] = pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d")
+    if "date" in frame.columns:
+        frame = frame.with_columns(pl.col("date").cast(pl.String).str.slice(0, 10).alias("date"))
+    numeric_exprs = []
     for col in ("open", "max", "min", "close", "Trading_Volume"):
         if col in frame.columns:
-            frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    return frame
+            numeric_exprs.append(pl.col(col).cast(pl.Float64, strict=False).alias(col))
+    return frame.with_columns(numeric_exprs) if numeric_exprs else frame
 
 
 def _record_change(
@@ -89,9 +137,9 @@ def _record_change(
     date: str,
     mode: str,
     reason: str,
-    old_row: pd.Series,
+    old_row: dict[str, object],
     new_values: dict[str, float],
-    finmind_row: pd.Series,
+    finmind_row: dict[str, object],
 ) -> dict[str, object]:
     rec: dict[str, object] = {
         "symbol": symbol,
@@ -101,45 +149,47 @@ def _record_change(
         "source": "FinMind TaiwanStockPrice",
     }
     for col in PRICE_COLUMNS:
-        if col in old_row.index:
+        if col in old_row:
             rec[f"old_{col}"] = old_row.get(col)
         if col in new_values:
             rec[f"new_{col}"] = new_values[col]
-    if "Trading_Volume" in old_row.index:
+    if "Trading_Volume" in old_row:
         rec["old_Trading_Volume"] = old_row.get("Trading_Volume")
     if "Trading_Volume" in new_values:
         rec["new_Trading_Volume"] = new_values["Trading_Volume"]
     for col in ("open", "max", "min", "close", "Trading_Volume"):
-        if col in finmind_row.index:
+        if col in finmind_row:
             rec[f"finmind_{col}"] = finmind_row.get(col)
     return rec
 
 
-def _apply_source_repair(frame: pd.DataFrame, finmind: pd.DataFrame, action: SourceRepair, *, apply: bool) -> list[dict[str, object]]:
-    if finmind.empty:
+def _apply_source_repair(frame: pl.DataFrame, finmind: pl.DataFrame, action: SourceRepair, *, apply: bool) -> tuple[list[dict[str, object]], pl.DataFrame]:
+    if finmind.is_empty():
         return [
             {
                 "symbol": action.symbol,
                 "repair_method": "finmind_empty_no_change",
                 "repair_reason": action.reason,
             }
-        ]
-    frame = frame.sort_values("date").reset_index(drop=True)
-    frame_dates = pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d")
-    index_by_date = {date: int(idx) for idx, date in enumerate(frame_dates)}
+        ], frame
+    frame = frame.sort("date") if "date" in frame.columns else frame
+    frame_rows = frame.to_dicts()
+    frame_dates = [_format_date(row.get("date")) for row in frame_rows]
+    index_by_date = {date: int(idx) for idx, date in enumerate(frame_dates) if date is not None}
 
     records: list[dict[str, object]] = []
-    for _, src in finmind.iterrows():
+    repaired_rows = [dict(row) for row in frame_rows] if apply else []
+    for src in finmind.iter_rows(named=True):
         date = str(src["date"])
         idx = index_by_date.get(date)
         if idx is None:
             continue
 
-        open_px = float(src.get("open", np.nan))
-        high_px = float(src.get("max", np.nan))
-        low_px = float(src.get("min", np.nan))
-        close_px = float(src.get("close", np.nan))
-        volume = float(src.get("Trading_Volume", np.nan))
+        open_px = _safe_float(src.get("open"))
+        high_px = _safe_float(src.get("max"))
+        low_px = _safe_float(src.get("min"))
+        close_px = _safe_float(src.get("close"))
+        volume = _safe_float(src.get("Trading_Volume"))
 
         if action.mode == "replace_positive_finmind_ohlc_full_history":
             if not all(np.isfinite(v) and v > 0.0 for v in (open_px, high_px, low_px, close_px)):
@@ -166,15 +216,15 @@ def _apply_source_repair(frame: pd.DataFrame, finmind: pd.DataFrame, action: Sou
         else:
             raise ValueError(f"Unknown mode: {action.mode}")
 
-        old_row = frame.iloc[idx].copy()
+        old_row = frame_rows[idx]
         changed = False
         for col, value in new_values.items():
             if col not in frame.columns:
                 continue
             old_value = old_row.get(col)
-            if pd.isna(old_value) and pd.isna(value):
+            if _is_null(old_value) and _is_null(value):
                 continue
-            if not np.isclose(float(old_value), float(value), rtol=0.0, atol=1e-8) if pd.notna(old_value) and pd.notna(value) else True:
+            if not np.isclose(float(old_value), float(value), rtol=0.0, atol=1e-8) if not _is_null(old_value) and not _is_null(value) else True:
                 changed = True
                 break
         if not changed:
@@ -194,8 +244,9 @@ def _apply_source_repair(frame: pd.DataFrame, finmind: pd.DataFrame, action: Sou
         if apply:
             for col, value in new_values.items():
                 if col in frame.columns:
-                    frame.iat[idx, frame.columns.get_loc(col)] = value
-    return records, frame
+                    repaired_rows[idx][col] = value
+    repaired = pl.DataFrame(repaired_rows, schema=frame.schema, orient="row") if apply else frame
+    return records, repaired
 
 
 def repair(*, data_root: Path, output_dir: Path, backup_dir: Path, apply: bool) -> Path:
@@ -218,19 +269,19 @@ def repair(*, data_root: Path, output_dir: Path, backup_dir: Path, apply: bool) 
                 }
             )
             continue
-        frame = pd.read_parquet(parquet_path)
+        frame = _read_parquet(parquet_path)
         finmind = _fetch_finmind(action.symbol, action.start_date, action.end_date)
         records, repaired = _apply_source_repair(frame, finmind, action, apply=apply)
         all_records.extend(records)
         if apply and records:
             backup_target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(parquet_path, backup_target / parquet_path.name)
-            repaired.to_parquet(parquet_path, index=False)
+            _write_parquet(repaired, parquet_path)
             touched.append(action.symbol)
 
-    ledger = pd.DataFrame(all_records)
-    ledger.to_csv(ledger_path, index=False)
-    method_counts = ledger["repair_method"].value_counts().to_dict() if "repair_method" in ledger.columns else {}
+    ledger = pl.DataFrame(all_records) if all_records else pl.DataFrame()
+    ledger.write_csv(ledger_path)
+    method_counts = _method_counts(ledger)
     lines = [
         "# FinMind Source Repairs For Fold >10% Events",
         "",

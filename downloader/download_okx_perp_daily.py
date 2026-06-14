@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import polars as pl
+import pyarrow.parquet as pq
 
 from common import resolve_end_date, run_parallel_tasks
 
@@ -26,6 +27,14 @@ CANDLE_INTERVAL_MS = 15 * 60 * 1000
 OKX_MAX_REQ_PER_SEC = 10.0
 OKX_MIN_REQUEST_INTERVAL = 1.0 / OKX_MAX_REQ_PER_SEC
 OKX_HISTORY_LIMIT = "300"
+
+
+def _read_parquet(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path))
+
+
+def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
 
 
 @dataclass(slots=True)
@@ -302,7 +311,7 @@ def _download_symbol_daily(
 
     if output_path.exists() and not refresh:
         try:
-            existing_df = pl.read_parquet(output_path)
+            existing_df = _read_parquet(output_path)
             if not _frame_matches_15m_interval(existing_df):
                 print(
                     f"[okx] {record.okx_symbol}: existing parquet does not look like "
@@ -413,7 +422,7 @@ def _download_symbol_daily(
         df = combined
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(output_path, compression="snappy", statistics=True)
+    _write_parquet(df, output_path)
 
     return DownloadResult(
         asset_class="crypto_okx_perp",
