@@ -2300,6 +2300,12 @@ def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> li
     return records
 
 
+def _report_frame_from_rows(rows: list[dict[str, object]], columns: list[str]) -> pl.DataFrame:
+    if not rows:
+        return pl.DataFrame({column: [] for column in columns})
+    return pl.DataFrame(rows, infer_schema_length=None).select(columns)
+
+
 def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[DownloadResult]) -> None:
     report_path = output_dir / "download_report.csv"
     _require_polars()
@@ -2317,11 +2323,7 @@ def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[
         "checked_through_date",
     ]
     report_rows = [asdict(result) for result in results]
-    report_frame = (
-        pl.DataFrame(report_rows).select(report_columns)
-        if report_rows
-        else pl.DataFrame({column: [] for column in report_columns})
-    )
+    report_frame = _report_frame_from_rows(report_rows, report_columns)
     report_frame.write_csv(report_path)
 
     counts: dict[str, int] = {}
@@ -2928,11 +2930,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         }
         for check in checks
     ]
-    repair_report_frame = (
-        pl.DataFrame(repair_report_rows).select(repair_report_columns)
-        if repair_report_rows
-        else pl.DataFrame({column: [] for column in repair_report_columns})
-    )
+    repair_report_frame = _report_frame_from_rows(repair_report_rows, repair_report_columns)
     repair_report_frame.write_csv(repair_report_path)
 
     # Post-repair coverage: compute entirely from in-memory data; no second disk scan.

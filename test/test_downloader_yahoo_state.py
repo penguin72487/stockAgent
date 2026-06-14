@@ -140,6 +140,16 @@ def test_unavailable_yahoo_timezone_message_is_blacklist_trigger():
     assert yahoo._captured_indicates_unavailable(captured.lower())
 
 
+def test_report_frame_handles_late_optional_string_values():
+    rows = [{"code": str(i), "message": None} for i in range(101)]
+    rows.append({"code": "9999", "message": "All candidate Yahoo symbols are in blacklist."})
+
+    frame = yahoo._report_frame_from_rows(rows, ["code", "message"])
+
+    assert frame.schema["message"] == pl.String
+    assert frame["message"].to_list()[-1] == "All candidate Yahoo symbols are in blacklist."
+
+
 def test_blacklisted_missing_symbols_skip_repair_until_forced(tmp_path):
     output_dir = tmp_path / "tw_stocks"
     output_dir.mkdir()
