@@ -15,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/tw_stocks
-  benchmark_name: "2330"
+  parquet_root: data_yahoo/us_stocks
+  benchmark_name: "SPY"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -24,8 +24,8 @@ data:
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
-  tradable_mode: tw_limit_guard
-  # tradable_mode: tradable
+  # tradable_mode: tw_limit_guard
+  tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1

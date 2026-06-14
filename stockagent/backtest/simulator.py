@@ -2116,6 +2116,7 @@ def run_backtest_integer_shares(
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
+    collect_holdings: bool = True,
 ) -> tuple[BacktestResult, list[HoldingsRecord]]:
     """Daily backtest with integer shares, virtual cash, and daily fee settlement.
 
@@ -2136,10 +2137,13 @@ def run_backtest_integer_shares(
     if symbols is None:
         symbols = [f"SYM_{idx:04d}" for idx in range(n_symbols)]
     tw_symbol_mask = np.asarray([_is_tw_symbol(sym) for sym in symbols], dtype=bool)
-    if dates is None:
-        date_text = [f"t{idx:04d}" for idx in range(t_len)]
+    if collect_holdings:
+        if dates is None:
+            date_text = [f"t{idx:04d}" for idx in range(t_len)]
+        else:
+            date_text = [str(np.datetime_as_string(np.asarray(d, dtype="datetime64[D]"), unit="D")) for d in dates]
     else:
-        date_text = [str(np.datetime_as_string(np.asarray(d, dtype="datetime64[D]"), unit="D")) for d in dates]
+        date_text = []
 
     strategy_returns = np.zeros(t_len, dtype=np.float32)
     turnovers = np.zeros(t_len, dtype=np.float32)
@@ -2170,17 +2174,18 @@ def run_backtest_integer_shares(
             strategy_returns[t] = 0.0
             turnovers[t] = 0.0
             stock_weights_history[t] = 0.0
-            records.append(
-                HoldingsRecord(
-                    date=date_text[t],
-                    symbol="CASH",
-                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
-                    price=1.0,
-                    market_value=float(cash),
-                    holding_ratio=1.0 if cash > 0 else 0.0,
-                    is_cash=True,
+            if collect_holdings:
+                records.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol="CASH",
+                        shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                        price=1.0,
+                        market_value=float(cash),
+                        holding_ratio=1.0 if cash > 0 else 0.0,
+                        is_cash=True,
+                    )
                 )
-            )
             continue
 
         if price_matrix is not None:
@@ -2283,17 +2288,18 @@ def run_backtest_integer_shares(
                         stock_weights_history[t] = 0.0
                         shares.fill(0)
                         cash_hold_mode = True
-                        records.append(
-                            HoldingsRecord(
-                                date=date_text[t],
-                                symbol="CASH",
-                                shares=int(_floor_to_int64(cash, non_negative=True).item()),
-                                price=1.0,
-                                market_value=float(cash),
-                                holding_ratio=1.0 if cash > 0 else 0.0,
-                                is_cash=True,
+                        if collect_holdings:
+                            records.append(
+                                HoldingsRecord(
+                                    date=date_text[t],
+                                    symbol="CASH",
+                                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                                    price=1.0,
+                                    market_value=float(cash),
+                                    holding_ratio=1.0 if cash > 0 else 0.0,
+                                    is_cash=True,
+                                )
                             )
-                        )
                         continue
 
         buy_fee = buy_fee_rate * buy_notional
@@ -2325,43 +2331,44 @@ def run_backtest_integer_shares(
         else:
             ratio_vec.fill(0.0)
 
-        cash_ratio = float(ratio_vec[0])
         stock_holding_ratio = ratio_vec[1:]
 
         stock_weights_history[t] = stock_holding_ratio.astype(np.float32)
         turnovers[t] = float(traded_notional / equity_before)
 
-        day_rows: list[HoldingsRecord] = []
-        day_rows.append(
-            HoldingsRecord(
-                date=date_text[t],
-                symbol="CASH",
-                shares=int(_floor_to_int64(cash, non_negative=True).item()),
-                price=1.0,
-                market_value=float(cash),
-                holding_ratio=cash_ratio,
-                is_cash=True,
-            )
-        )
-        nonzero = np.flatnonzero(shares != 0)
-        for idx in nonzero.tolist():
-            mv = float(stock_market_values[idx])
-            price_out = float(current_prices[idx])
-            if tw_symbol_mask[idx]:
-                price_out = float(_round_half_up(price_out, decimals=2).item())
+        if collect_holdings:
+            cash_ratio = float(ratio_vec[0])
+            day_rows: list[HoldingsRecord] = []
             day_rows.append(
                 HoldingsRecord(
                     date=date_text[t],
-                    symbol=symbols[idx],
-                    shares=int(shares[idx]),
-                    price=price_out,
-                    market_value=mv,
-                    holding_ratio=float(stock_holding_ratio[idx]),
-                    is_cash=False,
+                    symbol="CASH",
+                    shares=int(_floor_to_int64(cash, non_negative=True).item()),
+                    price=1.0,
+                    market_value=float(cash),
+                    holding_ratio=cash_ratio,
+                    is_cash=True,
                 )
             )
-        day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
-        records.extend(day_rows)
+            nonzero = np.flatnonzero(shares != 0)
+            for idx in nonzero.tolist():
+                mv = float(stock_market_values[idx])
+                price_out = float(current_prices[idx])
+                if tw_symbol_mask[idx]:
+                    price_out = float(_round_half_up(price_out, decimals=2).item())
+                day_rows.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol=symbols[idx],
+                        shares=int(shares[idx]),
+                        price=price_out,
+                        market_value=mv,
+                        holding_ratio=float(stock_holding_ratio[idx]),
+                        is_cash=False,
+                    )
+                )
+            day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
+            records.extend(day_rows)
 
         # PnL follows the canonical return label (adj close when available).
         # close_prices are reserved for execution prices, integer share sizing,
