@@ -231,3 +231,74 @@ def test_repair_plan_keeps_delisted_file_with_history_without_refetch(tmp_path):
         ("OLDW", "delisted_skip", None),
     ]
     assert output_path.exists()
+
+
+def test_daily_repair_plan_treats_weekend_stock_target_as_current(tmp_path):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "2330_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-11", "2026-06-12"]),
+                "open": [100.0, 101.0],
+                "max": [102.0, 103.0],
+                "min": [99.0, 100.0],
+                "close": [101.0, 102.0],
+                "adjclose": [101.0, 102.0],
+                "Trading_Volume": [1000, 1100],
+            }
+        ),
+        output_path,
+        asset_class="tw_stocks",
+        requested_end_date="2026-06-12",
+    )
+
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    checks = yahoo._resolve_repair_plan(
+        "tw_stocks",
+        _base_args(tmp_path, end_date="2026-06-14"),
+        [record],
+        output_dir,
+    )
+
+    assert [(check.status, check.last_date, check.repair_start_date) for check in checks] == [
+        ("current", "2026-06-12", None),
+    ]
+
+
+def test_daily_repair_plan_uses_checked_through_metadata_to_avoid_same_day_refetch(tmp_path):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "2330_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-11", "2026-06-12"]),
+                "open": [100.0, 101.0],
+                "max": [102.0, 103.0],
+                "min": [99.0, 100.0],
+                "close": [101.0, 102.0],
+                "adjclose": [101.0, 102.0],
+                "Trading_Volume": [1000, 1100],
+            }
+        ),
+        output_path,
+        asset_class="tw_stocks",
+        requested_end_date="2026-06-15",
+    )
+
+    info = yahoo._load_existing_file_info(output_path)
+    assert info.checked_through_date == "2026-06-15"
+
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    checks = yahoo._resolve_repair_plan(
+        "tw_stocks",
+        _base_args(tmp_path, end_date="2026-06-15"),
+        [record],
+        output_dir,
+    )
+
+    assert [(check.status, check.last_date, check.checked_through_date, check.repair_start_date) for check in checks] == [
+        ("current", "2026-06-12", "2026-06-15", None),
+    ]

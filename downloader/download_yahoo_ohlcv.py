@@ -3,34 +3,45 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import contextlib
-import csv
 import io
 import json
 import multiprocessing as mp
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
+import math
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
 
 try:
+    import pyarrow as pa
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
 except Exception:  # pragma: no cover - optional runtime dependency guard
+    pa = None
+    pc = None
     pq = None
+
+try:
+    import polars as pl
+except Exception:  # pragma: no cover - optional runtime dependency guard
+    pl = None
 
 
 ASSET_CLASSES = ("tw_stocks", "us_stocks", "crypto", "forex")
+WEEKDAY_DAILY_ASSET_CLASSES = {"tw_stocks", "us_stocks", "forex"}
 TWSE_SOURCES = {
     "listed": ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", ".TW"),
     "otc": ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO"),
@@ -60,6 +71,13 @@ CRYPTO_SYMBOL_PATTERN = re.compile(r"^[a-z]{2,8}$")
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "Trading_Volume"]
 BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose", "Trading_Volume"}
+PARQUET_META_SOURCE_KEY = b"stockagent.source"
+PARQUET_META_ASSET_CLASS_KEY = b"stockagent.asset_class"
+PARQUET_META_CHECKED_THROUGH_KEY = b"stockagent.yahoo_checked_through"
+PARQUET_META_REQUESTED_END_KEY = b"stockagent.yahoo_requested_end"
+PARQUET_META_FIRST_DATE_KEY = b"stockagent.first_date"
+PARQUET_META_LAST_DATE_KEY = b"stockagent.last_date"
+PARQUET_META_WRITE_TS_UTC_KEY = b"stockagent.write_ts_utc"
 BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
 UNAVAILABLE_TRIGGER_TEXTS = (
     BLACKLIST_TRIGGER_TEXT,
@@ -256,6 +274,18 @@ class DownloadResult:
     rows: int
     output_path: str | None
     message: str | None = None
+    first_date: str | None = None
+    last_date: str | None = None
+    checked_through_date: str | None = None
+
+
+@dataclass(slots=True)
+class ExistingFileInfo:
+    first_date: str | None
+    last_date: str | None
+    error: str | None
+    columns: set[str]
+    checked_through_date: str | None = None
 
 
 @dataclass(slots=True)
@@ -268,6 +298,7 @@ class RepairCheck:
     repair_start_date: str | None
     merge_existing: bool = True
     message: str | None = None
+    checked_through_date: str | None = None
 
 
 @dataclass(slots=True)
@@ -546,6 +577,259 @@ def _today_str() -> str:
     return date.today().isoformat()
 
 
+def _coerce_to_date(value: object) -> date | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    if isinstance(parsed, pd.Timestamp):
+        return parsed.date()
+    return parsed.to_pydatetime().date()
+
+
+def _decode_metadata_date(value: bytes | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    value = str(value).strip()
+    if not value:
+        return None
+    parsed = _coerce_to_date(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _frame_date_bounds(frame: pd.DataFrame) -> tuple[str | None, str | None]:
+    if frame.empty or "date" not in frame.columns:
+        return None, None
+    dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+    if dates.empty:
+        return None, None
+    return dates.min().date().isoformat(), dates.max().date().isoformat()
+
+
+def _previous_weekday(value: date) -> date:
+    while value.weekday() >= 5:
+        value -= timedelta(days=1)
+    return value
+
+
+def _effective_repair_target_end_date(asset_class: str, args: argparse.Namespace) -> date:
+    requested = _parse_date(args.end_date or _today_str()).date()
+    if getattr(args, "mode", "") != "daily-update":
+        return requested
+    if asset_class not in WEEKDAY_DAILY_ASSET_CLASSES:
+        return requested
+    return _previous_weekday(requested)
+
+
+def _daily_update_target_adjustment_reason(asset_class: str, requested: date, effective: date) -> str | None:
+    if requested == effective:
+        return None
+    if asset_class in WEEKDAY_DAILY_ASSET_CLASSES and requested.weekday() >= 5:
+        return "weekend_non_trading_day"
+    return "calendar_adjustment"
+
+
+def _read_parquet_row_count(output_path: Path) -> int:
+    if pq is not None:
+        return int(pq.ParquetFile(output_path, memory_map=True).metadata.num_rows)
+    if pl is not None:
+        return int(pl.scan_parquet(str(output_path)).select(pl.len()).collect().item())
+    return int(len(pd.read_parquet(output_path)))
+
+
+def _read_parquet_frame(output_path: Path) -> pd.DataFrame:
+    if pl is not None:
+        return pl.read_parquet(str(output_path)).to_pandas()
+    return pd.read_parquet(output_path)
+
+
+def _date_bounds_from_arrow_table(table: object) -> tuple[str | None, str | None]:
+    if pc is None or table.num_rows == 0:
+        return None, None
+    bounds = pc.min_max(table.column("date")).as_py()
+    first = _coerce_to_date(bounds.get("min"))
+    last = _coerce_to_date(bounds.get("max"))
+    if first is None or last is None:
+        return None, None
+    return first.isoformat(), last.isoformat()
+
+
+def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | None:
+    if pq is None:
+        return None
+    try:
+        parquet_metadata = pq.read_metadata(output_path)
+        arrow_schema = parquet_metadata.schema.to_arrow_schema()
+        columns = set(arrow_schema.names)
+        metadata = dict(parquet_metadata.metadata or {})
+        metadata.update(arrow_schema.metadata or {})
+        checked_through = _decode_metadata_date(metadata.get(PARQUET_META_CHECKED_THROUGH_KEY))
+    except Exception as exc:
+        return ExistingFileInfo(None, None, f"schema_error: {exc}", set())
+
+    if "date" not in columns:
+        return ExistingFileInfo(None, None, "empty", columns, checked_through)
+
+    try:
+        date_table = pq.read_table(output_path, columns=["date"], memory_map=True)
+        first_date, last_date = _date_bounds_from_arrow_table(date_table)
+    except Exception as exc:
+        return ExistingFileInfo(None, None, f"read_error: {exc}", columns, checked_through)
+    if first_date is None or last_date is None:
+        return ExistingFileInfo(None, None, "no_valid_date", columns, checked_through)
+    return ExistingFileInfo(first_date, last_date, None, columns, checked_through)
+
+
+def _load_existing_file_info_polars(output_path: Path) -> ExistingFileInfo | None:
+    if pl is None:
+        return None
+    try:
+        lazy = pl.scan_parquet(str(output_path))
+        schema = lazy.collect_schema()
+        columns = set(schema.names() if hasattr(schema, "names") else schema.keys())
+    except Exception as exc:
+        return ExistingFileInfo(None, None, f"schema_error: {exc}", set())
+
+    if "date" not in columns:
+        return ExistingFileInfo(None, None, "empty", columns)
+
+    try:
+        bounds = lazy.select(
+            pl.col("date").min().alias("first_date"),
+            pl.col("date").max().alias("last_date"),
+        ).collect()
+    except Exception as exc:
+        return ExistingFileInfo(None, None, f"read_error: {exc}", columns)
+    if bounds.is_empty():
+        return ExistingFileInfo(None, None, "empty", columns)
+    row = bounds.to_dicts()[0]
+    first = _coerce_to_date(row.get("first_date"))
+    last = _coerce_to_date(row.get("last_date"))
+    if first is None or last is None:
+        return ExistingFileInfo(None, None, "no_valid_date", columns)
+    return ExistingFileInfo(first.isoformat(), last.isoformat(), None, columns)
+
+
+def _prepare_arrow_table_for_write(frame: pd.DataFrame) -> object:
+    ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in frame.columns] + [
+        column for column in frame.columns if column not in set(BASE_OUTPUT_COLUMNS)
+    ]
+    if pl is not None:
+        polars_frame = pl.from_pandas(frame[ordered_columns])
+        if "date" in polars_frame.columns:
+            polars_frame = (
+                polars_frame.with_columns(pl.col("date").cast(pl.Datetime("us"), strict=False))
+                .drop_nulls("date")
+                .sort("date")
+                .unique(subset=["date"], keep="last", maintain_order=True)
+            )
+        return polars_frame.select([column for column in ordered_columns if column in polars_frame.columns]).to_arrow()
+    assert pa is not None
+    return pa.Table.from_pandas(frame[ordered_columns], preserve_index=False)
+
+
+def _fsync_file(path: Path) -> None:
+    try:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_feature_parquet_atomic(
+    frame: pd.DataFrame,
+    output_path: Path,
+    *,
+    asset_class: str,
+    requested_end_date: str,
+) -> tuple[str | None, str | None]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    first_date, last_date = _frame_date_bounds(frame)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+        delete=False,
+    )
+    tmp_path = Path(handle.name)
+    handle.close()
+    try:
+        if pa is not None and pq is not None:
+            table = _prepare_arrow_table_for_write(frame)
+            metadata = dict(table.schema.metadata or {})
+            metadata.update(
+                {
+                    PARQUET_META_SOURCE_KEY: b"yahoo",
+                    PARQUET_META_ASSET_CLASS_KEY: asset_class.encode("utf-8"),
+                    PARQUET_META_REQUESTED_END_KEY: requested_end_date.encode("utf-8"),
+                    PARQUET_META_CHECKED_THROUGH_KEY: requested_end_date.encode("utf-8"),
+                    PARQUET_META_WRITE_TS_UTC_KEY: (
+                        datetime.now(timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .encode("utf-8")
+                    ),
+                }
+            )
+            if first_date is not None:
+                metadata[PARQUET_META_FIRST_DATE_KEY] = first_date.encode("utf-8")
+            if last_date is not None:
+                metadata[PARQUET_META_LAST_DATE_KEY] = last_date.encode("utf-8")
+            table = table.replace_schema_metadata(metadata)
+            pq.write_table(
+                table,
+                tmp_path,
+                compression="snappy",
+                use_dictionary=True,
+                write_statistics=True,
+                row_group_size=128_000,
+                coerce_timestamps="us",
+                allow_truncated_timestamps=True,
+            )
+        elif pl is not None:
+            pl.from_pandas(frame).write_parquet(str(tmp_path), compression="snappy", statistics=True)
+        else:
+            frame.to_parquet(tmp_path, index=False)
+        _fsync_file(tmp_path)
+        os.replace(tmp_path, output_path)
+        _fsync_directory(output_path.parent)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return first_date, last_date
+
+
 class PrecheckTimeoutError(TimeoutError):
     pass
 
@@ -587,7 +871,7 @@ class PrecheckLoader:
         self.close()
         self._start()
 
-    def load_with_timeout(self, output_path: Path, timeout_seconds: int) -> tuple[str | None, str | None, str | None, set[str]]:
+    def load_with_timeout(self, output_path: Path, timeout_seconds: int) -> ExistingFileInfo:
         if timeout_seconds <= 0:
             return _load_existing_file_info(output_path)
 
@@ -611,8 +895,7 @@ class PrecheckLoader:
             self._restart()
             raise RuntimeError("precheck worker pipe broken; worker restarted")
         if status == "ok":
-            first_date, last_date, error, columns = payload
-            return first_date, last_date, error, set(columns)
+            return payload
 
         raise RuntimeError(str(payload))
 
@@ -1627,9 +1910,12 @@ def _download_symbol(
             pass
         else:
             try:
-                existing = pd.read_parquet(output_path)
+                existing_rows = _read_parquet_row_count(output_path)
+                existing_info = _load_existing_file_info(output_path)
+                if existing_info.error is not None:
+                    raise RuntimeError(existing_info.error)
                 if asset_class == "crypto" and not _frame_matches_expected_interval(
-                    existing,
+                    _read_parquet_frame(output_path),
                     YF_CRYPTO_INTRADAY_SECONDS,
                 ):
                     print(
@@ -1643,8 +1929,11 @@ def _download_symbol(
                         yahoo_symbol=record.yahoo_symbol,
                         market=record.market,
                         status="skipped_existing",
-                        rows=int(len(existing)),
+                        rows=existing_rows,
                         output_path=str(output_path),
+                        first_date=existing_info.first_date,
+                        last_date=existing_info.last_date,
+                        checked_through_date=existing_info.checked_through_date,
                     )
             except Exception as exc:
                 return DownloadResult(
@@ -1661,7 +1950,7 @@ def _download_symbol(
     existing_frame: pd.DataFrame | None = None
     if output_path.exists() and merge_existing:
         try:
-            existing_frame = pd.read_parquet(output_path)
+            existing_frame = _read_parquet_frame(output_path)
             if asset_class == "crypto" and not _frame_matches_expected_interval(
                 existing_frame,
                 YF_CRYPTO_INTRADAY_SECONDS,
@@ -1738,7 +2027,12 @@ def _download_symbol(
                             normalized = normalized.drop(columns=["Trading_Volume"])
                     normalized = normalized.reset_index(drop=True)
 
-                normalized.to_parquet(output_path, index=False)
+                first_date, last_date = _write_feature_parquet_atomic(
+                    normalized,
+                    output_path,
+                    asset_class=asset_class,
+                    requested_end_date=end_date,
+                )
                 _whitelist_symbol(candidate_symbol, whitelist_symbols, whitelist_path, whitelist_lock)
                 return DownloadResult(
                     asset_class=asset_class,
@@ -1748,6 +2042,9 @@ def _download_symbol(
                     status="updated",
                     rows=int(len(normalized)),
                     output_path=str(output_path),
+                    first_date=first_date,
+                    last_date=last_date,
+                    checked_through_date=end_date,
                 )
             except Exception as exc:
                 last_error = f"{candidate_symbol}: {exc}"
@@ -1803,7 +2100,19 @@ def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[
     with report_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["asset_class", "code", "yahoo_symbol", "market", "status", "rows", "output_path", "message"],
+            fieldnames=[
+                "asset_class",
+                "code",
+                "yahoo_symbol",
+                "market",
+                "status",
+                "rows",
+                "output_path",
+                "message",
+                "first_date",
+                "last_date",
+                "checked_through_date",
+            ],
         )
         writer.writeheader()
         for result in results:
@@ -1835,43 +2144,30 @@ def _resolve_asset_output_dir(args: argparse.Namespace, asset_class: str) -> Pat
     return Path(args.output_root) / asset_class
 
 
-def _load_existing_file_info(output_path: Path) -> tuple[str | None, str | None, str | None, set[str]]:
+def _load_existing_file_info(output_path: Path) -> ExistingFileInfo:
     if not output_path.exists():
-        return None, None, "missing", set()
-    columns: set[str] = set()
-    date_values: pd.Series | None = None
+        return ExistingFileInfo(None, None, "missing", set())
 
-    if pq is not None:
-        try:
-            schema = pq.read_schema(output_path)
-            columns = set(schema.names)
-        except Exception as exc:
-            return None, None, f"schema_error: {exc}", set()
+    pyarrow_info = _load_existing_file_info_pyarrow(output_path)
+    if pyarrow_info is not None:
+        return pyarrow_info
 
-        if "date" not in columns:
-            return None, None, "empty", columns
+    polars_info = _load_existing_file_info_polars(output_path)
+    if polars_info is not None:
+        return polars_info
 
-        try:
-            date_frame = pd.read_parquet(output_path, columns=["date"])
-        except Exception as exc:
-            return None, None, f"read_error: {exc}", columns
-        if date_frame.empty:
-            return None, None, "empty", columns
-        date_values = date_frame["date"]
-    else:
-        try:
-            frame = pd.read_parquet(output_path)
-        except Exception as exc:
-            return None, None, f"read_error: {exc}", set()
-        columns = set(frame.columns)
-        if frame.empty or "date" not in columns:
-            return None, None, "empty", columns
-        date_values = frame["date"]
+    try:
+        frame = pd.read_parquet(output_path)
+    except Exception as exc:
+        return ExistingFileInfo(None, None, f"read_error: {exc}", set())
+    columns = set(frame.columns)
+    if frame.empty or "date" not in columns:
+        return ExistingFileInfo(None, None, "empty", columns)
 
-    dates = pd.to_datetime(date_values, errors="coerce").dropna()
+    dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
     if dates.empty:
-        return None, None, "no_valid_date", columns
-    return dates.min().date().isoformat(), dates.max().date().isoformat(), None, columns
+        return ExistingFileInfo(None, None, "no_valid_date", columns)
+    return ExistingFileInfo(dates.min().date().isoformat(), dates.max().date().isoformat(), None, columns)
 
 
 def _summarize_repair_coverage(checks: list[RepairCheck], target_end: str) -> tuple[str | None, str | None, int | None, int]:
@@ -1892,10 +2188,10 @@ def _summarize_post_repair_coverage(
     target_end: str,
 ) -> tuple[str | None, str | None, int | None, int]:
     """Compute post-repair coverage from in-memory data without re-reading disk."""
-    # Build a map of code -> last_date for successfully repaired symbols.
-    repair_end_date = target_end  # repaired files go up to the requested end date.
-    repaired_codes: set[str] = {
-        r.code for r in results if r.status in {"repaired", "schema_repaired"}
+    repaired_last_dates = {
+        r.code: r.last_date
+        for r in results
+        if r.status in {"repaired", "schema_repaired", "new_symbol_repaired"} and r.last_date
     }
 
     first_dates: list[date] = []
@@ -1904,8 +2200,9 @@ def _summarize_post_repair_coverage(
         if check.status == "broken" or check.first_date is None:
             continue
         first_dates.append(_parse_date(check.first_date).date())
-        if check.record.code in repaired_codes:
-            last_dates.append(_parse_date(repair_end_date).date())
+        repaired_last_date = repaired_last_dates.get(check.record.code)
+        if repaired_last_date:
+            last_dates.append(_parse_date(repaired_last_date).date())
         elif check.last_date:
             last_dates.append(_parse_date(check.last_date).date())
 
@@ -1928,7 +2225,8 @@ def _resolve_repair_plan(
     checks: list[RepairCheck] = []
     new_codes = new_codes or set()
     target_end = args.end_date or _today_str()
-    target_end_dt = _parse_date(target_end).date()
+    requested_target_end_dt = _parse_date(target_end).date()
+    target_end_dt = _effective_repair_target_end_date(asset_class, args)
     overlap = max(1, args.repair_overlap_days)
     precheck_loader = PrecheckLoader() if args.precheck_file_timeout_seconds > 0 else None
     blacklist_path = _blacklist_file_path(output_dir)
@@ -1993,12 +2291,9 @@ def _resolve_repair_plan(
             output_path = output_dir / f"{record.code}_features.parquet"
             try:
                 if precheck_loader is not None:
-                    first_date, last_date, error, columns = precheck_loader.load_with_timeout(
-                        output_path,
-                        args.precheck_file_timeout_seconds,
-                    )
+                    info = precheck_loader.load_with_timeout(output_path, args.precheck_file_timeout_seconds)
                 else:
-                    first_date, last_date, error, columns = _load_existing_file_info(output_path)
+                    info = _load_existing_file_info(output_path)
             except PrecheckTimeoutError as exc:
                 _blacklist_record_symbols(record.yahoo_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
                 checks.append(
@@ -2028,6 +2323,11 @@ def _resolve_repair_plan(
                     )
                 )
                 continue
+            first_date = info.first_date
+            last_date = info.last_date
+            error = info.error
+            columns = info.columns
+            checked_through_date = info.checked_through_date
             if error == "missing":
                 if _is_delisted_record(record):
                     checks.append(_delisted_no_history(record, output_path, "confirmed delisted with no local history"))
@@ -2126,6 +2426,7 @@ def _resolve_repair_plan(
                             first_date=first_date,
                             last_date=last_date,
                             repair_start_date=None,
+                            checked_through_date=checked_through_date,
                             merge_existing=False,
                             message=(
                                 f"lag_days={lag_days} exceeds daily_stale_max_lag_days="
@@ -2135,6 +2436,7 @@ def _resolve_repair_plan(
                     )
                     continue
 
+            checked_through_dt = _parse_date(checked_through_date).date() if checked_through_date else None
             if local_last_dt >= target_end_dt:
                 checks.append(
                     RepairCheck(
@@ -2144,6 +2446,25 @@ def _resolve_repair_plan(
                         first_date=first_date,
                         last_date=last_date,
                         repair_start_date=None,
+                        checked_through_date=checked_through_date,
+                    )
+                )
+                continue
+            if (
+                args.mode == "daily-update"
+                and checked_through_dt is not None
+                and checked_through_dt >= requested_target_end_dt
+            ):
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="current",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=None,
+                        checked_through_date=checked_through_date,
+                        message=f"checked_through={checked_through_date}",
                     )
                 )
                 continue
@@ -2245,6 +2566,19 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
+    requested_target_end_dt = _parse_date(args.end_date or _today_str()).date()
+    effective_target_end_dt = _effective_repair_target_end_date(asset_class, args)
+    adjustment_reason = _daily_update_target_adjustment_reason(
+        asset_class,
+        requested_target_end_dt,
+        effective_target_end_dt,
+    )
+    if adjustment_reason is not None:
+        print(
+            f"[daily-update] asset={asset_class} effective_target_end={effective_target_end_dt.isoformat()} "
+            f"requested_end={requested_target_end_dt.isoformat()} reason={adjustment_reason}"
+        )
+
     _write_symbol_manifest(output_dir, resolution.manifest_records)
     if resolution.active_discovery_symbols:
         active_listing_candidates: set[str] = set()
@@ -2307,7 +2641,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         f"not_found_skip={status_counts.get('not_found_skip', 0)} "
         f"lagging_skip={status_counts.get('lagging_skip', 0)}"
     )
-    target_end = args.end_date or _today_str()
+    target_end = effective_target_end_dt.isoformat()
     oldest_date, newest_date, lag_days, tracked = _summarize_repair_coverage(checks, target_end)
     if oldest_date and newest_date and lag_days is not None:
         print(
@@ -2377,7 +2711,17 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     with repair_report_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["code", "yahoo_symbol", "precheck_status", "first_date", "last_date", "repair_start_date", "output_path", "message"],
+            fieldnames=[
+                "code",
+                "yahoo_symbol",
+                "precheck_status",
+                "first_date",
+                "last_date",
+                "checked_through_date",
+                "repair_start_date",
+                "output_path",
+                "message",
+            ],
         )
         writer.writeheader()
         for check in checks:
@@ -2388,6 +2732,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
                     "precheck_status": check.status,
                     "first_date": check.first_date,
                     "last_date": check.last_date,
+                    "checked_through_date": check.checked_through_date,
                     "repair_start_date": check.repair_start_date,
                     "output_path": str(check.output_path),
                     "message": check.message,
