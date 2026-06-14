@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import pandas as pd
+import polars as pl
 
 from common import resolve_end_date, run_parallel_tasks
 
@@ -88,15 +88,27 @@ def _date_to_ms(date_str: str, *, end_of_day: bool) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _resolve_next_start_ms(existing_df: pd.DataFrame, fallback_start_ms: int) -> int:
+def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty() or "date" not in frame.columns:
+        return frame
+    normalized = frame.with_columns(
+        pl.col("date").str.to_datetime(strict=False).dt.strftime("%Y-%m-%d %H:%M:%S").alias("date")
+        if frame.schema.get("date") == pl.String
+        else pl.col("date").cast(pl.Datetime("us"), strict=False).dt.strftime("%Y-%m-%d %H:%M:%S").alias("date")
+    )
+    return normalized.drop_nulls("date").sort("date")
+
+
+def _resolve_next_start_ms(existing_df: pl.DataFrame, fallback_start_ms: int) -> int:
     if "date" not in existing_df.columns:
         return fallback_start_ms
 
-    parsed = pd.to_datetime(existing_df["date"], errors="coerce", utc=True).dropna()
-    if parsed.empty:
+    parsed = _normalize_date_frame(existing_df)
+    if parsed.is_empty():
         return fallback_start_ms
 
-    latest_ms = int(parsed.max().timestamp() * 1000)
+    latest = parsed.select(pl.col("date").str.to_datetime(strict=False).max()).item()
+    latest_ms = int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
     return max(fallback_start_ms, latest_ms + CANDLE_INTERVAL_MS)
 
 
@@ -177,25 +189,37 @@ def _ms_to_date_string(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _frame_matches_15m_interval(frame: pd.DataFrame) -> bool:
-    if frame.empty or "date" not in frame.columns:
+def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
+    if frame.is_empty() or "date" not in frame.columns:
         return True
 
-    parsed = pd.to_datetime(frame["date"], errors="coerce", utc=True).dropna().sort_values()
-    if len(parsed) < 3:
+    parsed = _normalize_date_frame(frame).select(pl.col("date").str.to_datetime(strict=False).alias("date")).drop_nulls("date")
+    if parsed.height < 3:
         return True
 
-    deltas = parsed.diff().dropna().dt.total_seconds()
-    deltas = deltas[deltas > 0]
-    if deltas.empty:
+    deltas = (
+        parsed.sort("date")
+        .select(pl.col("date").diff().dt.total_seconds().alias("delta"))
+        .drop_nulls("delta")
+        .filter(pl.col("delta") > 0)
+    )
+    if deltas.is_empty():
         return True
 
-    median_delta = float(deltas.median())
-    large_gap_share = float((deltas >= 12 * 60 * 60).mean())
+    median_delta = float(deltas.select(pl.col("delta").median()).item())
+    large_gap_share = float(deltas.select(pl.col("delta").ge(12 * 60 * 60).mean()).item())
     if large_gap_share > 0.05:
         return False
     midnight_share = float(
-        ((parsed.dt.hour == 0) & (parsed.dt.minute == 0) & (parsed.dt.second == 0)).mean()
+        parsed.select(
+            (
+                pl.col("date").dt.hour().eq(0)
+                & pl.col("date").dt.minute().eq(0)
+                & pl.col("date").dt.second().eq(0)
+            )
+            .mean()
+            .alias("midnight_share")
+        ).item()
     )
     if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
         return False
@@ -234,7 +258,7 @@ def _fetch_swap_symbols(client: OkxClient, limit: int | None = None) -> list[Sym
     return records
 
 
-def _normalize_candles(raw_rows: list[list[str]]) -> pd.DataFrame:
+def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         if len(row) < 9:
@@ -258,22 +282,9 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pd.DataFrame:
         )
 
     if not rows:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+        return pl.DataFrame({column: [] for column in OUTPUT_COLUMNS})
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values("ts").drop_duplicates(subset=["date"], keep="last")
-    return df.drop(columns=["ts"])
-
-
-def _normalize_existing_dates(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty or "date" not in frame.columns:
-        return frame
-
-    normalized = frame.copy()
-    parsed = pd.to_datetime(normalized["date"], errors="coerce", utc=True)
-    normalized = normalized.assign(date=parsed.dt.strftime("%Y-%m-%d %H:%M:%S"))
-    normalized = normalized.dropna(subset=["date"]).sort_values("date")
-    return normalized.reset_index(drop=True)
+    return pl.DataFrame(rows).sort("ts").unique(subset=["date"], keep="last").sort("ts").drop("ts")
 
 
 def _download_symbol_daily(
@@ -286,12 +297,12 @@ def _download_symbol_daily(
     refresh: bool,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    existing_df: pd.DataFrame | None = None
+    existing_df: pl.DataFrame | None = None
     effective_start_ms = start_ms
 
     if output_path.exists() and not refresh:
         try:
-            existing_df = pd.read_parquet(output_path)
+            existing_df = pl.read_parquet(output_path)
             if not _frame_matches_15m_interval(existing_df):
                 print(
                     f"[okx] {record.okx_symbol}: existing parquet does not look like "
@@ -302,7 +313,7 @@ def _download_symbol_daily(
             existing_df = None
 
         if mode == "full" and existing_df is not None:
-            rows = len(existing_df) if existing_df is not None else 0
+            rows = existing_df.height if existing_df is not None else 0
             return DownloadResult(
                 asset_class="crypto_okx_perp",
                 code=record.code,
@@ -313,7 +324,7 @@ def _download_symbol_daily(
                 output_path=str(output_path),
             )
 
-        if existing_df is not None and not existing_df.empty:
+        if existing_df is not None and not existing_df.is_empty():
             effective_start_ms = _resolve_next_start_ms(existing_df, start_ms)
             if effective_start_ms > end_ms:
                 return DownloadResult(
@@ -322,7 +333,7 @@ def _download_symbol_daily(
                     okx_symbol=record.okx_symbol,
                     market=record.market,
                     status="skipped_up_to_date",
-                    rows=len(existing_df),
+                    rows=existing_df.height,
                     output_path=str(output_path),
                 )
 
@@ -369,7 +380,7 @@ def _download_symbol_daily(
 
     filtered_rows = [row for row in all_rows if effective_start_ms <= int(row[0]) <= end_ms]
     df = _normalize_candles(filtered_rows)
-    if df.empty:
+    if df.is_empty():
         return DownloadResult(
             asset_class="crypto_okx_perp",
             code=record.code,
@@ -381,10 +392,14 @@ def _download_symbol_daily(
             message="No rows in requested date range.",
         )
 
-    if existing_df is not None and not existing_df.empty:
-        combined = pd.concat([_normalize_existing_dates(existing_df), df], ignore_index=True)
-        combined = combined.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-        added_rows = max(0, len(combined) - len(existing_df))
+    if existing_df is not None and not existing_df.is_empty():
+        combined = (
+            pl.concat([_normalize_date_frame(existing_df), df], how="diagonal_relaxed")
+            .sort("date")
+            .unique(subset=["date"], keep="last", maintain_order=True)
+            .sort("date")
+        )
+        added_rows = max(0, combined.height - existing_df.height)
         if added_rows == 0:
             return DownloadResult(
                 asset_class="crypto_okx_perp",
@@ -392,13 +407,13 @@ def _download_symbol_daily(
                 okx_symbol=record.okx_symbol,
                 market=record.market,
                 status="skipped_up_to_date",
-                rows=len(existing_df),
+                rows=existing_df.height,
                 output_path=str(output_path),
             )
         df = combined
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(output_path, index=False)
+    df.write_parquet(output_path, compression="snappy", statistics=True)
 
     return DownloadResult(
         asset_class="crypto_okx_perp",
@@ -406,7 +421,7 @@ def _download_symbol_daily(
         okx_symbol=record.okx_symbol,
         market=record.market,
         status="updated",
-        rows=len(df),
+        rows=df.height,
         output_path=str(output_path),
     )
 
@@ -432,7 +447,7 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     symbols_path = output_dir / "symbols.csv"
-    pd.DataFrame([asdict(s) for s in symbols]).to_csv(symbols_path, index=False)
+    pl.DataFrame([asdict(s) for s in symbols]).write_csv(symbols_path)
 
     def _worker(record: SymbolRecord) -> DownloadResult:
         return _download_symbol_daily(
@@ -469,15 +484,21 @@ def main() -> None:
     report_path = output_dir / "download_report.csv"
     summary_path = output_dir / "download_summary.json"
 
-    result_df = pd.DataFrame([asdict(r) for r in results]).sort_values(["status", "okx_symbol"])
-    result_df.to_csv(report_path, index=False)
+    result_rows = [asdict(r) for r in results]
+    result_df = pl.DataFrame(result_rows).sort(["status", "okx_symbol"]) if result_rows else pl.DataFrame()
+    result_df.write_csv(report_path)
+    status_counts: dict[str, int] = {}
+    row_count = 0
+    for result in results:
+        status_counts[result.status] = status_counts.get(result.status, 0) + 1
+        row_count += int(result.rows)
 
     summary = {
         "asset_class": "crypto_okx_perp",
         "interval": KLINE_BAR,
         "symbol_count": len(symbols),
-        "row_count": int(result_df["rows"].sum()) if not result_df.empty else 0,
-        "status_counts": {k: int(v) for k, v in result_df["status"].value_counts().to_dict().items()},
+        "row_count": row_count,
+        "status_counts": status_counts,
         "start_date": start_date,
         "end_date": end_date,
     }
