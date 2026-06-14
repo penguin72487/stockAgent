@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -30,7 +30,7 @@ def _shares_by_date(records, symbol: str) -> dict[str, int]:
 
 
 def test_limit_price_examples() -> None:
-    prev = pd.Series([9.95, 10.0, 49.8, 50.0, 99.9, 100.0, 499.0, 500.0, 999.0, 1000.0])
+    prev = np.asarray([9.95, 10.0, 49.8, 50.0, 99.9, 100.0, 499.0, 500.0, 999.0, 1000.0])
     up = _tw_limit_price(prev, 1.10)
     down = _tw_limit_price(prev, 0.90)
 
@@ -44,7 +44,7 @@ def test_limit_price_examples() -> None:
 
 
 def test_limit_masks() -> None:
-    frame = pd.DataFrame(
+    frame = pl.DataFrame(
         {
             "tradable": [True, True, True],
             "close_raw": [100.0, 110.0, 90.0],
@@ -54,22 +54,22 @@ def test_limit_masks() -> None:
     can_buy, can_sell = _compute_tw_limit_masks(frame)
 
     # First row has no prev_close, only tradable rule applies.
-    assert bool(can_buy.iloc[0]) is True
-    assert bool(can_sell.iloc[0]) is True
+    assert bool(can_buy[0]) is True
+    assert bool(can_sell[0]) is True
 
     # Row 1 is limit-up from prev_close=100 -> cannot buy, can sell.
-    assert bool(can_buy.iloc[1]) is False
-    assert bool(can_sell.iloc[1]) is True
+    assert bool(can_buy[1]) is False
+    assert bool(can_sell[1]) is True
 
     # Row 2 is limit-down (or lower) from prev_close=110 -> can buy, cannot sell.
-    assert bool(can_buy.iloc[2]) is True
-    assert bool(can_sell.iloc[2]) is False
+    assert bool(can_buy[2]) is True
+    assert bool(can_sell[2]) is False
 
 
 def test_limit_masks_ex_dividend_reference_price() -> None:
     # Day 1 has ex-dividend cash=1.0. Reference should be prev_close - dividend.
     # prev_close=35.1 -> reference=34.1 -> limit_up=37.5, so close=37.5 is limit-up.
-    frame = pd.DataFrame(
+    frame = pl.DataFrame(
         {
             "tradable": [True, True],
             "close_raw": [35.1, 37.5],
@@ -80,14 +80,14 @@ def test_limit_masks_ex_dividend_reference_price() -> None:
 
     can_buy, can_sell = _compute_tw_limit_masks(frame)
 
-    assert bool(can_buy.iloc[1]) is False
-    assert bool(can_sell.iloc[1]) is True
+    assert bool(can_buy[1]) is False
+    assert bool(can_sell[1]) is True
 
 
 def test_limit_masks_split_reference_price() -> None:
     # Day 1 has 2-for-1 split. Reference should be prev_close / 2.
     # prev_close=100 -> reference=50 -> limit_up=55.0, so close=55.0 is limit-up.
-    frame = pd.DataFrame(
+    frame = pl.DataFrame(
         {
             "tradable": [True, True],
             "close_raw": [100.0, 55.0],
@@ -98,8 +98,8 @@ def test_limit_masks_split_reference_price() -> None:
 
     can_buy, can_sell = _compute_tw_limit_masks(frame)
 
-    assert bool(can_buy.iloc[1]) is False
-    assert bool(can_sell.iloc[1]) is True
+    assert bool(can_buy[1]) is False
+    assert bool(can_sell[1]) is True
 
 
 def test_no_buy_on_limit_up_day() -> None:

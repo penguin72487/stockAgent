@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 from torch import nn
 
@@ -295,7 +295,7 @@ def _role_embedding_frame(
     aux: dict[str, torch.Tensor],
     symbols: list[str],
     importance: np.ndarray,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pl.DataFrame, list[str]]:
     warnings: list[str] = []
     tensor = None
     source_name = ""
@@ -306,7 +306,7 @@ def _role_embedding_frame(
             source_name = name
             break
     if tensor is None:
-        return pd.DataFrame(), ["No stock-level aux tensor was available for role embedding."]
+        return pl.DataFrame(), ["No stock-level aux tensor was available for role embedding."]
     centered = tensor - tensor.mean(axis=0, keepdims=True)
     try:
         _, _, vt = np.linalg.svd(centered, full_matrices=False)
@@ -327,14 +327,15 @@ def _role_embedding_frame(
         }
         for idx in range(tensor.shape[0])
     ]
-    return pd.DataFrame(rows), warnings
+    return pl.DataFrame(rows), warnings
 
 
 def _write_matrix_csv(path: Path, matrix: np.ndarray, source_symbols: list[str], target_symbols: list[str]) -> None:
-    frame = pd.DataFrame(matrix, index=source_symbols, columns=target_symbols)
-    frame.index.name = "source_symbol"
+    data: dict[str, Any] = {"source_symbol": list(source_symbols)}
+    data.update({str(symbol): matrix[:, idx] for idx, symbol in enumerate(target_symbols)})
+    frame = pl.DataFrame(data)
     path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(path)
+    frame.write_csv(path)
 
 
 def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: list[str], target_symbols: list[str]) -> None:
@@ -366,18 +367,21 @@ def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: li
     plt.close(fig)
 
 
-def _plot_top_edges(path: Path, edges: pd.DataFrame) -> None:
-    if edges.empty:
+def _plot_top_edges(path: Path, edges: pl.DataFrame) -> None:
+    if edges.is_empty():
         return
     try:
         import matplotlib.pyplot as plt
     except Exception:
         return
-    data = edges.head(30).copy()
-    labels = data["shock"].astype(str) + " " + data["source_symbol"].astype(str) + " -> " + data["target_symbol"].astype(str)
-    fig, ax = plt.subplots(figsize=(11, max(5, 0.28 * len(data) + 1.5)), dpi=140)
-    ax.barh(np.arange(len(data)), data["validated_transmission"].to_numpy(dtype=np.float64))
-    ax.set_yticks(np.arange(len(data)), labels, fontsize=7)
+    data = edges.head(30)
+    labels = [
+        f"{row['shock']} {row['source_symbol']} -> {row['target_symbol']}"
+        for row in data.select(["shock", "source_symbol", "target_symbol"]).to_dicts()
+    ]
+    fig, ax = plt.subplots(figsize=(11, max(5, 0.28 * data.height + 1.5)), dpi=140)
+    ax.barh(np.arange(data.height), data["validated_transmission"].to_numpy().astype(np.float64, copy=False))
+    ax.set_yticks(np.arange(data.height), labels, fontsize=7)
     ax.invert_yaxis()
     ax.set_xlabel("validated transmission")
     ax.set_title("Top Abstract Cross-Asset Transmission Edges")
@@ -502,11 +506,11 @@ def abstract_cross_asset_transmission(
         attention_selected = np.zeros((len(source_idx), len(target_idx)), dtype=np.float32)
     else:
         attention_selected = attention_flow[np.ix_(source_idx, target_idx)].astype(np.float32, copy=False)
-    attention_frame = pd.DataFrame(attention_rows)
-    attention_frame.to_csv(tables_dir / "attention_capture_summary.csv", index=False)
+    attention_frame = pl.DataFrame(attention_rows)
+    attention_frame.write_csv(tables_dir / "attention_capture_summary.csv")
     _write_matrix_csv(matrices_dir / "attention_flow.csv", attention_selected, source_symbols, target_symbols)
 
-    all_edges: list[pd.DataFrame] = []
+    all_edges: list[pl.DataFrame] = []
     shock_summaries: list[dict[str, Any]] = []
     requested_shocks = tuple(str(shock).strip().lower() for shock in settings.shocks if str(shock).strip())
     for shock in requested_shocks:
@@ -664,7 +668,7 @@ def abstract_cross_asset_transmission(
                 }
                 row.update({name: float(matrix[i, j]) for name, matrix in buffers.items()})
                 edge_rows.append(row)
-        edge_frame = pd.DataFrame(edge_rows)
+        edge_frame = pl.DataFrame(edge_rows)
         all_edges.append(edge_frame)
         shock_summaries.append(
             {
@@ -679,35 +683,48 @@ def abstract_cross_asset_transmission(
             }
         )
 
-    edges = pd.concat(all_edges, ignore_index=True) if all_edges else pd.DataFrame()
-    if not edges.empty:
-        edges = edges.sort_values("validated_transmission", ascending=False)
-        edges.to_csv(tables_dir / "edge_metrics.csv", index=False)
-        top_edges = edges.head(max(1, int(settings.top_edges))).copy()
-        top_edges.to_csv(tables_dir / "top_edges.csv", index=False)
+    edges = pl.concat(all_edges, how="diagonal_relaxed") if all_edges else pl.DataFrame()
+    if not edges.is_empty():
+        edges = edges.sort("validated_transmission", descending=True)
+        edges.write_csv(tables_dir / "edge_metrics.csv")
+        top_edges = edges.head(max(1, int(settings.top_edges)))
+        top_edges.write_csv(tables_dir / "top_edges.csv")
         _plot_top_edges(plots_dir / "top_edges.png", top_edges)
     else:
-        top_edges = pd.DataFrame()
-        edges.to_csv(tables_dir / "edge_metrics.csv", index=False)
-        top_edges.to_csv(tables_dir / "top_edges.csv", index=False)
+        top_edges = pl.DataFrame()
+        edges.write_csv(tables_dir / "edge_metrics.csv")
+        top_edges.write_csv(tables_dir / "top_edges.csv")
 
-    source_summary = edges.groupby("source_symbol", as_index=False)["validated_transmission"].sum() if not edges.empty else pd.DataFrame()
-    target_summary = edges.groupby("target_symbol", as_index=False)["validated_transmission"].sum() if not edges.empty else pd.DataFrame()
-    source_summary.to_csv(tables_dir / "source_summary.csv", index=False)
-    target_summary.to_csv(tables_dir / "target_summary.csv", index=False)
-    pd.DataFrame(shock_summaries).to_csv(tables_dir / "shock_summary.csv", index=False)
+    source_summary = (
+        edges.group_by("source_symbol").agg(pl.col("validated_transmission").sum())
+        if not edges.is_empty()
+        else pl.DataFrame()
+    )
+    target_summary = (
+        edges.group_by("target_symbol").agg(pl.col("validated_transmission").sum())
+        if not edges.is_empty()
+        else pl.DataFrame()
+    )
+    source_summary.write_csv(tables_dir / "source_summary.csv")
+    target_summary.write_csv(tables_dir / "target_summary.csv")
+    pl.DataFrame(shock_summaries).write_csv(tables_dir / "shock_summary.csv")
 
     role_warnings: list[str] = []
     if bool(settings.role_embedding):
         role_frame, role_warnings = _role_embedding_frame(aux, symbols, importance)
-        role_frame.to_csv(tables_dir / "role_embeddings.csv", index=False)
-        if not role_frame.empty:
+        role_frame.write_csv(tables_dir / "role_embeddings.csv")
+        if not role_frame.is_empty():
             try:
                 import matplotlib.pyplot as plt
                 fig, ax = plt.subplots(figsize=(8, 6), dpi=140)
-                ax.scatter(role_frame["role_x"], role_frame["role_y"], s=16, alpha=0.75)
-                for row in role_frame.nlargest(20, "selection_importance").itertuples(index=False):
-                    ax.text(float(row.role_x), float(row.role_y), str(row.symbol), fontsize=7)
+                ax.scatter(
+                    role_frame["role_x"].to_numpy(),
+                    role_frame["role_y"].to_numpy(),
+                    s=16,
+                    alpha=0.75,
+                )
+                for row in role_frame.sort("selection_importance", descending=True).head(20).to_dicts():
+                    ax.text(float(row["role_x"]), float(row["role_y"]), str(row["symbol"]), fontsize=7)
                 ax.set_title("Latent Stock Role Embedding")
                 ax.set_xlabel("role_x")
                 ax.set_ylabel("role_y")
@@ -718,7 +735,7 @@ def abstract_cross_asset_transmission(
                 role_warnings.append(f"Role embedding plot failed: {type(exc).__name__}: {exc}")
     warnings.extend(role_warnings)
 
-    top_preview = top_edges.head(20).to_dict(orient="records") if not top_edges.empty else []
+    top_preview = top_edges.head(20).to_dicts() if not top_edges.is_empty() else []
     summary = {
         "enabled": True,
         "module": MODULE_NAME,

@@ -575,7 +575,6 @@ def plot_fold_first_year_returns(
     output_path: str | Path | None = None,
 ) -> None:
     """Plot all folds' first test-year daily cumulative NAV as a single line per strategy/baseline, X axis is date, Y axis is log scale."""
-    import pandas as pd
     if not all_first_year_dates:
         return
 
@@ -594,13 +593,12 @@ def plot_fold_first_year_returns(
     strat_nav = _safe_equity_for_plot(strat_sorted)
     base_nav = _safe_equity_for_plot(base_sorted)
 
-    # Convert dates to pandas for better x-axis formatting
-    date_pd = pd.to_datetime(dates_sorted)
+    date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(date_pd, strat_nav, label="Strategy", linewidth=2.2)
-    ax.plot(date_pd, base_nav, label="Baseline", linewidth=2.2)
-    _annotate_max_drawdown_segment(ax, date_pd, strat_nav)
+    ax.plot(date_values, strat_nav, label="Strategy", linewidth=2.2)
+    ax.plot(date_values, base_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment(ax, date_values, strat_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
     ax.set_title("Walkforward First-Test-Year Daily Cumulative NAV (All Folds)")
@@ -764,19 +762,17 @@ def plot_first_test_year_only(
     if len(dates) == 0:
         return
 
-    import pandas as pd
-
     strategy = np.nan_to_num(np.asarray(strategy_log_returns, dtype=np.float64), nan=0.0)
     baseline = np.nan_to_num(np.asarray(baseline_log_returns, dtype=np.float64), nan=0.0)
-    date_pd = pd.to_datetime(dates)
+    date_values = np.asarray(dates, dtype="datetime64[ns]")
     strategy_nav = _safe_equity_for_plot(strategy)
     baseline_nav = _safe_equity_for_plot(baseline)
     result = _build_plot_result(strategy, baseline)
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(date_pd, strategy_nav, label="Strategy", linewidth=2.2)
-    ax.plot(date_pd, baseline_nav, label="Baseline", linewidth=2.2)
-    _annotate_max_drawdown_segment(ax, date_pd, strategy_nav)
+    ax.plot(date_values, strategy_nav, label="Strategy", linewidth=2.2)
+    ax.plot(date_values, baseline_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment(ax, date_values, strategy_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
     ax.set_title("Walkforward First Test Year Only")

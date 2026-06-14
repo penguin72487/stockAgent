@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -54,7 +53,7 @@ SCAN_PATTERNS: dict[str, list[str]] = {
     ],
     "downloader_merge": [
         "merge_existing",
-        "pd.concat",
+        "pl.concat",
         "drop_duplicates",
         "read_csv",
         "read_html",
@@ -64,8 +63,8 @@ SCAN_PATTERNS: dict[str, list[str]] = {
         "groupby",
         "merge(",
         "concat(",
-        "pd.to_numeric",
-        "pd.to_datetime",
+        "pl.col",
+        "pyarrow",
     ],
 }
 
@@ -152,23 +151,37 @@ def _module_available(name: str) -> bool:
     return True
 
 
-def _stats_from_pandas_frame(frame: pd.DataFrame) -> SymbolStats:
+def _stats_from_polars_frame(frame: Any) -> SymbolStats:
+    import polars as pl
+
     feature_cols = [col for col in LOG_RETURN_FEATURE_COLUMNS if col in frame.columns]
     feature_sum = 0.0
     if feature_cols:
-        values = frame[feature_cols].to_numpy(dtype=np.float64, copy=False)
+        values = frame.select([pl.col(col).cast(pl.Float64, strict=False) for col in feature_cols]).to_numpy()
         feature_sum = float(np.nansum(values))
+    returns = (
+        frame.get_column("return_1d").cast(pl.Float64, strict=False).to_numpy()
+        if "return_1d" in frame.columns
+        else np.asarray([], dtype=np.float64)
+    )
+    tradable = (
+        frame.get_column("tradable").cast(pl.Boolean, strict=False).fill_null(False).to_numpy()
+        if "tradable" in frame.columns
+        else np.zeros(int(frame.height), dtype=bool)
+    )
     return SymbolStats(
-        rows=int(len(frame)),
+        rows=int(frame.height),
         feature_sum=feature_sum,
-        return_sum=float(np.nansum(frame.get("return_1d", pd.Series(dtype=float)).to_numpy(dtype=np.float64))),
-        tradable_count=int(np.asarray(frame.get("tradable", pd.Series(dtype=bool)), dtype=bool).sum()),
+        return_sum=float(np.nansum(returns)),
+        tradable_count=int(np.asarray(tradable, dtype=bool).sum()),
     )
 
 
-def _bench_pandas_file(path: Path) -> SymbolStats:
-    frame = _prepare_symbol_frame(pd.read_parquet(path), path)
-    return _stats_from_pandas_frame(frame)
+def _bench_polars_frame_file(path: Path) -> SymbolStats:
+    import pyarrow.parquet as pq
+
+    frame = _prepare_symbol_frame(pq.read_table(path), path)
+    return _stats_from_polars_frame(frame)
 
 
 def _safe_log_np(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -200,7 +213,9 @@ def _numeric_arrow_column(table: Any, name: str, rows: int) -> np.ndarray:
     try:
         return np.asarray(values, dtype=np.float64)
     except (TypeError, ValueError):
-        return pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=np.float64)
+        import polars as pl
+
+        return pl.Series(values).cast(pl.Float64, strict=False).to_numpy()
 
 
 def _bench_pyarrow_file(path: Path) -> SymbolStats:
@@ -217,7 +232,14 @@ def _bench_pyarrow_file(path: Path) -> SymbolStats:
         try:
             order = np.argsort(np.asarray(date_values, dtype="datetime64[ns]"))
         except (TypeError, ValueError):
-            order = np.argsort(pd.to_datetime(pd.Series(date_values), errors="coerce").to_numpy())
+            import polars as pl
+
+            order = np.argsort(
+                pl.Series(date_values)
+                .cast(pl.String, strict=False)
+                .str.to_datetime(strict=False)
+                .to_numpy()
+            )
 
     def col(name: str) -> np.ndarray:
         values = _numeric_arrow_column(table, name, rows)
@@ -297,8 +319,9 @@ def _polars_log_ratio(num: Any, den: Any) -> Any:
 
 def _bench_polars_file(path: Path) -> SymbolStats:
     import polars as pl
+    import pyarrow.parquet as pq
 
-    df = pl.read_parquet(path)
+    df = pl.from_arrow(pq.read_table(path))
     if "date" in df.columns:
         df = df.sort("date")
     cols = set(df.columns)
@@ -403,7 +426,7 @@ def _bench_polars_streaming_file(path: Path) -> SymbolStats:
 
 
 FEATURE_PREP_BACKENDS: dict[str, tuple[str, Callable[[Path], SymbolStats]]] = {
-    "pandas": ("pandas", _bench_pandas_file),
+    "polars_frame": ("polars", _bench_polars_frame_file),
     "polars": ("polars", _bench_polars_lazy_file),
     "polars_eager": ("polars", _bench_polars_file),
     "polars_lazy": ("polars", _bench_polars_lazy_file),
@@ -629,13 +652,6 @@ def _wide_data(rows: int, symbols: int, seed: int) -> tuple[np.ndarray, np.ndarr
     return dates, weights, names
 
 
-def _bench_wide_write_pandas(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
-    df = pd.DataFrame(weights, columns=symbols)
-    df.insert(0, "date", dates)
-    df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
-    return path.stat().st_size
-
-
 def _bench_wide_write_pyarrow(path: Path, dates: np.ndarray, weights: np.ndarray, symbols: list[str]) -> int:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -686,7 +702,6 @@ def _bench_wide_write_polars_streaming(path: Path, dates: np.ndarray, weights: n
 
 
 WIDE_WRITE_BACKENDS: dict[str, tuple[str, Callable[[Path, np.ndarray, np.ndarray, list[str]], int]]] = {
-    "pandas": ("pandas", _bench_wide_write_pandas),
     "polars": ("polars", _bench_wide_write_polars_lazy),
     "polars_eager": ("polars", _bench_wide_write_polars),
     "polars_lazy": ("polars", _bench_wide_write_polars_lazy),

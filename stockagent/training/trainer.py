@@ -2266,10 +2266,15 @@ def _unlink_table_variants(base_path: Path) -> None:
 
 def _write_dataframe_table(df: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    import polars as pl
+
+    frame = df if isinstance(df, pl.DataFrame) else pl.DataFrame(df)
     if output_path.suffix.lower() == ".parquet":
-        df.to_parquet(output_path, index=False, engine="pyarrow", compression="snappy")
+        import pyarrow.parquet as pq
+
+        pq.write_table(frame.to_arrow(), output_path, compression="snappy")
     elif output_path.suffix.lower() == ".csv":
-        df.to_csv(output_path, index=False)
+        frame.write_csv(output_path)
     else:
         raise ValueError(f"Unsupported table output extension: {output_path}")
 
@@ -2279,9 +2284,9 @@ def _save_holdings_table(
     holdings: list[HoldingsRecord],
 ) -> None:
     """Save daily holdings detail sorted by holding ratio."""
-    import pandas as pd  # already a transitive dependency
+    import polars as pl
 
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
             "date": [row.date for row in holdings],
             "symbol": [row.symbol for row in holdings],
@@ -2302,9 +2307,9 @@ def _save_daily_portfolio_returns_csv(
     benchmark_returns: np.ndarray,
     turnovers: np.ndarray,
 ) -> None:
-    import pandas as pd
+    import polars as pl
 
-    df = pd.DataFrame(
+    df = pl.DataFrame(
         {
             "date": np.asarray(dates),
             "portfolio_return": np.asarray(strategy_returns, dtype=np.float64),
@@ -2312,7 +2317,7 @@ def _save_daily_portfolio_returns_csv(
             "turnover": np.asarray(turnovers, dtype=np.float64),
         }
     )
-    df.to_csv(output_path, index=False)
+    df.write_csv(output_path)
 
 
 def _save_daily_weights_table(
@@ -2322,29 +2327,11 @@ def _save_daily_weights_table(
     weights_history: np.ndarray,
 ) -> None:
     weights = np.asarray(weights_history, dtype=np.float64)
-    if output_path.suffix.lower() == ".parquet":
-        try:
-            import polars as pl
+    import polars as pl
 
-            data = {"date": np.asarray(dates)}
-            data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            lazy = pl.LazyFrame(data)
-            if hasattr(lazy, "sink_parquet"):
-                try:
-                    lazy.sink_parquet(output_path, compression="snappy", engine="streaming")
-                except TypeError:
-                    lazy.sink_parquet(output_path, compression="snappy")
-            else:
-                lazy.collect(engine="streaming").write_parquet(output_path, compression="snappy")
-            return
-        except Exception as exc:
-            print(f"[artifact] Polars daily weights parquet write failed; falling back to pandas: {exc}")
-
-    import pandas as pd
-
-    df = pd.DataFrame(weights, columns=list(symbols))
-    df.insert(0, "date", np.asarray(dates))
+    data = {"date": np.asarray(dates)}
+    data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
+    df = pl.DataFrame(data)
     _write_dataframe_table(df, output_path)
 
 

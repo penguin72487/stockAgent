@@ -5,7 +5,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def _load_benchmark_module():
@@ -22,54 +23,54 @@ def _load_benchmark_module():
 
 def _write_symbol(path: Path, offset: float) -> None:
     rows = 8
-    dates = pd.date_range("2024-01-01", periods=rows, freq="D")
+    dates = np.arange(np.datetime64("2024-01-01"), np.datetime64("2024-01-01") + rows)
     close = np.linspace(10.0 + offset, 11.0 + offset, rows)
-    frame = pd.DataFrame(
+    table = pa.table(
         {
-            "date": dates,
-            "open": close * 0.99,
-            "max": close * 1.02,
-            "min": close * 0.98,
-            "close": close,
-            "adjclose": close,
-            "Trading_Volume": np.linspace(1000.0, 2000.0, rows),
+            "date": pa.array(dates),
+            "open": pa.array(close * 0.99),
+            "max": pa.array(close * 1.02),
+            "min": pa.array(close * 0.98),
+            "close": pa.array(close),
+            "adjclose": pa.array(close),
+            "Trading_Volume": pa.array(np.linspace(1000.0, 2000.0, rows)),
         }
     )
-    frame.to_parquet(path, index=False)
+    pq.write_table(table, path)
 
 
 def _write_symbol_nan_range(path: Path, offset: float) -> None:
     rows = 8
-    dates = pd.date_range("2024-01-01", periods=rows, freq="D")
+    dates = np.arange(np.datetime64("2024-01-01"), np.datetime64("2024-01-01") + rows)
     close = np.linspace(20.0 + offset, 21.0 + offset, rows)
-    frame = pd.DataFrame(
+    table = pa.table(
         {
-            "date": dates,
-            "open": close * 0.99,
-            "max": [np.nan] * rows,
-            "min": [np.nan] * rows,
-            "close": close,
-            "adjclose": close,
-            "Trading_Volume": np.linspace(1000.0, 2000.0, rows),
+            "date": pa.array(dates),
+            "open": pa.array(close * 0.99),
+            "max": pa.array([np.nan] * rows),
+            "min": pa.array([np.nan] * rows),
+            "close": pa.array(close),
+            "adjclose": pa.array(close),
+            "Trading_Volume": pa.array(np.linspace(1000.0, 2000.0, rows)),
         }
     )
-    frame.to_parquet(path, index=False)
+    pq.write_table(table, path)
 
 
 def _write_tw_limit_symbol(path: Path) -> None:
     close = np.asarray([100.0, 110.0, 99.0, 100.0], dtype=np.float64)
-    frame = pd.DataFrame(
+    table = pa.table(
         {
-            "date": pd.date_range("2024-01-01", periods=len(close), freq="D"),
-            "open": close,
-            "max": close,
-            "min": close,
-            "close": close,
-            "adjclose": close,
-            "Trading_Volume": np.full(len(close), 1000.0),
+            "date": pa.array(np.arange(np.datetime64("2024-01-01"), np.datetime64("2024-01-01") + len(close))),
+            "open": pa.array(close),
+            "max": pa.array(close),
+            "min": pa.array(close),
+            "close": pa.array(close),
+            "adjclose": pa.array(close),
+            "Trading_Volume": pa.array(np.full(len(close), 1000.0)),
         }
     )
-    frame.to_parquet(path, index=False)
+    pq.write_table(table, path)
 
 
 def test_scan_data_processing_hotspots_finds_panel_and_table_outputs() -> None:
@@ -88,8 +89,9 @@ def test_feature_prep_benchmark_runs_on_synthetic_parquet(tmp_path: Path) -> Non
     _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
     _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
 
-    backends = ["pandas", "pyarrow"]
+    backends = ["pyarrow"]
     if module._module_available("polars"):
+        backends.append("polars_frame")
         backends.append("polars_lazy")
         backends.append("polars_streaming")
 
@@ -112,7 +114,7 @@ def test_feature_prep_benchmark_runs_on_synthetic_parquet(tmp_path: Path) -> Non
         assert result.checksum is not None
 
 
-def test_pyarrow_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Path) -> None:
+def test_pyarrow_panel_backend_builds_synthetic_parquet(tmp_path: Path) -> None:
     module = _load_benchmark_module()
     from stockagent.data.panel import build_panel
 
@@ -122,13 +124,6 @@ def test_pyarrow_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Pat
     _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
     _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
 
-    pandas_panel = build_panel(
-        tmp_path,
-        use_rapids=False,
-        benchmark_name="universe_average_return",
-        panel_backend="pandas",
-        panel_load_workers=1,
-    )
     pyarrow_panel = build_panel(
         tmp_path,
         use_rapids=False,
@@ -137,17 +132,13 @@ def test_pyarrow_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Pat
         panel_load_workers=1,
     )
 
-    assert pyarrow_panel.symbols == pandas_panel.symbols
-    assert pyarrow_panel.feature_names == pandas_panel.feature_names
-    assert np.array_equal(pyarrow_panel.dates, pandas_panel.dates)
-    assert np.allclose(pyarrow_panel.features, pandas_panel.features, equal_nan=True)
-    assert np.allclose(pyarrow_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True)
-    assert np.array_equal(pyarrow_panel.tradable_mask, pandas_panel.tradable_mask)
-    assert np.array_equal(pyarrow_panel.alive_mask, pandas_panel.alive_mask)
-    assert np.allclose(pyarrow_panel.benchmark_returns, pandas_panel.benchmark_returns, equal_nan=True)
+    assert pyarrow_panel.symbols == ["AAA", "BBB"]
+    assert pyarrow_panel.features.shape[:2] == (8, 2)
+    assert pyarrow_panel.returns_1d.shape == (8, 2)
+    assert pyarrow_panel.tradable_mask.all()
 
 
-def test_polars_lazy_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Path) -> None:
+def test_polars_lazy_panel_backend_matches_pyarrow_on_synthetic_parquet(tmp_path: Path) -> None:
     module = _load_benchmark_module()
     from stockagent.data.panel import build_panel
 
@@ -157,11 +148,11 @@ def test_polars_lazy_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path:
     _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
     _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
 
-    pandas_panel = build_panel(
+    pyarrow_panel = build_panel(
         tmp_path,
         use_rapids=False,
         benchmark_name="universe_average_return",
-        panel_backend="pandas",
+        panel_backend="pyarrow",
         panel_load_workers=1,
     )
     polars_panel = build_panel(
@@ -172,17 +163,17 @@ def test_polars_lazy_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path:
         panel_load_workers=1,
     )
 
-    assert polars_panel.symbols == pandas_panel.symbols
-    assert polars_panel.feature_names == pandas_panel.feature_names
-    assert np.array_equal(polars_panel.dates, pandas_panel.dates)
-    assert np.allclose(polars_panel.features, pandas_panel.features, equal_nan=True, atol=1e-6)
-    assert np.allclose(polars_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True, atol=1e-7)
-    assert np.array_equal(polars_panel.tradable_mask, pandas_panel.tradable_mask)
-    assert np.array_equal(polars_panel.can_buy_mask, pandas_panel.can_buy_mask)
-    assert np.array_equal(polars_panel.can_sell_mask, pandas_panel.can_sell_mask)
+    assert polars_panel.symbols == pyarrow_panel.symbols
+    assert polars_panel.feature_names == pyarrow_panel.feature_names
+    assert np.array_equal(polars_panel.dates, pyarrow_panel.dates)
+    assert np.allclose(polars_panel.features, pyarrow_panel.features, equal_nan=True, atol=1e-6)
+    assert np.allclose(polars_panel.returns_1d, pyarrow_panel.returns_1d, equal_nan=True, atol=1e-7)
+    assert np.array_equal(polars_panel.tradable_mask, pyarrow_panel.tradable_mask)
+    assert np.array_equal(polars_panel.can_buy_mask, pyarrow_panel.can_buy_mask)
+    assert np.array_equal(polars_panel.can_sell_mask, pyarrow_panel.can_sell_mask)
 
 
-def test_polars_streaming_panel_backend_matches_pandas_on_synthetic_parquet(tmp_path: Path) -> None:
+def test_polars_streaming_panel_backend_matches_pyarrow_on_synthetic_parquet(tmp_path: Path) -> None:
     module = _load_benchmark_module()
     from stockagent.data.panel import build_panel
 
@@ -192,11 +183,11 @@ def test_polars_streaming_panel_backend_matches_pandas_on_synthetic_parquet(tmp_
     _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
     _write_symbol(tmp_path / "BBB_features.parquet", 1.0)
 
-    pandas_panel = build_panel(
+    pyarrow_panel = build_panel(
         tmp_path,
         use_rapids=False,
         benchmark_name="universe_average_return",
-        panel_backend="pandas",
+        panel_backend="pyarrow",
         panel_load_workers=1,
     )
     polars_panel = build_panel(
@@ -207,19 +198,19 @@ def test_polars_streaming_panel_backend_matches_pandas_on_synthetic_parquet(tmp_
         panel_load_workers=1,
     )
 
-    assert polars_panel.symbols == pandas_panel.symbols
-    assert polars_panel.feature_names == pandas_panel.feature_names
-    assert np.array_equal(polars_panel.dates, pandas_panel.dates)
-    assert np.allclose(polars_panel.features, pandas_panel.features, equal_nan=True, atol=1e-6)
-    assert np.allclose(polars_panel.returns_1d, pandas_panel.returns_1d, equal_nan=True, atol=1e-7)
-    assert np.array_equal(polars_panel.tradable_mask, pandas_panel.tradable_mask)
-    assert np.array_equal(polars_panel.can_buy_mask, pandas_panel.can_buy_mask)
-    assert np.array_equal(polars_panel.can_sell_mask, pandas_panel.can_sell_mask)
+    assert polars_panel.symbols == pyarrow_panel.symbols
+    assert polars_panel.feature_names == pyarrow_panel.feature_names
+    assert np.array_equal(polars_panel.dates, pyarrow_panel.dates)
+    assert np.allclose(polars_panel.features, pyarrow_panel.features, equal_nan=True, atol=1e-6)
+    assert np.allclose(polars_panel.returns_1d, pyarrow_panel.returns_1d, equal_nan=True, atol=1e-7)
+    assert np.array_equal(polars_panel.tradable_mask, pyarrow_panel.tradable_mask)
+    assert np.array_equal(polars_panel.can_buy_mask, pyarrow_panel.can_buy_mask)
+    assert np.array_equal(polars_panel.can_sell_mask, pyarrow_panel.can_sell_mask)
 
 
 def test_wide_write_benchmark_reports_fastest_backend() -> None:
     module = _load_benchmark_module()
-    backends = ["pandas", "pyarrow"]
+    backends = ["pyarrow"]
     if module._module_available("polars"):
         backends.append("polars_lazy")
         backends.append("polars_streaming")

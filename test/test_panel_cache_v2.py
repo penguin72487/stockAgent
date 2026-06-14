@@ -34,14 +34,14 @@ def test_panel_cache_v2_round_trips_memmap_payload(tmp_path) -> None:
         tmp_path,
         panel,
         source_hash="hash-v1",
-        backend_key="pandas|benchmark=test|usd_only=False|tradable_mode=tradable",
+        backend_key="pyarrow|benchmark=test|usd_only=False|tradable_mode=tradable",
         version=123,
     )
 
     assert panel_cache_v2_is_valid(
         tmp_path,
         source_hash="hash-v1",
-        backend_key="pandas|benchmark=test|usd_only=False|tradable_mode=tradable",
+        backend_key="pyarrow|benchmark=test|usd_only=False|tradable_mode=tradable",
         version=123,
         source_paths=[source],
     )
@@ -76,7 +76,7 @@ def test_panel_cache_v2_invalidates_on_backend_key(tmp_path) -> None:
         tmp_path,
         panel,
         source_hash="hash-v1",
-        backend_key="pandas|benchmark=test|usd_only=False|tradable_mode=tradable",
+        backend_key="pyarrow|benchmark=test|usd_only=False|tradable_mode=tradable",
         version=123,
     )
 
