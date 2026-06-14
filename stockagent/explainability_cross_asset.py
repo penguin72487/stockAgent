@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 import torch
 from torch import nn
 
@@ -330,12 +331,29 @@ def _role_embedding_frame(
     return pl.DataFrame(rows), warnings
 
 
+def _write_frame_csv_or_parquet(path: Path, frame: pl.DataFrame) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        frame.write_csv(path)
+        parquet_path = path.with_suffix(".parquet")
+        if parquet_path.exists():
+            parquet_path.unlink()
+        return path
+    except Exception as exc:
+        if "nested" not in str(exc).lower():
+            raise
+        parquet_path = path.with_suffix(".parquet")
+        pq.write_table(frame.to_arrow(), parquet_path, compression="snappy")
+        if path.exists():
+            path.unlink()
+        return parquet_path
+
+
 def _write_matrix_csv(path: Path, matrix: np.ndarray, source_symbols: list[str], target_symbols: list[str]) -> None:
     data: dict[str, Any] = {"source_symbol": list(source_symbols)}
     data.update({str(symbol): matrix[:, idx] for idx, symbol in enumerate(target_symbols)})
     frame = pl.DataFrame(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    frame.write_csv(path)
+    _write_frame_csv_or_parquet(path, frame)
 
 
 def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: list[str], target_symbols: list[str]) -> None:
@@ -507,7 +525,7 @@ def abstract_cross_asset_transmission(
     else:
         attention_selected = attention_flow[np.ix_(source_idx, target_idx)].astype(np.float32, copy=False)
     attention_frame = pl.DataFrame(attention_rows)
-    attention_frame.write_csv(tables_dir / "attention_capture_summary.csv")
+    _write_frame_csv_or_parquet(tables_dir / "attention_capture_summary.csv", attention_frame)
     _write_matrix_csv(matrices_dir / "attention_flow.csv", attention_selected, source_symbols, target_symbols)
 
     all_edges: list[pl.DataFrame] = []
@@ -686,14 +704,14 @@ def abstract_cross_asset_transmission(
     edges = pl.concat(all_edges, how="diagonal_relaxed") if all_edges else pl.DataFrame()
     if not edges.is_empty():
         edges = edges.sort("validated_transmission", descending=True)
-        edges.write_csv(tables_dir / "edge_metrics.csv")
+        _write_frame_csv_or_parquet(tables_dir / "edge_metrics.csv", edges)
         top_edges = edges.head(max(1, int(settings.top_edges)))
-        top_edges.write_csv(tables_dir / "top_edges.csv")
+        _write_frame_csv_or_parquet(tables_dir / "top_edges.csv", top_edges)
         _plot_top_edges(plots_dir / "top_edges.png", top_edges)
     else:
         top_edges = pl.DataFrame()
-        edges.write_csv(tables_dir / "edge_metrics.csv")
-        top_edges.write_csv(tables_dir / "top_edges.csv")
+        _write_frame_csv_or_parquet(tables_dir / "edge_metrics.csv", edges)
+        _write_frame_csv_or_parquet(tables_dir / "top_edges.csv", top_edges)
 
     source_summary = (
         edges.group_by("source_symbol").agg(pl.col("validated_transmission").sum())
@@ -705,14 +723,14 @@ def abstract_cross_asset_transmission(
         if not edges.is_empty()
         else pl.DataFrame()
     )
-    source_summary.write_csv(tables_dir / "source_summary.csv")
-    target_summary.write_csv(tables_dir / "target_summary.csv")
-    pl.DataFrame(shock_summaries).write_csv(tables_dir / "shock_summary.csv")
+    _write_frame_csv_or_parquet(tables_dir / "source_summary.csv", source_summary)
+    _write_frame_csv_or_parquet(tables_dir / "target_summary.csv", target_summary)
+    _write_frame_csv_or_parquet(tables_dir / "shock_summary.csv", pl.DataFrame(shock_summaries))
 
     role_warnings: list[str] = []
     if bool(settings.role_embedding):
         role_frame, role_warnings = _role_embedding_frame(aux, symbols, importance)
-        role_frame.write_csv(tables_dir / "role_embeddings.csv")
+        _write_frame_csv_or_parquet(tables_dir / "role_embeddings.csv", role_frame)
         if not role_frame.is_empty():
             try:
                 import matplotlib.pyplot as plt

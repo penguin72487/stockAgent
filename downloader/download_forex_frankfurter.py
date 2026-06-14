@@ -339,7 +339,7 @@ def main() -> None:
     report_columns = ["code", "status", "rows", "output_path", "message"]
     report_rows = [asdict(item) for item in results]
     report_frame = (
-        pl.DataFrame(report_rows).select(report_columns)
+        pl.DataFrame(report_rows, infer_schema_length=None).select(report_columns)
         if report_rows
         else pl.DataFrame({column: [] for column in report_columns})
     )

@@ -85,3 +85,6 @@ Multi-asset Taiwan stock trading research workspace.
 - Shell runners default to `/home/user/miniforge3/envs/fintech/bin/python` on WSL; override with `PYTHON_BIN=/path/to/python` if needed.
 mamba env export -n fintech --no-builds > fintech_environment.yml
 mamba env update -n fintech -f fintech_environment.yml
+
+mkdir -p "$CONDA_PREFIX/conda-meta"
+nano "$CONDA_PREFIX/conda-meta/pinned"
