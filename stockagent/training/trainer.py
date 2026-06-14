@@ -2300,15 +2300,18 @@ def _save_holdings_table(
     _write_dataframe_table(df, output_path)
 
 
-def _save_daily_portfolio_returns_csv(
-    output_path: Path,
+def _save_daily_portfolio_returns_table(
+    base_path: Path,
     dates: np.ndarray,
     strategy_returns: np.ndarray,
     benchmark_returns: np.ndarray,
     turnovers: np.ndarray,
+    *,
+    table_output_format: str,
 ) -> None:
     import polars as pl
 
+    output_path = _table_path(base_path, table_output_format)
     df = pl.DataFrame(
         {
             "date": np.asarray(dates),
@@ -2317,7 +2320,11 @@ def _save_daily_portfolio_returns_csv(
             "turnover": np.asarray(turnovers, dtype=np.float64),
         }
     )
-    df.write_csv(output_path)
+    _write_dataframe_table(df, output_path)
+    for suffix in (".csv", ".parquet"):
+        stale_path = base_path.with_suffix(suffix)
+        if stale_path != output_path and stale_path.exists():
+            stale_path.unlink()
 
 
 def _save_daily_weights_table(
@@ -2386,14 +2393,18 @@ def _save_integer_share_audit_artifacts(
     )
     timing["npz_s"] = float(time.perf_counter() - stage_start)
     stage_start = time.perf_counter()
-    _save_daily_portfolio_returns_csv(
-        fold_dir / "integer_share_daily_portfolio_returns.csv",
+    _save_daily_portfolio_returns_table(
+        fold_dir / "integer_share_daily_portfolio_returns",
         dates,
         result.strategy_returns,
         result.benchmark_returns,
         result.turnovers,
+        table_output_format=table_output_format,
     )
-    timing["daily_returns_csv_s"] = float(time.perf_counter() - stage_start)
+    elapsed = float(time.perf_counter() - stage_start)
+    timing["daily_returns_table_s"] = elapsed
+    timing["daily_returns_csv_s"] = elapsed if table_output_format == "csv" else 0.0
+    timing["daily_returns_parquet_s"] = elapsed if table_output_format == "parquet" else 0.0
     daily_weights_base = fold_dir / "integer_share_daily_weights"
     if write_daily_weights_table:
         stage_start = time.perf_counter()
@@ -4408,10 +4419,10 @@ def _evaluate_windowed_tensor_batch(
         )
         return backtest, {}, {}
 
-    weights_chunks: list[torch.Tensor] = []
-    strategy_chunks: list[torch.Tensor] = []
-    benchmark_chunks: list[torch.Tensor] = []
-    turnover_chunks: list[torch.Tensor] = []
+    weights_history_out: torch.Tensor | None = None
+    strategy_returns_out: torch.Tensor | None = None
+    benchmark_returns_out: torch.Tensor | None = None
+    turnovers_out: torch.Tensor | None = None
 
     n_rows = 0
     sum_r_t = torch.zeros((), device=device, dtype=torch.float64)
@@ -4582,16 +4593,43 @@ def _evaluate_windowed_tensor_batch(
 
             backtest_finalize_start = time.perf_counter()
             prev_weights = _detach_portfolio_state(backtest_chunk.final_weights)
-            # Required for compiled/CUDA-graph backtest outputs; the next replay
-            # may reuse output storage.
-            if return_weights_history:
-                weights_chunks.append(backtest_chunk.weights_history[:valid_rows].clone())
             strategy_returns_valid = backtest_chunk.strategy_returns[:valid_rows]
             benchmark_returns_valid = backtest_chunk.benchmark_returns[:valid_rows]
             turnovers_valid = backtest_chunk.turnovers[:valid_rows]
-            strategy_chunks.append(strategy_returns_valid.clone())
-            benchmark_chunks.append(benchmark_returns_valid.clone())
-            turnover_chunks.append(turnovers_valid.clone())
+            if strategy_returns_out is None:
+                strategy_returns_out = torch.empty(
+                    (total_rows_for_eval,),
+                    device=device,
+                    dtype=strategy_returns_valid.dtype,
+                )
+                benchmark_returns_out = torch.empty(
+                    (total_rows_for_eval,),
+                    device=device,
+                    dtype=benchmark_returns_valid.dtype,
+                )
+                turnovers_out = torch.empty(
+                    (total_rows_for_eval,),
+                    device=device,
+                    dtype=turnovers_valid.dtype,
+                )
+                if return_weights_history:
+                    weights_history_out = torch.empty(
+                        (total_rows_for_eval, int(weights_chunk.size(1))),
+                        device=device,
+                        dtype=backtest_chunk.weights_history.dtype,
+                    )
+            # Required for compiled/CUDA-graph backtest outputs; the next replay
+            # may reuse output storage. Copy into final buffers directly to avoid
+            # per-chunk clone lists and a large final cat.
+            assert strategy_returns_out is not None
+            assert benchmark_returns_out is not None
+            assert turnovers_out is not None
+            strategy_returns_out[start:end].copy_(strategy_returns_valid)
+            benchmark_returns_out[start:end].copy_(benchmark_returns_valid)
+            turnovers_out[start:end].copy_(turnovers_valid)
+            if return_weights_history:
+                assert weights_history_out is not None
+                weights_history_out[start:end].copy_(backtest_chunk.weights_history[:valid_rows])
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_finalize_s += time.perf_counter() - backtest_finalize_start
             timing.backtest_s += time.perf_counter() - backtest_start
@@ -4645,22 +4683,21 @@ def _evaluate_windowed_tensor_batch(
                 )
 
         concat_start = time.perf_counter()
+        if strategy_returns_out is None or benchmark_returns_out is None or turnovers_out is None:
+            raise RuntimeError("windowed eval produced no buffers")
         weights = (
-            torch.cat(weights_chunks, dim=0)
-            if return_weights_history
+            weights_history_out
+            if return_weights_history and weights_history_out is not None
             else torch.empty(
                 (0, split.num_symbols),
                 device=device,
-                dtype=strategy_chunks[0].dtype if strategy_chunks else torch.float32,
+                dtype=strategy_returns_out.dtype,
             )
         )
-        strategy_returns = torch.cat(strategy_chunks, dim=0)
-        benchmark_returns = torch.cat(benchmark_chunks, dim=0)
-        turnovers = torch.cat(turnover_chunks, dim=0)
         backtest = BacktestResultTensor(
-            strategy_returns=strategy_returns,
-            benchmark_returns=benchmark_returns,
-            turnovers=turnovers,
+            strategy_returns=strategy_returns_out,
+            benchmark_returns=benchmark_returns_out,
+            turnovers=turnovers_out,
             weights_history=weights,
         )
         timing.concat_s += time.perf_counter() - concat_start
@@ -6862,13 +6899,20 @@ def _run_training_tree_models(
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
+            write_integer_holdings_table = bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_holdings_table",
+                    getattr(config.training, "save_integer_share_holdings_csv", True),
+                )
+            )
             test_integer_bt, holdings_records = run_backtest_integer_shares(
-                weights=test_bt_t.weights_history.detach().cpu().numpy(),
+                weights=test_bt.weights_history,
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 can_buy_mask=test_buy_masks.detach().cpu().numpy(),
                 can_sell_mask=test_sell_masks.detach().cpu().numpy(),
-                benchmark_returns=test_bench.detach().cpu().numpy(),
+                benchmark_returns=test_bt.benchmark_returns,
                 initial_capital=1_000_000.0,
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
@@ -6878,6 +6922,7 @@ def _run_training_tree_models(
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
+                collect_holdings=write_integer_holdings_table,
             )
             test_integer_met = compute_metrics(test_integer_bt)
 
@@ -6907,12 +6952,14 @@ def _run_training_tree_models(
                 json.dump(asdict(fold_result), f, indent=2)
 
             _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
-            _save_daily_portfolio_returns_csv(
-                fold_dir / "daily_portfolio_returns.csv",
+            table_output_format = str(getattr(config.training, "table_output_format", "csv"))
+            _save_daily_portfolio_returns_table(
+                fold_dir / "daily_portfolio_returns",
                 test_dates,
                 test_bt.strategy_returns,
                 test_bt.benchmark_returns,
                 test_bt.turnovers,
+                table_output_format=table_output_format,
             )
             _maybe_save_daily_weights_table(
                 fold_dir / "daily_weights.csv",
@@ -6926,7 +6973,7 @@ def _run_training_tree_models(
                         getattr(config.training, "save_daily_weights_csv", True),
                     )
                 ),
-                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+                table_output_format=table_output_format,
             )
             report = generate_annual_report(test_bt, test_dates)
             print("\n" + report)
@@ -6952,14 +6999,8 @@ def _run_training_tree_models(
                         getattr(config.training, "save_integer_share_daily_weights_csv", True),
                     )
                 ),
-                write_holdings_table=bool(
-                    getattr(
-                        config.training,
-                        "save_integer_share_holdings_table",
-                        getattr(config.training, "save_integer_share_holdings_csv", True),
-                    )
-                ),
-                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+                write_holdings_table=write_integer_holdings_table,
+                table_output_format=table_output_format,
             )
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -7100,13 +7141,20 @@ def _run_inference_tree_models(
         test_dates = panel.dates[test_eval_indices]
         test_close_prices = panel.close_prices[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
+        write_integer_holdings_table = bool(
+            getattr(
+                config.training,
+                "save_integer_share_holdings_table",
+                getattr(config.training, "save_integer_share_holdings_csv", True),
+            )
+        )
         test_integer_bt, holdings_records = run_backtest_integer_shares(
-            weights=test_bt_t.weights_history.detach().cpu().numpy(),
+            weights=test_bt.weights_history,
             future_returns=test_returns.detach().cpu().numpy(),
             tradable_mask=test_masks.detach().cpu().numpy(),
             can_buy_mask=test_buy_masks.detach().cpu().numpy(),
             can_sell_mask=test_sell_masks.detach().cpu().numpy(),
-            benchmark_returns=test_bench.detach().cpu().numpy(),
+            benchmark_returns=test_bt.benchmark_returns,
             initial_capital=1_000_000.0,
             buy_fee_rate=config.trading.buy_fee_rate,
             sell_fee_rate=config.trading.sell_fee_rate,
@@ -7116,6 +7164,7 @@ def _run_inference_tree_models(
             close_prices=test_close_prices,
             symbols=panel.symbols,
             dates=test_dates,
+            collect_holdings=write_integer_holdings_table,
         )
         test_integer_met = compute_metrics(test_integer_bt)
 
@@ -7137,12 +7186,14 @@ def _run_inference_tree_models(
             json.dump(asdict(fold_result), f, indent=2)
 
         _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
-        _save_daily_portfolio_returns_csv(
-            fold_dir / "daily_portfolio_returns.csv",
+        table_output_format = str(getattr(config.training, "table_output_format", "csv"))
+        _save_daily_portfolio_returns_table(
+            fold_dir / "daily_portfolio_returns",
             test_dates,
             test_bt.strategy_returns,
             test_bt.benchmark_returns,
             test_bt.turnovers,
+            table_output_format=table_output_format,
         )
         _maybe_save_daily_weights_table(
             fold_dir / "daily_weights.csv",
@@ -7156,7 +7207,7 @@ def _run_inference_tree_models(
                     getattr(config.training, "save_daily_weights_csv", True),
                 )
             ),
-            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+            table_output_format=table_output_format,
         )
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
@@ -7181,14 +7232,8 @@ def _run_inference_tree_models(
                     getattr(config.training, "save_integer_share_daily_weights_csv", True),
                 )
             ),
-            write_holdings_table=bool(
-                getattr(
-                    config.training,
-                    "save_integer_share_holdings_table",
-                    getattr(config.training, "save_integer_share_holdings_csv", True),
-                )
-            ),
-            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+            write_holdings_table=write_integer_holdings_table,
+            table_output_format=table_output_format,
         )
 
     if results_by_fold:
@@ -7387,13 +7432,20 @@ def _run_inference_neural_models(
         test_dates = panel.dates[test_eval_indices]
         test_close_prices = panel.close_prices[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
+        write_integer_holdings_table = bool(
+            getattr(
+                config.training,
+                "save_integer_share_holdings_table",
+                getattr(config.training, "save_integer_share_holdings_csv", True),
+            )
+        )
         test_integer_bt, holdings_records = run_backtest_integer_shares(
-            weights=test_bt_t.weights_history.detach().cpu().numpy(),
+            weights=test_bt.weights_history,
             future_returns=test_returns.detach().cpu().numpy(),
             tradable_mask=test_masks.detach().cpu().numpy(),
             can_buy_mask=test_buy_masks.detach().cpu().numpy(),
             can_sell_mask=test_sell_masks.detach().cpu().numpy(),
-            benchmark_returns=test_bench.detach().cpu().numpy(),
+            benchmark_returns=test_bt.benchmark_returns,
             initial_capital=1_000_000.0,
             buy_fee_rate=config.trading.buy_fee_rate,
             sell_fee_rate=config.trading.sell_fee_rate,
@@ -7403,6 +7455,7 @@ def _run_inference_neural_models(
             close_prices=test_close_prices,
             symbols=panel.symbols,
             dates=test_dates,
+            collect_holdings=write_integer_holdings_table,
         )
         test_integer_met = compute_metrics(test_integer_bt)
 
@@ -7424,12 +7477,14 @@ def _run_inference_neural_models(
             json.dump(asdict(fold_result), f, indent=2)
 
         _save_backtest_artifact(_backtest_path(fold_dir), test_bt, test_dates)
-        _save_daily_portfolio_returns_csv(
-            fold_dir / "daily_portfolio_returns.csv",
+        table_output_format = str(getattr(config.training, "table_output_format", "csv"))
+        _save_daily_portfolio_returns_table(
+            fold_dir / "daily_portfolio_returns",
             test_dates,
             test_bt.strategy_returns,
             test_bt.benchmark_returns,
             test_bt.turnovers,
+            table_output_format=table_output_format,
         )
         _maybe_save_daily_weights_table(
             fold_dir / "daily_weights.csv",
@@ -7443,7 +7498,7 @@ def _run_inference_neural_models(
                     getattr(config.training, "save_daily_weights_csv", True),
                 )
             ),
-            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+            table_output_format=table_output_format,
         )
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
@@ -7468,14 +7523,8 @@ def _run_inference_neural_models(
                     getattr(config.training, "save_integer_share_daily_weights_csv", True),
                 )
             ),
-            write_holdings_table=bool(
-                getattr(
-                    config.training,
-                    "save_integer_share_holdings_table",
-                    getattr(config.training, "save_integer_share_holdings_csv", True),
-                )
-            ),
-            table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+            write_holdings_table=write_integer_holdings_table,
+            table_output_format=table_output_format,
         )
 
     if results_by_fold:
@@ -9486,13 +9535,20 @@ def run_training(
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
+            write_integer_holdings_table = bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_holdings_table",
+                    getattr(config.training, "save_integer_share_holdings_csv", True),
+                )
+            )
             test_integer_bt, holdings_records = run_backtest_integer_shares(
-                weights=test_bt_t.weights_history.detach().cpu().numpy(),
+                weights=test_bt.weights_history,
                 future_returns=test_returns.detach().cpu().numpy(),
                 tradable_mask=test_masks.detach().cpu().numpy(),
                 can_buy_mask=test_buy_masks.detach().cpu().numpy(),
                 can_sell_mask=test_sell_masks.detach().cpu().numpy(),
-                benchmark_returns=test_bench.detach().cpu().numpy(),
+                benchmark_returns=test_bt.benchmark_returns,
                 initial_capital=1_000_000.0,
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
@@ -9502,6 +9558,7 @@ def run_training(
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
+                collect_holdings=write_integer_holdings_table,
             )
             test_integer_met = compute_metrics(test_integer_bt)
             test_report_total = time.perf_counter() - test_report_start
@@ -9556,14 +9613,19 @@ def run_training(
             save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
             save_timing["backtest_artifact_compression"] = backtest_artifact_compression
             stage_start = time.perf_counter()
-            _save_daily_portfolio_returns_csv(
-                fold_dir / "daily_portfolio_returns.csv",
+            table_output_format = str(getattr(config.training, "table_output_format", "csv"))
+            _save_daily_portfolio_returns_table(
+                fold_dir / "daily_portfolio_returns",
                 test_dates,
                 test_bt.strategy_returns,
                 test_bt.benchmark_returns,
                 test_bt.turnovers,
+                table_output_format=table_output_format,
             )
-            save_timing["daily_returns_csv_s"] = float(time.perf_counter() - stage_start)
+            elapsed = float(time.perf_counter() - stage_start)
+            save_timing["daily_returns_table_s"] = elapsed
+            save_timing["daily_returns_csv_s"] = elapsed if table_output_format == "csv" else 0.0
+            save_timing["daily_returns_parquet_s"] = elapsed if table_output_format == "parquet" else 0.0
             stage_start = time.perf_counter()
             _maybe_save_daily_weights_table(
                 fold_dir / "daily_weights.csv",
@@ -9577,10 +9639,10 @@ def run_training(
                         getattr(config.training, "save_daily_weights_csv", True),
                     )
                 ),
-                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+                table_output_format=table_output_format,
             )
             save_timing["daily_weights_table_s"] = float(time.perf_counter() - stage_start)
-            save_timing["table_output_format"] = str(getattr(config.training, "table_output_format", "csv"))
+            save_timing["table_output_format"] = table_output_format
             stage_start = time.perf_counter()
             report = generate_annual_report(test_bt, test_dates)
             save_timing["annual_report_compute_s"] = float(time.perf_counter() - stage_start)
@@ -9638,14 +9700,8 @@ def run_training(
                         getattr(config.training, "save_integer_share_daily_weights_csv", True),
                     )
                 ),
-                write_holdings_table=bool(
-                    getattr(
-                        config.training,
-                        "save_integer_share_holdings_table",
-                        getattr(config.training, "save_integer_share_holdings_csv", True),
-                    )
-                ),
-                table_output_format=str(getattr(config.training, "table_output_format", "csv")),
+                write_holdings_table=write_integer_holdings_table,
+                table_output_format=table_output_format,
                 backtest_artifact_compression=backtest_artifact_compression,
             )
             plot_timing["integer_share_audit_s"] = float(time.perf_counter() - audit_start)

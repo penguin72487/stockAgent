@@ -494,7 +494,11 @@ def main() -> None:
     summary_path = output_dir / "download_summary.json"
 
     result_rows = [asdict(r) for r in results]
-    result_df = pl.DataFrame(result_rows).sort(["status", "okx_symbol"]) if result_rows else pl.DataFrame()
+    result_df = (
+        pl.DataFrame(result_rows, infer_schema_length=None).sort(["status", "okx_symbol"])
+        if result_rows
+        else pl.DataFrame()
+    )
     result_df.write_csv(report_path)
     status_counts: dict[str, int] = {}
     row_count = 0

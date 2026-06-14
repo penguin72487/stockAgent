@@ -9,9 +9,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import pyarrow as pa
+import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
 _CURVE_FILENAMES = ("epoch_curve.parquet", "epoch_curve.jsonl", "epoch_curve.csv")
+_REPORT_PARQUET_FILENAMES = (
+    "attention_capture_summary.parquet",
+    "daily_portfolio_returns.parquet",
+    "daily_weights.parquet",
+    "edge_metrics.parquet",
+    "holdings.parquet",
+    "integer_share_daily_portfolio_returns.parquet",
+    "integer_share_daily_weights.parquet",
+    "role_embeddings.parquet",
+    "shock_summary.parquet",
+    "source_summary.parquet",
+    "target_summary.parquet",
+    "top_edges.parquet",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -53,6 +68,24 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="When reading jsonl/csv, also write <curve_dir>/epoch_curve.parquet for faster reloads.",
+    )
+    parser.add_argument(
+        "--export-report-csvs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Convert parquet report tables under --artifacts-root to same-name CSVs after plotting.",
+    )
+    parser.add_argument(
+        "--force-report-csvs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Rewrite report CSV exports even when the CSV is newer than the parquet source.",
+    )
+    parser.add_argument(
+        "--skip-plots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip epoch curve plotting; useful with --export-report-csvs for CSV export only.",
     )
     return parser.parse_args()
 
@@ -128,6 +161,87 @@ def _write_curve_parquet_cache(curve_path: Path, rows: list[dict]) -> tuple[Path
     table = pa.Table.from_pylist(rows)
     pq.write_table(table, parquet_path, compression="snappy")
     return parquet_path, float(time.perf_counter() - start)
+
+
+def _polars_dtype_is_nested(dtype: object) -> bool:
+    checker = getattr(dtype, "is_nested", None)
+    if callable(checker):
+        return bool(checker())
+    return str(dtype).startswith(("List", "Array", "Struct"))
+
+
+def _json_cell(value: object) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "to_list"):
+        value = value.to_list()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist()
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _write_parquet_table_as_csv(parquet_path: Path, csv_path: Path) -> None:
+    table = pq.read_table(parquet_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        pacsv.write_csv(table, csv_path)
+        return
+    except Exception:
+        frame = pl.from_arrow(table)
+        nested_columns = [
+            column
+            for column, dtype in zip(frame.columns, frame.dtypes)
+            if _polars_dtype_is_nested(dtype)
+        ]
+        if not nested_columns:
+            raise
+        frame = frame.with_columns(
+            [
+                pl.col(column).map_elements(_json_cell, return_dtype=pl.String).alias(column)
+                for column in nested_columns
+            ]
+        )
+        frame.write_csv(csv_path)
+
+
+def export_report_csvs(root: Path, *, force: bool = False, quiet: bool = False) -> dict[str, float | int | str]:
+    """Export training report parquet tables to CSV outside the training hot path."""
+    total_start = time.perf_counter()
+    root = root if root.is_dir() else root.parent
+    candidates = sorted(
+        path
+        for path in root.rglob("*.parquet")
+        if path.name in _REPORT_PARQUET_FILENAMES
+    )
+    written = 0
+    skipped = 0
+    for parquet_path in candidates:
+        csv_path = parquet_path.with_suffix(".csv")
+        if csv_path.exists() and not force:
+            try:
+                if csv_path.stat().st_mtime >= parquet_path.stat().st_mtime:
+                    skipped += 1
+                    continue
+            except OSError:
+                pass
+        _write_parquet_table_as_csv(parquet_path, csv_path)
+        written += 1
+        if not quiet:
+            print(f"exported csv: {csv_path}")
+    elapsed = float(time.perf_counter() - total_start)
+    result = {
+        "root": str(root),
+        "candidates": int(len(candidates)),
+        "written": int(written),
+        "skipped": int(skipped),
+        "total_s": elapsed,
+    }
+    if not quiet:
+        print(
+            "report_csv_export: "
+            f"candidates={len(candidates)} written={written} skipped={skipped} total={elapsed:.3f}s"
+        )
+    return result
 
 
 def _sample_rows(rows: list[dict], interval: int) -> list[dict]:
@@ -343,11 +457,19 @@ def plot_curve_file(
 def main() -> None:
     args = _parse_args()
 
-    if args.curve_file:
+    if args.skip_plots:
+        curve_paths = []
+    elif args.curve_file:
         curve_paths = [Path(args.curve_file)]
     else:
-        curve_paths = _find_curve_files(Path(args.artifacts_root))
-        print(f"plotting all curve files under {args.artifacts_root}: {len(curve_paths)} found")
+        try:
+            curve_paths = _find_curve_files(Path(args.artifacts_root))
+        except FileNotFoundError:
+            if not args.export_report_csvs:
+                raise
+            curve_paths = []
+        if curve_paths:
+            print(f"plotting all curve files under {args.artifacts_root}: {len(curve_paths)} found")
 
     for curve_path in curve_paths:
         if args.output and len(curve_paths) == 1:
@@ -365,6 +487,12 @@ def main() -> None:
             output_path=output_path,
             timing_output_path=timing_output_path,
             write_parquet_cache=bool(args.write_parquet_cache),
+        )
+
+    if args.export_report_csvs:
+        export_report_csvs(
+            Path(args.artifacts_root),
+            force=bool(args.force_report_csvs),
         )
 
 
