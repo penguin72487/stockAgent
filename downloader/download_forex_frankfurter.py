@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 import requests
 
 from common import resolve_end_date, run_parallel_tasks
@@ -93,12 +93,12 @@ def _load_default_pairs() -> list[str]:
             "EURJPY", "EURGBP", "EURCHF", "EURAUD", "EURNZD", "EURCAD", "GBPJPY", "GBPCHF",
         ]
 
-    frame = pd.read_csv(DEFAULT_SYMBOLS_PATH, dtype=str).fillna("")
+    frame = pl.read_csv(DEFAULT_SYMBOLS_PATH, infer_schema=False, ignore_errors=True).fill_null("")
     if "code" not in frame.columns:
         return []
 
     pairs: list[str] = []
-    for raw in frame["code"].tolist():
+    for raw in frame["code"].to_list():
         code = str(raw).strip().upper()
         if len(code) == 6 and code.isalpha():
             pairs.append(code)
@@ -131,6 +131,48 @@ def _build_symbol_records(pairs: list[str], supported: set[str]) -> list[SymbolR
     return records
 
 
+def _normalize_date_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty() or "date" not in frame.columns:
+        return frame
+    date_expr = (
+        pl.col("date").str.to_datetime(strict=False).alias("date")
+        if frame.schema.get("date") == pl.String
+        else pl.col("date").cast(pl.Datetime("us"), strict=False).alias("date")
+    )
+    return frame.with_columns(date_expr).drop_nulls("date").sort("date")
+
+
+def _max_frame_date(frame: pl.DataFrame) -> str | None:
+    normalized = _normalize_date_frame(frame)
+    if normalized.is_empty():
+        return None
+    latest = normalized.select(pl.col("date").max()).item()
+    return latest.date().isoformat()
+
+
+def _normalize_rate_rows(rows: list[dict[str, object]], fetch_start_date: str, end_date: str) -> pl.DataFrame:
+    if not rows:
+        return pl.DataFrame()
+    start_dt = datetime.strptime(fetch_start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    return (
+        pl.DataFrame(rows)
+        .with_columns(
+            pl.col("date").str.to_datetime(strict=False).alias("date"),
+            *[
+                pl.col(column).cast(pl.Float64, strict=False).alias(column)
+                for column in ("open", "max", "min", "close", "adjclose", "Trading_Volume")
+                if column in rows[0]
+            ],
+        )
+        .filter(pl.col("date").is_between(start_dt, end_dt, closed="both"))
+        .drop_nulls(["date", "close"])
+        .sort("date")
+        .unique(subset=["date"], keep="last", maintain_order=True)
+        .sort("date")
+    )
+
+
 def _download_pair(
     record: SymbolRecord,
     start_date: str,
@@ -141,20 +183,19 @@ def _download_pair(
     incremental: bool,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    existing_frame: pd.DataFrame | None = None
+    existing_frame: pl.DataFrame | None = None
     existing_rows = 0
     fetch_start_date = start_date
 
     if output_path.exists() and incremental:
         try:
-            existing_frame = pd.read_parquet(output_path)
-            existing_rows = int(len(existing_frame))
-            if "date" in existing_frame.columns and not existing_frame.empty:
-                existing_dates = pd.to_datetime(existing_frame["date"], errors="coerce").dropna()
-                if not existing_dates.empty:
-                    next_date = (existing_dates.max() + pd.Timedelta(days=1)).date().isoformat()
-                    fetch_start_date = max(start_date, next_date)
-            if pd.Timestamp(fetch_start_date) > pd.Timestamp(end_date):
+            existing_frame = pl.read_parquet(output_path)
+            existing_rows = int(existing_frame.height)
+            latest_date = _max_frame_date(existing_frame)
+            if latest_date is not None:
+                next_date = (datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
+                fetch_start_date = max(start_date, next_date)
+            if datetime.strptime(fetch_start_date, "%Y-%m-%d") > datetime.strptime(end_date, "%Y-%m-%d"):
                 return DownloadResult(
                     code=record.code,
                     status="up_to_date",
@@ -172,7 +213,7 @@ def _download_pair(
 
     if output_path.exists() and not refresh and not incremental:
         try:
-            rows = len(pd.read_parquet(output_path))
+            rows = pl.read_parquet(output_path).height
             return DownloadResult(code=record.code, status="skipped_existing", rows=int(rows), output_path=str(output_path))
         except Exception as exc:
             return DownloadResult(
@@ -206,40 +247,34 @@ def _download_pair(
                     "min": close_num,
                     "close": close_num,
                     "adjclose": close_num,
-                    "Trading_Volume": pd.NA,
+                    "Trading_Volume": None,
                 }
             )
 
         if not rows:
             return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points")
 
-        frame = pd.DataFrame(rows)
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.tz_localize(None)
-        start_ts = pd.Timestamp(fetch_start_date)
-        end_ts = pd.Timestamp(end_date)
-        frame = frame[(frame["date"] >= start_ts) & (frame["date"] <= end_ts)]
-        frame = frame.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
-        frame = frame.reset_index(drop=True)
-        if frame.empty:
+        frame = _normalize_rate_rows(rows, fetch_start_date, end_date)
+        if frame.is_empty():
             return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points after date filtering")
 
         if incremental and existing_frame is not None:
-            if "date" in existing_frame.columns:
-                existing_frame = existing_frame.copy()
-                existing_frame["date"] = pd.to_datetime(existing_frame["date"], errors="coerce").dt.tz_localize(None)
-                existing_frame = existing_frame.dropna(subset=["date"])
-            merged = pd.concat([existing_frame, frame], ignore_index=True)
-            merged = merged.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
-            merged.to_parquet(output_path, index=False)
+            merged = (
+                pl.concat([_normalize_date_frame(existing_frame), frame], how="diagonal_relaxed")
+                .sort("date")
+                .unique(subset=["date"], keep="last", maintain_order=True)
+                .sort("date")
+            )
+            merged.write_parquet(output_path, compression="snappy", statistics=True)
             return DownloadResult(
                 code=record.code,
                 status="updated_incremental",
-                rows=int(len(merged)),
+                rows=int(merged.height),
                 output_path=str(output_path),
             )
 
-        frame.to_parquet(output_path, index=False)
-        return DownloadResult(code=record.code, status="updated", rows=int(len(frame)), output_path=str(output_path))
+        frame.write_parquet(output_path, compression="snappy", statistics=True)
+        return DownloadResult(code=record.code, status="updated", rows=int(frame.height), output_path=str(output_path))
     except Exception as exc:
         return DownloadResult(code=record.code, status="failed", rows=0, output_path=None, message=str(exc))
 
@@ -269,8 +304,7 @@ def main() -> None:
         raise RuntimeError("No valid forex pairs resolved for Frankfurter")
 
     if not args.skip_manifest:
-        manifest = pd.DataFrame([asdict(item) for item in records])
-        manifest.to_csv(output_dir / "symbols.csv", index=False)
+        pl.DataFrame([asdict(item) for item in records]).write_csv(output_dir / "symbols.csv")
 
     def _worker(record: SymbolRecord) -> DownloadResult:
         return _download_pair(
@@ -293,11 +327,14 @@ def main() -> None:
 
     results.sort(key=lambda item: item.code)
 
-    with (output_dir / "download_report.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["code", "status", "rows", "output_path", "message"])
-        writer.writeheader()
-        for item in results:
-            writer.writerow(asdict(item))
+    report_columns = ["code", "status", "rows", "output_path", "message"]
+    report_rows = [asdict(item) for item in results]
+    report_frame = (
+        pl.DataFrame(report_rows).select(report_columns)
+        if report_rows
+        else pl.DataFrame({column: [] for column in report_columns})
+    )
+    report_frame.write_csv(output_dir / "download_report.csv")
 
     status_counts: dict[str, int] = {}
     row_count = 0

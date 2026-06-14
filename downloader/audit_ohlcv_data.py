@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 from common import resolve_end_date, run_parallel_tasks
 
@@ -100,43 +100,58 @@ def _schema_columns(path: Path) -> set[str] | None:
         return None
 
 
-def _read_audit_frame(path: Path) -> tuple[pd.DataFrame, set[str]]:
+def _read_audit_frame(path: Path) -> tuple[pl.DataFrame, set[str]]:
     schema_columns = _schema_columns(path)
     if schema_columns is not None:
         columns = [column for column in READ_COLUMNS if column in schema_columns]
         if not columns:
-            return pd.DataFrame(), schema_columns
-        return pd.read_parquet(path, columns=columns), schema_columns
+            return pl.DataFrame(), schema_columns
+        return pl.read_parquet(path, columns=columns), schema_columns
 
-    frame = pd.read_parquet(path)
-    return frame[[column for column in READ_COLUMNS if column in frame.columns]].copy(), set(frame.columns)
+    frame = pl.read_parquet(path)
+    return frame.select([column for column in READ_COLUMNS if column in frame.columns]), set(frame.columns)
 
 
 def _summarize_gaps(
-    timestamps: pd.Series,
+    timestamps: pl.DataFrame,
     *,
     root: Path,
     daily_gap_days: int,
     intraday_gap_multiple: float,
 ) -> tuple[float | None, int]:
-    if len(timestamps) < 3:
+    if timestamps.height < 3:
         return None, 0
 
-    sorted_ts = timestamps.sort_values()
-    deltas = sorted_ts.diff().dropna().dt.total_seconds()
-    deltas = deltas[deltas > 0]
-    if deltas.empty:
+    deltas = (
+        timestamps.sort("date")
+        .select(pl.col("date").diff().dt.total_seconds().alias("delta"))
+        .drop_nulls("delta")
+        .filter(pl.col("delta") > 0)
+    )
+    if deltas.is_empty():
         return None, 0
 
-    median_delta = float(deltas.median())
-    max_gap = float(deltas.max())
+    median_delta = float(deltas.select(pl.col("delta").median()).item())
+    max_gap = float(deltas.select(pl.col("delta").max()).item())
     intraday = _is_intraday_root(root) or median_delta < 12 * 60 * 60
     if intraday:
         expected_seconds = max(1.0, median_delta)
         threshold = expected_seconds * max(1.0, float(intraday_gap_multiple))
     else:
         threshold = max(1, int(daily_gap_days)) * 24 * 60 * 60
-    return max_gap, int((deltas > threshold).sum())
+    return max_gap, int(deltas.select(pl.col("delta").gt(threshold).sum()).item())
+
+
+def _date_expr(frame: pl.DataFrame) -> object:
+    if frame.schema.get("date") == pl.String:
+        return pl.col("date").str.to_datetime(strict=False).alias("date")
+    return pl.col("date").cast(pl.Datetime("us"), strict=False).alias("date")
+
+
+def _numeric_frame(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    return frame.select(
+        [pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column) for column in columns]
+    )
 
 
 def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
@@ -157,34 +172,41 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
             message=str(exc),
         )
 
-    result.rows = int(len(frame))
+    result.rows = int(frame.height)
     missing_required = [column for column in REQUIRED_COLUMNS if column not in columns]
     if missing_required:
         issues.append("missing_columns")
         result.missing_columns = ",".join(missing_required)
-    if "date" not in frame.columns or frame.empty:
+    if "date" not in frame.columns or frame.is_empty():
         result.status = "failed"
         result.issues = "|".join(issues or ["empty_or_missing_date"])
         return result
 
-    parsed_dates = pd.to_datetime(frame["date"], errors="coerce", utc=True)
-    valid_dates = parsed_dates.dropna()
-    result.invalid_dates = int(parsed_dates.isna().sum())
-    if valid_dates.empty:
+    valid_dates = frame.select(_date_expr(frame)).drop_nulls("date")
+    result.invalid_dates = int(frame.height - valid_dates.height)
+    if valid_dates.is_empty():
         result.status = "failed"
         issues.append("no_valid_dates")
         result.issues = "|".join(sorted(set(issues)))
         return result
 
-    result.first_date = valid_dates.min().date().isoformat()
-    result.last_date = valid_dates.max().date().isoformat()
-    target_end = pd.Timestamp(resolve_end_date(str(args.end_date))).date()
-    result.stale_lag_days = int((target_end - valid_dates.max().date()).days)
+    bounds = valid_dates.select(pl.col("date").min().alias("first_date"), pl.col("date").max().alias("last_date")).to_dicts()[0]
+    first_dt = bounds["first_date"]
+    last_dt = bounds["last_date"]
+    result.first_date = first_dt.date().isoformat()
+    result.last_date = last_dt.date().isoformat()
+    target_end = datetime.strptime(resolve_end_date(str(args.end_date)), "%Y-%m-%d").date()
+    result.stale_lag_days = int((target_end - last_dt.date()).days)
     if result.stale_lag_days > args.stale_max_lag_days:
         issues.append("stale")
 
-    date_key = valid_dates.dt.floor("s") if _is_intraday_root(root) else valid_dates.dt.normalize()
-    result.duplicate_dates = int(date_key.duplicated(keep=False).sum())
+    date_key = (
+        valid_dates.select(pl.col("date").dt.truncate("1s").alias("date_key"))
+        if _is_intraday_root(root)
+        else valid_dates.select(pl.col("date").dt.date().alias("date_key"))
+    )
+    duplicate_groups = date_key.group_by("date_key").len().filter(pl.col("len") > 1)
+    result.duplicate_dates = int(duplicate_groups.select(pl.col("len").sum()).item() or 0)
     if result.duplicate_dates:
         issues.append("duplicate_dates")
 
@@ -201,30 +223,37 @@ def _audit_file(payload: tuple[Path, Path, argparse.Namespace]) -> AuditResult:
 
     ohlc_columns = [column for column in ("open", "max", "min", "close") if column in frame.columns]
     if ohlc_columns:
-        ohlc = frame[ohlc_columns].apply(pd.to_numeric, errors="coerce")
-        result.nan_ohlc_rows = int(ohlc.isna().any(axis=1).sum())
+        ohlc = _numeric_frame(frame, ohlc_columns)
+        result.nan_ohlc_rows = int(ohlc.select(pl.any_horizontal(pl.all().is_null()).sum()).item())
         if result.nan_ohlc_rows:
             issues.append("nan_ohlc")
 
         if {"open", "max", "min", "close"}.issubset(ohlc.columns):
-            bad_ohlc = (
-                (ohlc["max"] < ohlc["min"])
-                | (ohlc["max"] < ohlc["open"])
-                | (ohlc["max"] < ohlc["close"])
-                | (ohlc["min"] > ohlc["open"])
-                | (ohlc["min"] > ohlc["close"])
+            result.bad_ohlc_rows = int(
+                ohlc.select(
+                    (
+                        pl.col("max").lt(pl.col("min"))
+                        | pl.col("max").lt(pl.col("open"))
+                        | pl.col("max").lt(pl.col("close"))
+                        | pl.col("min").gt(pl.col("open"))
+                        | pl.col("min").gt(pl.col("close"))
+                    )
+                    .fill_null(False)
+                    .sum()
+                ).item()
             )
-            result.bad_ohlc_rows = int(bad_ohlc.fillna(False).sum())
             if result.bad_ohlc_rows:
                 issues.append("bad_ohlc")
 
-        result.nonpositive_price_rows = int((ohlc <= 0).any(axis=1).sum())
+        result.nonpositive_price_rows = int(ohlc.select(pl.any_horizontal(pl.all().le(0)).sum()).item())
         if result.nonpositive_price_rows:
             issues.append("nonpositive_price")
 
     if "Trading_Volume" in frame.columns:
-        volume = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
-        result.negative_volume_rows = int((volume < 0).fillna(False).sum())
+        volume = _numeric_frame(frame, ["Trading_Volume"])
+        result.negative_volume_rows = int(
+            volume.select(pl.col("Trading_Volume").lt(0).fill_null(False).sum()).item()
+        )
         if result.negative_volume_rows:
             issues.append("negative_volume")
 
@@ -269,13 +298,16 @@ def main() -> None:
     summary_path = output_dir / "data_quality_summary.json"
     latest_summary_path = Path(args.output_dir) / "latest_summary.json"
 
-    report_frame = pd.DataFrame([asdict(item) for item in results])
-    report_frame.to_csv(report_path, index=False)
+    report_rows = [asdict(item) for item in results]
+    report_frame = pl.DataFrame(report_rows) if report_rows else pl.DataFrame()
+    report_frame.write_csv(report_path)
 
-    status_counts = report_frame["status"].value_counts().to_dict() if not report_frame.empty else {}
+    status_counts: dict[str, int] = {}
+    for item in results:
+        status_counts[item.status] = status_counts.get(item.status, 0) + 1
     issue_counts: dict[str, int] = {}
-    if not report_frame.empty and "issues" in report_frame.columns:
-        for raw_issues in report_frame["issues"].dropna().astype(str):
+    if results:
+        for raw_issues in [item.issues for item in results if item.issues]:
             for issue in raw_issues.split("|"):
                 if issue:
                     issue_counts[issue] = issue_counts.get(issue, 0) + 1

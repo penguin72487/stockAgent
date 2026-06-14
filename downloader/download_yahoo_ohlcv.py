@@ -254,6 +254,8 @@ TW_INCLUDED_SECTION_LABELS: dict[str, set[str]] = {
     "listed": {"股票", "特別股", "ETF"},
     "otc": {"股票", "特別股", "ETF"},
 }
+TW_SUPPORTED_ACTIVE_CODE_PATTERN = re.compile(r"^(?:\d{4}[A-Z]?|00[0-9A-Z]{3,4})$")
+TW_EXCLUDED_ACTIVE_NAME_PATTERN = re.compile(r"(權證|牛證|熊證|元展|展延)")
 
 
 @dataclass(slots=True)
@@ -577,24 +579,46 @@ def _today_str() -> str:
     return date.today().isoformat()
 
 
+def _require_polars() -> object:
+    if pl is None:
+        raise RuntimeError("download_yahoo_ohlcv.py requires polars for dataframe operations")
+    return pl
+
+
+def _empty_feature_frame() -> object:
+    _require_polars()
+    return pl.DataFrame({column: [] for column in BASE_OUTPUT_COLUMNS})
+
+
 def _coerce_to_date(value: object) -> date | None:
     if value is None:
         return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
+    value_text = str(value).strip()
+    if not value_text or value_text.lower() in {"nan", "nat", "none", "null"}:
         return None
-    if isinstance(parsed, pd.Timestamp):
-        return parsed.date()
-    return parsed.to_pydatetime().date()
+    value_text = value_text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(value_text).date()
+    except ValueError:
+        try:
+            return date.fromisoformat(value_text[:10])
+        except ValueError:
+            return None
 
 
 def _decode_metadata_date(value: bytes | str | None) -> str | None:
@@ -612,13 +636,33 @@ def _decode_metadata_date(value: bytes | str | None) -> str | None:
     return parsed.isoformat() if parsed is not None else None
 
 
-def _frame_date_bounds(frame: pd.DataFrame) -> tuple[str | None, str | None]:
-    if frame.empty or "date" not in frame.columns:
+def _frame_date_bounds(frame: object) -> tuple[str | None, str | None]:
+    _require_polars()
+    if frame.is_empty() or "date" not in frame.columns:
         return None, None
-    dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
-    if dates.empty:
+    bounds = frame.select(
+        pl.col("date").min().alias("first_date"),
+        pl.col("date").max().alias("last_date"),
+    )
+    if bounds.is_empty():
         return None, None
-    return dates.min().date().isoformat(), dates.max().date().isoformat()
+    row = bounds.to_dicts()[0]
+    first = _coerce_to_date(row.get("first_date"))
+    last = _coerce_to_date(row.get("last_date"))
+    if first is None or last is None:
+        return None, None
+    return first.isoformat(), last.isoformat()
+
+
+def _datetime_expression(frame: object, column: str = "date") -> object:
+    _require_polars()
+    dtype = frame.schema.get(column)
+    expr = pl.col(column)
+    if dtype == pl.String:
+        return expr.str.to_datetime(strict=False).cast(pl.Datetime("us"), strict=False).alias(column)
+    if dtype == pl.Date:
+        return expr.cast(pl.Datetime("us"), strict=False).alias(column)
+    return expr.cast(pl.Datetime("us"), strict=False).alias(column)
 
 
 def _previous_weekday(value: date) -> date:
@@ -649,13 +693,12 @@ def _read_parquet_row_count(output_path: Path) -> int:
         return int(pq.ParquetFile(output_path, memory_map=True).metadata.num_rows)
     if pl is not None:
         return int(pl.scan_parquet(str(output_path)).select(pl.len()).collect().item())
-    return int(len(pd.read_parquet(output_path)))
+    raise RuntimeError("reading parquet requires pyarrow or polars")
 
 
-def _read_parquet_frame(output_path: Path) -> pd.DataFrame:
-    if pl is not None:
-        return pl.read_parquet(str(output_path)).to_pandas()
-    return pd.read_parquet(output_path)
+def _read_parquet_frame(output_path: Path) -> object:
+    _require_polars()
+    return pl.read_parquet(str(output_path))
 
 
 def _date_bounds_from_arrow_table(table: object) -> tuple[str | None, str | None]:
@@ -725,22 +768,20 @@ def _load_existing_file_info_polars(output_path: Path) -> ExistingFileInfo | Non
     return ExistingFileInfo(first.isoformat(), last.isoformat(), None, columns)
 
 
-def _prepare_arrow_table_for_write(frame: pd.DataFrame) -> object:
+def _prepare_arrow_table_for_write(frame: object) -> object:
+    _require_polars()
     ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in frame.columns] + [
         column for column in frame.columns if column not in set(BASE_OUTPUT_COLUMNS)
     ]
-    if pl is not None:
-        polars_frame = pl.from_pandas(frame[ordered_columns])
-        if "date" in polars_frame.columns:
-            polars_frame = (
-                polars_frame.with_columns(pl.col("date").cast(pl.Datetime("us"), strict=False))
-                .drop_nulls("date")
-                .sort("date")
-                .unique(subset=["date"], keep="last", maintain_order=True)
-            )
-        return polars_frame.select([column for column in ordered_columns if column in polars_frame.columns]).to_arrow()
-    assert pa is not None
-    return pa.Table.from_pandas(frame[ordered_columns], preserve_index=False)
+    polars_frame = frame.select([column for column in ordered_columns if column in frame.columns])
+    if "date" in polars_frame.columns:
+        polars_frame = (
+            polars_frame.with_columns(_datetime_expression(polars_frame))
+            .drop_nulls("date")
+            .sort("date")
+            .unique(subset=["date"], keep="last", maintain_order=True)
+        )
+    return polars_frame.to_arrow()
 
 
 def _fsync_file(path: Path) -> None:
@@ -765,12 +806,13 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _write_feature_parquet_atomic(
-    frame: pd.DataFrame,
+    frame: object,
     output_path: Path,
     *,
     asset_class: str,
     requested_end_date: str,
 ) -> tuple[str | None, str | None]:
+    frame = _canonicalize_feature_frame(frame, keep_zero_volume=asset_class != "forex")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     first_date, last_date = _frame_date_bounds(frame)
     handle = tempfile.NamedTemporaryFile(
@@ -815,9 +857,9 @@ def _write_feature_parquet_atomic(
                 allow_truncated_timestamps=True,
             )
         elif pl is not None:
-            pl.from_pandas(frame).write_parquet(str(tmp_path), compression="snappy", statistics=True)
+            frame.write_parquet(str(tmp_path), compression="snappy", statistics=True)
         else:
-            frame.to_parquet(tmp_path, index=False)
+            raise RuntimeError("writing parquet requires pyarrow or polars")
         _fsync_file(tmp_path)
         os.replace(tmp_path, output_path)
         _fsync_directory(output_path.parent)
@@ -918,85 +960,145 @@ class PrecheckLoader:
             self._process = None
 
 
-def _normalize_download_frame(frame: pd.DataFrame, *, keep_zero_volume: bool = True) -> pd.DataFrame:
-    if frame.empty:
-        return pd.DataFrame(columns=BASE_OUTPUT_COLUMNS)
+def _dedupe_column_names(columns: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    deduped: list[str] = []
+    for column in columns:
+        base = column or "column"
+        count = counts.get(base, 0)
+        counts[base] = count + 1
+        deduped.append(base if count == 0 else f"{base}_{count}")
+    return deduped
 
-    frame = frame.reset_index()
-    if isinstance(frame.columns, pd.MultiIndex):
-        flattened_columns: list[str] = []
-        for column in frame.columns:
-            if not isinstance(column, tuple):
-                flattened_columns.append(str(column))
-                continue
 
+def _yahoo_frame_to_polars(frame: object) -> object:
+    _require_polars()
+    if isinstance(frame, pl.DataFrame):
+        return frame
+    if frame is None or bool(getattr(frame, "empty", False)):
+        return _empty_feature_frame()
+
+    reset_frame = frame.reset_index()
+    flattened_columns: list[str] = []
+    for column in list(reset_frame.columns):
+        if isinstance(column, tuple):
             primary = str(column[0]).strip()
             secondary = str(column[1]).strip() if len(column) > 1 else ""
             flattened_columns.append(primary or secondary)
-        frame.columns = flattened_columns
+        else:
+            flattened_columns.append(str(column).strip())
+    reset_frame.columns = _dedupe_column_names(flattened_columns)
+    return pl.DataFrame({column: list(reset_frame[column]) for column in reset_frame.columns})
 
-    renamed = frame.rename(
-        columns={
-            "Date": "date",
-            "Datetime": "date",
-            "index": "date",
-            "Open": "open",
-            "High": "max",
-            "Low": "min",
-            "Close": "close",
-            "Adj Close": "adjclose",
-            "AdjClose": "adjclose",
-            "Volume": "Trading_Volume",
-        }
+
+def _canonicalize_feature_frame(frame: object, *, keep_zero_volume: bool = True) -> object:
+    _require_polars()
+    if frame.is_empty():
+        return _empty_feature_frame()
+    if "date" not in frame.columns:
+        return _empty_feature_frame()
+
+    extra_columns = [column for column in frame.columns if column not in set(BASE_OUTPUT_COLUMNS)]
+    ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in frame.columns] + extra_columns
+    normalized = frame.select(ordered_columns)
+    numeric_columns = [column for column in normalized.columns if column != "date"]
+    expressions = [_datetime_expression(normalized)]
+    expressions.extend(
+        pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column)
+        for column in numeric_columns
+    )
+    normalized = (
+        normalized.with_columns(expressions)
+        .drop_nulls(["date", "close"] if "close" in normalized.columns else ["date"])
+        .sort("date")
+        .unique(subset=["date"], keep="last", maintain_order=True)
+        .sort("date")
     )
 
-    if "date" not in renamed.columns:
-        return pd.DataFrame(columns=BASE_OUTPUT_COLUMNS)
-
-    # Preserve canonical OHLCV columns and keep any extra Yahoo columns when available.
-    extra_columns = [column for column in renamed.columns if column not in set(BASE_OUTPUT_COLUMNS)]
-    ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in renamed.columns] + extra_columns
-    normalized = renamed[ordered_columns].copy()
-    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce").dt.tz_localize(None)
-    numeric_columns = [column for column in normalized.columns if column != "date"]
-    for column in numeric_columns:
-        normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
-
-    normalized = normalized.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
     empty_extra_columns = [
         column
         for column in normalized.columns
-        if column not in set(BASE_OUTPUT_COLUMNS) and normalized[column].isna().all()
+        if column not in set(BASE_OUTPUT_COLUMNS)
+        and bool(normalized.select(pl.col(column).is_null().all()).item())
     ]
     if empty_extra_columns:
-        normalized = normalized.drop(columns=empty_extra_columns)
+        normalized = normalized.drop(empty_extra_columns)
+
     if not keep_zero_volume and "Trading_Volume" in normalized.columns:
-        volume = pd.to_numeric(normalized["Trading_Volume"], errors="coerce")
-        if volume.isna().all() or volume.fillna(0).eq(0).all():
-            normalized = normalized.drop(columns=["Trading_Volume"])
+        all_zero_or_null = bool(
+            normalized.select(pl.col("Trading_Volume").fill_null(0).eq(0).all()).item()
+        )
+        if all_zero_or_null:
+            normalized = normalized.drop("Trading_Volume")
 
-    return normalized.reset_index(drop=True)
+    ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in normalized.columns] + [
+        column for column in normalized.columns if column not in set(BASE_OUTPUT_COLUMNS)
+    ]
+    return normalized.select(ordered_columns)
 
 
-def _frame_matches_expected_interval(frame: pd.DataFrame, expected_seconds: int) -> bool:
-    if frame.empty or "date" not in frame.columns:
+def _normalize_download_frame(frame: object, *, keep_zero_volume: bool = True) -> object:
+    raw = _yahoo_frame_to_polars(frame)
+    if raw.is_empty():
+        return _empty_feature_frame()
+
+    rename_map = {
+        "Date": "date",
+        "Datetime": "date",
+        "index": "date",
+        "Open": "open",
+        "High": "max",
+        "Low": "min",
+        "Close": "close",
+        "Adj Close": "adjclose",
+        "AdjClose": "adjclose",
+        "Volume": "Trading_Volume",
+    }
+    renamed = raw.rename({source: target for source, target in rename_map.items() if source in raw.columns})
+    return _canonicalize_feature_frame(renamed, keep_zero_volume=keep_zero_volume)
+
+
+def _merge_feature_frames(existing_frame: object, fresh_frame: object, *, keep_zero_volume: bool = True) -> object:
+    _require_polars()
+    merged = pl.concat([existing_frame, fresh_frame], how="diagonal_relaxed")
+    return _canonicalize_feature_frame(merged, keep_zero_volume=keep_zero_volume)
+
+
+def _frame_matches_expected_interval(frame: object, expected_seconds: int) -> bool:
+    _require_polars()
+    if frame.is_empty() or "date" not in frame.columns:
         return True
 
-    parsed = pd.to_datetime(frame["date"], errors="coerce").dropna().sort_values()
-    if len(parsed) < 3:
+    parsed = (
+        frame.select(_datetime_expression(frame))
+        .drop_nulls("date")
+        .sort("date")
+    )
+    if parsed.height < 3:
         return True
 
-    deltas = parsed.diff().dropna().dt.total_seconds()
-    deltas = deltas[deltas > 0]
-    if deltas.empty:
+    deltas = (
+        parsed.select(pl.col("date").diff().dt.total_seconds().alias("delta"))
+        .drop_nulls("delta")
+        .filter(pl.col("delta") > 0)
+    )
+    if deltas.is_empty():
         return True
 
-    median_delta = float(deltas.median())
-    large_gap_share = float((deltas >= 12 * 60 * 60).mean())
+    median_delta = float(deltas.select(pl.col("delta").median()).item())
+    large_gap_share = float(deltas.select(pl.col("delta").ge(12 * 60 * 60).mean()).item())
     if large_gap_share > 0.05:
         return False
     midnight_share = float(
-        ((parsed.dt.hour == 0) & (parsed.dt.minute == 0) & (parsed.dt.second == 0)).mean()
+        parsed.select(
+            (
+                pl.col("date").dt.hour().eq(0)
+                & pl.col("date").dt.minute().eq(0)
+                & pl.col("date").dt.second().eq(0)
+            )
+            .mean()
+            .alias("midnight_share")
+        ).item()
     )
     if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
         return False
@@ -1028,9 +1130,51 @@ def _http_get_text(url: str, timeout: int = 30) -> str:
         return raw.decode("utf-8", errors="ignore")
 
 
-def _read_html_tables(url: str, timeout: int = 30) -> list[pd.DataFrame]:
-    html = _http_get_text(url, timeout=timeout)
-    return pd.read_html(io.StringIO(html))
+class _HTMLTableRowParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._current_row: list[str] | None = None
+        self._current_cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "tr":
+            self._current_row = []
+        elif tag in {"td", "th"} and self._current_row is not None:
+            self._current_cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_cell is not None:
+            self._current_cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._current_row is not None and self._current_cell is not None:
+            value = " ".join(part.strip() for part in self._current_cell if part.strip())
+            self._current_row.append(value.strip())
+            self._current_cell = None
+        elif tag == "tr" and self._current_row is not None:
+            if any(cell for cell in self._current_row):
+                self.rows.append(self._current_row)
+            self._current_row = None
+            self._current_cell = None
+
+
+def _read_html_table_rows(url: str, timeout: int = 30) -> list[list[str]]:
+    parser = _HTMLTableRowParser()
+    parser.feed(_http_get_text(url, timeout=timeout))
+    return parser.rows
+
+
+def _read_csv_frame(source: object, *, separator: str = ",") -> object:
+    _require_polars()
+    return pl.read_csv(
+        source,
+        separator=separator,
+        infer_schema=False,
+        ignore_errors=True,
+        truncate_ragged_lines=True,
+        missing_utf8_is_empty_string=True,
+    ).fill_null("")
 
 
 def _http_get_json(url: str, timeout: int = 30) -> object:
@@ -1055,16 +1199,14 @@ def _fetch_with_hard_timeout(fn, *args, timeout: int = 60, **kwargs):
 def _extract_tw_codes_from_tables(url: str) -> set[str]:
     codes: set[str] = set()
     try:
-        tables = _read_html_tables(url)
+        rows = _read_html_table_rows(url)
     except Exception:
         return codes
 
-    for table in tables:
-        for column in table.columns:
-            values = table[column].astype(str)
-            for value in values:
-                for match in TW_GENERIC_CODE_PATTERN.finditer(value):
-                    codes.add(match.group(1).upper())
+    for row in rows:
+        for value in row:
+            for match in TW_GENERIC_CODE_PATTERN.finditer(value):
+                codes.add(match.group(1).upper())
     return codes
 
 
@@ -1110,7 +1252,15 @@ def _record_from_input(asset_class: str, raw_symbol: str) -> SymbolRecord:
 def _record_from_local_code(asset_class: str, code: str) -> SymbolRecord:
     normalized = code.strip().upper()
     if asset_class == "tw_stocks" and TW_GENERIC_CODE_PATTERN.fullmatch(normalized):
-        return SymbolRecord(code=normalized, name=normalized, market=asset_class, yahoo_symbol=f"{normalized}.TW,{normalized}.TWO")
+        record = SymbolRecord(
+            code=normalized,
+            name=normalized,
+            market=asset_class,
+            yahoo_symbol=f"{normalized}.TW,{normalized}.TWO",
+        )
+        if not _is_supported_tw_active_record(record):
+            raise ValueError(f"Unsupported tw_stocks local code: {normalized}")
+        return record
     return _record_from_input(asset_class, normalized)
 
 
@@ -1186,6 +1336,22 @@ def _with_market(record: SymbolRecord, market: str) -> SymbolRecord:
     return SymbolRecord(code=record.code, name=record.name, market=market, yahoo_symbol=record.yahoo_symbol)
 
 
+def _is_supported_tw_active_record(record: SymbolRecord) -> bool:
+    code = record.code.strip().upper()
+    name = record.name.strip()
+    if not TW_SUPPORTED_ACTIVE_CODE_PATTERN.fullmatch(code):
+        return False
+    return not TW_EXCLUDED_ACTIVE_NAME_PATTERN.search(name)
+
+
+def _filter_tw_records_for_supported_universe(records: list[SymbolRecord]) -> list[SymbolRecord]:
+    filtered: list[SymbolRecord] = []
+    for record in records:
+        if _is_delisted_record(record) or _is_supported_tw_active_record(record):
+            filtered.append(record)
+    return filtered
+
+
 def _apply_daily_listing_state(
     asset_class: str,
     records: list[SymbolRecord],
@@ -1221,22 +1387,22 @@ def _load_tw_symbols_from_local_manifest() -> list[SymbolRecord]:
     if not manifest_path.exists():
         return []
 
-    frame = pd.read_csv(manifest_path, dtype=str).fillna("")
+    frame = _read_csv_frame(manifest_path)
     required_columns = {"code", "name", "market", "yahoo_symbol"}
     if not required_columns.issubset(frame.columns):
         return []
 
     records: list[SymbolRecord] = []
-    for row in frame.itertuples(index=False):
-        code = str(getattr(row, "code", "")).strip().upper()
-        yahoo_symbol = str(getattr(row, "yahoo_symbol", "")).strip().upper()
+    for row in frame.iter_rows(named=True):
+        code = str(row.get("code", "")).strip().upper()
+        yahoo_symbol = str(row.get("yahoo_symbol", "")).strip().upper()
         if not code or not yahoo_symbol:
             continue
         records.append(
             SymbolRecord(
                 code=code,
-                name=str(getattr(row, "name", code)).strip() or code,
-                market=str(getattr(row, "market", "tw_stocks")).strip() or "tw_stocks",
+                name=str(row.get("name", code)).strip() or code,
+                market=str(row.get("market", "tw_stocks")).strip() or "tw_stocks",
                 yahoo_symbol=yahoo_symbol,
             )
         )
@@ -1255,56 +1421,62 @@ def _load_tw_symbols_from_local_parquet() -> list[SymbolRecord]:
         code = output_path.name[: -len(suffix)].strip().upper()
         if not code or code in seen_codes or not TW_GENERIC_CODE_PATTERN.fullmatch(code):
             continue
-        seen_codes.add(code)
-        records.append(
-            SymbolRecord(
-                code=code,
-                name=code,
-                market="tw_stocks",
-                yahoo_symbol=f"{code}.TW,{code}.TWO",
-            )
+        record = SymbolRecord(
+            code=code,
+            name=code,
+            market="tw_stocks",
+            yahoo_symbol=f"{code}.TW,{code}.TWO",
         )
+        if not _is_supported_tw_active_record(record):
+            continue
+        seen_codes.add(code)
+        records.append(record)
     return records
 
 
 def _load_tw_symbols_from_exchange() -> list[SymbolRecord]:
     records: list[SymbolRecord] = []
     seen_codes: set[str] = set()
+    section_labels = set().union(*TW_INCLUDED_SECTION_LABELS.values())
     for market, (url, suffix) in TWSE_SOURCES.items():
-        tables = _read_html_tables(url)
-        for table in tables:
-            current_section: str | None = None
-            for row in table.fillna("").itertuples(index=False):
-                values = [str(value).strip() for value in row]
-                nonempty = [value for value in values if value]
-                if nonempty and len(set(nonempty)) == 1 and len(nonempty) >= 3:
-                    current_section = nonempty[0]
-                    continue
-                if current_section not in TW_INCLUDED_SECTION_LABELS.get(market, set()):
-                    continue
-                if len(values) < 4:
-                    continue
-                raw_value = values[0]
-                market_value = values[3]
-                if market == "listed" and market_value != "上市":
-                    continue
-                if market == "otc" and market_value != "上櫃":
-                    continue
-                match = TWSE_CODE_NAME_PATTERN.match(raw_value)
-                if not match:
-                    continue
-                code = match.group("code").upper()
-                if code in seen_codes:
-                    continue
-                seen_codes.add(code)
-                records.append(
-                    SymbolRecord(
-                        code=code,
-                        name=match.group("name").strip(),
-                        market=market,
-                        yahoo_symbol=f"{code}{suffix}",
-                    )
-                )
+        rows = _read_html_table_rows(url)
+        current_section: str | None = None
+        for row in rows:
+            values = [str(value).strip() for value in row]
+            nonempty = [value for value in values if value]
+            if nonempty and (
+                (len(set(nonempty)) == 1 and len(nonempty) >= 3)
+                or (len(nonempty) == 1 and nonempty[0] in section_labels)
+            ):
+                current_section = nonempty[0]
+                continue
+            if current_section not in TW_INCLUDED_SECTION_LABELS.get(market, set()):
+                continue
+            if len(values) < 4:
+                continue
+            raw_value = values[0]
+            market_value = values[3]
+            if market == "listed" and market_value != "上市":
+                continue
+            if market == "otc" and market_value != "上櫃":
+                continue
+            match = TWSE_CODE_NAME_PATTERN.match(raw_value)
+            if not match:
+                continue
+            code = match.group("code").upper()
+            name = match.group("name").strip()
+            if code in seen_codes:
+                continue
+            record = SymbolRecord(
+                code=code,
+                name=name,
+                market=market,
+                yahoo_symbol=f"{code}{suffix}",
+            )
+            if not _is_supported_tw_active_record(record):
+                continue
+            seen_codes.add(code)
+            records.append(record)
     return records
 
 
@@ -1313,8 +1485,8 @@ def _load_us_symbols_from_web(timeout: int = 60) -> list[SymbolRecord]:
     seen: set[str] = set()
 
     nasdaq_url, other_url = US_SYMBOL_SOURCES
-    nasdaq = pd.read_csv(io.StringIO(_http_get_text(nasdaq_url, timeout=timeout)), sep="|", dtype=str, engine="python")
-    other = pd.read_csv(io.StringIO(_http_get_text(other_url, timeout=timeout)), sep="|", dtype=str, engine="python")
+    nasdaq = _read_csv_frame(io.StringIO(_http_get_text(nasdaq_url, timeout=timeout)), separator="|")
+    other = _read_csv_frame(io.StringIO(_http_get_text(other_url, timeout=timeout)), separator="|")
 
     for frame, symbol_col, name_col, test_issue_col in (
         (nasdaq, "Symbol", "Security Name", "Test Issue"),
@@ -1323,7 +1495,7 @@ def _load_us_symbols_from_web(timeout: int = 60) -> list[SymbolRecord]:
         if symbol_col not in frame.columns:
             continue
 
-        for _, row in frame.iterrows():
+        for row in frame.iter_rows(named=True):
             raw_symbol = str(row.get(symbol_col, "")).strip().upper()
             if not raw_symbol:
                 continue
@@ -1351,17 +1523,17 @@ def _load_us_delisted_from_alpha_vantage(api_key: str, timeout: int = 60) -> lis
 
     query = urlencode({"function": "LISTING_STATUS", "state": "delisted", "apikey": api_key})
     url = f"{ALPHA_VANTAGE_LISTING_STATUS_URL}?{query}"
-    frame = pd.read_csv(io.StringIO(_http_get_text(url, timeout=timeout)), dtype=str)
+    frame = _read_csv_frame(io.StringIO(_http_get_text(url, timeout=timeout)))
     if "symbol" not in frame.columns:
         return []
 
     records: list[SymbolRecord] = []
-    for row in frame.itertuples(index=False):
-        symbol = str(getattr(row, "symbol", "")).strip().upper()
+    for row in frame.iter_rows(named=True):
+        symbol = str(row.get("symbol", "")).strip().upper()
         if not symbol or not US_VALID_SYMBOL_PATTERN.match(symbol):
             continue
         yahoo_symbol = _normalize_us_yahoo_symbol(symbol)
-        name = str(getattr(row, "name", yahoo_symbol)).strip() or yahoo_symbol
+        name = str(row.get("name", yahoo_symbol)).strip() or yahoo_symbol
         records.append(SymbolRecord(code=f"{yahoo_symbol}_DL", name=name, market="us_delisted", yahoo_symbol=yahoo_symbol))
     return records
 
@@ -1430,7 +1602,7 @@ def _load_cached_symbols_from_manifest(manifest_path: Path, asset_class: str) ->
         return []
 
     try:
-        frame = pd.read_csv(manifest_path, dtype=str).fillna("")
+        frame = _read_csv_frame(manifest_path)
     except Exception:
         return []
 
@@ -1438,13 +1610,13 @@ def _load_cached_symbols_from_manifest(manifest_path: Path, asset_class: str) ->
         return []
 
     records: list[SymbolRecord] = []
-    for row in frame.itertuples(index=False):
-        yahoo_symbol = str(getattr(row, "yahoo_symbol", "")).strip().upper()
+    for row in frame.iter_rows(named=True):
+        yahoo_symbol = str(row.get("yahoo_symbol", "")).strip().upper()
         if not FOREX_TICKER_PATTERN.match(yahoo_symbol):
             continue
-        code = str(getattr(row, "code", "")).strip().upper() or yahoo_symbol.replace("=X", "")
-        name = str(getattr(row, "name", code)).strip() or code
-        market = str(getattr(row, "market", asset_class)).strip() or asset_class
+        code = str(row.get("code", "")).strip().upper() or yahoo_symbol.replace("=X", "")
+        name = str(row.get("name", code)).strip() or code
+        market = str(row.get("market", asset_class)).strip() or asset_class
         records.append(SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol))
     return records
 
@@ -1558,8 +1730,13 @@ def _use_daily_update_cache_if_available(
 ) -> list[SymbolRecord] | None:
     is_daily_update = getattr(args, "mode", "") == "daily-update"
     if cached and is_daily_update and not getattr(args, "daily_discover_symbols", True):
-        print(f"[symbols] daily-update: cached manifest {asset_class} ({len(cached)} symbols, skipping HTTP)")
-        return cached
+        records = _filter_tw_records_for_supported_universe(cached) if asset_class == "tw_stocks" else cached
+        pruned = len(cached) - len(records)
+        message = f"[symbols] daily-update: cached manifest {asset_class} ({len(records)} symbols, skipping HTTP)"
+        if pruned:
+            message += f"; pruned {pruned} unsupported records"
+        print(message)
+        return records
     return None
 
 
@@ -1585,17 +1762,22 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         # the manifest while still allowing new exchange listings to be added.
         records.extend(local_manifest_records)
         records.extend(local_parquet_records)
+        pruned_count = len(records) - len(_filter_tw_records_for_supported_universe(records))
+        if pruned_count:
+            print(f"[symbols] pruned {pruned_count} unsupported tw_stocks records outside stock/ETF universe")
+        records = _filter_tw_records_for_supported_universe(records)
     elif repo_fallback_records:
         print(f"[symbols] using repo fallback manifest for tw_stocks ({len(repo_fallback_records)} symbols)")
-        records = repo_fallback_records
+        records = _filter_tw_records_for_supported_universe(repo_fallback_records)
     elif local_manifest_records:
         print(f"[symbols] using local data_parquet manifest for tw_stocks ({len(local_manifest_records)} symbols)")
-        records = local_manifest_records
+        records = _filter_tw_records_for_supported_universe(local_manifest_records)
     elif local_parquet_records:
         print(f"[symbols] fallback to local data_parquet codes for tw_stocks ({len(local_parquet_records)} symbols)")
-        records = local_parquet_records
+        records = _filter_tw_records_for_supported_universe(local_parquet_records)
     else:
         records = cached or []
+        records = _filter_tw_records_for_supported_universe(records)
 
     if args.include_tw_delisted:
         try:
@@ -1746,9 +1928,25 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 # Manifest-only output dirs are partial bootstraps. Process them
                 # once instead of leaving the asset permanently inert.
                 active_records.extend(cached)
+            if asset_class == "tw_stocks":
+                active_before = len(active_records)
+                active_records = _filter_tw_records_for_supported_universe(active_records)
+                if active_before != len(active_records):
+                    print(
+                        f"[symbols] daily-update: pruned {active_before - len(active_records)} "
+                        "unsupported tw_stocks active records outside stock/ETF universe"
+                    )
 
             manifest_records = list(cached)
             manifest_records.extend(active_records)
+            if asset_class == "tw_stocks":
+                manifest_before = len(manifest_records)
+                manifest_records = _filter_tw_records_for_supported_universe(manifest_records)
+                if manifest_before != len(manifest_records):
+                    print(
+                        f"[symbols] daily-update: pruned {manifest_before - len(manifest_records)} "
+                        "unsupported tw_stocks manifest records outside stock/ETF universe"
+                    )
             known_before = {record.code for record in manifest_records}
             known_symbol_keys: set[str] = set()
             for record in manifest_records:
@@ -1759,6 +1957,8 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
             if getattr(args, "daily_retry_known_missing_symbols", False):
                 active_codes = {record.code for record in active_records}
                 known_missing = [record for record in cached if record.code not in active_codes]
+                if asset_class == "tw_stocks":
+                    known_missing = _filter_tw_records_for_supported_universe(known_missing)
                 if known_missing:
                     print(
                         f"[symbols] daily-update: retrying {len(known_missing)} known missing "
@@ -1767,6 +1967,8 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                     active_records.extend(known_missing)
 
             repo_candidates = _load_repo_symbol_fallback(asset_class)
+            if asset_class == "tw_stocks":
+                repo_candidates = _filter_tw_records_for_supported_universe(repo_candidates)
             new_from_repo = [record for record in repo_candidates if record.code not in known_before]
             if new_from_repo:
                 print(
@@ -1784,6 +1986,8 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 except Exception as exc:
                     print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
                 else:
+                    if asset_class == "tw_stocks":
+                        discovered = _filter_tw_records_for_supported_universe(discovered)
                     discovered_active_symbols: set[str] = set()
                     discovered_delisted_symbols: set[str] = set()
                     for record in discovered:
@@ -1836,6 +2040,10 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                             known_symbol_keys.update(_candidate_symbol_keys(asset_class, record))
                             if not _is_delisted_record(record):
                                 active_discovery_symbols.update(_candidate_symbol_keys(asset_class, record) & discovered_active_symbols)
+
+            if asset_class == "tw_stocks":
+                active_records = _filter_tw_records_for_supported_universe(active_records)
+                manifest_records = _filter_tw_records_for_supported_universe(manifest_records)
 
             active_deduped = _dedupe_records_by_code(active_records)
             manifest_deduped = _dedupe_records_by_code(manifest_records)
@@ -1947,7 +2155,7 @@ def _download_symbol(
                     message=str(exc),
                 )
 
-    existing_frame: pd.DataFrame | None = None
+    existing_frame: object | None = None
     if output_path.exists() and merge_existing:
         try:
             existing_frame = _read_parquet_frame(output_path)
@@ -1961,7 +2169,7 @@ def _download_symbol(
                 )
                 existing_frame = None
             elif "date" in existing_frame.columns:
-                existing_frame["date"] = pd.to_datetime(existing_frame["date"], errors="coerce").dt.tz_localize(None)
+                existing_frame = _canonicalize_feature_frame(existing_frame, keep_zero_volume=asset_class != "forex")
         except Exception as exc:
             existing_frame = None
             print(f"[download] merge-existing read failed for {output_path.name}: {exc}")
@@ -1985,7 +2193,7 @@ def _download_symbol(
                 std_capture = io.StringIO()
                 err_capture = io.StringIO()
 
-                def _download_frame() -> pd.DataFrame:
+                def _download_frame() -> object:
                     return yf.download(
                         tickers=candidate_symbol,
                         start=effective_start_date,
@@ -2010,22 +2218,19 @@ def _download_symbol(
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
                     last_error = f"{candidate_symbol}: unavailable or delisted"
                     break
-                if normalized.empty:
+                if normalized.is_empty():
                     last_error = f"{candidate_symbol}: Yahoo returned no rows."
                     if attempt < retries:
                         time.sleep(0.8 * (attempt + 1))
                         continue
                     break
 
-                if existing_frame is not None and not existing_frame.empty:
-                    normalized = pd.concat([existing_frame, normalized], ignore_index=True)
-                    normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce").dt.tz_localize(None)
-                    normalized = normalized.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
-                    if asset_class == "forex" and "Trading_Volume" in normalized.columns:
-                        volume = pd.to_numeric(normalized["Trading_Volume"], errors="coerce")
-                        if volume.isna().all() or volume.fillna(0).eq(0).all():
-                            normalized = normalized.drop(columns=["Trading_Volume"])
-                    normalized = normalized.reset_index(drop=True)
+                if existing_frame is not None and not existing_frame.is_empty():
+                    normalized = _merge_feature_frames(
+                        existing_frame,
+                        normalized,
+                        keep_zero_volume=asset_class != "forex",
+                    )
 
                 first_date, last_date = _write_feature_parquet_atomic(
                     normalized,
@@ -2040,7 +2245,7 @@ def _download_symbol(
                     yahoo_symbol=candidate_symbol,
                     market=record.market,
                     status="updated",
-                    rows=int(len(normalized)),
+                    rows=int(normalized.height),
                     output_path=str(output_path),
                     first_date=first_date,
                     last_date=last_date,
@@ -2068,8 +2273,8 @@ def _download_symbol(
 
 def _write_symbol_manifest(output_dir: Path, records: list[SymbolRecord]) -> None:
     manifest_path = output_dir / "symbols.csv"
-    frame = pd.DataFrame([asdict(record) for record in _dedupe_records_by_code(records)])
-    frame.to_csv(manifest_path, index=False)
+    _require_polars()
+    pl.DataFrame([asdict(record) for record in _dedupe_records_by_code(records)]).write_csv(manifest_path)
 
 
 def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> list[SymbolRecord]:
@@ -2077,46 +2282,47 @@ def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> li
     if not manifest_path.exists():
         return []
     try:
-        frame = pd.read_csv(manifest_path, dtype=str).fillna("")
+        frame = _read_csv_frame(manifest_path)
     except Exception:
         return []
     required = {"code", "name", "market", "yahoo_symbol"}
     if not required.issubset(frame.columns):
         return []
     records: list[SymbolRecord] = []
-    for row in frame.itertuples(index=False):
-        code = str(getattr(row, "code", "")).strip().upper()
-        yahoo_symbol = str(getattr(row, "yahoo_symbol", "")).strip().upper()
+    for row in frame.iter_rows(named=True):
+        code = str(row.get("code", "")).strip().upper()
+        yahoo_symbol = str(row.get("yahoo_symbol", "")).strip().upper()
         if not code or not yahoo_symbol:
             continue
-        name = str(getattr(row, "name", code)).strip() or code
-        market = str(getattr(row, "market", asset_class)).strip() or asset_class
+        name = str(row.get("name", code)).strip() or code
+        market = str(row.get("market", asset_class)).strip() or asset_class
         records.append(SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol))
     return records
 
 
 def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[DownloadResult]) -> None:
     report_path = output_dir / "download_report.csv"
-    with report_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "asset_class",
-                "code",
-                "yahoo_symbol",
-                "market",
-                "status",
-                "rows",
-                "output_path",
-                "message",
-                "first_date",
-                "last_date",
-                "checked_through_date",
-            ],
-        )
-        writer.writeheader()
-        for result in results:
-            writer.writerow(asdict(result))
+    _require_polars()
+    report_columns = [
+        "asset_class",
+        "code",
+        "yahoo_symbol",
+        "market",
+        "status",
+        "rows",
+        "output_path",
+        "message",
+        "first_date",
+        "last_date",
+        "checked_through_date",
+    ]
+    report_rows = [asdict(result) for result in results]
+    report_frame = (
+        pl.DataFrame(report_rows).select(report_columns)
+        if report_rows
+        else pl.DataFrame({column: [] for column in report_columns})
+    )
+    report_frame.write_csv(report_path)
 
     counts: dict[str, int] = {}
     total_rows = 0
@@ -2156,18 +2362,7 @@ def _load_existing_file_info(output_path: Path) -> ExistingFileInfo:
     if polars_info is not None:
         return polars_info
 
-    try:
-        frame = pd.read_parquet(output_path)
-    except Exception as exc:
-        return ExistingFileInfo(None, None, f"read_error: {exc}", set())
-    columns = set(frame.columns)
-    if frame.empty or "date" not in columns:
-        return ExistingFileInfo(None, None, "empty", columns)
-
-    dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
-    if dates.empty:
-        return ExistingFileInfo(None, None, "no_valid_date", columns)
-    return ExistingFileInfo(dates.min().date().isoformat(), dates.max().date().isoformat(), None, columns)
+    return ExistingFileInfo(None, None, "read_error: pyarrow/polars not available", set())
 
 
 def _summarize_repair_coverage(checks: list[RepairCheck], target_end: str) -> tuple[str | None, str | None, int | None, int]:
@@ -2708,36 +2903,37 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     if results:
         _write_download_artifacts(output_dir, asset_class, results)
     repair_report_path = output_dir / "repair_report.csv"
-    with repair_report_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "code",
-                "yahoo_symbol",
-                "precheck_status",
-                "first_date",
-                "last_date",
-                "checked_through_date",
-                "repair_start_date",
-                "output_path",
-                "message",
-            ],
-        )
-        writer.writeheader()
-        for check in checks:
-            writer.writerow(
-                {
-                    "code": check.record.code,
-                    "yahoo_symbol": check.record.yahoo_symbol,
-                    "precheck_status": check.status,
-                    "first_date": check.first_date,
-                    "last_date": check.last_date,
-                    "checked_through_date": check.checked_through_date,
-                    "repair_start_date": check.repair_start_date,
-                    "output_path": str(check.output_path),
-                    "message": check.message,
-                }
-            )
+    repair_report_columns = [
+        "code",
+        "yahoo_symbol",
+        "precheck_status",
+        "first_date",
+        "last_date",
+        "checked_through_date",
+        "repair_start_date",
+        "output_path",
+        "message",
+    ]
+    repair_report_rows = [
+        {
+            "code": check.record.code,
+            "yahoo_symbol": check.record.yahoo_symbol,
+            "precheck_status": check.status,
+            "first_date": check.first_date,
+            "last_date": check.last_date,
+            "checked_through_date": check.checked_through_date,
+            "repair_start_date": check.repair_start_date,
+            "output_path": str(check.output_path),
+            "message": check.message,
+        }
+        for check in checks
+    ]
+    repair_report_frame = (
+        pl.DataFrame(repair_report_rows).select(repair_report_columns)
+        if repair_report_rows
+        else pl.DataFrame({column: [] for column in repair_report_columns})
+    )
+    repair_report_frame.write_csv(repair_report_path)
 
     # Post-repair coverage: compute entirely from in-memory data; no second disk scan.
     post_oldest, post_newest, post_lag_days, post_tracked = _summarize_post_repair_coverage(
