@@ -300,6 +300,16 @@ def _warn_missing_trading_volume(path: Path) -> None:
     )
 
 
+def _polars_datetime_ns_expr(schema: dict[str, Any], column: str = "date") -> Any:
+    if pl is None:
+        raise RuntimeError("Polars is not available")
+    dtype = schema.get(column)
+    expr = pl.col(column)
+    if dtype == pl.String:
+        return expr.str.to_datetime(strict=False).cast(pl.Datetime("ns"), strict=False).alias(column)
+    return expr.cast(pl.Datetime("ns"), strict=False).alias(column)
+
+
 def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
     if pl is None:
         raise RuntimeError("_prepare_symbol_frame requires polars")
@@ -319,7 +329,7 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
         return pl.lit(None, dtype=pl.Float64)
 
     frame = (
-        frame.with_columns(pl.col("date").cast(pl.Datetime("ns"), strict=False))
+        frame.with_columns(_polars_datetime_ns_expr(frame.schema, "date"))
         .drop_nulls("date")
         .sort("date")
         .with_columns(
@@ -726,7 +736,7 @@ def _load_symbol_arrays_polars_lazy(
         ]
     )
     selected_columns = [
-        pl.col("date").cast(pl.Datetime("ns"), strict=False),
+        _polars_datetime_ns_expr(frame.schema, "date"),
         pl.col("_close").alias("close_px"),
         pl.col("return_1d"),
         pl.col("tradable"),

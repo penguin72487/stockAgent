@@ -56,6 +56,29 @@ class AuditResult:
     message: str | None = None
 
 
+AUDIT_REPORT_SCHEMA: dict[str, pl.DataType] = {
+    "root": pl.String,
+    "code": pl.String,
+    "path": pl.String,
+    "status": pl.String,
+    "rows": pl.Int64,
+    "first_date": pl.String,
+    "last_date": pl.String,
+    "stale_lag_days": pl.Int64,
+    "duplicate_dates": pl.Int64,
+    "invalid_dates": pl.Int64,
+    "max_gap_seconds": pl.Float64,
+    "gap_count": pl.Int64,
+    "missing_columns": pl.String,
+    "nan_ohlc_rows": pl.Int64,
+    "bad_ohlc_rows": pl.Int64,
+    "nonpositive_price_rows": pl.Int64,
+    "negative_volume_rows": pl.Int64,
+    "issues": pl.String,
+    "message": pl.String,
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit saved OHLCV parquet files for common data quality issues.")
     parser.add_argument("--roots", nargs="+", default=list(DEFAULT_ROOTS), help="Data roots to scan.")
@@ -279,6 +302,17 @@ def _collect_files(roots: list[str], limit: int | None) -> list[tuple[Path, Path
     return items
 
 
+def _report_frame(results: list[AuditResult]) -> pl.DataFrame:
+    report_rows = [asdict(item) for item in results]
+    if not report_rows:
+        return pl.DataFrame(schema=AUDIT_REPORT_SCHEMA)
+    return pl.DataFrame(
+        report_rows,
+        schema_overrides=AUDIT_REPORT_SCHEMA,
+        infer_schema_length=None,
+    )
+
+
 def main() -> None:
     args = parse_args()
     run_id = args.run_id or _utc_run_id()
@@ -300,9 +334,7 @@ def main() -> None:
     summary_path = output_dir / "data_quality_summary.json"
     latest_summary_path = Path(args.output_dir) / "latest_summary.json"
 
-    report_rows = [asdict(item) for item in results]
-    report_frame = pl.DataFrame(report_rows) if report_rows else pl.DataFrame()
-    report_frame.write_csv(report_path)
+    _report_frame(results).write_csv(report_path)
 
     status_counts: dict[str, int] = {}
     for item in results:
