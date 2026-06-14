@@ -196,9 +196,9 @@ def test_paper_fold_stability_outputs(tmp_path: Path) -> None:
                 "mean_available_share": 0.20 - shift,
             },
         ]
-        import pandas as pd
+        import polars as pl
 
-        pd.DataFrame(rows).to_csv(table_dir / "global_feature_attribution.csv", index=False)
+        pl.DataFrame(rows).write_csv(table_dir / "global_feature_attribution.csv")
 
     output = write_fold_stability_outputs(root)
     assert output is not None

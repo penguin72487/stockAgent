@@ -7,6 +7,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 _CURVE_FILENAMES = ("epoch_curve.parquet", "epoch_curve.jsonl", "epoch_curve.csv")
 
@@ -104,30 +107,26 @@ def _load_curve(curve_path: Path) -> list[dict]:
     if suffix not in {".csv", ".parquet"}:
         raise ValueError(f"Unsupported curve file extension: {curve_path}")
 
-    import pandas as pd
-
     if suffix == ".csv":
-        frame = pd.read_csv(curve_path)
+        frame = pl.read_csv(curve_path)
     else:
-        frame = pd.read_parquet(curve_path)
-    if frame.empty:
+        frame = pl.from_arrow(pq.read_table(curve_path))
+    if frame.is_empty():
         raise ValueError(f"Curve file is empty: {curve_path}")
     if "epoch" not in frame.columns:
         raise ValueError(f"Curve file is missing required column 'epoch': {curve_path}")
-    frame = frame.where(pd.notnull(frame), None)
-    return frame.to_dict(orient="records")
+    return frame.with_columns(pl.all().fill_nan(None)).to_dicts()
 
 
 def _write_curve_parquet_cache(curve_path: Path, rows: list[dict]) -> tuple[Path | None, float]:
     if curve_path.suffix.lower() == ".parquet":
         return None, 0.0
     start = time.perf_counter()
-    import pandas as pd
 
     parquet_path = curve_path.with_suffix(".parquet")
-    frame = pd.DataFrame(rows)
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_parquet(parquet_path, index=False, engine="pyarrow", compression="snappy")
+    table = pa.Table.from_pylist(rows)
+    pq.write_table(table, parquet_path, compression="snappy")
     return parquet_path, float(time.perf_counter() - start)
 
 

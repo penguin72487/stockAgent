@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 from torch import nn
 
@@ -234,6 +234,105 @@ def _lookback_label(value: Any) -> str:
     except (TypeError, ValueError):
         return str(value)
     return f"t-{offset}"
+
+
+def _empty_frame(columns: list[str] | tuple[str, ...] | None = None) -> pl.DataFrame:
+    if columns is None:
+        return pl.DataFrame()
+    return pl.DataFrame({str(column): [] for column in columns})
+
+
+def _is_empty_frame(frame: pl.DataFrame | None) -> bool:
+    return frame is None or frame.is_empty()
+
+
+def _concat_frames(frames: list[pl.DataFrame]) -> pl.DataFrame:
+    pieces = [frame for frame in frames if frame is not None and not frame.is_empty()]
+    if not pieces:
+        return pl.DataFrame()
+    return pl.concat(pieces, how="diagonal_relaxed")
+
+
+def _numeric_expr(column: str) -> pl.Expr:
+    return pl.col(column).cast(pl.Float64, strict=False).fill_nan(None)
+
+
+def _with_numeric(frame: pl.DataFrame, *columns: str) -> pl.DataFrame:
+    expressions = [_numeric_expr(column).alias(column) for column in columns if column in frame.columns]
+    return frame.with_columns(expressions) if expressions else frame
+
+
+def _numeric_numpy(frame: pl.DataFrame, column: str, *, default: float = 0.0) -> np.ndarray:
+    if column not in frame.columns:
+        return np.full(frame.height, float(default), dtype=np.float64)
+    values = frame.select(_numeric_expr(column).fill_null(float(default)).alias(column)).to_series().to_numpy()
+    return np.asarray(values, dtype=np.float64)
+
+
+def _numeric_sum(frame: pl.DataFrame, column: str) -> float:
+    if column not in frame.columns or frame.is_empty():
+        return 0.0
+    value = frame.select(_numeric_expr(column).fill_null(0.0).sum()).item()
+    return _safe_float(value)
+
+
+def _numeric_max(frame: pl.DataFrame, column: str) -> float:
+    if column not in frame.columns or frame.is_empty():
+        return 0.0
+    value = frame.select(_numeric_expr(column).fill_null(0.0).max()).item()
+    return _safe_float(value)
+
+
+def _first_row(frame: pl.DataFrame) -> dict[str, Any]:
+    return frame.row(0, named=True) if not frame.is_empty() else {}
+
+
+def _with_feature_labels(frame: pl.DataFrame, feature_col: str = "feature") -> pl.DataFrame:
+    if feature_col not in frame.columns:
+        return frame
+    return frame.with_columns(
+        [
+            pl.col(feature_col)
+            .cast(pl.String)
+            .map_elements(_feature_group, return_dtype=pl.String)
+            .alias("feature_group"),
+            pl.col(feature_col)
+            .cast(pl.String)
+            .map_elements(_feature_label, return_dtype=pl.String)
+            .alias("feature_label"),
+        ]
+    )
+
+
+def _write_csv(frame: pl.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_csv(path)
+
+
+def _frame_to_dict(frame: pl.DataFrame) -> dict[str, list[Any]]:
+    return frame.to_dict(as_series=False)
+
+
+def _render_table_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
+    if _is_empty_frame(frame):
+        return "_No rows._"
+    data = frame.head(limit)
+    columns = [str(column) for column in data.columns]
+    if not columns:
+        return "_No rows._"
+    rows = data.to_dicts()
+
+    def fmt(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        return str(value).replace("\n", " ").replace("|", "\\|")
+
+    header = "| " + " | ".join(columns) + " |"
+    separator = "| " + " | ".join("---" for _ in columns) + " |"
+    body = ["| " + " | ".join(fmt(row.get(column)) for column in columns) + " |" for row in rows]
+    return "\n".join([header, separator, *body])
 
 
 def _use_datashader_for_explainability(plot_backend: str, *, estimated_points: int = 0) -> bool:
@@ -504,7 +603,7 @@ def _feature_time_frame(
     attribution: torch.Tensor,
     feature_names: list[str],
     metric_name: str,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     values = attribution.detach().abs().mean(dim=(0, 2)).cpu().numpy()
     rows: list[dict[str, Any]] = []
     for time_idx in range(values.shape[0]):
@@ -519,12 +618,12 @@ def _feature_time_frame(
                     metric_name: float(values[time_idx, feat_idx]),
                 }
             )
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
-def _feature_summary_frame(feature_time: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+def _feature_summary_frame(feature_time: pl.DataFrame, metric_name: str) -> pl.DataFrame:
     if feature_time.empty:
-        return pd.DataFrame(columns=["feature", "feature_group", "feature_label", metric_name, "share"])
+        return pl.DataFrame(columns=["feature", "feature_group", "feature_label", metric_name, "share"])
     summary = feature_time.groupby("feature", as_index=False)[metric_name].sum()
     summary["feature_group"] = summary["feature"].map(_feature_group)
     summary["feature_label"] = summary["feature"].map(_feature_label)
@@ -533,9 +632,9 @@ def _feature_summary_frame(feature_time: pd.DataFrame, metric_name: str) -> pd.D
     return summary.sort_values(metric_name, ascending=False)
 
 
-def _time_summary_frame(feature_time: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+def _time_summary_frame(feature_time: pl.DataFrame, metric_name: str) -> pl.DataFrame:
     if feature_time.empty:
-        return pd.DataFrame(columns=["lookback_index", "lookback_from_end", metric_name, "share"])
+        return pl.DataFrame(columns=["lookback_index", "lookback_from_end", metric_name, "share"])
     summary = feature_time.groupby(["lookback_index", "lookback_from_end"], as_index=False)[metric_name].sum()
     total = float(summary[metric_name].sum())
     summary["share"] = summary[metric_name] / total if total > 0.0 else 0.0
@@ -553,7 +652,7 @@ def _perturbation_importance(
     *,
     max_auto_batch_size: int = 16,
     max_input_elements: int = 96_000_000,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     perturbations = [
         (time_idx, feat_idx, feature)
@@ -573,8 +672,8 @@ def _perturbation_importance(
         "oom_chunk_sizes": [],
     }
     if not perturbations:
-        frame = pd.DataFrame(rows)
-        return frame, pd.DataFrame(), diagnostics
+        frame = pl.DataFrame(rows)
+        return frame, pl.DataFrame(), diagnostics
     chunk_size = _auto_repeat_chunk_size(
         x,
         len(perturbations),
@@ -627,9 +726,9 @@ def _perturbation_importance(
                     }
                 )
             start += repeats
-    frame = pd.DataFrame(rows)
+    frame = pl.DataFrame(rows)
     if frame.empty:
-        return frame, pd.DataFrame(), diagnostics
+        return frame, pl.DataFrame(), diagnostics
     summary = frame.groupby("feature", as_index=False)[["weight_abs_delta", "score_abs_delta"]].sum()
     summary["feature_group"] = summary["feature"].map(_feature_group)
     summary["feature_label"] = summary["feature"].map(_feature_label)
@@ -645,7 +744,7 @@ def _feature_correlations(
     weights: torch.Tensor,
     mask: torch.Tensor,
     feature_names: list[str],
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     x_last = x[:, -1].detach().float()
     x_mean = x.detach().float().mean(dim=1)
     mask_flat = mask.detach().bool().reshape(-1).cpu().numpy()
@@ -675,7 +774,7 @@ def _feature_correlations(
                     "abs_weight_corr": abs(weight_corr),
                 }
             )
-    return pd.DataFrame(rows).sort_values(["abs_score_corr", "abs_weight_corr"], ascending=False)
+    return pl.DataFrame(rows).sort_values(["abs_score_corr", "abs_weight_corr"], ascending=False)
 
 
 def _decision_rows(
@@ -686,7 +785,7 @@ def _decision_rows(
     dates: list[str],
     symbols: list[str],
     top_k: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     top_k = max(1, min(int(top_k), int(weights.size(1))))
     rows: list[dict[str, Any]] = []
     weights_cpu = weights.detach().cpu()
@@ -713,7 +812,7 @@ def _decision_rows(
                     "tradable": bool(mask_cpu[row_idx, sym_idx]),
                 }
             )
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
 def _portfolio_summary(weights: torch.Tensor, returns: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
@@ -745,9 +844,9 @@ def _portfolio_summary(weights: torch.Tensor, returns: torch.Tensor, mask: torch
     }
 
 
-def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pl.DataFrame, dict[str, pl.DataFrame]]:
     rows: list[dict[str, Any]] = []
-    dim_frames: dict[str, pd.DataFrame] = {}
+    dim_frames: dict[str, pl.DataFrame] = {}
     for name, value in sorted(aux.items()):
         if not torch.is_tensor(value) or value.numel() == 0:
             continue
@@ -769,14 +868,14 @@ def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pd.DataFrame, dict[str, 
         if tensor.ndim >= 3:
             by_dim = abs_tensor.reshape(-1, tensor.shape[-1]).mean(dim=0).cpu().numpy()
             total = float(by_dim.sum())
-            dim_frames[name] = pd.DataFrame(
+            dim_frames[name] = pl.DataFrame(
                 {
                     "dim": np.arange(by_dim.shape[0], dtype=np.int64),
                     "mean_abs": by_dim,
                     "share": by_dim / total if total > 0.0 else np.zeros_like(by_dim),
                 }
             ).sort_values("mean_abs", ascending=False)
-    return pd.DataFrame(rows).sort_values("mean_abs", ascending=False), dim_frames
+    return pl.DataFrame(rows).sort_values("mean_abs", ascending=False), dim_frames
 
 
 def _aux_point_metadata(
@@ -834,7 +933,7 @@ def _aux_umap_projection_frames(
     dates: list[str],
     settings: ExplainabilitySettings,
     device: torch.device,
-) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]], list[str], dict[str, Any]]:
+) -> tuple[dict[str, pl.DataFrame], list[dict[str, Any]], list[str], dict[str, Any]]:
     timing: dict[str, Any] = {
         "enabled": bool(settings.umap_enabled),
         "eligible_tensors": 0,
@@ -854,7 +953,7 @@ def _aux_umap_projection_frames(
     if max_points < 4:
         return {}, [], ["cuML UMAP projections skipped because explain_umap_max_points < 4."], timing
 
-    projection_frames: dict[str, pd.DataFrame] = {}
+    projection_frames: dict[str, pl.DataFrame] = {}
     summaries: list[dict[str, Any]] = []
     warnings: list[str] = []
     preferred_order = (
@@ -931,7 +1030,7 @@ def _aux_umap_projection_frames(
             symbols=symbols,
             dates=dates,
         )
-        frame = pd.DataFrame(meta)
+        frame = pl.DataFrame(meta)
         frame["umap_x"] = embedding_cpu[:, 0].astype(np.float32, copy=False)
         frame["umap_y"] = embedding_cpu[:, 1].astype(np.float32, copy=False)
         frame["sampled_points"] = int(sample_idx_cpu.size)
@@ -967,7 +1066,7 @@ def _stock_contribution_frame(
     returns: torch.Tensor,
     mask: torch.Tensor,
     symbols: list[str],
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     contribution = (weights.detach().float() * returns.detach().float()).masked_fill(~mask.detach().bool(), 0.0)
     mean_weight = weights.detach().float().mean(dim=0)
     mean_abs_weight = weights.detach().float().abs().mean(dim=0)
@@ -977,7 +1076,7 @@ def _stock_contribution_frame(
     symbol_values = list(symbols[:n_symbols])
     if len(symbol_values) < n_symbols:
         symbol_values.extend(str(idx) for idx in range(len(symbol_values), n_symbols))
-    frame = pd.DataFrame(
+    frame = pl.DataFrame(
         {
             "symbol": symbol_values,
             "mean_weight": mean_weight.cpu().numpy(),
@@ -992,10 +1091,10 @@ def _stock_contribution_frame(
 
 def _make_warnings(
     portfolio: dict[str, float],
-    feature_summary: pd.DataFrame,
-    time_summary: pd.DataFrame,
-    corr: pd.DataFrame,
-    aux_summary: pd.DataFrame,
+    feature_summary: pl.DataFrame,
+    time_summary: pl.DataFrame,
+    corr: pl.DataFrame,
+    aux_summary: pl.DataFrame,
 ) -> list[str]:
     warnings: list[str] = []
     if portfolio.get("untradable_abs_weight_sum", 0.0) > 1e-5:
@@ -1036,7 +1135,7 @@ def _daily_portfolio_frame(
     returns: torch.Tensor,
     mask: torch.Tensor,
     dates: list[str],
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     weights_f = weights.detach().float().masked_fill(~mask.detach().bool(), 0.0)
     returns_f = returns.detach().float().masked_fill(~mask.detach().bool(), 0.0)
     active = mask.detach().bool().sum(dim=1).clamp_min(1)
@@ -1067,13 +1166,13 @@ def _daily_portfolio_frame(
                 "hhi": float(hhi[idx].cpu()),
             }
         )
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
-def _regime_analysis_frame(daily: pd.DataFrame) -> pd.DataFrame:
+def _regime_analysis_frame(daily: pl.DataFrame) -> pl.DataFrame:
     required = {"market_log_return", "strategy_log_return", "turnover_proxy", "gross_exposure", "net_exposure"}
     if daily.empty or not required.issubset(daily.columns):
-        return pd.DataFrame()
+        return pl.DataFrame()
     data = daily.copy()
     data["market_direction"] = np.where(
         data["market_log_return"] > 0.001,
@@ -1109,12 +1208,12 @@ def _regime_analysis_frame(daily: pd.DataFrame) -> pd.DataFrame:
                     "hit_rate": float((group["strategy_log_return"] > 0.0).mean()),
                 }
             )
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
-def _case_study_frame(decisions: pd.DataFrame, daily: pd.DataFrame, top_k: int) -> pd.DataFrame:
+def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame, top_k: int) -> pl.DataFrame:
     if decisions.empty or daily.empty or "date" not in decisions.columns:
-        return pd.DataFrame()
+        return pl.DataFrame()
     top_k = max(1, int(top_k))
     selected: list[tuple[str, str]] = []
     if "strategy_log_return" in daily.columns:
@@ -1138,7 +1237,7 @@ def _case_study_frame(decisions: pd.DataFrame, daily: pd.DataFrame, top_k: int) 
         if item not in seen:
             unique_selected.append(item)
             seen.add(item)
-    rows: list[pd.DataFrame] = []
+    rows: list[pl.DataFrame] = []
     daily_small = daily.set_index("date", drop=False)
     for case_type, date in unique_selected:
         chunk = decisions[decisions["date"].astype(str) == date].copy()
@@ -1149,20 +1248,20 @@ def _case_study_frame(decisions: pd.DataFrame, daily: pd.DataFrame, top_k: int) 
         chunk.insert(0, "case_type", case_type)
         if date in daily_small.index:
             daily_row = daily_small.loc[date]
-            if isinstance(daily_row, pd.DataFrame):
+            if isinstance(daily_row, pl.DataFrame):
                 daily_row = daily_row.iloc[0]
             for col in ("strategy_log_return", "market_log_return", "turnover_proxy", "gross_exposure", "net_exposure"):
                 chunk[f"case_{col}"] = daily_row.get(col)
         rows.append(chunk)
     if not rows:
-        return pd.DataFrame()
+        return pl.DataFrame()
     return pd.concat(rows, ignore_index=True)
 
 
-def _feature_time_top_cells(frame: pd.DataFrame, metric_name: str, top_n: int = 20) -> pd.DataFrame:
+def _feature_time_top_cells(frame: pl.DataFrame, metric_name: str, top_n: int = 20) -> pl.DataFrame:
     required = {"feature", "lookback_from_end", metric_name}
     if frame.empty or not required.issubset(frame.columns):
-        return pd.DataFrame()
+        return pl.DataFrame()
     data = frame.copy()
     data[metric_name] = pd.to_numeric(data[metric_name], errors="coerce")
     data = data.dropna(subset=[metric_name]).sort_values(metric_name, ascending=False).head(top_n)
@@ -1180,11 +1279,11 @@ def _feature_time_top_cells(frame: pd.DataFrame, metric_name: str, top_n: int = 
 
 def _trust_check_frame(
     portfolio: dict[str, float],
-    feature_summary: pd.DataFrame,
-    time_summary: pd.DataFrame,
-    corr: pd.DataFrame,
-    aux_summary: pd.DataFrame,
-) -> pd.DataFrame:
+    feature_summary: pl.DataFrame,
+    time_summary: pl.DataFrame,
+    corr: pl.DataFrame,
+    aux_summary: pl.DataFrame,
+) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
 
     def add_check(name: str, value: float, threshold: float, comparator: str, interpretation: str) -> None:
@@ -1257,7 +1356,7 @@ def _trust_check_frame(
             "<=",
             "Near-zero aux tensors can indicate collapsed latent/market token representations.",
         )
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
 def _score_head_surrogate_shap(
@@ -1268,10 +1367,10 @@ def _score_head_surrogate_shap(
     *,
     enabled: bool,
     mode: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], list[str]]:
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any], list[str]]:
     mode = _normalize_shap_mode(mode)
     if not enabled or mode in {"off", "none"}:
-        return pd.DataFrame(), pd.DataFrame(), {"enabled": bool(enabled), "method": "skipped"}, []
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": bool(enabled), "method": "skipped"}, []
     warnings: list[str] = []
 
     x_cpu = x.detach().float().cpu()
@@ -1296,7 +1395,7 @@ def _score_head_surrogate_shap(
     target = target[finite]
     if design.shape[0] < max(20, 2 * design.shape[1]):
         message = "SHAP skipped because there are too few valid stock-date observations for a surrogate model."
-        return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
     max_fit_rows = min(20000, int(design.shape[0]))
     if design.shape[0] > max_fit_rows:
         idx = np.linspace(0, design.shape[0] - 1, max_fit_rows).round().astype(np.int64)
@@ -1312,7 +1411,7 @@ def _score_head_surrogate_shap(
     target_std = float(np.std(target_fit))
     if target_std < 1e-10:
         message = "SHAP skipped because score targets are nearly constant."
-        return pd.DataFrame(), pd.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
     target_mean = float(np.mean(target_fit))
     target_centered = target_fit - target_mean
     alpha = 1e-3
@@ -1345,7 +1444,7 @@ def _score_head_surrogate_shap(
                 "surrogate_coef": float(coef.reshape(-1)[idx]),
             }
         )
-    component_frame = pd.DataFrame(component_rows).sort_values("shap_abs", ascending=False)
+    component_frame = pl.DataFrame(component_rows).sort_values("shap_abs", ascending=False)
     summary = component_frame.groupby("feature", as_index=False)["shap_abs"].sum()
     summary["feature_group"] = summary["feature"].map(_feature_group)
     summary["feature_label"] = summary["feature"].map(_feature_label)
@@ -1423,9 +1522,9 @@ def explain_batch(
         ig_feature = _feature_summary_frame(ig_ft, "integrated_gradients_abs")
         ig_time = _time_summary_frame(ig_ft, "integrated_gradients_abs")
     else:
-        ig_ft = pd.DataFrame()
-        ig_feature = pd.DataFrame()
-        ig_time = pd.DataFrame()
+        ig_ft = pl.DataFrame()
+        ig_feature = pl.DataFrame()
+        ig_time = pl.DataFrame()
     _mark_elapsed(timing, "integrated_gradients_s", stage_start)
 
     stage_start = time.perf_counter()
@@ -1442,8 +1541,8 @@ def explain_batch(
             max_input_elements=settings.perturb_max_input_elements,
         )
     else:
-        perturb_ft = pd.DataFrame()
-        perturb_feature = pd.DataFrame()
+        perturb_ft = pl.DataFrame()
+        perturb_feature = pl.DataFrame()
         perturb_diagnostics = {
             "num_perturbations": 0,
             "requested_batch_size": int(settings.perturb_batch_size),
@@ -1475,7 +1574,7 @@ def explain_batch(
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
-    regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pd.DataFrame()
+    regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
     case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
     _mark_elapsed(timing, "tabular_diagnostics_s", stage_start)
 
@@ -1574,10 +1673,10 @@ def _weighted_feature_time_from_chunks(
     frame_name: str,
     metric_names: tuple[str, ...],
     total_rows: int,
-) -> pd.DataFrame:
-    pieces: list[pd.DataFrame] = []
+) -> pl.DataFrame:
+    pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
-        frame = result.get("frames", {}).get(frame_name, pd.DataFrame())
+        frame = result.get("frames", {}).get(frame_name, pl.DataFrame())
         if frame is None or frame.empty:
             continue
         data = frame.copy()
@@ -1586,7 +1685,7 @@ def _weighted_feature_time_from_chunks(
                 data[metric_name] = pd.to_numeric(data[metric_name], errors="coerce").fillna(0.0) * float(rows)
         pieces.append(data)
     if not pieces:
-        return pd.DataFrame()
+        return pl.DataFrame()
     combined = pd.concat(pieces, ignore_index=True)
     group_cols = [
         col
@@ -1603,12 +1702,12 @@ def _weighted_feature_time_from_chunks(
     return out
 
 
-def _combine_perturbation_summary(frame: pd.DataFrame) -> pd.DataFrame:
+def _combine_perturbation_summary(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.empty:
-        return pd.DataFrame()
+        return pl.DataFrame()
     value_cols = [col for col in ("weight_abs_delta", "score_abs_delta") if col in frame.columns]
     if not value_cols:
-        return pd.DataFrame()
+        return pl.DataFrame()
     summary = frame.groupby("feature", as_index=False)[value_cols].sum()
     summary["feature_group"] = summary["feature"].map(_feature_group)
     summary["feature_label"] = summary["feature"].map(_feature_label)
@@ -1620,17 +1719,17 @@ def _combine_perturbation_summary(frame: pd.DataFrame) -> pd.DataFrame:
 def _combine_shap_feature_from_chunks(
     chunk_results: list[tuple[dict[str, Any], int]],
     total_rows: int,
-) -> pd.DataFrame:
-    pieces: list[pd.DataFrame] = []
+) -> pl.DataFrame:
+    pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
-        frame = result.get("frames", {}).get("feature_importance_shap", pd.DataFrame())
+        frame = result.get("frames", {}).get("feature_importance_shap", pl.DataFrame())
         if frame is None or frame.empty or "feature" not in frame.columns or "shap_abs" not in frame.columns:
             continue
         data = frame.copy()
         data["shap_abs"] = pd.to_numeric(data["shap_abs"], errors="coerce").fillna(0.0) * float(rows)
         pieces.append(data)
     if not pieces:
-        return pd.DataFrame()
+        return pl.DataFrame()
     combined = pd.concat(pieces, ignore_index=True)
     summary = combined.groupby("feature", as_index=False)["shap_abs"].sum()
     summary["shap_abs"] = summary["shap_abs"] / max(1.0, float(total_rows))
@@ -1646,30 +1745,30 @@ def _concat_chunk_frame(
     frame_name: str,
     *,
     add_chunk_id: bool = False,
-) -> pd.DataFrame:
-    pieces: list[pd.DataFrame] = []
+) -> pl.DataFrame:
+    pieces: list[pl.DataFrame] = []
     for chunk_id, (result, _) in enumerate(chunk_results):
-        frame = result.get("frames", {}).get(frame_name, pd.DataFrame())
+        frame = result.get("frames", {}).get(frame_name, pl.DataFrame())
         if frame is None or frame.empty:
             continue
         data = frame.copy()
         if add_chunk_id:
             data.insert(0, "explain_chunk_id", int(chunk_id))
         pieces.append(data)
-    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+    return pd.concat(pieces, ignore_index=True) if pieces else pl.DataFrame()
 
 
-def _combine_aux_summary_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> pd.DataFrame:
-    pieces: list[pd.DataFrame] = []
+def _combine_aux_summary_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> pl.DataFrame:
+    pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
-        frame = result.get("frames", {}).get("aux_summary", pd.DataFrame())
+        frame = result.get("frames", {}).get("aux_summary", pl.DataFrame())
         if frame is None or frame.empty or "name" not in frame.columns:
             continue
         data = frame.copy()
         data["_rows"] = float(rows)
         pieces.append(data)
     if not pieces:
-        return pd.DataFrame()
+        return pl.DataFrame()
     combined = pd.concat(pieces, ignore_index=True)
     rows: list[dict[str, Any]] = []
     weighted_cols = ["mean", "std", "mean_abs", "zero_fraction", "finite_fraction"]
@@ -1684,12 +1783,12 @@ def _combine_aux_summary_from_chunks(chunk_results: list[tuple[dict[str, Any], i
         if "max_abs" in group.columns:
             row["max_abs"] = float(pd.to_numeric(group["max_abs"], errors="coerce").fillna(0.0).max())
         rows.append(row)
-    out = pd.DataFrame(rows)
+    out = pl.DataFrame(rows)
     return out.sort_values("mean_abs", ascending=False) if "mean_abs" in out.columns else out
 
 
-def _combine_aux_dim_frames_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, pd.DataFrame]:
-    by_name: dict[str, list[pd.DataFrame]] = {}
+def _combine_aux_dim_frames_from_chunks(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, pl.DataFrame]:
+    by_name: dict[str, list[pl.DataFrame]] = {}
     for result, rows in chunk_results:
         for name, frame in result.get("aux_dim_frames", {}).items():
             if frame is None or frame.empty or "dim" not in frame.columns:
@@ -1697,7 +1796,7 @@ def _combine_aux_dim_frames_from_chunks(chunk_results: list[tuple[dict[str, Any]
             data = frame.copy()
             data["_rows"] = float(rows)
             by_name.setdefault(str(name), []).append(data)
-    out: dict[str, pd.DataFrame] = {}
+    out: dict[str, pl.DataFrame] = {}
     for name, pieces in by_name.items():
         combined = pd.concat(pieces, ignore_index=True)
         rows = []
@@ -1706,7 +1805,7 @@ def _combine_aux_dim_frames_from_chunks(chunk_results: list[tuple[dict[str, Any]
             denom = float(weight.sum()) or 1.0
             mean_abs = float((pd.to_numeric(group["mean_abs"], errors="coerce").fillna(0.0) * weight).sum() / denom)
             rows.append({"dim": int(dim), "mean_abs": mean_abs})
-        frame = pd.DataFrame(rows).sort_values("mean_abs", ascending=False)
+        frame = pl.DataFrame(rows).sort_values("mean_abs", ascending=False)
         total = float(frame["mean_abs"].sum())
         frame["share"] = frame["mean_abs"] / total if total > 0.0 else 0.0
         out[name] = frame
@@ -1796,7 +1895,7 @@ def _combine_chunked_explainability_results(
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
-    regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pd.DataFrame()
+    regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
     case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
     aux_frame = _combine_aux_summary_from_chunks(chunk_results)
     aux_dim_frames = _combine_aux_dim_frames_from_chunks(chunk_results)
@@ -1957,9 +2056,9 @@ def _write_markdown_report(
     *,
     metadata: dict[str, Any],
     summary: dict[str, Any],
-    frames: dict[str, pd.DataFrame],
+    frames: dict[str, pl.DataFrame],
 ) -> None:
-    def _render_frame(frame: pd.DataFrame) -> str:
+    def _render_frame(frame: pl.DataFrame) -> str:
         try:
             return frame.head(20).to_markdown(index=False)
         except ImportError:
@@ -2026,7 +2125,7 @@ def _write_markdown_report(
     if aux_projection_summary:
         lines.append("## cuML UMAP Aux Projections")
         lines.append("")
-        lines.append(_render_frame(pd.DataFrame(aux_projection_summary)))
+        lines.append(_render_frame(pl.DataFrame(aux_projection_summary)))
         lines.append("")
     plots = summary.get("plots_generated", [])
     if plots:
@@ -2121,11 +2220,11 @@ def _paper_scope(metadata: dict[str, Any], summary: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def _global_attribution_table(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    tables: list[pd.DataFrame] = []
+def _global_attribution_table(frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    tables: list[pl.DataFrame] = []
 
     def add(frame_name: str, value_col: str, share_col: str, prefix: str) -> None:
-        frame = frames.get(frame_name, pd.DataFrame())
+        frame = frames.get(frame_name, pl.DataFrame())
         if frame.empty or "feature" not in frame.columns or value_col not in frame.columns:
             return
         cols = ["feature", value_col]
@@ -2149,7 +2248,7 @@ def _global_attribution_table(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     add("feature_importance_perturbation", "weight_abs_delta", "weight_delta_share", "perturbation_weight")
     add("feature_importance_shap", "shap_abs", "share", "shap")
     if not tables:
-        return pd.DataFrame()
+        return pl.DataFrame()
     out = tables[0]
     for table in tables[1:]:
         out = out.merge(table, on="feature", how="outer")
@@ -2164,26 +2263,26 @@ def _global_attribution_table(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
 def _write_paper_tables(
     output_dir: Path,
     *,
-    frames: dict[str, pd.DataFrame],
+    frames: dict[str, pl.DataFrame],
     summary: dict[str, Any],
     metadata: dict[str, Any],
 ) -> dict[str, str]:
     table_dir = output_dir / "paper_tables"
     table_dir.mkdir(parents=True, exist_ok=True)
-    tables: dict[str, pd.DataFrame] = {}
+    tables: dict[str, pl.DataFrame] = {}
     tables["global_feature_attribution"] = _global_attribution_table(frames)
-    top_cell_frames: list[pd.DataFrame] = []
+    top_cell_frames: list[pl.DataFrame] = []
     for name, method in (
         ("top_feature_time_gradient_cells", "gradient_x_input"),
         ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
         ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
     ):
-        frame = frames.get(name, pd.DataFrame())
+        frame = frames.get(name, pl.DataFrame())
         if frame is not None and not frame.empty:
             chunk = frame.copy()
             chunk.insert(0, "method", method)
             top_cell_frames.append(chunk)
-    tables["feature_time_top_cells"] = pd.concat(top_cell_frames, ignore_index=True) if top_cell_frames else pd.DataFrame()
+    tables["feature_time_top_cells"] = pd.concat(top_cell_frames, ignore_index=True) if top_cell_frames else pl.DataFrame()
     for name in (
         "daily_portfolio",
         "regime_analysis",
@@ -2194,10 +2293,10 @@ def _write_paper_tables(
         "shap_components",
         "aux_summary",
     ):
-        tables[name] = frames.get(name, pd.DataFrame())
+        tables[name] = frames.get(name, pl.DataFrame())
     lookback_expected = metadata.get("config_lookback")
     lookback_observed = summary.get("attribution_lookback")
-    tables["lookback_consistency"] = pd.DataFrame(
+    tables["lookback_consistency"] = pl.DataFrame(
         [
             {
                 "config_lookback": lookback_expected,
@@ -2219,7 +2318,7 @@ def _write_paper_tables(
     return written
 
 
-def _plot_paper_global_attribution(table: pd.DataFrame, output_path: Path, *, subtitle: str) -> None:
+def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, subtitle: str) -> None:
     if table.empty:
         return
     share_cols = [
@@ -2276,7 +2375,7 @@ def _plot_paper_global_attribution(table: pd.DataFrame, output_path: Path, *, su
 
 
 def _plot_paper_feature_time_heatmap(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     *,
     output_path: Path,
     value_col: str,
@@ -2340,7 +2439,7 @@ def _plot_paper_feature_time_heatmap(
     plt.close(fig)
 
 
-def _plot_paper_time_importance(frame: pd.DataFrame, *, output_path: Path, value_col: str, subtitle: str) -> None:
+def _plot_paper_time_importance(frame: pl.DataFrame, *, output_path: Path, value_col: str, subtitle: str) -> None:
     if frame.empty or not {"lookback_from_end", value_col}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -2367,7 +2466,7 @@ def _plot_paper_time_importance(frame: pd.DataFrame, *, output_path: Path, value
     plt.close(fig)
 
 
-def _plot_paper_feature_correlations(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
     if frame.empty or not {"feature", "source", "score_corr", "weight_corr"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -2400,7 +2499,7 @@ def _plot_paper_feature_correlations(frame: pd.DataFrame, *, output_path: Path, 
     plt.close(fig)
 
 
-def _plot_paper_trust_checks(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+def _plot_paper_trust_checks(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
     if frame.empty or not {"check", "value", "status"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -2425,7 +2524,7 @@ def _plot_paper_trust_checks(frame: pd.DataFrame, *, output_path: Path, subtitle
     plt.close(fig)
 
 
-def _plot_paper_regime(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+def _plot_paper_regime(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
     if frame.empty or not {"dimension", "regime", "mean_strategy_log_return"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -2449,7 +2548,7 @@ def _plot_paper_regime(frame: pd.DataFrame, *, output_path: Path, subtitle: str)
     plt.close(fig)
 
 
-def _plot_paper_case_studies(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
     if frame.empty or not {"case_type", "symbol", "gross_contribution"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -2474,7 +2573,7 @@ def _plot_paper_case_studies(frame: pd.DataFrame, *, output_path: Path, subtitle
     plt.close(fig)
 
 
-def _plot_paper_aux_summary(frame: pd.DataFrame, *, output_path: Path, subtitle: str) -> None:
+def _plot_paper_aux_summary(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
     if frame.empty or not {"name", "mean_abs"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -2498,7 +2597,7 @@ def _plot_paper_aux_summary(frame: pd.DataFrame, *, output_path: Path, subtitle:
 def _plot_all_paper_figures(
     output_dir: Path,
     *,
-    frames: dict[str, pd.DataFrame],
+    frames: dict[str, pl.DataFrame],
     summary: dict[str, Any],
     metadata: dict[str, Any],
     paper_tables: dict[str, str],
@@ -2549,7 +2648,7 @@ def _plot_all_paper_figures(
         _time_plot(
             f"{frame_name}_{value_col}_heatmap_s",
             lambda frame_name=frame_name, value_col=value_col, title=title, subtitle=subtitle, out=out: _plot_paper_feature_time_heatmap(
-                frames.get(frame_name, pd.DataFrame()),
+                frames.get(frame_name, pl.DataFrame()),
                 output_path=out,
                 value_col=value_col,
                 title=title,
@@ -2561,7 +2660,7 @@ def _plot_all_paper_figures(
     _time_plot(
         "time_importance_gradient_s",
         lambda: _plot_paper_time_importance(
-            frames.get("time_importance_gradient", pd.DataFrame()),
+            frames.get("time_importance_gradient", pl.DataFrame()),
             output_path=out,
             value_col="grad_x_input_abs",
             subtitle=f"Share of gradient × input by lookback day; {scope}",
@@ -2571,31 +2670,31 @@ def _plot_all_paper_figures(
     out = plot_dir / "feature_correlations_shortcut_checks.png"
     _time_plot(
         "feature_correlations_shortcut_checks_s",
-        lambda: _plot_paper_feature_correlations(frames.get("feature_correlations", pd.DataFrame()), output_path=out, subtitle=scope),
+        lambda: _plot_paper_feature_correlations(frames.get("feature_correlations", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
     out = plot_dir / "trust_checks.png"
     _time_plot(
         "trust_checks_s",
-        lambda: _plot_paper_trust_checks(frames.get("trust_checks", pd.DataFrame()), output_path=out, subtitle=scope),
+        lambda: _plot_paper_trust_checks(frames.get("trust_checks", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
     out = plot_dir / "regime_analysis.png"
     _time_plot(
         "regime_analysis_s",
-        lambda: _plot_paper_regime(frames.get("regime_analysis", pd.DataFrame()), output_path=out, subtitle=scope),
+        lambda: _plot_paper_regime(frames.get("regime_analysis", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
     out = plot_dir / "decision_case_studies.png"
     _time_plot(
         "decision_case_studies_s",
-        lambda: _plot_paper_case_studies(frames.get("decision_case_studies", pd.DataFrame()), output_path=out, subtitle=scope),
+        lambda: _plot_paper_case_studies(frames.get("decision_case_studies", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
     out = plot_dir / "aux_token_diagnostics.png"
     _time_plot(
         "aux_token_diagnostics_s",
-        lambda: _plot_paper_aux_summary(frames.get("aux_summary", pd.DataFrame()), output_path=out, subtitle=scope),
+        lambda: _plot_paper_aux_summary(frames.get("aux_summary", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
     return [str(path.relative_to(output_dir)) for path in generated]
@@ -2655,7 +2754,7 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _render_frame_markdown(frame: pd.DataFrame, limit: int = 20) -> str:
+def _render_frame_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
     if frame is None or frame.empty:
         return "_No rows._"
     try:
@@ -2666,7 +2765,7 @@ def _render_frame_markdown(frame: pd.DataFrame, limit: int = 20) -> str:
 
 def _paper_executive_summary(
     *,
-    frames: dict[str, pd.DataFrame],
+    frames: dict[str, pl.DataFrame],
     summary: dict[str, Any],
     metadata: dict[str, Any],
 ) -> list[str]:
@@ -2679,7 +2778,7 @@ def _paper_executive_summary(
             f"- The strongest global signal is `{top['feature']}` ({top['feature_group']}); "
             f"mean available attribution share is {_format_share(top.get('mean_available_share', 0.0))}."
         )
-    shap = frames.get("feature_importance_shap", pd.DataFrame())
+    shap = frames.get("feature_importance_shap", pl.DataFrame())
     if shap is not None and not shap.empty:
         row = shap.iloc[0]
         r2 = _safe_float(row.get("surrogate_r2", summary.get("shap_info", {}).get("surrogate_r2", 0.0)))
@@ -2718,7 +2817,7 @@ def _write_paper_report(
     *,
     metadata: dict[str, Any],
     summary: dict[str, Any],
-    frames: dict[str, pd.DataFrame],
+    frames: dict[str, pl.DataFrame],
     paper_tables: dict[str, str],
     paper_plots: list[str],
 ) -> None:
@@ -2751,7 +2850,7 @@ def _write_paper_report(
         lines.append("")
     lines.append("## Trust And Sanity Checks")
     lines.append("")
-    lines.append(_render_frame_markdown(frames.get("trust_checks", pd.DataFrame()), limit=30))
+    lines.append(_render_frame_markdown(frames.get("trust_checks", pl.DataFrame()), limit=30))
     lines.append("")
     lines.append("## Global Attribution Table")
     lines.append("")
@@ -2765,20 +2864,20 @@ def _write_paper_report(
         ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
         ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
     ):
-        frame = frames.get(key, pd.DataFrame())
+        frame = frames.get(key, pl.DataFrame())
         if frame is not None and not frame.empty:
             chunk = frame.copy()
             chunk.insert(0, "method", method)
             feature_time_tables.append(chunk)
-    lines.append(_render_frame_markdown(pd.concat(feature_time_tables, ignore_index=True) if feature_time_tables else pd.DataFrame(), limit=30))
+    lines.append(_render_frame_markdown(pd.concat(feature_time_tables, ignore_index=True) if feature_time_tables else pl.DataFrame(), limit=30))
     lines.append("")
     lines.append("## Regime Analysis")
     lines.append("")
-    lines.append(_render_frame_markdown(frames.get("regime_analysis", pd.DataFrame()), limit=30))
+    lines.append(_render_frame_markdown(frames.get("regime_analysis", pl.DataFrame()), limit=30))
     lines.append("")
     lines.append("## Decision Case Studies")
     lines.append("")
-    lines.append(_render_frame_markdown(frames.get("decision_case_studies", pd.DataFrame()), limit=30))
+    lines.append(_render_frame_markdown(frames.get("decision_case_studies", pl.DataFrame()), limit=30))
     lines.append("")
     lines.append("## Output Files")
     lines.append("")
@@ -2813,14 +2912,14 @@ def _write_paper_summary(
 def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
     root = Path(explainability_root)
     fold_dirs = sorted(path for path in root.glob("fold_*_test") if path.is_dir())
-    rows: list[pd.DataFrame] = []
+    rows: list[pl.DataFrame] = []
     for fold_dir in fold_dirs:
         path = fold_dir / "paper_tables" / "global_feature_attribution.csv"
         if not path.exists():
             fallback = fold_dir / "feature_importance_gradient.csv"
             if not fallback.exists():
                 continue
-            table = pd.read_csv(fallback)
+            table = pl.read_csv(fallback)
             if "share" not in table.columns:
                 continue
             table = table.rename(columns={"share": "gradient_share"})
@@ -2828,7 +2927,7 @@ def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
             table["feature_group"] = table["feature"].map(_feature_group)
             table["feature_label"] = table["feature"].map(_feature_label)
         else:
-            table = pd.read_csv(path)
+            table = pl.read_csv(path)
         if table.empty or "feature" not in table.columns:
             continue
         fold_id = fold_dir.name.removeprefix("fold_").removesuffix("_test")
@@ -2897,7 +2996,7 @@ def _safe_plot_filename(name: str) -> str:
 
 
 def _plot_barh(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     *,
     output_path: Path,
     label_col: str,
@@ -2929,7 +3028,7 @@ def _plot_barh(
 
 
 def _plot_time_importance(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     *,
     output_path: Path,
     value_col: str,
@@ -2959,7 +3058,7 @@ def _plot_time_importance(
 
 
 def _plot_feature_time_heatmap(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     *,
     output_path: Path,
     value_col: str,
@@ -3014,7 +3113,7 @@ def _plot_feature_time_heatmap(
 
 
 def _plot_feature_time_heatmap_datashader(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     *,
     output_path: Path,
     value_col: str,
@@ -3061,7 +3160,7 @@ def _plot_feature_time_heatmap_datashader(
     )
 
 
-def _plot_feature_correlations(frame: pd.DataFrame, output_path: Path) -> None:
+def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     if frame.empty or "feature" not in frame.columns:
         return
     data = frame.copy()
@@ -3093,7 +3192,7 @@ def _plot_feature_correlations(frame: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_decision_exposure(frame: pd.DataFrame, output_path: Path) -> None:
+def _plot_decision_exposure(frame: pl.DataFrame, output_path: Path) -> None:
     if frame.empty or not {"date", "side", "weight"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -3122,7 +3221,7 @@ def _plot_decision_exposure(frame: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_decision_exposure_datashader(frame: pd.DataFrame, output_path: Path) -> None:
+def _plot_decision_exposure_datashader(frame: pl.DataFrame, output_path: Path) -> None:
     if frame.empty or not {"date", "side", "weight"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -3150,7 +3249,7 @@ def _plot_decision_exposure_datashader(frame: pd.DataFrame, output_path: Path) -
     )
 
 
-def _plot_aux_dim_datashader(frame: pd.DataFrame, *, output_path: Path, title: str) -> None:
+def _plot_aux_dim_datashader(frame: pl.DataFrame, *, output_path: Path, title: str) -> None:
     if frame.empty or not {"dim", "mean_abs"}.issubset(frame.columns):
         return
     data = frame[["dim", "mean_abs"]].dropna().copy()
@@ -3169,7 +3268,7 @@ def _plot_aux_dim_datashader(frame: pd.DataFrame, *, output_path: Path, title: s
     )
 
 
-def _plot_aux_projection_datashader(frame: pd.DataFrame, *, output_path: Path, title: str) -> None:
+def _plot_aux_projection_datashader(frame: pl.DataFrame, *, output_path: Path, title: str) -> None:
     if frame.empty or not {"umap_x", "umap_y"}.issubset(frame.columns):
         return
     data = frame.copy()
@@ -3202,11 +3301,11 @@ def _plot_aux_projection_datashader(frame: pd.DataFrame, *, output_path: Path, t
 
 
 def _plot_all_explanation_figures(
-    frames: dict[str, pd.DataFrame],
-    aux_dim_frames: dict[str, pd.DataFrame],
+    frames: dict[str, pl.DataFrame],
+    aux_dim_frames: dict[str, pl.DataFrame],
     output_dir: Path,
     *,
-    aux_projection_frames: dict[str, pd.DataFrame] | None = None,
+    aux_projection_frames: dict[str, pl.DataFrame] | None = None,
     plot_backend: str = "auto",
     plot_timing: dict[str, Any] | None = None,
 ) -> list[str]:
@@ -3243,7 +3342,7 @@ def _plot_all_explanation_figures(
         ("aux_summary", "name", "mean_abs", "Auxiliary Representation Mean Abs"),
     ]
     for frame_name, label_col, value_col, title in specs:
-        frame = frames.get(frame_name, pd.DataFrame())
+        frame = frames.get(frame_name, pl.DataFrame())
         out = plot_dir / f"{frame_name}_{value_col}.png"
         _plot_barh(frame, output_path=out, label_col=label_col, value_col=value_col, title=title)
         if out.exists():
@@ -3258,7 +3357,7 @@ def _plot_all_explanation_figures(
     ]
     for frame_name, value_col, title in time_specs:
         out = plot_dir / f"{frame_name}.png"
-        _plot_time_importance(frames.get(frame_name, pd.DataFrame()), output_path=out, value_col=value_col, title=title)
+        _plot_time_importance(frames.get(frame_name, pl.DataFrame()), output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
     if plot_timing is not None:
@@ -3273,7 +3372,7 @@ def _plot_all_explanation_figures(
     ]
     for frame_name, value_col, title in heatmap_specs:
         out = plot_dir / f"{frame_name}_{value_col}_heatmap.png"
-        frame = frames.get(frame_name, pd.DataFrame())
+        frame = frames.get(frame_name, pl.DataFrame())
         if use_datashader:
             try:
                 _plot_feature_time_heatmap_datashader(frame, output_path=out, value_col=value_col, title=title)
@@ -3292,7 +3391,7 @@ def _plot_all_explanation_figures(
 
     stage_start = time.perf_counter()
     out = plot_dir / "feature_correlations.png"
-    _plot_feature_correlations(frames.get("feature_correlations", pd.DataFrame()), out)
+    _plot_feature_correlations(frames.get("feature_correlations", pl.DataFrame()), out)
     if out.exists():
         generated.append(out)
     if plot_timing is not None:
@@ -3300,7 +3399,7 @@ def _plot_all_explanation_figures(
 
     stage_start = time.perf_counter()
     out = plot_dir / "top_decisions_exposure_by_side.png"
-    decision_frame = frames.get("top_decisions", pd.DataFrame())
+    decision_frame = frames.get("top_decisions", pl.DataFrame())
     if use_datashader:
         try:
             _plot_decision_exposure_datashader(decision_frame, out)
@@ -3417,9 +3516,9 @@ def write_explanation_outputs(
     write_timing: dict[str, Any] = {}
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = metadata or {}
-    frames: dict[str, pd.DataFrame] = result["frames"]
-    aux_dim_frames: dict[str, pd.DataFrame] = result.get("aux_dim_frames", {})
-    aux_projection_frames: dict[str, pd.DataFrame] = result.get("aux_projection_frames", {})
+    frames: dict[str, pl.DataFrame] = result["frames"]
+    aux_dim_frames: dict[str, pl.DataFrame] = result.get("aux_dim_frames", {})
+    aux_projection_frames: dict[str, pl.DataFrame] = result.get("aux_projection_frames", {})
     stage_start = time.perf_counter()
     for name, frame in frames.items():
         if frame is not None and not frame.empty:

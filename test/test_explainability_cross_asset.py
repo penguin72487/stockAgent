@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 from torch import nn
 
@@ -78,6 +78,14 @@ def _dates(rows: int = 4) -> list[str]:
     return [f"2026-01-{idx + 1:02d}" for idx in range(rows)]
 
 
+def _matrix_csv(path: Path) -> tuple[list[str], list[str], np.ndarray]:
+    frame = pl.read_csv(path)
+    source_symbols = frame["source_symbol"].cast(pl.String).to_list()
+    target_symbols = [column for column in frame.columns if column != "source_symbol"]
+    values = frame.select(target_symbols).to_numpy().astype(np.float64, copy=False)
+    return source_symbols, target_symbols, values
+
+
 def test_independent_model_off_diagonal_score_influence_near_zero(tmp_path: Path) -> None:
     batch = _batch()
     summary = abstract_cross_asset_transmission(
@@ -99,11 +107,11 @@ def test_independent_model_off_diagonal_score_influence_near_zero(tmp_path: Path
     )
 
     assert summary["enabled"] is True
-    matrix = pd.read_csv(tmp_path / MODULE_NAME / "matrices" / "zero_score_abs.csv", index_col=0)
-    for source_symbol in matrix.index:
-        for target_symbol in matrix.columns:
+    source_symbols, target_symbols, values = _matrix_csv(tmp_path / MODULE_NAME / "matrices" / "zero_score_abs.csv")
+    for source_idx, source_symbol in enumerate(source_symbols):
+        for target_idx, target_symbol in enumerate(target_symbols):
             if source_symbol != target_symbol:
-                assert abs(float(matrix.loc[source_symbol, target_symbol])) < 1e-6
+                assert abs(float(values[source_idx, target_idx])) < 1e-6
 
 
 def test_cross_stock_toy_detects_injected_source_to_target_dependency(tmp_path: Path) -> None:
@@ -126,9 +134,9 @@ def test_cross_stock_toy_detects_injected_source_to_target_dependency(tmp_path: 
         device=torch.device("cpu"),
     )
 
-    edges = pd.read_csv(tmp_path / MODULE_NAME / "tables" / "edge_metrics.csv")
-    injected = edges[(edges["source_index"] == 0) & (edges["target_index"] == 1)].iloc[0]
-    unrelated = edges[(edges["source_index"] == 2) & (edges["target_index"] == 1)].iloc[0]
+    edges = pl.read_csv(tmp_path / MODULE_NAME / "tables" / "edge_metrics.csv")
+    injected = edges.filter((pl.col("source_index") == 0) & (pl.col("target_index") == 1)).row(0, named=True)
+    unrelated = edges.filter((pl.col("source_index") == 2) & (pl.col("target_index") == 1)).row(0, named=True)
     assert float(injected["score_abs"]) > 5.0
     assert float(injected["score_abs"]) > float(unrelated["score_abs"]) + 1.0
 
@@ -159,8 +167,8 @@ def test_cross_asset_shape_nan_safety_and_missing_shocks(tmp_path: Path) -> None
     assert summary["sources"] <= 3
     assert summary["targets"] <= 3
     assert any("not_a_feature" in warning for warning in summary["warnings"])
-    matrix = pd.read_csv(tmp_path / MODULE_NAME / "matrices" / "zero_weight_residual_abs.csv", index_col=0)
-    assert np.isfinite(matrix.to_numpy(dtype=np.float64)).all()
+    _, _, values = _matrix_csv(tmp_path / MODULE_NAME / "matrices" / "zero_weight_residual_abs.csv")
+    assert np.isfinite(values).all()
 
 
 def _tiny_transformer() -> TransformerBasePortfolioModel:

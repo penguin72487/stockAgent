@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import torch
 from torch import nn
 
@@ -152,9 +151,8 @@ class CrossSectionalLightGBM(_CrossSectionalTreeBase):
         )
 
     def _fit_numpy(self, x: np.ndarray, y: np.ndarray) -> None:
-        x_df = pd.DataFrame(x, columns=self._feature_names)
         try:
-            self._model.fit(x_df, y)
+            self._model.fit(x, y, feature_name=self._feature_names)
         except Exception as exc:
             if self._use_gpu:
                 raise RuntimeError(
@@ -164,8 +162,7 @@ class CrossSectionalLightGBM(_CrossSectionalTreeBase):
             raise
 
     def _predict_numpy(self, x: np.ndarray) -> np.ndarray:
-        x_df = pd.DataFrame(x, columns=self._feature_names)
-        pred = self._model.predict(x_df)
+        pred = self._model.predict(x)
         return np.asarray(pred, dtype=np.float32)
 
 
@@ -213,10 +210,8 @@ class CrossSectionalXGBoost(_CrossSectionalTreeBase):
         )
 
     def _fit_numpy(self, x: np.ndarray, y: np.ndarray) -> None:
-        x_df = pd.DataFrame(x, columns=self._feature_names)
-        self._model.fit(x_df, y)
+        self._model.fit(x, y)
 
     def _predict_numpy(self, x: np.ndarray) -> np.ndarray:
-        x_df = pd.DataFrame(x, columns=self._feature_names)
-        pred = self._model.predict(x_df)
+        pred = self._model.predict(x)
         return np.asarray(pred, dtype=np.float32)

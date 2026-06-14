@@ -6,9 +6,9 @@ from pathlib import Path
 import hashlib
 import pickle
 import os
+from typing import Any
 
 import numpy as np
-import pandas as pd
 
 try:
     import polars as pl
@@ -16,8 +16,12 @@ except Exception:  # pragma: no cover - optional parquet reader
     pl = None
 
 try:
+    import pyarrow as pa
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
 except Exception:  # pragma: no cover - optional parquet reader
+    pa = None
+    pc = None
     pq = None
 
 from stockagent.data.panel_cache import (
@@ -93,7 +97,7 @@ PREV_DAY_LOG_RETURN_RENAME = {
 _MISSING_VOLUME_WARNED_SYMBOLS: set[str] = set()
 
 
-def _round_half_up(values: np.ndarray | pd.Series, decimals: int = 2) -> np.ndarray:
+def _round_half_up(values: np.ndarray, decimals: int = 2) -> np.ndarray:
     """Round with half-up semantics (0.5 always rounds away from zero)."""
     arr = np.asarray(values, dtype=np.float64)
     factor = float(10**decimals)
@@ -105,13 +109,6 @@ def _round_half_up(values: np.ndarray | pd.Series, decimals: int = 2) -> np.ndar
     out[neg] = np.ceil(arr[neg] * factor - 0.5) / factor
     return out
 
-
-def _round_tw_price_series(series: pd.Series) -> pd.Series:
-    """Normalize TW stock prices to 2 decimals using half-up rounding."""
-    numeric = pd.to_numeric(series, errors="coerce")
-    return pd.Series(_round_half_up(numeric, decimals=2), index=series.index)
-
-
 def _price_decimals_for_path(path: Path) -> int:
     """Return market-specific price precision: TW=2, others=8 decimals."""
     parts = {part.lower() for part in path.parts}
@@ -120,18 +117,13 @@ def _price_decimals_for_path(path: Path) -> int:
     return 2 if is_tw_market else 8
 
 
-def _return_price_column(frame: pd.DataFrame, path: Path) -> str:
+def _return_price_column(frame: Any, path: Path) -> str:
     """Choose the price series used for forward return labels."""
     # Use adjusted close whenever available so corporate actions
     # (splits/dividends/capital changes) do not create fake label jumps.
     if "adjclose" in frame.columns:
         return "adjclose"
     return "close"
-
-
-def _round_price_series(series: pd.Series, decimals: int) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    return pd.Series(_round_half_up(numeric, decimals=decimals), index=series.index)
 
 
 @dataclass(slots=True)
@@ -178,29 +170,6 @@ def _is_usd_trading_pair(path: Path) -> bool:
     return _symbol_name_from_path(path).upper().endswith("USD")
 
 
-def _safe_log_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    """Compute log(numerator / denominator) only where both values are finite and > 0."""
-    num = pd.to_numeric(numerator, errors="coerce").to_numpy(dtype=np.float64, copy=False)
-    den = pd.to_numeric(denominator, errors="coerce").to_numpy(dtype=np.float64, copy=False)
-    out = np.full(num.shape, np.nan, dtype=np.float64)
-    valid = np.isfinite(num) & np.isfinite(den) & (num > 0.0) & (den > 0.0)
-    np.divide(num, den, out=out, where=valid)
-    np.log(out, out=out, where=valid)
-    out[~valid] = np.nan
-    return pd.Series(out, index=numerator.index)
-
-
-def _compute_tradable_from_frame(frame: pd.DataFrame) -> pd.Series:
-    close_is_valid = frame["close"].notna()
-    if "Trading_Volume" not in frame.columns:
-        return close_is_valid
-
-    volume = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
-    has_positive_volume = volume.fillna(0).gt(0)
-    volume_missing = volume.isna()
-    return close_is_valid & (has_positive_volume | volume_missing)
-
-
 def _tw_tick_size(price: np.ndarray) -> np.ndarray:
     """TWSE tick size by price bucket (vectorized)."""
     p = np.asarray(price, dtype=np.float64)
@@ -215,9 +184,54 @@ def _tw_tick_size(price: np.ndarray) -> np.ndarray:
     return tick
 
 
-def _tw_limit_price(prev_close: pd.Series, ratio: float) -> pd.Series:
+def _to_float_array(values: Any, rows: int | None = None, default: float = np.nan) -> np.ndarray:
+    if values is None:
+        if rows is None:
+            return np.asarray([], dtype=np.float64)
+        return np.full(int(rows), default, dtype=np.float64)
+    if pl is not None and isinstance(values, pl.Series):
+        values = values.to_numpy()
+    arr = np.asarray(values)
+    try:
+        return arr.astype(np.float64, copy=False)
+    except (TypeError, ValueError):
+        out = np.full(arr.shape, default, dtype=np.float64)
+        flat = out.reshape(-1)
+        for idx, value in enumerate(arr.reshape(-1)):
+            try:
+                flat[idx] = float(value)
+            except (TypeError, ValueError):
+                flat[idx] = default
+        return out
+
+
+def _frame_height(frame: Any) -> int:
+    if pl is not None and isinstance(frame, pl.DataFrame):
+        return int(frame.height)
+    return int(len(frame))
+
+
+def _frame_column_float_array(frame: Any, name: str, *, default: float = np.nan) -> np.ndarray:
+    rows = _frame_height(frame)
+    if name not in frame.columns:
+        return np.full(rows, default, dtype=np.float64)
+    if pl is not None and isinstance(frame, pl.DataFrame):
+        return frame.get_column(name).cast(pl.Float64, strict=False).to_numpy()
+    return _to_float_array(frame[name], rows=rows, default=default)
+
+
+def _frame_column_bool_array(frame: Any, name: str, *, default: bool = False) -> np.ndarray:
+    rows = _frame_height(frame)
+    if name not in frame.columns:
+        return np.full(rows, default, dtype=bool)
+    if pl is not None and isinstance(frame, pl.DataFrame):
+        return frame.get_column(name).cast(pl.Boolean, strict=False).fill_null(default).to_numpy()
+    return np.asarray(frame[name], dtype=bool)
+
+
+def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
     """Compute TW daily limit price with floor-to-tick rule from theoretical price."""
-    prev = pd.to_numeric(prev_close, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    prev = _to_float_array(prev_close)
     theoretical = prev * ratio
     tick = _tw_tick_size(theoretical)
 
@@ -225,10 +239,10 @@ def _tw_limit_price(prev_close: pd.Series, ratio: float) -> pd.Series:
     valid = np.isfinite(theoretical) & np.isfinite(tick) & (tick > 0.0)
     # Small epsilon avoids floating-point edge cases around exact tick boundaries.
     out[valid] = np.floor((theoretical[valid] / tick[valid]) + 1e-12) * tick[valid]
-    return pd.Series(_round_half_up(out, decimals=2), index=prev_close.index)
+    return _round_half_up(out, decimals=2)
 
 
-def _tw_reference_price_for_limits(frame: pd.DataFrame, prev_close_raw: pd.Series) -> pd.Series:
+def _tw_reference_price_for_limits(frame: Any, prev_close_raw: np.ndarray) -> np.ndarray:
     """Compute TW daily reference price used for limit-up/down checks.
 
     Base rule uses previous close, then applies ex-right/ex-dividend adjustments
@@ -236,78 +250,43 @@ def _tw_reference_price_for_limits(frame: pd.DataFrame, prev_close_raw: pd.Serie
     - Dividends: subtract cash dividend on ex-dividend day.
     - Stock Splits: divide by split ratio on ex-right day.
     """
-    reference = pd.to_numeric(prev_close_raw, errors="coerce").astype(np.float64)
+    reference = _to_float_array(prev_close_raw).astype(np.float64, copy=True)
 
     if "Dividends" in frame.columns:
-        dividends = pd.to_numeric(frame["Dividends"], errors="coerce").fillna(0.0)
+        dividends = np.nan_to_num(_frame_column_float_array(frame, "Dividends"), nan=0.0)
         reference = reference - dividends
 
     if "Stock Splits" in frame.columns:
-        split_ratio = pd.to_numeric(frame["Stock Splits"], errors="coerce")
-        valid_split = split_ratio.notna() & split_ratio.gt(0.0) & split_ratio.ne(1.0)
-        reference = reference.where(~valid_split, reference / split_ratio)
+        split_ratio = _frame_column_float_array(frame, "Stock Splits")
+        valid_split = np.isfinite(split_ratio) & (split_ratio > 0.0) & (split_ratio != 1.0)
+        reference[valid_split] = reference[valid_split] / split_ratio[valid_split]
 
-    reference = reference.where(reference.gt(0.0))
-    return pd.Series(_round_half_up(reference, decimals=2), index=prev_close_raw.index)
+    reference = np.where(reference > 0.0, reference, np.nan)
+    return _round_half_up(reference, decimals=2)
 
 
-def _compute_tw_limit_masks(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+def _compute_tw_limit_masks(frame: Any) -> tuple[np.ndarray, np.ndarray]:
     """Return (can_buy, can_sell) masks under TW 10% daily limit assumptions.
 
     Rule:
     - limit-up day: cannot buy, can sell
     - limit-down day: can buy, cannot sell
     """
-    tradable = frame["tradable"].astype(bool)
-    close_raw = _round_tw_price_series(frame.get("close_raw"))
-    prev_close_raw = close_raw.shift(1)
+    tradable = _frame_column_bool_array(frame, "tradable")
+    close_raw = _round_half_up(_frame_column_float_array(frame, "close_raw"), decimals=2)
+    prev_close_raw = _shift_array(close_raw, 1)
     reference_price = _tw_reference_price_for_limits(frame, prev_close_raw)
 
     limit_up_price = _tw_limit_price(reference_price, 1.10)
     limit_down_price = _tw_limit_price(reference_price, 0.90)
 
     # Use small price tolerance to absorb source rounding noise.
-    is_limit_up = close_raw.ge(limit_up_price - 1e-9) & reference_price.gt(0)
-    is_limit_down = close_raw.le(limit_down_price + 1e-9) & reference_price.gt(0)
+    is_limit_up = (close_raw >= (limit_up_price - 1e-9)) & (reference_price > 0.0)
+    is_limit_down = (close_raw <= (limit_down_price + 1e-9)) & (reference_price > 0.0)
 
-    can_buy = tradable & ~is_limit_up.fillna(False)
-    can_sell = tradable & ~is_limit_down.fillna(False)
+    can_buy = tradable & ~np.nan_to_num(is_limit_up, nan=False).astype(bool)
+    can_sell = tradable & ~np.nan_to_num(is_limit_down, nan=False).astype(bool)
     return can_buy, can_sell
-
-
-def _add_derived_features(frame: pd.DataFrame) -> pd.DataFrame:
-    open_px = pd.to_numeric(frame.get("open"), errors="coerce")
-    high_px = pd.to_numeric(frame.get("max"), errors="coerce")
-    low_px = pd.to_numeric(frame.get("min"), errors="coerce")
-    close_px = pd.to_numeric(frame.get("close"), errors="coerce")
-
-    frame["intraday_return_co"] = _safe_log_ratio(close_px, open_px)
-    frame["overnight_gap_oc"] = _safe_log_ratio(open_px, close_px.shift(1))
-    frame["intraday_range"] = _safe_log_ratio(high_px, low_px)
-
-    spread = (high_px - low_px).clip(lower=0.0)
-    denom = spread + EPSILON
-
-    frame["body_ratio"] = (close_px - open_px).abs() / denom
-    frame["signed_body_ratio"] = (close_px - open_px) / denom
-    frame["clv"] = (close_px - low_px) / denom
-    frame["clv_centered"] = frame["clv"] - 0.5
-    frame["upper_shadow"] = (high_px - np.maximum(open_px, close_px)) / denom
-    frame["lower_shadow"] = (np.minimum(open_px, close_px) - low_px) / denom
-    frame["shadow_imbalance"] = frame["upper_shadow"] - frame["lower_shadow"]
-
-    frame["delta_clv"] = frame["clv"] - frame["clv"].shift(1)
-    frame["delta_body_ratio"] = frame["body_ratio"] - frame["body_ratio"].shift(1)
-
-    return frame
-
-
-def _apply_prev_day_log_returns(frame: pd.DataFrame, columns: list[str]) -> None:
-    """Convert selected columns to log returns vs previous day in-place."""
-    for col in columns:
-        if col in frame.columns:
-            out_col = PREV_DAY_LOG_RETURN_RENAME.get(col, f"{col}_logret_1d")
-            frame[out_col] = _safe_log_ratio(frame[col], frame[col].shift(1))
 
 
 def _warn_missing_trading_volume(path: Path) -> None:
@@ -321,74 +300,143 @@ def _warn_missing_trading_volume(path: Path) -> None:
     )
 
 
-def _ensure_feature_columns(frame: pd.DataFrame, columns: list[str]) -> None:
-    """Materialize all requested feature columns; fill missing ones with NaN."""
-    for col in columns:
-        if col not in frame.columns:
-            frame[col] = np.nan
+def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
+    if pl is None:
+        raise RuntimeError("_prepare_symbol_frame requires polars")
+    if not isinstance(frame, pl.DataFrame):
+        if pa is not None and isinstance(frame, pa.Table):
+            frame = pl.from_arrow(frame)
+        else:
+            frame = pl.DataFrame(frame)
+    if "date" not in frame.columns:
+        raise ValueError(f"{path.name} is missing required date column")
 
-
-def _prepare_symbol_frame(frame: pd.DataFrame, path: Path) -> pd.DataFrame:
-    frame = frame.copy()
-    if not pd.api.types.is_datetime64_any_dtype(frame["date"]):
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    frame = frame.sort_values("date").reset_index(drop=True)
-    frame["symbol"] = _symbol_name_from_path(path)
     price_decimals = _price_decimals_for_path(path)
-    for col in ["open", "max", "min", "close"]:
-        if col in frame.columns:
-            frame[col] = _round_price_series(frame[col], decimals=price_decimals)
-    if "adjclose" in frame.columns:
-        frame["adjclose"] = _round_price_series(frame["adjclose"], decimals=price_decimals)
-    frame["close_raw"] = pd.to_numeric(frame["close"], errors="coerce").astype(np.float32)
 
-    frame = _add_derived_features(frame)
+    def num(name: str):
+        if name in frame.columns:
+            return pl.col(name).cast(pl.Float64, strict=False)
+        return pl.lit(None, dtype=pl.Float64)
 
-    return_price_col = _return_price_column(frame, path)
-    frame["return_1d"] = _safe_log_ratio(frame[return_price_col].shift(-1), frame[return_price_col])
-
-    frame["tradable"] = _compute_tradable_from_frame(frame)
-
-    _apply_prev_day_log_returns(frame, ["open", "max", "min", "close"])
-
-    if "Trading_Volume" in frame.columns:
-        vol = pd.to_numeric(frame["Trading_Volume"], errors="coerce")
-        frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]] = _safe_log_ratio(vol, vol.shift(1))
-
-        volume_log_delta = pd.to_numeric(
-            frame[PREV_DAY_LOG_RETURN_RENAME["Trading_Volume"]], errors="coerce"
+    frame = (
+        frame.with_columns(pl.col("date").cast(pl.Datetime("ns"), strict=False))
+        .drop_nulls("date")
+        .sort("date")
+        .with_columns(
+            [
+                _polars_round_half_up(num("open"), price_decimals).alias("open"),
+                _polars_round_half_up(num("max"), price_decimals).alias("max"),
+                _polars_round_half_up(num("min"), price_decimals).alias("min"),
+                _polars_round_half_up(num("close"), price_decimals).alias("close"),
+                _polars_round_half_up(num("adjclose"), price_decimals).alias("adjclose"),
+                pl.lit(_symbol_name_from_path(path)).alias("symbol"),
+            ]
         )
-        signed_intraday = np.sign(pd.to_numeric(frame["intraday_return_co"], errors="coerce"))
-        frame["signed_vol"] = signed_intraday * volume_log_delta
+        .with_columns(pl.col("close").cast(pl.Float32, strict=False).alias("close_raw"))
+    )
+
+    spread = (pl.col("max") - pl.col("min")).clip(0.0, None)
+    denom = spread + EPSILON
+    return_price = pl.col(_return_price_column(frame, path))
+    close_valid = _polars_not_nan_or_null(pl.col("close"))
+    if "Trading_Volume" in frame.columns:
+        volume = num("Trading_Volume")
+        volume_missing = volume.is_null() | volume.is_nan().fill_null(False)
+        tradable_expr = close_valid & ((volume.fill_nan(0.0).fill_null(0.0) > 0.0) | volume_missing)
     else:
         _warn_missing_trading_volume(path)
+        volume = pl.lit(None, dtype=pl.Float64)
+        tradable_expr = close_valid
 
-    _ensure_feature_columns(frame, LOG_RETURN_FEATURE_COLUMNS)
+    frame = frame.with_columns(
+        [
+            _polars_safe_log(pl.col("close"), pl.col("open")).alias("intraday_return_co"),
+            _polars_safe_log(pl.col("open"), pl.col("close").shift(1)).alias("overnight_gap_oc"),
+            _polars_safe_log(pl.col("max"), pl.col("min")).alias("intraday_range"),
+            ((pl.col("close") - pl.col("open")).abs() / denom).alias("body_ratio"),
+            ((pl.col("close") - pl.col("open")) / denom).alias("signed_body_ratio"),
+            ((pl.col("close") - pl.col("min")) / denom).alias("clv"),
+            ((pl.col("max") - pl.max_horizontal("open", "close")) / denom).alias("upper_shadow"),
+            ((pl.min_horizontal("open", "close") - pl.col("min")) / denom).alias("lower_shadow"),
+            _polars_safe_log(return_price.shift(-1), return_price).alias("return_1d"),
+            _polars_safe_log(pl.col("open"), pl.col("open").shift(1)).alias("open_logret_1d"),
+            _polars_safe_log(pl.col("max"), pl.col("max").shift(1)).alias("max_logret_1d"),
+            _polars_safe_log(pl.col("min"), pl.col("min").shift(1)).alias("min_logret_1d"),
+            _polars_safe_log(pl.col("close"), pl.col("close").shift(1)).alias("close_logret_1d"),
+            _polars_safe_log(volume, volume.shift(1)).alias("trading_volume_logret_1d"),
+            tradable_expr.alias("tradable"),
+        ]
+    )
+    frame = frame.with_columns(
+        [
+            (pl.col("clv") - 0.5).alias("clv_centered"),
+            (pl.col("upper_shadow") - pl.col("lower_shadow")).alias("shadow_imbalance"),
+            (pl.col("clv") - pl.col("clv").shift(1)).alias("delta_clv"),
+            (pl.col("body_ratio") - pl.col("body_ratio").shift(1)).alias("delta_body_ratio"),
+            (pl.col("intraday_return_co").sign() * pl.col("trading_volume_logret_1d")).alias("signed_vol"),
+        ]
+    )
+    for col in LOG_RETURN_FEATURE_COLUMNS:
+        if col not in frame.columns:
+            frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
     return frame
 
 
-def _load_symbol_frame(path: Path) -> pd.DataFrame:
-    return _prepare_symbol_frame(pd.read_parquet(path), path)
+def _load_symbol_frame(path: Path) -> Any:
+    if pq is None:
+        raise RuntimeError("PyArrow is not available")
+    return _prepare_symbol_frame(pq.read_table(path), path)
 
 
 def _coerce_arrow_numeric_column(table, name: str, rows: int) -> np.ndarray:
     if name not in table.column_names:
         return np.full(rows, np.nan, dtype=np.float64)
-    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
+    column = table[name].combine_chunks()
+    values = column.to_numpy(zero_copy_only=False)
     try:
         return np.asarray(values, dtype=np.float64)
     except (TypeError, ValueError):
-        return pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=np.float64)
+        if pc is not None and pa is not None:
+            try:
+                casted = pc.cast(column, pa.float64(), safe=False)
+                return np.asarray(casted.to_numpy(zero_copy_only=False), dtype=np.float64)
+            except Exception:
+                pass
+        if pl is not None:
+            return pl.Series(values).cast(pl.Float64, strict=False).to_numpy()
+        return _to_float_array(values, rows=rows)
 
 
 def _coerce_arrow_datetime_ns_column(table, name: str, rows: int) -> np.ndarray:
     if name not in table.column_names:
         return np.full(rows, np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
-    values = table[name].combine_chunks().to_numpy(zero_copy_only=False)
+    column = table[name].combine_chunks()
+    values = column.to_numpy(zero_copy_only=False)
     try:
         return np.asarray(values, dtype="datetime64[ns]")
     except (TypeError, ValueError):
-        return pd.to_datetime(pd.Series(values), errors="coerce").to_numpy(dtype="datetime64[ns]")
+        if pc is not None and pa is not None:
+            try:
+                casted = pc.cast(column, pa.timestamp("ns"), safe=False)
+                return np.asarray(casted.to_numpy(zero_copy_only=False), dtype="datetime64[ns]")
+            except Exception:
+                pass
+        if pl is not None:
+            return (
+                pl.Series(values)
+                .cast(pl.String, strict=False)
+                .str.to_datetime(strict=False)
+                .to_numpy()
+                .astype("datetime64[ns]", copy=False)
+            )
+        out = np.full(rows, np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
+        flat = np.asarray(values).reshape(-1)
+        for idx, value in enumerate(flat[:rows]):
+            try:
+                out[idx] = np.datetime64(str(value), "ns")
+            except Exception:
+                out[idx] = np.datetime64("NaT", "ns")
+        return out
 
 
 def _shift_array(values: np.ndarray, periods: int) -> np.ndarray:
@@ -469,8 +517,8 @@ def _tw_limit_masks_from_arrays(
     reference[valid_split] = reference[valid_split] / splits[valid_split]
     reference = np.where(reference > 0.0, reference, np.nan)
 
-    limit_up = _tw_limit_price(pd.Series(reference), 1.10).to_numpy(dtype=np.float64)
-    limit_down = _tw_limit_price(pd.Series(reference), 0.90).to_numpy(dtype=np.float64)
+    limit_up = _tw_limit_price(reference, 1.10).astype(np.float64, copy=False)
+    limit_down = _tw_limit_price(reference, 0.90).astype(np.float64, copy=False)
 
     base = np.asarray(tradable, dtype=bool)
     is_limit_up = np.isfinite(reference) & (close >= (limit_up - 1e-9))
@@ -844,98 +892,6 @@ def _resolve_benchmark_index(symbols: list[str], benchmark_name: str) -> int | N
     )
 
 
-def _build_panel_from_frame(
-    frame_all: pd.DataFrame,
-    symbols: list[str],
-    benchmark_name: str = "universe_average_return",
-) -> PanelData:
-    feature_columns = _get_feature_columns(frame_all)
-
-    all_dates = sorted(frame_all["date"].dropna().unique().tolist())
-    num_dates = len(all_dates)
-    num_symbols = len(symbols)
-    num_features = len(feature_columns)
-
-    features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
-    returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-    close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
-    tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-    can_buy_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-    can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-    alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
-
-    date_index = {date: idx for idx, date in enumerate(all_dates)}
-    symbol_index = {symbol: idx for idx, symbol in enumerate(symbols)}
-
-    frame_all = frame_all[frame_all["symbol"].isin(symbols)].copy()
-    row_idx = frame_all["date"].map(date_index).to_numpy(dtype=np.int64)
-    sym_idx = frame_all["symbol"].map(symbol_index).to_numpy(dtype=np.int64)
-
-    for feat_idx, col in enumerate(feature_columns):
-        features[row_idx, sym_idx, feat_idx] = frame_all[col].to_numpy(dtype=np.float32, copy=False)
-
-    returns_1d[row_idx, sym_idx] = frame_all["return_1d"].to_numpy(dtype=np.float32, copy=False)
-    close_prices[row_idx, sym_idx] = frame_all["close_raw"].to_numpy(dtype=np.float32, copy=False)
-    tradable_mask[row_idx, sym_idx] = frame_all["tradable"].to_numpy(dtype=bool, copy=False)
-    if "can_buy" in frame_all.columns:
-        can_buy_mask[row_idx, sym_idx] = frame_all["can_buy"].to_numpy(dtype=bool, copy=False)
-    else:
-        can_buy_mask[row_idx, sym_idx] = tradable_mask[row_idx, sym_idx]
-    if "can_sell" in frame_all.columns:
-        can_sell_mask[row_idx, sym_idx] = frame_all["can_sell"].to_numpy(dtype=bool, copy=False)
-    else:
-        can_sell_mask[row_idx, sym_idx] = tradable_mask[row_idx, sym_idx]
-    alive_mask[row_idx, sym_idx] = frame_all["close"].notna().to_numpy(dtype=bool, copy=False)
-
-    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
-    if benchmark_symbol_index is None:
-        valid_returns = np.isfinite(returns_1d)
-        n_valid = valid_returns.sum(axis=1)
-        sum_ret = np.nansum(np.where(valid_returns, returns_1d, 0.0), axis=1)
-        benchmark_returns = np.zeros_like(sum_ret, dtype=np.float32)
-        np.divide(
-            sum_ret,
-            n_valid,
-            out=benchmark_returns,
-            where=n_valid > 0,
-        )
-    else:
-        benchmark_returns = np.nan_to_num(
-            returns_1d[:, benchmark_symbol_index],
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32, copy=False)
-
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return PanelData(
-        dates=np.array(all_dates, dtype="datetime64[ns]"),
-        symbols=symbols,
-        feature_names=feature_columns,
-        features=features,
-        returns_1d=returns_1d,
-        tradable_mask=tradable_mask,
-        can_buy_mask=can_buy_mask,
-        can_sell_mask=can_sell_mask,
-        alive_mask=alive_mask,
-        benchmark_returns=benchmark_returns,
-        close_prices=close_prices,
-    )
-
-
-def _get_feature_columns(frame: pd.DataFrame) -> list[str]:
-    numeric_columns = set(frame.select_dtypes(include=[np.number]).columns.tolist())
-    feature_columns = [
-        column
-        for column in LOG_RETURN_FEATURE_COLUMNS
-        if column in numeric_columns and column not in RESERVED_COLUMNS
-    ]
-    if not feature_columns:
-        raise ValueError("No log-return feature columns found in symbol frame")
-    return feature_columns
-
-
 def _panel_cache_path(parquet_root: str | Path) -> Path:
     return legacy_panel_cache_path(parquet_root)
 
@@ -1092,7 +1048,7 @@ def build_panel(
             raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
 
     panel_backend = str(panel_backend).strip().lower()
-    valid_backends = {"auto", "pandas", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
+    valid_backends = {"auto", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
     if panel_backend not in valid_backends:
         raise ValueError(f"panel_backend must be one of {sorted(valid_backends)}, got {panel_backend!r}")
     panel_load_workers = max(0, int(panel_load_workers))
@@ -1125,7 +1081,7 @@ def build_panel(
     elif panel_backend == "auto" and pq is not None:
         selected_backend = "pyarrow"
     else:
-        selected_backend = "pandas"
+        raise RuntimeError("data.panel_backend='auto' requires polars or pyarrow")
 
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
@@ -1142,86 +1098,38 @@ def build_panel(
         f"[panel] building from {len(parquet_paths)} parquet files "
         f"(backend={selected_backend}, workers={panel_load_workers})..."
     )
-    if selected_backend in {"pyarrow", "polars_lazy", "polars_streaming"}:
-        polars_collect_engine = "streaming" if selected_backend == "polars_streaming" else "auto"
+    polars_collect_engine = "streaming" if selected_backend == "polars_streaming" else "auto"
 
-        def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
-            try:
-                if selected_backend == "pyarrow":
-                    arrays = _load_symbol_arrays_pyarrow(path, tradable_mode=tradable_mode)
-                else:
-                    arrays = _load_symbol_arrays_polars_lazy(
-                        path,
-                        tradable_mode=tradable_mode,
-                        collect_engine=polars_collect_engine,
-                    )
-                if int(arrays.dates.size) == 0:
-                    raise ValueError(f"Symbol file is empty: {path.name}")
-                return path, arrays, None
-            except Exception as exc:
-                return path, None, exc
-
-        if panel_load_workers > 1 and len(parquet_paths) > 1:
-            with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
-                loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
-        else:
-            loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
-
-        valid_arrays: list[_SymbolPanelArrays] = []
-        for path, arrays, exc in loaded_arrays:
-            if exc is not None:
-                print(f"[panel] SKIP {path.name}: {exc}")
-                continue
-            if arrays is not None:
-                valid_arrays.append(arrays)
-        panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
-        _save_panel_cache(parquet_root, panel, source_hash, backend_key)
-        print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
-        _print_feature_overview(panel)
-        return panel
-
-    symbol_frames: list[pd.DataFrame] = []
-    valid_paths: list[Path] = []
-
-    def _load_one(path: Path) -> tuple[Path, pd.DataFrame | None, Exception | None]:
+    def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
         try:
-            frame = _load_symbol_frame(path)
-            if len(frame) == 0:
-                raise ValueError(f"Symbol file is empty: {path.name}")
-            use_tw_limit_guard = tradable_mode == "tw_limit_guard"
-            if use_tw_limit_guard:
-                can_buy_limit, can_sell_limit = _compute_tw_limit_masks(frame)
-                frame["can_buy"] = can_buy_limit
-                frame["can_sell"] = can_sell_limit
+            if selected_backend == "pyarrow":
+                arrays = _load_symbol_arrays_pyarrow(path, tradable_mode=tradable_mode)
             else:
-                frame["can_buy"] = frame["tradable"].astype(bool)
-                frame["can_sell"] = frame["tradable"].astype(bool)
-            return path, frame, None
+                arrays = _load_symbol_arrays_polars_lazy(
+                    path,
+                    tradable_mode=tradable_mode,
+                    collect_engine=polars_collect_engine,
+                )
+            if int(arrays.dates.size) == 0:
+                raise ValueError(f"Symbol file is empty: {path.name}")
+            return path, arrays, None
         except Exception as exc:
             return path, None, exc
 
     if panel_load_workers > 1 and len(parquet_paths) > 1:
         with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
-            loaded = list(executor.map(_load_one, parquet_paths))
+            loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
     else:
-        loaded = [_load_one(path) for path in parquet_paths]
+        loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
 
-    for path, frame, exc in loaded:
+    valid_arrays: list[_SymbolPanelArrays] = []
+    for path, arrays, exc in loaded_arrays:
         if exc is not None:
             print(f"[panel] SKIP {path.name}: {exc}")
             continue
-        if frame is None:
-            continue
-        symbol_frames.append(frame)
-        valid_paths.append(path)
-
-    if not symbol_frames:
-        raise RuntimeError("No valid parquet files could be loaded.")
-
-    symbols = [_symbol_name_from_path(path) for path in valid_paths]
-    frame_all = pd.concat(symbol_frames, ignore_index=True)
-    panel = _build_panel_from_frame(frame_all, symbols, benchmark_name=benchmark_name)
-    
+        if arrays is not None:
+            valid_arrays.append(arrays)
+    panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)
