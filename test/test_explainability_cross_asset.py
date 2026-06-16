@@ -266,6 +266,10 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
     assert summary["module"] == MODULE_NAME
     assert (base / "abstract_cross_asset_report.md").exists()
     assert (base / "tables" / "top_edges.csv").exists()
+    assert (base / "tables" / "shock_summary.csv").exists()
     assert (base / "tables" / "role_embeddings.csv").exists()
     assert (base / "matrices" / "zero_score_abs.csv").exists()
     assert (base / "matrices" / "zero_validated_transmission.csv").exists()
+    shock_summary = pl.read_csv(base / "tables" / "shock_summary.csv")
+    assert shock_summary["matched_feature_count"].to_list() == [4]
+    assert shock_summary["matched_features"].to_list() == ["ret_feature;volume_feature;range_feature;open_gap_feature"]

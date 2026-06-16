@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import shutil
+import warnings
 
 import numpy as np
 import torch
 
 from stockagent.explainability import (
     ExplainabilitySettings,
+    _feature_correlations,
     explain_batch,
     write_fold_stability_outputs,
     write_explanation_outputs,
@@ -73,6 +75,22 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert summary["plots_generated"]
     assert summary["paper_plots"]
     assert list((out_dir / "plots").glob("*.png"))
+
+
+def test_feature_correlations_zero_variance_without_runtime_warning() -> None:
+    x = torch.ones(3, 2, 4, 2)
+    scores = torch.ones(3, 4)
+    weights = torch.full((3, 4), 0.25)
+    mask = torch.ones(3, 4, dtype=torch.bool)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        frame = _feature_correlations(x, scores, weights, mask, ["constant_a", "constant_b"])
+
+    runtime_messages = [str(item.message) for item in caught if issubclass(item.category, RuntimeWarning)]
+    assert not any("invalid value encountered in divide" in message for message in runtime_messages)
+    assert frame["score_corr"].to_list() == [0.0, 0.0, 0.0, 0.0]
+    assert frame["weight_corr"].to_list() == [0.0, 0.0, 0.0, 0.0]
 
 
 def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards() -> None:

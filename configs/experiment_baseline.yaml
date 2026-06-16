@@ -15,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/us_stocks
-  benchmark_name: "SPY"
+  parquet_root: data_yahoo/forex
+  benchmark_name: "JPYUSD"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
