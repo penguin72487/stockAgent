@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -19,6 +21,10 @@ from stockagent.training.trainer import (
     _evaluate_windowed_tensor_batch,
     _maybe_share_windowed_base_from_cached,
     _PanelSlabForwardWrapper,
+    _panel_indices_to_tensors,
+    _pad_eval_chunk_first_dim,
+    _pad_eval_metadata_first_dim,
+    _pad_training_tensors,
     _pad_windowed_training_split,
     _prepare_windowed_split,
     TimingBreakdown,
@@ -95,6 +101,25 @@ def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> No
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert torch.equal(wrapped(x), torch.tensor(3.0))
     assert calls == {"compiled": 1, "eager": 2}
+
+
+def test_compiled_loss_strict_no_fallback_raises_after_cudagraph_state_overwrite() -> None:
+    calls = {"compiled": 0, "eager": 0}
+
+    def compiled_fn(x: torch.Tensor) -> torch.Tensor:
+        calls["compiled"] += 1
+        raise RuntimeError("tensor output of CUDAGraphs that has been overwritten by a subsequent run")
+
+    def eager_fn(x: torch.Tensor) -> torch.Tensor:
+        calls["eager"] += 1
+        return x + 1.0
+
+    wrapped = _CompiledLossFallback(compiled_fn, eager_fn, label="test", strict_no_fallback=True)
+
+    with pytest.raises(RuntimeError, match="strict_no_fallback=true"):
+        wrapped(torch.tensor(2.0))
+
+    assert calls == {"compiled": 1, "eager": 0}
 
 
 def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
@@ -433,6 +458,23 @@ def test_windowed_split_matches_materialized_dataset_tensors() -> None:
     assert torch.equal(batch["sample_mask"], torch.ones(3, dtype=torch.bool))
 
 
+def test_dataset_excludes_dates_without_any_finite_target_return() -> None:
+    panel = _make_panel(rows=6, symbols=4, features=3)
+    panel.returns_1d[-1, :] = np.nan
+    dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=2)
+
+    assert dataset.valid_indices.tolist() == [1, 2, 3, 4]
+
+    valid_indices, _, _, masks, _, _, _ = _panel_indices_to_tensors(
+        panel,
+        torch.arange(panel.num_dates).numpy(),
+        lookback=2,
+    )
+
+    assert valid_indices.tolist() == [1, 2, 3, 4]
+    assert masks.all(dim=1).tolist() == [True, True, True, True]
+
+
 def test_windowed_contiguous_fast_path_matches_indexed_path() -> None:
     panel = _make_panel(rows=10, symbols=4, features=3)
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=4)
@@ -467,6 +509,73 @@ def test_padded_windowed_training_split_keeps_contiguous_prefix_fast_path() -> N
     assert tail_batch["date_start"].tolist() == [9]
     assert bool(tail_batch["rows_are_contiguous"].item()) is False
     assert tail_batch["sample_mask"].tolist() == [True, False, False, False]
+    assert tail_batch["tradable_mask"].all(dim=1).tolist() == [True, True, True, True]
+
+
+def test_padding_rows_copy_last_valid_mask_for_no_fallback_attention() -> None:
+    x = torch.randn(2, 3, 4, 2)
+    returns = torch.randn(2, 4)
+    masks = torch.tensor(
+        [
+            [True, False, False, False],
+            [False, True, True, False],
+        ],
+        dtype=torch.bool,
+    )
+    buy_masks = masks.clone()
+    sell_masks = masks.clone()
+    benchmark = torch.randn(2)
+
+    padded = _pad_training_tensors(
+        x,
+        returns,
+        masks,
+        buy_masks,
+        sell_masks,
+        benchmark,
+        batch_size=4,
+    )
+    _, _, padded_masks, padded_buy, padded_sell, _, sample_mask = padded
+
+    assert sample_mask.tolist() == [True, True, False, False]
+    assert torch.equal(padded_masks[2], masks[-1])
+    assert torch.equal(padded_masks[3], masks[-1])
+    assert torch.equal(padded_buy[2], buy_masks[-1])
+    assert torch.equal(padded_sell[3], sell_masks[-1])
+
+    date_indices = torch.tensor([5, 6], dtype=torch.long)
+    padded_meta = _pad_eval_metadata_first_dim(
+        date_indices,
+        returns,
+        masks,
+        buy_masks,
+        sell_masks,
+        benchmark,
+        target_rows=4,
+    )
+    padded_dates, _, meta_masks, meta_buy, meta_sell, _, valid_rows = padded_meta
+
+    assert valid_rows == 2
+    assert padded_dates.tolist() == [5, 6, 6, 6]
+    assert torch.equal(meta_masks[2], masks[-1])
+    assert torch.equal(meta_buy[3], buy_masks[-1])
+    assert torch.equal(meta_sell[2], sell_masks[-1])
+
+    padded_chunk = _pad_eval_chunk_first_dim(
+        x,
+        returns,
+        masks,
+        buy_masks,
+        sell_masks,
+        benchmark,
+        target_rows=4,
+    )
+    _, _, chunk_masks, chunk_buy, chunk_sell, _, valid_chunk_rows = padded_chunk
+
+    assert valid_chunk_rows == 2
+    assert torch.equal(chunk_masks[2], masks[-1])
+    assert torch.equal(chunk_buy[3], buy_masks[-1])
+    assert torch.equal(chunk_sell[2], sell_masks[-1])
 
 
 def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> None:

@@ -36,6 +36,7 @@ class DataConfig:
     use_rapids: bool = False
     usd_only_trading_pairs: bool = False
     tradable_mode: str = "tradable"
+    trading_volume_policy: str = "auto"
     panel_backend: str = "auto"
     panel_load_workers: int = 4
 
@@ -381,6 +382,7 @@ class TrainingConfig:
     backtest_compile_dynamic: bool = False
     backtest_cpp_ext: bool = False
     backtest_verbose: bool = False
+    strict_no_fallback: bool = False
     backtest_checkpoint_chunk_rows: int = 0
     runtime_shape_check: bool = False
     allow_dynamic_symbols: bool = True
@@ -574,6 +576,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("backtest_compile_dynamic", False)
     training.setdefault("backtest_cpp_ext", False)
     training.setdefault("backtest_verbose", False)
+    training.setdefault("strict_no_fallback", False)
     training.setdefault("backtest_checkpoint_chunk_rows", 0)
     training.setdefault("runtime_shape_check", False)
     training.setdefault("allow_dynamic_symbols", True)
@@ -962,6 +965,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
     data.setdefault("usd_only_trading_pairs", False)
+    data.setdefault("trading_volume_policy", "auto")
     data.setdefault("panel_backend", "auto")
     data.setdefault("panel_load_workers", 4)
 
@@ -1005,6 +1009,14 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             f"data.tradable_mode must be one of {sorted(valid_tradable_modes)}, got {data.get('tradable_mode')!r}"
         )
     data["tradable_mode"] = mode
+    trading_volume_policy = str(data.get("trading_volume_policy", "auto")).strip().lower()
+    valid_volume_policies = {"auto", "required", "optional"}
+    if trading_volume_policy not in valid_volume_policies:
+        raise ValueError(
+            "data.trading_volume_policy must be one of "
+            f"{sorted(valid_volume_policies)}, got {data.get('trading_volume_policy')!r}"
+        )
+    data["trading_volume_policy"] = trading_volume_policy
     panel_backend = str(data.get("panel_backend", "auto")).strip().lower()
     valid_panel_backends = {"auto", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
     if panel_backend not in valid_panel_backends:
@@ -1020,6 +1032,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             f"training.plot_backend must be one of {sorted(valid_plot_backends)}, got {training.get('plot_backend')!r}"
         )
     training["plot_backend"] = plot_backend
+    if bool(training.get("strict_no_fallback", False)) and bool(training.get("explain_write_plots", False)) and plot_backend == "auto":
+        raise ValueError(
+            "training.plot_backend cannot be 'auto' when strict_no_fallback=true and explain_write_plots=true; "
+            "choose 'rapids_datashader' or 'matplotlib' explicitly."
+        )
     report_style = str(training.get("explain_report_style", "paper")).strip().lower()
     if report_style not in {"paper", "standard", "none"}:
         raise ValueError("training.explain_report_style must be one of: paper, standard, none")
@@ -1135,6 +1152,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             backtest_compile_dynamic=training_raw["backtest_compile_dynamic"],
             backtest_cpp_ext=training_raw["backtest_cpp_ext"],
             backtest_verbose=training_raw["backtest_verbose"],
+            strict_no_fallback=training_raw["strict_no_fallback"],
             backtest_checkpoint_chunk_rows=training_raw["backtest_checkpoint_chunk_rows"],
             runtime_shape_check=training_raw["runtime_shape_check"],
             allow_dynamic_symbols=training_raw["allow_dynamic_symbols"],

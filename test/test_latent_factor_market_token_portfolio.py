@@ -3,6 +3,7 @@
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from stockagent.config import load_config
@@ -130,7 +131,7 @@ def test_dynamic_symbols_and_token_counts() -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
 
 
-def test_long_only_and_empty_mask_rows_are_safe() -> None:
+def test_long_only_rejects_empty_mask_rows() -> None:
     device = _device()
     model = _make_model(portfolio_mode="long_only").eval()
     x = torch.randn(2, 10, 100, 21, device=device)
@@ -138,14 +139,8 @@ def test_long_only_and_empty_mask_rows_are_safe() -> None:
     mask[0, :] = False
     mask[1, 50:] = False
 
-    with torch.no_grad():
-        weights, _, _ = model(x, mask, return_aux=True)
-
-    assert torch.isfinite(weights).all()
-    assert weights[0].abs().sum().item() == 0.0
-    assert weights[:, 50:].abs().max().item() < 1e-6
-    assert torch.all(weights >= 0.0)
-    assert torch.allclose(weights[1:].sum(dim=1), torch.ones(1, device=device), atol=1e-5)
+    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
+        model(x, mask, return_aux=True)
 
 
 def test_factory_builds_latent_factor_market_token_model() -> None:
