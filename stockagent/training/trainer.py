@@ -1295,6 +1295,78 @@ def _trim_group_curve(path: Path, start_epoch: int) -> None:
             handle.write(line + "\n")
 
 
+def _coerce_nonnegative_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, parsed)
+
+
+def _finite_float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _infer_no_improve_epochs_from_curve(path: Path, stop_before_epoch: int | None = None) -> int:
+    if not path.exists():
+        return 0
+    best_val = float("inf")
+    no_improve_epochs = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            try:
+                epoch = int(payload.get("epoch", 0))
+            except (TypeError, ValueError):
+                continue
+            if epoch <= 0:
+                continue
+            if stop_before_epoch is not None and epoch >= stop_before_epoch:
+                continue
+
+            explicit_no_improve = _coerce_nonnegative_int(payload.get("no_improve"))
+            val_mean = _finite_float_or_none(payload.get("val_mean"))
+            if explicit_no_improve is not None:
+                no_improve_epochs = explicit_no_improve
+                if val_mean is not None and val_mean < best_val:
+                    best_val = val_mean
+                continue
+            if val_mean is None:
+                continue
+            if val_mean < best_val:
+                best_val = val_mean
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+    return no_improve_epochs
+
+
+def _resume_no_improve_epochs_from_checkpoint(
+    checkpoint: Mapping[str, Any],
+    curve_path: Path,
+) -> tuple[int, str]:
+    checkpoint_no_improve = _coerce_nonnegative_int(checkpoint.get("no_improve_epochs"))
+    if checkpoint_no_improve is not None:
+        return checkpoint_no_improve, "checkpoint"
+    if not curve_path.exists():
+        return 0, "default"
+    return _infer_no_improve_epochs_from_curve(curve_path), "epoch_curve"
+
+
 def _append_group_curve(path: Path, payload: dict[str, float | int | None]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -2049,6 +2121,10 @@ def _save_group_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    no_improve_epochs: int = 0,
+    early_stop_patience: int = 0,
+    early_stopping_no_improve_ratio: float = 0.0,
+    early_stop_val_interval_epochs: int = 1,
 ) -> None:
     if not _model_parameters_are_finite(model):
         raise RuntimeError(f"Refusing to save non-finite model checkpoint: {checkpoint_path}")
@@ -2062,6 +2138,10 @@ def _save_group_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "scheduler_state_dict": scheduler_state,
+            "no_improve_epochs": int(max(0, no_improve_epochs)),
+            "early_stop_patience": int(max(0, early_stop_patience)),
+            "early_stopping_no_improve_ratio": float(max(0.0, early_stopping_no_improve_ratio)),
+            "early_stop_val_interval_epochs": int(max(1, early_stop_val_interval_epochs)),
         },
         checkpoint_path,
     )
@@ -4988,7 +5068,7 @@ def _run_fold_explainability(
         _cross_asset_settings_from_explainability,
         _first_year_indices,
         _sample_dataset,
-        explain_batch,
+        explain_batch_row_chunked,
         write_explanation_outputs,
     )
 
@@ -5048,7 +5128,7 @@ def _run_fold_explainability(
     model.eval()
     compute_start = time.perf_counter()
     try:
-        result = explain_batch(
+        result = explain_batch_row_chunked(
             model,
             batch,
             feature_names=panel.feature_names,
@@ -8000,6 +8080,8 @@ def run_training(
             print(f"[Train {train_years}] lr_scheduler={scheduler_name}")
 
         start_epoch = 1
+        resume_no_improve_epochs = 0
+        resume_no_improve_source: str | None = None
         resume_checkpoint_path = group_checkpoint_path
         if (
             resume
@@ -8028,6 +8110,10 @@ def run_training(
                     if scheduler_state:
                         scheduler.load_state_dict(scheduler_state)
                 start_epoch = int(checkpoint.get("epoch", 0)) + 1
+                resume_no_improve_epochs, resume_no_improve_source = _resume_no_improve_epochs_from_checkpoint(
+                    checkpoint,
+                    group_curve_path,
+                )
                 print(
                     f"[Train {train_years}] resumed from epoch {start_epoch} "
                     f"(checkpoint={resume_checkpoint_path})"
@@ -8545,13 +8631,20 @@ def run_training(
         early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
         val_interval = max(1, int(config.training.val_interval_epochs))
         print(f"[Train {train_years}] validation interval={val_interval} epoch(s)")
-        no_improve_epochs = 0
+        no_improve_epochs = resume_no_improve_epochs
         last_epoch = start_epoch - 1
         if early_stop_patience > 0:
             print(
                 f"[Train {train_years}] early stopping enabled: "
-                f"patience={early_stop_patience} epochs "
+                f"patience={early_stop_patience} validation check(s) "
                 f"(ratio={early_stop_ratio:.2f})"
+            )
+        if resume_no_improve_source is not None:
+            print(
+                f"[Train {train_years}] resumed early-stop state: "
+                f"no_improve={no_improve_epochs}, "
+                f"patience={early_stop_patience}, "
+                f"source={resume_no_improve_source}"
             )
         print(f"Train {train_years}")
         epoch_pbar = tqdm(
@@ -8780,6 +8873,7 @@ def run_training(
                         "val_mean": None,
                         "test_mean": test_mean_best_by_val,
                         "lr": float(optimizer.param_groups[0]["lr"]),
+                        "no_improve": int(no_improve_epochs),
                         **_timing_curve_payload(
                             train_timing=train_timing,
                             scheduler_s=scheduler_total,
@@ -9148,19 +9242,7 @@ def run_training(
                 sampled_test_mean = float(np.mean(test_losses_epoch)) if test_losses_epoch else None
                 test_mean_best_by_val = sampled_test_mean
 
-            if any_fold_improved:
-                group_ckpt_start = time.perf_counter()
-                _save_group_checkpoint(
-                    group_checkpoint_path,
-                    train_years=train_years,
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                )
-                group_ckpt_total = time.perf_counter() - group_ckpt_start
-            else:
-                group_ckpt_total = 0.0
+            group_ckpt_total = 0.0
 
             if val_losses:
                 if any_fold_improved:
@@ -9175,6 +9257,22 @@ def run_training(
                     else:
                         scheduler.step()
                     scheduler_total = time.perf_counter() - scheduler_start
+
+                group_ckpt_start = time.perf_counter()
+                _save_group_checkpoint(
+                    group_checkpoint_path,
+                    train_years=train_years,
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    scheduler=scheduler,
+                    no_improve_epochs=no_improve_epochs,
+                    early_stop_patience=early_stop_patience,
+                    early_stopping_no_improve_ratio=early_stop_ratio,
+                    early_stop_val_interval_epochs=val_interval,
+                )
+                group_ckpt_total = time.perf_counter() - group_ckpt_start
 
                 progress_update_start = time.perf_counter()
                 bt_stats_after = get_backtest_compile_stats()
@@ -9255,6 +9353,7 @@ def run_training(
                         "val_mean": val_mean_loss,
                         "test_mean": test_mean_best_by_val,
                         "lr": float(optimizer.param_groups[0]["lr"]),
+                        "no_improve": int(no_improve_epochs),
                         **_timing_curve_payload(
                             train_timing=train_timing,
                             val_timing=val_timing,
@@ -9287,10 +9386,10 @@ def run_training(
                         TimingBreakdown(plot_s=curve_record_total, total_s=curve_record_total),
                     )
 
-                if early_stop_patience > 0 and no_improve_epochs > early_stop_patience:
+                if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
                     print(
                         f"[Train {train_years}] early stop at epoch {epoch}: "
-                        f"no improvement for {no_improve_epochs} epochs "
+                        f"no improvement for {no_improve_epochs} validation check(s) "
                         f"(patience={early_stop_patience})"
                     )
                     break
@@ -9758,6 +9857,10 @@ def run_training(
             optimizer=optimizer,
             scaler=scaler,
             scheduler=scheduler,
+            no_improve_epochs=no_improve_epochs,
+            early_stop_patience=early_stop_patience,
+            early_stopping_no_improve_ratio=early_stop_ratio,
+            early_stop_val_interval_epochs=val_interval,
         )
 
         if config.training.warm_start_from_previous_fold:
