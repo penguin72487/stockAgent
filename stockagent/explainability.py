@@ -168,6 +168,7 @@ class ExplainabilitySettings:
     cross_asset_attention_capture_rows: int = 4
     cross_asset_validated_transmission: bool = True
     cross_asset_role_embedding: bool = True
+    strict_no_fallback: bool = False
 
 
 @dataclass(slots=True)
@@ -278,6 +279,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return out
 
 
+def _safe_corrcoef(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    valid = np.isfinite(left) & np.isfinite(right)
+    if int(valid.sum()) < 3:
+        return 0.0
+    left = left[valid]
+    right = right[valid]
+    left_std = float(left.std(ddof=0))
+    right_std = float(right.std(ddof=0))
+    if left_std <= 0.0 or right_std <= 0.0:
+        return 0.0
+    left_centered = left - float(left.mean())
+    right_centered = right - float(right.mean())
+    corr = float(np.mean(left_centered * right_centered) / (left_std * right_std))
+    return _safe_float(corr)
+
+
 def _normalize_plot_backend(value: str | None) -> str:
     normalized = str(value or "auto").strip().lower()
     if normalized in {"rapids", "datashader", "gpu", "gpu_datashader"}:
@@ -361,7 +380,12 @@ def _numeric_numpy(frame: pl.DataFrame, column: str, *, default: float = 0.0) ->
     if column not in frame.columns:
         return np.full(frame.height, float(default), dtype=np.float64)
     values = frame.select(_numeric_expr(column).fill_null(float(default)).alias(column)).to_series().to_numpy()
-    return np.asarray(values, dtype=np.float64)
+    return np.nan_to_num(
+        np.asarray(values, dtype=np.float64),
+        nan=float(default),
+        posinf=float(default),
+        neginf=float(default),
+    )
 
 
 def _numeric_sum(frame: pl.DataFrame, column: str) -> float:
@@ -951,10 +975,8 @@ def _feature_correlations(
                 score_corr = 0.0
                 weight_corr = 0.0
             else:
-                score_corr = float(np.corrcoef(feat[valid], score_np[valid])[0, 1])
-                weight_corr = float(np.corrcoef(feat[valid], weight_np[valid])[0, 1])
-                score_corr = _safe_float(score_corr)
-                weight_corr = _safe_float(weight_corr)
+                score_corr = _safe_corrcoef(feat[valid], score_np[valid])
+                weight_corr = _safe_corrcoef(feat[valid], weight_np[valid])
             rows.append(
                 {
                     "source": source_name,
@@ -2248,6 +2270,11 @@ def explain_batch_row_chunked(
         except RuntimeError as exc:
             if not _is_cuda_oom(exc) or used_fallback:
                 raise
+            if bool(effective_settings.strict_no_fallback):
+                raise RuntimeError(
+                    "CUDA OOM during explainability; strict_no_fallback=true so "
+                    "VRAM-safe degraded explainability fallback is disabled."
+                ) from exc
             fallback_settings = _cuda_oom_fallback_settings(effective_settings)
             if fallback_settings is None:
                 raise
@@ -3127,13 +3154,18 @@ def _write_paper_summary(
     path.write_text(json.dumps(_to_builtin(payload), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
+def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallback: bool = False) -> Path | None:
     root = Path(explainability_root)
     fold_dirs = sorted(path for path in root.glob("fold_*_test") if path.is_dir())
     rows: list[pl.DataFrame] = []
     for fold_dir in fold_dirs:
         path = fold_dir / "paper_tables" / "global_feature_attribution.csv"
         if not path.exists():
+            if strict_no_fallback:
+                raise FileNotFoundError(
+                    f"{path} is required for fold stability when strict_no_fallback=true; "
+                    "legacy feature_importance_gradient.csv fallback is disabled."
+                )
             fallback = fold_dir / "feature_importance_gradient.csv"
             if not fallback.exists():
                 continue
@@ -3526,6 +3558,7 @@ def _plot_all_explanation_figures(
     aux_projection_frames: dict[str, pl.DataFrame] | None = None,
     plot_backend: str = "auto",
     plot_timing: dict[str, Any] | None = None,
+    strict_no_fallback: bool = False,
 ) -> list[str]:
     normalized_backend = _normalize_plot_backend(plot_backend)
     estimated_points = sum(len(frame) for frame in frames.values() if frame is not None)
@@ -3595,6 +3628,11 @@ def _plot_all_explanation_figures(
             try:
                 _plot_feature_time_heatmap_datashader(frame, output_path=out, value_col=value_col, title=title)
             except Exception as exc:
+                if strict_no_fallback:
+                    raise RuntimeError(
+                        f"Datashader plot failed for {out.name}; strict_no_fallback=true so "
+                        "matplotlib fallback is disabled."
+                    ) from exc
                 if plot_timing is not None:
                     plot_timing.setdefault("datashader_fallbacks", []).append(
                         {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
@@ -3622,6 +3660,11 @@ def _plot_all_explanation_figures(
         try:
             _plot_decision_exposure_datashader(decision_frame, out)
         except Exception as exc:
+            if strict_no_fallback:
+                raise RuntimeError(
+                    f"Datashader plot failed for {out.name}; strict_no_fallback=true so "
+                    "matplotlib fallback is disabled."
+                ) from exc
             if plot_timing is not None:
                 plot_timing.setdefault("datashader_fallbacks", []).append(
                     {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
@@ -3642,6 +3685,11 @@ def _plot_all_explanation_figures(
             try:
                 _plot_aux_dim_datashader(frame, output_path=out, title=f"Aux Dimension Profile: {name}")
             except Exception as exc:
+                if strict_no_fallback:
+                    raise RuntimeError(
+                        f"Datashader plot failed for {out.name}; strict_no_fallback=true so "
+                        "matplotlib fallback is disabled."
+                    ) from exc
                 if plot_timing is not None:
                     plot_timing.setdefault("datashader_fallbacks", []).append(
                         {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
@@ -3680,6 +3728,11 @@ def _plot_all_explanation_figures(
                     title=f"cuML UMAP Projection: {name}",
                 )
             except Exception as exc:
+                if strict_no_fallback:
+                    raise RuntimeError(
+                        f"Datashader plot failed for {out.name}; strict_no_fallback=true so "
+                        "matplotlib fallback is disabled."
+                    ) from exc
                 if plot_timing is not None:
                     plot_timing.setdefault("datashader_fallbacks", []).append(
                         {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
@@ -3735,6 +3788,7 @@ def write_explanation_outputs(
     plot_backend: str = "auto",
     report_style: str | None = None,
     plot_theme: str | None = None,
+    strict_no_fallback: bool = False,
 ) -> None:
     write_start = time.perf_counter()
     write_timing: dict[str, Any] = {}
@@ -3769,6 +3823,7 @@ def write_explanation_outputs(
             aux_projection_frames=aux_projection_frames,
             plot_backend=plot_backend,
             plot_timing=standard_plot_details,
+            strict_no_fallback=bool(strict_no_fallback),
         )
         if write_plots and write_standard_plots
         else []
@@ -4002,6 +4057,8 @@ def load_explanation_context(
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
+        trading_volume_policy=config.data.trading_volume_policy,
+        strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
     )
@@ -4068,6 +4125,10 @@ def run_loaded_model_explanation(
     write_fold_stability: bool = False,
 ) -> Path:
     total_start = time.perf_counter()
+    config_strict_no_fallback = bool(getattr(context.config.training, "strict_no_fallback", False))
+    if config_strict_no_fallback and not bool(settings.strict_no_fallback):
+        settings = replace(settings, strict_no_fallback=True)
+    strict = bool(strict or settings.strict_no_fallback)
     device = device or next(model.parameters()).device
     split_norm = split.strip().lower()
     runner_timing: dict[str, float | str | int | bool] = {
@@ -4150,6 +4211,11 @@ def run_loaded_model_explanation(
         skip_cross_asset = bool(isinstance(row_chunking, dict) and row_chunking.get("cuda_oom_fallback"))
         cross_asset_start = time.perf_counter()
         if skip_cross_asset:
+            if bool(settings.strict_no_fallback):
+                raise RuntimeError(
+                    "Cross-asset explainability would be skipped because main explainability used CUDA OOM fallback; "
+                    "strict_no_fallback=true so skip fallback is disabled."
+                )
             cross_asset_summary = _write_cross_asset_skip(
                 cross_asset_dir,
                 reason="main_explainability_cuda_oom_fallback",
@@ -4171,6 +4237,11 @@ def run_loaded_model_explanation(
             except RuntimeError as exc:
                 if not _is_cuda_oom(exc):
                     raise
+                if bool(settings.strict_no_fallback):
+                    raise RuntimeError(
+                        "CUDA OOM during cross-asset explainability; strict_no_fallback=true so "
+                        "skipped-output fallback is disabled."
+                    ) from exc
                 _clear_explainability_runtime_cache()
                 cross_asset_summary = _write_cross_asset_skip(
                     cross_asset_dir,
@@ -4386,6 +4457,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Write latent role embedding table and plot when aux tensors are available.",
     )
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
+    parser.add_argument(
+        "--strict-no-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fail instead of using degraded explainability, plotting, or cross-asset fallback paths.",
+    )
     return parser.parse_args(argv)
 
 
@@ -4429,6 +4506,7 @@ def main(argv: list[str] | None = None) -> None:
         cross_asset_attention_capture_rows=max(1, int(args.cross_asset_attention_capture_rows)),
         cross_asset_validated_transmission=bool(args.cross_asset_validated_transmission),
         cross_asset_role_embedding=bool(args.cross_asset_role_embedding),
+        strict_no_fallback=bool(args.strict_no_fallback),
     )
     # Default behavior: if neither --fold nor --checkpoint is provided,
     # run explainability for all folds that have checkpoint_best.pt.
@@ -4442,6 +4520,8 @@ def main(argv: list[str] | None = None) -> None:
             benchmark_name=config.data.benchmark_name,
             usd_only_trading_pairs=config.data.usd_only_trading_pairs,
             tradable_mode=config.data.tradable_mode,
+            trading_volume_policy=config.data.trading_volume_policy,
+            strict_no_fallback=config.training.strict_no_fallback,
             panel_backend=config.data.panel_backend,
             panel_load_workers=config.data.panel_load_workers,
         )
@@ -4497,7 +4577,10 @@ def main(argv: list[str] | None = None) -> None:
                 _clear_explainability_runtime_cache()
             print(f"explainability output (fold {fold_id}): {out_dir}")
         if settings.fold_stability:
-            stability_dir = write_fold_stability_outputs(resolved_output_dir / "explainability")
+            stability_dir = write_fold_stability_outputs(
+                resolved_output_dir / "explainability",
+                strict_no_fallback=bool(settings.strict_no_fallback),
+            )
             if stability_dir is not None:
                 print(f"fold stability output: {stability_dir}")
         return
@@ -4511,7 +4594,7 @@ def main(argv: list[str] | None = None) -> None:
         explain_output_dir=args.explain_output_dir,
         settings=settings,
         device_override=args.device,
-        strict=args.strict,
+        strict=bool(args.strict or args.strict_no_fallback),
         write_plots=bool(args.plots),
         plot_backend=args.plot_backend,
     )

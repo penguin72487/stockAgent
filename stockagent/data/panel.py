@@ -101,6 +101,48 @@ PREV_DAY_LOG_RETURN_RENAME = {
 _MISSING_VOLUME_WARNED_SYMBOLS: set[str] = set()
 
 
+class _MissingTradingVolumeError(ValueError):
+    pass
+
+
+def _normalize_trading_volume_policy(policy: str | bool | None) -> str:
+    if isinstance(policy, bool):
+        return "required" if policy else "optional"
+    normalized = str(policy or "auto").strip().lower()
+    if normalized not in {"auto", "required", "optional"}:
+        raise ValueError(
+            "trading_volume_policy must be one of: auto, required, optional; "
+            f"got {policy!r}"
+        )
+    return normalized
+
+
+def _path_requires_trading_volume(path: Path, policy: str | bool | None) -> bool:
+    normalized = _normalize_trading_volume_policy(policy)
+    if normalized == "required":
+        return True
+    if normalized == "optional":
+        return False
+    parts = {part.lower() for part in path.parts}
+    path_text = path.as_posix().lower()
+    if {"forex", "forex_pepperstone", "data_forex_frankfurter"} & parts:
+        return False
+    if "frankfurter" in path_text or "pepperstone" in path_text:
+        return False
+    volume_assets = {"tw_stocks", "us_stocks", "crypto", "data_parquet", "data_okx", "data_bybit"}
+    return bool(volume_assets & parts)
+
+
+def _require_trading_volume_column(path: Path, columns: set[str], policy: str | bool | None) -> None:
+    if "Trading_Volume" in columns or not _path_requires_trading_volume(path, policy):
+        return
+    raise _MissingTradingVolumeError(
+        f"{path.name} is missing required Trading_Volume column under "
+        f"trading_volume_policy={_normalize_trading_volume_policy(policy)!r}. "
+        "Use trading_volume_policy='optional' only for assets without meaningful volume."
+    )
+
+
 def _round_half_up(values: np.ndarray, decimals: int = 2) -> np.ndarray:
     """Round with half-up semantics (0.5 always rounds away from zero)."""
     arr = np.asarray(values, dtype=np.float64)
@@ -563,11 +605,16 @@ def _tw_limit_masks_from_arrays(
     return base & ~is_limit_up, base & ~is_limit_down
 
 
-def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> _SymbolPanelArrays:
+def _load_symbol_arrays_pyarrow(
+    path: Path,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+) -> _SymbolPanelArrays:
     if pq is None:
         raise RuntimeError("PyArrow is not available")
 
     table = pq.read_table(path)
+    _require_trading_volume_column(path, set(table.column_names), trading_volume_policy)
     rows = int(table.num_rows)
     if rows == 0:
         empty_1d = np.empty((0,), dtype=np.float32)
@@ -697,6 +744,7 @@ def _load_symbol_arrays_polars_lazy(
     tradable_mode: str = "tradable",
     *,
     collect_engine: str = "auto",
+    trading_volume_policy: str | bool | None = "auto",
 ) -> _SymbolPanelArrays:
     if pl is None:
         raise RuntimeError("Polars is not available")
@@ -706,6 +754,7 @@ def _load_symbol_arrays_polars_lazy(
     frame = pl.from_arrow(pq.read_table(path, memory_map=True))
     lazy = frame.lazy().sort("date")
     schema_names = set(frame.columns)
+    _require_trading_volume_column(path, schema_names, trading_volume_policy)
     price_decimals = _price_decimals_for_path(path)
 
     def num(name: str):
@@ -1077,6 +1126,8 @@ def build_panel(
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
     tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+    strict_no_fallback: bool | None = None,
     buy_tradable_mode: str | None = None,
     sell_tradable_mode: str | None = None,
     panel_backend: str = "auto",
@@ -1112,6 +1163,16 @@ def build_panel(
         raise ValueError(
             f"tradable_mode must be one of {sorted(valid_tradable_modes)}, got {tradable_mode!r}"
         )
+    trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
+    if strict_no_fallback is None:
+        strict_no_fallback = str(os.getenv("STOCKAGENT_STRICT_NO_FALLBACK", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        strict_no_fallback = bool(strict_no_fallback)
 
     if panel_backend == "pyarrow":
         if pq is None:
@@ -1130,7 +1191,8 @@ def build_panel(
 
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
-        f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}"
+        f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
+        f"trading_volume_policy={trading_volume_policy}"
     )
     source_hash = _compute_source_hash(parquet_paths)
 
@@ -1148,12 +1210,17 @@ def build_panel(
     def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
         try:
             if selected_backend == "pyarrow":
-                arrays = _load_symbol_arrays_pyarrow(path, tradable_mode=tradable_mode)
+                arrays = _load_symbol_arrays_pyarrow(
+                    path,
+                    tradable_mode=tradable_mode,
+                    trading_volume_policy=trading_volume_policy,
+                )
             else:
                 arrays = _load_symbol_arrays_polars_lazy(
                     path,
                     tradable_mode=tradable_mode,
                     collect_engine=polars_collect_engine,
+                    trading_volume_policy=trading_volume_policy,
                 )
             if int(arrays.dates.size) == 0:
                 raise ValueError(f"Symbol file is empty: {path.name}")
@@ -1170,6 +1237,8 @@ def build_panel(
     valid_arrays: list[_SymbolPanelArrays] = []
     for path, arrays, exc in loaded_arrays:
         if exc is not None:
+            if strict_no_fallback or isinstance(exc, _MissingTradingVolumeError):
+                raise type(exc)(f"{path.name}: {exc}") from exc
             print(f"[panel] SKIP {path.name}: {exc}")
             continue
         if arrays is not None:

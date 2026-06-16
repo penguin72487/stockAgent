@@ -88,6 +88,16 @@ UNAVAILABLE_TRIGGER_TEXTS = (
     "unavailable or delisted",
 )
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _strict_no_fallback(args: argparse.Namespace | None = None) -> bool:
+    if args is not None and hasattr(args, "strict_no_fallback"):
+        return bool(getattr(args, "strict_no_fallback"))
+    return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
 YF_CRYPTO_INTRADAY_INTERVAL = "15m"
 YF_CRYPTO_INTRADAY_SECONDS = 15 * 60
 YF_CRYPTO_MAX_LOOKBACK_DAYS = 59
@@ -567,6 +577,12 @@ def parse_args() -> argparse.Namespace:
             "Retry symbols in yahoo_blacklist.txt during repair/daily-update by clearing them "
             "from the blacklist before download. Default false keeps unavailable symbols stable."
         ),
+    )
+    parser.add_argument(
+        "--strict-no-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=_env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0"),
+        help="Fail instead of using static/cached/local symbol-universe fallback when discovery fails.",
     )
     return parser.parse_args()
 
@@ -1723,6 +1739,11 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         records.extend(fetched)
         print(f"[symbols] loaded {len(fetched)} tw_stocks symbols from exchange")
     except Exception as exc:
+        if _strict_no_fallback(args):
+            raise RuntimeError(
+                "Failed to load tw_stocks symbols from exchange; strict_no_fallback=true "
+                "so repo/local/cached symbol fallback is disabled."
+            ) from exc
         print(f"[symbols] failed to load tw symbols from exchange: {exc}")
 
     if records:
@@ -1734,6 +1755,11 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         if pruned_count:
             print(f"[symbols] pruned {pruned_count} unsupported tw_stocks records outside stock/ETF universe")
         records = _filter_tw_records_for_supported_universe(records)
+    elif _strict_no_fallback(args):
+        raise RuntimeError(
+            "Loaded zero tw_stocks symbols from exchange; strict_no_fallback=true "
+            "so repo/local/cached symbol fallback is disabled."
+        )
     elif repo_fallback_records:
         print(f"[symbols] using repo fallback manifest for tw_stocks ({len(repo_fallback_records)} symbols)")
         records = _filter_tw_records_for_supported_universe(repo_fallback_records)
@@ -1779,13 +1805,18 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         return cached_daily
 
     repo_fallback_records = _load_repo_symbol_fallback("us_stocks")
-    records = _records_from_defaults("us_stocks")
+    records = [] if _strict_no_fallback(args) else _records_from_defaults("us_stocks")
     try:
         print("[symbols] fetching us_stocks from Nasdaq (timeout=60s)…")
         fetched = _fetch_with_hard_timeout(_load_us_symbols_from_web, timeout=60)
         records.extend(fetched)
         print(f"[symbols] loaded {len(fetched)} us_stocks symbols from web")
     except Exception as exc:
+        if _strict_no_fallback(args):
+            raise RuntimeError(
+                "Failed to load us_stocks symbols from Nasdaq; strict_no_fallback=true "
+                "so static/repo/cached symbol fallback is disabled."
+            ) from exc
         print(f"[symbols] fallback to static us_stocks list: {exc}")
         if repo_fallback_records:
             print(f"[symbols] using repo fallback manifest for us_stocks ({len(repo_fallback_records)} symbols)")
@@ -1793,6 +1824,11 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         elif cached:
             print(f"[symbols] using cached manifest as fallback ({len(cached)} symbols)")
             records = cached
+    if _strict_no_fallback(args) and not records:
+        raise RuntimeError(
+            "Loaded zero us_stocks symbols from Nasdaq; strict_no_fallback=true "
+            "so static/repo/cached symbol fallback is disabled."
+        )
 
     if args.include_us_delisted:
         try:
@@ -1814,13 +1850,18 @@ def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]
         return cached_daily
 
     repo_fallback_records = _load_repo_symbol_fallback("crypto")
-    records = _records_from_defaults("crypto")
+    records = [] if _strict_no_fallback(args) else _records_from_defaults("crypto")
     try:
         print("[symbols] fetching crypto list from CoinGecko (timeout=60s)…")
         fetched = _fetch_with_hard_timeout(_load_crypto_symbols_from_coingecko, timeout=60)
         records.extend(fetched)
         print(f"[symbols] loaded {len(fetched)} crypto symbols from CoinGecko")
     except Exception as exc:
+        if _strict_no_fallback(args):
+            raise RuntimeError(
+                "Failed to load crypto symbols from CoinGecko; strict_no_fallback=true "
+                "so static/repo/cached symbol fallback is disabled."
+            ) from exc
         print(f"[symbols] fallback to static crypto list: {exc}")
         if repo_fallback_records:
             print(f"[symbols] using repo fallback manifest for crypto ({len(repo_fallback_records)} symbols)")
@@ -1828,6 +1869,11 @@ def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]
         elif cached:
             print(f"[symbols] using cached manifest as fallback ({len(cached)} symbols)")
             records = cached
+    if _strict_no_fallback(args) and not records:
+        raise RuntimeError(
+            "Loaded zero crypto symbols from CoinGecko; strict_no_fallback=true "
+            "so static/repo/cached symbol fallback is disabled."
+        )
     return records
 
 
@@ -1837,9 +1883,10 @@ def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: l
         return cached_daily
 
     repo_fallback_records = _load_repo_symbol_fallback("forex")
-    records = _records_from_defaults("forex")
-    records.extend(_load_cached_symbols_from_manifest(output_dir / "symbols.csv", "forex"))
-    records.extend(_load_cached_symbols_from_whitelist(_whitelist_file_path(output_dir), "forex"))
+    records = [] if _strict_no_fallback(args) else _records_from_defaults("forex")
+    if not _strict_no_fallback(args):
+        records.extend(_load_cached_symbols_from_manifest(output_dir / "symbols.csv", "forex"))
+        records.extend(_load_cached_symbols_from_whitelist(_whitelist_file_path(output_dir), "forex"))
 
     used_web_symbols = False
     try:
@@ -1849,6 +1896,11 @@ def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: l
         used_web_symbols = True
         print(f"[symbols] loaded {len(fetched)} forex symbols from Yahoo")
     except Exception as exc:
+        if _strict_no_fallback(args):
+            raise RuntimeError(
+                "Failed to load forex symbols from Yahoo; strict_no_fallback=true "
+                "so static/repo/cached symbol fallback is disabled."
+            ) from exc
         print(f"[symbols] fallback to static forex list: {exc}")
     if not used_web_symbols:
         if repo_fallback_records:
@@ -1856,6 +1908,11 @@ def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: l
             records.extend(repo_fallback_records)
         else:
             records.extend(_load_forex_expanded_fallback())
+    if _strict_no_fallback(args) and not records:
+        raise RuntimeError(
+            "Loaded zero forex symbols from Yahoo; strict_no_fallback=true "
+            "so static/repo/cached symbol fallback is disabled."
+        )
     return records
 
 
@@ -1891,7 +1948,8 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
 
         if is_daily_update:
             active_records = _load_local_tracked_records(asset_class, output_dir, cached)
-            active_records.extend(_records_from_defaults(asset_class))
+            if not _strict_no_fallback(args):
+                active_records.extend(_records_from_defaults(asset_class))
             if not active_records and cached:
                 # Manifest-only output dirs are partial bootstraps. Process them
                 # once instead of leaving the asset permanently inert.
@@ -1934,24 +1992,30 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                     )
                     active_records.extend(known_missing)
 
-            repo_candidates = _load_repo_symbol_fallback(asset_class)
-            if asset_class == "tw_stocks":
-                repo_candidates = _filter_tw_records_for_supported_universe(repo_candidates)
-            new_from_repo = [record for record in repo_candidates if record.code not in known_before]
-            if new_from_repo:
-                print(
-                    f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
-                    f"from repo fallback manifest for {asset_class}"
-                )
-                active_records.extend(new_from_repo)
-                manifest_records.extend(new_from_repo)
-                new_codes.update(record.code for record in new_from_repo)
-                known_before.update(record.code for record in new_from_repo)
+            if not _strict_no_fallback(args):
+                repo_candidates = _load_repo_symbol_fallback(asset_class)
+                if asset_class == "tw_stocks":
+                    repo_candidates = _filter_tw_records_for_supported_universe(repo_candidates)
+                new_from_repo = [record for record in repo_candidates if record.code not in known_before]
+                if new_from_repo:
+                    print(
+                        f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
+                        f"from repo fallback manifest for {asset_class}"
+                    )
+                    active_records.extend(new_from_repo)
+                    manifest_records.extend(new_from_repo)
+                    new_codes.update(record.code for record in new_from_repo)
+                    known_before.update(record.code for record in new_from_repo)
 
             if getattr(args, "daily_discover_symbols", True) and asset_class in {"tw_stocks", "us_stocks"}:
                 try:
                     discovered = _discover_daily_stock_records(asset_class, args, cached)
                 except Exception as exc:
+                    if _strict_no_fallback(args):
+                        raise RuntimeError(
+                            f"Daily symbol discovery failed for {asset_class}; strict_no_fallback=true "
+                            "so cached/repo discovery fallback is disabled."
+                        ) from exc
                     print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
                 else:
                     if asset_class == "tw_stocks":

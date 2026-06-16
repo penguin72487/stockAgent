@@ -15,12 +15,12 @@ from stockagent.models.normalization import (
 
 
 def _safe_attention_mask(mask: torch.Tensor) -> torch.Tensor:
-    """Avoid all-masked attention rows while preserving the real mask for weights."""
     safe_mask = mask.to(dtype=torch.bool)
-    empty_rows = ~safe_mask.any(dim=1, keepdim=True)
-    fallback = torch.zeros_like(safe_mask)
-    fallback[:, :1] = empty_rows
-    return safe_mask | fallback
+    torch._assert(
+        safe_mask.any(dim=1).all(),
+        "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row",
+    )
+    return safe_mask
 
 
 class LatentFactorMarketTokenPortfolioModel(nn.Module):
