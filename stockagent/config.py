@@ -409,41 +409,41 @@ class TrainingConfig:
     explain_first_test_year_only: bool = True
     explain_top_k: int = 20
     explain_max_rows: int = 32
-    explain_ig_steps: int = 8
-    explain_ig_batch_size: int = 0
+    explain_ig_steps: int = 0
+    explain_ig_batch_size: int = 1
     explain_sample_method: str = "even"
-    explain_perturb: bool = True
-    explain_perturb_batch_size: int = 0
-    explain_perturb_max_auto_batch_size: int = 8
-    explain_perturb_max_input_elements: int = 64_000_000
-    explain_write_plots: bool = True
-    explain_report_style: str = "paper"
+    explain_perturb: bool = False
+    explain_perturb_batch_size: int = 1
+    explain_perturb_max_auto_batch_size: int = 1
+    explain_perturb_max_input_elements: int = 8_000_000
+    explain_write_plots: bool = False
+    explain_report_style: str = "none"
     explain_plot_theme: str = "paper"
-    explain_standard_plots: bool = True
+    explain_standard_plots: bool = False
     explain_interactive_plots: bool = False
-    explain_shap_enabled: bool = True
+    explain_shap_enabled: bool = False
     explain_shap_mode: str = "score_head_surrogate"
     explain_case_study_top_k: int = 5
-    explain_regime_analysis: bool = True
-    explain_fold_stability: bool = True
-    explain_umap_enabled: bool = True
-    explain_umap_max_points: int = 10000
+    explain_regime_analysis: bool = False
+    explain_fold_stability: bool = False
+    explain_umap_enabled: bool = False
+    explain_umap_max_points: int = 1000
     explain_umap_max_projections: int = 0
     explain_umap_n_neighbors: int = 15
     explain_umap_min_dist: float = 0.1
-    explain_cross_asset_enabled: bool = True
-    explain_cross_asset_max_sources: int = 24
-    explain_cross_asset_max_targets: int = 24
+    explain_cross_asset_enabled: bool = False
+    explain_cross_asset_max_sources: int = 8
+    explain_cross_asset_max_targets: int = 8
     explain_cross_asset_top_edges: int = 150
-    explain_cross_asset_source_chunk_size: int = 2
+    explain_cross_asset_source_chunk_size: int = 1
     explain_cross_asset_perturb_scale: float = 1.0
     explain_cross_asset_shocks: list[str] = field(
         default_factory=lambda: ["zero", "momentum", "gap", "volume", "volatility", "liquidity"]
     )
     explain_cross_asset_attention_flow: bool = True
-    explain_cross_asset_attention_capture_rows: int = 4
+    explain_cross_asset_attention_capture_rows: int = 1
     explain_cross_asset_validated_transmission: bool = True
-    explain_cross_asset_role_embedding: bool = True
+    explain_cross_asset_role_embedding: bool = False
     table_output_format: str = "csv"
     save_daily_weights_table: bool = True
     save_integer_share_daily_weights_table: bool = True
@@ -596,42 +596,42 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_first_test_year_only", True)
     training.setdefault("explain_top_k", 20)
     training.setdefault("explain_max_rows", 32)
-    training.setdefault("explain_ig_steps", 8)
-    training.setdefault("explain_ig_batch_size", 0)
+    training.setdefault("explain_ig_steps", 0)
+    training.setdefault("explain_ig_batch_size", 1)
     training.setdefault("explain_sample_method", "even")
-    training.setdefault("explain_perturb", True)
-    training.setdefault("explain_perturb_batch_size", 0)
-    training.setdefault("explain_perturb_max_auto_batch_size", 8)
-    training.setdefault("explain_perturb_max_input_elements", 64_000_000)
-    training.setdefault("explain_write_plots", True)
-    training.setdefault("explain_report_style", "paper")
+    training.setdefault("explain_perturb", False)
+    training.setdefault("explain_perturb_batch_size", 1)
+    training.setdefault("explain_perturb_max_auto_batch_size", 1)
+    training.setdefault("explain_perturb_max_input_elements", 8_000_000)
+    training.setdefault("explain_write_plots", False)
+    training.setdefault("explain_report_style", "none")
     training.setdefault("explain_plot_theme", "paper")
-    training.setdefault("explain_standard_plots", True)
+    training.setdefault("explain_standard_plots", False)
     training.setdefault("explain_interactive_plots", False)
-    training.setdefault("explain_shap_enabled", True)
+    training.setdefault("explain_shap_enabled", False)
     training.setdefault("explain_shap_mode", "score_head_surrogate")
     training.setdefault("explain_case_study_top_k", 5)
-    training.setdefault("explain_regime_analysis", True)
-    training.setdefault("explain_fold_stability", True)
-    training.setdefault("explain_umap_enabled", True)
-    training.setdefault("explain_umap_max_points", 10000)
+    training.setdefault("explain_regime_analysis", False)
+    training.setdefault("explain_fold_stability", False)
+    training.setdefault("explain_umap_enabled", False)
+    training.setdefault("explain_umap_max_points", 1000)
     training.setdefault("explain_umap_max_projections", 0)
     training.setdefault("explain_umap_n_neighbors", 15)
     training.setdefault("explain_umap_min_dist", 0.1)
-    training.setdefault("explain_cross_asset_enabled", True)
-    training.setdefault("explain_cross_asset_max_sources", 24)
-    training.setdefault("explain_cross_asset_max_targets", 24)
+    training.setdefault("explain_cross_asset_enabled", False)
+    training.setdefault("explain_cross_asset_max_sources", 8)
+    training.setdefault("explain_cross_asset_max_targets", 8)
     training.setdefault("explain_cross_asset_top_edges", 150)
-    training.setdefault("explain_cross_asset_source_chunk_size", 2)
+    training.setdefault("explain_cross_asset_source_chunk_size", 1)
     training.setdefault("explain_cross_asset_perturb_scale", 1.0)
     training.setdefault(
         "explain_cross_asset_shocks",
         ["zero", "momentum", "gap", "volume", "volatility", "liquidity"],
     )
     training.setdefault("explain_cross_asset_attention_flow", True)
-    training.setdefault("explain_cross_asset_attention_capture_rows", 4)
+    training.setdefault("explain_cross_asset_attention_capture_rows", 1)
     training.setdefault("explain_cross_asset_validated_transmission", True)
-    training.setdefault("explain_cross_asset_role_embedding", True)
+    training.setdefault("explain_cross_asset_role_embedding", False)
     training.setdefault("table_output_format", "csv")
     training.setdefault("save_integer_share_daily_weights_csv", True)
     training.setdefault("save_integer_share_holdings_csv", True)

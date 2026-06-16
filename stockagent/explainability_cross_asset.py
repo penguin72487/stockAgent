@@ -62,7 +62,7 @@ def _auto_row_chunk_size(n_rows: int, n_symbols: int, settings: CrossAssetTransm
     max_repeated_rows = max(1, int(settings.max_repeated_rows))
     value = max(1, min(n_rows, max_repeated_rows // source_chunk))
     if int(n_symbols) >= 10_000:
-        value = min(value, 4)
+        value = 1
     return value, {
         "reason": "repeated_row_budget",
         "row_chunk_size": value,
@@ -468,6 +468,11 @@ def abstract_cross_asset_transmission(
         warnings.append(
             f"Cross-asset transmission used row microbatching: row_chunk_size={row_chunk_size}, rows={n_rows}."
         )
+    force_single_source_chunk = int(n_symbols) >= 10_000
+    if force_single_source_chunk and int(settings.source_chunk_size) > 1:
+        warnings.append(
+            "Cross-asset transmission capped source_chunk_size to 1 for a large stock universe to avoid repeated-input VRAM blowups."
+        )
 
     was_training = model.training
     model.eval()
@@ -549,7 +554,7 @@ def abstract_cross_asset_transmission(
             warnings.append(f"{shock}: no matching features; skipped.")
             continue
         buffers = _empty_metric_buffers(len(source_idx), len(target_idx))
-        chunk_size = max(1, int(settings.source_chunk_size))
+        chunk_size = 1 if force_single_source_chunk else max(1, int(settings.source_chunk_size))
         source_pos = 0
         forward_batches = 0
         oom_retries = 0

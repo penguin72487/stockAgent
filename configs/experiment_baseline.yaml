@@ -34,8 +34,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.000855
-  sell_fee_rate: 0.003855
+  buy_fee_rate: 0.0001
+  sell_fee_rate: 0.0001
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -73,9 +73,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 128
-  batch_size_train: 128
-  batch_size_eval: 128
+  batch_size: 8
+  batch_size_train: 8
+  batch_size_eval: 8
   epochs: 1000
   early_stopping_no_improve_ratio: 0.05
   val_interval_epochs: 1
@@ -88,43 +88,43 @@ training:
   defer_epoch_curve_plot_until_end: false
   input_pipeline_ab_test: false
   input_pipeline_ab_test_steps: 20
-  explain_after_each_fold: true
+  explain_after_each_fold: false
   explain_first_test_year_only: true
   explain_top_k: 20
   explain_max_rows: 32
-  explain_ig_steps: 8
-  explain_ig_batch_size: 0
+  explain_ig_steps: 0
+  explain_ig_batch_size: 1
   explain_sample_method: even
-  explain_perturb: true
-  explain_perturb_batch_size: 0
-  explain_perturb_max_auto_batch_size: 8
-  explain_perturb_max_input_elements: 64000000
-  explain_write_plots: true
-  explain_report_style: paper
+  explain_perturb: false
+  explain_perturb_batch_size: 1
+  explain_perturb_max_auto_batch_size: 1
+  explain_perturb_max_input_elements: 8000000
+  explain_write_plots: false
+  explain_report_style: none
   explain_plot_theme: paper
-  explain_standard_plots: true
+  explain_standard_plots: false
   explain_interactive_plots: false
-  explain_shap_enabled: true
+  explain_shap_enabled: false
   explain_shap_mode: score_head_surrogate
   explain_case_study_top_k: 5
-  explain_regime_analysis: true
-  explain_fold_stability: true
-  explain_umap_enabled: true
-  explain_umap_max_points: 4096
-  explain_umap_max_projections: 2
+  explain_regime_analysis: false
+  explain_fold_stability: false
+  explain_umap_enabled: false
+  explain_umap_max_points: 1000
+  explain_umap_max_projections: 0
   explain_umap_n_neighbors: 15
   explain_umap_min_dist: 0.1
-  explain_cross_asset_enabled: true
-  explain_cross_asset_max_sources: 24
-  explain_cross_asset_max_targets: 24
+  explain_cross_asset_enabled: false
+  explain_cross_asset_max_sources: 8
+  explain_cross_asset_max_targets: 8
   explain_cross_asset_top_edges: 150
-  explain_cross_asset_source_chunk_size: 2
+  explain_cross_asset_source_chunk_size: 1
   explain_cross_asset_perturb_scale: 1.0
   explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
   explain_cross_asset_attention_flow: true
-  explain_cross_asset_attention_capture_rows: 4
+  explain_cross_asset_attention_capture_rows: 1
   explain_cross_asset_validated_transmission: true
-  explain_cross_asset_role_embedding: true
+  explain_cross_asset_role_embedding: false
   table_output_format: parquet
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true
