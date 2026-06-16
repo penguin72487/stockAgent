@@ -25,13 +25,13 @@ def _ensure_conda_cuda_path() -> None:
 
     current = os.environ.get("CUDA_PATH")
     if current and (Path(current) / "include" / "cuda_runtime.h").exists():
-        os.environ.setdefault("CUDA_HOME", current)
+        os.environ["CUDA_HOME"] = current
         return
 
     for candidate in (prefix / "targets" / "x86_64-linux", prefix):
         if (candidate / "include" / "cuda_runtime.h").exists():
             os.environ["CUDA_PATH"] = str(candidate)
-            os.environ.setdefault("CUDA_HOME", str(candidate))
+            os.environ["CUDA_HOME"] = str(candidate)
             return
 
 

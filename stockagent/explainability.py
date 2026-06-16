@@ -184,6 +184,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return out
 
 
+def _safe_corrcoef(left: np.ndarray, right: np.ndarray) -> float:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    valid = np.isfinite(left) & np.isfinite(right)
+    if int(valid.sum()) < 3:
+        return 0.0
+    left = left[valid]
+    right = right[valid]
+    left_std = float(left.std(ddof=0))
+    right_std = float(right.std(ddof=0))
+    if left_std <= 0.0 or right_std <= 0.0:
+        return 0.0
+    left_centered = left - float(left.mean())
+    right_centered = right - float(right.mean())
+    corr = float(np.mean(left_centered * right_centered) / (left_std * right_std))
+    return _safe_float(corr)
+
+
 def _normalize_plot_backend(value: str | None) -> str:
     normalized = str(value or "auto").strip().lower()
     if normalized in {"rapids", "datashader", "gpu", "gpu_datashader"}:
@@ -266,7 +284,12 @@ def _numeric_numpy(frame: pl.DataFrame, column: str, *, default: float = 0.0) ->
     if column not in frame.columns:
         return np.full(frame.height, float(default), dtype=np.float64)
     values = frame.select(_numeric_expr(column).fill_null(float(default)).alias(column)).to_series().to_numpy()
-    return np.asarray(values, dtype=np.float64)
+    return np.nan_to_num(
+        np.asarray(values, dtype=np.float64),
+        nan=float(default),
+        posinf=float(default),
+        neginf=float(default),
+    )
 
 
 def _numeric_sum(frame: pl.DataFrame, column: str) -> float:
@@ -827,10 +850,8 @@ def _feature_correlations(
                 score_corr = 0.0
                 weight_corr = 0.0
             else:
-                score_corr = float(np.corrcoef(feat[valid], score_np[valid])[0, 1])
-                weight_corr = float(np.corrcoef(feat[valid], weight_np[valid])[0, 1])
-                score_corr = _safe_float(score_corr)
-                weight_corr = _safe_float(weight_corr)
+                score_corr = _safe_corrcoef(feat[valid], score_np[valid])
+                weight_corr = _safe_corrcoef(feat[valid], weight_np[valid])
             rows.append(
                 {
                     "source": source_name,
