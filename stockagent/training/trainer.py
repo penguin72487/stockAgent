@@ -287,10 +287,12 @@ class _CompiledLossFallback:
         eager_fn: Callable[..., torch.Tensor],
         *,
         label: str,
+        strict_no_fallback: bool | None = None,
     ) -> None:
         self._compiled_fn = compiled_fn
         self._eager_fn = eager_fn
         self._label = label
+        self._strict_no_fallback = _strict_no_fallback_enabled() if strict_no_fallback is None else bool(strict_no_fallback)
         self._disabled = False
         self._warned = False
 
@@ -302,6 +304,11 @@ class _CompiledLossFallback:
         except RuntimeError as exc:
             if not _is_cudagraph_overwrite_error(exc):
                 raise
+            if self._strict_no_fallback:
+                raise RuntimeError(
+                    f"[{self._label}] torch.compile loss hit CUDA Graph state overwrite; "
+                    "strict_no_fallback=true so eager loss fallback is disabled."
+                ) from exc
             self._disabled = True
             if not self._warned:
                 print(
@@ -326,10 +333,12 @@ class _CompiledFusedLossFallback:
         eager_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
         *,
         label: str,
+        strict_no_fallback: bool | None = None,
     ) -> None:
         self._compiled_fn = compiled_fn
         self._eager_fn = eager_fn
         self._label = label
+        self._strict_no_fallback = _strict_no_fallback_enabled() if strict_no_fallback is None else bool(strict_no_fallback)
         self._disabled = False
         self._warned = False
 
@@ -339,6 +348,11 @@ class _CompiledFusedLossFallback:
         try:
             return self._compiled_fn(*args, **kwargs)
         except Exception as exc:
+            if self._strict_no_fallback:
+                raise RuntimeError(
+                    f"[{self._label}] torch.compile fused log-utility loss failed; "
+                    "strict_no_fallback=true so eager fused-loss fallback is disabled."
+                ) from exc
             self._disabled = True
             if not self._warned:
                 print(
@@ -355,6 +369,10 @@ class _CompiledFusedLossFallback:
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _strict_no_fallback_enabled() -> bool:
+    return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
 
 
 def _progress(message: str) -> None:
@@ -2046,6 +2064,11 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
         message = str(exc)
         if not (hasattr(target, "forward_from_panel") and "Unexpected key(s)" in message):
             raise
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Checkpoint state_dict is not strictly compatible with the model; "
+                "strict_no_fallback=true so strict=False checkpoint loading is disabled."
+            ) from exc
 
     incompatible = target.load_state_dict(cleaned_state_dict, strict=False)
     allowed_prefixes = (
@@ -2577,6 +2600,9 @@ def _panel_indices_to_tensors(
         return indices, empty_x, empty_y, empty_mask, empty_mask.clone(), empty_mask.clone(), empty_bench
 
     valid_indices = indices[indices >= max(0, lookback - 1)]
+    target_mask_np = panel.tradable_mask & np.isfinite(panel.returns_1d)
+    if valid_indices.size > 0:
+        valid_indices = valid_indices[target_mask_np[valid_indices].any(axis=1)]
     if valid_indices.size == 0:
         empty_x = torch.empty((0, lookback, panel.num_symbols, len(panel.feature_names)), dtype=torch.float32)
         empty_y = torch.empty((0, panel.num_symbols), dtype=torch.float32)
@@ -2591,7 +2617,7 @@ def _panel_indices_to_tensors(
         neginf=0.0,
     )
     returns_np = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-    tradable_np = panel.tradable_mask & np.isfinite(panel.returns_1d)
+    tradable_np = target_mask_np
     can_buy_np = panel.can_buy_mask if panel.can_buy_mask is not None else tradable_np
     can_sell_np = panel.can_sell_mask if panel.can_sell_mask is not None else tradable_np
 
@@ -3003,12 +3029,13 @@ def _pad_training_tensors(
     if padded_rows == total_rows:
         return x, returns, masks, can_buy_masks, can_sell_masks, benchmark, sample_mask
 
+    pad_count = padded_rows - total_rows
     return (
         _pad_rows(x, padded_rows, 0),
         _pad_rows(returns, padded_rows, 0.0),
-        _pad_rows(masks, padded_rows, False),
-        _pad_rows(can_buy_masks, padded_rows, False),
-        _pad_rows(can_sell_masks, padded_rows, False),
+        torch.cat([masks, masks[-1:].expand((pad_count,) + tuple(masks.shape[1:]))], dim=0),
+        torch.cat([can_buy_masks, can_buy_masks[-1:].expand((pad_count,) + tuple(can_buy_masks.shape[1:]))], dim=0),
+        torch.cat([can_sell_masks, can_sell_masks[-1:].expand((pad_count,) + tuple(can_sell_masks.shape[1:]))], dim=0),
         _pad_rows(benchmark, padded_rows, 0.0),
         _pad_rows(sample_mask, padded_rows, False),
     )
@@ -3360,9 +3387,9 @@ def _pad_eval_chunk_first_dim(
     pad_rows = target_rows - valid_rows
     x_pad = x[-1:].expand((pad_rows,) + tuple(x.shape[1:]))
     returns_pad = returns.new_zeros((pad_rows,) + tuple(returns.shape[1:]))
-    tradable_pad = tradable_mask.new_zeros((pad_rows,) + tuple(tradable_mask.shape[1:]))
-    buy_pad = can_buy_mask.new_zeros((pad_rows,) + tuple(can_buy_mask.shape[1:]))
-    sell_pad = can_sell_mask.new_zeros((pad_rows,) + tuple(can_sell_mask.shape[1:]))
+    tradable_pad = tradable_mask[-1:].expand((pad_rows,) + tuple(tradable_mask.shape[1:]))
+    buy_pad = can_buy_mask[-1:].expand((pad_rows,) + tuple(can_buy_mask.shape[1:]))
+    sell_pad = can_sell_mask[-1:].expand((pad_rows,) + tuple(can_sell_mask.shape[1:]))
     benchmark_pad = benchmark.new_zeros((pad_rows,) + tuple(benchmark.shape[1:]))
     return (
         torch.cat((x, x_pad), dim=0),
@@ -3393,9 +3420,9 @@ def _pad_eval_metadata_first_dim(
     pad_rows = target_rows - valid_rows
     date_pad = date_indices[-1:].expand(pad_rows)
     returns_pad = returns.new_zeros((pad_rows,) + tuple(returns.shape[1:]))
-    tradable_pad = tradable_mask.new_zeros((pad_rows,) + tuple(tradable_mask.shape[1:]))
-    buy_pad = can_buy_mask.new_zeros((pad_rows,) + tuple(can_buy_mask.shape[1:]))
-    sell_pad = can_sell_mask.new_zeros((pad_rows,) + tuple(can_sell_mask.shape[1:]))
+    tradable_pad = tradable_mask[-1:].expand((pad_rows,) + tuple(tradable_mask.shape[1:]))
+    buy_pad = can_buy_mask[-1:].expand((pad_rows,) + tuple(can_buy_mask.shape[1:]))
+    sell_pad = can_sell_mask[-1:].expand((pad_rows,) + tuple(can_sell_mask.shape[1:]))
     benchmark_pad = benchmark.new_zeros((pad_rows,) + tuple(benchmark.shape[1:]))
     return (
         torch.cat((date_indices, date_pad), dim=0),
@@ -5060,28 +5087,171 @@ def _run_fold_explainability(
         return None
 
     from stockagent.explainability import (
-        run_loaded_model_explanation,
-        settings_from_training_config,
+        ExplainabilitySettings,
+        _cross_asset_settings_from_explainability,
+        _first_year_indices,
+        _sample_dataset,
+        explain_batch_row_chunked,
+        write_explanation_outputs,
     )
 
-    settings = settings_from_training_config(config.training)
-    return run_loaded_model_explanation(
-        config=config,
-        panel=panel,
-        fold=fold,
-        model=model,
-        checkpoint_path=checkpoint_path,
-        output_dir=output_path,
-        split="test",
-        explain_output_dir=None,
-        settings=settings,
-        write_plots=bool(getattr(config.training, "explain_write_plots", False)),
-        plot_backend=str(getattr(config.training, "plot_backend", "auto")),
-        device=device,
-        checkpoint_info={},
-        timing_file_name="train_explainability_timing.json",
-        write_fold_stability=bool(getattr(config.training, "explain_fold_stability", False)),
+    test_indices = fold.test_indices
+    first_year_only = bool(getattr(config.training, "explain_first_test_year_only", True))
+    if first_year_only:
+        test_indices = _first_year_indices(panel, test_indices)
+    sample_start = time.perf_counter()
+    dataset = CrossSectionalDataset(panel, test_indices, config.training.lookback)
+    settings = ExplainabilitySettings(
+        top_k=int(getattr(config.training, "explain_top_k", 20)),
+        max_rows=int(getattr(config.training, "explain_max_rows", 32)),
+        ig_steps=int(getattr(config.training, "explain_ig_steps", 8)),
+        ig_batch_size=int(getattr(config.training, "explain_ig_batch_size", 0)),
+        perturb=bool(getattr(config.training, "explain_perturb", True)),
+        perturb_batch_size=int(getattr(config.training, "explain_perturb_batch_size", 0)),
+        sample_method=str(getattr(config.training, "explain_sample_method", "even")),
+        first_test_year_only=first_year_only,
+        report_style=str(getattr(config.training, "explain_report_style", "paper")),
+        plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
+        standard_plots=bool(getattr(config.training, "explain_standard_plots", True)),
+        interactive_plots=bool(getattr(config.training, "explain_interactive_plots", False)),
+        shap_enabled=bool(getattr(config.training, "explain_shap_enabled", True)),
+        shap_mode=str(getattr(config.training, "explain_shap_mode", "score_head_surrogate")),
+        case_study_top_k=int(getattr(config.training, "explain_case_study_top_k", 5)),
+        regime_analysis=bool(getattr(config.training, "explain_regime_analysis", True)),
+        fold_stability=bool(getattr(config.training, "explain_fold_stability", True)),
+        umap_enabled=bool(getattr(config.training, "explain_umap_enabled", True)),
+        umap_max_points=int(getattr(config.training, "explain_umap_max_points", 10000)),
+        umap_max_projections=int(getattr(config.training, "explain_umap_max_projections", 0)),
+        umap_n_neighbors=int(getattr(config.training, "explain_umap_n_neighbors", 15)),
+        umap_min_dist=float(getattr(config.training, "explain_umap_min_dist", 0.1)),
+        cross_asset_enabled=bool(getattr(config.training, "explain_cross_asset_enabled", True)),
+        cross_asset_max_sources=int(getattr(config.training, "explain_cross_asset_max_sources", 24)),
+        cross_asset_max_targets=int(getattr(config.training, "explain_cross_asset_max_targets", 24)),
+        cross_asset_top_edges=int(getattr(config.training, "explain_cross_asset_top_edges", 150)),
+        cross_asset_source_chunk_size=int(getattr(config.training, "explain_cross_asset_source_chunk_size", 2)),
+        cross_asset_perturb_scale=float(getattr(config.training, "explain_cross_asset_perturb_scale", 1.0)),
+        cross_asset_shocks=tuple(getattr(config.training, "explain_cross_asset_shocks", [])),
+        cross_asset_attention_flow=bool(getattr(config.training, "explain_cross_asset_attention_flow", True)),
+        cross_asset_attention_capture_rows=int(getattr(config.training, "explain_cross_asset_attention_capture_rows", 4)),
+        cross_asset_validated_transmission=bool(
+            getattr(config.training, "explain_cross_asset_validated_transmission", True)
+        ),
+        cross_asset_role_embedding=bool(getattr(config.training, "explain_cross_asset_role_embedding", True)),
     )
+    settings.perturb_max_auto_batch_size = int(getattr(config.training, "explain_perturb_max_auto_batch_size", 16))
+    settings.perturb_max_input_elements = int(getattr(config.training, "explain_perturb_max_input_elements", 96_000_000))
+    batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
+    dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
+    timing["sample_s"] = float(time.perf_counter() - sample_start)
+    timing["sample_rows"] = int(len(dates))
+    timing["ig_steps"] = int(settings.ig_steps)
+    timing["perturb"] = bool(settings.perturb)
+    timing["write_plots"] = bool(getattr(config.training, "explain_write_plots", True))
+    was_training = model.training
+    model.eval()
+    compute_start = time.perf_counter()
+    try:
+        result = explain_batch_row_chunked(
+            model,
+            batch,
+            feature_names=panel.feature_names,
+            symbols=panel.symbols,
+            dates=dates,
+            settings=settings,
+            device=device,
+        )
+    finally:
+        if was_training:
+            model.train()
+    timing["compute_s"] = float(time.perf_counter() - compute_start)
+    compute_timing = result.get("summary", {}).get("timing", {})
+
+    destination = output_path / "explainability" / f"fold_{int(fold.fold_id):02d}_test"
+    metadata = {
+        "model_name": config.training.model_name,
+        "fold_id": int(fold.fold_id),
+        "split": "test",
+        "checkpoint": str(checkpoint_path),
+        "device": str(device),
+        "sample_rows": int(len(dates)),
+        "first_test_year_only": first_year_only,
+        "config_lookback": int(config.training.lookback),
+        "date_start": dates[0] if dates else None,
+        "date_end": dates[-1] if dates else None,
+    }
+    write_start = time.perf_counter()
+    write_explanation_outputs(
+        result,
+        destination,
+        metadata=metadata,
+        write_plots=bool(getattr(config.training, "explain_write_plots", True)),
+        write_standard_plots=bool(getattr(config.training, "explain_standard_plots", True)),
+        plot_backend=str(getattr(config.training, "plot_backend", "auto")),
+        report_style=str(getattr(config.training, "explain_report_style", "paper")),
+        plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
+    )
+    timing["write_s"] = float(time.perf_counter() - write_start)
+    write_timing = result.get("summary", {}).get("write_timing", {})
+    cross_asset_summary: dict[str, Any] = {}
+    if bool(settings.cross_asset_enabled):
+        cross_asset_start = time.perf_counter()
+        try:
+            from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
+
+            cross_asset_summary = abstract_cross_asset_transmission(
+                model,
+                batch,
+                feature_names=panel.feature_names,
+                symbols=panel.symbols,
+                dates=dates,
+                output_dir=destination,
+                settings=_cross_asset_settings_from_explainability(settings),
+                device=device,
+            )
+        except Exception as exc:
+            print(f"[Fold {fold.fold_id}] cross-asset explainability skipped: {type(exc).__name__}: {exc}")
+            timing["cross_asset_error"] = f"{type(exc).__name__}: {exc}"
+        timing["cross_asset_s"] = float(time.perf_counter() - cross_asset_start)
+    else:
+        timing["cross_asset_s"] = 0.0
+    if bool(getattr(config.training, "explain_fold_stability", True)):
+        stability_start = time.perf_counter()
+        try:
+            from stockagent.explainability import write_fold_stability_outputs
+
+            write_fold_stability_outputs(output_path / "explainability")
+        except Exception as exc:
+            print(f"[Fold {fold.fold_id}] fold stability explainability skipped: {type(exc).__name__}: {exc}")
+        timing["fold_stability_s"] = float(time.perf_counter() - stability_start)
+    else:
+        timing["fold_stability_s"] = 0.0
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    timing["total_s"] = float(time.perf_counter() - total_start)
+    timing_path = destination / "train_explainability_timing.json"
+    timing_path.write_text(
+        json.dumps(
+            {
+                **timing,
+                "compute_timing": compute_timing,
+                "write_timing": write_timing,
+                "cross_asset_summary": cross_asset_summary,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"[Fold {fold.fold_id}] explainability timing: "
+        f"total={float(timing['total_s']):.3f}s "
+        f"compute={float(timing['compute_s']):.3f}s "
+        f"write={float(timing['write_s']):.3f}s "
+        f"cross_asset={float(timing['cross_asset_s']):.3f}s "
+        f"stability={float(timing['fold_stability_s']):.3f}s "
+        f"json={timing_path}"
+    )
+    return destination
 
 
 def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult | None:
@@ -5274,6 +5444,7 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     )
     os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
+    os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if bool(training.strict_no_fallback) else "0"
     os.environ["STOCKAGENT_BACKTEST_CHECKPOINT_CHUNK_ROWS"] = str(
         max(0, int(training.backtest_checkpoint_chunk_rows))
     )
@@ -8121,6 +8292,11 @@ def run_training(
                                 "(mode=default, dynamic=False, cudagraphs=False)"
                             )
                         except Exception as e:
+                            if bool(config.training.strict_no_fallback):
+                                raise RuntimeError(
+                                    f"[Train {train_years}] torch.compile panel-slab forward failed; "
+                                    "strict_no_fallback=true so eager slab forward fallback is disabled."
+                                ) from e
                             panel_slab_compile_status = "fallback:eager"
                             print(
                                 f"[Train {train_years}] torch.compile panel-slab forward failed, "
@@ -8146,6 +8322,11 @@ def run_training(
                             )
                             loss_compile_status = "enabled:fused_log_utility"
                         except Exception as e:
+                            if bool(config.training.strict_no_fallback):
+                                raise RuntimeError(
+                                    f"[Train {train_years}] torch.compile fused log-utility loss setup failed; "
+                                    "strict_no_fallback=true so eager fused-loss fallback is disabled."
+                                ) from e
                             loss_compile_status = "fallback:fused_eager"
                             print(
                                 f"[Train {train_years}] torch.compile fused log-utility loss setup failed, "
@@ -8170,6 +8351,11 @@ def run_training(
                             )
                             loss_compile_status = "enabled"
                         except Exception as e:
+                            if bool(config.training.strict_no_fallback):
+                                raise RuntimeError(
+                                    f"[Train {train_years}] torch.compile loss failed; "
+                                    "strict_no_fallback=true so eager loss fallback is disabled."
+                                ) from e
                             compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                             loss_compile_status = "fallback:eager"
                             print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
@@ -8181,12 +8367,22 @@ def run_training(
                             TimingBreakdown(total_s=time.perf_counter() - compile_start),
                         )
                 except Exception as e:
+                    if bool(config.training.strict_no_fallback):
+                        raise RuntimeError(
+                            f"[Train {train_years}] torch.compile failed; "
+                            "strict_no_fallback=true so eager model fallback is disabled."
+                        ) from e
                     model_compile_status = "fallback:eager"
                     if panel_slab_model is not None:
                         panel_slab_compile_status = "eager"
                     loss_compile_status = "eager"
                     print(f"[Train {train_years}] torch.compile failed, falling back to eager: {e}")
             else:
+                if bool(config.training.strict_no_fallback):
+                    raise RuntimeError(
+                        f"[Train {train_years}] torch.compile requested but unavailable: {reason}. "
+                        "strict_no_fallback=true so eager model fallback is disabled."
+                    )
                 model_compile_status = f"skipped:{reason}"
                 loss_compile_status = "eager"
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")

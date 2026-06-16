@@ -278,6 +278,7 @@ def main() -> None:
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if config.training.backtest_autotune else "0"
     os.environ["STOCKAGENT_BACKTEST_COMPILE"] = "1" if config.training.backtest_compile else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if config.training.backtest_verbose else "0"
+    os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if config.training.strict_no_fallback else "0"
     os.environ["STOCKAGENT_BACKTEST_CHECKPOINT_CHUNK_ROWS"] = str(config.training.backtest_checkpoint_chunk_rows)
     os.environ["STOCKAGENT_AUTO_TORCH_COMPILE_SHARPE"] = "1" if config.training.auto_torch_compile_sharpe else "0"
     if config.training.compile_loss is not None:
@@ -296,6 +297,11 @@ def main() -> None:
             "Please run on a GPU-enabled environment."
         )
     if config.environment.device == "cuda" and not torch.cuda.is_available():
+        if config.training.strict_no_fallback:
+            raise RuntimeError(
+                "CUDA is unavailable while environment.device='cuda'; "
+                "strict_no_fallback=true so CPU fallback is disabled."
+            )
         config.environment.device = "cpu"
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
@@ -305,6 +311,8 @@ def main() -> None:
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
+        trading_volume_policy=config.data.trading_volume_policy,
+        strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
     )

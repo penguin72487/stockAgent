@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 
 from plot_epoch_curves import _write_parquet_table_as_csv, export_report_csvs
@@ -13,6 +14,7 @@ from stockagent.explainability import (
     ExplainabilitySettings,
     _auto_explain_row_chunk_size,
     _cuda_oom_fallback_settings,
+    explain_batch_row_chunked,
     parse_args,
     settings_from_training_config,
 )
@@ -104,6 +106,30 @@ def test_cuda_oom_fallback_disables_high_vram_explainability_steps() -> None:
     assert fallback.perturb_max_auto_batch_size == 1
     assert fallback.perturb_max_input_elements == 8_000_000
     assert fallback.umap_enabled is False
+
+
+def test_strict_no_fallback_raises_on_explainability_cuda_oom(monkeypatch) -> None:
+    batch = {
+        "x": torch.zeros(2, 1, 3, 2),
+        "future_log_returns": torch.zeros(2, 3),
+        "tradable_mask": torch.ones(2, 3, dtype=torch.bool),
+    }
+
+    def raise_cuda_oom(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(explainability_module, "explain_batch", raise_cuda_oom)
+
+    with pytest.raises(RuntimeError, match="strict_no_fallback=true"):
+        explain_batch_row_chunked(
+            torch.nn.Linear(1, 1),
+            batch,
+            feature_names=["f0", "f1"],
+            symbols=["A", "B", "C"],
+            dates=["2026-01-01", "2026-01-02"],
+            settings=ExplainabilitySettings(ig_steps=8, perturb=True, strict_no_fallback=True),
+            device=torch.device("cpu"),
+        )
 
 
 def test_explain_model_cli_defaults_are_complete_offline_explainability() -> None:

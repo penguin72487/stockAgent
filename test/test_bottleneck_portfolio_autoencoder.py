@@ -4,6 +4,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -78,20 +79,15 @@ def test_long_short_forward_shape_mask_and_normalization() -> None:
     assert weights[:, 60:].abs().max().item() < 1e-7
 
 
-def test_tcn_temporal_option_and_empty_mask_row() -> None:
+def test_tcn_temporal_option_rejects_empty_mask_row() -> None:
     device = _device()
     model = _make_model(temporal_type="tcn", d_model=32, z_dim=8, asset_encoder_layers=1).eval()
     x = torch.randn(4, 20, 100, 21, device=device)
     tradable_mask = torch.ones(4, 100, dtype=torch.bool, device=device)
     tradable_mask[0] = False
 
-    with torch.no_grad():
-        weights = model(x, tradable_mask, return_aux=False)
-
-    assert weights.shape == (4, 100)
-    assert torch.isfinite(weights).all()
-    assert weights[0].abs().sum().item() == 0.0
-    assert torch.allclose(weights[1:].abs().sum(dim=1), torch.ones(3, device=device), atol=1e-5)
+    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
+        model(x, tradable_mask, return_aux=False)
 
 
 def test_portfolio_autoencoder_loss_backward() -> None:

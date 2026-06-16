@@ -7,6 +7,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+
+from stockagent.data.panel import build_panel
 
 
 def _load_benchmark_module():
@@ -34,6 +37,23 @@ def _write_symbol(path: Path, offset: float) -> None:
             "close": pa.array(close),
             "adjclose": pa.array(close),
             "Trading_Volume": pa.array(np.linspace(1000.0, 2000.0, rows)),
+        }
+    )
+    pq.write_table(table, path)
+
+
+def _write_symbol_without_volume(path: Path, offset: float) -> None:
+    rows = 4
+    dates = np.arange(np.datetime64("2024-01-01"), np.datetime64("2024-01-01") + rows)
+    close = np.linspace(10.0 + offset, 11.0 + offset, rows)
+    table = pa.table(
+        {
+            "date": pa.array(dates),
+            "open": pa.array(close * 0.99),
+            "max": pa.array(close * 1.02),
+            "min": pa.array(close * 0.98),
+            "close": pa.array(close),
+            "adjclose": pa.array(close),
         }
     )
     pq.write_table(table, path)
@@ -112,6 +132,30 @@ def test_feature_prep_benchmark_runs_on_synthetic_parquet(tmp_path: Path) -> Non
         assert result.elapsed_s is not None and result.elapsed_s >= 0.0
         assert result.rows_per_s is not None and result.rows_per_s > 0.0
         assert result.checksum is not None
+
+
+def test_panel_trading_volume_policy_required_rejects_missing_volume(tmp_path: Path) -> None:
+    _write_symbol_without_volume(tmp_path / "AAA_features.parquet", 0.0)
+
+    with pytest.raises(ValueError, match="Trading_Volume"):
+        build_panel(tmp_path, panel_backend="pyarrow", trading_volume_policy="required")
+
+
+def test_panel_trading_volume_policy_auto_rejects_stock_like_missing_volume(tmp_path: Path) -> None:
+    root = tmp_path / "us_stocks"
+    root.mkdir()
+    _write_symbol_without_volume(root / "AAA_features.parquet", 0.0)
+
+    with pytest.raises(ValueError, match="Trading_Volume"):
+        build_panel(root, panel_backend="pyarrow", trading_volume_policy="auto")
+
+
+def test_panel_trading_volume_policy_optional_allows_missing_volume(tmp_path: Path) -> None:
+    _write_symbol_without_volume(tmp_path / "AAA_features.parquet", 0.0)
+
+    panel = build_panel(tmp_path, panel_backend="pyarrow", trading_volume_policy="optional")
+
+    assert panel.num_symbols == 1
 
 
 def test_pyarrow_panel_backend_builds_synthetic_parquet(tmp_path: Path) -> None:

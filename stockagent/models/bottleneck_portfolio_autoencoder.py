@@ -180,10 +180,11 @@ class BottleneckPortfolioAutoencoder(nn.Module):
 
     @staticmethod
     def _safe_attention_mask(mask_bool: torch.Tensor) -> torch.Tensor:
-        empty_rows = ~mask_bool.any(dim=1, keepdim=True)
-        fallback = torch.zeros_like(mask_bool)
-        fallback[:, :1] = empty_rows
-        return mask_bool | fallback
+        torch._assert(
+            mask_bool.any(dim=1).all(),
+            "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row",
+        )
+        return mask_bool
 
     def _encode_temporal(self, embedded: torch.Tensor) -> torch.Tensor:
         bsz, steps, n_symbols, dim = embedded.shape

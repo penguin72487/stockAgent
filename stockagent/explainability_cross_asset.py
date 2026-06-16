@@ -400,6 +400,17 @@ def _write_matrix_csv(path: Path, matrix: np.ndarray, source_symbols: list[str],
     _write_frame_csv_or_parquet(path, frame)
 
 
+def _shock_summary_csv_frame(shock_summaries: list[dict[str, Any]]) -> pl.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for row in shock_summaries:
+        out = dict(row)
+        matched = out.get("matched_features")
+        if isinstance(matched, list | tuple):
+            out["matched_features"] = ";".join(str(item) for item in matched)
+        rows.append(out)
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
 def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: list[str], target_symbols: list[str]) -> None:
     if matrix.size == 0:
         return
@@ -739,6 +750,7 @@ def abstract_cross_asset_transmission(
             {
                 "shock": shock,
                 "matched_features": [feature_names[idx] for idx in feature_idx],
+                "matched_feature_count": int(len(feature_idx)),
                 "source_chunk_size_final": int(chunk_size),
                 "row_chunk_size": int(row_chunk_size),
                 "forward_batches": int(forward_batches),
@@ -772,7 +784,7 @@ def abstract_cross_asset_transmission(
     )
     _write_frame_csv_or_parquet(tables_dir / "source_summary.csv", source_summary)
     _write_frame_csv_or_parquet(tables_dir / "target_summary.csv", target_summary)
-    _write_frame_csv_or_parquet(tables_dir / "shock_summary.csv", pl.DataFrame(shock_summaries))
+    _write_frame_csv_or_parquet(tables_dir / "shock_summary.csv", _shock_summary_csv_frame(shock_summaries))
 
     role_warnings: list[str] = []
     if bool(settings.role_embedding):

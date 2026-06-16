@@ -262,6 +262,25 @@ def _env_flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() not in {"0", "false", "off", "no"}
 
 
+def _strict_no_fallback_enabled() -> bool:
+    return _env_flag("STOCKAGENT_STRICT_NO_FALLBACK", "0")
+
+
+def _require_side_masks_if_strict(
+    can_buy_mask: object | None,
+    can_sell_mask: object | None,
+    *,
+    context: str,
+) -> None:
+    if not _strict_no_fallback_enabled():
+        return
+    if can_buy_mask is None or can_sell_mask is None:
+        raise ValueError(
+            f"{context} requires can_buy_mask and can_sell_mask when strict_no_fallback=true; "
+            "side masks are not inferred from tradable_mask."
+        )
+
+
 def _env_int(name: str, default: int = 0) -> int:
     raw = os.environ.get(name, str(default)).strip()
     try:
@@ -354,6 +373,11 @@ def _compile_enabled() -> bool:
     if enabled:
         _prepend_cuda_toolchain_paths()
         if not shutil.which("ptxas"):
+            if _strict_no_fallback_enabled():
+                raise RuntimeError(
+                    "Backtest torch.compile was requested but ptxas was not found; "
+                    "strict_no_fallback=true so eager backtest fallback is disabled."
+                )
             return False
     return enabled
 
@@ -672,6 +696,11 @@ def _resolve_reduced_scan_runner(
         stateful_initial,
     )
     if key in _REDUCED_COMPILE_FAILED:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Reduced backtest runner compile was previously marked failed for this shape; "
+                "strict_no_fallback=true so eager reduced-runner fallback is disabled."
+            )
         _add_backtest_runtime_stat("eager_reduced_runner_calls")
         return base_runner
     cached = _REDUCED_COMPILED_CACHE.get(key)
@@ -691,7 +720,12 @@ def _resolve_reduced_scan_runner(
         _REDUCED_COMPILED_CACHE[key] = compiled
         _add_backtest_runtime_stat("compiled_reduced_runner_calls")
         return compiled
-    except Exception:
+    except Exception as exc:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Reduced backtest runner torch.compile failed; "
+                "strict_no_fallback=true so eager reduced-runner fallback is disabled."
+            ) from exc
         _REDUCED_COMPILE_FAILED.add(key)
         _add_backtest_runtime_stat("eager_reduced_runner_calls")
         if _compile_verbose():
@@ -816,6 +850,11 @@ def _resolve_scan_runner(
         stateful_initial,
     )
     if key in _SCAN_COMPILE_FAILED:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Backtest scan runner compile was previously marked failed for this shape; "
+                "strict_no_fallback=true so eager scan fallback is disabled."
+            )
         _SCAN_COMPILE_STATS["disabled"] += 1
         if _compile_verbose():
             print(
@@ -855,7 +894,12 @@ def _resolve_scan_runner(
             compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=compile_dynamic)
         _SCAN_COMPILED_CACHE[key] = compiled
         return compiled
-    except Exception:
+    except Exception as exc:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Backtest scan runner torch.compile failed; "
+                "strict_no_fallback=true so eager scan fallback is disabled."
+            ) from exc
         _SCAN_COMPILE_FAILED.add(key)
         _SCAN_COMPILE_STATS["failures"] += 1
         print(
@@ -888,6 +932,11 @@ def _fallback_scan_runner_after_runtime_failure(
     _SCAN_COMPILE_FAILED.add(key)
     _SCAN_COMPILED_CACHE.pop(key, None)
     _SCAN_COMPILE_STATS["failures"] += 1
+    if _strict_no_fallback_enabled():
+        raise RuntimeError(
+            "Compiled backtest scan runner failed at runtime; "
+            "strict_no_fallback=true so eager scan fallback is disabled."
+        ) from error
     print(
         "[backtest compile] runtime failed, falling back to eager for "
         f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, "
@@ -1043,6 +1092,7 @@ def _vectorized_backtest(
     target_weights = np.asarray(weights, dtype=np.float32).copy()
     gross_budget = _resolve_exposure_budget(gross_leverage)
     tradable = tradable_mask.astype(bool)
+    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="numpy backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask.astype(bool)
     sell_mask = tradable if can_sell_mask is None else can_sell_mask.astype(bool)
 
@@ -1116,6 +1166,7 @@ def _vectorized_backtest_torch_scan_long_only(
     future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
     target_weights = weights
     tradable = tradable_mask
+    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask
     sell_mask = tradable if can_sell_mask is None else can_sell_mask
 
@@ -1195,6 +1246,7 @@ def _vectorized_backtest_torch_scan_long_short(
 
     target_weights = weights
     tradable = tradable_mask
+    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask
     sell_mask = tradable if can_sell_mask is None else can_sell_mask
 
@@ -1278,6 +1330,7 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
     future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
     target_weights = weights
     tradable = tradable_mask
+    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="reduced torch backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask
     sell_mask = tradable if can_sell_mask is None else can_sell_mask
 
@@ -1442,6 +1495,11 @@ def _resolve_prepare_runner(
         gross_budget,
     )
     if key in _PREP_COMPILE_FAILED:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Backtest prep runner compile was previously marked failed for this shape; "
+                "strict_no_fallback=true so eager prep fallback is disabled."
+            )
         _PREP_COMPILE_STATS["disabled"] += 1
         _add_backtest_runtime_stat("eager_prep_calls")
         return base_runner
@@ -1465,6 +1523,11 @@ def _resolve_prepare_runner(
         _add_backtest_runtime_stat("compiled_prep_calls")
         return compiled
     except Exception as e:
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Backtest prep runner torch.compile failed; "
+                "strict_no_fallback=true so eager prep fallback is disabled."
+            ) from e
         _PREP_COMPILE_FAILED.add(key)
         _PREP_COMPILE_STATS["failures"] += 1
         _add_backtest_runtime_stat("eager_prep_calls")
@@ -1486,6 +1549,7 @@ def _prepare_scan_inputs(
     gross_leverage: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gross_budget = _resolve_exposure_budget(gross_leverage)
+    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="backtest input preparation")
     buy_input = tradable_mask if can_buy_mask is None else can_buy_mask
     sell_input = tradable_mask if can_sell_mask is None else can_sell_mask
     runner = _resolve_prepare_runner(
@@ -1518,6 +1582,11 @@ def _prepare_scan_inputs(
         _PREP_COMPILED_CACHE.pop(key, None)
         _PREP_COMPILE_STATS["failures"] += 1
         _add_backtest_runtime_stat("eager_prep_calls")
+        if _strict_no_fallback_enabled():
+            raise RuntimeError(
+                "Compiled backtest prep runner failed at runtime; "
+                "strict_no_fallback=true so eager prep fallback is disabled."
+            ) from e
         if _compile_verbose():
             print(
                 "[backtest prep compile] runtime failed, falling back to eager for "
@@ -1670,6 +1739,11 @@ def _vectorized_backtest_torch(
         except Exception as e:
             _add_backtest_runtime_stat("cpp_ext_failures")
             _add_backtest_elapsed_stat("cpp_ext_s", cpp_start)
+            if _strict_no_fallback_enabled():
+                raise RuntimeError(
+                    "C++ long-short backtest extension failed; "
+                    "strict_no_fallback=true so eager scan fallback is disabled."
+                ) from e
             if _compile_verbose():
                 print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
 
@@ -2011,6 +2085,11 @@ def run_backtest_torch_reduced(
             )
             _REDUCED_COMPILE_FAILED.add(key)
             _REDUCED_COMPILED_CACHE.pop(key, None)
+            if _strict_no_fallback_enabled():
+                raise RuntimeError(
+                    "Compiled reduced backtest runner failed at runtime; "
+                    "strict_no_fallback=true so eager reduced-runner fallback is disabled."
+                ) from e
             if _compile_verbose():
                 print(
                     "[backtest reduced compile] runtime failed, falling back to eager for "
@@ -2132,6 +2211,7 @@ def run_backtest_integer_shares(
     w = np.asarray(weights, dtype=np.float64)
     r = np.nan_to_num(np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     m = np.asarray(tradable_mask, dtype=bool)
+    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="integer-share backtest")
     buy_m = m if can_buy_mask is None else np.asarray(can_buy_mask, dtype=bool)
     sell_m = m if can_sell_mask is None else np.asarray(can_sell_mask, dtype=bool)
     b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)

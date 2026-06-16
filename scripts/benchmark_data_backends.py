@@ -606,6 +606,7 @@ def benchmark_panel_build(
                     tmp_dir,
                     use_rapids=False,
                     benchmark_name=benchmark_name,
+                    strict_no_fallback=False,
                     panel_backend=backend,
                     panel_load_workers=max(0, int(panel_load_workers)),
                 )

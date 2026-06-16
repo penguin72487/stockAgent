@@ -65,3 +65,17 @@ prepend_fintech_path() {
     export PATH="$FINTECH_ENV_PATH/bin:$PATH"
   fi
 }
+normalize_fintech_cuda_env() {
+  local cuda_target="$FINTECH_ENV_PATH/targets/x86_64-linux"
+  if [[ -f "$cuda_target/include/cuda_runtime.h" ]]; then
+    export CUDA_PATH="$cuda_target"
+    export CUDA_HOME="$cuda_target"
+  elif [[ -f "$FINTECH_ENV_PATH/include/cuda_runtime.h" ]]; then
+    export CUDA_PATH="$FINTECH_ENV_PATH"
+    export CUDA_HOME="$FINTECH_ENV_PATH"
+  elif [[ -n "${CUDA_PATH:-}" ]]; then
+    export CUDA_HOME="$CUDA_PATH"
+  fi
+}
+
+normalize_fintech_cuda_env

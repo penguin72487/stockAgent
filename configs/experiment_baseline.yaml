@@ -15,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/us_stocks
-  benchmark_name: "SPY"
+  parquet_root: data_yahoo/forex
+  benchmark_name: "JPYUSD"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -24,6 +24,7 @@ data:
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
+  trading_volume_policy: auto
   # tradable_mode: tw_limit_guard
   tradable_mode: tradable
 
@@ -70,6 +71,7 @@ training:
   backtest_compile_dynamic: false
   backtest_cpp_ext: false
   backtest_verbose: false
+  strict_no_fallback: true
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: false
