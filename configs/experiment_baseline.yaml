@@ -24,6 +24,7 @@ data:
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
+  trading_volume_policy: auto
   # tradable_mode: tw_limit_guard
   tradable_mode: tradable
 
@@ -69,6 +70,7 @@ training:
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
   backtest_verbose: false
+  strict_no_fallback: true
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: false

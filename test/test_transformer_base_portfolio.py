@@ -405,20 +405,15 @@ def test_large_temporal_batch_uses_chunked_sdpa_without_cuda_invalid_argument() 
     assert torch.isfinite(out["weights"]).all()
 
 
-def test_long_only_mode_and_empty_rows_are_safe() -> None:
+def test_long_only_mode_rejects_empty_rows() -> None:
     device = _device()
     model = _make_model(portfolio_mode="long_only").eval()
     x = torch.randn(2, 6, 13, 11, device=device)
     mask = torch.ones(2, 13, dtype=torch.bool, device=device)
     mask[0, :] = False
 
-    with torch.no_grad():
-        weights, _, _ = model(x, mask, return_aux=True)
-
-    assert torch.isfinite(weights).all()
-    assert weights[0].abs().sum().item() == 0.0
-    assert torch.all(weights >= 0.0)
-    assert torch.allclose(weights[1:].sum(dim=1), torch.ones(1, device=device), atol=1e-5)
+    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
+        model(x, mask, return_aux=True)
 
 
 def test_factory_builds_transformer_base_portfolio_model() -> None:

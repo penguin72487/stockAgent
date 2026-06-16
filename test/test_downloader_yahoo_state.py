@@ -4,6 +4,7 @@ import argparse
 
 import polars as pl
 import pyarrow.parquet as pq
+import pytest
 
 from downloader import download_yahoo_ohlcv as yahoo
 
@@ -96,6 +97,18 @@ def test_tw_exchange_parser_excludes_warrant_like_listings(monkeypatch):
 
     assert {"2330", "2888A", "0050", "00632R"}.issubset(by_code)
     assert {"030037", "03003T", "03006X", "087644"}.isdisjoint(by_code)
+
+
+def test_strict_no_fallback_rejects_tw_symbol_discovery_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(yahoo, "_load_tw_symbols_from_exchange", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr(
+        yahoo,
+        "_load_repo_symbol_fallback",
+        lambda asset_class: [yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")],
+    )
+
+    with pytest.raises(RuntimeError, match="strict_no_fallback=true"):
+        yahoo._resolve_tw_symbols(_base_args(tmp_path, strict_no_fallback=True), cached=[])
 
 
 def test_daily_resolution_prunes_cached_tw_warrants_from_manifest_and_schedule(tmp_path, monkeypatch):

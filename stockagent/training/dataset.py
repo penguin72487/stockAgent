@@ -17,16 +17,23 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         # Keep only indices that have a full lookback window inside this fold.
         fold_start_idx = int(self.date_indices[0])
         min_valid_idx = fold_start_idx + lookback - 1
-        self.valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
+        tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
+        valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
+        if valid_indices.size > 0:
+            valid_indices = valid_indices[tradable[valid_indices].any(axis=1)]
+        self.valid_indices = valid_indices
 
         if len(self.valid_indices) == 0:
             raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback} dates.")
 
         returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-        tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
-        # If panel does not provide TW-specific masks, fall back to tradable mask.
-        can_buy = panel.can_buy_mask if panel.can_buy_mask is not None else tradable
-        can_sell = panel.can_sell_mask if panel.can_sell_mask is not None else tradable
+        if panel.can_buy_mask is None or panel.can_sell_mask is None:
+            raise ValueError(
+                "PanelData must provide can_buy_mask and can_sell_mask; no-fallback dataset path "
+                "does not infer side masks from tradable_mask"
+            )
+        can_buy = panel.can_buy_mask
+        can_sell = panel.can_sell_mask
 
         # Cache tensors once to avoid per-item numpy copies.
         self.features_t = torch.nan_to_num(
