@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,6 +20,7 @@ from stockagent.models.normalization import dual_branch_softmax, masked_cross_se
 
 MODULE_NAME = "abstract_cross_asset_transmission"
 DEFAULT_SHOCKS = ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
+_MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
 
 
 @dataclass(slots=True)
@@ -79,6 +81,48 @@ def _sanitize_tensor(value: torch.Tensor) -> torch.Tensor:
 
 def _to_numpy(value: torch.Tensor) -> np.ndarray:
     return np.nan_to_num(value.detach().float().cpu().numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _sanitize_matplotlib_axis_limits(fig: Any) -> None:
+    for ax in getattr(fig, "axes", ()):
+        for axis_name, getter, setter in (
+            ("x", ax.get_xlim, ax.set_xlim),
+            ("y", ax.get_ylim, ax.set_ylim),
+        ):
+            try:
+                lo, hi = getter()
+            except Exception:
+                continue
+            if np.isfinite([lo, hi]).all() and lo != hi:
+                continue
+            default_limits = (1e-12, 1.0) if axis_name == "y" and ax.get_yscale() == "log" else (0.0, 1.0)
+            try:
+                setter(*default_limits)
+            except Exception:
+                continue
+
+
+def _safe_matplotlib_tight_layout(fig: Any) -> None:
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        fig.tight_layout()
+
+
+def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        fig.savefig(output_path, **kwargs)
 
 
 def _call_model(model: nn.Module, x: torch.Tensor, mask: torch.Tensor, *, return_aux: bool = True) -> Any:
@@ -379,9 +423,8 @@ def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: li
     ax.set_xticks(range(max_cols), [str(v) for v in target_symbols[:max_cols]], rotation=90, fontsize=7)
     ax.set_yticks(range(max_rows), [str(v) for v in source_symbols[:max_rows]], fontsize=7)
     fig.colorbar(image, ax=ax, shrink=0.8)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path)
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, path)
     plt.close(fig)
 
 
@@ -403,9 +446,8 @@ def _plot_top_edges(path: Path, edges: pl.DataFrame) -> None:
     ax.invert_yaxis()
     ax.set_xlabel("validated transmission")
     ax.set_title("Top Abstract Cross-Asset Transmission Edges")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path)
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, path)
     plt.close(fig)
 
 
@@ -751,8 +793,8 @@ def abstract_cross_asset_transmission(
                 ax.set_title("Latent Stock Role Embedding")
                 ax.set_xlabel("role_x")
                 ax.set_ylabel("role_y")
-                fig.tight_layout()
-                fig.savefig(plots_dir / "role_embeddings.png")
+                _safe_matplotlib_tight_layout(fig)
+                _save_matplotlib_figure(fig, plots_dir / "role_embeddings.png")
                 plt.close(fig)
             except Exception as exc:
                 role_warnings.append(f"Role embedding plot failed: {type(exc).__name__}: {exc}")

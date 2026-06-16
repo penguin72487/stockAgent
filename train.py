@@ -11,10 +11,12 @@ import torch
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
+from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.trainer import run_inference, run_training
 
 
 def _configure_cuda_runtime() -> None:
+    normalize_cuda_env()
     if not torch.cuda.is_available():
         return
     torch.set_float32_matmul_precision("high")

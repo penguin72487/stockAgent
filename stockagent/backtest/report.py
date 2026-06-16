@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,53 @@ from stockagent.backtest.simulator import BacktestResult
 
 _PLOT_LOG_MIN = -60.0
 _PLOT_LOG_MAX = 60.0
+_MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+
+
+def _sanitize_matplotlib_axis_limits(fig: object) -> None:
+    for ax in getattr(fig, "axes", ()):
+        axis_specs = (
+            ("x", ax.get_xlim, ax.set_xlim, ax.get_xscale),
+            ("y", ax.get_ylim, ax.set_ylim, ax.get_yscale),
+        )
+        for _, getter, setter, scale_getter in axis_specs:
+            try:
+                lo, hi = getter()
+            except Exception:
+                continue
+            if np.isfinite([lo, hi]).all() and lo != hi:
+                continue
+            default = (1e-12, 1.0) if scale_getter() == "log" else (0.0, 1.0)
+            try:
+                setter(*default)
+            except Exception:
+                pass
+
+
+def _safe_tight_layout() -> None:
+    fig = plt.gcf()
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        plt.tight_layout()
+
+
+def _save_current_figure(output_path: str | Path, **kwargs: object) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.gcf()
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        plt.savefig(path, **kwargs)
 
 
 def _format_risk_metrics_text(result: BacktestResult) -> str:
@@ -461,10 +509,10 @@ def plot_annual_performance(
     ax.axhline(y=0, color="red", linestyle="--", linewidth=1)
     ax.legend()
     
-    plt.tight_layout()
+    _safe_tight_layout()
     
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -498,10 +546,10 @@ def plot_equity_curve(
     ax.grid(True, alpha=0.3)
     _add_metrics_box(ax, _format_risk_metrics_text(result))
 
-    plt.tight_layout()
+    _safe_tight_layout()
 
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -536,10 +584,10 @@ def plot_equity_curve_log(
     ax.grid(True, alpha=0.3, which="both")
     _add_metrics_box(ax, _format_risk_metrics_text(result))
     
-    plt.tight_layout()
+    _safe_tight_layout()
     
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -572,10 +620,10 @@ def plot_leverage_curve(
     ax.legend()
     _add_metrics_box(ax, _format_risk_metrics_text(result))
 
-    plt.tight_layout()
+    _safe_tight_layout()
 
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -615,10 +663,10 @@ def plot_configured_leverage_equity_curve(
     info_text = f"{risk_text}\nConfigured Leverage: {float(configured_gross_leverage):.2f}x"
     _add_metrics_box(ax, info_text)
 
-    plt.tight_layout()
+    _safe_tight_layout()
 
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -665,9 +713,9 @@ def plot_fold_first_year_returns(
     _add_metrics_box(ax, _format_risk_metrics_text(combined_result))
 
     fig.autofmt_xdate()
-    plt.tight_layout()
+    _safe_tight_layout()
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -746,9 +794,9 @@ def plot_first_year_fold_metric_bars(
         ax.set_xticklabels(labels, rotation=45, ha="right")
         ax.grid(True, axis="y", alpha=0.3)
 
-    plt.tight_layout()
+    _safe_tight_layout()
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -802,9 +850,9 @@ def plot_first_year_turnover_concentration(
     for ax in axes:
         ax.grid(True, axis="y", alpha=0.3)
 
-    plt.tight_layout()
+    _safe_tight_layout()
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -840,8 +888,8 @@ def plot_first_test_year_only(
     _add_metrics_box(ax, _format_risk_metrics_text(result))
 
     fig.autofmt_xdate()
-    plt.tight_layout()
+    _safe_tight_layout()
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()

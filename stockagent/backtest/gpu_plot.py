@@ -8,6 +8,8 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from stockagent.runtime_env import normalize_cuda_env
+
 
 Color = str
 LineSeries = tuple[str, object, object, Color]
@@ -16,6 +18,9 @@ HeatmapLabel = tuple[int, str]
 
 
 def _ensure_conda_cuda_path() -> None:
+    if normalize_cuda_env() is not None:
+        return
+
     prefix = Path(sys.prefix)
     env_bin = prefix / "bin"
     if env_bin.exists():
@@ -25,13 +30,13 @@ def _ensure_conda_cuda_path() -> None:
 
     current = os.environ.get("CUDA_PATH")
     if current and (Path(current) / "include" / "cuda_runtime.h").exists():
-        os.environ.setdefault("CUDA_HOME", current)
+        os.environ["CUDA_HOME"] = current
         return
 
     for candidate in (prefix / "targets" / "x86_64-linux", prefix):
         if (candidate / "include" / "cuda_runtime.h").exists():
             os.environ["CUDA_PATH"] = str(candidate)
-            os.environ.setdefault("CUDA_HOME", str(candidate))
+            os.environ["CUDA_HOME"] = str(candidate)
             return
 
 
@@ -55,6 +60,14 @@ def _import_cuml_umap():
     return UMAP
 
 
+def _new_cuml_umap(**kwargs):
+    UMAP = _import_cuml_umap()
+    try:
+        return UMAP(init="random", **kwargs)
+    except TypeError:
+        return UMAP(**kwargs)
+
+
 def rapids_datashader_available(require_cuda: bool = True) -> bool:
     try:
         cp, _cudf, _ds, _tf = _import_rapids_stack()
@@ -72,9 +85,8 @@ def cuml_umap_available(require_cuda: bool = True) -> bool:
         cp, _cudf, _ds, _tf = _import_rapids_stack()
         if require_cuda and int(cp.cuda.runtime.getDeviceCount()) <= 0:
             return False
-        UMAP = _import_cuml_umap()
         probe = cp.random.random((8, 3), dtype=cp.float32)
-        _ = UMAP(n_components=2, n_neighbors=3, min_dist=0.1, random_state=42).fit_transform(probe)
+        _ = _new_cuml_umap(n_components=2, n_neighbors=3, min_dist=0.1, random_state=42).fit_transform(probe)
         return True
     except Exception:
         return False
@@ -332,14 +344,13 @@ def run_cuml_umap(
     random_state: int = 42,
 ):
     cp, _cudf, _ds, _tf = _import_rapids_stack()
-    UMAP = _import_cuml_umap()
     matrix = to_cupy_2d(values, dtype="float32")
     matrix = cp.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
     n_samples = int(matrix.shape[0])
     if n_samples < 4:
         raise ValueError("cuML UMAP needs at least 4 samples for a useful projection")
     n_neighbors = max(2, min(int(n_neighbors), n_samples - 1))
-    reducer = UMAP(
+    reducer = _new_cuml_umap(
         n_components=2,
         n_neighbors=n_neighbors,
         min_dist=float(min_dist),
