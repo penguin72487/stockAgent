@@ -27,6 +27,7 @@ _REPORT_PARQUET_FILENAMES = (
     "target_summary.parquet",
     "top_edges.parquet",
 )
+_DEFAULT_REPORT_CSV_BATCH_SIZE = 65_536
 
 
 def _parse_args() -> argparse.Namespace:
@@ -72,7 +73,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--export-report-csvs",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Convert parquet report tables under --artifacts-root to same-name CSVs after plotting.",
     )
     parser.add_argument(
@@ -80,6 +81,12 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Rewrite report CSV exports even when the CSV is newer than the parquet source.",
+    )
+    parser.add_argument(
+        "--report-csv-batch-size",
+        type=int,
+        default=_DEFAULT_REPORT_CSV_BATCH_SIZE,
+        help="Rows per streaming parquet->CSV batch for report table exports.",
     )
     parser.add_argument(
         "--skip-plots",
@@ -163,48 +170,89 @@ def _write_curve_parquet_cache(curve_path: Path, rows: list[dict]) -> tuple[Path
     return parquet_path, float(time.perf_counter() - start)
 
 
-def _polars_dtype_is_nested(dtype: object) -> bool:
-    checker = getattr(dtype, "is_nested", None)
-    if callable(checker):
-        return bool(checker())
-    return str(dtype).startswith(("List", "Array", "Struct"))
+def _arrow_type_is_nested(dtype: pa.DataType) -> bool:
+    return (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+        or pa.types.is_list_view(dtype)
+        or pa.types.is_large_list_view(dtype)
+        or pa.types.is_map(dtype)
+        or pa.types.is_struct(dtype)
+    )
 
 
-def _json_cell(value: object) -> str | None:
-    if value is None:
-        return None
-    if hasattr(value, "to_list"):
-        value = value.to_list()
-    elif isinstance(value, np.ndarray):
-        value = value.tolist()
-    return json.dumps(value, ensure_ascii=False)
+def _csv_schema_from_arrow_schema(schema: pa.Schema) -> pa.Schema:
+    fields = [
+        pa.field(field.name, pa.string()) if _arrow_type_is_nested(field.type) else field
+        for field in schema
+    ]
+    return pa.schema(fields, metadata=schema.metadata)
 
 
-def _write_parquet_table_as_csv(parquet_path: Path, csv_path: Path) -> None:
-    table = pq.read_table(parquet_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        pacsv.write_csv(table, csv_path)
-        return
-    except Exception:
-        frame = pl.from_arrow(table)
-        nested_columns = [
-            column
-            for column, dtype in zip(frame.columns, frame.dtypes)
-            if _polars_dtype_is_nested(dtype)
-        ]
-        if not nested_columns:
-            raise
-        frame = frame.with_columns(
-            [
-                pl.col(column).map_elements(_json_cell, return_dtype=pl.String).alias(column)
-                for column in nested_columns
+def _record_batch_for_csv(batch: pa.RecordBatch) -> pa.RecordBatch:
+    arrays: list[pa.Array] = []
+    fields: list[pa.Field] = []
+    for field, column in zip(batch.schema, batch.columns, strict=False):
+        if _arrow_type_is_nested(field.type):
+            values = [
+                None if value is None else json.dumps(value, ensure_ascii=False)
+                for value in column.to_pylist()
             ]
-        )
-        frame.write_csv(csv_path)
+            arrays.append(pa.array(values, type=pa.string()))
+            fields.append(pa.field(field.name, pa.string()))
+        else:
+            arrays.append(column)
+            fields.append(field)
+    return pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields, metadata=batch.schema.metadata))
 
 
-def export_report_csvs(root: Path, *, force: bool = False, quiet: bool = False) -> dict[str, float | int | str]:
+def _write_empty_csv_from_schema(csv_path: Path, schema: pa.Schema) -> None:
+    csv_schema = _csv_schema_from_arrow_schema(schema)
+    arrays = [pa.array([], type=field.type) for field in csv_schema]
+    table = pa.Table.from_arrays(arrays, schema=csv_schema)
+    pacsv.write_csv(table, csv_path)
+
+
+def _write_parquet_table_as_csv(
+    parquet_path: Path,
+    csv_path: Path,
+    *,
+    batch_size: int = _DEFAULT_REPORT_CSV_BATCH_SIZE,
+) -> None:
+    parquet_file = pq.ParquetFile(parquet_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = csv_path.with_name(csv_path.name + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    writer: pacsv.CSVWriter | None = None
+    try:
+        for batch in parquet_file.iter_batches(batch_size=max(1, int(batch_size))):
+            csv_batch = _record_batch_for_csv(batch)
+            if writer is None:
+                writer = pacsv.CSVWriter(str(tmp_path), csv_batch.schema)
+            writer.write_batch(csv_batch)
+        if writer is None:
+            _write_empty_csv_from_schema(tmp_path, parquet_file.schema_arrow)
+        else:
+            writer.close()
+            writer = None
+        tmp_path.replace(csv_path)
+    except Exception:
+        if writer is not None:
+            writer.close()
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def export_report_csvs(
+    root: Path,
+    *,
+    force: bool = False,
+    quiet: bool = False,
+    batch_size: int = _DEFAULT_REPORT_CSV_BATCH_SIZE,
+) -> dict[str, float | int | str]:
     """Export training report parquet tables to CSV outside the training hot path."""
     total_start = time.perf_counter()
     root = root if root.is_dir() else root.parent
@@ -224,7 +272,7 @@ def export_report_csvs(root: Path, *, force: bool = False, quiet: bool = False) 
                     continue
             except OSError:
                 pass
-        _write_parquet_table_as_csv(parquet_path, csv_path)
+        _write_parquet_table_as_csv(parquet_path, csv_path, batch_size=batch_size)
         written += 1
         if not quiet:
             print(f"exported csv: {csv_path}")
@@ -493,6 +541,7 @@ def main() -> None:
         export_report_csvs(
             Path(args.artifacts_root),
             force=bool(args.force_report_csvs),
+            batch_size=max(1, int(args.report_csv_batch_size)),
         )
 
 
