@@ -475,7 +475,7 @@ def _auto_explain_row_chunk_size(
     usable_bytes = max(0.0, min(float(free_bytes) * 0.70, float(total_bytes) * 0.65) - workspace_reserve)
     estimated = int(max(1.0, usable_bytes / (bytes_per_row * activation_multiplier)))
     if n_symbols >= 10_000:
-        estimated = min(estimated, 4)
+        estimated = 1
     elif n_symbols >= 4_000:
         estimated = min(estimated, 8)
     row_chunk_size = max(1, min(n_rows, estimated))
@@ -612,6 +612,35 @@ def _repeat_first_dim(tensor: torch.Tensor, repeats: int) -> torch.Tensor:
 def _is_cuda_oom(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return isinstance(exc, RuntimeError) and "out of memory" in msg and ("cuda" in msg or "cublas" in msg)
+
+
+def _cuda_oom_fallback_settings(settings: ExplainabilitySettings) -> ExplainabilitySettings | None:
+    if (
+        int(settings.ig_steps) <= 0
+        and not bool(settings.perturb)
+        and not bool(settings.umap_enabled)
+    ):
+        return None
+    return replace(
+        settings,
+        ig_steps=0,
+        ig_batch_size=1,
+        perturb=False,
+        perturb_batch_size=1,
+        perturb_max_auto_batch_size=1,
+        perturb_max_input_elements=min(int(settings.perturb_max_input_elements), 8_000_000),
+        umap_enabled=False,
+        umap_max_points=min(int(settings.umap_max_points), 1000),
+        umap_max_projections=0,
+    )
+
+
+def _append_summary_warning(result: dict[str, Any], warning: str) -> None:
+    summary = result.setdefault("summary", {})
+    warnings = list(summary.get("warnings", []) or [])
+    if warning not in warnings:
+        warnings.append(warning)
+    summary["warnings"] = warnings
 
 
 def _integrated_gradients_attribution(
@@ -2056,58 +2085,85 @@ def explain_batch_row_chunked(
     settings: ExplainabilitySettings,
     device: torch.device,
 ) -> dict[str, Any]:
-    total_start = time.perf_counter()
     n_rows = int(batch["x"].size(0))
-    row_chunk_size, diagnostics = _auto_explain_row_chunk_size(batch, settings, device)
-    if row_chunk_size >= n_rows:
-        result = explain_batch(
-            model,
-            batch,
-            feature_names=feature_names,
-            symbols=symbols,
-            dates=dates,
-            settings=settings,
-            device=device,
-        )
-        result["summary"]["row_chunking"] = diagnostics
-        return result
+    effective_settings = settings
+    fallback_warning: str | None = None
+    used_fallback = False
 
-    print(
-        "[explain] row microbatching enabled: "
-        f"rows={n_rows}, row_chunk_size={row_chunk_size}, symbols={diagnostics.get('symbols')}, "
-        f"free_gb={diagnostics.get('free_gb', 0.0):.2f}"
-    )
-    chunk_results: list[tuple[dict[str, Any], int]] = []
-    for chunk_id, start in enumerate(range(0, n_rows, row_chunk_size), start=1):
-        end = min(n_rows, start + row_chunk_size)
-        chunk_settings = settings if chunk_id == 1 else replace(settings, umap_enabled=False)
-        chunk = _slice_batch_rows(batch, start, end)
-        chunk_dates = dates[start:end]
-        result = explain_batch(
-            model,
-            chunk,
-            feature_names=feature_names,
-            symbols=symbols,
-            dates=chunk_dates,
-            settings=chunk_settings,
-            device=device,
-        )
-        chunk_results.append((result, end - start))
-        del chunk, result
-        _clear_explainability_runtime_cache()
-        print(f"[explain] completed row chunk {chunk_id}: rows {start}:{end}")
+    while True:
+        total_start = time.perf_counter()
+        row_chunk_size, diagnostics = _auto_explain_row_chunk_size(batch, effective_settings, device)
+        if used_fallback:
+            diagnostics = {**diagnostics, "cuda_oom_fallback": True}
+        try:
+            if row_chunk_size >= n_rows:
+                result = explain_batch(
+                    model,
+                    batch,
+                    feature_names=feature_names,
+                    symbols=symbols,
+                    dates=dates,
+                    settings=effective_settings,
+                    device=device,
+                )
+                result["summary"]["row_chunking"] = diagnostics
+                if fallback_warning is not None:
+                    _append_summary_warning(result, fallback_warning)
+                return result
 
-    diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
-    return _combine_chunked_explainability_results(
-        chunk_results,
-        batch=batch,
-        feature_names=feature_names,
-        symbols=symbols,
-        dates=dates,
-        settings=settings,
-        row_chunk_diagnostics=diagnostics,
-        total_elapsed_s=float(time.perf_counter() - total_start),
-    )
+            print(
+                "[explain] row microbatching enabled: "
+                f"rows={n_rows}, row_chunk_size={row_chunk_size}, symbols={diagnostics.get('symbols')}, "
+                f"free_gb={diagnostics.get('free_gb', 0.0):.2f}"
+            )
+            chunk_results: list[tuple[dict[str, Any], int]] = []
+            for chunk_id, start in enumerate(range(0, n_rows, row_chunk_size), start=1):
+                end = min(n_rows, start + row_chunk_size)
+                chunk_settings = effective_settings if chunk_id == 1 else replace(effective_settings, umap_enabled=False)
+                chunk = _slice_batch_rows(batch, start, end)
+                chunk_dates = dates[start:end]
+                result = explain_batch(
+                    model,
+                    chunk,
+                    feature_names=feature_names,
+                    symbols=symbols,
+                    dates=chunk_dates,
+                    settings=chunk_settings,
+                    device=device,
+                )
+                chunk_results.append((result, end - start))
+                del chunk, result
+                _clear_explainability_runtime_cache()
+                print(f"[explain] completed row chunk {chunk_id}: rows {start}:{end}")
+
+            diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
+            combined = _combine_chunked_explainability_results(
+                chunk_results,
+                batch=batch,
+                feature_names=feature_names,
+                symbols=symbols,
+                dates=dates,
+                settings=effective_settings,
+                row_chunk_diagnostics=diagnostics,
+                total_elapsed_s=float(time.perf_counter() - total_start),
+            )
+            if fallback_warning is not None:
+                _append_summary_warning(combined, fallback_warning)
+            return combined
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or used_fallback:
+                raise
+            fallback_settings = _cuda_oom_fallback_settings(effective_settings)
+            if fallback_settings is None:
+                raise
+            used_fallback = True
+            effective_settings = fallback_settings
+            fallback_warning = (
+                "CUDA OOM during explainability; retried with VRAM-safe fallback "
+                "(Integrated Gradients disabled, perturbation disabled, UMAP disabled)."
+            )
+            _clear_explainability_runtime_cache()
+            print(f"[explain] {fallback_warning}")
 
 
 def _write_markdown_report(
@@ -3955,16 +4011,59 @@ def run_checkpoint_explanation(
     if bool(settings.cross_asset_enabled):
         from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
 
-        abstract_cross_asset_transmission(
-            model,
-            batch,
-            feature_names=context.panel.feature_names,
-            symbols=context.panel.symbols,
-            dates=dates,
-            output_dir=destination,
-            settings=_cross_asset_settings_from_explainability(settings),
-            device=device,
-        )
+        row_chunking = result.get("summary", {}).get("row_chunking", {})
+        cross_asset_dir = destination / "abstract_cross_asset_transmission"
+        skip_cross_asset = bool(isinstance(row_chunking, dict) and row_chunking.get("cuda_oom_fallback"))
+        if skip_cross_asset:
+            cross_asset_dir.mkdir(parents=True, exist_ok=True)
+            skipped = {
+                "enabled": False,
+                "module": "abstract_cross_asset_transmission",
+                "skipped_reason": "main_explainability_cuda_oom_fallback",
+            }
+            (cross_asset_dir / "abstract_cross_asset_summary.json").write_text(
+                json.dumps(skipped, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (cross_asset_dir / "abstract_cross_asset_report.md").write_text(
+                "# Abstract Cross-Asset Transmission\n\n"
+                "Skipped because main explainability already required CUDA OOM fallback.\n",
+                encoding="utf-8",
+            )
+            print("[explain] cross-asset skipped after CUDA OOM fallback in main explainability")
+        else:
+            try:
+                abstract_cross_asset_transmission(
+                    model,
+                    batch,
+                    feature_names=context.panel.feature_names,
+                    symbols=context.panel.symbols,
+                    dates=dates,
+                    output_dir=destination,
+                    settings=_cross_asset_settings_from_explainability(settings),
+                    device=device,
+                )
+            except RuntimeError as exc:
+                if not _is_cuda_oom(exc):
+                    raise
+                _clear_explainability_runtime_cache()
+                cross_asset_dir.mkdir(parents=True, exist_ok=True)
+                skipped = {
+                    "enabled": False,
+                    "module": "abstract_cross_asset_transmission",
+                    "skipped_reason": "cuda_oom",
+                    "error": str(exc),
+                }
+                (cross_asset_dir / "abstract_cross_asset_summary.json").write_text(
+                    json.dumps(skipped, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                (cross_asset_dir / "abstract_cross_asset_report.md").write_text(
+                    "# Abstract Cross-Asset Transmission\n\n"
+                    "Skipped after CUDA out-of-memory during cross-asset analysis.\n",
+                    encoding="utf-8",
+                )
+                print("[explain] cross-asset skipped after CUDA OOM")
     destination_out = destination
     del result, batch, dataset, model
     _clear_explainability_runtime_cache()
@@ -3982,50 +4081,80 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
     parser.add_argument("--top-k", default=20, type=int)
     parser.add_argument("--max-rows", default=32, type=int)
-    parser.add_argument("--ig-steps", default=8, type=int)
+    parser.add_argument("--ig-steps", default=0, type=int)
     parser.add_argument("--ig-batch-size", default=0, type=int, help="Batch IG alpha steps together; 0 selects an automatic safe chunk size.")
     parser.add_argument("--sample-method", default="even", choices=("even", "first", "last"))
     parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
-    parser.add_argument("--no-perturb", action="store_true", help="Skip feature perturbation sensitivity.")
+    parser.add_argument(
+        "--perturb",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run feature perturbation sensitivity; off by default for throughput.",
+    )
     parser.add_argument("--perturb-batch-size", default=0, type=int, help="Batch feature-day perturbations together; 0 selects an automatic safe chunk size.")
-    parser.add_argument("--perturb-max-auto-batch-size", default=16, type=int)
-    parser.add_argument("--perturb-max-input-elements", default=32_000_000, type=int)
-    parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")
-    parser.add_argument("--report-style", default="paper", choices=("paper", "standard", "none"))
+    parser.add_argument("--perturb-max-auto-batch-size", default=1, type=int)
+    parser.add_argument("--perturb-max-input-elements", default=8_000_000, type=int)
+    parser.add_argument(
+        "--plots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write PNG plots; off by default for throughput.",
+    )
+    parser.add_argument("--report-style", default="none", choices=("paper", "standard", "none"))
     parser.add_argument("--plot-theme", default="paper", choices=("paper", "standard"))
     parser.add_argument(
         "--standard-plots",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Write the legacy plots/ PNG set in addition to paper plots.",
     )
     parser.add_argument("--no-interactive-plots", action="store_true", help="Keep explainability output static only.")
-    parser.add_argument("--no-shap", action="store_true", help="Skip score-head surrogate SHAP.")
+    parser.add_argument(
+        "--shap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run score-head surrogate SHAP; off by default for throughput.",
+    )
     parser.add_argument("--shap-mode", default="score_head_surrogate", choices=("score_head_surrogate", "off", "none"))
     parser.add_argument("--case-study-top-k", default=5, type=int)
-    parser.add_argument("--no-regime-analysis", action="store_true", help="Skip regime-analysis tables and plots.")
-    parser.add_argument("--no-fold-stability", action="store_true", help="Skip cross-fold attribution-stability summary.")
+    parser.add_argument(
+        "--regime-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run regime-analysis tables and plots; off by default for throughput.",
+    )
+    parser.add_argument(
+        "--fold-stability",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write cross-fold attribution-stability summary; off by default for throughput.",
+    )
     parser.add_argument(
         "--plot-backend",
         default=None,
         choices=("auto", "matplotlib", "rapids_datashader"),
         help="PNG plot backend. auto uses RAPIDS Datashader for dense plots when CUDA is available.",
     )
-    parser.add_argument("--no-umap", action="store_true", help="Skip cuML UMAP aux projections.")
-    parser.add_argument("--umap-max-points", default=10000, type=int)
+    parser.add_argument(
+        "--umap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run cuML UMAP aux projections; off by default for throughput.",
+    )
+    parser.add_argument("--umap-max-points", default=1000, type=int)
     parser.add_argument("--umap-max-projections", default=0, type=int, help="Maximum aux tensors to project with UMAP; 0 means no limit.")
     parser.add_argument("--umap-n-neighbors", default=15, type=int)
     parser.add_argument("--umap-min-dist", default=0.1, type=float)
     parser.add_argument(
         "--cross-asset",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write abstract_cross_asset_transmission outputs. Use --no-cross-asset to disable.",
+        default=False,
+        help="Write abstract_cross_asset_transmission outputs; off by default for throughput.",
     )
-    parser.add_argument("--cross-asset-max-sources", default=24, type=int)
-    parser.add_argument("--cross-asset-max-targets", default=24, type=int)
+    parser.add_argument("--cross-asset-max-sources", default=8, type=int)
+    parser.add_argument("--cross-asset-max-targets", default=8, type=int)
     parser.add_argument("--cross-asset-top-edges", default=150, type=int)
-    parser.add_argument("--cross-asset-source-chunk-size", default=2, type=int)
+    parser.add_argument("--cross-asset-source-chunk-size", default=1, type=int)
     parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
     parser.add_argument(
         "--cross-asset-shocks",
@@ -4038,7 +4167,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Use captured attention as transmission evidence when available.",
     )
-    parser.add_argument("--cross-asset-attention-capture-rows", default=4, type=int)
+    parser.add_argument("--cross-asset-attention-capture-rows", default=1, type=int)
     parser.add_argument(
         "--cross-asset-validated-transmission",
         action=argparse.BooleanOptionalAction,
@@ -4048,7 +4177,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cross-asset-role-embedding",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Write latent role embedding table and plot when aux tensors are available.",
     )
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
@@ -4062,7 +4191,7 @@ def main(argv: list[str] | None = None) -> None:
         max_rows=args.max_rows,
         ig_steps=args.ig_steps,
         ig_batch_size=args.ig_batch_size,
-        perturb=not args.no_perturb,
+        perturb=bool(args.perturb),
         perturb_batch_size=args.perturb_batch_size,
         perturb_max_auto_batch_size=args.perturb_max_auto_batch_size,
         perturb_max_input_elements=args.perturb_max_input_elements,
@@ -4072,12 +4201,12 @@ def main(argv: list[str] | None = None) -> None:
         plot_theme=args.plot_theme,
         standard_plots=bool(args.standard_plots),
         interactive_plots=not args.no_interactive_plots,
-        shap_enabled=not args.no_shap,
+        shap_enabled=bool(args.shap),
         shap_mode=args.shap_mode,
         case_study_top_k=args.case_study_top_k,
-        regime_analysis=not args.no_regime_analysis,
-        fold_stability=not args.no_fold_stability,
-        umap_enabled=not args.no_umap,
+        regime_analysis=bool(args.regime_analysis),
+        fold_stability=bool(args.fold_stability),
+        umap_enabled=bool(args.umap),
         umap_max_points=args.umap_max_points,
         umap_max_projections=args.umap_max_projections,
         umap_n_neighbors=args.umap_n_neighbors,
@@ -4137,7 +4266,7 @@ def main(argv: list[str] | None = None) -> None:
                     settings=settings,
                     device_override=args.device,
                     strict=args.strict,
-                    write_plots=not args.no_plots,
+                    write_plots=bool(args.plots),
                     plot_backend=args.plot_backend,
                 )
             finally:
@@ -4159,7 +4288,7 @@ def main(argv: list[str] | None = None) -> None:
         settings=settings,
         device_override=args.device,
         strict=args.strict,
-        write_plots=not args.no_plots,
+        write_plots=bool(args.plots),
         plot_backend=args.plot_backend,
     )
     print(f"explainability output: {out_dir}")
