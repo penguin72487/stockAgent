@@ -84,9 +84,13 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 18
+PANEL_CACHE_VERSION = 19
 FEATURE_FILE_SUFFIX = "_features.parquet"
 EPSILON = 1e-8
+# Treat single-day price moves beyond +/-100% log-return magnitude as unusable
+# labels/features. The full US universe contains stale/delisted Yahoo rows with
+# penny-to-thousands jumps that otherwise dominate log-return backtests.
+MAX_ABS_DAILY_PRICE_LOG_RETURN = float(np.log(5.0))
 PREV_DAY_LOG_RETURN_RENAME = {
     "open": "open_logret_1d",
     "max": "max_logret_1d",
@@ -368,11 +372,11 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
             ((pl.col("close") - pl.col("min")) / denom).alias("clv"),
             ((pl.col("max") - pl.max_horizontal("open", "close")) / denom).alias("upper_shadow"),
             ((pl.min_horizontal("open", "close") - pl.col("min")) / denom).alias("lower_shadow"),
-            _polars_safe_log(return_price.shift(-1), return_price).alias("return_1d"),
-            _polars_safe_log(pl.col("open"), pl.col("open").shift(1)).alias("open_logret_1d"),
-            _polars_safe_log(pl.col("max"), pl.col("max").shift(1)).alias("max_logret_1d"),
-            _polars_safe_log(pl.col("min"), pl.col("min").shift(1)).alias("min_logret_1d"),
-            _polars_safe_log(pl.col("close"), pl.col("close").shift(1)).alias("close_logret_1d"),
+            _polars_price_log_return(return_price.shift(-1), return_price).alias("return_1d"),
+            _polars_price_log_return(pl.col("open"), pl.col("open").shift(1)).alias("open_logret_1d"),
+            _polars_price_log_return(pl.col("max"), pl.col("max").shift(1)).alias("max_logret_1d"),
+            _polars_price_log_return(pl.col("min"), pl.col("min").shift(1)).alias("min_logret_1d"),
+            _polars_price_log_return(pl.col("close"), pl.col("close").shift(1)).alias("close_logret_1d"),
             _polars_safe_log(volume, volume.shift(1)).alias("trading_volume_logret_1d"),
             tradable_expr.alias("tradable"),
         ]
@@ -472,6 +476,13 @@ def _safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.
     return out
 
 
+def _sanitize_price_log_return_array(values: np.ndarray) -> np.ndarray:
+    out = np.asarray(values, dtype=np.float64).copy()
+    invalid = np.isfinite(out) & (np.abs(out) > MAX_ABS_DAILY_PRICE_LOG_RETURN)
+    out[invalid] = np.nan
+    return out
+
+
 def _polars_safe_log(num, den):
     if pl is None:
         raise RuntimeError("Polars is not available")
@@ -480,6 +491,22 @@ def _polars_safe_log(num, den):
         .then((num / den).log())
         .otherwise(None)
     )
+
+
+def _polars_sanitize_price_log_return(expr):
+    if pl is None:
+        raise RuntimeError("Polars is not available")
+    return (
+        pl.when(expr.is_null() | ~expr.is_finite())
+        .then(None)
+        .when(expr.abs() > MAX_ABS_DAILY_PRICE_LOG_RETURN)
+        .then(None)
+        .otherwise(expr)
+    )
+
+
+def _polars_price_log_return(num, den):
+    return _polars_sanitize_price_log_return(_polars_safe_log(num, den))
 
 
 def _polars_round_half_up(expr, decimals: int):
@@ -591,6 +618,11 @@ def _load_symbol_arrays_pyarrow(path: Path, tradable_mode: str = "tradable") -> 
     max_logret_1d = _safe_log_ratio_array(high_px, _shift_array(high_px, 1))
     min_logret_1d = _safe_log_ratio_array(low_px, _shift_array(low_px, 1))
     close_logret_1d = _safe_log_ratio_array(close_px, _shift_array(close_px, 1))
+    return_1d = _sanitize_price_log_return_array(return_1d)
+    open_logret_1d = _sanitize_price_log_return_array(open_logret_1d)
+    max_logret_1d = _sanitize_price_log_return_array(max_logret_1d)
+    min_logret_1d = _sanitize_price_log_return_array(min_logret_1d)
+    close_logret_1d = _sanitize_price_log_return_array(close_logret_1d)
     trading_volume_logret_1d = _safe_log_ratio_array(volume, _shift_array(volume, 1))
     signed_vol = np.sign(intraday_return_co) * trading_volume_logret_1d
 
@@ -717,11 +749,11 @@ def _load_symbol_arrays_polars_lazy(
             ((pl.col("_close") - pl.col("_min")) / denom).alias("clv"),
             ((pl.col("_max") - pl.max_horizontal("_open", "_close")) / denom).alias("upper_shadow"),
             ((pl.min_horizontal("_open", "_close") - pl.col("_min")) / denom).alias("lower_shadow"),
-            _polars_safe_log(return_price.shift(-1), return_price).alias("return_1d"),
-            _polars_safe_log(pl.col("_open"), pl.col("_open").shift(1)).alias("open_logret_1d"),
-            _polars_safe_log(pl.col("_max"), pl.col("_max").shift(1)).alias("max_logret_1d"),
-            _polars_safe_log(pl.col("_min"), pl.col("_min").shift(1)).alias("min_logret_1d"),
-            _polars_safe_log(pl.col("_close"), pl.col("_close").shift(1)).alias("close_logret_1d"),
+            _polars_price_log_return(return_price.shift(-1), return_price).alias("return_1d"),
+            _polars_price_log_return(pl.col("_open"), pl.col("_open").shift(1)).alias("open_logret_1d"),
+            _polars_price_log_return(pl.col("_max"), pl.col("_max").shift(1)).alias("max_logret_1d"),
+            _polars_price_log_return(pl.col("_min"), pl.col("_min").shift(1)).alias("min_logret_1d"),
+            _polars_price_log_return(pl.col("_close"), pl.col("_close").shift(1)).alias("close_logret_1d"),
             _polars_safe_log(pl.col("_volume"), pl.col("_volume").shift(1)).alias("trading_volume_logret_1d"),
             tradable_expr.alias("tradable"),
         ]

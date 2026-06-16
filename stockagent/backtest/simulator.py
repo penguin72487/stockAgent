@@ -11,6 +11,8 @@ from typing import Callable
 
 import numpy as np
 import torch
+
+from stockagent.runtime_env import normalize_cuda_env
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
 from stockagent.backtest.cpp_long_short import (
@@ -313,6 +315,7 @@ def _torch_dynamo_is_compiling() -> bool:
 
 def _prepend_cuda_toolchain_paths() -> None:
     _configure_compile_cache_paths()
+    normalize_cuda_env()
     env_bin = Path(sys.executable).resolve().parent
     env_root = env_bin.parent
     os.environ.setdefault("CONDA_PREFIX", str(env_root))

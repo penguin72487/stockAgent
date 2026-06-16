@@ -3,13 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import shutil
+import warnings
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from stockagent.data.panel import PanelData
+from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import (
     ExplainabilitySettings,
+    _save_matplotlib_figure,
+    _with_numeric,
     explain_batch,
+    run_loaded_model_explanation,
     write_fold_stability_outputs,
     write_explanation_outputs,
 )
@@ -33,6 +40,41 @@ class ToyExplainableModel(torch.nn.Module):
             "z_feat": x[:, -1],
             "aux": {"z_set": x.mean(dim=1)},
         }
+
+
+def test_save_matplotlib_figure_suppresses_transform_dot_warning(monkeypatch, tmp_path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    ax.plot([0.0, 1.0], [0.0, 1.0])
+    output_path = tmp_path / "plot.png"
+
+    def noisy_savefig(path: str | Path, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        warnings.warn("invalid value encountered in dot", RuntimeWarning, stacklevel=1)
+        Path(path).write_bytes(b"plot")
+
+    monkeypatch.setattr(fig, "savefig", noisy_savefig)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            _save_matplotlib_figure(fig, output_path)
+        assert output_path.exists()
+    finally:
+        plt.close(fig)
+
+
+def test_with_numeric_masks_nonfinite_values_before_plotting() -> None:
+    import polars as pl
+
+    frame = pl.DataFrame({"metric": [1.0, float("inf"), float("-inf"), float("nan"), None]})
+
+    cleaned = _with_numeric(frame, "metric")
+
+    assert cleaned.get_column("metric").to_list() == [1.0, None, None, None, None]
 
 
 def test_explainability_smoke(tmp_path: Path) -> None:
@@ -205,3 +247,73 @@ def test_paper_fold_stability_outputs(tmp_path: Path) -> None:
     assert (output / "paper_tables" / "fold_feature_stability.csv").exists()
     assert (output / "plots_paper" / "fold_stability_feature_share.png").exists()
     assert (output / "paper_fold_stability_report.md").exists()
+
+
+def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path) -> None:
+    torch.manual_seed(7)
+    rows, lookback, symbols, features = 6, 2, 4, 3
+    panel = PanelData(
+        dates=np.arange(rows).astype("datetime64[D]"),
+        symbols=[f"S{i}" for i in range(symbols)],
+        feature_names=[f"f{i}" for i in range(features)],
+        features=torch.randn(rows, symbols, features).numpy(),
+        returns_1d=(torch.randn(rows, symbols) * 0.01).numpy(),
+        tradable_mask=torch.ones(rows, symbols, dtype=torch.bool).numpy(),
+        can_buy_mask=torch.ones(rows, symbols, dtype=torch.bool).numpy(),
+        can_sell_mask=torch.ones(rows, symbols, dtype=torch.bool).numpy(),
+        alive_mask=torch.ones(rows, symbols, dtype=torch.bool).numpy(),
+        benchmark_returns=(torch.randn(rows) * 0.01).numpy(),
+        close_prices=torch.ones(rows, symbols).numpy(),
+    )
+    fold = WalkForwardFold(
+        fold_id=1,
+        train_indices=np.arange(0, 2),
+        val_indices=np.arange(2, 3),
+        test_indices=np.arange(3, rows),
+        train_years=[1970],
+        val_years=[1970],
+        test_years=[1970],
+    )
+    config = SimpleNamespace(training=SimpleNamespace(model_name="toy", lookback=lookback))
+    settings = ExplainabilitySettings(
+        top_k=2,
+        max_rows=2,
+        ig_steps=0,
+        perturb=False,
+        report_style="none",
+        standard_plots=False,
+        shap_enabled=False,
+        regime_analysis=False,
+        fold_stability=False,
+        umap_enabled=False,
+        cross_asset_enabled=False,
+    )
+
+    output = run_loaded_model_explanation(
+        config=config,
+        panel=panel,
+        fold=fold,
+        model=ToyExplainableModel(features),
+        checkpoint_path=tmp_path / "fold_01" / "checkpoint_best.pt",
+        output_dir=tmp_path,
+        split="test",
+        explain_output_dir=None,
+        settings=settings,
+        write_plots=False,
+        plot_backend="matplotlib",
+        device=torch.device("cpu"),
+        checkpoint_info={"checkpoint_epoch": 3},
+        timing_file_name="train_explainability_timing.json",
+    )
+
+    assert output == tmp_path / "explainability" / "fold_01_test"
+    assert (output / "summary.json").exists()
+    assert (output / "report.md").exists()
+    assert (output / "explainability_timing.json").exists()
+    assert (output / "train_explainability_timing.json").exists()
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    timing = json.loads((output / "train_explainability_timing.json").read_text(encoding="utf-8"))
+    assert summary["report_style"] == "none"
+    assert summary["rows"] == 2
+    assert timing["loaded_model_reused"] is True
+    assert timing["compute_timing"]["total_s"] >= 0

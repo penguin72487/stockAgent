@@ -68,6 +68,7 @@ training:
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
+  backtest_cpp_ext: false
   backtest_verbose: false
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
@@ -129,6 +130,8 @@ training:
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true
   save_integer_share_holdings_table: true
+  # Legacy CSV-specific switches still feed runtime fallbacks; keep disabled
+  # while table_output_format=parquet is the default training output.
   save_integer_share_daily_weights_csv: false
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
@@ -138,13 +141,13 @@ training:
   learning_rate: 0.0001
   enable_lr_scheduler: false
   lr_scheduler: plateau
+  lr_scheduler_t_max: 0
+  lr_scheduler_eta_min: 0.00001
+  lr_scheduler_step_size: 50
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 10
   lr_scheduler_threshold: 0.001
   top_k: 10
-  hidden_dim: 1024
-  hidden_layers: 1
-  dropout: 0.1
   num_workers: 0
   weight_decay: 0.1
   grad_clip_norm: 0.0
@@ -155,6 +158,8 @@ training:
   vram_budget_gb: 16
   vram_safety_margin_gb: 1.5
   target_vram_fraction: 0.85
+  # Model branches. Only the block named by training.model_name is active.
+  # Current active branch: transformer_base_portfolio.
   mlp:
     hidden_dim: 1024
     hidden_layers: 2
@@ -249,6 +254,7 @@ training:
     portfolio_mode: long_short
     return_aux: true
     return_aux_details: false
+  # Active model branch for this experiment.
   transformer_base_portfolio:
     d_model: 32
     # full: most complete O((lookback*stocks)^2), small universes only
@@ -296,7 +302,7 @@ training:
     checkpoint_blocks: false
     return_aux: false
     return_aux_details: false
-     # return_aux_details: whether to return detailed aux outputs for analysis, such as attention weights and latent factors. Setting this to true may increase memory usage and reduce training speed, so it is typically set to false during training and true during inference or analysis.
+    # return_aux_details returns attention/factor internals; keep false for training speed.
   bottleneck_portfolio_autoencoder:
     d_model: 64
     z_dim: 32
@@ -327,6 +333,17 @@ training:
     n_blocks: 4
     dropout: 0.1
   cross_sectional_temporal_portfolio_model:
+    stock_embedding_dim: 128
+    stock_hidden_dim: 128
+    stock_n_blocks: 2
+    temporal_hidden_dim: 128
+    temporal_blocks: 2
+    temporal_kernel_size: 3
+    cross_hidden_dim: 128
+    cross_heads: 4
+    cross_layers: 2
+    candidate_top_m: 64
+    portfolio_top_k: 10
     candidate_k: 64
     trade_k: 10
     scorer: tabular_resnet

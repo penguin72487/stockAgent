@@ -82,7 +82,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Conda or mamba environment: `fintech`
 - Training target: CUDA with Tensor Core acceleration
 - Recommended activation command: `mamba activate fintech`
-- Shell runners default to `/home/user/miniforge3/envs/fintech/bin/python` on WSL; override with `PYTHON_BIN=/path/to/python` if needed.
+- Shell runners auto-detect the active `fintech` conda/mamba environment across common WSL install paths; override with `PYTHON_BIN=/path/to/python` if needed.
 mamba env export -n fintech --no-builds > fintech_environment.yml
 mamba env update -n fintech -f fintech_environment.yml
 

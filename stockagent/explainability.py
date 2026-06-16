@@ -7,6 +7,7 @@ import json
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -73,6 +74,51 @@ PAPER_TOKENS = {
     "neutral_mid": "#7A828F",
     "neutral_dark": "#464C55",
 }
+
+_MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+
+
+def _sanitize_matplotlib_axis_limits(fig: Any) -> None:
+    for ax in getattr(fig, "axes", ()):
+        axis_specs = (
+            ("x", ax.get_xlim, ax.set_xlim),
+            ("y", ax.get_ylim, ax.set_ylim),
+        )
+        for axis_name, getter, setter in axis_specs:
+            try:
+                lo, hi = getter()
+            except Exception:
+                continue
+            if np.isfinite([lo, hi]).all() and lo != hi:
+                continue
+            default = (1e-12, 1.0) if (axis_name == "y" and ax.get_yscale() == "log") else (0.0, 1.0)
+            try:
+                setter(*default)
+            except Exception:
+                pass
+
+
+def _safe_matplotlib_tight_layout(fig: Any) -> None:
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        fig.tight_layout()
+
+
+def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        fig.savefig(output_path, **kwargs)
 
 FEATURE_GROUP_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Return", ("logret", "return", "ret_", "_ret")),
@@ -151,6 +197,54 @@ def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
         attention_capture_rows=max(1, int(settings.cross_asset_attention_capture_rows)),
         validated_transmission=bool(settings.cross_asset_validated_transmission),
         role_embedding=bool(settings.cross_asset_role_embedding),
+    )
+
+
+def settings_from_training_config(training: Any) -> ExplainabilitySettings:
+    """Build the post-training explainability settings from TrainingConfig.
+
+    Keep these defaults aligned with explain_model.py CLI defaults, not with the
+    historical ExplainabilitySettings dataclass defaults.
+    """
+
+    return ExplainabilitySettings(
+        top_k=int(getattr(training, "explain_top_k", 20)),
+        max_rows=int(getattr(training, "explain_max_rows", 32)),
+        ig_steps=int(getattr(training, "explain_ig_steps", 0)),
+        ig_batch_size=int(getattr(training, "explain_ig_batch_size", 1)),
+        perturb=bool(getattr(training, "explain_perturb", False)),
+        perturb_batch_size=int(getattr(training, "explain_perturb_batch_size", 1)),
+        perturb_max_auto_batch_size=int(getattr(training, "explain_perturb_max_auto_batch_size", 1)),
+        perturb_max_input_elements=int(getattr(training, "explain_perturb_max_input_elements", 8_000_000)),
+        sample_method=str(getattr(training, "explain_sample_method", "even")),
+        first_test_year_only=bool(getattr(training, "explain_first_test_year_only", True)),
+        report_style=str(getattr(training, "explain_report_style", "none")),
+        plot_theme=str(getattr(training, "explain_plot_theme", "paper")),
+        standard_plots=bool(getattr(training, "explain_standard_plots", False)),
+        interactive_plots=bool(getattr(training, "explain_interactive_plots", False)),
+        shap_enabled=bool(getattr(training, "explain_shap_enabled", False)),
+        shap_mode=str(getattr(training, "explain_shap_mode", "score_head_surrogate")),
+        case_study_top_k=int(getattr(training, "explain_case_study_top_k", 5)),
+        regime_analysis=bool(getattr(training, "explain_regime_analysis", False)),
+        fold_stability=bool(getattr(training, "explain_fold_stability", False)),
+        umap_enabled=bool(getattr(training, "explain_umap_enabled", False)),
+        umap_max_points=int(getattr(training, "explain_umap_max_points", 1000)),
+        umap_max_projections=int(getattr(training, "explain_umap_max_projections", 0)),
+        umap_n_neighbors=int(getattr(training, "explain_umap_n_neighbors", 15)),
+        umap_min_dist=float(getattr(training, "explain_umap_min_dist", 0.1)),
+        cross_asset_enabled=bool(getattr(training, "explain_cross_asset_enabled", False)),
+        cross_asset_max_sources=int(getattr(training, "explain_cross_asset_max_sources", 8)),
+        cross_asset_max_targets=int(getattr(training, "explain_cross_asset_max_targets", 8)),
+        cross_asset_top_edges=int(getattr(training, "explain_cross_asset_top_edges", 150)),
+        cross_asset_source_chunk_size=int(getattr(training, "explain_cross_asset_source_chunk_size", 1)),
+        cross_asset_perturb_scale=float(getattr(training, "explain_cross_asset_perturb_scale", 1.0)),
+        cross_asset_shocks=tuple(getattr(training, "explain_cross_asset_shocks", ())),
+        cross_asset_attention_flow=bool(getattr(training, "explain_cross_asset_attention_flow", True)),
+        cross_asset_attention_capture_rows=int(getattr(training, "explain_cross_asset_attention_capture_rows", 1)),
+        cross_asset_validated_transmission=bool(
+            getattr(training, "explain_cross_asset_validated_transmission", True)
+        ),
+        cross_asset_role_embedding=bool(getattr(training, "explain_cross_asset_role_embedding", False)),
     )
 
 
@@ -254,7 +348,8 @@ def _concat_frames(frames: list[pl.DataFrame]) -> pl.DataFrame:
 
 
 def _numeric_expr(column: str) -> pl.Expr:
-    return pl.col(column).cast(pl.Float64, strict=False).fill_nan(None)
+    value = pl.col(column).cast(pl.Float64, strict=False).fill_nan(None)
+    return pl.when(value.is_finite()).then(value).otherwise(None)
 
 
 def _with_numeric(frame: pl.DataFrame, *columns: str) -> pl.DataFrame:
@@ -2493,7 +2588,7 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
     )
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2561,7 +2656,7 @@ def _plot_paper_feature_time_heatmap(
     ax.tick_params(axis="y", labelsize=8)
     _add_paper_header(fig, ax, title, subtitle)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2589,7 +2684,7 @@ def _plot_paper_time_importance(frame: pl.DataFrame, *, output_path: Path, value
     _add_paper_header(fig, ax, "Temporal attribution across the lookback window", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2627,7 +2722,7 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
     _add_paper_header(fig, ax, "Simple feature correlations test for shortcut rules", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2650,7 +2745,7 @@ def _plot_paper_trust_checks(frame: pl.DataFrame, *, output_path: Path, subtitle
     _add_paper_header(fig, ax, "Strategy trust checks highlight concentration, masking, and shortcut risks", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2674,7 +2769,7 @@ def _plot_paper_regime(frame: pl.DataFrame, *, output_path: Path, subtitle: str)
     _add_paper_header(fig, ax, "Performance by market regime checks whether the rule survives different states", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2698,7 +2793,7 @@ def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle
     _add_paper_header(fig, ax, "Case-study trades show which names drove wins and losses", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -2717,7 +2812,7 @@ def _plot_paper_aux_summary(frame: pl.DataFrame, *, output_path: Path, subtitle:
     _add_paper_header(fig, ax, "Latent and market-token diagnostics check whether representations collapse", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -3099,7 +3194,7 @@ def write_fold_stability_outputs(explainability_root: Path) -> Path | None:
         fold_count = int(combined.select(pl.col("fold_id").n_unique()).item())
         _add_paper_header(fig, ax, "Fold stability shows whether the same features remain important", f"Computed across {fold_count} fold explainability outputs.")
         _finish_paper_axes(ax)
-        fig.savefig(plot_dir / "fold_stability_feature_share.png")
+        _save_matplotlib_figure(fig, plot_dir / "fold_stability_feature_share.png")
         plt.close(fig)
     report = [
         "# Paper Fold Stability Summary",
@@ -3146,9 +3241,9 @@ def _plot_barh(
     ax.set_title(title)
     ax.set_xlabel(value_col)
     ax.grid(True, axis="x", alpha=0.25)
-    fig.tight_layout()
+    _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -3173,9 +3268,9 @@ def _plot_time_importance(
     ax.set_xlabel("lookback_from_end (0 = latest)")
     ax.set_ylabel(value_col)
     ax.grid(True, axis="y", alpha=0.25)
-    fig.tight_layout()
+    _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -3222,9 +3317,9 @@ def _plot_feature_time_heatmap(
     ax.set_yticks(np.arange(len(labels)))
     ax.set_yticklabels([str(idx) for idx in labels])
     fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
-    fig.tight_layout()
+    _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -3298,9 +3393,9 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     ax.set_xlabel("correlation")
     ax.grid(True, axis="x", alpha=0.25)
     ax.legend()
-    fig.tight_layout()
+    _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -3334,9 +3429,9 @@ def _plot_decision_exposure(frame: pl.DataFrame, output_path: Path) -> None:
     ax.set_ylabel("sum abs(weight)")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend()
-    fig.tight_layout()
+    _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -3601,9 +3696,9 @@ def _plot_all_explanation_figures(
                 ax.set_title(f"cuML UMAP Projection: {name}")
                 ax.set_xlabel("umap_x")
                 ax.set_ylabel("umap_y")
-                fig.tight_layout()
+                _safe_matplotlib_tight_layout(fig)
                 out.parent.mkdir(parents=True, exist_ok=True)
-                fig.savefig(out)
+                _save_matplotlib_figure(fig, out)
                 plt.close(fig)
         else:
             if _is_empty_frame(frame) or not {"umap_x", "umap_y"}.issubset(frame.columns):
@@ -3618,9 +3713,9 @@ def _plot_all_explanation_figures(
             ax.set_title(f"cuML UMAP Projection: {name}")
             ax.set_xlabel("umap_x")
             ax.set_ylabel("umap_y")
-            fig.tight_layout()
+            _safe_matplotlib_tight_layout(fig)
             out.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out)
+            _save_matplotlib_figure(fig, out)
             plt.close(fig)
         if out.exists():
             generated.append(out)
@@ -3928,6 +4023,208 @@ def load_explanation_context(
     )
 
 
+def _write_cross_asset_skip(
+    cross_asset_dir: Path,
+    *,
+    reason: str,
+    message: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    cross_asset_dir.mkdir(parents=True, exist_ok=True)
+    skipped: dict[str, Any] = {
+        "enabled": False,
+        "module": "abstract_cross_asset_transmission",
+        "skipped_reason": reason,
+    }
+    if error is not None:
+        skipped["error"] = error
+    (cross_asset_dir / "abstract_cross_asset_summary.json").write_text(
+        json.dumps(skipped, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (cross_asset_dir / "abstract_cross_asset_report.md").write_text(
+        "# Abstract Cross-Asset Transmission\n\n" + message.rstrip() + "\n",
+        encoding="utf-8",
+    )
+    return skipped
+
+
+def run_loaded_model_explanation(
+    *,
+    config: ExperimentConfig,
+    panel: PanelData,
+    fold: WalkForwardFold,
+    model: nn.Module,
+    checkpoint_path: Path,
+    output_dir: Path,
+    split: str,
+    explain_output_dir: Path | None,
+    settings: ExplainabilitySettings,
+    write_plots: bool = True,
+    plot_backend: str | None = None,
+    device: torch.device | None = None,
+    checkpoint_info: dict[str, Any] | None = None,
+    timing_file_name: str | None = None,
+    write_fold_stability: bool = False,
+) -> Path:
+    total_start = time.perf_counter()
+    device = device or next(model.parameters()).device
+    split_norm = split.strip().lower()
+    runner_timing: dict[str, float | str | int | bool] = {
+        "fold_id": int(fold.fold_id),
+        "split": split_norm,
+        "enabled": True,
+        "loaded_model_reused": True,
+    }
+    sample_start = time.perf_counter()
+    dataset = _dataset_for_split(
+        panel,
+        fold,
+        split_norm,
+        config.training.lookback,
+        first_test_year_only=settings.first_test_year_only,
+    )
+    batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
+    dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
+    runner_timing["sample_s"] = float(time.perf_counter() - sample_start)
+    runner_timing["sample_rows"] = int(len(dates))
+    runner_timing["ig_steps"] = int(settings.ig_steps)
+    runner_timing["perturb"] = bool(settings.perturb)
+    runner_timing["write_plots"] = bool(write_plots)
+
+    was_training = model.training
+    model.eval()
+    compute_start = time.perf_counter()
+    try:
+        result = explain_batch_row_chunked(
+            model,
+            batch,
+            feature_names=panel.feature_names,
+            symbols=panel.symbols,
+            dates=dates,
+            settings=settings,
+            device=device,
+        )
+    finally:
+        if was_training:
+            model.train()
+    runner_timing["compute_s"] = float(time.perf_counter() - compute_start)
+
+    destination = explain_output_dir or (
+        output_dir
+        / "explainability"
+        / f"fold_{int(fold.fold_id):02d}_{split_norm}"
+    )
+    metadata = {
+        "model_name": config.training.model_name,
+        "fold_id": int(fold.fold_id),
+        "split": split_norm,
+        "checkpoint": str(checkpoint_path),
+        "device": str(device),
+        "sample_rows": int(len(dates)),
+        "first_test_year_only": bool(settings.first_test_year_only),
+        "config_lookback": int(config.training.lookback),
+        "date_start": dates[0] if dates else None,
+        "date_end": dates[-1] if dates else None,
+        **(checkpoint_info or {}),
+    }
+    resolved_plot_backend = plot_backend or str(getattr(config.training, "plot_backend", "auto"))
+    write_start = time.perf_counter()
+    write_explanation_outputs(
+        result,
+        destination,
+        metadata=metadata,
+        write_plots=write_plots,
+        write_standard_plots=bool(settings.standard_plots),
+        plot_backend=resolved_plot_backend,
+        report_style=settings.report_style,
+        plot_theme=settings.plot_theme,
+    )
+    runner_timing["write_s"] = float(time.perf_counter() - write_start)
+    cross_asset_summary: dict[str, Any] = {}
+    if bool(settings.cross_asset_enabled):
+        from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
+
+        row_chunking = result.get("summary", {}).get("row_chunking", {})
+        cross_asset_dir = destination / "abstract_cross_asset_transmission"
+        skip_cross_asset = bool(isinstance(row_chunking, dict) and row_chunking.get("cuda_oom_fallback"))
+        cross_asset_start = time.perf_counter()
+        if skip_cross_asset:
+            cross_asset_summary = _write_cross_asset_skip(
+                cross_asset_dir,
+                reason="main_explainability_cuda_oom_fallback",
+                message="Skipped because main explainability already required CUDA OOM fallback.",
+            )
+            print("[explain] cross-asset skipped after CUDA OOM fallback in main explainability")
+        else:
+            try:
+                cross_asset_summary = abstract_cross_asset_transmission(
+                    model,
+                    batch,
+                    feature_names=panel.feature_names,
+                    symbols=panel.symbols,
+                    dates=dates,
+                    output_dir=destination,
+                    settings=_cross_asset_settings_from_explainability(settings),
+                    device=device,
+                )
+            except RuntimeError as exc:
+                if not _is_cuda_oom(exc):
+                    raise
+                _clear_explainability_runtime_cache()
+                cross_asset_summary = _write_cross_asset_skip(
+                    cross_asset_dir,
+                    reason="cuda_oom",
+                    message="Skipped after CUDA out-of-memory during cross-asset analysis.",
+                    error=str(exc),
+                )
+                print("[explain] cross-asset skipped after CUDA OOM")
+        runner_timing["cross_asset_s"] = float(time.perf_counter() - cross_asset_start)
+    else:
+        runner_timing["cross_asset_s"] = 0.0
+
+    if write_fold_stability and bool(settings.fold_stability):
+        stability_start = time.perf_counter()
+        stability_dir = write_fold_stability_outputs(output_dir / "explainability")
+        runner_timing["fold_stability_s"] = float(time.perf_counter() - stability_start)
+        runner_timing["fold_stability_output"] = str(stability_dir) if stability_dir is not None else ""
+    else:
+        runner_timing["fold_stability_s"] = 0.0
+
+    runner_timing["total_s"] = float(time.perf_counter() - total_start)
+    if timing_file_name:
+        timing_path = destination / timing_file_name
+        timing_path.write_text(
+            json.dumps(
+                _to_builtin(
+                    {
+                        **runner_timing,
+                        "compute_timing": result.get("summary", {}).get("timing", {}),
+                        "write_timing": result.get("summary", {}).get("write_timing", {}),
+                        "cross_asset_summary": cross_asset_summary,
+                    }
+                ),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            f"[Fold {fold.fold_id}] explainability timing: "
+            f"total={float(runner_timing['total_s']):.3f}s "
+            f"compute={float(runner_timing['compute_s']):.3f}s "
+            f"write={float(runner_timing['write_s']):.3f}s "
+            f"cross_asset={float(runner_timing['cross_asset_s']):.3f}s "
+            f"stability={float(runner_timing['fold_stability_s']):.3f}s "
+            f"json={timing_path}"
+        )
+
+    destination_out = destination
+    del result, batch, dataset, model
+    _clear_explainability_runtime_cache()
+    return destination_out
+
+
 def run_checkpoint_explanation(
     *,
     config_path: Path,
@@ -3961,113 +4258,21 @@ def run_checkpoint_explanation(
         device,
         strict=strict,
     )
-    dataset = _dataset_for_split(
-        context.panel,
-        context.fold,
-        split,
-        context.config.training.lookback,
-        first_test_year_only=settings.first_test_year_only,
-    )
-    batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
-    dates = [str(np.datetime_as_string(context.panel.dates[int(idx)], unit="D")) for idx in date_indices]
-    result = explain_batch_row_chunked(
-        model,
-        batch,
-        feature_names=context.panel.feature_names,
-        symbols=context.panel.symbols,
-        dates=dates,
+    return run_loaded_model_explanation(
+        config=context.config,
+        panel=context.panel,
+        fold=context.fold,
+        model=model,
+        checkpoint_path=context.checkpoint_path,
+        output_dir=context.output_dir,
+        split=split,
+        explain_output_dir=explain_output_dir,
         settings=settings,
-        device=device,
-    )
-    destination = explain_output_dir or (
-        context.output_dir
-        / "explainability"
-        / f"fold_{int(context.fold.fold_id):02d}_{split.strip().lower()}"
-    )
-    metadata = {
-        "model_name": context.config.training.model_name,
-        "fold_id": int(context.fold.fold_id),
-        "split": split,
-        "checkpoint": str(context.checkpoint_path),
-        "device": str(device),
-        "sample_rows": int(len(dates)),
-        "first_test_year_only": bool(settings.first_test_year_only),
-        "config_lookback": int(context.config.training.lookback),
-        "date_start": dates[0] if dates else None,
-        "date_end": dates[-1] if dates else None,
-        **checkpoint_info,
-    }
-    resolved_plot_backend = plot_backend or str(getattr(context.config.training, "plot_backend", "auto"))
-    write_explanation_outputs(
-        result,
-        destination,
-        metadata=metadata,
         write_plots=write_plots,
-        write_standard_plots=bool(settings.standard_plots),
-        plot_backend=resolved_plot_backend,
-        report_style=settings.report_style,
-        plot_theme=settings.plot_theme,
+        plot_backend=plot_backend,
+        device=device,
+        checkpoint_info=checkpoint_info,
     )
-    if bool(settings.cross_asset_enabled):
-        from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
-
-        row_chunking = result.get("summary", {}).get("row_chunking", {})
-        cross_asset_dir = destination / "abstract_cross_asset_transmission"
-        skip_cross_asset = bool(isinstance(row_chunking, dict) and row_chunking.get("cuda_oom_fallback"))
-        if skip_cross_asset:
-            cross_asset_dir.mkdir(parents=True, exist_ok=True)
-            skipped = {
-                "enabled": False,
-                "module": "abstract_cross_asset_transmission",
-                "skipped_reason": "main_explainability_cuda_oom_fallback",
-            }
-            (cross_asset_dir / "abstract_cross_asset_summary.json").write_text(
-                json.dumps(skipped, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            (cross_asset_dir / "abstract_cross_asset_report.md").write_text(
-                "# Abstract Cross-Asset Transmission\n\n"
-                "Skipped because main explainability already required CUDA OOM fallback.\n",
-                encoding="utf-8",
-            )
-            print("[explain] cross-asset skipped after CUDA OOM fallback in main explainability")
-        else:
-            try:
-                abstract_cross_asset_transmission(
-                    model,
-                    batch,
-                    feature_names=context.panel.feature_names,
-                    symbols=context.panel.symbols,
-                    dates=dates,
-                    output_dir=destination,
-                    settings=_cross_asset_settings_from_explainability(settings),
-                    device=device,
-                )
-            except RuntimeError as exc:
-                if not _is_cuda_oom(exc):
-                    raise
-                _clear_explainability_runtime_cache()
-                cross_asset_dir.mkdir(parents=True, exist_ok=True)
-                skipped = {
-                    "enabled": False,
-                    "module": "abstract_cross_asset_transmission",
-                    "skipped_reason": "cuda_oom",
-                    "error": str(exc),
-                }
-                (cross_asset_dir / "abstract_cross_asset_summary.json").write_text(
-                    json.dumps(skipped, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                (cross_asset_dir / "abstract_cross_asset_report.md").write_text(
-                    "# Abstract Cross-Asset Transmission\n\n"
-                    "Skipped after CUDA out-of-memory during cross-asset analysis.\n",
-                    encoding="utf-8",
-                )
-                print("[explain] cross-asset skipped after CUDA OOM")
-    destination_out = destination
-    del result, batch, dataset, model
-    _clear_explainability_runtime_cache()
-    return destination_out
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -4081,53 +4286,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
     parser.add_argument("--top-k", default=20, type=int)
     parser.add_argument("--max-rows", default=32, type=int)
-    parser.add_argument("--ig-steps", default=0, type=int)
+    parser.add_argument("--ig-steps", default=8, type=int)
     parser.add_argument("--ig-batch-size", default=0, type=int, help="Batch IG alpha steps together; 0 selects an automatic safe chunk size.")
     parser.add_argument("--sample-method", default="even", choices=("even", "first", "last"))
     parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
     parser.add_argument(
         "--perturb",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Run feature perturbation sensitivity; off by default for throughput.",
+        default=True,
+        help="Run feature perturbation sensitivity; on by default for complete offline explainability.",
     )
     parser.add_argument("--perturb-batch-size", default=0, type=int, help="Batch feature-day perturbations together; 0 selects an automatic safe chunk size.")
-    parser.add_argument("--perturb-max-auto-batch-size", default=1, type=int)
-    parser.add_argument("--perturb-max-input-elements", default=8_000_000, type=int)
+    parser.add_argument("--perturb-max-auto-batch-size", default=5, type=int)
+    parser.add_argument("--perturb-max-input-elements", default=32_000_000, type=int)
     parser.add_argument(
         "--plots",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Write PNG plots; off by default for throughput.",
+        default=True,
+        help="Write PNG plots; on by default for complete offline explainability.",
     )
-    parser.add_argument("--report-style", default="none", choices=("paper", "standard", "none"))
+    parser.add_argument("--report-style", default="paper", choices=("paper", "standard", "none"))
     parser.add_argument("--plot-theme", default="paper", choices=("paper", "standard"))
     parser.add_argument(
         "--standard-plots",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Write the legacy plots/ PNG set in addition to paper plots.",
     )
     parser.add_argument("--no-interactive-plots", action="store_true", help="Keep explainability output static only.")
     parser.add_argument(
         "--shap",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Run score-head surrogate SHAP; off by default for throughput.",
+        default=True,
+        help="Run score-head surrogate SHAP; on by default for complete offline explainability.",
     )
     parser.add_argument("--shap-mode", default="score_head_surrogate", choices=("score_head_surrogate", "off", "none"))
     parser.add_argument("--case-study-top-k", default=5, type=int)
     parser.add_argument(
         "--regime-analysis",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Run regime-analysis tables and plots; off by default for throughput.",
+        default=True,
+        help="Run regime-analysis tables and plots; on by default for complete offline explainability.",
     )
     parser.add_argument(
         "--fold-stability",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Write cross-fold attribution-stability summary; off by default for throughput.",
+        default=True,
+        help="Write cross-fold attribution-stability summary; on by default for complete offline explainability.",
     )
     parser.add_argument(
         "--plot-backend",
@@ -4138,23 +4343,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--umap",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Run cuML UMAP aux projections; off by default for throughput.",
+        default=True,
+        help="Run cuML UMAP aux projections; on by default for complete offline explainability.",
     )
-    parser.add_argument("--umap-max-points", default=1000, type=int)
+    parser.add_argument("--umap-max-points", default=10000, type=int)
     parser.add_argument("--umap-max-projections", default=0, type=int, help="Maximum aux tensors to project with UMAP; 0 means no limit.")
     parser.add_argument("--umap-n-neighbors", default=15, type=int)
     parser.add_argument("--umap-min-dist", default=0.1, type=float)
     parser.add_argument(
         "--cross-asset",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Write abstract_cross_asset_transmission outputs; off by default for throughput.",
+        default=True,
+        help="Write abstract_cross_asset_transmission outputs; on by default for complete offline explainability.",
     )
-    parser.add_argument("--cross-asset-max-sources", default=8, type=int)
-    parser.add_argument("--cross-asset-max-targets", default=8, type=int)
+    parser.add_argument("--cross-asset-max-sources", default=24, type=int)
+    parser.add_argument("--cross-asset-max-targets", default=24, type=int)
     parser.add_argument("--cross-asset-top-edges", default=150, type=int)
-    parser.add_argument("--cross-asset-source-chunk-size", default=1, type=int)
+    parser.add_argument("--cross-asset-source-chunk-size", default=2, type=int)
     parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
     parser.add_argument(
         "--cross-asset-shocks",
@@ -4167,7 +4372,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Use captured attention as transmission evidence when available.",
     )
-    parser.add_argument("--cross-asset-attention-capture-rows", default=1, type=int)
+    parser.add_argument("--cross-asset-attention-capture-rows", default=4, type=int)
     parser.add_argument(
         "--cross-asset-validated-transmission",
         action=argparse.BooleanOptionalAction,
@@ -4177,7 +4382,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cross-asset-role-embedding",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Write latent role embedding table and plot when aux tensors are available.",
     )
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
@@ -4250,26 +4455,45 @@ def main(argv: list[str] | None = None) -> None:
         if not fold_ids:
             raise FileNotFoundError(f"No fold checkpoint_best.pt found under {resolved_output_dir}")
 
+        device = _device_from_config(config, args.device)
+        if device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        folds_by_id = {int(fold.fold_id): fold for fold in folds}
         print(f"explaining folds: {fold_ids}")
         for fold_id in fold_ids:
             fold_output_dir = args.explain_output_dir
             if fold_output_dir is not None:
                 fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
+            checkpoint_path = _fold_dir(resolved_output_dir, fold_id) / "checkpoint_best.pt"
+            model: nn.Module | None = None
             try:
-                out_dir = run_checkpoint_explanation(
-                    config_path=args.config,
-                    output_dir=args.output_dir,
-                    fold_id=fold_id,
-                    checkpoint=None,
+                model, checkpoint_info = load_model_from_checkpoint(
+                    config,
+                    panel,
+                    checkpoint_path,
+                    device,
+                    strict=args.strict,
+                )
+                out_dir = run_loaded_model_explanation(
+                    config=config,
+                    panel=panel,
+                    fold=folds_by_id[int(fold_id)],
+                    model=model,
+                    checkpoint_path=checkpoint_path,
+                    output_dir=resolved_output_dir,
                     split=args.split,
                     explain_output_dir=fold_output_dir,
                     settings=settings,
-                    device_override=args.device,
-                    strict=args.strict,
                     write_plots=bool(args.plots),
                     plot_backend=args.plot_backend,
+                    device=device,
+                    checkpoint_info=checkpoint_info,
                 )
             finally:
+                if model is not None:
+                    del model
                 _clear_explainability_runtime_cache()
             print(f"explainability output (fold {fold_id}): {out_dir}")
         if settings.fold_stability:

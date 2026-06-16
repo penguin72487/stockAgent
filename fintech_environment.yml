@@ -652,5 +652,3 @@ dependencies:
     - tensorrt_cu13_bindings==11.0.0.114
     - tensorrt_cu13_libs==11.0.0.114
     - transformer_engine==2.16.0+4220403
-
-prefix: "/root/miniforge3/envs/fintech"
