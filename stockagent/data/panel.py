@@ -33,6 +33,11 @@ from stockagent.data.panel_cache import (
     save_panel_cache_v2,
 )
 
+try:
+    from stockagent.data import panel_numba as _panel_numba
+except Exception:  # pragma: no cover - Numba is an acceleration dependency
+    _panel_numba = None
+
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
 LOG_RETURN_FEATURE_COLUMNS = [
@@ -145,6 +150,8 @@ def _require_trading_volume_column(path: Path, columns: set[str], policy: str | 
 
 def _round_half_up(values: np.ndarray, decimals: int = 2) -> np.ndarray:
     """Round with half-up semantics (0.5 always rounds away from zero)."""
+    if _panel_numba is not None:
+        return _panel_numba.round_half_up(values, decimals=decimals)
     arr = np.asarray(values, dtype=np.float64)
     factor = float(10**decimals)
     out = np.full(arr.shape, np.nan, dtype=np.float64)
@@ -218,6 +225,8 @@ def _is_usd_trading_pair(path: Path) -> bool:
 
 def _tw_tick_size(price: np.ndarray) -> np.ndarray:
     """TWSE tick size by price bucket (vectorized)."""
+    if _panel_numba is not None:
+        return _panel_numba.tw_tick_size(price)
     p = np.asarray(price, dtype=np.float64)
     tick = np.full(p.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(p) & (p > 0.0)
@@ -277,6 +286,8 @@ def _frame_column_bool_array(frame: Any, name: str, *, default: bool = False) ->
 
 def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
     """Compute TW daily limit price with floor-to-tick rule from theoretical price."""
+    if _panel_numba is not None:
+        return _panel_numba.tw_limit_price(prev_close, ratio)
     prev = _to_float_array(prev_close)
     theoretical = prev * ratio
     tick = _tw_tick_size(theoretical)
@@ -320,6 +331,18 @@ def _compute_tw_limit_masks(frame: Any) -> tuple[np.ndarray, np.ndarray]:
     """
     tradable = _frame_column_bool_array(frame, "tradable")
     close_raw = _round_half_up(_frame_column_float_array(frame, "close_raw"), decimals=2)
+    if _panel_numba is not None:
+        dividends = (
+            _frame_column_float_array(frame, "Dividends")
+            if "Dividends" in frame.columns
+            else np.full(tradable.shape, np.nan, dtype=np.float64)
+        )
+        stock_splits = (
+            _frame_column_float_array(frame, "Stock Splits")
+            if "Stock Splits" in frame.columns
+            else np.full(tradable.shape, np.nan, dtype=np.float64)
+        )
+        return _panel_numba.tw_limit_masks_from_arrays(close_raw, tradable, dividends, stock_splits)
     prev_close_raw = _shift_array(close_raw, 1)
     reference_price = _tw_reference_price_for_limits(frame, prev_close_raw)
 
@@ -496,6 +519,8 @@ def _coerce_arrow_datetime_ns_column(table, name: str, rows: int) -> np.ndarray:
 
 
 def _shift_array(values: np.ndarray, periods: int) -> np.ndarray:
+    if _panel_numba is not None:
+        return _panel_numba.shift_array(values, periods)
     arr = np.asarray(values, dtype=np.float64)
     out = np.full(arr.shape, np.nan, dtype=np.float64)
     if periods > 0:
@@ -508,6 +533,8 @@ def _shift_array(values: np.ndarray, periods: int) -> np.ndarray:
 
 
 def _safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    if _panel_numba is not None:
+        return _panel_numba.safe_log_ratio_array(numerator, denominator)
     num = np.asarray(numerator, dtype=np.float64)
     den = np.asarray(denominator, dtype=np.float64)
     out = np.full(num.shape, np.nan, dtype=np.float64)
@@ -519,6 +546,8 @@ def _safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.
 
 
 def _sanitize_price_log_return_array(values: np.ndarray) -> np.ndarray:
+    if _panel_numba is not None:
+        return _panel_numba.sanitize_price_log_return_array(values, MAX_ABS_DAILY_PRICE_LOG_RETURN)
     out = np.asarray(values, dtype=np.float64).copy()
     invalid = np.isfinite(out) & (np.abs(out) > MAX_ABS_DAILY_PRICE_LOG_RETURN)
     out[invalid] = np.nan
@@ -584,6 +613,8 @@ def _tw_limit_masks_from_arrays(
     dividends: np.ndarray,
     stock_splits: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if _panel_numba is not None:
+        return _panel_numba.tw_limit_masks_from_arrays(close_raw, tradable, dividends, stock_splits)
     close = _round_half_up(np.asarray(close_raw, dtype=np.float64), decimals=2)
     prev_close = _shift_array(close, 1)
     reference = np.asarray(prev_close, dtype=np.float64).copy()

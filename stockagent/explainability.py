@@ -4125,10 +4125,9 @@ def run_loaded_model_explanation(
     write_fold_stability: bool = False,
 ) -> Path:
     total_start = time.perf_counter()
-    config_strict_no_fallback = bool(getattr(context.config.training, "strict_no_fallback", False))
+    config_strict_no_fallback = bool(getattr(config.training, "strict_no_fallback", False))
     if config_strict_no_fallback and not bool(settings.strict_no_fallback):
         settings = replace(settings, strict_no_fallback=True)
-    strict = bool(strict or settings.strict_no_fallback)
     device = device or next(model.parameters()).device
     split_norm = split.strip().lower()
     runner_timing: dict[str, float | str | int | bool] = {

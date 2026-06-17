@@ -15,6 +15,11 @@ import torch
 from stockagent.runtime_env import normalize_cuda_env
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
+try:
+    from stockagent.data import panel_numba as _panel_numba
+except Exception:  # pragma: no cover - Numba is an acceleration dependency
+    _panel_numba = None
+
 from stockagent.backtest.cpp_long_short import (
     cpp_long_short_enabled,
     run_long_short_cpp_autograd,
@@ -108,6 +113,8 @@ _BACKTEST_PENDING_CUDA_EVENTS: list[tuple[str, torch.cuda.Event, torch.cuda.Even
 
 def _round_half_up(values: np.ndarray | float, decimals: int = 2) -> np.ndarray:
     """Round with half-up semantics (0.5 always rounds away from zero)."""
+    if _panel_numba is not None:
+        return _panel_numba.round_half_up(values, decimals=decimals)
     arr = np.asarray(values, dtype=np.float64)
     factor = float(10**decimals)
     out = np.full(arr.shape, np.nan, dtype=np.float64)

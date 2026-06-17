@@ -6,7 +6,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 6
 environment:
   conda_env: fintech
   device: cuda
@@ -15,8 +15,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_yahoo/forex
-  benchmark_name: "JPYUSD"
+  parquet_root: data_okx
+  benchmark_name: "BTCUSDTSWAP"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -35,8 +35,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0001
-  sell_fee_rate: 0.0001
+  buy_fee_rate: 0.0005
+  sell_fee_rate: 0.0005
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -80,7 +80,7 @@ training:
   batch_size_train: 8
   batch_size_eval: 8
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.05
+  early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true
