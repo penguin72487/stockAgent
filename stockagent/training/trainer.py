@@ -5087,171 +5087,27 @@ def _run_fold_explainability(
         return None
 
     from stockagent.explainability import (
-        ExplainabilitySettings,
-        _cross_asset_settings_from_explainability,
-        _first_year_indices,
-        _sample_dataset,
-        explain_batch_row_chunked,
-        write_explanation_outputs,
+        run_loaded_model_explanation,
+        settings_from_training_config,
     )
 
-    test_indices = fold.test_indices
-    first_year_only = bool(getattr(config.training, "explain_first_test_year_only", True))
-    if first_year_only:
-        test_indices = _first_year_indices(panel, test_indices)
-    sample_start = time.perf_counter()
-    dataset = CrossSectionalDataset(panel, test_indices, config.training.lookback)
-    settings = ExplainabilitySettings(
-        top_k=int(getattr(config.training, "explain_top_k", 20)),
-        max_rows=int(getattr(config.training, "explain_max_rows", 32)),
-        ig_steps=int(getattr(config.training, "explain_ig_steps", 8)),
-        ig_batch_size=int(getattr(config.training, "explain_ig_batch_size", 0)),
-        perturb=bool(getattr(config.training, "explain_perturb", True)),
-        perturb_batch_size=int(getattr(config.training, "explain_perturb_batch_size", 0)),
-        sample_method=str(getattr(config.training, "explain_sample_method", "even")),
-        first_test_year_only=first_year_only,
-        report_style=str(getattr(config.training, "explain_report_style", "paper")),
-        plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
-        standard_plots=bool(getattr(config.training, "explain_standard_plots", True)),
-        interactive_plots=bool(getattr(config.training, "explain_interactive_plots", False)),
-        shap_enabled=bool(getattr(config.training, "explain_shap_enabled", True)),
-        shap_mode=str(getattr(config.training, "explain_shap_mode", "score_head_surrogate")),
-        case_study_top_k=int(getattr(config.training, "explain_case_study_top_k", 5)),
-        regime_analysis=bool(getattr(config.training, "explain_regime_analysis", True)),
-        fold_stability=bool(getattr(config.training, "explain_fold_stability", True)),
-        umap_enabled=bool(getattr(config.training, "explain_umap_enabled", True)),
-        umap_max_points=int(getattr(config.training, "explain_umap_max_points", 10000)),
-        umap_max_projections=int(getattr(config.training, "explain_umap_max_projections", 0)),
-        umap_n_neighbors=int(getattr(config.training, "explain_umap_n_neighbors", 15)),
-        umap_min_dist=float(getattr(config.training, "explain_umap_min_dist", 0.1)),
-        cross_asset_enabled=bool(getattr(config.training, "explain_cross_asset_enabled", True)),
-        cross_asset_max_sources=int(getattr(config.training, "explain_cross_asset_max_sources", 24)),
-        cross_asset_max_targets=int(getattr(config.training, "explain_cross_asset_max_targets", 24)),
-        cross_asset_top_edges=int(getattr(config.training, "explain_cross_asset_top_edges", 150)),
-        cross_asset_source_chunk_size=int(getattr(config.training, "explain_cross_asset_source_chunk_size", 2)),
-        cross_asset_perturb_scale=float(getattr(config.training, "explain_cross_asset_perturb_scale", 1.0)),
-        cross_asset_shocks=tuple(getattr(config.training, "explain_cross_asset_shocks", [])),
-        cross_asset_attention_flow=bool(getattr(config.training, "explain_cross_asset_attention_flow", True)),
-        cross_asset_attention_capture_rows=int(getattr(config.training, "explain_cross_asset_attention_capture_rows", 4)),
-        cross_asset_validated_transmission=bool(
-            getattr(config.training, "explain_cross_asset_validated_transmission", True)
-        ),
-        cross_asset_role_embedding=bool(getattr(config.training, "explain_cross_asset_role_embedding", True)),
-    )
-    settings.perturb_max_auto_batch_size = int(getattr(config.training, "explain_perturb_max_auto_batch_size", 16))
-    settings.perturb_max_input_elements = int(getattr(config.training, "explain_perturb_max_input_elements", 96_000_000))
-    batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
-    dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
-    timing["sample_s"] = float(time.perf_counter() - sample_start)
-    timing["sample_rows"] = int(len(dates))
-    timing["ig_steps"] = int(settings.ig_steps)
-    timing["perturb"] = bool(settings.perturb)
-    timing["write_plots"] = bool(getattr(config.training, "explain_write_plots", True))
-    was_training = model.training
-    model.eval()
-    compute_start = time.perf_counter()
-    try:
-        result = explain_batch_row_chunked(
-            model,
-            batch,
-            feature_names=panel.feature_names,
-            symbols=panel.symbols,
-            dates=dates,
-            settings=settings,
-            device=device,
-        )
-    finally:
-        if was_training:
-            model.train()
-    timing["compute_s"] = float(time.perf_counter() - compute_start)
-    compute_timing = result.get("summary", {}).get("timing", {})
-
-    destination = output_path / "explainability" / f"fold_{int(fold.fold_id):02d}_test"
-    metadata = {
-        "model_name": config.training.model_name,
-        "fold_id": int(fold.fold_id),
-        "split": "test",
-        "checkpoint": str(checkpoint_path),
-        "device": str(device),
-        "sample_rows": int(len(dates)),
-        "first_test_year_only": first_year_only,
-        "config_lookback": int(config.training.lookback),
-        "date_start": dates[0] if dates else None,
-        "date_end": dates[-1] if dates else None,
-    }
-    write_start = time.perf_counter()
-    write_explanation_outputs(
-        result,
-        destination,
-        metadata=metadata,
+    settings = settings_from_training_config(config.training)
+    return run_loaded_model_explanation(
+        config=config,
+        panel=panel,
+        fold=fold,
+        model=model,
+        checkpoint_path=checkpoint_path,
+        output_dir=output_path,
+        split="test",
+        explain_output_dir=None,
+        settings=settings,
         write_plots=bool(getattr(config.training, "explain_write_plots", True)),
-        write_standard_plots=bool(getattr(config.training, "explain_standard_plots", True)),
         plot_backend=str(getattr(config.training, "plot_backend", "auto")),
-        report_style=str(getattr(config.training, "explain_report_style", "paper")),
-        plot_theme=str(getattr(config.training, "explain_plot_theme", "paper")),
+        device=device,
+        timing_file_name="train_explainability_timing.json",
+        write_fold_stability=bool(getattr(config.training, "explain_fold_stability", False)),
     )
-    timing["write_s"] = float(time.perf_counter() - write_start)
-    write_timing = result.get("summary", {}).get("write_timing", {})
-    cross_asset_summary: dict[str, Any] = {}
-    if bool(settings.cross_asset_enabled):
-        cross_asset_start = time.perf_counter()
-        try:
-            from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
-
-            cross_asset_summary = abstract_cross_asset_transmission(
-                model,
-                batch,
-                feature_names=panel.feature_names,
-                symbols=panel.symbols,
-                dates=dates,
-                output_dir=destination,
-                settings=_cross_asset_settings_from_explainability(settings),
-                device=device,
-            )
-        except Exception as exc:
-            print(f"[Fold {fold.fold_id}] cross-asset explainability skipped: {type(exc).__name__}: {exc}")
-            timing["cross_asset_error"] = f"{type(exc).__name__}: {exc}"
-        timing["cross_asset_s"] = float(time.perf_counter() - cross_asset_start)
-    else:
-        timing["cross_asset_s"] = 0.0
-    if bool(getattr(config.training, "explain_fold_stability", True)):
-        stability_start = time.perf_counter()
-        try:
-            from stockagent.explainability import write_fold_stability_outputs
-
-            write_fold_stability_outputs(output_path / "explainability")
-        except Exception as exc:
-            print(f"[Fold {fold.fold_id}] fold stability explainability skipped: {type(exc).__name__}: {exc}")
-        timing["fold_stability_s"] = float(time.perf_counter() - stability_start)
-    else:
-        timing["fold_stability_s"] = 0.0
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    timing["total_s"] = float(time.perf_counter() - total_start)
-    timing_path = destination / "train_explainability_timing.json"
-    timing_path.write_text(
-        json.dumps(
-            {
-                **timing,
-                "compute_timing": compute_timing,
-                "write_timing": write_timing,
-                "cross_asset_summary": cross_asset_summary,
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    print(
-        f"[Fold {fold.fold_id}] explainability timing: "
-        f"total={float(timing['total_s']):.3f}s "
-        f"compute={float(timing['compute_s']):.3f}s "
-        f"write={float(timing['write_s']):.3f}s "
-        f"cross_asset={float(timing['cross_asset_s']):.3f}s "
-        f"stability={float(timing['fold_stability_s']):.3f}s "
-        f"json={timing_path}"
-    )
-    return destination
 
 
 def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult | None:
