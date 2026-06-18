@@ -1,12 +1,11 @@
-experiment_name: us-stock-full-universe-benchmark
+experiment_name: tw-stock-transformer-fold24-25-stability
 
 runner:
   output_dir: artifacts
-  require_cuda: true
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 6
+  start_fold: 24
 environment:
   conda_env: fintech
   device: cuda
@@ -15,8 +14,8 @@ environment:
   target_vram_fraction: 0.85
 
 data:
-  parquet_root: data_okx
-  benchmark_name: "BTCUSDTSWAP"
+  parquet_root: data_yahoo/tw_stocks
+  benchmark_name: "2330"
   benchmark_required: false
   benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
@@ -25,8 +24,8 @@ data:
   panel_backend: auto
   panel_load_workers: 16
   trading_volume_policy: auto
-  # tradable_mode: tw_limit_guard
-  tradable_mode: tradable
+  tradable_mode: tw_limit_guard
+  # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -35,8 +34,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  buy_fee_rate: 0.0005
-  sell_fee_rate: 0.0005
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   long_only: false
@@ -56,7 +55,7 @@ training:
   compile_loss: true
   fused_log_utility_loss: true
   materialize_window_tensors: false
-  warm_start_from_previous_fold: false
+  warm_start_from_previous_fold: true
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
@@ -76,9 +75,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 8
-  batch_size_train: 8
-  batch_size_eval: 8
+  batch_size: 32
+  batch_size_train: 32
+  batch_size_eval: 16
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -145,19 +144,19 @@ training:
   backtest_artifact_compression: none
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
-  learning_rate: 0.0001
+  learning_rate: 0.000075
   enable_lr_scheduler: false
   lr_scheduler: plateau
   lr_scheduler_t_max: 0
   lr_scheduler_eta_min: 0.00001
   lr_scheduler_step_size: 50
   lr_scheduler_gamma: 0.5
-  lr_scheduler_patience: 10
-  lr_scheduler_threshold: 0.001
+  lr_scheduler_patience: 4
+  lr_scheduler_threshold: 0.0005
   top_k: 10
   num_workers: 0
-  weight_decay: 0.1
-  grad_clip_norm: 0.0
+  weight_decay: 0.02
+  grad_clip_norm: 1.0
   finite_check_interval_steps: 0
   loss_type: log_utility
   min_batch_size: 1
@@ -277,7 +276,7 @@ training:
     sdpa_batch_limit: 16384
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: false
+    qk_norm: true
     rope_temporal: true
     rope_base: 10000.0
     temporal_layers: 2
@@ -296,14 +295,14 @@ training:
     num_market_tokens: 4
     market_layers: 1
     dynamic_latent_tokens: false
-    dynamic_market_tokens: false
+    dynamic_market_tokens: true
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
     dynamic_token_dropout: 0.0
     head_hidden_dim: 32
     head_layers: 1
-    dropout: 0.1
-    default_temperature: 1.0
+    dropout: 0.0
+    default_temperature: 1.5
     portfolio_mode: long_short
     max_full_tokens: 16384
     checkpoint_blocks: false
