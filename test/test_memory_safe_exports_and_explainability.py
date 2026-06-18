@@ -12,6 +12,7 @@ from plot_epoch_curves import _write_parquet_table_as_csv, export_report_csvs
 from stockagent import explainability as explainability_module
 from stockagent.explainability import (
     ExplainabilitySettings,
+    _adapt_dynamic_symbol_position_state,
     _auto_explain_row_chunk_size,
     _cuda_oom_fallback_settings,
     explain_batch_row_chunked,
@@ -153,6 +154,36 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.cross_asset_source_chunk_size == 2
     assert args.cross_asset_attention_capture_rows == 4
     assert args.cross_asset_role_embedding is True
+
+
+def test_dynamic_symbol_position_checkpoint_state_is_resized_for_explainability() -> None:
+    class DynamicSymbolModel(torch.nn.Module):
+        allow_dynamic_symbols = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.symbol_position = torch.nn.Parameter(torch.zeros(1, 1, 5, 3))
+
+    model = DynamicSymbolModel()
+    checkpoint_position = torch.arange(12, dtype=torch.float32).reshape(1, 1, 4, 3)
+
+    adapted, adjustments = _adapt_dynamic_symbol_position_state(
+        model,
+        {"symbol_position": checkpoint_position},
+        strict=False,
+    )
+
+    assert adjustments == [
+        {
+            "key": "symbol_position",
+            "checkpoint_shape": [1, 1, 4, 3],
+            "model_shape": [1, 1, 5, 3],
+            "copied_symbols": 4,
+        }
+    ]
+    assert adapted["symbol_position"].shape == (1, 1, 5, 3)
+    torch.testing.assert_close(adapted["symbol_position"][:, :, :4, :], checkpoint_position)
+    torch.testing.assert_close(adapted["symbol_position"][:, :, 4:, :], torch.zeros(1, 1, 1, 3))
 
 
 def test_training_explainability_settings_use_throughput_defaults() -> None:

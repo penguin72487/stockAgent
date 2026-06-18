@@ -5,7 +5,9 @@ import json
 import os
 from dataclasses import asdict
 from pathlib import Path
+import re
 
+import numpy as np
 import torch
 
 from stockagent.config import load_config
@@ -164,6 +166,36 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated override for training.explain_cross_asset_shocks.",
     )
     parser.add_argument(
+        "--explain-cross-asset-graph-backend",
+        choices=("auto", "polars", "cugraph"),
+        default=None,
+        help="Override training.explain_cross_asset_graph_backend.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-graph-benchmark-min-edges",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_graph_benchmark_min_edges.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-graph-explainability",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.explain_cross_asset_graph_explainability.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-graph-betweenness-max-vertices",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_graph_betweenness_max_vertices.",
+    )
+    parser.add_argument(
+        "--explain-cross-asset-graph-plot-max-nodes",
+        type=int,
+        default=None,
+        help="Override training.explain_cross_asset_graph_plot_max_nodes.",
+    )
+    parser.add_argument(
         "--save-daily-weights-csv",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -208,8 +240,61 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _extract_symbol_code(name: str) -> str | None:
+    text = (name or "").strip().upper()
+    if re.fullmatch(r"\d{4}", text):
+        return text
+    match = re.search(r"(\d{4})", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _apply_benchmark_override(panel, benchmark_name: str, benchmark_required: bool, benchmark_source: str) -> None:
+    benchmark_mode = (benchmark_source or benchmark_name).strip().lower()
+
+    if benchmark_mode in {"universe_average_return", "derived_from_panel", "universe_average"}:
+        # Panel default is daily average return over all tradable symbols.
+        print("[benchmark] using universe average daily return (all tradable symbols)")
+        return
+
+    if benchmark_mode in {"universe_cumulative_return", "universe_cumulative", "all_symbols_cumulative"}:
+        returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0)
+        tradable = panel.tradable_mask.astype(bool)
+        panel.benchmark_returns = np.where(tradable, returns, 0.0).sum(axis=1).astype(np.float32)
+        print("[benchmark] using universe cumulative daily return (sum across all tradable symbols)")
+        return
+
+    # Keep current universe benchmark unless user explicitly points to a symbol like 0050.
+    if benchmark_name.strip().lower() in {"universe_average_return", "derived_from_panel", "universe_average"}:
+        return
+
+    code = _extract_symbol_code(benchmark_name)
+    if code is None:
+        if benchmark_required:
+            raise ValueError(f"Unsupported benchmark_name: {benchmark_name}")
+        print(f"[benchmark] unsupported benchmark_name={benchmark_name}, fallback to universe average")
+        return
+
+    symbol_index = {symbol: idx for idx, symbol in enumerate(panel.symbols)}
+    idx = symbol_index.get(code)
+    if idx is None:
+        if benchmark_required:
+            raise ValueError(f"Benchmark symbol {code} not found in panel symbols")
+        print(f"[benchmark] symbol {code} not found, fallback to universe average")
+        return
+
+    returns = np.nan_to_num(panel.returns_1d[:, idx], nan=0.0, posinf=0.0, neginf=0.0)
+    tradable = panel.tradable_mask[:, idx].astype(bool)
+    panel.benchmark_returns = np.where(tradable, returns, 0.0).astype(np.float32)
+    print(f"[benchmark] using symbol {code} as benchmark ({int(tradable.sum())} tradable days)")
+
+
 def main() -> None:
     args = parse_args()
+    if args.start_fold < 1:
+        raise ValueError("--start-fold must be >= 1")
+
     config = load_config(args.config)
     if args.epochs is not None:
         if args.epochs < 1:
@@ -253,6 +338,25 @@ def main() -> None:
         config.training.explain_cross_asset_shocks = [
             value.strip().lower() for value in str(args.explain_cross_asset_shocks).split(",") if value.strip()
         ]
+    if args.explain_cross_asset_graph_backend is not None:
+        config.training.explain_cross_asset_graph_backend = str(args.explain_cross_asset_graph_backend)
+    if args.explain_cross_asset_graph_benchmark_min_edges is not None:
+        config.training.explain_cross_asset_graph_benchmark_min_edges = max(
+            0,
+            int(args.explain_cross_asset_graph_benchmark_min_edges),
+        )
+    if args.explain_cross_asset_graph_explainability is not None:
+        config.training.explain_cross_asset_graph_explainability = bool(args.explain_cross_asset_graph_explainability)
+    if args.explain_cross_asset_graph_betweenness_max_vertices is not None:
+        config.training.explain_cross_asset_graph_betweenness_max_vertices = max(
+            0,
+            int(args.explain_cross_asset_graph_betweenness_max_vertices),
+        )
+    if args.explain_cross_asset_graph_plot_max_nodes is not None:
+        config.training.explain_cross_asset_graph_plot_max_nodes = max(
+            5,
+            int(args.explain_cross_asset_graph_plot_max_nodes),
+        )
     if args.save_daily_weights_csv is not None:
         config.training.save_daily_weights_csv = bool(args.save_daily_weights_csv)
         config.training.save_daily_weights_table = bool(args.save_daily_weights_csv)

@@ -14,6 +14,10 @@ from types import SimpleNamespace
 from stockagent.training.trainer import _resolve_amp_dtype
 
 
+def _cuda_supports_nvfp4() -> bool:
+    return bool(torch.cuda.is_available() and torch.cuda.get_device_capability(0) >= (10, 0))
+
+
 def test_project_amp_contract_remains_bf16_and_fp16_only() -> None:
     assert _resolve_amp_dtype("bf16") is torch.bfloat16
     assert _resolve_amp_dtype("fp16") is torch.float16
@@ -58,7 +62,7 @@ def test_precision_benchmark_uses_native_low_bit_backends_only() -> None:
         assert "native" in plan.reason.lower() or "training" in plan.reason.lower()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 padding adapter smoke requires CUDA")
+@pytest.mark.skipif(not _cuda_supports_nvfp4(), reason="NVFP4 execution requires CUDA compute capability 10.0+")
 def test_nvfp4_adapter_pads_project_linear_shapes_without_fallback() -> None:
     pytest.importorskip("transformer_engine")
     device = torch.device("cuda")
