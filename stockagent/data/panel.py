@@ -123,6 +123,8 @@ def _path_requires_trading_volume(path: Path, policy: str | bool | None) -> bool
         return True
     if normalized == "optional":
         return False
+    if path.name.upper().endswith("_DL_FEATURES.PARQUET"):
+        return False
     parts = {part.lower() for part in path.parts}
     path_text = path.as_posix().lower()
     if {"forex", "forex_pepperstone", "data_forex_frankfurter"} & parts:

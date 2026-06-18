@@ -5003,12 +5003,25 @@ def _estimate_eval_chunk_rows(
     return max(1, min(upper, int(estimated_rows)))
 
 
+def _remove_stale_log_plot_files(fold_dir: Path) -> None:
+    for name in ("equity_curve_log.png", "leverage_equity_curve_log.png"):
+        path = fold_dir / name
+        if path.exists():
+            path.unlink()
+
+
 def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
     _write_summary(results, output_path)
 
     stale_combined_log_plot = output_path / "walkforward_equity_curve_log.png"
     if stale_combined_log_plot.exists():
         stale_combined_log_plot.unlink()
+    stale_combined_log10_plot = output_path / "walkforward_equity_curve_log10.png"
+    if stale_combined_log10_plot.exists():
+        stale_combined_log10_plot.unlink()
+    stale_first_year_cumulative_plot = output_path / "walkforward_first_year_cumulative_returns.png"
+    if stale_first_year_cumulative_plot.exists():
+        stale_first_year_cumulative_plot.unlink()
     stale_first_test_year_only_plot = output_path / "walkforward_first_test_year_only.png"
     if stale_first_test_year_only_plot.exists():
         stale_first_test_year_only_plot.unlink()
@@ -5057,7 +5070,7 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
             all_first_year_dates,
             all_first_year_strategy_log,
             all_first_year_baseline_log,
-            output_path / "walkforward_first_year_cumulative_returns.png",
+            output_path / "walkforward_first_year_log10_nav.png",
         )
         plot_first_year_fold_metric_bars(
             all_first_year_fold_ids,
@@ -7085,11 +7098,12 @@ def _run_training_tree_models(
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
 
+            _remove_stale_log_plot_files(fold_dir)
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log10.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
             plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log10.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
             _save_integer_share_audit_artifacts(
                 fold_dir,
@@ -7318,11 +7332,12 @@ def _run_inference_tree_models(
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
 
+        _remove_stale_log_plot_files(fold_dir)
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
         plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
         _save_integer_share_audit_artifacts(
             fold_dir,
@@ -7609,11 +7624,12 @@ def _run_inference_neural_models(
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
 
+        _remove_stale_log_plot_files(fold_dir)
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
         plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
         _save_integer_share_audit_artifacts(
             fold_dir,
@@ -9821,14 +9837,15 @@ def run_training(
                 plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
                 plot_timing[f"{name}_copied_from"] = str(source.name)
 
+            _remove_stale_log_plot_files(fold_dir)
             _time_plot("equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "equity_curve.png")
-            _time_plot("equity_curve_log", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            _time_plot("equity_curve_log10", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log10.png")
             _time_plot("annual_performance", plot_annual_performance, test_bt, test_dates, fold_dir / "annual_performance.png")
             _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
             _copy_plot(
-                "leverage_equity_curve_log",
-                fold_dir / "equity_curve_log.png",
-                fold_dir / "leverage_equity_curve_log.png",
+                "leverage_equity_curve_log10",
+                fold_dir / "equity_curve_log10.png",
+                fold_dir / "leverage_equity_curve_log10.png",
             )
             _copy_plot(
                 "leverage_annual_performance",

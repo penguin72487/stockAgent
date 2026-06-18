@@ -150,6 +150,20 @@ def test_panel_trading_volume_policy_auto_rejects_stock_like_missing_volume(tmp_
         build_panel(root, panel_backend="pyarrow", trading_volume_policy="auto")
 
 
+@pytest.mark.parametrize("backend", ["pyarrow", "polars_lazy"])
+def test_panel_trading_volume_policy_auto_allows_delisted_yahoo_missing_volume(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    root = tmp_path / "us_stocks"
+    root.mkdir()
+    _write_symbol_without_volume(root / "AAA_DL_features.parquet", 0.0)
+
+    panel = build_panel(root, panel_backend=backend, trading_volume_policy="auto")
+
+    assert panel.num_symbols == 1
+
+
 def test_panel_trading_volume_policy_optional_allows_missing_volume(tmp_path: Path) -> None:
     _write_symbol_without_volume(tmp_path / "AAA_features.parquet", 0.0)
 
