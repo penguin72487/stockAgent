@@ -11,13 +11,13 @@ environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  target_vram_fraction: 0.85
+  target_vram_fraction: 0.7
 
 data:
   parquet_root: data_yahoo/tw_stocks
   benchmark_name: "2330"
   benchmark_required: false
-  benchmark_source: derived_from_panel
+  benchmark_source: universe_average_return
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
@@ -42,6 +42,7 @@ trading:
   cash_allowed: true
 training:
   backend: pytorch
+  model_name: TD3 # options: MLP, GRU, Transformer, XGBoost, Ridge, ElasticNet, PPO, DDPG, TD3, SAC
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
