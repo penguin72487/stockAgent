@@ -1,16 +1,35 @@
-"""Model definitions and model factory APIs."""
+"""Model definitions."""
 
-from stockagent.models.base import PortfolioModel
-from stockagent.models.factory import build_model, register_model
-from stockagent.models.gru import CrossSectionalGRU
+from stockagent.models.factory import build_model, model_hidden_dim_hint
+from stockagent.models.bottleneck_portfolio_autoencoder import BottleneckPortfolioAutoencoder
+from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSectionalTemporalPortfolioModel
+from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
+from stockagent.models.ft_transformer import CrossSectionalFTTransformer
+from stockagent.models.latent_factor_market_token_portfolio import LatentFactorMarketTokenPortfolioModel
+from stockagent.models.low_rank_market_transformer_portfolio import LowRankMarketTransformerPortfolioModel
 from stockagent.models.mlp import CrossSectionalMLP
-from stockagent.models.transformer import CrossSectionalTransformer
+from stockagent.models.multi_stock_tcn import CrossSectionalMultiStockTCN
+from stockagent.models.tabular_resnet import CrossSectionalTabularResNet
+from stockagent.models.tcn_hybrid_tabular_resnet import CrossSectionalTCNHybridTabularResNet
+from stockagent.models.temporal_tabular_resnet import CrossSectionalTemporalTabularResNet
+from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
+from stockagent.models.tree_models import CrossSectionalLightGBM, CrossSectionalXGBoost
 
 __all__ = [
-	"PortfolioModel",
-	"CrossSectionalGRU",
-	"CrossSectionalMLP",
-	"CrossSectionalTransformer",
 	"build_model",
-	"register_model",
+	"model_hidden_dim_hint",
+	"BottleneckPortfolioAutoencoder",
+	"CrossSectionalTemporalPortfolioModel",
+	"EfficientTCNTabularSetPortfolioModel",
+	"LatentFactorMarketTokenPortfolioModel",
+	"LowRankMarketTransformerPortfolioModel",
+	"TransformerBasePortfolioModel",
+	"CrossSectionalFTTransformer",
+	"CrossSectionalMultiStockTCN",
+	"CrossSectionalTabularResNet",
+	"CrossSectionalTCNHybridTabularResNet",
+	"CrossSectionalTemporalTabularResNet",
+	"CrossSectionalMLP",
+	"CrossSectionalLightGBM",
+	"CrossSectionalXGBoost",
 ]

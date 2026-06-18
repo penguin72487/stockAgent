@@ -1,0 +1,15 @@
+# Pepperstone commodites (typo kept for requested folder naming)
+GC=F
+SI=F
+CL=F
+BZ=F
+NG=F
+HG=F
+ZC=F
+ZW=F
+ZS=F
+KC=F
+CT=F
+SB=F
+PL=F
+PA=F

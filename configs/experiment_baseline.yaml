@@ -1,9 +1,11 @@
-experiment_name: tw-stock-expanding-walkforward
+experiment_name: tw-stock-transformer-fold24-25-stability
 
 runner:
   output_dir: artifacts
-  require_cuda: true
-
+  mode: train
+  resume: true
+  post_train_infer: false
+  start_fold: 24
 environment:
   conda_env: fintech
   device: cuda
@@ -12,11 +14,18 @@ environment:
   target_vram_fraction: 0.7
 
 data:
-  parquet_root: data_yahoo_tw_ohlcv
-  benchmark_name: "universe_average_return"
+  parquet_root: data_yahoo/tw_stocks
+  benchmark_name: "2330"
   benchmark_required: false
   benchmark_source: universe_average_return
   universe_mode: all_daily_symbols
+  use_rapids: false
+  usd_only_trading_pairs: false
+  panel_backend: auto
+  panel_load_workers: 16
+  trading_volume_policy: auto
+  tradable_mode: tw_limit_guard
+  # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
@@ -25,141 +34,413 @@ walk_forward:
 
 trading:
   frequency: daily
-  fee_per_side: 0.0
+  buy_fee_rate: 0.000855
+  sell_fee_rate: 0.003855
+  max_turnover_ratio: 50.0
+  gross_leverage: 2.5
   long_only: false
   cash_allowed: true
-  use_all_tradable_symbols: true
-  # execution_mode: "overnight_tplus2"
-  # execution_mode: "intraday_next_open" # "intraday_next_open" or "overnight_tplus2"
-  lot_size: 1000
-  min_fee: 20
-  intraday_buy_fee_rate: 0.001425
-  intraday_sell_fee_rate: 0.002925
-  overnight_buy_fee_rate: 0.001425
-  overnight_sell_fee_rate: 0.004425
-  settlement_delay_days: 2
-
 training:
   backend: pytorch
   model_name: TD3 # options: MLP, GRU, Transformer, XGBoost, Ridge, ElasticNet, PPO, DDPG, TD3, SAC
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
-  non_blocking_transfer: false
-  lookback: 1
+  non_blocking_transfer: true
+  model_name: transformer_base_portfolio
+  enable_torch_compile: true
+  auto_torch_compile_sharpe: false
+  torch_compile_mode: reduce-overhead
+  torchinductor_cache_dir: ~/.cache/torchinductor
+  triton_cache_dir: ~/.cache/triton
+  cuda_cache_path: ~/.cache/nv_cuda
+  compile_loss: true
+  fused_log_utility_loss: true
+  materialize_window_tensors: false
+  warm_start_from_previous_fold: true
+  chunk_rows: 0
+  eval_model_chunk_rows: auto
+  eval_backtest_chunk_rows: 512
+  eval_backtest_chunk_rows_auto: true
+  eval_auto_chunk_rows_cap: 16
+  train_symbol_subsample_ratio: 1.0
+  detach_prev_state: true
+  prefer_fp16: false
+  backtest_autotune: true
+  backtest_compile: true
+  backtest_compile_stateful: true
+  backtest_compile_dynamic: false
+  backtest_cpp_ext: false
+  backtest_verbose: false
+  strict_no_fallback: true
+  backtest_checkpoint_chunk_rows: 0
+  runtime_shape_check: false
+  allow_dynamic_symbols: false
+  lookback: 32
+  batch_size: 32
+  batch_size_train: 32
+  batch_size_eval: 16
   epochs: 1000
-  num_workers: 28
-  min_batch_size: 4
-  auto_batch_size: true
+  early_stopping_no_improve_ratio: 0.1
+  val_interval_epochs: 1
+  curve_test_interval: 1
+  record_epoch_curve: true
+  curve_plot_interval: 1
+  curve_plot_async: true
+  plot_backend: auto
+  epoch_test_curve: true
+  defer_epoch_curve_plot_until_end: false
+  input_pipeline_ab_test: false
+  input_pipeline_ab_test_steps: 20
+  explain_after_each_fold: false
+  explain_first_test_year_only: true
+  explain_top_k: 20
+  explain_max_rows: 32
+  explain_ig_steps: 0
+  explain_ig_batch_size: 1
+  explain_sample_method: even
+  explain_perturb: false
+  explain_perturb_batch_size: 1
+  explain_perturb_max_auto_batch_size: 1
+  explain_perturb_max_input_elements: 8000000
+  explain_write_plots: false
+  explain_report_style: none
+  explain_plot_theme: paper
+  explain_standard_plots: false
+  explain_interactive_plots: false
+  explain_shap_enabled: false
+  explain_shap_mode: score_head_surrogate
+  explain_case_study_top_k: 5
+  explain_regime_analysis: false
+  explain_fold_stability: false
+  explain_umap_enabled: false
+  explain_umap_max_points: 1000
+  explain_umap_max_projections: 0
+  explain_umap_n_neighbors: 15
+  explain_umap_min_dist: 0.1
+  explain_cross_asset_enabled: false
+  explain_cross_asset_max_sources: 8
+  explain_cross_asset_max_targets: 8
+  explain_cross_asset_top_edges: 150
+  explain_cross_asset_source_chunk_size: 1
+  explain_cross_asset_perturb_scale: 1.0
+  explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
+  explain_cross_asset_attention_flow: true
+  explain_cross_asset_attention_capture_rows: 1
+  explain_cross_asset_validated_transmission: true
+  explain_cross_asset_role_embedding: false
+  explain_cross_asset_graph_backend: auto
+  explain_cross_asset_graph_benchmark_min_edges: 1000000
+  explain_cross_asset_graph_explainability: true
+  explain_cross_asset_graph_betweenness_max_vertices: 512
+  explain_cross_asset_graph_plot_max_nodes: 80
+  table_output_format: parquet
+  save_daily_weights_table: true
+  save_integer_share_daily_weights_table: true
+  save_integer_share_holdings_table: true
+  # Legacy CSV-specific switches still feed runtime fallbacks; keep disabled
+  # while table_output_format=parquet is the default training output.
+  save_integer_share_daily_weights_csv: false
+  save_integer_share_holdings_csv: false
+  save_daily_weights_csv: false
+  backtest_artifact_compression: none
+  cache_train_tensors_on_gpu: true
+  cache_eval_tensors_on_gpu: true
+  learning_rate: 0.000075
+  enable_lr_scheduler: false
+  lr_scheduler: plateau
+  lr_scheduler_t_max: 0
+  lr_scheduler_eta_min: 0.00001
+  lr_scheduler_step_size: 50
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_patience: 4
+  lr_scheduler_threshold: 0.0005
+  top_k: 10
+  num_workers: 0
+  weight_decay: 0.02
+  grad_clip_norm: 1.0
+  finite_check_interval_steps: 0
+  loss_type: log_utility
+  min_batch_size: 1
+  auto_batch_size: false
   vram_budget_gb: 16
-  vram_safety_margin_gb: 2.5
-  target_vram_fraction: 0.7
-  model_configs:
-    mlp:
-      num_layers: 2
-      residual_norm: false
-      batch_size: 1024
-      batch_size_train: 1024
-      batch_size_eval: 1024
-      learning_rate: 0.001
-      hidden_dim: 512
-      dropout: 0.3
-      weight_decay: 1.0
-      loss_type: sharpe
-
-    gru:
-      num_layers: 2
-      residual_norm: false
-      batch_size: 1024
-      batch_size_train: 1024
-      batch_size_eval: 1024
-      learning_rate: 0.001
-      hidden_dim: 512
-      dropout: 0.3
-      weight_decay: 1.0
-      loss_type: sharpe
-
-    transformer:
-      num_layers: 2
-      residual_norm: false
-      batch_size: 256
-      batch_size_train: 256
-      batch_size_eval: 256
-      learning_rate: 0.0005
-      hidden_dim: 512
-      dropout: 0.1
-      weight_decay: 0.01
-      loss_type: sharpe
-
-    xgboost:
-      xgb_n_estimators: 600
-      xgb_max_depth: 12
-      xgb_learning_rate: 0.05
-      xgb_subsample: 0.8
-      xgb_colsample_bytree: 0.8
-      xgb_reg_lambda: 1.0
-
-    ridge:
-      ridge_alpha: 1.0
-      ridge_fit_intercept: true
-
-    elasticnet:
-      elasticnet_alpha: 1.0
-      elasticnet_l1_ratio: 0.5
-      elasticnet_fit_intercept: true
-      elasticnet_max_iter: 2000
-      elasticnet_tol: 0.0001
-
-    ppo:
-      learning_rate: 0.001
-      rl_total_timesteps: 20000
-      rl_batch_size: 256
-      rl_n_steps: 2048
-      rl_gamma: 0.99
-      rl_policy_hidden_dim: 256
-      rl_max_symbols: 64
-      rl_device: cuda
-
-    ddpg:
-      learning_rate: 0.001
-      rl_total_timesteps: 20000
-      rl_batch_size: 256
-      rl_buffer_size: 200000
-      rl_learning_starts: 1000
-      rl_gamma: 0.99
-      rl_policy_hidden_dim: 256
-      rl_max_symbols: 64
-      rl_device: cuda
-
-    td3:
-      learning_rate: 0.001
-      rl_total_timesteps: 20000
-      rl_batch_size: 256
-      rl_buffer_size: 200000
-      rl_learning_starts: 1000
-      rl_gamma: 0.99
-      rl_policy_hidden_dim: 256
-      rl_max_symbols: 64
-      rl_device: cuda
-
-    sac:
-      learning_rate: 0.001
-      rl_total_timesteps: 20000
-      rl_batch_size: 256
-      rl_buffer_size: 200000
-      rl_learning_starts: 1000
-      rl_gamma: 0.99
-      rl_policy_hidden_dim: 256
-      rl_max_symbols: 64
-      rl_device: cuda
+  vram_safety_margin_gb: 1.5
+  target_vram_fraction: 0.85
+  # Model branches. Only the block named by training.model_name is active.
+  # Current active branch: transformer_base_portfolio.
+  mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    embedding_dim: 64
+    dropout: 0.1
+  ft_transformer:
+    d_token: 64
+    n_layers: 2
+    n_heads: 4
+    ffn_dim: 256
+    dropout: 0.1
+    use_cls_token: true
+  tabular_resnet:
+    embedding_dim: 128
+    hidden_dim: 256
+    n_blocks: 4
+    dropout: 0.1
+  multi_stock_tcn:
+    hidden_channels: 16
+    embedding_dim: 16
+    tcn_blocks: 4
+    tcn_kernel_size: 3
+    head_hidden_dim: 16
+    head_layers: 1
+    dropout: 0.1
+    tcn_conv_mode: separable
+    conv_layers_per_block: 1
+    norm_type: none
+    sanitize_inputs: false
+  efficient_tcn_tabular_set_portfolio:
+    temporal_enabled: true
+    temporal_dim: 16
+    temporal_hidden_channels: 32
+    temporal_dilations: [1, 2]
+    temporal_kernel_size: 3
+    tabular_dim: 64
+    tabular_hidden_dim: 128
+    tabular_blocks: 2
+    model_dim: 64
+    set_enabled: true
+    num_inducing_points: 16
+    num_heads: 4
+    ffn_mult: 2
+    head_hidden_dim: 64
+    head_layers: 1
+    dropout: 0.1
+    residual_scale: 0.5
+    default_temperature: 1.0
+    portfolio_mode: long_only
+    return_aux: true
+  latent_factor_market_token_portfolio:
+    temporal_enabled: true
+    temporal_dim: 16
+    temporal_hidden_channels: 32
+    temporal_dilations: [1, 2]
+    temporal_kernel_size: 3
+    tabular_dim: 64
+    tabular_hidden_dim: 128
+    tabular_blocks: 2
+    stock_embedding_dim: 64
+    num_latent_factors: 32
+    num_market_tokens: 4
+    num_heads: 4
+    ffn_mult: 2
+    head_hidden_dim: 64
+    head_layers: 1
+    dropout: 0.3
+    residual_scale: 0.5
+    default_temperature: 1.0
+    portfolio_mode: long_only
+    return_aux: true
+  low_rank_market_transformer_portfolio:
+    feature_dim: 32
+    temporal_mixer: conv
+    temporal_layers: 4
+    temporal_heads: 2
+    temporal_ffn_dim: 64
+    temporal_dropout: 0.1
+    temporal_pooling: attention
+    temporal_kernel_size: 3
+    temporal_dilations: [1, 2, 4, 8]
+    temporal_checkpoint: false
+    stock_embedding_dim: 32
+    num_latent_factors: 8
+    num_market_tokens: 4
+    cross_heads: 2
+    cross_ffn_mult: 1
+    head_hidden_dim: 32
+    head_layers: 1
+    dropout: 0.1
+    default_temperature: 1.0
+    portfolio_mode: long_short
+    return_aux: true
+    return_aux_details: false
+  # Active model branch for this experiment.
+  transformer_base_portfolio:
+    d_model: 32
+    # full: most complete O((lookback*stocks)^2), small universes only
+    # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
+    # latent: temporal + latent factors + market tokens, large universe friendly
+    # market_token: temporal + market tokens, smallest cross-stock transformer
+    # temporal_only: no cross-stock attention
+    attention_mode: market_token
+    use_flash_attention: true
+    use_time_pos: true
+    use_symbol_pos: true
+    input_dropout: 0.0
+    sdpa_batch_limit: 16384
+    norm_type: rmsnorm
+    ffn_type: swiglu
+    qk_norm: true
+    rope_temporal: true
+    rope_base: 10000.0
+    temporal_layers: 2
+    temporal_heads: 4
+    temporal_ffn_mult: 2
+    temporal_pooling: last
+    temporal_query_mode: last_only
+    cross_layers: 1
+    cross_heads: 4
+    cross_ffn_mult: 2
+    joint_layers: 2
+    joint_heads: 4
+    joint_ffn_mult: 2
+    latent_layers: 1
+    num_latent_factors: 16
+    num_market_tokens: 4
+    market_layers: 1
+    dynamic_latent_tokens: false
+    dynamic_market_tokens: true
+    dynamic_token_hidden_mult: 2
+    dynamic_token_gate_init: 0.1
+    dynamic_token_dropout: 0.0
+    head_hidden_dim: 32
+    head_layers: 1
+    dropout: 0.0
+    default_temperature: 1.5
+    portfolio_mode: long_short
+    max_full_tokens: 16384
+    checkpoint_blocks: false
+    return_aux: false
+    return_aux_details: false
+    # return_aux_details returns attention/factor internals; keep false for training speed.
+  bottleneck_portfolio_autoencoder:
+    d_model: 64
+    z_dim: 32
+    temporal_type: tcn
+    temporal_layers: 2
+    asset_encoder_type: lite_isab
+    asset_encoder_layers: 1
+    n_heads: 4
+    num_inducing_points: 32
+    ffn_mult: 2
+    dropout: 0.1
+    long_short: true
+    noise_std: 0.01
+    return_aux: false
+  tcn_hybrid_tabular_resnet:
+    embedding_dim: 64
+    encoder_hidden_dim: 128
+    encoder_blocks: 2
+    tcn_blocks: 2
+    tcn_kernel_size: 3
+    dropout: 0.3
+  temporal_tabular_resnet:
+    temporal_hidden_dim: 128
+    temporal_layers: 1
+    temporal_dropout: 0.3
+    embedding_dim: 128
+    hidden_dim: 256
+    n_blocks: 4
+    dropout: 0.1
+  cross_sectional_temporal_portfolio_model:
+    stock_embedding_dim: 128
+    stock_hidden_dim: 128
+    stock_n_blocks: 2
+    temporal_hidden_dim: 128
+    temporal_blocks: 2
+    temporal_kernel_size: 3
+    cross_hidden_dim: 128
+    cross_heads: 4
+    cross_layers: 2
+    candidate_top_m: 64
+    portfolio_top_k: 10
+    candidate_k: 64
+    trade_k: 10
+    scorer: tabular_resnet
+    scorer_hidden: 128
+    scorer_blocks: 2
+    reranker: set_transformer
+    d_model: 128
+    heads: 4
+    layers: 2
+    dropout: 0.15
+    regime_classes: 3
+  multitask_loss:
+    rank_ic_weight: 1.00
+    direction_weight: 0.00
+    volatility_regime_weight: 0.00
+    concentration_weight: 0.00
+    regime_up_threshold: 0.002
+    regime_down_threshold: -0.002
+  factor_generalization_loss:
+    slope_tstat_weight: 1.0
+    rank_ic_weight: 0.5
+    factor_sharpe_weight: 0.25
+    block_stability_weight: 0.20
+    regime_stability_weight: 0.20
+    consistency_weight: 0.05
+    net_exposure_weight: 0.05
+    gross_exposure_weight: 0.02
+    concentration_weight: 0.02
+    turnover_weight: 0.02
+    score_l2_weight: 0.001
+    factor_temperature: 1.0
+    block_count: 4
+    worst_fraction: 0.25
+    augmentation_feature_dropout: 0.10
+    augmentation_stock_dropout: 0.05
+    augmentation_time_dropout: 0.05
+    augmentation_noise_std: 0.01
+  portfolio_autoencoder_loss:
+    cost_rate: 0.0005
+    lambda_turnover: 0.1
+    lambda_concentration: 0.01
+    lambda_latent: 0.001
+  lightgbm:
+    use_gpu: true
+    gpu_device_id: 0
+    n_estimators: 300
+    num_leaves: 63
+    max_depth: -1
+    learning_rate: 1
+    subsample: 0.9
+    colsample_bytree: 0.9
+    reg_lambda: 1.0
+    n_jobs: -1
+    random_state: 42
+  xgboost:
+    use_gpu: true
+    gpu_device_id: 0
+    n_estimators: 300
+    max_depth: 8
+    learning_rate: 0.05
+    subsample: 0.9
+    colsample_bytree: 0.9
+    reg_lambda: 1.0
+    n_jobs: -1
+    random_state: 42
 
 evaluation:
-  primary_baseline: "0050"
+  primary_baseline: "2330"
   metrics:
     - cumulative_return
     - annualized_return
+    - cagr
     - sharpe
+    - sortino
     - max_drawdown
+    - calmar
     - turnover
     - excess_return_vs_universe_average
   gamma_sharpe: 1.0
-  gamma_turnover: 0.0
+  gamma_excess: 1.0
+  gamma_cvar: 1.0
+  cvar_alpha: 0.95
+  gamma_drawdown: 0.5
+  drawdown_target: 0.2
+  gamma_turnover: 0
+  gamma_underperformance: 2.0
+  excess_target: 0.0
+  cvar_budget: 0.03
+  drawdown_budget: 0.18
+  turnover_budget: 0.35
+  gamma_cvar_budget: 2.0
+  gamma_drawdown_budget: 2.5
+  gamma_turnover_budget: 0.5

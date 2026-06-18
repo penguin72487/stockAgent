@@ -1,0 +1,11 @@
+# Pepperstone 24hTrading (major FX symbols)
+EURUSD
+GBPUSD
+USDJPY
+AUDUSD
+USDCAD
+USDCHF
+NZDUSD
+EURJPY
+GBPJPY
+EURGBP
