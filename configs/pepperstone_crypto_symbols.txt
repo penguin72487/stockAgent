@@ -1,0 +1,11 @@
+# Pepperstone crypto symbols (Yahoo crypto format will be resolved automatically)
+BTCUSD
+ETHUSD
+LTCUSD
+BCHUSD
+XRPUSD
+ADAUSD
+DOTUSD
+SOLUSD
+DOGEUSD
+LINKUSD

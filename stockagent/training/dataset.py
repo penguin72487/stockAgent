@@ -11,23 +11,41 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(self, panel: PanelData, date_indices: np.ndarray, lookback: int) -> None:
         self.lookback = lookback
         self.date_indices = np.array(sorted(date_indices.tolist()), dtype=np.int64)
+        if self.date_indices.size == 0:
+            raise ValueError("Fold has no dates after split filtering.")
+
         # Keep only indices that have a full lookback window inside this fold.
         fold_start_idx = int(self.date_indices[0])
         min_valid_idx = fold_start_idx + lookback - 1
-        self.valid_indices = self.date_indices[self.date_indices > min_valid_idx]  # Use > instead of >=
-        
-        # ✅ OPTIMIZATION: Error checking for insufficient data
+        tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
+        valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
+        if valid_indices.size > 0:
+            valid_indices = valid_indices[tradable[valid_indices].any(axis=1)]
+        self.valid_indices = valid_indices
+
         if len(self.valid_indices) == 0:
-            raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback + 1} dates.")
+            raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback} dates.")
 
         returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-        # Tradable mask should only reflect same-day availability, not future label existence.
-        tradable = panel.tradable_mask
+        if panel.can_buy_mask is None or panel.can_sell_mask is None:
+            raise ValueError(
+                "PanelData must provide can_buy_mask and can_sell_mask; no-fallback dataset path "
+                "does not infer side masks from tradable_mask"
+            )
+        can_buy = panel.can_buy_mask
+        can_sell = panel.can_sell_mask
 
         # Cache tensors once to avoid per-item numpy copies.
-        self.features_t = torch.from_numpy(panel.features)
+        self.features_t = torch.nan_to_num(
+            torch.from_numpy(panel.features),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         self.future_log_returns_t = torch.from_numpy(returns)
         self.tradable_mask_t = torch.from_numpy(tradable)
+        self.can_buy_mask_t = torch.from_numpy(can_buy)
+        self.can_sell_mask_t = torch.from_numpy(can_sell)
         self.benchmark_t = torch.from_numpy(panel.benchmark_returns.astype(np.float32, copy=False))
 
     def __len__(self) -> int:
@@ -40,14 +58,41 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "x": self.features_t[start_idx : date_idx + 1],
             "future_log_returns": self.future_log_returns_t[date_idx],
             "tradable_mask": self.tradable_mask_t[date_idx],
+            "can_buy_mask": self.can_buy_mask_t[date_idx],
+            "can_sell_mask": self.can_sell_mask_t[date_idx],
             "benchmark": self.benchmark_t[date_idx],
         }
 
 
-def collate_batch(samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+def collate_batch(
+    samples: list[dict[str, torch.Tensor]],
+    batch_size: int | None = None,
+) -> dict[str, torch.Tensor]:
+    if batch_size is None or len(samples) >= batch_size:
+        return {
+            "x": torch.stack([s["x"] for s in samples]),
+            "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
+            "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
+            "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
+            "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
+            "benchmark": torch.stack([s["benchmark"] for s in samples]),
+            "sample_mask": torch.ones(len(samples), dtype=torch.bool),
+        }
+
+    pad_count = batch_size - len(samples)
+    template = samples[0]
+
+    def _pad_tensor_list(name: str) -> torch.Tensor:
+        values = [s[name] for s in samples]
+        padding = [torch.zeros_like(template[name]) for _ in range(pad_count)]
+        return torch.stack(values + padding)
+
     return {
-        "x": torch.stack([s["x"] for s in samples]),
-        "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
-        "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
-        "benchmark": torch.stack([s["benchmark"] for s in samples]),
+        "x": _pad_tensor_list("x"),
+        "future_log_returns": _pad_tensor_list("future_log_returns"),
+        "tradable_mask": _pad_tensor_list("tradable_mask"),
+        "can_buy_mask": _pad_tensor_list("can_buy_mask"),
+        "can_sell_mask": _pad_tensor_list("can_sell_mask"),
+        "benchmark": _pad_tensor_list("benchmark"),
+        "sample_mask": torch.tensor([True] * len(samples) + [False] * pad_count, dtype=torch.bool),
     }

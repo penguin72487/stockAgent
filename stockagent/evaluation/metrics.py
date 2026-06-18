@@ -11,6 +11,15 @@ except Exception:  # pragma: no cover - optional GPU dependency
     cp = None
 
 
+def _rank_from_sorted_indices(sorted_idx: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Construct row-wise rank tensor from argsort indices using scatter."""
+    row_rank = torch.arange(sorted_idx.size(1), device=sorted_idx.device, dtype=dtype)
+    row_rank = row_rank.unsqueeze(0).expand_as(sorted_idx)
+    ranks = torch.empty(sorted_idx.shape, device=sorted_idx.device, dtype=dtype)
+    ranks.scatter_(1, sorted_idx, row_rank)
+    return ranks
+
+
 def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask_f = mask.to(dtype=predictions.dtype)
     squared_error = (predictions - targets).pow(2) * mask_f
@@ -95,11 +104,11 @@ def compute_ic_series_torch(
     mask_f = valid_mask.float()
     valid_count = mask_f.sum(dim=1)
 
-    # Use masked fill then argsort(argsort()) for rank approximation.
-    s_fill = torch.where(valid_mask, scores_t, torch.full_like(scores_t, -1e30))
-    r_fill = torch.where(valid_mask, returns_t, torch.full_like(returns_t, -1e30))
-    s_rank = torch.argsort(torch.argsort(s_fill, dim=1), dim=1).float()
-    r_rank = torch.argsort(torch.argsort(r_fill, dim=1), dim=1).float()
+    # Single argsort + scatter rank construction is faster than argsort(argsort()).
+    s_fill = scores_t.masked_fill(~valid_mask, float("-inf"))
+    r_fill = returns_t.masked_fill(~valid_mask, float("-inf"))
+    s_rank = _rank_from_sorted_indices(torch.argsort(s_fill, dim=1), dtype=torch.float32)
+    r_rank = _rank_from_sorted_indices(torch.argsort(r_fill, dim=1), dtype=torch.float32)
 
     denom_count = valid_count.clamp_min(1.0).unsqueeze(1)
     s_mean = (s_rank * mask_f).sum(dim=1, keepdim=True) / denom_count
@@ -141,15 +150,27 @@ def summarize_returns(strategy_returns: np.ndarray, benchmark_returns: np.ndarra
     ann_r = float(np.expm1(avg * 252.0))
     sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
     baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
+    downside = np.minimum(r, 0.0)
+    downside_b = np.minimum(b, 0.0)
+    downside_dev = float(np.sqrt(np.mean(np.square(downside))))
+    downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
+    sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
+    baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
     equity = np.exp(np.cumsum(r))
     running_max = np.maximum.accumulate(equity)
     dd = equity / np.clip(running_max, 1e-12, None) - 1.0
+    max_dd = float(dd.min(initial=0.0))
+    calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
     return {
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
+        "cagr": ann_r,
         "sharpe": sharpe,
         "baseline_sharpe": baseline_sharpe,
-        "max_drawdown": float(dd.min(initial=0.0)),
+        "sortino": sortino,
+        "baseline_sortino": baseline_sortino,
+        "max_drawdown": max_dd,
+        "calmar": calmar,
         "turnover": float(turnover.mean()) if turnover.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
         "excess_return_vs_universe_average": cum_r - cum_b,

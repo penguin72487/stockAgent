@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-import pandas as pd
 
 
 @dataclass(slots=True)
@@ -36,8 +35,8 @@ def build_expanding_year_folds(
     _ = val_years
     _ = require_future_test_year
 
-    years = pd.to_datetime(dates).year.to_numpy()
-    unique_years = sorted(pd.unique(years).tolist())
+    years = np.asarray(dates, dtype="datetime64[Y]").astype(np.int64) + 1970
+    unique_years = sorted(np.unique(years).astype(int).tolist())
     folds: list[WalkForwardFold] = []
 
     total_years = len(unique_years)

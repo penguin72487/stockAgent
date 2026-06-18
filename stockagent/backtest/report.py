@@ -1,17 +1,107 @@
 from __future__ import annotations
 
 import math
+import warnings
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 from stockagent.backtest.simulator import BacktestResult
 
 
-_LOG_EXP_UPPER = 709.0
-_LOG_EXP_LOWER = -745.0
-_PLOT_LOG_EXP_UPPER = 80.0
+_PLOT_LOG_MIN = -60.0
+_PLOT_LOG_MAX = 60.0
+_MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+
+
+def _sanitize_matplotlib_axis_limits(fig: object) -> None:
+    for ax in getattr(fig, "axes", ()):
+        axis_specs = (
+            ("x", ax.get_xlim, ax.set_xlim, ax.get_xscale),
+            ("y", ax.get_ylim, ax.set_ylim, ax.get_yscale),
+        )
+        for _, getter, setter, scale_getter in axis_specs:
+            try:
+                lo, hi = getter()
+            except Exception:
+                continue
+            if np.isfinite([lo, hi]).all() and lo != hi:
+                continue
+            default = (1e-12, 1.0) if scale_getter() == "log" else (0.0, 1.0)
+            try:
+                setter(*default)
+            except Exception:
+                pass
+
+
+def _safe_tight_layout() -> None:
+    fig = plt.gcf()
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        plt.tight_layout()
+
+
+def _save_current_figure(output_path: str | Path, **kwargs: object) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plt.gcf()
+    _sanitize_matplotlib_axis_limits(fig)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=_MATPLOTLIB_TRANSFORM_DOT_WARNING,
+            category=RuntimeWarning,
+        )
+        plt.savefig(path, **kwargs)
+
+
+def _format_risk_metrics_text(result: BacktestResult) -> str:
+    """Build a compact text block for on-chart risk metrics."""
+    met = compute_metrics(result)
+    return (
+        f"CAGR: {met['cagr']:.2%}\n"
+        f"Sharpe: {met['sharpe']:.3f}\n"
+        f"Sortino: {met['sortino']:.3f}\n"
+        f"Calmar: {met['calmar']:.3f}\n"
+        f"MDD: {met['max_drawdown']:.2%}"
+    )
+
+
+def _add_metrics_box(ax: plt.Axes, text: str) -> None:
+    """Render risk metrics box in a consistent style across plots."""
+    ax.text(
+        0.01,
+        0.99,
+        text,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=10,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75, "edgecolor": "0.7"},
+    )
+
+
+def _build_plot_result(
+    strategy_log_returns: np.ndarray,
+    benchmark_log_returns: np.ndarray,
+) -> BacktestResult:
+    """Build a minimal BacktestResult for plotting-only metrics overlays."""
+    strategy = np.nan_to_num(np.asarray(strategy_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    benchmark = np.nan_to_num(np.asarray(benchmark_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    rows = int(strategy.shape[0])
+    return BacktestResult(
+        strategy_returns=strategy,
+        benchmark_returns=benchmark,
+        turnovers=np.zeros(rows, dtype=np.float64),
+        weights_history=np.zeros((rows, 1), dtype=np.float64),
+    )
 
 
 def _safe_expm1(log_sum: float) -> float:
@@ -23,61 +113,157 @@ def _safe_expm1(log_sum: float) -> float:
     return math.expm1(log_sum)
 
 
-def _safe_equity_from_log_returns(log_returns: np.ndarray) -> np.ndarray:
-    """Convert log returns to equity curve with clipping to avoid overflow/underflow."""
-    clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
-    cum_log = np.cumsum(clean)
-    return np.exp(np.clip(cum_log, _LOG_EXP_LOWER, _LOG_EXP_UPPER))
+def _total_log_return(log_returns: np.ndarray) -> float:
+    """Return the finite cumulative log return for summary plots."""
+    clean = np.nan_to_num(np.asarray(log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    return float(clean.sum())
 
 
 def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
-    """Plot-safe equity curve with tighter cap to avoid matplotlib overflow."""
-    clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
-    cum_log = np.cumsum(clean)
-    # Keep values finite and within a practical dynamic range for plotting.
-    return np.exp(np.clip(cum_log, _LOG_EXP_LOWER, _PLOT_LOG_EXP_UPPER))
+    """Build a plot-safe equity curve from log returns."""
+    clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    cum_log = np.nan_to_num(np.cumsum(clean), nan=0.0, posinf=_PLOT_LOG_MAX, neginf=_PLOT_LOG_MIN)
+    # Keep plotting range finite to avoid matplotlib overflow warnings.
+    equity = np.exp(np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LOG_MAX))
+    return np.nan_to_num(
+        equity,
+        nan=float(np.exp(_PLOT_LOG_MIN)),
+        posinf=float(np.exp(_PLOT_LOG_MAX)),
+        neginf=float(np.exp(_PLOT_LOG_MIN)),
+    )
+
+
+def _finite_values(values: list[float] | np.ndarray, *, nan: float = 0.0) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    return np.nan_to_num(arr, nan=nan, posinf=nan, neginf=nan)
+
+
+def _clean_log_returns(values: np.ndarray) -> np.ndarray:
+    return np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _finite_xy(x_values: np.ndarray, y_values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x_values)
+    y = np.asarray(y_values, dtype=np.float64)
+    mask = np.isfinite(y)
+    if np.issubdtype(x.dtype, np.datetime64):
+        mask &= ~np.isnat(x.astype("datetime64[ns]"))
+    elif np.issubdtype(x.dtype, np.number):
+        mask &= np.isfinite(x.astype(np.float64))
+    return x[mask], y[mask]
+
+
+def _plot_finite_line(ax: plt.Axes, x_values: np.ndarray, y_values: np.ndarray, *args: object, **kwargs: object) -> None:
+    x, y = _finite_xy(x_values, y_values)
+    if x.size == 0 or y.size == 0:
+        return
+    ax.plot(x, y, *args, **kwargs)
+
+
+def _configure_log_y_axis(ax: plt.Axes, *series: np.ndarray) -> None:
+    """Configure a stable log-scale Y axis for very wide equity ranges."""
+    positive = [
+        np.asarray(values, dtype=np.float64)[np.asarray(values, dtype=np.float64) > 0.0]
+        for values in series
+    ]
+    positive = [values[np.isfinite(values)] for values in positive if values.size]
+    if not positive:
+        return
+
+    all_positive = np.concatenate(positive)
+    y_min = max(float(all_positive.min(initial=1.0)), float(np.exp(_PLOT_LOG_MIN)))
+    y_max = min(float(all_positive.max(initial=1.0)), float(np.exp(_PLOT_LOG_MAX)))
+    if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min <= 0.0 or y_max <= 0.0:
+        return
+    if y_min >= y_max:
+        y_min = max(y_min / 10.0, float(np.exp(_PLOT_LOG_MIN)))
+        y_max = min(y_max * 10.0, float(np.exp(_PLOT_LOG_MAX)))
+        if y_min >= y_max:
+            return
+
+    ax.set_yscale("log")
+    ax.set_ylim(y_min, y_max)
+
+    min_exp = int(np.floor(np.log10(y_min)))
+    max_exp = int(np.ceil(np.log10(y_max)))
+    span = max_exp - min_exp
+    step = max(1, int(np.ceil(span / 12)))
+    exponents = np.arange(min_exp, max_exp + 1, step, dtype=np.int32)
+    ticks = np.power(10.0, exponents.astype(np.float64))
+
+    ax.yaxis.set_major_locator(mticker.FixedLocator(ticks))
+    ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation(base=10.0))
+    ax.yaxis.set_minor_locator(mticker.NullLocator())
 
 
 def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
-    """Compute max drawdown in log space for numerical stability."""
-    clean = np.nan_to_num(log_returns, nan=0.0).astype(np.float64)
+    """Compute max drawdown in log-space without unstable exp/divide operations."""
+    clean = _clean_log_returns(log_returns)
     cum_log = np.cumsum(clean)
     running_max_log = np.maximum.accumulate(cum_log)
-    # cum_log - running_max_log <= 0, so expm1 is stable and never overflows.
-    drawdown = np.expm1(np.clip(cum_log - running_max_log, _LOG_EXP_LOWER, 0.0))
-    return float(drawdown.min(initial=0.0))
+    dd = np.expm1(np.clip(cum_log - running_max_log, _PLOT_LOG_MIN, 0.0))
+    return float(dd.min(initial=0.0))
 
 
+def _annotate_max_drawdown_segment(
+    ax: plt.Axes,
+    dates: np.ndarray,
+    equity_curve: np.ndarray,
+    color: str = "tab:red",
+) -> None:
+    """Connect MDD peak-to-trough with a dashed line and label the drawdown percent."""
+    x_values, equity = _finite_xy(np.asarray(dates), np.asarray(equity_curve, dtype=np.float64))
+    equity = np.maximum(equity, float(np.exp(_PLOT_LOG_MIN)))
+    if equity.size < 2 or x_values.size != equity.size:
+        return
 
-def compute_god_mode_returns(
-    future_log_returns: np.ndarray,
-    tradable_mask: np.ndarray,
-) -> np.ndarray:
-    """Theoretical maximum: each day pick the single tradable stock with highest return.
+    running_max = np.maximum.accumulate(equity)
+    safe_running_max = np.maximum(running_max, 1e-12)
+    drawdowns = equity / safe_running_max - 1.0
+    trough_idx = int(np.argmin(drawdowns))
+    mdd = float(drawdowns[trough_idx])
+    if mdd >= 0.0:
+        return
 
-    Args:
-        future_log_returns: [T, S] log returns
-        tradable_mask:       [T, S] bool mask
+    peak_idx = int(np.argmax(equity[: trough_idx + 1]))
+    x_peak = x_values[peak_idx]
+    x_trough = x_values[trough_idx]
+    y_peak = float(equity[peak_idx])
+    y_trough = float(equity[trough_idx])
 
-    Returns:
-        god_returns: [T] log returns of perfect daily selection
-    """
-    masked = np.where(tradable_mask.astype(bool), future_log_returns, -np.inf)
-    god = np.max(masked, axis=1).astype(np.float32)  # [T]
-    god = np.where(np.isneginf(god), 0.0, god)  # no tradable stocks → 0
-    return god
+    ax.plot(
+        [x_peak, x_trough],
+        [y_peak, y_trough],
+        linestyle="--",
+        color=color,
+        linewidth=1.8,
+        alpha=0.9,
+        label="_nolegend_",
+        zorder=5,
+    )
+    ax.scatter([x_peak, x_trough], [y_peak, y_trough], color=color, s=22, zorder=6, label="_nolegend_")
+    ax.annotate(
+        f"{mdd:.2%}",
+        xy=(x_trough, y_trough),
+        xytext=(8, -10),
+        textcoords="offset points",
+        color=color,
+        fontsize=9,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+    )
 
 
 def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
     Returns a dict with:
-        cumulative_return, annualized_return, sharpe, baseline_sharpe, max_drawdown,
-        turnover, daily_hit_rate, excess_return_vs_universe_average,
+        cumulative_return, annualized_return, cagr, sharpe, baseline_sharpe, sortino, baseline_sortino,
+        max_drawdown, calmar, turnover, daily_hit_rate, excess_return_vs_universe_average,
         cumulative_benchmark
     """
-    r = np.nan_to_num(result.strategy_returns, nan=0.0)
-    b = np.nan_to_num(result.benchmark_returns, nan=0.0)
+    r = _clean_log_returns(result.strategy_returns)
+    b = _clean_log_returns(result.benchmark_returns)
 
     # r and b are log returns; cumulative = exp(sum) - 1
     cum_r = _safe_expm1(float(r.sum()))
@@ -90,16 +276,27 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     ann_r = _safe_expm1(float(avg * 252.0))
     sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
     baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
+    downside = np.minimum(r, 0.0)
+    downside_b = np.minimum(b, 0.0)
+    downside_dev = float(np.sqrt(np.mean(np.square(downside))))
+    downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
+    sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
+    baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
 
     max_dd = _max_drawdown_from_log_returns(r)
+    calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
 
     return {
         "cumulative_return": cum_r,
         "annualized_return": ann_r,
+        "cagr": ann_r,
         "sharpe": sharpe,
         "baseline_sharpe": baseline_sharpe,
+        "sortino": sortino,
+        "baseline_sortino": baseline_sortino,
         "max_drawdown": max_dd,
-        "turnover": float(result.turnovers.mean()) if result.turnovers.size else 0.0,
+        "calmar": calmar,
+        "turnover": float(_finite_values(result.turnovers).mean()) if result.turnovers.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
         "excess_return_vs_universe_average": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
@@ -109,32 +306,38 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
 def compute_metrics_by_year(
     result: BacktestResult,
     dates: np.ndarray,
-    god_returns: np.ndarray | None = None,
 ) -> dict[int, dict[str, float]]:
     """Compute annual performance metrics.
 
     Args:
         result: BacktestResult containing daily returns
         dates: numpy array of datetime64 (shape [T])
-        god_returns: optional [T] log returns for theoretical max (god mode)
-
     Returns:
         dict mapping year -> annual metrics
     """
-    r = np.nan_to_num(result.strategy_returns, nan=0.0)
-    b = np.nan_to_num(result.benchmark_returns, nan=0.0)
-    g = np.nan_to_num(god_returns, nan=0.0) if god_returns is not None else None
+    r = _clean_log_returns(result.strategy_returns)
+    b = _clean_log_returns(result.benchmark_returns)
+    turnover = _finite_values(result.turnovers)
 
-    # Extract year from dates
-    years = np.asarray(dates, dtype='datetime64[D]').astype(object)
-    years = np.array([d.year for d in years])
+    date_values = np.asarray(dates, dtype="datetime64[D]")
+    n = min(int(date_values.size), int(r.size), int(b.size), int(turnover.size))
+    if n <= 0:
+        return {}
+    date_values = date_values[:n]
+    valid_dates = ~np.isnat(date_values)
+    if not bool(valid_dates.any()):
+        return {}
+    years = date_values[valid_dates].astype("datetime64[Y]").astype(np.int64) + 1970
+    r = r[:n][valid_dates]
+    b = b[:n][valid_dates]
+    turnover = turnover[:n][valid_dates]
 
     annual_metrics = {}
     for year in np.unique(years):
         mask = years == year
         r_year = r[mask]
         b_year = b[mask]
-        turnover_year = result.turnovers[mask]
+        turnover_year = turnover[mask]
 
         cum_r = _safe_expm1(float(r_year.sum()))
         cum_b = _safe_expm1(float(b_year.sum()))
@@ -145,22 +348,31 @@ def compute_metrics_by_year(
         ann_r = _safe_expm1(float(avg * 252.0))
         sharpe = float(avg / std * math.sqrt(252.0))
         baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0))
+        downside = np.minimum(r_year, 0.0)
+        downside_b = np.minimum(b_year, 0.0)
+        downside_dev = float(np.sqrt(np.mean(np.square(downside))))
+        downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
+        sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
+        baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
 
         max_dd = _max_drawdown_from_log_returns(r_year)
+        calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
 
         entry: dict[str, float] = {
             "cumulative_return": cum_r,
             "annualized_return": ann_r,
+            "cagr": ann_r,
             "sharpe": sharpe,
             "baseline_sharpe": baseline_sharpe,
+            "sortino": sortino,
+            "baseline_sortino": baseline_sortino,
             "max_drawdown": max_dd,
+            "calmar": calmar,
             "turnover": float(turnover_year.mean()),
             "daily_hit_rate": float((r_year > 0).mean()),
             "excess_return_vs_universe_average": cum_r - cum_b,
             "cumulative_benchmark": cum_b,
         }
-        if g is not None:
-            entry["god_cumulative_return"] = _safe_expm1(float(g[mask].sum()))
         annual_metrics[int(year)] = entry
 
     return annual_metrics
@@ -170,7 +382,6 @@ def generate_annual_report(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | None = None,
-    god_returns: np.ndarray | None = None,
 ) -> str:
     """Generate a text report of annual performance.
 
@@ -178,34 +389,23 @@ def generate_annual_report(
         result: BacktestResult
         dates: datetime64 array [T]
         output_path: optional file path to save report
-        god_returns: optional [T] log returns for theoretical max (god mode)
-
     Returns:
         formatted report string
     """
-    annual_metrics = compute_metrics_by_year(result, dates, god_returns=god_returns)
-    has_god = god_returns is not None
+    annual_metrics = compute_metrics_by_year(result, dates)
 
-    # Column widths: Year(8) Strategy(12) Baseline(12) Excess(12) Sharpe(10) BaseSharpe(11) MaxDD(10) Turnover(10) [GodMode(14)]
-    width = 109 if not has_god else 124
+    # Column widths: Year(8) Strategy(12) Baseline(12) Excess(12) Sharpe(10) BaseSharpe(11) MaxDD(10) Turnover(10)
+    width = 109
     lines = ["Annual Performance Report", "=" * width]
     header = (
         f"{'Year':<8} {'Strategy':>12} {'Baseline':>12} {'Excess':>12} "
         f"{'Sharpe':>10} {'BaseShrp':>11} {'Max DD':>10} {'Turnover':>10}"
     )
-    if has_god:
-        header += f" {'GodMode':>14}"
     lines.append(header)
     lines.append("-" * width)
 
-    # Accumulate totals for summary row
-    strat_log_sum = 0.0
-    bench_log_sum = 0.0
-    god_log_sum = 0.0
-
-    r_all = np.nan_to_num(result.strategy_returns, nan=0.0)
-    b_all = np.nan_to_num(result.benchmark_returns, nan=0.0)
-    g_all = np.nan_to_num(god_returns, nan=0.0) if has_god else None
+    r_all = _clean_log_returns(result.strategy_returns)
+    b_all = _clean_log_returns(result.benchmark_returns)
 
     for year in sorted(annual_metrics.keys()):
         m = annual_metrics[year]
@@ -214,8 +414,6 @@ def generate_annual_report(
             f"{m['excess_return_vs_universe_average']:>12.2%} "
             f"{m['sharpe']:>10.3f} {m['baseline_sharpe']:>11.3f} {m['max_drawdown']:>10.2%} {m['turnover']:>10.4f}"
         )
-        if has_god:
-            row += f" {m.get('god_cumulative_return', float('nan')):>13.2%}"
         lines.append(row)
 
     # --- Summary row (full-period) ---
@@ -228,6 +426,12 @@ def generate_annual_report(
     std_b = float(b_all.std(ddof=0)) + 1e-8
     sharpe_total = float(avg / std * math.sqrt(252.0))
     baseline_sharpe_total = float(avg_b / std_b * math.sqrt(252.0))
+    downside_total = np.minimum(r_all, 0.0)
+    downside_total_b = np.minimum(b_all, 0.0)
+    downside_total_dev = float(np.sqrt(np.mean(np.square(downside_total))))
+    downside_total_dev_b = float(np.sqrt(np.mean(np.square(downside_total_b))))
+    sortino_total = float(avg / downside_total_dev * math.sqrt(252.0)) if downside_total_dev > 0 else 0.0
+    baseline_sortino_total = float(avg_b / downside_total_dev_b * math.sqrt(252.0)) if downside_total_dev_b > 0 else 0.0
     max_dd_total = _max_drawdown_from_log_returns(r_all)
     turnover_total = float(result.turnovers.mean()) if result.turnovers.size else 0.0
 
@@ -236,10 +440,15 @@ def generate_annual_report(
         f"{cum_r_total - cum_b_total:>12.2%} "
         f"{sharpe_total:>10.3f} {baseline_sharpe_total:>11.3f} {max_dd_total:>10.2%} {turnover_total:>10.4f}"
     )
-    if has_god:
-        cum_g_total = _safe_expm1(float(g_all.sum()))
-        summary_row += f" {cum_g_total:>13.2%}"
     lines.append(summary_row)
+    lines.append(
+        f"{'':<8} {'':>12} {'':>12} {'':>12} "
+        f"{'Sortino':>10} {'BaseSrt':>11} {'':>10} {'':>10}"
+    )
+    lines.append(
+        f"{'':<8} {'':>12} {'':>12} {'':>12} "
+        f"{sortino_total:>10.3f} {baseline_sortino_total:>11.3f} {'':>10} {'':>10}"
+    )
 
     report = "\n".join(lines)
 
@@ -263,11 +472,13 @@ def plot_annual_performance(
         output_path: optional file path to save figure
     """
     annual_metrics = compute_metrics_by_year(result, dates)
+    risk_text = _format_risk_metrics_text(result)
     years = sorted(annual_metrics.keys())
     
-    strategy_returns = [annual_metrics[y]["cumulative_return"] for y in years]
-    benchmark_returns = [annual_metrics[y]["cumulative_benchmark"] for y in years]
-    sharpe_ratios = [annual_metrics[y]["sharpe"] for y in years]
+    strategy_returns = _finite_values([annual_metrics[y]["cumulative_return"] for y in years])
+    benchmark_returns = _finite_values([annual_metrics[y]["cumulative_benchmark"] for y in years])
+    sharpe_ratios = _finite_values([annual_metrics[y]["sharpe"] for y in years])
+    baseline_sharpes = _finite_values([annual_metrics[y]["baseline_sharpe"] for y in years])
     
     fig, axes = plt.subplots(2, 1, figsize=(12, 8))
     
@@ -285,10 +496,12 @@ def plot_annual_performance(
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     ax.axhline(y=0, color="black", linestyle="-", linewidth=0.5)
+    _add_metrics_box(ax, risk_text)
     
     # Panel 2: Sharpe ratio by year
     ax = axes[1]
-    ax.plot(years, sharpe_ratios, marker="o", linewidth=2, markersize=8, label="Sharpe Ratio")
+    _plot_finite_line(ax, np.asarray(years), sharpe_ratios, marker="o", linewidth=2, markersize=8, label="Strategy Sharpe")
+    _plot_finite_line(ax, np.asarray(years), baseline_sharpes, marker="s", linewidth=2, markersize=6, label="Baseline Sharpe")
     ax.set_xlabel("Year")
     ax.set_ylabel("Sharpe Ratio")
     ax.set_title("Annual Sharpe Ratio")
@@ -296,10 +509,10 @@ def plot_annual_performance(
     ax.axhline(y=0, color="red", linestyle="--", linewidth=1)
     ax.legend()
     
-    plt.tight_layout()
+    _safe_tight_layout()
     
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -308,7 +521,6 @@ def plot_equity_curve(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | Path | None = None,
-    god_returns: np.ndarray | None = None,
 ) -> None:
     """Plot cumulative equity curve for strategy and benchmark.
 
@@ -316,32 +528,28 @@ def plot_equity_curve(
         result: BacktestResult
         dates: datetime64 array [T]
         output_path: optional file path to save figure
-        god_returns: optional [T] log returns for theoretical max (god mode)
     """
-    r = np.nan_to_num(result.strategy_returns, nan=0.0)
-    b = np.nan_to_num(result.benchmark_returns, nan=0.0)
+    r = _clean_log_returns(result.strategy_returns)
+    b = _clean_log_returns(result.benchmark_returns)
 
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=(14, 7))
-    ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
-    if god_returns is not None:
-        g = np.nan_to_num(god_returns, nan=0.0)
-        god_equity = _safe_equity_for_plot(g)
-        ax.plot(dates, god_equity, label="God Mode (theoretical max)", linewidth=1.5,
-                linestyle="--", color="gold", alpha=0.9)
+    _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
     ax.set_title("Strategy vs Benchmark Equity Curve")
     ax.legend()
     ax.grid(True, alpha=0.3)
+    _add_metrics_box(ax, _format_risk_metrics_text(result))
 
-    plt.tight_layout()
+    _safe_tight_layout()
 
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -350,7 +558,6 @@ def plot_equity_curve_log(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | Path | None = None,
-    god_returns: np.ndarray | None = None,
 ) -> None:
     """Plot cumulative equity curve for strategy and benchmark (log scale Y-axis).
 
@@ -358,33 +565,108 @@ def plot_equity_curve_log(
         result: BacktestResult
         dates: datetime64 array [T]
         output_path: optional file path to save figure
-        god_returns: optional [T] log returns for theoretical max (god mode)
     """
-    r = np.nan_to_num(result.strategy_returns, nan=0.0)
-    b = np.nan_to_num(result.benchmark_returns, nan=0.0)
+    r = _clean_log_returns(result.strategy_returns)
+    b = _clean_log_returns(result.benchmark_returns)
 
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=(14, 7))
-    ax.plot(dates, strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    ax.plot(dates, benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
-    if god_returns is not None:
-        g = np.nan_to_num(god_returns, nan=0.0)
-        god_equity = _safe_equity_for_plot(g)
-        ax.plot(dates, god_equity, label="God Mode (theoretical max)", linewidth=1.5,
-                linestyle="--", color="gold", alpha=0.9)
+    _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
-    ax.set_yscale("log")
+    _configure_log_y_axis(ax, strategy_equity, benchmark_equity)
     ax.set_title("Strategy vs Benchmark Equity Curve (Log Scale)")
     ax.legend()
     ax.grid(True, alpha=0.3, which="both")
+    _add_metrics_box(ax, _format_risk_metrics_text(result))
     
-    plt.tight_layout()
+    _safe_tight_layout()
     
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_leverage_curve(
+    result: BacktestResult,
+    dates: np.ndarray,
+    output_path: str | Path | None = None,
+    target_gross_leverage: float = 1.0,
+) -> None:
+    """Plot realised daily gross leverage from weights history.
+
+    Gross leverage is defined as sum(abs(weights)) each day.
+    """
+    weights = np.asarray(result.weights_history, dtype=np.float64)
+    if weights.ndim != 2 or weights.size == 0:
+        return
+
+    leverage_series = np.sum(np.abs(np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)), axis=1)
+    if leverage_series.size == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    _plot_finite_line(ax, np.asarray(dates), leverage_series, label="Realized Gross Leverage", linewidth=1.8, alpha=0.9)
+    ax.axhline(y=float(target_gross_leverage), color="tab:red", linestyle="--", linewidth=1.2, label=f"Target {float(target_gross_leverage):.2f}x")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Gross Leverage")
+    ax.set_title("Daily Gross Leverage")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    _add_metrics_box(ax, _format_risk_metrics_text(result))
+
+    _safe_tight_layout()
+
+    if output_path:
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_configured_leverage_equity_curve(
+    result: BacktestResult,
+    dates: np.ndarray,
+    output_path: str | Path | None = None,
+    configured_gross_leverage: float = 1.0,
+) -> None:
+    """Plot equity curve from strategy returns generated under configured leverage."""
+    r = _clean_log_returns(result.strategy_returns)
+    b = _clean_log_returns(result.benchmark_returns)
+
+    strategy_equity = _safe_equity_for_plot(r)
+    benchmark_equity = _safe_equity_for_plot(b)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    _plot_finite_line(
+        ax,
+        np.asarray(dates),
+        strategy_equity,
+        label=f"Strategy (configured leverage={float(configured_gross_leverage):.2f}x)",
+        linewidth=2.2,
+        alpha=0.9,
+    )
+    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label="Benchmark", linewidth=1.8, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative Value (starting at 1.0)")
+    ax.set_title("Equity Curve (Configured Leverage Run)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # These are the realised risk metrics from the configured-leverage run.
+    risk_text = _format_risk_metrics_text(result)
+    info_text = f"{risk_text}\nConfigured Leverage: {float(configured_gross_leverage):.2f}x"
+    _add_metrics_box(ax, info_text)
+
+    _safe_tight_layout()
+
+    if output_path:
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
 
@@ -396,7 +678,6 @@ def plot_fold_first_year_returns(
     output_path: str | Path | None = None,
 ) -> None:
     """Plot all folds' first test-year daily cumulative NAV as a single line per strategy/baseline, X axis is date, Y axis is log scale."""
-    import pandas as pd
     if not all_first_year_dates:
         return
 
@@ -415,23 +696,200 @@ def plot_fold_first_year_returns(
     strat_nav = _safe_equity_for_plot(strat_sorted)
     base_nav = _safe_equity_for_plot(base_sorted)
 
-    # Convert dates to pandas for better x-axis formatting
-    date_pd = pd.to_datetime(dates_sorted)
+    date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(date_pd, strat_nav, label="Strategy", linewidth=2.2)
-    ax.plot(date_pd, base_nav, label="Baseline", linewidth=2.2)
+    _plot_finite_line(ax, date_values, strat_nav, label="Strategy", linewidth=2.2)
+    _plot_finite_line(ax, date_values, base_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment(ax, date_values, strat_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
     ax.set_title("Walkforward First-Test-Year Daily Cumulative NAV (All Folds)")
-    ax.set_yscale("log")
+    _configure_log_y_axis(ax, strat_nav, base_nav)
     ax.axhline(y=1.0, color="black", linewidth=0.8)
     ax.grid(True, alpha=0.3, which="both")
     ax.legend()
+    combined_result = _build_plot_result(strat_sorted, base_sorted)
+    _add_metrics_box(ax, _format_risk_metrics_text(combined_result))
 
     fig.autofmt_xdate()
-    plt.tight_layout()
+    _safe_tight_layout()
     if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_first_year_fold_metric_bars(
+    fold_ids: list[int],
+    all_first_year_strategy_log: list[np.ndarray],
+    all_first_year_baseline_log: list[np.ndarray],
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot per-fold first-test-year log-return/risk metrics."""
+    if not fold_ids:
+        return
+
+    labels = [f"F{int(fold_id):02d}" for fold_id in fold_ids]
+    rows: list[dict[str, float]] = []
+    for strategy, baseline in zip(all_first_year_strategy_log, all_first_year_baseline_log, strict=False):
+        strategy_log_return = _total_log_return(strategy)
+        baseline_log_return = _total_log_return(baseline)
+        result = _build_plot_result(strategy, baseline)
+        metrics = compute_metrics(result)
+        rows.append(
+            {
+                "strategy_return": strategy_log_return,
+                "baseline_return": baseline_log_return,
+                "excess_return": strategy_log_return - baseline_log_return,
+                "sharpe": float(metrics["sharpe"]),
+                "sortino": float(metrics["sortino"]),
+                "max_drawdown": float(metrics["max_drawdown"]),
+            }
+        )
+    if not rows:
+        return
+
+    x = np.arange(len(rows), dtype=np.float64)
+    width = 0.36
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+
+    strategy_return = _finite_values([row["strategy_return"] for row in rows])
+    baseline_return = _finite_values([row["baseline_return"] for row in rows])
+    excess_return = _finite_values([row["excess_return"] for row in rows])
+    sharpe = _finite_values([row["sharpe"] for row in rows])
+    sortino = _finite_values([row["sortino"] for row in rows])
+    max_drawdown = _finite_values([row["max_drawdown"] for row in rows])
+
+    ax = axes[0, 0]
+    ax.bar(x - width / 2, strategy_return, width, label="Strategy")
+    ax.bar(x + width / 2, baseline_return, width, label="Baseline")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Cumulative Log Return")
+    ax.set_ylabel("Log return")
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.bar(x, excess_return, color=np.where(excess_return >= 0.0, "tab:green", "tab:red"))
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Excess Log Return")
+    ax.set_ylabel("Strategy - Baseline")
+
+    ax = axes[1, 0]
+    _plot_finite_line(ax, x, sharpe, marker="o", label="Sharpe")
+    _plot_finite_line(ax, x, sortino, marker="o", label="Sortino")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Risk-Adjusted Return")
+    ax.set_ylabel("Ratio")
+    ax.legend()
+
+    ax = axes[1, 1]
+    ax.bar(x, max_drawdown, color="tab:orange")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_title("First Test Year Max Drawdown")
+    ax.set_ylabel("Drawdown")
+
+    for ax in axes.ravel():
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.grid(True, axis="y", alpha=0.3)
+
+    _safe_tight_layout()
+    if output_path:
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_first_year_turnover_concentration(
+    fold_ids: list[int],
+    all_first_year_turnovers: list[np.ndarray],
+    all_first_year_weights: list[np.ndarray],
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot first-test-year turnover and concentration by fold."""
+    if not fold_ids:
+        return
+
+    labels = [f"F{int(fold_id):02d}" for fold_id in fold_ids]
+    mean_turnover: list[float] = []
+    mean_max_abs_weight: list[float] = []
+    mean_hhi: list[float] = []
+    for turnovers, weights in zip(all_first_year_turnovers, all_first_year_weights, strict=False):
+        turnover_arr = _finite_values(turnovers)
+        weight_arr = _finite_values(weights)
+        mean_turnover.append(float(turnover_arr.mean()) if turnover_arr.size else 0.0)
+        if weight_arr.size == 0:
+            mean_max_abs_weight.append(0.0)
+            mean_hhi.append(0.0)
+            continue
+        abs_weights = np.abs(weight_arr)
+        gross = abs_weights.sum(axis=1, keepdims=True)
+        shares = np.divide(abs_weights, np.maximum(gross, 1e-12))
+        hhi = np.square(shares).sum(axis=1)
+        mean_max_abs_weight.append(float(abs_weights.max(axis=1).mean()))
+        mean_hhi.append(float(hhi.mean()))
+
+    x = np.arange(len(labels), dtype=np.float64)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    axes[0].bar(x, _finite_values(mean_turnover), color="tab:blue")
+    axes[0].set_title("First Test Year Mean Turnover")
+    axes[0].set_ylabel("Turnover")
+
+    axes[1].bar(x, _finite_values(mean_max_abs_weight), color="tab:purple")
+    axes[1].set_title("First Test Year Mean Max Absolute Single-Name Weight")
+    axes[1].set_ylabel("Weight")
+
+    axes[2].bar(x, _finite_values(mean_hhi), color="tab:brown")
+    axes[2].set_title("First Test Year Mean Weight HHI")
+    axes[2].set_ylabel("HHI")
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=45, ha="right")
+
+    for ax in axes:
+        ax.grid(True, axis="y", alpha=0.3)
+
+    _safe_tight_layout()
+    if output_path:
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_first_test_year_only(
+    dates: np.ndarray,
+    strategy_log_returns: np.ndarray,
+    baseline_log_returns: np.ndarray,
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot only the earliest first test year in walkforward evaluation."""
+    if len(dates) == 0:
+        return
+
+    strategy = np.nan_to_num(np.asarray(strategy_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    baseline = np.nan_to_num(np.asarray(baseline_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    date_values = np.asarray(dates, dtype="datetime64[ns]")
+    strategy_nav = _safe_equity_for_plot(strategy)
+    baseline_nav = _safe_equity_for_plot(baseline)
+    result = _build_plot_result(strategy, baseline)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    _plot_finite_line(ax, date_values, strategy_nav, label="Strategy", linewidth=2.2)
+    _plot_finite_line(ax, date_values, baseline_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment(ax, date_values, strategy_nav)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative NAV (log scale, start=1)")
+    ax.set_title("Walkforward First Test Year Only")
+    _configure_log_y_axis(ax, strategy_nav, baseline_nav)
+    ax.axhline(y=1.0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend()
+    _add_metrics_box(ax, _format_risk_metrics_text(result))
+
+    fig.autofmt_xdate()
+    _safe_tight_layout()
+    if output_path:
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
         print(f"Saved plot to {output_path}")
     plt.close()
