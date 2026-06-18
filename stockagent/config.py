@@ -446,6 +446,11 @@ class TrainingConfig:
     explain_cross_asset_attention_capture_rows: int = 1
     explain_cross_asset_validated_transmission: bool = True
     explain_cross_asset_role_embedding: bool = False
+    explain_cross_asset_graph_backend: str = "auto"
+    explain_cross_asset_graph_benchmark_min_edges: int = 1_000_000
+    explain_cross_asset_graph_explainability: bool = True
+    explain_cross_asset_graph_betweenness_max_vertices: int = 512
+    explain_cross_asset_graph_plot_max_nodes: int = 80
     table_output_format: str = "csv"
     save_daily_weights_table: bool = True
     save_integer_share_daily_weights_table: bool = True
@@ -635,6 +640,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_cross_asset_attention_capture_rows", 1)
     training.setdefault("explain_cross_asset_validated_transmission", True)
     training.setdefault("explain_cross_asset_role_embedding", False)
+    training.setdefault("explain_cross_asset_graph_backend", "auto")
+    training.setdefault("explain_cross_asset_graph_benchmark_min_edges", 1_000_000)
+    training.setdefault("explain_cross_asset_graph_explainability", True)
+    training.setdefault("explain_cross_asset_graph_betweenness_max_vertices", 512)
+    training.setdefault("explain_cross_asset_graph_plot_max_nodes", 80)
     training.setdefault("table_output_format", "csv")
     training.setdefault("save_integer_share_daily_weights_csv", True)
     training.setdefault("save_integer_share_holdings_csv", True)
@@ -1086,6 +1096,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_cross_asset_attention_capture_rows"] = max(
         1, int(training.get("explain_cross_asset_attention_capture_rows", 4))
     )
+    graph_backend = str(training.get("explain_cross_asset_graph_backend", "auto")).strip().lower()
+    if graph_backend not in {"auto", "polars", "cugraph"}:
+        raise ValueError("training.explain_cross_asset_graph_backend must be one of: auto, polars, cugraph")
+    training["explain_cross_asset_graph_backend"] = graph_backend
+    training["explain_cross_asset_graph_benchmark_min_edges"] = max(
+        0, int(training.get("explain_cross_asset_graph_benchmark_min_edges", 1_000_000))
+    )
+    training["explain_cross_asset_graph_explainability"] = bool(
+        training.get("explain_cross_asset_graph_explainability", True)
+    )
+    training["explain_cross_asset_graph_betweenness_max_vertices"] = max(
+        0, int(training.get("explain_cross_asset_graph_betweenness_max_vertices", 512))
+    )
+    training["explain_cross_asset_graph_plot_max_nodes"] = max(
+        5, int(training.get("explain_cross_asset_graph_plot_max_nodes", 80))
+    )
     backtest_artifact_compression = str(training.get("backtest_artifact_compression", "none")).strip().lower()
     if backtest_artifact_compression not in {"none", "compressed"}:
         raise ValueError("training.backtest_artifact_compression must be one of: none, compressed")
@@ -1214,6 +1240,15 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_cross_asset_attention_capture_rows=training_raw["explain_cross_asset_attention_capture_rows"],
             explain_cross_asset_validated_transmission=training_raw["explain_cross_asset_validated_transmission"],
             explain_cross_asset_role_embedding=training_raw["explain_cross_asset_role_embedding"],
+            explain_cross_asset_graph_backend=training_raw["explain_cross_asset_graph_backend"],
+            explain_cross_asset_graph_benchmark_min_edges=training_raw[
+                "explain_cross_asset_graph_benchmark_min_edges"
+            ],
+            explain_cross_asset_graph_explainability=training_raw["explain_cross_asset_graph_explainability"],
+            explain_cross_asset_graph_betweenness_max_vertices=training_raw[
+                "explain_cross_asset_graph_betweenness_max_vertices"
+            ],
+            explain_cross_asset_graph_plot_max_nodes=training_raw["explain_cross_asset_graph_plot_max_nodes"],
             table_output_format=training_raw["table_output_format"],
             save_daily_weights_table=training_raw["save_daily_weights_table"],
             save_integer_share_daily_weights_table=training_raw["save_integer_share_daily_weights_table"],
