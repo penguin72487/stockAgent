@@ -7525,6 +7525,10 @@ def run_training(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
         try:
             # Keep compile/cudagraph enabled while suppressing verbose artifact logs.
             torch._logging.set_logs(
@@ -7546,7 +7550,10 @@ def run_training(
     print(
         f"[runtime] device={device.type} "
         f"cuda_available={torch.cuda.is_available()} "
-        f"num_gpus={torch.cuda.device_count()}"
+        f"num_gpus={torch.cuda.device_count()} "
+        f"amp_dtype={config.environment.amp_dtype} "
+        f"effective_amp={amp_dtype} "
+        f"tensor_cores={config.environment.use_tensor_cores}"
     )
     if device.type == "cuda":
         amp_mode = "tf32" if amp_dtype is None else str(amp_dtype).replace("torch.", "")
@@ -7750,8 +7757,12 @@ def run_training(
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
             test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size_eval)
             if config.training.auto_batch_size and device.type == "cuda":
-                val_batch_size = min(train_batch_size * 2, len(val_ds))
-                test_batch_size = min(train_batch_size * 2, len(test_ds))
+                if config.training.model_name.strip().lower() == "transformer":
+                    val_batch_size = min(train_batch_size, len(val_ds))
+                    test_batch_size = min(train_batch_size, len(test_ds))
+                else:
+                    val_batch_size = min(train_batch_size * 2, len(val_ds))
+                    test_batch_size = min(train_batch_size * 2, len(test_ds))
 
             fold_dir = _fold_dir(output_path, fold.fold_id)
             fold_dir.mkdir(parents=True, exist_ok=True)
