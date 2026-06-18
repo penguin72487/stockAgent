@@ -128,6 +128,11 @@ training:
   explain_cross_asset_attention_capture_rows: 1
   explain_cross_asset_validated_transmission: true
   explain_cross_asset_role_embedding: false
+  explain_cross_asset_graph_backend: auto
+  explain_cross_asset_graph_benchmark_min_edges: 1000000
+  explain_cross_asset_graph_explainability: true
+  explain_cross_asset_graph_betweenness_max_vertices: 512
+  explain_cross_asset_graph_plot_max_nodes: 80
   table_output_format: parquet
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true

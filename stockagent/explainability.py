@@ -168,6 +168,11 @@ class ExplainabilitySettings:
     cross_asset_attention_capture_rows: int = 4
     cross_asset_validated_transmission: bool = True
     cross_asset_role_embedding: bool = True
+    cross_asset_graph_backend: str = "auto"
+    cross_asset_graph_benchmark_min_edges: int = 1_000_000
+    cross_asset_graph_explainability: bool = True
+    cross_asset_graph_betweenness_max_vertices: int = 512
+    cross_asset_graph_plot_max_nodes: int = 80
     strict_no_fallback: bool = False
 
 
@@ -198,6 +203,11 @@ def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
         attention_capture_rows=max(1, int(settings.cross_asset_attention_capture_rows)),
         validated_transmission=bool(settings.cross_asset_validated_transmission),
         role_embedding=bool(settings.cross_asset_role_embedding),
+        graph_backend=str(settings.cross_asset_graph_backend),
+        graph_benchmark_min_edges=max(0, int(settings.cross_asset_graph_benchmark_min_edges)),
+        graph_explainability=bool(settings.cross_asset_graph_explainability),
+        graph_betweenness_max_vertices=max(0, int(settings.cross_asset_graph_betweenness_max_vertices)),
+        graph_plot_max_nodes=max(5, int(settings.cross_asset_graph_plot_max_nodes)),
     )
 
 
@@ -246,6 +256,15 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
             getattr(training, "explain_cross_asset_validated_transmission", True)
         ),
         cross_asset_role_embedding=bool(getattr(training, "explain_cross_asset_role_embedding", False)),
+        cross_asset_graph_backend=str(getattr(training, "explain_cross_asset_graph_backend", "auto")),
+        cross_asset_graph_benchmark_min_edges=int(
+            getattr(training, "explain_cross_asset_graph_benchmark_min_edges", 1_000_000)
+        ),
+        cross_asset_graph_explainability=bool(getattr(training, "explain_cross_asset_graph_explainability", True)),
+        cross_asset_graph_betweenness_max_vertices=int(
+            getattr(training, "explain_cross_asset_graph_betweenness_max_vertices", 512)
+        ),
+        cross_asset_graph_plot_max_nodes=int(getattr(training, "explain_cross_asset_graph_plot_max_nodes", 80)),
     )
 
 
@@ -3928,6 +3947,46 @@ def _strip_orig_mod_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
     return state_dict
 
 
+def _adapt_dynamic_symbol_position_state(
+    model: nn.Module,
+    state_dict: dict[str, Any],
+    *,
+    strict: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if strict or not bool(getattr(model, "allow_dynamic_symbols", False)):
+        return state_dict, []
+    model_state = model.state_dict()
+    adapted: dict[str, Any] | None = None
+    adjustments: list[dict[str, Any]] = []
+    for key, value in state_dict.items():
+        if not str(key).endswith("symbol_position"):
+            continue
+        target = model_state.get(str(key))
+        if not torch.is_tensor(value) or not torch.is_tensor(target):
+            continue
+        if tuple(value.shape) == tuple(target.shape):
+            continue
+        if value.ndim != 4 or target.ndim != 4:
+            continue
+        if (value.size(0), value.size(1), value.size(3)) != (target.size(0), target.size(1), target.size(3)):
+            continue
+        if adapted is None:
+            adapted = dict(state_dict)
+        resized = target.detach().clone()
+        copy_symbols = min(int(value.size(2)), int(target.size(2)))
+        resized[:, :, :copy_symbols, :] = value[:, :, :copy_symbols, :].to(dtype=resized.dtype)
+        adapted[str(key)] = resized
+        adjustments.append(
+            {
+                "key": str(key),
+                "checkpoint_shape": list(value.shape),
+                "model_shape": list(target.shape),
+                "copied_symbols": int(copy_symbols),
+            }
+        )
+    return (adapted if adapted is not None else state_dict), adjustments
+
+
 def load_model_from_checkpoint(
     config: ExperimentConfig,
     panel: PanelData,
@@ -3945,6 +4004,7 @@ def load_model_from_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     state_dict = _strip_orig_mod_prefix(state_dict)
+    state_dict, adapted_state_keys = _adapt_dynamic_symbol_position_state(model, state_dict, strict=strict)
     incompatible = model.load_state_dict(state_dict, strict=strict)
     model.eval()
     info = {
@@ -3952,6 +4012,7 @@ def load_model_from_checkpoint(
         "checkpoint_best_val_loss": checkpoint.get("best_val_loss"),
         "missing_keys": list(getattr(incompatible, "missing_keys", [])),
         "unexpected_keys": list(getattr(incompatible, "unexpected_keys", [])),
+        "adapted_state_keys": adapted_state_keys,
     }
     return model, info
 

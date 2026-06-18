@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pytest
 import torch
 from torch import nn
 
@@ -12,6 +13,8 @@ from stockagent.explainability_cross_asset import (
     MODULE_NAME,
     CrossAssetTransmissionSettings,
     abstract_cross_asset_transmission,
+    _build_graph_explainability,
+    _process_cross_asset_graph_edges,
 )
 from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
 
@@ -84,6 +87,112 @@ def _matrix_csv(path: Path) -> tuple[list[str], list[str], np.ndarray]:
     target_symbols = [column for column in frame.columns if column != "source_symbol"]
     values = frame.select(target_symbols).to_numpy().astype(np.float64, copy=False)
     return source_symbols, target_symbols, values
+
+
+def _graph_edge_frame(symbols: int = 4, shocks: tuple[str, ...] = ("zero", "volume")) -> pl.DataFrame:
+    rows: list[dict[str, object]] = []
+    for shock_pos, shock in enumerate(shocks):
+        for source_idx in range(symbols):
+            for target_idx in range(symbols):
+                rows.append(
+                    {
+                        "shock": shock,
+                        "source_symbol": f"S{source_idx}",
+                        "target_symbol": f"S{target_idx}",
+                        "source_index": source_idx,
+                        "target_index": target_idx,
+                        "validated_transmission": float(
+                            (source_idx + 1) * (target_idx + 2) + shock_pos
+                        )
+                        / 100.0,
+                    }
+                )
+    return pl.DataFrame(rows)
+
+
+def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None:
+    edges = _graph_edge_frame()
+    result = _process_cross_asset_graph_edges(
+        edges,
+        CrossAssetTransmissionSettings(
+            top_edges=3,
+            graph_backend="auto",
+            graph_benchmark_min_edges=edges.height + 1,
+        ),
+    )
+
+    assert result.backend == "polars"
+    assert result.benchmark["selection_reason"] == "below_min_edges"
+    assert result.benchmark["backends"]["polars"]["elapsed_s"] >= 0
+    assert result.top_edges.height == 3
+    assert result.top_edges["validated_transmission"].to_list() == sorted(
+        result.top_edges["validated_transmission"].to_list(),
+        reverse=True,
+    )
+
+
+def test_cross_asset_graph_cugraph_matches_polars_when_available() -> None:
+    pytest.importorskip("cudf")
+    pytest.importorskip("cugraph")
+    if not torch.cuda.is_available():
+        pytest.skip("cuGraph graph processing requires CUDA in this environment.")
+
+    edges = _graph_edge_frame(symbols=5)
+    result = _process_cross_asset_graph_edges(
+        edges,
+        CrossAssetTransmissionSettings(
+            top_edges=5,
+            graph_backend="cugraph",
+            graph_benchmark_min_edges=0,
+        ),
+    )
+
+    assert result.backend == "cugraph"
+    assert result.benchmark["selected_backend"] == "cugraph"
+    assert result.benchmark["validation"]["ok"] is True
+    assert result.benchmark["backends"]["cugraph"]["graph_vertices"] == 5
+    assert result.benchmark["backends"]["cugraph"]["graph_edges"] == 25
+    assert not result.node_metrics.is_empty()
+    assert {"symbol_index", "symbol", "weighted_out_degree", "weighted_in_degree", "pagerank"}.issubset(
+        set(result.node_metrics.columns)
+    )
+
+
+def test_cross_asset_full_graph_cugraph_explainability_when_available() -> None:
+    pytest.importorskip("cudf")
+    pytest.importorskip("cugraph")
+    if not torch.cuda.is_available():
+        pytest.skip("cuGraph graph explainability requires CUDA in this environment.")
+
+    edges = _graph_edge_frame(symbols=6)
+    result = _build_graph_explainability(
+        edges,
+        CrossAssetTransmissionSettings(
+            graph_backend="cugraph",
+            graph_benchmark_min_edges=0,
+            graph_betweenness_max_vertices=100,
+        ),
+    )
+
+    assert result.backend == "cugraph"
+    assert result.summary["graph_vertices"] == 6
+    assert result.summary["graph_edges"] == 36
+    assert {"pagerank", "hits", "louvain"}.issubset(set(result.summary["algorithms"]))
+    assert not result.graph_edges.is_empty()
+    assert not result.node_metrics.is_empty()
+    assert not result.community_summary.is_empty()
+    assert not result.community_edges.is_empty()
+    assert {
+        "symbol_index",
+        "symbol",
+        "weighted_out_degree",
+        "weighted_in_degree",
+        "pagerank",
+        "hub_score",
+        "authority_score",
+        "community_id",
+        "primary_role",
+    }.issubset(set(result.node_metrics.columns))
 
 
 def test_independent_model_off_diagonal_score_influence_near_zero(tmp_path: Path) -> None:
@@ -264,8 +373,16 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
     base = tmp_path / MODULE_NAME
     summary = json.loads((base / "abstract_cross_asset_summary.json").read_text(encoding="utf-8"))
     assert summary["module"] == MODULE_NAME
+    assert summary["graph_backend"] == "polars"
+    assert summary["graph_benchmark"]["selection_reason"] == "below_min_edges"
+    assert summary["graph_explainability"]["enabled"] is True
+    assert summary["graph_explainability"]["backend"] in {"cugraph", "polars"}
     assert (base / "abstract_cross_asset_report.md").exists()
     assert (base / "tables" / "top_edges.csv").exists()
+    assert (base / "tables" / "graph_edges.csv").exists()
+    assert (base / "tables" / "graph_node_metrics.csv").exists()
+    assert (base / "tables" / "graph_community_summary.csv").exists()
+    assert (base / "tables" / "graph_community_edges.csv").exists()
     assert (base / "tables" / "shock_summary.csv").exists()
     assert (base / "tables" / "role_embeddings.csv").exists()
     assert (base / "matrices" / "zero_score_abs.csv").exists()
