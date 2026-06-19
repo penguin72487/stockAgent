@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 24
+  start_fold: 23
 environment:
   conda_env: fintech
   device: cuda
@@ -55,7 +55,7 @@ training:
   compile_loss: true
   fused_log_utility_loss: true
   materialize_window_tensors: false
-  warm_start_from_previous_fold: true
+  warm_start_from_previous_fold: false
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
@@ -79,7 +79,7 @@ training:
   batch_size_train: 32
   batch_size_eval: 16
   epochs: 1000
-  early_stopping_no_improve_ratio: 0.1
+  early_stopping_no_improve_ratio: 0.2
   val_interval_epochs: 1
   curve_test_interval: 1
   record_epoch_curve: true
@@ -144,7 +144,7 @@ training:
   backtest_artifact_compression: none
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
-  learning_rate: 0.000075
+  learning_rate: 0.001
   enable_lr_scheduler: false
   lr_scheduler: plateau
   lr_scheduler_t_max: 0
@@ -155,7 +155,7 @@ training:
   lr_scheduler_threshold: 0.0005
   top_k: 10
   num_workers: 0
-  weight_decay: 0.02
+  weight_decay: 0.1
   grad_clip_norm: 1.0
   finite_check_interval_steps: 0
   loss_type: log_utility
