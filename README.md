@@ -77,6 +77,16 @@ Multi-asset Taiwan stock trading research workspace.
 - Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
 - Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
 
+## Live Signal And Discord Bot
+
+- Run a local live signal:
+  `python scripts/live_signal.py --fold-id 25 --price-source panel`
+- Use `--price-source csv --prices-csv path/to/prices.csv` for current-price mark-to-market. The CSV must include `symbol`/`code`/`ticker` and `price`/`close`/`last` columns.
+- Output is written under `artifacts/live_signals/YYYY-MM-DD/` by default:
+  `summary.json`, `discord_message.md`, `target_weights.parquet`, and `rebalance.parquet`.
+- The Discord bot entrypoint is `services/discord_bot/bot.py`; configure it with `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`, and the `STOCKAGENT_*` environment variables shown in `services/discord_bot/.env.example`.
+- The bot exposes `/signal_now`, `/positions`, `/rebalance`, and `/health`, and sends the scheduled signal at `STOCKAGENT_SIGNAL_TIME` (default `13:15` Asia/Taipei).
+
 ## Environment
 
 - Conda or mamba environment: `fintech`
