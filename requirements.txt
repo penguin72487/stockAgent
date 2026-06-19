@@ -5,10 +5,10 @@ PyYAML>=6.0
 torch>=2.3
 tqdm>=4.66
 yfinance>=0.2.65
+discord.py>=2.4
 polars>=0.20
 transformers>=4.40
 flash-attn>=2.5
 xformers>=0.0.24
 lightgbm>=4.3
 xgboost>=2.0
-
