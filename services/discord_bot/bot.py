@@ -35,7 +35,14 @@ try:
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("discord.py is required. Install with: pip install discord.py>=2.4") from exc
 
+from stockagent.live.market_config import LiveMarketConfig, load_market_configs
 from stockagent.live.signal_engine import generate_live_signal
+
+
+class MarketUnsupportedError(RuntimeError):
+    def __init__(self, cfg: LiveMarketConfig) -> None:
+        self.cfg = cfg
+        super().__init__(_unsupported_message(cfg))
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -59,29 +66,146 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _markets_dir() -> Path:
+    raw = _env("STOCKAGENT_MARKETS_DIR", "services/discord_bot/markets")
+    path = Path(raw or "services/discord_bot/markets")
+    return path if path.is_absolute() else ROOT / path
+
+
+def _market_configs() -> dict[str, LiveMarketConfig]:
+    configs = load_market_configs(_markets_dir())
+    if configs:
+        return configs
+
+    fold_raw = _env("STOCKAGENT_FOLD_ID")
+    fallback = LiveMarketConfig(
+        market=_env("STOCKAGENT_DEFAULT_MARKET", "default") or "default",
+        label=_env("STOCKAGENT_MARKET_LABEL", _env("STOCKAGENT_DEFAULT_MARKET", "default") or "default") or "default",
+        config_path=_env("STOCKAGENT_CONFIG", "configs/markets/tw.yaml") or "configs/markets/tw.yaml",
+        output_dir=_env("STOCKAGENT_OUTPUT_DIR"),
+        live_output_dir=_env("STOCKAGENT_LIVE_OUTPUT_DIR"),
+        fold_id=int(fold_raw) if fold_raw else None,
+        checkpoint_path=_env("STOCKAGENT_CHECKPOINT"),
+        weights_path=_env("STOCKAGENT_WEIGHTS_PATH"),
+        panel_date=_env("STOCKAGENT_PANEL_DATE", "latest") or "latest",
+        price_source=_env("STOCKAGENT_PRICE_SOURCE", "panel") or "panel",
+        prices_csv=_env("STOCKAGENT_PRICES_CSV"),
+        device=_env("STOCKAGENT_DEVICE"),
+        top_n=_env_int("STOCKAGENT_TOP_N", 20) or 20,
+        min_abs_delta=_env_float("STOCKAGENT_MIN_ABS_DELTA", 0.001),
+    )
+    return {fallback.market: fallback}
+
+
+def _default_market() -> str:
+    configured = _env("STOCKAGENT_DEFAULT_MARKET")
+    configs = _market_configs()
+    if configured and configured in configs:
+        return configured
+    if "tw" in configs:
+        return "tw"
+    return next(iter(configs))
+
+
+def _resolve_market(market: str | None) -> LiveMarketConfig:
+    configs = _market_configs()
+    key = str(market or "").strip() or _default_market()
+    if key not in configs:
+        raise ValueError(f"unknown market={key!r}; available={', '.join(sorted(configs))}")
+    return configs[key]
+
+
+def _resolve_repo_path(value: str | None) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
+
+
+def _latest_checkpoint(output_dir: str | None) -> Path | None:
+    root = _resolve_repo_path(output_dir)
+    if root is None or not root.exists():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for path in root.glob("fold_*/checkpoint_best.pt"):
+        try:
+            fold_id = int(path.parent.name.removeprefix("fold_"))
+        except ValueError:
+            continue
+        candidates.append((fold_id, path))
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: item[0])[-1][1]
+
+
+def _market_model_checkpoint(cfg: LiveMarketConfig) -> Path | None:
+    explicit = _resolve_repo_path(cfg.checkpoint_path)
+    if explicit is not None:
+        return explicit if explicit.exists() else None
+    if cfg.fold_id is not None and cfg.output_dir:
+        path = _resolve_repo_path(cfg.output_dir)
+        if path is None:
+            return None
+        checkpoint = path / f"fold_{int(cfg.fold_id):02d}" / "checkpoint_best.pt"
+        return checkpoint if checkpoint.exists() else None
+    return _latest_checkpoint(cfg.output_dir)
+
+
+def _market_has_model(cfg: LiveMarketConfig) -> bool:
+    return _market_model_checkpoint(cfg) is not None
+
+
+def _unsupported_message(cfg: LiveMarketConfig) -> str:
+    if cfg.unsupported_message:
+        return cfg.unsupported_message
+    return f"**{cfg.label}** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
+
+
+def _scheduled_markets() -> list[str]:
+    raw = _env("STOCKAGENT_SCHEDULED_MARKETS")
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return [_default_market()]
+
+
+async def market_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    del interaction
+    query = str(current or "").strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+    for key, cfg in sorted(_market_configs().items()):
+        label = f"{key} - {cfg.label}"
+        if query and query not in key.lower() and query not in cfg.label.lower():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=key))
+    return choices[:25]
+
+
 def _signal_kwargs(
     *,
+    market: str | None = None,
     price_source: str | None = None,
     top_n: int | None = None,
     min_abs_delta: float | None = None,
 ) -> dict:
-    fold_raw = _env("STOCKAGENT_FOLD_ID", "25")
-    return {
-        "config_path": _env("STOCKAGENT_CONFIG", "configs/experiment_baseline.yaml"),
-        "output_dir": _env("STOCKAGENT_OUTPUT_DIR"),
-        "fold_id": int(fold_raw) if fold_raw else None,
-        "checkpoint_path": _env("STOCKAGENT_CHECKPOINT"),
-        "weights_path": _env("STOCKAGENT_WEIGHTS_PATH"),
-        "panel_date": _env("STOCKAGENT_PANEL_DATE", "latest"),
-        "price_source": price_source or _env("STOCKAGENT_PRICE_SOURCE", "panel"),
-        "prices_csv": _env("STOCKAGENT_PRICES_CSV"),
-        "device": _env("STOCKAGENT_DEVICE"),
-        "top_n": int(top_n if top_n is not None else _env_int("STOCKAGENT_TOP_N", 20)),
-        "min_abs_delta": float(
-            min_abs_delta if min_abs_delta is not None else _env_float("STOCKAGENT_MIN_ABS_DELTA", 0.001)
-        ),
-        "write": True,
+    cfg = _resolve_market(market)
+    if not _market_has_model(cfg):
+        raise MarketUnsupportedError(cfg)
+    overrides = {
+        "price_source": price_source if price_source and price_source != "auto" else None,
+        "top_n": top_n,
+        "min_abs_delta": min_abs_delta,
     }
+    return cfg.signal_kwargs(**overrides)
+
+
+async def _send_command_error(interaction: discord.Interaction, prefix: str, exc: Exception) -> None:
+    if isinstance(exc, MarketUnsupportedError):
+        await interaction.followup.send(str(exc))
+        return
+    await interaction.followup.send(f"{prefix} failed: `{type(exc).__name__}: {str(exc)[:1500]}`")
 
 
 class StockAgentBot(discord.Client):
@@ -92,7 +216,7 @@ class StockAgentBot(discord.Client):
         self.tz = ZoneInfo(_env("STOCKAGENT_TZ", "Asia/Taipei") or "Asia/Taipei")
         self.signal_time = _env("STOCKAGENT_SIGNAL_TIME", "13:15") or "13:15"
         self.channel_id = _env_int("DISCORD_CHANNEL_ID")
-        self._last_scheduled_date: str | None = None
+        self._last_scheduled_keys: set[str] = set()
         self._synced_guild_id: int | None = None
 
     async def setup_hook(self) -> None:
@@ -136,30 +260,35 @@ def _symbol_label(row: dict) -> str:
 
 
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
-@app_commands.describe(price_source="panel/csv/yahoo", top_n="Rows to show", min_abs_delta="Minimum absolute weight delta")
+@app_commands.describe(market="Market id", price_source="auto/panel/csv/yahoo", top_n="Rows to show", min_abs_delta="Minimum absolute weight delta")
+@app_commands.autocomplete(market=market_autocomplete)
 async def signal_now(
     interaction: discord.Interaction,
-    price_source: str = "panel",
+    market: str = "",
+    price_source: str = "auto",
     top_n: int = 20,
     min_abs_delta: float = 0.001,
 ) -> None:
     await interaction.response.defer(thinking=True)
     try:
-        result = await _run_signal(**_signal_kwargs(price_source=price_source, top_n=top_n, min_abs_delta=min_abs_delta))
+        result = await _run_signal(
+            **_signal_kwargs(market=market, price_source=price_source, top_n=top_n, min_abs_delta=min_abs_delta)
+        )
     except Exception as exc:
-        await interaction.followup.send(f"live signal failed: `{type(exc).__name__}: {str(exc)[:1500]}`")
+        await _send_command_error(interaction, "live signal", exc)
         return
     await _send_long_response(interaction, result.message)
 
 
 @bot.tree.command(name="positions", description="Show target position weights.")
-@app_commands.describe(top_n="Rows to show")
-async def positions(interaction: discord.Interaction, top_n: int = 20) -> None:
+@app_commands.describe(market="Market id", top_n="Rows to show")
+@app_commands.autocomplete(market=market_autocomplete)
+async def positions(interaction: discord.Interaction, market: str = "", top_n: int = 20) -> None:
     await interaction.response.defer(thinking=True)
     try:
-        result = await _run_signal(**_signal_kwargs(top_n=top_n))
+        result = await _run_signal(**_signal_kwargs(market=market, top_n=top_n))
     except Exception as exc:
-        await interaction.followup.send(f"positions failed: `{type(exc).__name__}: {str(exc)[:1500]}`")
+        await _send_command_error(interaction, "positions", exc)
         return
     rows = result.summary.get("top_positions", [])[:top_n]
     lines = ["**target positions**"]
@@ -169,40 +298,66 @@ async def positions(interaction: discord.Interaction, top_n: int = 20) -> None:
 
 
 @bot.tree.command(name="rebalance", description="Show rebalance deltas.")
-@app_commands.describe(threshold="Minimum absolute weight delta", top_n="Rows to show")
-async def rebalance(interaction: discord.Interaction, threshold: float = 0.001, top_n: int = 20) -> None:
+@app_commands.describe(market="Market id", threshold="Minimum absolute weight delta", top_n="Rows to show")
+@app_commands.autocomplete(market=market_autocomplete)
+async def rebalance(interaction: discord.Interaction, market: str = "", threshold: float = 0.001, top_n: int = 20) -> None:
     await interaction.response.defer(thinking=True)
     try:
-        result = await _run_signal(**_signal_kwargs(top_n=top_n, min_abs_delta=threshold))
+        result = await _run_signal(**_signal_kwargs(market=market, top_n=top_n, min_abs_delta=threshold))
     except Exception as exc:
-        await interaction.followup.send(f"rebalance failed: `{type(exc).__name__}: {str(exc)[:1500]}`")
+        await _send_command_error(interaction, "rebalance", exc)
         return
     rows = result.summary.get("rebalance", [])[:top_n]
     lines = ["**rebalance**"]
     for row in rows:
         delta = float(row["delta_weight"])
         side = "BUY" if delta > 0 else "SELL"
+        trade_price = float(row.get("trade_price", row.get("current_price", float("nan"))))
         lines.append(
             f"{_symbol_label(row)} {side} delta={delta * 100:.2f}% "
+            f"px={trade_price:.2f} "
             f"now={float(row['current_weight']) * 100:.2f}% target={float(row['target_weight']) * 100:.2f}%"
         )
     await _send_long_response(interaction, "\n".join(lines))
 
 
 @bot.tree.command(name="health", description="Show bot configuration.")
-async def health(interaction: discord.Interaction) -> None:
+@app_commands.describe(market="Market id")
+@app_commands.autocomplete(market=market_autocomplete)
+async def health(interaction: discord.Interaction, market: str = "") -> None:
+    configs = _market_configs()
+    cfg = _resolve_market(market)
+    checkpoint = _market_model_checkpoint(cfg)
     await interaction.response.send_message(
         "\n".join(
             [
                 "**stockAgent bot health**",
-                f"config=`{_env('STOCKAGENT_CONFIG', 'configs/experiment_baseline.yaml')}`",
-                f"output_dir=`{_env('STOCKAGENT_OUTPUT_DIR', 'config default')}`",
-                f"fold_id=`{_env('STOCKAGENT_FOLD_ID', '25')}`",
-                f"price_source=`{_env('STOCKAGENT_PRICE_SOURCE', 'panel')}`",
+                f"markets=`{', '.join(sorted(configs))}` default=`{_default_market()}`",
+                f"active=`{cfg.market}` label=`{cfg.label}`",
+                f"model=`{'ready' if checkpoint is not None else '目前不支援'}`",
+                f"checkpoint=`{checkpoint if checkpoint is not None else 'none'}`",
+                f"config=`{cfg.config_path}`",
+                f"output_dir=`{cfg.output_dir or 'config default'}`",
+                f"live_output_dir=`{cfg.live_output_dir or 'auto'}`",
+                f"fold_id=`{cfg.fold_id if cfg.fold_id is not None else 'latest'}`",
+                f"price_source=`{cfg.price_source}`",
                 f"signal_time=`{bot.signal_time}` tz=`{bot.tz.key}`",
             ]
         )
     )
+
+
+@bot.tree.command(name="markets", description="List configured stockAgent markets.")
+async def markets(interaction: discord.Interaction) -> None:
+    lines = ["**stockAgent markets**"]
+    for key, cfg in sorted(_market_configs().items()):
+        fold = cfg.fold_id if cfg.fold_id is not None else "latest"
+        status = "ready" if _market_has_model(cfg) else "目前不支援"
+        lines.append(
+            f"`{key}` {cfg.label} model=`{status}` "
+            f"config=`{cfg.config_path}` output=`{cfg.output_dir or 'config default'}` fold=`{fold}`"
+        )
+    await interaction.response.send_message("\n".join(lines))
 
 
 @tasks.loop(minutes=1)
@@ -213,12 +368,18 @@ async def scheduled_signal() -> None:
     if now.strftime("%H:%M") != bot.signal_time:
         return
     today = now.strftime("%Y-%m-%d")
-    if bot._last_scheduled_date == today:
-        return
-    bot._last_scheduled_date = today
     channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
-    result = await _run_signal(**_signal_kwargs())
-    await channel.send(result.message)
+    for market in _scheduled_markets():
+        key = f"{today}:{market}"
+        if key in bot._last_scheduled_keys:
+            continue
+        bot._last_scheduled_keys.add(key)
+        try:
+            result = await _run_signal(**_signal_kwargs(market=market))
+        except MarketUnsupportedError as exc:
+            await channel.send(str(exc))
+            continue
+        await channel.send(result.message)
 
 
 @scheduled_signal.before_loop

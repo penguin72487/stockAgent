@@ -33,6 +33,7 @@ def test_build_rebalance_rows_sorts_by_absolute_delta() -> None:
     assert [row["symbol"] for row in rows] == ["B", "A", "C"]
     assert rows[0]["name"] == "Bravo"
     assert rows[0]["delta_weight"] == -0.3
+    assert rows[0]["trade_price"] == 20.0
     assert rows[0]["price_return"] == 1.0
 
 
@@ -48,7 +49,14 @@ def test_format_signal_message_stays_discord_sized() -> None:
         "estimated_trade_cost": 0.001,
         "top_positions": [{"symbol": "2330", "name": "TSMC", "weight": 0.2, "current_price": 1000.0}],
         "rebalance": [
-            {"symbol": "2330", "name": "TSMC", "delta_weight": 0.05, "current_weight": 0.15, "target_weight": 0.2}
+            {
+                "symbol": "2330",
+                "name": "TSMC",
+                "delta_weight": 0.05,
+                "trade_price": 1000.0,
+                "current_weight": 0.15,
+                "target_weight": 0.2,
+            }
         ],
     }
 
@@ -57,4 +65,5 @@ def test_format_signal_message_stays_discord_sized() -> None:
     assert "stockAgent live signal" in message
     assert "2330" in message
     assert "TSMC" in message
+    assert "px=1000.00" in message
     assert len(message) < 1900

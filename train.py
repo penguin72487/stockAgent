@@ -42,7 +42,7 @@ def _configure_cuda_runtime() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the stockAgent baseline model")
-    parser.add_argument("--config", default="configs/experiment_baseline.yaml", help="Path to experiment config")
+    parser.add_argument("--config", default="configs/markets/tw.yaml", help="Path to experiment config")
     parser.add_argument("--output-dir", default=None, help="Directory for training outputs (override config.runner.output_dir)")
     parser.add_argument(
         "--mode",

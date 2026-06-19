@@ -41,8 +41,12 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
     rebalance = list(summary.get("rebalance", []))[: max(0, int(max_rows))]
     top_positions = list(summary.get("top_positions", []))[: min(max(0, int(max_rows)), 8)]
 
+    market_label = str(summary.get("market_label") or summary.get("market") or "").strip()
+    title = "**stockAgent live signal**"
+    if market_label:
+        title += f" {market_label}"
     lines = [
-        f"**stockAgent live signal** `{summary.get('asof_date', 'latest')}`",
+        f"{title} `{summary.get('asof_date', 'latest')}`",
         (
             f"panel=`{summary.get('panel_date', 'n/a')}` "
             f"fold=`{summary.get('fold_id', 'auto')}` "
@@ -75,6 +79,7 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
             lines.append(
                 f"{_label(row)} {side} "
                 f"delta={_fmt_pct(delta)} "
+                f"px={_fmt_float(row.get('trade_price', row.get('current_price')), 2)} "
                 f"now={_fmt_pct(row.get('current_weight'))} "
                 f"target={_fmt_pct(row.get('target_weight'))}"
             )

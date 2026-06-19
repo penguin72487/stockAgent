@@ -111,6 +111,7 @@ def build_rebalance_rows(
                 "target_weight": float(target[idx]),
                 "delta_weight": float(delta[idx]),
                 "abs_delta_weight": abs_delta,
+                "trade_price": current_price,
                 "current_price": current_price,
                 "base_price": base_price,
                 "price_return": float(simple_return),

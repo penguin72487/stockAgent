@@ -1,0 +1,21 @@
+market: forex
+label: 外匯
+
+config_path: configs/markets/forex.yaml
+output_dir: artifacts/markets/forex
+live_output_dir: artifacts/live_signals/forex
+
+# null/empty/auto/latest means: discover the latest fold_*/checkpoint_best.pt.
+fold_id:
+checkpoint_path:
+weights_path:
+
+panel_date: latest
+device: cuda
+price_source: panel
+prices_csv:
+yahoo_chunk_size: 80
+
+top_n: 20
+min_abs_delta: 0.001
+unsupported_message: "**外匯** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
