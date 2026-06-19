@@ -215,7 +215,7 @@ def _price_snapshot(
 def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date: str) -> str:
     import polars as pl
 
-    output_dir = Path(output_root) / "live_signals" / str(asof_date)
+    output_dir = Path(output_root) / str(asof_date)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "summary.json").write_text(
         json.dumps(result.summary, indent=2, ensure_ascii=False),
@@ -229,8 +229,11 @@ def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date:
 
 def generate_live_signal(
     *,
-    config_path: str | Path = "configs/experiment_baseline.yaml",
+    market: str | None = None,
+    market_label: str | None = None,
+    config_path: str | Path = "configs/markets/tw.yaml",
     output_dir: str | Path | None = None,
+    live_output_dir: str | Path | None = None,
     fold_id: int | None = None,
     checkpoint_path: str | Path | None = None,
     weights_path: str | Path | None = None,
@@ -251,6 +254,8 @@ def generate_live_signal(
 
     resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
     resolved_fold_id, checkpoint = _resolve_checkpoint(resolved_output_dir, fold_id, checkpoint_path)
+    market_id = str(market or "").strip()
+    market_name = str(market_label or market_id or "").strip()
 
     panel = _build_panel(config)
     symbol_names = load_symbol_name_map(config.data.parquet_root)
@@ -383,6 +388,8 @@ def generate_live_signal(
 
     summary: dict[str, Any] = {
         "asof_date": resolved_asof,
+        "market": market_id,
+        "market_label": market_name,
         "panel_date": panel_date_str,
         "fold_id": int(resolved_fold_id),
         "checkpoint_path": str(checkpoint),
@@ -413,7 +420,13 @@ def generate_live_signal(
         output_dir=None,
     )
     if write:
-        result.output_dir = _write_outputs(result, resolved_output_dir, resolved_asof)
+        if live_output_dir is not None:
+            output_root = Path(live_output_dir)
+        elif market_id:
+            output_root = resolved_output_dir / "live_signals" / market_id
+        else:
+            output_root = resolved_output_dir / "live_signals"
+        result.output_dir = _write_outputs(result, output_root, resolved_asof)
         result.summary["output_dir"] = result.output_dir
         (Path(result.output_dir) / "summary.json").write_text(
             json.dumps(result.summary, indent=2, ensure_ascii=False),

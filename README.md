@@ -7,7 +7,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Raw research data lives under `data_parquet/`.
 - Each parquet file represents one stock symbol, for example `2330_features.parquet`.
 - The current training and validation specification is documented in `docs/training_spec.md`.
-- A concrete experiment template is provided in `configs/experiment_baseline.yaml`.
+- Market-specific experiment templates live under `configs/markets/`, for example `configs/markets/tw.yaml`. The legacy `configs/experiment_baseline.yaml` is kept for compatibility.
 
 ## Planned workflow
 
@@ -19,7 +19,7 @@ Multi-asset Taiwan stock trading research workspace.
 ## Training
 
 - Install dependencies from `requirements.txt` inside the `fintech` environment.
-- Run training with `python train.py --config configs/experiment_baseline.yaml --output-dir artifacts`.
+- Run Taiwan training with `python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
 - Or use the project runner: `./coda_runner.sh`.
 - Runner defaults are centralized in `configs/runner.env`.
 - Outputs include one folder per walk-forward fold and a top-level `summary.json`.
@@ -79,13 +79,15 @@ Multi-asset Taiwan stock trading research workspace.
 
 ## Live Signal And Discord Bot
 
-- Run a local live signal:
-  `python scripts/live_signal.py --fold-id 25 --price-source panel`
+- Each market has one YAML file under `services/discord_bot/markets/`, for example `services/discord_bot/markets/tw.yaml`.
+- Run a local live signal from a market config:
+  `python scripts/live_signal.py --market-config services/discord_bot/markets/tw.yaml --price-source panel`
+- Leave `fold_id` empty/null in the market YAML to discover the latest `fold_*/checkpoint_best.pt` under that market's `output_dir`.
 - Use `--price-source csv --prices-csv path/to/prices.csv` for current-price mark-to-market. The CSV must include `symbol`/`code`/`ticker` and `price`/`close`/`last` columns.
-- Output is written under `artifacts/live_signals/YYYY-MM-DD/` by default:
+- Per-market output is written under the market YAML's `live_output_dir`, for example `artifacts/live_signals/tw/YYYY-MM-DD/`:
   `summary.json`, `discord_message.md`, `target_weights.parquet`, and `rebalance.parquet`.
-- The Discord bot entrypoint is `services/discord_bot/bot.py`; configure it with `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`, and the `STOCKAGENT_*` environment variables shown in `services/discord_bot/.env.example`.
-- The bot exposes `/signal_now`, `/positions`, `/rebalance`, and `/health`, and sends the scheduled signal at `STOCKAGENT_SIGNAL_TIME` (default `13:15` Asia/Taipei).
+- The Discord bot entrypoint is `services/discord_bot/bot.py`; configure it with `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`, `STOCKAGENT_MARKETS_DIR`, and `STOCKAGENT_DEFAULT_MARKET`.
+- The bot exposes `/signal_now`, `/positions`, `/rebalance`, `/markets`, and `/health`; market-aware commands accept a `market` option.
 
 ## Environment
 
