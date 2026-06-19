@@ -6,13 +6,17 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 
 from stockagent.backtest.simulator import BacktestResult
 
 
+_PLOT_FLOAT_MAX = float(np.nextafter(np.finfo(np.float64).max, 0.0))
+_PLOT_NAV_MAX = float(np.exp(np.log(_PLOT_FLOAT_MAX)))
+_PLOT_LINEAR_NAV_MAX = float(_PLOT_NAV_MAX / 64.0)
 _PLOT_LOG_MIN = -60.0
-_PLOT_LOG_MAX = 60.0
+_PLOT_LOG_MAX = float(np.log(_PLOT_NAV_MAX))
+_PLOT_LINEAR_LOG_MAX = float(np.log(_PLOT_LINEAR_NAV_MAX))
+_LN_10 = float(np.log(10.0))
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
 
 
@@ -106,7 +110,7 @@ def _build_plot_result(
 
 def _safe_expm1(log_sum: float) -> float:
     """expm1 that returns inf instead of raising overflow for very large log sums."""
-    if log_sum >= 709.78:   # math.log(float_max) ≈ 709.78
+    if log_sum >= _PLOT_LOG_MAX:
         return math.inf
     if log_sum <= -745.13:  # underflow → -1
         return -1.0
@@ -122,14 +126,31 @@ def _total_log_return(log_returns: np.ndarray) -> float:
 def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     """Build a plot-safe equity curve from log returns."""
     clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-    cum_log = np.nan_to_num(np.cumsum(clean), nan=0.0, posinf=_PLOT_LOG_MAX, neginf=_PLOT_LOG_MIN)
-    # Keep plotting range finite to avoid matplotlib overflow warnings.
-    equity = np.exp(np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LOG_MAX))
+    cum_log = np.nan_to_num(np.cumsum(clean), nan=0.0, posinf=_PLOT_LINEAR_LOG_MAX, neginf=_PLOT_LOG_MIN)
+    # Keep linear plotting range finite with autoscale headroom; use log10 plots for true extreme NAV.
+    equity = np.exp(np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LINEAR_LOG_MAX))
     return np.nan_to_num(
         equity,
         nan=float(np.exp(_PLOT_LOG_MIN)),
-        posinf=float(np.exp(_PLOT_LOG_MAX)),
+        posinf=_PLOT_LINEAR_NAV_MAX,
         neginf=float(np.exp(_PLOT_LOG_MIN)),
+    )
+
+
+def _safe_log10_nav_for_plot(log_returns: np.ndarray) -> np.ndarray:
+    """Build a plot-safe log10(NAV) curve without exponentiating NAV."""
+    clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    cum_log = np.nan_to_num(
+        np.cumsum(clean),
+        nan=0.0,
+        posinf=np.finfo(np.float64).max,
+        neginf=-np.finfo(np.float64).max,
+    )
+    return np.nan_to_num(
+        cum_log / _LN_10,
+        nan=0.0,
+        posinf=np.finfo(np.float64).max,
+        neginf=-np.finfo(np.float64).max,
     )
 
 
@@ -158,42 +179,6 @@ def _plot_finite_line(ax: plt.Axes, x_values: np.ndarray, y_values: np.ndarray, 
     if x.size == 0 or y.size == 0:
         return
     ax.plot(x, y, *args, **kwargs)
-
-
-def _configure_log_y_axis(ax: plt.Axes, *series: np.ndarray) -> None:
-    """Configure a stable log-scale Y axis for very wide equity ranges."""
-    positive = [
-        np.asarray(values, dtype=np.float64)[np.asarray(values, dtype=np.float64) > 0.0]
-        for values in series
-    ]
-    positive = [values[np.isfinite(values)] for values in positive if values.size]
-    if not positive:
-        return
-
-    all_positive = np.concatenate(positive)
-    y_min = max(float(all_positive.min(initial=1.0)), float(np.exp(_PLOT_LOG_MIN)))
-    y_max = min(float(all_positive.max(initial=1.0)), float(np.exp(_PLOT_LOG_MAX)))
-    if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min <= 0.0 or y_max <= 0.0:
-        return
-    if y_min >= y_max:
-        y_min = max(y_min / 10.0, float(np.exp(_PLOT_LOG_MIN)))
-        y_max = min(y_max * 10.0, float(np.exp(_PLOT_LOG_MAX)))
-        if y_min >= y_max:
-            return
-
-    ax.set_yscale("log")
-    ax.set_ylim(y_min, y_max)
-
-    min_exp = int(np.floor(np.log10(y_min)))
-    max_exp = int(np.ceil(np.log10(y_max)))
-    span = max_exp - min_exp
-    step = max(1, int(np.ceil(span / 12)))
-    exponents = np.arange(min_exp, max_exp + 1, step, dtype=np.int32)
-    ticks = np.power(10.0, exponents.astype(np.float64))
-
-    ax.yaxis.set_major_locator(mticker.FixedLocator(ticks))
-    ax.yaxis.set_major_formatter(mticker.LogFormatterSciNotation(base=10.0))
-    ax.yaxis.set_minor_locator(mticker.NullLocator())
 
 
 def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
@@ -231,6 +216,66 @@ def _annotate_max_drawdown_segment(
     y_peak = float(equity[peak_idx])
     y_trough = float(equity[trough_idx])
 
+    ax.plot(
+        [x_peak, x_trough],
+        [y_peak, y_trough],
+        linestyle="--",
+        color=color,
+        linewidth=1.8,
+        alpha=0.9,
+        label="_nolegend_",
+        zorder=5,
+    )
+    ax.scatter([x_peak, x_trough], [y_peak, y_trough], color=color, s=22, zorder=6, label="_nolegend_")
+    ax.annotate(
+        f"{mdd:.2%}",
+        xy=(x_trough, y_trough),
+        xytext=(8, -10),
+        textcoords="offset points",
+        color=color,
+        fontsize=9,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+    )
+
+
+def _annotate_max_drawdown_segment_log10(
+    ax: plt.Axes,
+    dates: np.ndarray,
+    log_returns: np.ndarray,
+    log10_nav: np.ndarray,
+    color: str = "tab:red",
+) -> None:
+    """Connect MDD peak-to-trough on a linear log10(NAV) axis."""
+    n = min(len(dates), len(log_returns), len(log10_nav))
+    if n < 2:
+        return
+    x_values = np.asarray(dates)[:n]
+    y_values = np.asarray(log10_nav, dtype=np.float64)[:n]
+    clean_returns = _clean_log_returns(np.asarray(log_returns, dtype=np.float64)[:n])
+    mask = np.isfinite(y_values)
+    if np.issubdtype(x_values.dtype, np.datetime64):
+        mask &= ~np.isnat(x_values.astype("datetime64[ns]"))
+    elif np.issubdtype(x_values.dtype, np.number):
+        mask &= np.isfinite(x_values.astype(np.float64))
+    if int(mask.sum()) < 2:
+        return
+    x_values = x_values[mask]
+    y_values = y_values[mask]
+    cum_log = np.cumsum(clean_returns)[mask]
+    running_max_log = np.maximum.accumulate(cum_log)
+    drawdowns = np.expm1(np.clip(cum_log - running_max_log, _PLOT_LOG_MIN, 0.0))
+    trough_idx = int(np.argmin(drawdowns))
+    mdd = float(drawdowns[trough_idx])
+    if mdd >= 0.0:
+        return
+    peak_idx = int(np.argmax(cum_log[: trough_idx + 1]))
+    x_peak = x_values[peak_idx]
+    x_trough = x_values[trough_idx]
+    y_peak = float(y_values[peak_idx])
+    y_trough = float(y_values[trough_idx])
+    if not np.isfinite([y_peak, y_trough]).all():
+        return
     ax.plot(
         [x_peak, x_trough],
         [y_peak, y_trough],
@@ -559,7 +604,7 @@ def plot_equity_curve_log(
     dates: np.ndarray,
     output_path: str | Path | None = None,
 ) -> None:
-    """Plot cumulative equity curve for strategy and benchmark (log scale Y-axis).
+    """Plot cumulative log10 NAV curve for strategy and benchmark.
 
     Args:
         result: BacktestResult
@@ -569,19 +614,19 @@ def plot_equity_curve_log(
     r = _clean_log_returns(result.strategy_returns)
     b = _clean_log_returns(result.benchmark_returns)
 
-    strategy_equity = _safe_equity_for_plot(r)
-    benchmark_equity = _safe_equity_for_plot(b)
+    strategy_log10_nav = _safe_log10_nav_for_plot(r)
+    benchmark_log10_nav = _safe_log10_nav_for_plot(b)
 
     fig, ax = plt.subplots(figsize=(14, 7))
-    _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
-    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
+    _plot_finite_line(ax, np.asarray(dates), strategy_log10_nav, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_finite_line(ax, np.asarray(dates), benchmark_log10_nav, label="Benchmark", linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment_log10(ax, dates, r, strategy_log10_nav)
     ax.set_xlabel("Date")
-    ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
-    _configure_log_y_axis(ax, strategy_equity, benchmark_equity)
-    ax.set_title("Strategy vs Benchmark Equity Curve (Log Scale)")
+    ax.set_ylabel("log10(NAV), start=0")
+    ax.set_title("Strategy vs Benchmark log10 NAV")
+    ax.axhline(y=0.0, color="black", linewidth=0.8)
     ax.legend()
-    ax.grid(True, alpha=0.3, which="both")
+    ax.grid(True, alpha=0.3)
     _add_metrics_box(ax, _format_risk_metrics_text(result))
     
     _safe_tight_layout()
@@ -677,7 +722,7 @@ def plot_fold_first_year_returns(
     all_first_year_baseline_log: list[np.ndarray],
     output_path: str | Path | None = None,
 ) -> None:
-    """Plot all folds' first test-year daily cumulative NAV as a single line per strategy/baseline, X axis is date, Y axis is log scale."""
+    """Plot all folds' first test-year daily log10 NAV as a single line per strategy/baseline."""
     if not all_first_year_dates:
         return
 
@@ -692,22 +737,21 @@ def plot_fold_first_year_returns(
     strat_sorted = all_strategy[order]
     base_sorted = all_baseline[order]
 
-    # Compute cumulative NAV
-    strat_nav = _safe_equity_for_plot(strat_sorted)
-    base_nav = _safe_equity_for_plot(base_sorted)
+    # Compute log10 NAV directly so values above float64 NAV range remain plottable.
+    strat_log10_nav = _safe_log10_nav_for_plot(strat_sorted)
+    base_log10_nav = _safe_log10_nav_for_plot(base_sorted)
 
     date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    _plot_finite_line(ax, date_values, strat_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, base_nav, label="Baseline", linewidth=2.2)
-    _annotate_max_drawdown_segment(ax, date_values, strat_nav)
+    _plot_finite_line(ax, date_values, strat_log10_nav, label="Strategy", linewidth=2.2)
+    _plot_finite_line(ax, date_values, base_log10_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment_log10(ax, date_values, strat_sorted, strat_log10_nav)
     ax.set_xlabel("Date")
-    ax.set_ylabel("Cumulative NAV (log scale, start=1)")
-    ax.set_title("Walkforward First-Test-Year Daily Cumulative NAV (All Folds)")
-    _configure_log_y_axis(ax, strat_nav, base_nav)
-    ax.axhline(y=1.0, color="black", linewidth=0.8)
-    ax.grid(True, alpha=0.3, which="both")
+    ax.set_ylabel("log10(NAV), start=0")
+    ax.set_title("Walkforward First-Test-Year Daily log10 NAV (All Folds)")
+    ax.axhline(y=0.0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3)
     ax.legend()
     combined_result = _build_plot_result(strat_sorted, base_sorted)
     _add_metrics_box(ax, _format_risk_metrics_text(combined_result))
@@ -870,20 +914,19 @@ def plot_first_test_year_only(
     strategy = np.nan_to_num(np.asarray(strategy_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     baseline = np.nan_to_num(np.asarray(baseline_log_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     date_values = np.asarray(dates, dtype="datetime64[ns]")
-    strategy_nav = _safe_equity_for_plot(strategy)
-    baseline_nav = _safe_equity_for_plot(baseline)
+    strategy_log10_nav = _safe_log10_nav_for_plot(strategy)
+    baseline_log10_nav = _safe_log10_nav_for_plot(baseline)
     result = _build_plot_result(strategy, baseline)
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    _plot_finite_line(ax, date_values, strategy_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, baseline_nav, label="Baseline", linewidth=2.2)
-    _annotate_max_drawdown_segment(ax, date_values, strategy_nav)
+    _plot_finite_line(ax, date_values, strategy_log10_nav, label="Strategy", linewidth=2.2)
+    _plot_finite_line(ax, date_values, baseline_log10_nav, label="Baseline", linewidth=2.2)
+    _annotate_max_drawdown_segment_log10(ax, date_values, strategy, strategy_log10_nav)
     ax.set_xlabel("Date")
-    ax.set_ylabel("Cumulative NAV (log scale, start=1)")
-    ax.set_title("Walkforward First Test Year Only")
-    _configure_log_y_axis(ax, strategy_nav, baseline_nav)
-    ax.axhline(y=1.0, color="black", linewidth=0.8)
-    ax.grid(True, alpha=0.3, which="both")
+    ax.set_ylabel("log10(NAV), start=0")
+    ax.set_title("Walkforward First Test Year Only log10 NAV")
+    ax.axhline(y=0.0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3)
     ax.legend()
     _add_metrics_box(ax, _format_risk_metrics_text(result))
 

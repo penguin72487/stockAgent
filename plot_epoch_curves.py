@@ -12,7 +12,26 @@ import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
+from stockagent.backtest.report import (
+    generate_annual_report,
+    plot_annual_performance,
+    plot_equity_curve,
+    plot_equity_curve_log,
+    plot_first_year_fold_metric_bars,
+    plot_first_year_turnover_concentration,
+    plot_fold_first_year_returns,
+)
+from stockagent.backtest.simulator import BacktestResult
+
 _CURVE_FILENAMES = ("epoch_curve.parquet", "epoch_curve.jsonl", "epoch_curve.csv")
+_BACKTEST_ARTIFACT_FILENAME = "test_backtest.npz"
+_STALE_FOLD_LOG_PLOT_FILENAMES = ("equity_curve_log.png", "leverage_equity_curve_log.png")
+_STALE_WALKFORWARD_LOG_PLOT_FILENAMES = (
+    "walkforward_equity_curve_log.png",
+    "walkforward_equity_curve_log10.png",
+    "walkforward_first_year_cumulative_returns.png",
+    "walkforward_first_test_year_only.png",
+)
 _REPORT_PARQUET_FILENAMES = (
     "attention_capture_summary.parquet",
     "daily_portfolio_returns.parquet",
@@ -93,6 +112,12 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Skip epoch curve plotting; useful with --export-report-csvs for CSV export only.",
+    )
+    parser.add_argument(
+        "--redraw-backtest-plots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also redraw fold backtest plots from test_backtest.npz files under --artifacts-root.",
     )
     return parser.parse_args()
 
@@ -292,6 +317,173 @@ def export_report_csvs(
     return result
 
 
+def _fold_id_from_dir(fold_dir: Path) -> int:
+    name = fold_dir.name
+    if name.startswith("fold_"):
+        try:
+            return int(name[len("fold_") :])
+        except ValueError:
+            pass
+    return 10**9
+
+
+def _find_backtest_artifacts(root: Path) -> list[Path]:
+    root = root if root.is_dir() else root.parent
+    paths = list(root.rglob(_BACKTEST_ARTIFACT_FILENAME))
+    return sorted(paths, key=lambda path: (_fold_id_from_dir(path.parent), path.parent.as_posix()))
+
+
+def _load_backtest_artifact(backtest_path: Path) -> tuple[BacktestResult, np.ndarray]:
+    with np.load(backtest_path) as data:
+        result = BacktestResult(
+            strategy_returns=data["strategy_returns"].astype(np.float32),
+            benchmark_returns=data["benchmark_returns"].astype(np.float32),
+            turnovers=data["turnovers"].astype(np.float32),
+            weights_history=data["weights_history"].astype(np.float32),
+        )
+        dates = np.asarray(data["dates"])
+    return result, dates
+
+
+def _remove_stale_log_plot_files(fold_dir: Path) -> None:
+    for filename in _STALE_FOLD_LOG_PLOT_FILENAMES:
+        path = fold_dir / filename
+        if path.exists():
+            path.unlink()
+
+
+def _remove_stale_walkforward_log_plot_files(root: Path) -> None:
+    for filename in _STALE_WALKFORWARD_LOG_PLOT_FILENAMES:
+        path = root / filename
+        if path.exists():
+            path.unlink()
+
+
+def _first_year_mask(dates: np.ndarray) -> np.ndarray:
+    date_values = np.asarray(dates, dtype="datetime64[D]")
+    if date_values.size == 0:
+        return np.asarray([], dtype=bool)
+    years = date_values.astype(object)
+    year_values = np.asarray([date.year for date in years], dtype=np.int64)
+    return year_values == int(year_values.min())
+
+
+def _write_single_backtest_plots(
+    backtest_path: Path,
+    result: BacktestResult,
+    dates: np.ndarray,
+) -> None:
+    fold_dir = backtest_path.parent
+    _remove_stale_log_plot_files(fold_dir)
+    with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as handle:
+        handle.write(generate_annual_report(result, dates))
+    plot_equity_curve(result, dates, fold_dir / "equity_curve.png")
+    plot_equity_curve_log(result, dates, fold_dir / "equity_curve_log10.png")
+    plot_annual_performance(result, dates, fold_dir / "annual_performance.png")
+    plot_equity_curve(result, dates, fold_dir / "leverage_equity_curve.png")
+    plot_equity_curve_log(result, dates, fold_dir / "leverage_equity_curve_log10.png")
+    plot_annual_performance(result, dates, fold_dir / "leverage_annual_performance.png")
+
+
+def _write_walkforward_backtest_plots(
+    root: Path,
+    loaded: list[tuple[int, BacktestResult, np.ndarray]],
+) -> None:
+    _remove_stale_walkforward_log_plot_files(root)
+    all_first_year_fold_ids: list[int] = []
+    all_first_year_dates: list[np.ndarray] = []
+    all_first_year_strategy_log: list[np.ndarray] = []
+    all_first_year_baseline_log: list[np.ndarray] = []
+    all_first_year_turnovers: list[np.ndarray] = []
+    all_first_year_weights: list[np.ndarray] = []
+
+    for fold_id, result, dates in sorted(loaded, key=lambda item: item[0]):
+        mask = _first_year_mask(dates)
+        if not mask.any():
+            continue
+        all_first_year_fold_ids.append(int(fold_id))
+        all_first_year_dates.append(np.asarray(dates)[mask])
+        all_first_year_strategy_log.append(
+            np.nan_to_num(result.strategy_returns[mask], nan=0.0).astype(np.float64)
+        )
+        all_first_year_baseline_log.append(
+            np.nan_to_num(result.benchmark_returns[mask], nan=0.0).astype(np.float64)
+        )
+        all_first_year_turnovers.append(
+            np.nan_to_num(result.turnovers[mask], nan=0.0).astype(np.float64)
+        )
+        all_first_year_weights.append(
+            np.nan_to_num(result.weights_history[mask], nan=0.0).astype(np.float64)
+        )
+
+    if not all_first_year_dates:
+        return
+    plot_fold_first_year_returns(
+        all_first_year_dates,
+        all_first_year_strategy_log,
+        all_first_year_baseline_log,
+        root / "walkforward_first_year_log10_nav.png",
+    )
+    plot_first_year_fold_metric_bars(
+        all_first_year_fold_ids,
+        all_first_year_strategy_log,
+        all_first_year_baseline_log,
+        root / "walkforward_first_year_fold_metrics.png",
+    )
+    plot_first_year_turnover_concentration(
+        all_first_year_fold_ids,
+        all_first_year_turnovers,
+        all_first_year_weights,
+        root / "walkforward_first_year_turnover_concentration.png",
+    )
+
+
+def redraw_backtest_plots(
+    root: Path,
+    *,
+    quiet: bool = False,
+) -> dict[str, float | int | str]:
+    total_start = time.perf_counter()
+    root = root if root.is_dir() else root.parent
+    backtest_paths = _find_backtest_artifacts(root)
+    if not backtest_paths:
+        result = {
+            "root": str(root),
+            "backtest_artifacts": 0,
+            "written_folds": 0,
+            "total_s": float(time.perf_counter() - total_start),
+        }
+        if not quiet:
+            print(f"backtest_plot_redraw skipped: no {_BACKTEST_ARTIFACT_FILENAME} found under {root}")
+        return result
+
+    loaded: list[tuple[int, BacktestResult, np.ndarray]] = []
+    for backtest_path in backtest_paths:
+        fold_id = _fold_id_from_dir(backtest_path.parent)
+        result, dates = _load_backtest_artifact(backtest_path)
+        _write_single_backtest_plots(backtest_path, result, dates)
+        loaded.append((fold_id, result, dates))
+        if not quiet:
+            print(f"redrew backtest plots: {backtest_path.parent}")
+
+    _write_walkforward_backtest_plots(root, loaded)
+    timing = {
+        "root": str(root),
+        "backtest_artifacts": int(len(backtest_paths)),
+        "written_folds": int(len(loaded)),
+        "total_s": float(time.perf_counter() - total_start),
+    }
+    timing_json = root / "backtest_plot_redraw_timing.json"
+    timing_json.write_text(json.dumps(timing, indent=2, ensure_ascii=False), encoding="utf-8")
+    timing["timing_json"] = str(timing_json)
+    if not quiet:
+        print(
+            "backtest_plot_redraw: "
+            f"folds={len(loaded)} total={float(timing['total_s']):.3f}s timing={timing_json}"
+        )
+    return timing
+
+
 def _sample_rows(rows: list[dict], interval: int) -> list[dict]:
     interval = max(1, int(interval))
     sampled = [row for row in rows if int(row.get("epoch", 0)) % interval == 0]
@@ -319,6 +511,23 @@ def _has_finite(values: np.ndarray) -> bool:
     return bool(np.isfinite(values).any())
 
 
+def _log10_positive_values(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    mask = np.isfinite(arr) & (arr > 0.0)
+    out[mask] = np.log10(arr[mask])
+    return out
+
+
+def _signed_log10_values(values: np.ndarray, *, linthresh: float = 1e-3) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.full_like(arr, np.nan, dtype=np.float64)
+    mask = np.isfinite(arr)
+    scale = max(float(linthresh), np.finfo(np.float64).tiny)
+    out[mask] = np.sign(arr[mask]) * np.log10(1.0 + np.abs(arr[mask]) / scale)
+    return out
+
+
 def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, interval: int, *, quiet: bool = False) -> None:
     epochs = np.asarray([int(row.get("epoch", 0)) for row in rows], dtype=np.int64)
     train_loss = _to_float_array(rows, "train_loss")
@@ -326,21 +535,29 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     test_mean = _to_float_array(rows, "test_mean")
     all_loss_values = np.concatenate([train_loss, val_mean, test_mean])
     finite_loss_values = all_loss_values[np.isfinite(all_loss_values)]
+    if finite_loss_values.size == 0:
+        train_plot = train_loss
+        val_plot = val_mean
+        test_plot = test_mean
+        ylabel = "Loss"
+    elif np.any(finite_loss_values <= 0.0):
+        train_plot = _signed_log10_values(train_loss)
+        val_plot = _signed_log10_values(val_mean)
+        test_plot = _signed_log10_values(test_mean)
+        ylabel = "signed log10(1 + abs(Loss) / 1e-3)"
+    else:
+        train_plot = _log10_positive_values(train_loss)
+        val_plot = _log10_positive_values(val_mean)
+        test_plot = _log10_positive_values(test_mean)
+        ylabel = "log10(Loss)"
 
     fig, ax = plt.subplots(figsize=(12, 6), dpi=130)
-    ax.plot(epochs, train_loss, marker="o", linewidth=1.8, markersize=4, label="train_loss")
-    ax.plot(epochs, val_mean, marker="s", linewidth=1.8, markersize=4, label="val_mean")
-    ax.plot(epochs, test_mean, marker="^", linewidth=1.8, markersize=4, label="test_mean")
+    ax.plot(epochs, train_plot, marker="o", linewidth=1.8, markersize=4, label="train_loss")
+    ax.plot(epochs, val_plot, marker="s", linewidth=1.8, markersize=4, label="val_mean")
+    ax.plot(epochs, test_plot, marker="^", linewidth=1.8, markersize=4, label="test_mean")
     ax.set_title(f"Loss Curves (sample every {max(1, int(interval))} epochs)")
     ax.set_xlabel("Epoch")
-    if finite_loss_values.size == 0:
-        ax.set_ylabel("Loss")
-    elif np.any(finite_loss_values <= 0.0):
-        ax.set_ylabel("Loss (symlog)")
-        ax.set_yscale("symlog", linthresh=1e-3)
-    else:
-        ax.set_ylabel("Loss")
-        ax.set_yscale("log")
+    ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.25)
     ax.legend()
 
@@ -543,6 +760,9 @@ def main() -> None:
             force=bool(args.force_report_csvs),
             batch_size=max(1, int(args.report_csv_batch_size)),
         )
+
+    if args.redraw_backtest_plots:
+        redraw_backtest_plots(Path(args.artifacts_root))
 
 
 if __name__ == "__main__":
