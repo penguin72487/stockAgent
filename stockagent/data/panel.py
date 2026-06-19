@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
+import os
 import pickle
 import os
 from typing import Any
@@ -37,6 +38,11 @@ try:
     from stockagent.data import panel_numba as _panel_numba
 except Exception:  # pragma: no cover - Numba is an acceleration dependency
     _panel_numba = None
+
+try:
+    import cudf
+except Exception:  # pragma: no cover - optional GPU dependency
+    cudf = None
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
@@ -128,6 +134,8 @@ def _path_requires_trading_volume(path: Path, policy: str | bool | None) -> bool
         return True
     if normalized == "optional":
         return False
+    if path.name.upper().endswith("_DL_FEATURES.PARQUET"):
+        return False
     parts = {part.lower() for part in path.parts}
     path_text = path.as_posix().lower()
     if {"forex", "forex_pepperstone", "data_forex_frankfurter"} & parts:
@@ -189,6 +197,7 @@ class PanelData:
     tradable_mask: np.ndarray
     alive_mask: np.ndarray
     benchmark_returns: np.ndarray
+    open_prices: np.ndarray
     close_prices: np.ndarray
     can_buy_mask: np.ndarray | None = None
     can_sell_mask: np.ndarray | None = None
@@ -1067,6 +1076,7 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         can_sell_mask=can_sell_mask,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
+        open_prices=cached["open_prices"],
         close_prices=cached["close_prices"],
     )
 

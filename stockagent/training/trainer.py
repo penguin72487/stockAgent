@@ -5003,12 +5003,25 @@ def _estimate_eval_chunk_rows(
     return max(1, min(upper, int(estimated_rows)))
 
 
+def _remove_stale_log_plot_files(fold_dir: Path) -> None:
+    for name in ("equity_curve_log.png", "leverage_equity_curve_log.png"):
+        path = fold_dir / name
+        if path.exists():
+            path.unlink()
+
+
 def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
     _write_summary(results, output_path)
 
     stale_combined_log_plot = output_path / "walkforward_equity_curve_log.png"
     if stale_combined_log_plot.exists():
         stale_combined_log_plot.unlink()
+    stale_combined_log10_plot = output_path / "walkforward_equity_curve_log10.png"
+    if stale_combined_log10_plot.exists():
+        stale_combined_log10_plot.unlink()
+    stale_first_year_cumulative_plot = output_path / "walkforward_first_year_cumulative_returns.png"
+    if stale_first_year_cumulative_plot.exists():
+        stale_first_year_cumulative_plot.unlink()
     stale_first_test_year_only_plot = output_path / "walkforward_first_test_year_only.png"
     if stale_first_test_year_only_plot.exists():
         stale_first_test_year_only_plot.unlink()
@@ -5057,7 +5070,7 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
             all_first_year_dates,
             all_first_year_strategy_log,
             all_first_year_baseline_log,
-            output_path / "walkforward_first_year_cumulative_returns.png",
+            output_path / "walkforward_first_year_log10_nav.png",
         )
         plot_first_year_fold_metric_bars(
             all_first_year_fold_ids,
@@ -6941,11 +6954,12 @@ def _run_training_tree_models(
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
 
+            _remove_stale_log_plot_files(fold_dir)
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log10.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
             plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+            plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log10.png")
             plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
             _save_integer_share_audit_artifacts(
                 fold_dir,
@@ -7174,11 +7188,12 @@ def _run_inference_tree_models(
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
 
+        _remove_stale_log_plot_files(fold_dir)
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
         plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
         _save_integer_share_audit_artifacts(
             fold_dir,
@@ -7465,11 +7480,12 @@ def _run_inference_neural_models(
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
 
+        _remove_stale_log_plot_files(fold_dir)
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "annual_performance.png")
         plot_equity_curve(test_bt, test_dates, fold_dir / "leverage_equity_curve.png")
-        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log.png")
+        plot_equity_curve_log(test_bt, test_dates, fold_dir / "leverage_equity_curve_log10.png")
         plot_annual_performance(test_bt, test_dates, fold_dir / "leverage_annual_performance.png")
         _save_integer_share_audit_artifacts(
             fold_dir,
@@ -7525,6 +7541,10 @@ def run_training(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
         try:
             # Keep compile/cudagraph enabled while suppressing verbose artifact logs.
             torch._logging.set_logs(
@@ -7546,7 +7566,10 @@ def run_training(
     print(
         f"[runtime] device={device.type} "
         f"cuda_available={torch.cuda.is_available()} "
-        f"num_gpus={torch.cuda.device_count()}"
+        f"num_gpus={torch.cuda.device_count()} "
+        f"amp_dtype={config.environment.amp_dtype} "
+        f"effective_amp={amp_dtype} "
+        f"tensor_cores={config.environment.use_tensor_cores}"
     )
     if device.type == "cuda":
         amp_mode = "tf32" if amp_dtype is None else str(amp_dtype).replace("torch.", "")
@@ -7750,8 +7773,12 @@ def run_training(
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
             test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size_eval)
             if config.training.auto_batch_size and device.type == "cuda":
-                val_batch_size = min(train_batch_size * 2, len(val_ds))
-                test_batch_size = min(train_batch_size * 2, len(test_ds))
+                if config.training.model_name.strip().lower() == "transformer":
+                    val_batch_size = min(train_batch_size, len(val_ds))
+                    test_batch_size = min(train_batch_size, len(test_ds))
+                else:
+                    val_batch_size = min(train_batch_size * 2, len(val_ds))
+                    test_batch_size = min(train_batch_size * 2, len(test_ds))
 
             fold_dir = _fold_dir(output_path, fold.fold_id)
             fold_dir.mkdir(parents=True, exist_ok=True)
@@ -9677,14 +9704,15 @@ def run_training(
                 plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
                 plot_timing[f"{name}_copied_from"] = str(source.name)
 
+            _remove_stale_log_plot_files(fold_dir)
             _time_plot("equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "equity_curve.png")
-            _time_plot("equity_curve_log", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log.png")
+            _time_plot("equity_curve_log10", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log10.png")
             _time_plot("annual_performance", plot_annual_performance, test_bt, test_dates, fold_dir / "annual_performance.png")
             _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
             _copy_plot(
-                "leverage_equity_curve_log",
-                fold_dir / "equity_curve_log.png",
-                fold_dir / "leverage_equity_curve_log.png",
+                "leverage_equity_curve_log10",
+                fold_dir / "equity_curve_log10.png",
+                fold_dir / "leverage_equity_curve_log10.png",
             )
             _copy_plot(
                 "leverage_annual_performance",

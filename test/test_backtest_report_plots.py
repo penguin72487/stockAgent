@@ -55,7 +55,7 @@ def test_backtest_report_plots_handle_nonfinite_extremes_without_runtime_warning
         warnings.simplefilter("error", RuntimeWarning)
         report.plot_annual_performance(result, dates, tmp_path / "annual.png")
         report.plot_equity_curve(result, dates, tmp_path / "equity.png")
-        report.plot_equity_curve_log(result, dates, tmp_path / "equity_log.png")
+        report.plot_equity_curve_log(result, dates, tmp_path / "equity_log10.png")
         report.plot_leverage_curve(result, dates, tmp_path / "leverage.png")
         report.plot_configured_leverage_equity_curve(result, dates, tmp_path / "configured_leverage.png")
         report.plot_fold_first_year_returns([dates], [strategy_returns], [benchmark_returns], tmp_path / "fold.png")
@@ -66,3 +66,40 @@ def test_backtest_report_plots_handle_nonfinite_extremes_without_runtime_warning
     assert (tmp_path / "annual.png").exists()
     assert (tmp_path / "equity.png").exists()
     assert (tmp_path / "first_year.png").exists()
+
+
+def test_backtest_report_log10_nav_helper_handles_values_above_float64_nav():
+    strategy_returns = np.array([800.0, 800.0], dtype=np.float64)
+    strategy_log10_nav = report._safe_log10_nav_for_plot(strategy_returns)
+
+    assert np.isfinite(strategy_log10_nav).all()
+    assert strategy_log10_nav[-1] > 308.0
+    np.testing.assert_allclose(strategy_log10_nav, np.cumsum(strategy_returns) / np.log(10.0))
+
+
+def test_walkforward_nav_plot_uses_log10_values_above_float64_nav(monkeypatch):
+    dates = np.arange("2026-01-01", "2026-01-04", dtype="datetime64[D]")
+    strategy_returns = np.array([800.0, 800.0, -1.0], dtype=np.float64)
+    benchmark_returns = np.zeros(3, dtype=np.float64)
+    original_close = report.plt.close
+    monkeypatch.setattr(report.plt, "close", lambda *args, **kwargs: None)
+    fig = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            report.plot_fold_first_year_returns([dates], [strategy_returns], [benchmark_returns])
+        fig = report.plt.gcf()
+        ax = fig.axes[0]
+        strategy_line = next(line for line in ax.get_lines() if line.get_label() == "Strategy")
+        y_values = np.asarray(strategy_line.get_ydata(), dtype=np.float64)
+
+        assert ax.get_ylabel() == "log10(NAV), start=0"
+        assert ax.get_title() == "Walkforward First-Test-Year Daily log10 NAV (All Folds)"
+        assert ax.get_yscale() == "linear"
+        assert np.isfinite(y_values).all()
+        assert y_values[1] > 308.0
+        np.testing.assert_allclose(y_values[:2], np.cumsum(strategy_returns)[:2] / np.log(10.0))
+    finally:
+        monkeypatch.setattr(report.plt, "close", original_close)
+        if fig is not None:
+            original_close(fig)
