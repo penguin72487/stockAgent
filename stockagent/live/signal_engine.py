@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +18,12 @@ from stockagent.live.portfolio_state import (
     build_rebalance_rows,
     estimate_benchmark_return,
     estimate_drifted_weights,
+    portfolio_risk_summary,
     top_weight_rows,
 )
 from stockagent.live.quote_provider import PriceSnapshot, fetch_yahoo_last_prices, load_prices_csv, load_symbol_name_map
 from stockagent.live.report_formatter import format_signal_message
+from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.models.factory import build_model
 from stockagent.training.trainer import (
     _autocast_context,
@@ -227,6 +231,113 @@ def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date:
     return str(output_dir)
 
 
+def _signal_output_dir(output_root: str | Path, asof_date: str, signal_id: str | None) -> Path:
+    root = Path(output_root) / str(asof_date)
+    if signal_id:
+        return root / str(signal_id)
+    return root
+
+
+def _write_outputs_to_dir(result: LiveSignalResult, output_dir: str | Path) -> str:
+    import polars as pl
+
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "summary.json").write_text(
+        json.dumps(result.summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (path / "discord_message.md").write_text(result.message, encoding="utf-8")
+    pl.DataFrame(result.weights_rows).write_parquet(path / "target_weights.parquet")
+    pl.DataFrame(result.rebalance_rows).write_parquet(path / "rebalance.parquet")
+    return str(path)
+
+
+def _make_signal_id(market: str, asof_date: str) -> str:
+    prefix = str(market or "default").strip() or "default"
+    stamp = datetime.now().strftime("%H%M%S")
+    return f"{prefix}-{asof_date}-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _top_score_drivers(
+    symbols: list[str],
+    scores: np.ndarray | None,
+    target_weights: np.ndarray,
+    current_prices: np.ndarray,
+    *,
+    symbol_names: dict[str, str] | None,
+    top_n: int = 8,
+) -> list[dict[str, Any]]:
+    if scores is None:
+        return []
+    score_arr = np.nan_to_num(np.asarray(scores, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    weights = np.nan_to_num(np.asarray(target_weights, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    prices = np.asarray(current_prices, dtype=np.float64)
+    order = np.argsort(-np.abs(score_arr))
+    rows: list[dict[str, Any]] = []
+    for idx in order[: max(0, int(top_n))]:
+        rows.append(
+            {
+                "symbol": str(symbols[int(idx)]),
+                "name": str((symbol_names or {}).get(str(symbols[int(idx)]), "")),
+                "score": float(score_arr[int(idx)]),
+                "target_weight": float(weights[int(idx)]),
+                "current_price": float(prices[int(idx)]) if np.isfinite(prices[int(idx)]) else None,
+            }
+        )
+    return rows
+
+
+def _feature_driver_summary(
+    feature_names: list[str],
+    latest_features: np.ndarray,
+    target_weights: np.ndarray,
+    *,
+    top_n: int = 8,
+) -> list[dict[str, Any]]:
+    feature_values = np.nan_to_num(np.asarray(latest_features, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    weights = np.abs(np.nan_to_num(np.asarray(target_weights, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0))
+    denom = float(weights.sum(dtype=np.float64))
+    if denom <= 0.0 or feature_values.ndim != 2:
+        return []
+    scores = np.sum(np.abs(feature_values) * weights[:, None], axis=0) / denom
+    order = np.argsort(-scores)
+    rows: list[dict[str, Any]] = []
+    for idx in order[: max(0, int(top_n))]:
+        rows.append({"feature": str(feature_names[int(idx)]), "weighted_abs_value": float(scores[int(idx)])})
+    return rows
+
+
+def _risk_warnings(
+    *,
+    turnover: float,
+    target_risk: dict[str, float],
+    max_turnover_warning: float,
+    max_top_weight_warning: float,
+    max_gross_warning: float | None,
+    recent_performance: dict[str, Any] | None,
+) -> list[str]:
+    warnings: list[str] = []
+    if np.isfinite(turnover) and turnover > float(max_turnover_warning):
+        warnings.append(f"turnover {turnover:.1%} exceeds {float(max_turnover_warning):.1%}")
+    top_abs = float(target_risk.get("top_abs_weight", 0.0))
+    if np.isfinite(top_abs) and top_abs > float(max_top_weight_warning):
+        warnings.append(f"top weight {top_abs:.1%} exceeds {float(max_top_weight_warning):.1%}")
+    gross = float(target_risk.get("gross", 0.0))
+    if max_gross_warning is not None and np.isfinite(gross) and gross > float(max_gross_warning):
+        warnings.append(f"gross exposure {gross:.1%} exceeds {float(max_gross_warning):.1%}")
+    if recent_performance is not None:
+        excess = recent_performance.get("excess_return")
+        try:
+            if float(excess) < 0.0:
+                warnings.append(
+                    f"recent {int(recent_performance.get('window_days', 0))}d underperformed benchmark by {abs(float(excess)):.1%}"
+                )
+        except Exception:
+            pass
+    return warnings
+
+
 def generate_live_signal(
     *,
     market: str | None = None,
@@ -245,6 +356,11 @@ def generate_live_signal(
     device: str | None = None,
     top_n: int = 20,
     min_abs_delta: float = 0.001,
+    signal_id: str | None = None,
+    benchmark_window_days: int = 20,
+    max_turnover_warning: float = 1.5,
+    max_top_weight_warning: float = 0.1,
+    max_gross_warning: float | None = None,
     write: bool = True,
 ) -> LiveSignalResult:
     config = load_config(config_path)
@@ -316,8 +432,8 @@ def generate_live_signal(
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
         mask = torch.from_numpy(mask_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
         with _autocast_context(runtime_device, amp_dtype):
-            model_output = _call_model(model, x, mask, return_aux=False)
-            model_weights_t, _ = _extract_weights_and_aux(model_output)
+            model_output = _call_model(model, x, mask, return_aux=True)
+            model_weights_t, aux = _extract_weights_and_aux(model_output)
         zero_returns = torch.zeros_like(model_weights_t, dtype=torch.float32)
         initial = torch.from_numpy(drift.weights.astype(np.float32)).to(device=runtime_device, non_blocking=non_blocking)
         backtest = run_backtest_torch(
@@ -340,6 +456,16 @@ def generate_live_signal(
         turnover = float(backtest.turnovers[0].detach().float().cpu().item())
         estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
 
+    score_values: np.ndarray | None = None
+    if aux is not None:
+        score_tensor = aux.get("centered_score_logits")
+        if score_tensor is None:
+            score_tensor = aux.get("score_logits")
+        if score_tensor is None:
+            score_tensor = aux.get("rank_logits")
+        if score_tensor is not None:
+            score_values = score_tensor[0].detach().float().cpu().numpy().astype(np.float64)
+
     benchmark_simple = estimate_benchmark_return(
         panel.symbols,
         config.data.benchmark_name,
@@ -357,6 +483,36 @@ def generate_live_signal(
         min_abs_delta=min_abs_delta,
     )
     top_positions = top_weight_rows(panel.symbols, target_weights, current_prices, symbol_names=symbol_names, top_n=top_n)
+    current_risk = portfolio_risk_summary(drift.weights)
+    target_risk = portfolio_risk_summary(target_weights)
+    recent_performance = cumulative_recent_returns(checkpoint, window_days=benchmark_window_days)
+    risk_warnings = _risk_warnings(
+        turnover=turnover,
+        target_risk=target_risk,
+        max_turnover_warning=max_turnover_warning,
+        max_top_weight_warning=max_top_weight_warning,
+        max_gross_warning=max_gross_warning if max_gross_warning is not None else float(config.trading.gross_leverage) * 1.05,
+        recent_performance=recent_performance,
+    )
+    score_drivers = _top_score_drivers(
+        panel.symbols,
+        score_values,
+        target_weights,
+        current_prices,
+        symbol_names=symbol_names,
+        top_n=min(8, max(1, int(top_n))),
+    )
+    feature_drivers = _feature_driver_summary(
+        panel.feature_names,
+        x_np[-1],
+        target_weights,
+        top_n=min(8, max(1, int(top_n))),
+    )
+    confidence_proxy = None
+    if score_values is not None:
+        valid_scores = np.asarray(score_values, dtype=np.float64)[mask_np]
+        if valid_scores.size:
+            confidence_proxy = float(np.nanstd(valid_scores))
 
     weights_rows: list[dict[str, Any]] = []
     price_return = np.divide(
@@ -386,13 +542,20 @@ def generate_live_signal(
             }
         )
 
+    resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     summary: dict[str, Any] = {
+        "signal_id": resolved_signal_id,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "asof_date": resolved_asof,
         "market": market_id,
         "market_label": market_name,
         "panel_date": panel_date_str,
         "fold_id": int(resolved_fold_id),
         "checkpoint_path": str(checkpoint),
+        "checkpoint_mtime": datetime.fromtimestamp(checkpoint.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+        "checkpoint_fingerprint": short_file_fingerprint(checkpoint),
+        "config_path": str(config_path),
+        "config_fingerprint": short_file_fingerprint(Path(config_path)),
         "previous_weights_date": previous_weights_date,
         "previous_weights_path": previous_weights_path,
         "drift_base_date": drift_base_date,
@@ -406,11 +569,34 @@ def generate_live_signal(
         "benchmark_simple_return": float(benchmark_simple),
         "turnover": turnover,
         "estimated_trade_cost": estimated_trade_cost,
-        "current_gross": float(np.abs(drift.weights).sum(dtype=np.float64)),
-        "target_gross": float(np.abs(target_weights).sum(dtype=np.float64)),
+        "current_gross": float(current_risk["gross"]),
+        "target_gross": float(target_risk["gross"]),
+        "current_risk": current_risk,
+        "target_risk": target_risk,
+        "risk_warnings": risk_warnings,
+        "recent_performance": recent_performance,
+        "model_explanation": {
+            "source": "score logits plus weighted latest-feature proxy",
+            "confidence_proxy_score_std": confidence_proxy,
+            "top_score_drivers": score_drivers,
+            "top_feature_drivers": feature_drivers,
+        },
         "top_positions": top_positions,
         "rebalance": rebalance_rows[: max(0, int(top_n))],
     }
+    if write:
+        if live_output_dir is not None:
+            output_root = Path(live_output_dir)
+        elif market_id:
+            output_root = resolved_output_dir / "live_signals" / market_id
+        else:
+            output_root = resolved_output_dir / "live_signals"
+        output_path = _signal_output_dir(output_root, resolved_asof, resolved_signal_id)
+        summary["output_dir"] = str(output_path)
+        summary["summary_path"] = str(output_path / "summary.json")
+        summary["weights_path"] = str(output_path / "target_weights.parquet")
+        summary["rebalance_path"] = str(output_path / "rebalance.parquet")
+        summary["discord_message_path"] = str(output_path / "discord_message.md")
     message = format_signal_message(summary, max_rows=top_n)
     result = LiveSignalResult(
         summary=summary,
@@ -420,13 +606,7 @@ def generate_live_signal(
         output_dir=None,
     )
     if write:
-        if live_output_dir is not None:
-            output_root = Path(live_output_dir)
-        elif market_id:
-            output_root = resolved_output_dir / "live_signals" / market_id
-        else:
-            output_root = resolved_output_dir / "live_signals"
-        result.output_dir = _write_outputs(result, output_root, resolved_asof)
+        result.output_dir = _write_outputs_to_dir(result, summary["output_dir"])
         result.summary["output_dir"] = result.output_dir
         (Path(result.output_dir) / "summary.json").write_text(
             json.dumps(result.summary, indent=2, ensure_ascii=False),

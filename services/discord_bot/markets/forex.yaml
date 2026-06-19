@@ -1,5 +1,15 @@
 market: forex
 label: 外匯
+enabled: true
+market_type: forex
+timezone: America/New_York
+open_time:
+close_time:
+schedule_time: "16:55"
+summary_time: "17:10"
+data_ready_time: "18:00"
+freshness_max_lag_days: 3
+freshness_scan_limit: 0
 
 config_path: configs/markets/forex.yaml
 output_dir: artifacts/markets/forex
@@ -18,4 +28,8 @@ yahoo_chunk_size: 80
 
 top_n: 20
 min_abs_delta: 0.001
+benchmark_window_days: 20
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 2.75
 unsupported_message: "**外匯** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
