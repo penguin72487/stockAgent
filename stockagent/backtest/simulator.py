@@ -2188,46 +2188,6 @@ def run_backtest_torch(
     )
 
 
-def run_backtest_cupy(
-    weights,
-    future_returns,
-    tradable_mask,
-    benchmark_returns,
-    fee_per_side: float,
-) -> BacktestResult:
-    """GPU backtest core with CuPy, returned as numpy BacktestResult."""
-    if cp is None:
-        return run_backtest(
-            np.asarray(weights),
-            np.asarray(future_returns),
-            np.asarray(tradable_mask),
-            np.asarray(benchmark_returns),
-            fee_per_side,
-        )
-
-    w = cp.asarray(weights, dtype=cp.float32).copy()
-    r = cp.asarray(future_returns, dtype=cp.float32)
-    m = cp.asarray(tradable_mask).astype(cp.bool_)
-    b = cp.asarray(benchmark_returns, dtype=cp.float32)
-
-    w = cp.where(m, w, cp.zeros_like(w))
-    denom = cp.clip(w.sum(axis=1, keepdims=True), 1e-12, None)
-    w = w / denom
-
-    weights_history = cp.concatenate([cp.zeros_like(w[:1]), w[:-1]], axis=0)
-    prev = cp.concatenate([cp.zeros_like(weights_history[:1]), weights_history[:-1]], axis=0)
-    turnovers = cp.abs(weights_history - prev).sum(axis=1)
-    gross = (weights_history * r).sum(axis=1)
-    strategy_returns = gross - np.float32(fee_per_side) * turnovers
-
-    return BacktestResult(
-        strategy_returns=cp.asnumpy(strategy_returns.astype(cp.float32)),
-        benchmark_returns=cp.asnumpy(b.astype(cp.float32)),
-        turnovers=cp.asnumpy(turnovers.astype(cp.float32)),
-        weights_history=cp.asnumpy(weights_history.astype(cp.float32)),
-    )
-
-
 def run_backtest_integer_shares(
     weights: np.ndarray,
     future_returns: np.ndarray,
@@ -2256,20 +2216,14 @@ def run_backtest_integer_shares(
     - Cash is a virtual asset with 0 daily return.
     """
     w = np.asarray(weights, dtype=np.float64)
+    r = np.nan_to_num(np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     m = np.asarray(tradable_mask, dtype=bool)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="integer-share backtest")
     buy_m = m if can_buy_mask is None else np.asarray(can_buy_mask, dtype=bool)
     sell_m = m if can_sell_mask is None else np.asarray(can_sell_mask, dtype=bool)
     b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
     t_len, n_symbols = w.shape
-
-    if lot_size <= 0:
-        raise ValueError(f"lot_size must be positive, got {lot_size}")
-    if settlement_delay_days < 0:
-        raise ValueError(f"settlement_delay_days must be >= 0, got {settlement_delay_days}")
-    if execution_mode not in {"intraday_next_open", "overnight_tplus2"}:
-        raise ValueError(f"Unsupported execution_mode: {execution_mode}")
-
     if symbols is None:
         symbols = [f"SYM_{idx:04d}" for idx in range(n_symbols)]
     tw_symbol_mask = np.asarray([_is_tw_symbol(sym) for sym in symbols], dtype=bool)
@@ -2281,13 +2235,16 @@ def run_backtest_integer_shares(
     else:
         date_text = []
 
-    close_matrix = None
+    strategy_returns = np.zeros(t_len, dtype=np.float32)
+    turnovers = np.zeros(t_len, dtype=np.float32)
+    stock_weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
+
     if close_prices is not None:
-        close_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        if close_matrix.shape != (t_len, n_symbols):
+        price_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        if price_matrix.shape != (t_len, n_symbols):
             raise ValueError(
                 "close_prices shape must match (num_days, num_symbols): "
-                f"expected {(t_len, n_symbols)}, got {close_matrix.shape}"
+                f"expected {(t_len, n_symbols)}, got {price_matrix.shape}"
             )
         if np.any(tw_symbol_mask):
             price_matrix[:, tw_symbol_mask] = _round_half_up(price_matrix[:, tw_symbol_mask], decimals=2)
@@ -2299,23 +2256,6 @@ def run_backtest_integer_shares(
     cash = float(initial_capital)
     cash_hold_mode = False
 
-    open_matrix = None
-    if open_prices is not None:
-        open_matrix = np.nan_to_num(np.asarray(open_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        if open_matrix.shape != (t_len, n_symbols):
-            raise ValueError(
-                "open_prices shape must match (num_days, num_symbols): "
-                f"expected {(t_len, n_symbols)}, got {open_matrix.shape}"
-            )
-
-    if execution_mode == "intraday_next_open" and open_matrix is None:
-        raise ValueError("intraday_next_open mode requires open_prices")
-    if execution_mode == "overnight_tplus2" and close_matrix is None:
-        raise ValueError("overnight_tplus2 mode requires close_prices (raw close)")
-
-    strategy_returns = np.zeros(t_len, dtype=np.float32)
-    turnovers = np.zeros(t_len, dtype=np.float32)
-    weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
     records: list[HoldingsRecord] = []
     gross_leverage = _resolve_exposure_budget(gross_leverage)
 
@@ -2539,7 +2479,7 @@ def run_backtest_integer_shares(
             strategy_returns=strategy_returns,
             benchmark_returns=b.astype(np.float32),
             turnovers=turnovers,
-            weights_history=weights_history,
+            weights_history=stock_weights_history,
         ),
         records,
     )
