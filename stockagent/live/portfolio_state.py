@@ -85,6 +85,7 @@ def build_rebalance_rows(
     *,
     symbol_names: dict[str, str] | None = None,
     min_abs_delta: float = 0.0,
+    position_eps: float = 1e-6,
 ) -> list[dict[str, float | str]]:
     current = np.asarray(current_weights, dtype=np.float64)
     target = np.asarray(target_weights, dtype=np.float64)
@@ -96,6 +97,16 @@ def build_rebalance_rows(
         abs_delta = abs(float(delta[idx]))
         if abs_delta < float(min_abs_delta):
             continue
+        current_weight = float(current[idx])
+        target_weight = float(target[idx])
+        if abs(target_weight) <= float(position_eps) and abs(current_weight) > float(position_eps):
+            action = "EXIT"
+        elif abs(target_weight) < abs(current_weight) and np.sign(target_weight) == np.sign(current_weight):
+            action = "REDUCE"
+        elif float(delta[idx]) > 0.0:
+            action = "BUY"
+        else:
+            action = "SELL"
         base_price = float(base[idx]) if np.isfinite(base[idx]) else float("nan")
         current_price = float(prices[idx]) if np.isfinite(prices[idx]) else float("nan")
         simple_return = (
@@ -107,8 +118,9 @@ def build_rebalance_rows(
             {
                 "symbol": str(symbol),
                 "name": str((symbol_names or {}).get(str(symbol), "")),
-                "current_weight": float(current[idx]),
-                "target_weight": float(target[idx]),
+                "action": action,
+                "current_weight": current_weight,
+                "target_weight": target_weight,
                 "delta_weight": float(delta[idx]),
                 "abs_delta_weight": abs_delta,
                 "trade_price": current_price,
@@ -144,3 +156,26 @@ def top_weight_rows(
             }
         )
     return rows
+
+
+def portfolio_risk_summary(weights: np.ndarray) -> dict[str, float]:
+    arr = np.nan_to_num(np.asarray(weights, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    abs_arr = np.abs(arr)
+    gross = float(abs_arr.sum(dtype=np.float64))
+    long_gross = float(np.clip(arr, 0.0, None).sum(dtype=np.float64))
+    short_gross = float(np.abs(np.clip(arr, None, 0.0)).sum(dtype=np.float64))
+    net = float(arr.sum(dtype=np.float64))
+    top_abs = float(abs_arr.max(initial=0.0))
+    if gross > 0.0:
+        normalized_abs = abs_arr / gross
+        hhi = float(np.square(normalized_abs).sum(dtype=np.float64))
+    else:
+        hhi = 0.0
+    return {
+        "gross": gross,
+        "long_gross": long_gross,
+        "short_gross": short_gross,
+        "net": net,
+        "top_abs_weight": top_abs,
+        "hhi": hhi,
+    }

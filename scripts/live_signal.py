@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
     parser.add_argument("--top-n", type=int, default=None)
     parser.add_argument("--min-abs-delta", type=float, default=None)
+    parser.add_argument("--signal-id", default=None)
     parser.add_argument("--write", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--json", action="store_true", help="Print summary JSON instead of Discord message.")
     return parser.parse_args()
@@ -57,6 +58,7 @@ def main() -> None:
         "device": args.device,
         "top_n": args.top_n,
         "min_abs_delta": args.min_abs_delta,
+        "signal_id": args.signal_id,
         "write": args.write,
     }
     if args.market_config:
