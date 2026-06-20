@@ -91,6 +91,10 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
             f"excess={_fmt_pct(recent.get('excess_return'))}"
         )
 
+    notice = str(summary.get("market_notice") or "").strip()
+    if notice:
+        lines.append(f"notice: {notice}")
+
     if warnings:
         lines.append("warning: " + " | ".join(str(item) for item in warnings[:3]))
 

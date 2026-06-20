@@ -311,16 +311,27 @@ def _runtime_status(cfg: LiveMarketConfig) -> MarketRuntimeStatus:
 
 
 def _ensure_signal_ready(cfg: LiveMarketConfig, *, scheduled: bool = False) -> MarketRuntimeStatus:
+    del scheduled
     status = _runtime_status(cfg)
     if not status.enabled:
         raise MarketDisabledError(cfg)
     if status.checkpoint is None:
         raise MarketUnsupportedError(cfg)
-    if not status.data.fresh:
+    non_trading_day = (not status.market_open) and "not a trading day" in (status.market_open_reason or "")
+    if not status.data.fresh and not non_trading_day:
         raise DataStaleError(cfg, status)
-    if scheduled and not status.market_open:
-        raise MarketClosedError(cfg, status)
     return status
+
+
+def _market_notice(status: MarketRuntimeStatus) -> str | None:
+    if status.market_open:
+        return None
+    data_date = status.data.panel_date or status.data.last_data_date or "n/a"
+    reason = status.market_open_reason or "market closed"
+    if "not a trading day" in reason:
+        freshness = f"資料提醒：{status.data.reason}。" if status.data.reason else ""
+        return f"今天沒有開盤，使用最後可用資料 `{data_date}` 產生訊號。{freshness}"
+    return f"目前非交易時間，使用最後可用資料 `{data_date}` 產生訊號。"
 
 
 def _role_names_and_ids(interaction: discord.Interaction) -> tuple[set[str], set[int]]:
@@ -389,12 +400,13 @@ def _signal_kwargs(
     scheduled: bool = False,
 ) -> dict:
     cfg = _resolve_market(market)
-    _ensure_signal_ready(cfg, scheduled=scheduled)
+    status = _ensure_signal_ready(cfg, scheduled=scheduled)
     overrides = {
         "price_source": price_source if price_source and price_source != "auto" else None,
         "top_n": top_n,
         "min_abs_delta": min_abs_delta,
         "signal_id": signal_id,
+        "market_notice": _market_notice(status),
     }
     return cfg.signal_kwargs(**overrides)
 
@@ -548,6 +560,9 @@ def _daily_summary_message(cfg: LiveMarketConfig) -> str:
     ]
     if not status.data.fresh:
         lines.append(f"warning: 資料過期，目前不建議使用。 `{status.data.reason or 'stale'}`")
+    notice = _market_notice(status)
+    if notice:
+        lines.append(f"notice: {notice}")
     if latest is not None:
         path, summary = latest
         lines.append(f"signal=`{summary.get('signal_id', path.parent.name)}` artifact=`{path}`")

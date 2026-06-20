@@ -1233,8 +1233,41 @@ def _record_from_input(asset_class: str, raw_symbol: str) -> SymbolRecord:
     return SymbolRecord(code=upper_value, name=upper_value, market=asset_class, yahoo_symbol=upper_value)
 
 
+def _normalize_manifest_record(
+    asset_class: str,
+    *,
+    code: str,
+    name: str,
+    market: str,
+    yahoo_symbol: str,
+) -> SymbolRecord:
+    if asset_class == "us_stocks" and code.endswith("_DL"):
+        base_symbol = code[: -len("_DL")].strip().upper()
+        normalized_yahoo_symbol = yahoo_symbol.strip().upper()
+        if not normalized_yahoo_symbol or normalized_yahoo_symbol.endswith("_DL"):
+            normalized_yahoo_symbol = base_symbol
+        normalized_yahoo_symbol = _normalize_us_yahoo_symbol(normalized_yahoo_symbol)
+        if "_" in normalized_yahoo_symbol:
+            normalized_yahoo_symbol = _normalize_us_yahoo_symbol(base_symbol)
+        return SymbolRecord(
+            code=code,
+            name=name,
+            market="us_delisted",
+            yahoo_symbol=normalized_yahoo_symbol,
+        )
+    return SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol)
+
+
 def _record_from_local_code(asset_class: str, code: str) -> SymbolRecord:
     normalized = code.strip().upper()
+    if asset_class == "us_stocks" and normalized.endswith("_DL"):
+        return _normalize_manifest_record(
+            asset_class,
+            code=normalized,
+            name=normalized,
+            market=asset_class,
+            yahoo_symbol=normalized,
+        )
     if asset_class == "tw_stocks" and TW_GENERIC_CODE_PATTERN.fullmatch(normalized):
         record = SymbolRecord(
             code=normalized,
@@ -2328,7 +2361,15 @@ def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> li
             continue
         name = str(row.get("name", code)).strip() or code
         market = str(row.get("market", asset_class)).strip() or asset_class
-        records.append(SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol))
+        records.append(
+            _normalize_manifest_record(
+                asset_class,
+                code=code,
+                name=name,
+                market=market,
+                yahoo_symbol=yahoo_symbol,
+            )
+        )
     return records
 
 
@@ -2612,7 +2653,14 @@ def _resolve_repair_plan(
             missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
             if missing_required:
                 if _is_delisted_record(record):
-                    checks.append(_unavailable_skip(record, output_path, first_date, last_date))
+                    checks.append(
+                        _delisted_no_history(
+                            record,
+                            output_path,
+                            f"confirmed delisted with schema mismatch: "
+                            f"missing_required_columns={','.join(missing_required)}",
+                        )
+                    )
                     continue
                 if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
                     checks.append(_unavailable_skip(record, output_path, first_date, last_date))
