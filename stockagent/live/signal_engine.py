@@ -16,6 +16,7 @@ from stockagent.config import ExperimentConfig, load_config
 from stockagent.data.panel import PanelData, build_panel
 from stockagent.live.portfolio_state import (
     build_rebalance_rows,
+    classify_rebalance_action,
     estimate_benchmark_return,
     estimate_drifted_weights,
     portfolio_risk_summary,
@@ -41,6 +42,7 @@ class LiveSignalResult:
     summary: dict[str, Any]
     weights_rows: list[dict[str, Any]]
     rebalance_rows: list[dict[str, Any]]
+    decision_rows: list[dict[str, Any]]
     message: str
     output_dir: str | None = None
 
@@ -228,6 +230,8 @@ def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date:
     (output_dir / "discord_message.md").write_text(result.message, encoding="utf-8")
     pl.DataFrame(result.weights_rows).write_parquet(output_dir / "target_weights.parquet")
     pl.DataFrame(result.rebalance_rows).write_parquet(output_dir / "rebalance.parquet")
+    pl.DataFrame(result.decision_rows).write_parquet(output_dir / "decision_explanations.parquet")
+    _write_text_artifacts(result, output_dir)
     return str(output_dir)
 
 
@@ -250,6 +254,8 @@ def _write_outputs_to_dir(result: LiveSignalResult, output_dir: str | Path) -> s
     (path / "discord_message.md").write_text(result.message, encoding="utf-8")
     pl.DataFrame(result.weights_rows).write_parquet(path / "target_weights.parquet")
     pl.DataFrame(result.rebalance_rows).write_parquet(path / "rebalance.parquet")
+    pl.DataFrame(result.decision_rows).write_parquet(path / "decision_explanations.parquet")
+    _write_text_artifacts(result, path)
     return str(path)
 
 
@@ -257,6 +263,402 @@ def _make_signal_id(market: str, asof_date: str) -> str:
     prefix = str(market or "default").strip() or "default"
     stamp = datetime.now().strftime("%H%M%S")
     return f"{prefix}-{asof_date}-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(number):
+        return None
+    return number
+
+
+def _fmt_md_value(value: Any, *, pct: bool = False, digits: int = 4) -> str:
+    number = _finite_float_or_none(value)
+    if number is None:
+        text = "" if value is None else str(value)
+    elif pct:
+        text = f"{number * 100:.{digits}f}%"
+    else:
+        text = f"{number:.{digits}f}"
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _aux_scalar_by_symbol(
+    aux: dict[str, torch.Tensor] | None,
+    key: str,
+    symbol_count: int,
+    *,
+    reduction: str = "mean",
+) -> np.ndarray | None:
+    if aux is None:
+        return None
+    tensor = aux.get(key)
+    if tensor is None:
+        return None
+    try:
+        arr = tensor[0].detach().float().cpu().numpy().astype(np.float64)
+    except Exception:
+        return None
+    if arr.ndim == 0:
+        return None
+    if arr.shape[0] != int(symbol_count):
+        return None
+    if arr.ndim == 1:
+        out = arr
+    elif reduction == "norm":
+        out = np.linalg.norm(arr.reshape((arr.shape[0], -1)), axis=1)
+    else:
+        out = np.nanmean(arr.reshape((arr.shape[0], -1)), axis=1)
+    return np.asarray(out, dtype=np.float64)
+
+
+def _abs_rank(values: np.ndarray | None, symbol_count: int) -> np.ndarray:
+    ranks = np.zeros((int(symbol_count),), dtype=np.int64)
+    if values is None:
+        return ranks
+    arr = np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    order = np.argsort(-np.abs(arr))
+    ranks[order] = np.arange(1, len(order) + 1, dtype=np.int64)
+    return ranks
+
+
+def _constraint_note(
+    *,
+    tradable: bool,
+    can_buy: bool,
+    can_sell: bool,
+    current_weight: float,
+    target_weight: float,
+) -> str:
+    if not tradable:
+        return "not_tradable"
+    if target_weight > current_weight and not can_buy:
+        return "buy_blocked"
+    if target_weight < current_weight and not can_sell:
+        return "sell_blocked"
+    return ""
+
+
+def _decision_reason(action: str, score: float | None, model_weight: float, constraint: str) -> str:
+    pieces: list[str] = []
+    if score is None:
+        pieces.append("score_unavailable")
+    elif score > 0.0:
+        pieces.append("positive_score")
+    elif score < 0.0:
+        pieces.append("negative_score")
+    else:
+        pieces.append("neutral_score")
+    if model_weight > 0.0:
+        pieces.append("model_long")
+    elif model_weight < 0.0:
+        pieces.append("model_short")
+    else:
+        pieces.append("model_flat")
+    pieces.append(f"action_{action.lower()}")
+    if constraint:
+        pieces.append(constraint)
+    return "; ".join(pieces)
+
+
+def _build_decision_rows(
+    *,
+    symbols: list[str],
+    symbol_names: dict[str, str],
+    asof_date: str,
+    panel_date: str,
+    model_weights: np.ndarray,
+    current_weights: np.ndarray,
+    target_weights: np.ndarray,
+    scores: np.ndarray | None,
+    current_prices: np.ndarray,
+    base_prices: np.ndarray,
+    price_returns: np.ndarray,
+    tradable_mask: np.ndarray,
+    can_buy_mask: np.ndarray,
+    can_sell_mask: np.ndarray,
+    aux: dict[str, torch.Tensor] | None,
+) -> list[dict[str, Any]]:
+    symbol_count = len(symbols)
+    score_arr = None
+    if scores is not None:
+        score_arr = np.asarray(scores, dtype=np.float64)
+    score_ranks = _abs_rank(score_arr, symbol_count)
+    target_ranks = _abs_rank(target_weights, symbol_count)
+    gate = _aux_scalar_by_symbol(aux, "stock_market_gate", symbol_count, reduction="mean")
+    market_delta_norm = _aux_scalar_by_symbol(aux, "z_market_delta", symbol_count, reduction="norm")
+
+    rows: list[dict[str, Any]] = []
+    for idx, symbol in enumerate(symbols):
+        current_weight = float(current_weights[idx])
+        target_weight = float(target_weights[idx])
+        delta_weight = float(target_weight - current_weight)
+        action = classify_rebalance_action(current_weight, target_weight, delta_weight=delta_weight)
+        score = _finite_float_or_none(score_arr[idx]) if score_arr is not None else None
+        constraint = _constraint_note(
+            tradable=bool(tradable_mask[idx]),
+            can_buy=bool(can_buy_mask[idx]),
+            can_sell=bool(can_sell_mask[idx]),
+            current_weight=current_weight,
+            target_weight=target_weight,
+        )
+        rows.append(
+            {
+                "date": asof_date,
+                "panel_date": panel_date,
+                "symbol": str(symbol),
+                "name": str(symbol_names.get(str(symbol), "")),
+                "action": action,
+                "decision_reason": _decision_reason(action, score, float(model_weights[idx]), constraint),
+                "constraint": constraint,
+                "score": score,
+                "abs_score_rank": int(score_ranks[idx]),
+                "model_weight": float(model_weights[idx]),
+                "current_weight": current_weight,
+                "target_weight": target_weight,
+                "delta_weight": delta_weight,
+                "abs_delta_weight": abs(delta_weight),
+                "abs_target_rank": int(target_ranks[idx]),
+                "trade_price": _finite_float_or_none(current_prices[idx]),
+                "current_price": _finite_float_or_none(current_prices[idx]),
+                "base_price": _finite_float_or_none(base_prices[idx]),
+                "price_return": _finite_float_or_none(price_returns[idx]),
+                "tradable": bool(tradable_mask[idx]),
+                "can_buy": bool(can_buy_mask[idx]),
+                "can_sell": bool(can_sell_mask[idx]),
+                "stock_market_gate": _finite_float_or_none(gate[idx]) if gate is not None else None,
+                "market_delta_norm": _finite_float_or_none(market_delta_norm[idx]) if market_delta_norm is not None else None,
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            float(row.get("abs_delta_weight") or 0.0),
+            abs(float(row.get("target_weight") or 0.0)),
+            abs(float(row.get("score") or 0.0)),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def _markdown_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str, str, str]]) -> str:
+    lines = [f"# {title}", "", f"rows: {len(rows)}", ""]
+    lines.append("| " + " | ".join(label for label, _, _ in columns) + " |")
+    lines.append("| " + " | ".join("---" for _ in columns) + " |")
+    for row in rows:
+        cells: list[str] = []
+        for _, key, kind in columns:
+            if kind == "pct":
+                cells.append(_fmt_md_value(row.get(key), pct=True, digits=4))
+            elif kind == "price":
+                cells.append(_fmt_md_value(row.get(key), digits=4))
+            elif kind == "float":
+                cells.append(_fmt_md_value(row.get(key), digits=6))
+            else:
+                cells.append(_fmt_md_value(row.get(key)))
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _action_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        action = str(row.get("action") or "UNKNOWN")
+        counts[action] = counts.get(action, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _top_action_rows(rows: list[dict[str, Any]], action: str, limit: int = 15) -> list[dict[str, Any]]:
+    action_upper = action.upper()
+    matched = [row for row in rows if str(row.get("action") or "").upper() == action_upper]
+    return sorted(
+        matched,
+        key=lambda row: (
+            abs(float(row.get("delta_weight") or 0.0)),
+            abs(float(row.get("target_weight") or 0.0)),
+            abs(float(row.get("score") or 0.0)),
+        ),
+        reverse=True,
+    )[: max(0, int(limit))]
+
+
+def _compact_decision_bullets(rows: list[dict[str, Any]], limit: int = 15) -> list[str]:
+    lines: list[str] = []
+    for row in rows[: max(0, int(limit))]:
+        label = str(row.get("symbol") or "")
+        name = str(row.get("name") or "").strip()
+        if name:
+            label += f" {name}"
+        lines.append(
+            "- "
+            f"{label}: {row.get('action', 'HOLD')} "
+            f"delta={_fmt_md_value(row.get('delta_weight'), pct=True, digits=2)} "
+            f"target={_fmt_md_value(row.get('target_weight'), pct=True, digits=2)} "
+            f"score={_fmt_md_value(row.get('score'), digits=4)} "
+            f"rank={row.get('abs_score_rank', '')} "
+            f"px={_fmt_md_value(row.get('trade_price'), digits=2)} "
+            f"reason={row.get('decision_reason', '')}"
+        )
+    return lines
+
+
+def _decision_report_markdown(summary: dict[str, Any], decision_rows: list[dict[str, Any]]) -> str:
+    explanation = summary.get("model_explanation", {}) if isinstance(summary.get("model_explanation"), dict) else {}
+    counts = _action_counts(decision_rows)
+    lines = [
+        "# Live Decision Explanation Report",
+        "",
+        "## Signal",
+        "",
+        f"- signal_id: `{summary.get('signal_id', 'n/a')}`",
+        f"- market: `{summary.get('market', 'n/a')}` {summary.get('market_label', '') or ''}".rstrip(),
+        f"- asof_date: `{summary.get('asof_date', 'n/a')}`",
+        f"- panel_date: `{summary.get('panel_date', 'n/a')}`",
+        f"- fold: `{summary.get('fold_id', 'n/a')}`",
+        f"- price_source: `{summary.get('price_source', 'n/a')}`",
+        f"- explanation_source: {explanation.get('source', 'score/weight decision table')}",
+        f"- confidence_proxy_score_std: {_fmt_md_value(explanation.get('confidence_proxy_score_std'), digits=6)}",
+        "",
+        "## Action Counts",
+        "",
+    ]
+    for action in ("BUY", "SELL", "REDUCE", "EXIT", "HOLD"):
+        lines.append(f"- {action}: {counts.get(action, 0)}")
+    unknown = sum(value for key, value in counts.items() if key not in {"BUY", "SELL", "REDUCE", "EXIT", "HOLD"})
+    if unknown:
+        lines.append(f"- UNKNOWN: {unknown}")
+
+    top_features = explanation.get("top_feature_drivers") if isinstance(explanation.get("top_feature_drivers"), list) else []
+    if top_features:
+        lines.extend(["", "## Market-Level Feature Drivers", ""])
+        for row in top_features:
+            if isinstance(row, dict):
+                lines.append(
+                    f"- {row.get('feature')}: weighted_abs_value={_fmt_md_value(row.get('weighted_abs_value'), digits=6)}"
+                )
+
+    top_scores = explanation.get("top_score_drivers") if isinstance(explanation.get("top_score_drivers"), list) else []
+    if top_scores:
+        lines.extend(["", "## Largest Score Drivers", ""])
+        for row in top_scores:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("symbol") or "")
+            name = str(row.get("name") or "").strip()
+            if name:
+                label += f" {name}"
+            lines.append(
+                f"- {label}: score={_fmt_md_value(row.get('score'), digits=6)} "
+                f"target={_fmt_md_value(row.get('target_weight'), pct=True, digits=2)} "
+                f"px={_fmt_md_value(row.get('current_price'), digits=2)}"
+            )
+
+    for action in ("BUY", "SELL", "REDUCE", "EXIT", "HOLD"):
+        rows = _top_action_rows(decision_rows, action, limit=20 if action != "HOLD" else 10)
+        if not rows:
+            continue
+        lines.extend(["", f"## Top {action}", ""])
+        lines.extend(_compact_decision_bullets(rows, limit=len(rows)))
+
+    lines.extend(
+        [
+            "",
+            "## Field Guide",
+            "",
+            "- score: model score/logit used for cross-sectional ranking. Positive usually supports long exposure; negative usually supports short or sell pressure.",
+            "- model_weight: raw model portfolio weight before the trading simulator applies turnover, fee, leverage, and buy/sell constraints.",
+            "- current_weight: drifted current holding before today's rebalance.",
+            "- target_weight: final weight after the trading simulator and constraints.",
+            "- delta_weight: target_weight minus current_weight. Positive means buy/add, negative means sell/reduce.",
+            "- stock_market_gate: Transformer market-token gate when available. Higher means this stock's representation used more market-token context.",
+            "- market_delta_norm: magnitude of market-token adjustment when available. Higher means market context changed the stock embedding more.",
+            "- constraint: buy_blocked, sell_blocked, or not_tradable when the market mask affected the action.",
+            "- decision_reason: compact rule trace derived from score sign, model direction, action, and constraint.",
+            "",
+            "## Artifact Paths",
+            "",
+            f"- summary: `{summary.get('summary_path', 'n/a')}`",
+            f"- full_table: `{summary.get('decision_explanation_path', 'n/a')}`",
+            f"- markdown_table: `{summary.get('decision_explanation_markdown_path', 'n/a')}`",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
+    positions = sorted(
+        result.weights_rows,
+        key=lambda row: (abs(float(row.get("target_weight") or 0.0)), abs(float(row.get("delta_weight") or 0.0))),
+        reverse=True,
+    )
+    (output_dir / "target_positions.md").write_text(
+        _markdown_table(
+            "Target Positions",
+            positions,
+            [
+                ("symbol", "symbol", "text"),
+                ("name", "name", "text"),
+                ("target", "target_weight", "pct"),
+                ("current", "current_weight", "pct"),
+                ("delta", "delta_weight", "pct"),
+                ("px", "current_price", "price"),
+                ("ret", "price_return", "pct"),
+                ("score", "score", "float"),
+                ("action", "action", "text"),
+            ],
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "rebalance.md").write_text(
+        _markdown_table(
+            "Rebalance",
+            result.rebalance_rows,
+            [
+                ("symbol", "symbol", "text"),
+                ("name", "name", "text"),
+                ("action", "action", "text"),
+                ("delta", "delta_weight", "pct"),
+                ("now", "current_weight", "pct"),
+                ("target", "target_weight", "pct"),
+                ("px", "trade_price", "price"),
+                ("ret", "price_return", "pct"),
+            ],
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "decision_explanations.md").write_text(
+        _markdown_table(
+            "Decision Explanations",
+            result.decision_rows,
+            [
+                ("symbol", "symbol", "text"),
+                ("name", "name", "text"),
+                ("action", "action", "text"),
+                ("reason", "decision_reason", "text"),
+                ("score", "score", "float"),
+                ("score_rank", "abs_score_rank", "text"),
+                ("target", "target_weight", "pct"),
+                ("current", "current_weight", "pct"),
+                ("delta", "delta_weight", "pct"),
+                ("px", "trade_price", "price"),
+                ("ret", "price_return", "pct"),
+                ("gate", "stock_market_gate", "float"),
+                ("market_delta", "market_delta_norm", "float"),
+            ],
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "model_explanation.json").write_text(
+        json.dumps(result.summary.get("model_explanation", {}), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (output_dir / "decision_report.md").write_text(
+        _decision_report_markdown(result.summary, result.decision_rows),
+        encoding="utf-8",
+    )
 
 
 def _top_score_drivers(
@@ -523,16 +925,21 @@ def generate_live_signal(
         where=np.isfinite(current_prices) & np.isfinite(drift_base_prices) & (drift_base_prices > 0.0),
     ) - 1.0
     for idx, symbol in enumerate(panel.symbols):
+        delta_weight = float(target_weights[idx] - drift.weights[idx])
+        action = classify_rebalance_action(float(drift.weights[idx]), float(target_weights[idx]), delta_weight=delta_weight)
         weights_rows.append(
             {
                 "date": resolved_asof,
                 "panel_date": panel_date_str,
                 "symbol": str(symbol),
                 "name": str(symbol_names.get(str(symbol), "")),
+                "action": action,
+                "score": _finite_float_or_none(score_values[idx]) if score_values is not None else None,
                 "model_weight": float(model_weights[idx]),
                 "current_weight": float(drift.weights[idx]),
                 "target_weight": float(target_weights[idx]),
-                "delta_weight": float(target_weights[idx] - drift.weights[idx]),
+                "delta_weight": delta_weight,
+                "abs_delta_weight": abs(delta_weight),
                 "base_price": float(drift_base_prices[idx]) if np.isfinite(drift_base_prices[idx]) else None,
                 "panel_price": float(panel_prices[idx]) if np.isfinite(panel_prices[idx]) else None,
                 "current_price": float(current_prices[idx]) if np.isfinite(current_prices[idx]) else None,
@@ -542,6 +949,26 @@ def generate_live_signal(
                 "can_sell": bool(can_sell_np[idx]),
             }
         )
+
+    decision_rows = _build_decision_rows(
+        symbols=panel.symbols,
+        symbol_names=symbol_names,
+        asof_date=resolved_asof,
+        panel_date=panel_date_str,
+        model_weights=model_weights,
+        current_weights=drift.weights,
+        target_weights=target_weights,
+        scores=score_values,
+        current_prices=current_prices,
+        base_prices=drift_base_prices,
+        price_returns=price_return,
+        tradable_mask=mask_np,
+        can_buy_mask=can_buy_np,
+        can_sell_mask=can_sell_np,
+        aux=aux,
+    )
+    actionable_decisions = [row for row in decision_rows if str(row.get("action") or "") != "HOLD"]
+    decision_action_counts = _action_counts(decision_rows)
 
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     summary: dict[str, Any] = {
@@ -578,13 +1005,18 @@ def generate_live_signal(
         "market_notice": str(market_notice) if market_notice else None,
         "recent_performance": recent_performance,
         "model_explanation": {
-            "source": "score logits plus weighted latest-feature proxy",
+            "source": "score logits, trading constraints, target weights, and weighted latest-feature proxy",
             "confidence_proxy_score_std": confidence_proxy,
             "top_score_drivers": score_drivers,
             "top_feature_drivers": feature_drivers,
+            "decision_rows": int(len(decision_rows)),
+            "actionable_decision_rows": int(len(actionable_decisions)),
+            "action_counts": decision_action_counts,
+            "aux_fields": sorted(str(key) for key in aux.keys()) if isinstance(aux, dict) else [],
         },
         "top_positions": top_positions,
         "rebalance": rebalance_rows[: max(0, int(top_n))],
+        "decision_explanations": actionable_decisions[: max(0, int(top_n))],
     }
     if write:
         if live_output_dir is not None:
@@ -598,12 +1030,19 @@ def generate_live_signal(
         summary["summary_path"] = str(output_path / "summary.json")
         summary["weights_path"] = str(output_path / "target_weights.parquet")
         summary["rebalance_path"] = str(output_path / "rebalance.parquet")
+        summary["decision_explanation_path"] = str(output_path / "decision_explanations.parquet")
+        summary["positions_markdown_path"] = str(output_path / "target_positions.md")
+        summary["rebalance_markdown_path"] = str(output_path / "rebalance.md")
+        summary["decision_explanation_markdown_path"] = str(output_path / "decision_explanations.md")
+        summary["decision_report_path"] = str(output_path / "decision_report.md")
+        summary["model_explanation_path"] = str(output_path / "model_explanation.json")
         summary["discord_message_path"] = str(output_path / "discord_message.md")
     message = format_signal_message(summary, max_rows=top_n)
     result = LiveSignalResult(
         summary=summary,
         weights_rows=weights_rows,
         rebalance_rows=rebalance_rows,
+        decision_rows=decision_rows,
         message=message,
         output_dir=None,
     )

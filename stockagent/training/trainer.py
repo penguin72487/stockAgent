@@ -2387,7 +2387,7 @@ def _save_holdings_table(
     output_path: Path,
     holdings: list[HoldingsRecord],
 ) -> None:
-    """Save daily holdings detail sorted by holding ratio."""
+    """Save daily holdings detail sorted by date and absolute holding ratio."""
     import polars as pl
 
     df = pl.DataFrame(
@@ -2400,6 +2400,14 @@ def _save_holdings_table(
             "holding_ratio": [float(row.holding_ratio) for row in holdings],
             "is_cash": [bool(row.is_cash) for row in holdings],
         }
+    )
+    df = (
+        df.with_columns(pl.col("holding_ratio").abs().alias("_abs_holding_ratio"))
+        .sort(
+            by=["date", "_abs_holding_ratio", "symbol"],
+            descending=[False, True, False],
+        )
+        .drop("_abs_holding_ratio")
     )
     _write_dataframe_table(df, output_path)
 
