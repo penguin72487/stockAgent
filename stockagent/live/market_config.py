@@ -40,6 +40,8 @@ class LiveMarketConfig:
     max_turnover_warning: float = 1.5
     max_top_weight_warning: float = 0.1
     max_gross_warning: float | None = None
+    initial_capital: float | None = None
+    current_capital: float | None = None
     trader_role_ids: tuple[int, ...] = ()
     trader_role_names: tuple[str, ...] = ()
 
@@ -173,6 +175,8 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         max_turnover_warning=float(raw.get("max_turnover_warning") or 1.5),
         max_top_weight_warning=float(raw.get("max_top_weight_warning") or 0.1),
         max_gross_warning=_optional_float(raw.get("max_gross_warning")),
+        initial_capital=_optional_float(raw.get("initial_capital")),
+        current_capital=_optional_float(raw.get("current_capital")),
         trader_role_ids=_int_tuple(raw.get("trader_role_ids")),
         trader_role_names=_str_tuple(raw.get("trader_role_names")),
     )
