@@ -424,6 +424,7 @@ Plot/backend rules:
 - For US full-universe explainability on a 16GB GPU, do not put all sampled days on CUDA at once. Use row microbatching around 4 sampled days for `S≈16800`; measured 32-row explainability completed with ~8.9GB peak VRAM, while 8 rows without row microbatching reached the 16GB ceiling.
 - Keep perturbation feature-time batches small for full-universe explainability. Larger perturb batches reduce Python loop count but were slower in practice: a 4-row smoke run with perturb batch 4 took much longer than perturb batch 1 because each forward became a worse large-batch attention workload.
 - Cross-asset transmission should chunk both source symbols and sampled rows. Keep `source_chunk_size * row_chunk_size` bounded around 8 repeated rows for `S≈16800` unless a fresh VRAM profile proves more headroom.
+- Project-owned cross-asset graph processing and graph explainability should default to cuGraph (`explain_cross_asset_graph_backend: cugraph`). Do not implement new project graph analytics with NetworkX. Keep `networkx` only as an environment/runtime dependency required by PyTorch `torch.compile`/functorch internals; removing it breaks compiled training.
 - Static PNG chart labels should avoid CJK text unless a CJK-capable Matplotlib font is confirmed; use ASCII feature-group labels in plots and explain them in the Markdown report.
 
 Walk-forward summary visualization rules:
