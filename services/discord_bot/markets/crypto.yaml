@@ -1,0 +1,35 @@
+market: crypto
+label: 加密貨幣
+enabled: true
+market_type: crypto
+timezone: UTC
+open_time:
+close_time:
+schedule_time: "00:00"
+summary_time: "00:10"
+data_ready_time: "00:00"
+freshness_max_lag_days: 1
+freshness_scan_limit: 0
+
+config_path: configs/markets/crypto.yaml
+output_dir: artifacts/markets/crypto
+live_output_dir: artifacts/live_signals/crypto
+
+# null/empty/auto/latest means: discover the latest fold_*/checkpoint_best.pt.
+fold_id:
+checkpoint_path:
+weights_path:
+
+panel_date: latest
+device: cuda
+price_source: panel
+prices_csv:
+yahoo_chunk_size: 80
+
+top_n: 20
+min_abs_delta: 0.001
+benchmark_window_days: 20
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 2.75
+unsupported_message: "**加密貨幣** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"

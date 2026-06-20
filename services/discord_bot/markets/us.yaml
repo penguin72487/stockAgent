@@ -1,0 +1,36 @@
+market: us
+label: 美股
+enabled: true
+market_type: us
+timezone: America/New_York
+open_time: "09:30"
+close_time: "16:00"
+schedule_time: "15:45"
+summary_time: "16:15"
+data_ready_time: "18:00"
+freshness_max_lag_days: 3
+freshness_scan_limit: 1000
+holidays: []
+
+config_path: configs/markets/us.yaml
+output_dir: artifacts/markets/us
+live_output_dir: artifacts/live_signals/us
+
+# null/empty/auto/latest means: discover the latest fold_*/checkpoint_best.pt.
+fold_id:
+checkpoint_path:
+weights_path:
+
+panel_date: latest
+device: cuda
+price_source: panel
+prices_csv:
+yahoo_chunk_size: 80
+
+top_n: 20
+min_abs_delta: 0.001
+benchmark_window_days: 20
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 2.75
+unsupported_message: "**美股** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"

@@ -49,11 +49,11 @@ class CrossSectionalMLP(nn.Module):
 
     def forward(self, x: torch.Tensor, tradable_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Return per-symbol portfolio weights.
-
+        
         Args:
             x: [B, lookback, S, F]
             tradable_mask: [B, S] bool (optional)
-
+        
         Returns:
             weights: [B, S]
         """
