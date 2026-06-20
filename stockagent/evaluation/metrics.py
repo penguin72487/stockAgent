@@ -5,11 +5,6 @@ import math
 import numpy as np
 import torch
 
-try:
-    import cupy as cp
-except Exception:  # pragma: no cover - optional GPU dependency
-    cp = None
-
 
 def _rank_from_sorted_indices(sorted_idx: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Construct row-wise rank tensor from argsort indices using scatter."""
@@ -50,45 +45,6 @@ def compute_ic_series(
     returns_t = torch.from_numpy(future_log_returns).float()
     mask_t = torch.from_numpy(tradable_mask.astype(bool))
     return compute_ic_series_torch(scores_t, returns_t, mask_t).cpu().numpy().astype(np.float32)
-
-
-def compute_ic_series_cupy(
-    alpha_scores,
-    future_log_returns,
-    tradable_mask,
-) -> np.ndarray:
-    """GPU Spearman-like IC with CuPy; returns numpy array [T]."""
-    if cp is None:
-        return compute_ic_series(
-            np.asarray(alpha_scores),
-            np.asarray(future_log_returns),
-            np.asarray(tradable_mask),
-        )
-
-    scores = cp.asarray(alpha_scores, dtype=cp.float32)
-    returns = cp.asarray(future_log_returns, dtype=cp.float32)
-    mask = cp.asarray(tradable_mask).astype(cp.bool_)
-
-    valid_mask = mask & cp.isfinite(scores) & cp.isfinite(returns)
-    mask_f = valid_mask.astype(cp.float32)
-    valid_count = mask_f.sum(axis=1)
-
-    s_fill = cp.where(valid_mask, scores, cp.full_like(scores, -1e30))
-    r_fill = cp.where(valid_mask, returns, cp.full_like(returns, -1e30))
-    s_rank = cp.argsort(cp.argsort(s_fill, axis=1), axis=1).astype(cp.float32)
-    r_rank = cp.argsort(cp.argsort(r_fill, axis=1), axis=1).astype(cp.float32)
-
-    denom_count = cp.clip(valid_count, 1.0, None)[:, None]
-    s_mean = (s_rank * mask_f).sum(axis=1, keepdims=True) / denom_count
-    r_mean = (r_rank * mask_f).sum(axis=1, keepdims=True) / denom_count
-
-    s_c = (s_rank - s_mean) * mask_f
-    r_c = (r_rank - r_mean) * mask_f
-    cov = (s_c * r_c).sum(axis=1)
-    denom = cp.sqrt(cp.clip((s_c**2).sum(axis=1) * (r_c**2).sum(axis=1), 1e-8, None))
-    ic = cov / denom
-    ic = cp.where(valid_count >= 2, ic, cp.zeros_like(ic))
-    return cp.asnumpy(ic.astype(cp.float32))
 
 
 def compute_ic_series_torch(

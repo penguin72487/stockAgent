@@ -1,11 +1,11 @@
-experiment_name: tw-stock-transformer-fold24-25-stability
+experiment_name: tw-stock-transformer-market
 
 runner:
-  output_dir: artifacts
+  output_dir: artifacts/markets/tw
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 24
+  start_fold: 25
 environment:
   conda_env: fintech
   device: cuda

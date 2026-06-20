@@ -551,20 +551,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward.setdefault("val_years", 1)
     walk_forward.setdefault("require_future_test_year", True)
 
-    trading = raw.setdefault("trading", {})
-    trading.setdefault("execution_mode", "overnight_tplus2")
-    trading.setdefault("lot_size", 1000)
-    trading.setdefault("min_fee", 20.0)
-    trading.setdefault("intraday_buy_fee_rate", 0.001425)
-    trading.setdefault("intraday_sell_fee_rate", 0.002925)
-    trading.setdefault("overnight_buy_fee_rate", 0.001425)
-    trading.setdefault("overnight_sell_fee_rate", 0.004425)
-    trading.setdefault("settlement_delay_days", 2)
-
     training = raw.setdefault("training", {})
-    training.setdefault("model_name", "mlp")
-    training.setdefault("num_layers", 1)
-    training.setdefault("residual_norm", True)
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
     training.setdefault("batch_size_train", training.get("batch_size", 32))
@@ -688,28 +675,6 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("finite_check_interval_steps", 0)
     training.setdefault("materialize_window_tensors", False)
     training.setdefault("loss_type", "mse")
-    training.setdefault("xgb_n_estimators", 600)
-    training.setdefault("xgb_max_depth", 6)
-    training.setdefault("xgb_learning_rate", 0.05)
-    training.setdefault("xgb_subsample", 0.8)
-    training.setdefault("xgb_colsample_bytree", 0.8)
-    training.setdefault("xgb_reg_lambda", 1.0)
-    training.setdefault("ridge_alpha", 1.0)
-    training.setdefault("ridge_fit_intercept", True)
-    training.setdefault("elasticnet_alpha", 1.0)
-    training.setdefault("elasticnet_l1_ratio", 0.5)
-    training.setdefault("elasticnet_fit_intercept", True)
-    training.setdefault("elasticnet_max_iter", 2000)
-    training.setdefault("elasticnet_tol", 1e-4)
-    training.setdefault("rl_total_timesteps", 20000)
-    training.setdefault("rl_batch_size", 256)
-    training.setdefault("rl_n_steps", 2048)
-    training.setdefault("rl_buffer_size", 200000)
-    training.setdefault("rl_learning_starts", 1000)
-    training.setdefault("rl_gamma", 0.99)
-    training.setdefault("rl_policy_hidden_dim", 256)
-    training.setdefault("rl_max_symbols", 64)
-    training.setdefault("rl_device", "")
 
     # Model-specific blocks.
     legacy_hidden_dim = training.get("hidden_dim", 128)
@@ -1168,37 +1133,6 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     # Legacy key is accepted as input but removed from the normalized config payload.
     trading.pop("fee_per_side", None)
-    return raw
-
-
-def _apply_model_configs(raw: dict[str, Any]) -> dict[str, Any]:
-    training = raw.setdefault("training", {})
-    model_name = str(training.get("model_name", "mlp")).strip().lower()
-    model_configs = training.pop("model_configs", None)
-    if not isinstance(model_configs, dict):
-        return raw
-
-    lowered_map = {str(key).strip().lower(): value for key, value in model_configs.items()}
-    selected = lowered_map.get(model_name)
-    if not isinstance(selected, dict):
-        return raw
-
-    valid_fields = set(TrainingConfig.__dataclass_fields__.keys())
-    unknown = [key for key in selected.keys() if key not in valid_fields]
-    if unknown:
-        raise ValueError(
-            f"Unknown keys in training.model_configs.{model_name}: {unknown}. "
-            f"Valid keys: {sorted(valid_fields)}"
-        )
-
-    training.update(selected)
-
-    # Preserve batch_size convenience behavior for profile overrides.
-    if "batch_size" in selected and "batch_size_train" not in selected:
-        training["batch_size_train"] = training["batch_size"]
-    if "batch_size" in selected and "batch_size_eval" not in selected:
-        training["batch_size_eval"] = training["batch_size"]
-
     return raw
 
 
