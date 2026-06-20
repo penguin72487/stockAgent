@@ -85,9 +85,27 @@ Multi-asset Taiwan stock trading research workspace.
 - Leave `fold_id` empty/null in the market YAML to discover the latest `fold_*/checkpoint_best.pt` under that market's `output_dir`.
 - Use `--price-source csv --prices-csv path/to/prices.csv` for current-price mark-to-market. The CSV must include `symbol`/`code`/`ticker` and `price`/`close`/`last` columns.
 - Per-market output is written under the market YAML's `live_output_dir`, for example `artifacts/live_signals/tw/YYYY-MM-DD/`:
-  `summary.json`, `discord_message.md`, `target_weights.parquet`, and `rebalance.parquet`.
+  `summary.json`, `discord_message.md`, `target_weights.parquet`,
+  `target_positions.md`, `rebalance.parquet`, `rebalance.md`,
+  `decision_explanations.parquet`, `decision_explanations.md`,
+  `decision_report.md`, and `model_explanation.json`.
 - The Discord bot entrypoint is `services/discord_bot/bot.py`; configure it with `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`, `STOCKAGENT_MARKETS_DIR`, and `STOCKAGENT_DEFAULT_MARKET`.
-- The bot exposes `/signal_now`, `/positions`, `/rebalance`, `/markets`, and `/health`; market-aware commands accept a `market` option.
+- `services/discord_bot/bot.py` includes a reload supervisor by default: watched
+  file changes restart the child bot process 10 seconds after the last update.
+  Set `STOCKAGENT_BOT_RELOAD=0` to run without the supervisor.
+- The bot exposes `/signal_now`, `/positions`, `/rebalance`,
+  `/portfolio_history`, `/stock_history`, `/explain_signal`, `/markets`, and
+  `/health`; market-aware commands accept a `market` option. `/positions`,
+  `/rebalance`, `/portfolio_history`, `/stock_history`, and `/explain_signal`
+  use paged Discord responses so long lists are not truncated.
+  `/portfolio_history market:tw days:32 current_capital:1000000` shows recent
+  daily PnL, current exposure, and holding changes from fold artifacts scaled to
+  the supplied capital. `/stock_history market:tw symbol:2330 limit:32` shows
+  recent per-symbol trade/adjustment records. `/positions` and `/rebalance`
+  accept `current_capital` to estimate current/target/trade amounts.
+  `/set_capital` stores per-market default capital. `/explain_signal` can
+  filter by symbol/action, sort by delta/score/target/return/rank, and
+  optionally attach the full markdown decision report.
 
 ## Environment
 

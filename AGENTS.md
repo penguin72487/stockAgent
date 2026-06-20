@@ -74,6 +74,11 @@ Rules:
   `panel_backend="polars"` is an alias for `polars_lazy`; explicit
   `panel_backend="polars_streaming"` is available for measurement but is not the
   current auto default.
+- US Yahoo parquet files under `us_stocks` must keep `Trading_Volume` for
+  trainable stock-like assets. If old `_DL`/delisted/archive parquet files are
+  missing that column, treat them as schema-broken data: repair should normalize
+  `_DL` records back to the base Yahoo symbol and remove unusable delisted
+  schema-mismatch files instead of letting panel build fail on the first file.
 - Foreground full-US PyArrow+Polars benchmark after narrowing the scope:
   `panel_build` measured Polars Lazy `69.36s`, Polars Streaming `86.55s`, and
   PyArrow `195.85s` on recheck. PyArrow checksum was

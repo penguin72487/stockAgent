@@ -1073,7 +1073,7 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
 
 @dataclass(slots=True)
 class HoldingsRecord:
-    """Single holding record for one date/symbol, sorted by holding ratio."""
+    """Single holding record for one date/symbol, sorted by absolute holding ratio."""
 
     date: str
     symbol: str
@@ -1082,6 +1082,10 @@ class HoldingsRecord:
     market_value: float
     holding_ratio: float
     is_cash: bool
+
+
+def holding_record_abs_sort_key(record: HoldingsRecord) -> tuple[float, str]:
+    return (-abs(float(record.holding_ratio)), str(record.symbol))
 
 
 def _vectorized_backtest(
@@ -2457,7 +2461,7 @@ def run_backtest_integer_shares(
                         is_cash=False,
                     )
                 )
-            day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
+            day_rows.sort(key=holding_record_abs_sort_key)
             records.extend(day_rows)
 
         # PnL follows the canonical return label (adj close when available).
