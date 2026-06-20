@@ -47,6 +47,7 @@ def test_format_signal_message_stays_discord_sized() -> None:
         "benchmark_simple_return": -0.004,
         "turnover": 0.52,
         "estimated_trade_cost": 0.001,
+        "market_notice": "今天沒有開盤，使用最後可用資料 `2026-06-19` 產生訊號。",
         "top_positions": [{"symbol": "2330", "name": "TSMC", "weight": 0.2, "current_price": 1000.0}],
         "rebalance": [
             {
@@ -66,4 +67,5 @@ def test_format_signal_message_stays_discord_sized() -> None:
     assert "2330" in message
     assert "TSMC" in message
     assert "px=1000.00" in message
+    assert "今天沒有開盤" in message
     assert len(message) < 1900

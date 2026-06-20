@@ -357,6 +357,7 @@ def generate_live_signal(
     top_n: int = 20,
     min_abs_delta: float = 0.001,
     signal_id: str | None = None,
+    market_notice: str | None = None,
     benchmark_window_days: int = 20,
     max_turnover_warning: float = 1.5,
     max_top_weight_warning: float = 0.1,
@@ -574,6 +575,7 @@ def generate_live_signal(
         "current_risk": current_risk,
         "target_risk": target_risk,
         "risk_warnings": risk_warnings,
+        "market_notice": str(market_notice) if market_notice else None,
         "recent_performance": recent_performance,
         "model_explanation": {
             "source": "score logits plus weighted latest-feature proxy",

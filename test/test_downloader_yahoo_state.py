@@ -293,6 +293,34 @@ def test_daily_resolution_marks_cached_active_symbol_as_delisted(tmp_path, monke
     ]
 
 
+def test_cached_us_archive_manifest_symbol_uses_base_yahoo_symbol(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    pl.DataFrame(
+        [
+            {"code": "ACCU_DL", "name": "ACCU_DL", "market": "us_stocks", "yahoo_symbol": "ACCU_DL"},
+        ]
+    ).write_csv(output_dir / "symbols.csv")
+
+    records = yahoo._resolve_cached_manifest(output_dir, "us_stocks")
+
+    assert [(record.code, record.market, record.yahoo_symbol) for record in records] == [
+        ("ACCU_DL", "us_delisted", "ACCU"),
+    ]
+
+
+def test_local_us_archive_file_symbol_uses_base_yahoo_symbol(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    (output_dir / "ACCU_DL_features.parquet").write_text("placeholder", encoding="utf-8")
+
+    records = yahoo._load_local_tracked_records("us_stocks", output_dir, cached=[])
+
+    assert [(record.code, record.market, record.yahoo_symbol) for record in records] == [
+        ("ACCU_DL", "us_delisted", "ACCU"),
+    ]
+
+
 def test_repair_plan_removes_delisted_file_without_usable_history(tmp_path):
     output_dir = tmp_path / "us_stocks"
     output_dir.mkdir()
@@ -332,6 +360,33 @@ def test_repair_plan_keeps_delisted_file_with_history_without_refetch(tmp_path):
         ("OLDW", "delisted_skip", None),
     ]
     assert output_path.exists()
+
+
+def test_repair_plan_removes_delisted_schema_mismatch_file(tmp_path):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "OLDW_features.parquet"
+    _write_parquet(
+        pl.DataFrame(
+            {
+                "date": ["2026-01-01", "2026-01-02"],
+                "open": [1.0, 1.1],
+                "max": [1.2, 1.2],
+                "min": [0.9, 1.0],
+                "close": [1.1, 1.0],
+                "adjclose": [1.1, 1.0],
+            }
+        ),
+        output_path,
+    )
+
+    record = yahoo.SymbolRecord("OLDW", "old warrant", "us_delisted", "OLDW")
+    checks = yahoo._resolve_repair_plan("us_stocks", _base_args(tmp_path, asset="us_stocks"), [record], output_dir)
+
+    assert [(check.record.code, check.status, check.repair_start_date) for check in checks] == [
+        ("OLDW", "delisted_removed", None),
+    ]
+    assert not output_path.exists()
 
 
 def test_daily_repair_plan_treats_weekend_stock_target_as_current(tmp_path):
