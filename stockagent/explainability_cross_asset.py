@@ -44,7 +44,7 @@ class CrossAssetTransmissionSettings:
     validated_transmission: bool = True
     role_embedding: bool = True
     plot_top_k: int = 30
-    graph_backend: str = "auto"
+    graph_backend: str = "cugraph"
     graph_benchmark_min_edges: int = 1_000_000
     graph_explainability: bool = True
     graph_betweenness_max_vertices: int = 512
@@ -828,8 +828,8 @@ def _resolve_graph_backend(settings: CrossAssetTransmissionSettings) -> tuple[st
     raw = os.environ.get("STOCKAGENT_CROSS_ASSET_GRAPH_BACKEND", settings.graph_backend)
     backend = str(raw).strip().lower()
     if backend not in _GRAPH_BACKENDS:
-        warnings_out.append(f"Invalid cross-asset graph backend {raw!r}; using auto.")
-        backend = "auto"
+        warnings_out.append(f"Invalid cross-asset graph backend {raw!r}; using cugraph.")
+        backend = "cugraph"
     return backend, warnings_out
 
 
@@ -1071,7 +1071,7 @@ def _process_cross_asset_graph_edges(
             "error": f"{type(exc).__name__}: {exc}",
         }
         if backend == "cugraph":
-            benchmark["warnings"].append("cuGraph backend failed; using Polars output.")
+            raise RuntimeError(f"cuGraph graph backend was requested but failed: {type(exc).__name__}: {exc}") from exc
         selected.benchmark = benchmark
         return selected
 
@@ -1080,6 +1080,8 @@ def _process_cross_asset_graph_edges(
     benchmark["validation"] = validation
     if not bool(validation["ok"]):
         benchmark["selection_reason"] = "validation_failed"
+        if backend == "cugraph":
+            raise RuntimeError(f"cuGraph graph backend validation failed: {validation}")
         benchmark["warnings"].append("cuGraph output did not match Polars baseline; using Polars output.")
         selected.benchmark = benchmark
         return selected
@@ -1484,6 +1486,8 @@ def _build_graph_explainability(
         result.summary["warnings"] = backend_warnings
         return result
     except Exception as exc:
+        if backend == "cugraph":
+            raise RuntimeError(f"cuGraph graph explainability was requested but failed: {type(exc).__name__}: {exc}") from exc
         result = _build_polars_graph_explainability(edges, reason="cugraph_failed")
         result.summary["warnings"] = backend_warnings + [f"cuGraph graph explainability failed: {type(exc).__name__}: {exc}"]
         return result
