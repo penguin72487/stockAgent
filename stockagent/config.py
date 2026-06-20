@@ -446,7 +446,7 @@ class TrainingConfig:
     explain_cross_asset_attention_capture_rows: int = 1
     explain_cross_asset_validated_transmission: bool = True
     explain_cross_asset_role_embedding: bool = False
-    explain_cross_asset_graph_backend: str = "auto"
+    explain_cross_asset_graph_backend: str = "cugraph"
     explain_cross_asset_graph_benchmark_min_edges: int = 1_000_000
     explain_cross_asset_graph_explainability: bool = True
     explain_cross_asset_graph_betweenness_max_vertices: int = 512
@@ -640,7 +640,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("explain_cross_asset_attention_capture_rows", 1)
     training.setdefault("explain_cross_asset_validated_transmission", True)
     training.setdefault("explain_cross_asset_role_embedding", False)
-    training.setdefault("explain_cross_asset_graph_backend", "auto")
+    training.setdefault("explain_cross_asset_graph_backend", "cugraph")
     training.setdefault("explain_cross_asset_graph_benchmark_min_edges", 1_000_000)
     training.setdefault("explain_cross_asset_graph_explainability", True)
     training.setdefault("explain_cross_asset_graph_betweenness_max_vertices", 512)
@@ -1096,7 +1096,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_cross_asset_attention_capture_rows"] = max(
         1, int(training.get("explain_cross_asset_attention_capture_rows", 4))
     )
-    graph_backend = str(training.get("explain_cross_asset_graph_backend", "auto")).strip().lower()
+    graph_backend = str(training.get("explain_cross_asset_graph_backend", "cugraph")).strip().lower()
     if graph_backend not in {"auto", "polars", "cugraph"}:
         raise ValueError("training.explain_cross_asset_graph_backend must be one of: auto, polars, cugraph")
     training["explain_cross_asset_graph_backend"] = graph_backend

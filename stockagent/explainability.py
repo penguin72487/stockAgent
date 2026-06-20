@@ -168,7 +168,7 @@ class ExplainabilitySettings:
     cross_asset_attention_capture_rows: int = 4
     cross_asset_validated_transmission: bool = True
     cross_asset_role_embedding: bool = True
-    cross_asset_graph_backend: str = "auto"
+    cross_asset_graph_backend: str = "cugraph"
     cross_asset_graph_benchmark_min_edges: int = 1_000_000
     cross_asset_graph_explainability: bool = True
     cross_asset_graph_betweenness_max_vertices: int = 512
@@ -256,7 +256,7 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
             getattr(training, "explain_cross_asset_validated_transmission", True)
         ),
         cross_asset_role_embedding=bool(getattr(training, "explain_cross_asset_role_embedding", False)),
-        cross_asset_graph_backend=str(getattr(training, "explain_cross_asset_graph_backend", "auto")),
+        cross_asset_graph_backend=str(getattr(training, "explain_cross_asset_graph_backend", "cugraph")),
         cross_asset_graph_benchmark_min_edges=int(
             getattr(training, "explain_cross_asset_graph_benchmark_min_edges", 1_000_000)
         ),
