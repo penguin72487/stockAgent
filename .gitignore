@@ -200,3 +200,4 @@ data_okx/*
 data_bybit/*
 data_yahoo_tw_ohlcv/*
 
+data/temporal_edges*
