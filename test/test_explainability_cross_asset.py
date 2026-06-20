@@ -110,6 +110,10 @@ def _graph_edge_frame(symbols: int = 4, shocks: tuple[str, ...] = ("zero", "volu
     return pl.DataFrame(rows)
 
 
+def test_cross_asset_graph_default_backend_is_cugraph() -> None:
+    assert CrossAssetTransmissionSettings().graph_backend == "cugraph"
+
+
 def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None:
     edges = _graph_edge_frame()
     result = _process_cross_asset_graph_edges(
@@ -363,6 +367,7 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
             max_targets=3,
             top_edges=4,
             source_chunk_size=1,
+            graph_backend="polars",
             shocks=("zero",),
             attention_flow=False,
             role_embedding=True,
@@ -374,7 +379,7 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
     summary = json.loads((base / "abstract_cross_asset_summary.json").read_text(encoding="utf-8"))
     assert summary["module"] == MODULE_NAME
     assert summary["graph_backend"] == "polars"
-    assert summary["graph_benchmark"]["selection_reason"] == "below_min_edges"
+    assert summary["graph_benchmark"]["selection_reason"] == "backend_polars"
     assert summary["graph_explainability"]["enabled"] is True
     assert summary["graph_explainability"]["backend"] in {"cugraph", "polars"}
     assert (base / "abstract_cross_asset_report.md").exists()

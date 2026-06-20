@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 25
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -55,7 +55,7 @@ training:
   compile_loss: true
   fused_log_utility_loss: true
   materialize_window_tensors: false
-  warm_start_from_previous_fold: true
+  warm_start_from_previous_fold: false
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
@@ -127,7 +127,7 @@ training:
   explain_cross_asset_attention_capture_rows: 1
   explain_cross_asset_validated_transmission: true
   explain_cross_asset_role_embedding: false
-  explain_cross_asset_graph_backend: auto
+  explain_cross_asset_graph_backend: cugraph
   explain_cross_asset_graph_benchmark_min_edges: 1000000
   explain_cross_asset_graph_explainability: true
   explain_cross_asset_graph_betweenness_max_vertices: 512
