@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import numpy as np
+import polars as pl
 
-from stockagent.live.portfolio_state import build_rebalance_rows, estimate_drifted_weights
+from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
+from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
 from stockagent.live.report_formatter import format_signal_message
+from stockagent.live.signal_engine import _build_decision_rows
+from stockagent.live.portfolio_history import load_portfolio_history
+from stockagent.live.stock_history import load_stock_history
 
 
 def test_estimate_drifted_weights_marks_signed_portfolio_to_market() -> None:
@@ -37,6 +42,168 @@ def test_build_rebalance_rows_sorts_by_absolute_delta() -> None:
     assert rows[0]["price_return"] == 1.0
 
 
+def test_holdings_record_sort_key_uses_absolute_holding_ratio() -> None:
+    rows = [
+        HoldingsRecord("2026-01-02", "LONG", 1, 10.0, 10.0, 0.20, False),
+        HoldingsRecord("2026-01-02", "SHORT", -1, 10.0, -10.0, -0.40, False),
+        HoldingsRecord("2026-01-02", "CASH", 0, 1.0, 30.0, 0.30, True),
+    ]
+
+    rows.sort(key=holding_record_abs_sort_key)
+
+    assert [row.symbol for row in rows] == ["SHORT", "CASH", "LONG"]
+
+
+def test_classify_rebalance_action_handles_hold_reduce_exit_and_direction() -> None:
+    assert classify_rebalance_action(0.1, 0.1000000001) == "HOLD"
+    assert classify_rebalance_action(0.1, 0.0) == "EXIT"
+    assert classify_rebalance_action(0.2, 0.1) == "REDUCE"
+    assert classify_rebalance_action(0.0, 0.1) == "BUY"
+    assert classify_rebalance_action(0.0, -0.1) == "SELL"
+
+
+def test_build_decision_rows_records_scores_constraints_and_reasons() -> None:
+    rows = _build_decision_rows(
+        symbols=["A", "B", "C"],
+        symbol_names={"B": "Bravo"},
+        asof_date="2026-06-19",
+        panel_date="2026-06-18",
+        model_weights=np.array([0.2, -0.3, 0.0]),
+        current_weights=np.array([0.1, 0.0, -0.1]),
+        target_weights=np.array([0.2, -0.3, 0.0]),
+        scores=np.array([0.5, -1.2, 0.0]),
+        current_prices=np.array([10.0, 20.0, 30.0]),
+        base_prices=np.array([10.0, 10.0, 30.0]),
+        price_returns=np.array([0.0, 1.0, 0.0]),
+        tradable_mask=np.array([True, True, False]),
+        can_buy_mask=np.array([True, True, False]),
+        can_sell_mask=np.array([True, True, False]),
+        aux=None,
+    )
+
+    assert [row["symbol"] for row in rows] == ["B", "A", "C"]
+    assert rows[0]["name"] == "Bravo"
+    assert rows[0]["action"] == "SELL"
+    assert rows[0]["abs_score_rank"] == 1
+    assert rows[0]["trade_price"] == 20.0
+    assert "negative_score" in rows[0]["decision_reason"]
+    assert rows[-1]["constraint"] == "not_tradable"
+
+
+def test_load_stock_history_combines_model_integer_and_holding_tables(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05", "2026-01-06"],
+            "AAA": [0.10, 0.15, -0.20],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05", "2026-01-06"],
+            "AAA": [0.00, 0.12, -0.18],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_weights.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-05", "2026-01-06"],
+            "symbol": ["AAA", "AAA"],
+            "shares": [10, -5],
+            "price": [20.0, 22.0],
+            "market_value": [200.0, -110.0],
+            "holding_ratio": [0.12, -0.18],
+            "is_cash": [False, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05", "2026-01-06"],
+            "portfolio_return": [0.01, -0.02, 0.03],
+            "benchmark_return": [0.00, 0.01, -0.01],
+            "turnover": [0.1, 0.2, 0.3],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_stock_history(fold_dir, "aaa", limit=2, symbol_names={"AAA": "Alpha"})
+
+    assert result.symbol == "AAA"
+    assert result.name == "Alpha"
+    assert [row["date"] for row in result.rows] == ["2026-01-06", "2026-01-05"]
+    assert [row["action"] for row in result.rows] == ["FLIP_TO_SHORT", "OPEN_LONG"]
+    assert result.rows[0]["shares"] == -5
+    assert np.isclose(result.rows[0]["model_weight_delta"], -0.35)
+    assert np.isclose(result.rows[1]["holding_ratio"], 0.12)
+
+
+def test_load_portfolio_history_summarizes_pnl_and_holding_changes(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05", "2026-01-06"],
+            "symbol": ["CASH", "AAA", "CASH", "AAA", "CASH"],
+            "shares": [900, 10, 800, 20, 1000],
+            "price": [1.0, 10.0, 1.0, 10.0, 1.0],
+            "market_value": [900.0, 100.0, 800.0, 200.0, 1000.0],
+            "holding_ratio": [0.9, 0.1, 0.8, 0.2, 1.0],
+            "is_cash": [True, False, True, False, True],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05", "2026-01-06"],
+            "portfolio_return": [0.01, 0.05, -0.02],
+            "benchmark_return": [0.00, 0.02, 0.01],
+            "turnover": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_portfolio_history(fold_dir, days=2, top_changes=2, symbol_names={"AAA": "Alpha"})
+
+    assert result.start_date == "2026-01-05"
+    assert result.end_date == "2026-01-06"
+    assert np.isclose(result.period_return, 1.05 * 0.98 - 1.0)
+    assert np.isclose(result.profit_value, 30.0)
+    assert [row["date"] for row in result.rows] == ["2026-01-06", "2026-01-05"]
+    assert result.rows[0]["changes"][0]["action"] == "EXIT_LONG"
+    assert result.rows[1]["changes"][0]["action"] == "ADD_LONG"
+    assert result.rows[1]["changes"][0]["name"] == "Alpha"
+
+
+def test_load_portfolio_history_scales_values_from_current_capital(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
+            "symbol": ["CASH", "AAA", "CASH", "AAA"],
+            "shares": [900, 10, 800, 20],
+            "price": [1.0, 10.0, 1.0, 10.0],
+            "market_value": [900.0, 100.0, 800.0, 200.0],
+            "holding_ratio": [0.9, 0.1, 0.8, 0.2],
+            "is_cash": [True, False, True, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05"],
+            "portfolio_return": [0.01, 0.05],
+            "benchmark_return": [0.00, 0.02],
+            "turnover": [0.10, 0.20],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_portfolio_history(fold_dir, days=1, top_changes=1, current_capital=2000.0)
+
+    assert result.capital.mode == "current_capital"
+    assert np.isclose(result.capital.scale, 2.0)
+    assert np.isclose(result.rows[0]["nav"], 2000.0)
+    assert np.isclose(result.rows[0]["profit_value"], 100.0)
+    assert np.isclose(result.rows[0]["changes"][0]["market_value"], 400.0)
+    assert np.isclose(result.rows[0]["changes"][0]["market_value_delta"], 200.0)
+
+
 def test_format_signal_message_stays_discord_sized() -> None:
     summary = {
         "asof_date": "2026-06-19",
@@ -47,6 +214,8 @@ def test_format_signal_message_stays_discord_sized() -> None:
         "benchmark_simple_return": -0.004,
         "turnover": 0.52,
         "estimated_trade_cost": 0.001,
+        "market_notice": "今天沒有開盤，使用最後可用資料 `2026-06-19` 產生訊號。",
+        "decision_explanation_path": "artifacts/live_signals/tw/2026-06-19/signal/decision_explanations.parquet",
         "top_positions": [{"symbol": "2330", "name": "TSMC", "weight": 0.2, "current_price": 1000.0}],
         "rebalance": [
             {
@@ -66,4 +235,6 @@ def test_format_signal_message_stays_discord_sized() -> None:
     assert "2330" in message
     assert "TSMC" in message
     assert "px=1000.00" in message
+    assert "今天沒有開盤" in message
+    assert "explain:" in message
     assert len(message) < 1900

@@ -14,6 +14,26 @@ class DriftResult:
     valid_price_count: int
 
 
+def classify_rebalance_action(
+    current_weight: float,
+    target_weight: float,
+    *,
+    delta_weight: float | None = None,
+    position_eps: float = 1e-6,
+    delta_eps: float = 1e-9,
+) -> str:
+    current = float(current_weight)
+    target = float(target_weight)
+    delta = float(target - current if delta_weight is None else delta_weight)
+    if abs(delta) <= float(delta_eps):
+        return "HOLD"
+    if abs(target) <= float(position_eps) and abs(current) > float(position_eps):
+        return "EXIT"
+    if abs(target) < abs(current) and np.sign(target) == np.sign(current):
+        return "REDUCE"
+    return "BUY" if delta > 0.0 else "SELL"
+
+
 def estimate_drifted_weights(
     previous_weights: np.ndarray,
     base_prices: np.ndarray,
@@ -99,14 +119,12 @@ def build_rebalance_rows(
             continue
         current_weight = float(current[idx])
         target_weight = float(target[idx])
-        if abs(target_weight) <= float(position_eps) and abs(current_weight) > float(position_eps):
-            action = "EXIT"
-        elif abs(target_weight) < abs(current_weight) and np.sign(target_weight) == np.sign(current_weight):
-            action = "REDUCE"
-        elif float(delta[idx]) > 0.0:
-            action = "BUY"
-        else:
-            action = "SELL"
+        action = classify_rebalance_action(
+            current_weight,
+            target_weight,
+            delta_weight=float(delta[idx]),
+            position_eps=position_eps,
+        )
         base_price = float(base[idx]) if np.isfinite(base[idx]) else float("nan")
         current_price = float(prices[idx]) if np.isfinite(prices[idx]) else float("nan")
         simple_return = (
