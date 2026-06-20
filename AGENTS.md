@@ -79,6 +79,11 @@ Rules:
   missing that column, treat them as schema-broken data: repair should normalize
   `_DL` records back to the base Yahoo symbol and remove unusable delisted
   schema-mismatch files instead of letting panel build fail on the first file.
+- For the US Yahoo universe, do not remove a symbol only because it is currently
+  delisted; historical delisted common stocks/ADRs/ETFs are needed to reduce
+  survivorship bias. Do exclude security types outside the normal broker-tradable
+  stock/ETF/ADR universe, such as warrants, rights, units, preferred/depositary
+  preferreds, and exchange-listed notes/debt instruments.
 - Foreground full-US PyArrow+Polars benchmark after narrowing the scope:
   `panel_build` measured Polars Lazy `69.36s`, Polars Streaming `86.55s`, and
   PyArrow `195.85s` on recheck. PyArrow checksum was

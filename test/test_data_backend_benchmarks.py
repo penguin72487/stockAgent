@@ -182,6 +182,36 @@ def test_pyarrow_panel_backend_builds_synthetic_parquet(tmp_path: Path) -> None:
     assert pyarrow_panel.tradable_mask.all()
 
 
+def test_panel_security_filter_excludes_us_special_tools_but_keeps_delisted_common(tmp_path: Path) -> None:
+    root = tmp_path / "us_stocks"
+    root.mkdir()
+    _write_symbol(root / "AAPL_features.parquet", 0.0)
+    _write_symbol(root / "AACIW_features.parquet", 1.0)
+    _write_symbol(root / "OLD_DL_features.parquet", 2.0)
+    (root / "symbols.csv").write_text(
+        "\n".join(
+            [
+                "code,name,market,yahoo_symbol",
+                "AAPL,Apple Inc. - Common Stock,us_stocks,AAPL",
+                "AACIW,Armada Acquisition Corp. III - Warrant,us_stocks,AACIW",
+                "OLD_DL,Old Winner Corp. - Common Stock,us_delisted,OLD",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    panel = build_panel(
+        root,
+        benchmark_name="universe_average_return",
+        panel_backend="pyarrow",
+        panel_load_workers=1,
+        security_filter="broker_tradable",
+    )
+
+    assert panel.symbols == ["AAPL", "OLD_DL"]
+
+
 def test_polars_lazy_panel_backend_matches_pyarrow_on_synthetic_parquet(tmp_path: Path) -> None:
     module = _load_benchmark_module()
     from stockagent.data.panel import build_panel

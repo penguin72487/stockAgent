@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+import csv
 import hashlib
 import pickle
 import os
@@ -31,6 +32,11 @@ from stockagent.data.panel_cache import (
     panel_cache_v2_is_valid,
     panel_cache_v2_dir,
     save_panel_cache_v2,
+)
+from stockagent.data.us_universe import (
+    BROKER_TRADABLE_SECURITY_FILTER,
+    normalize_us_symbol_key,
+    us_broker_untradable_reason,
 )
 
 try:
@@ -104,6 +110,12 @@ PREV_DAY_LOG_RETURN_RENAME = {
     "Trading_Volume": "trading_volume_logret_1d",
 }
 _MISSING_VOLUME_WARNED_SYMBOLS: set[str] = set()
+
+
+@dataclass(slots=True)
+class _SymbolSecurityMetadata:
+    name: str
+    market: str
 
 
 class _MissingTradingVolumeError(ValueError):
@@ -217,6 +229,111 @@ class _SymbolPanelArrays:
 
 def _symbol_name_from_path(path: Path) -> str:
     return path.name.removesuffix(FEATURE_FILE_SUFFIX)
+
+
+def _normalize_security_filter(value: str | None) -> str:
+    normalized = str(value or "none").strip().lower()
+    if normalized in {"", "off", "false"}:
+        normalized = "none"
+    if normalized not in {"none", BROKER_TRADABLE_SECURITY_FILTER}:
+        raise ValueError(
+            "security_filter must be one of: none, broker_tradable; "
+            f"got {value!r}"
+        )
+    return normalized
+
+
+def _repo_fallback_us_symbols_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "configs" / "fallback_us_stocks_symbols.csv"
+
+
+def _security_filter_metadata_paths(parquet_root: Path, security_filter: str) -> list[Path]:
+    if security_filter != BROKER_TRADABLE_SECURITY_FILTER:
+        return []
+    candidates = [parquet_root / "symbols.csv", _repo_fallback_us_symbols_path()]
+    return [path for path in candidates if path.exists()]
+
+
+def _metadata_name_is_informative(symbol: str, name: str) -> bool:
+    clean_name = str(name or "").strip().upper()
+    if not clean_name:
+        return False
+    clean_symbol = str(symbol or "").strip().upper()
+    base_symbol = normalize_us_symbol_key(clean_symbol)
+    return clean_name not in {clean_symbol, base_symbol, f"{base_symbol}_DL"}
+
+
+def _add_us_security_metadata(
+    metadata: dict[str, _SymbolSecurityMetadata],
+    *,
+    code: str,
+    yahoo_symbol: str,
+    name: str,
+    market: str,
+) -> None:
+    keys = {
+        str(code or "").strip().upper(),
+        normalize_us_symbol_key(code),
+        str(yahoo_symbol or "").strip().upper(),
+        normalize_us_symbol_key(yahoo_symbol),
+    }
+    entry = _SymbolSecurityMetadata(name=str(name or "").strip(), market=str(market or "").strip())
+    new_is_informative = any(_metadata_name_is_informative(key, entry.name) for key in keys)
+    for key in {key for key in keys if key}:
+        existing = metadata.get(key)
+        if existing is None:
+            metadata[key] = entry
+            continue
+        existing_is_informative = _metadata_name_is_informative(key, existing.name)
+        if new_is_informative and not existing_is_informative:
+            metadata[key] = entry
+
+
+def _load_us_security_metadata(paths: list[Path]) -> dict[str, _SymbolSecurityMetadata]:
+    metadata: dict[str, _SymbolSecurityMetadata] = {}
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    _add_us_security_metadata(
+                        metadata,
+                        code=row.get("code", ""),
+                        yahoo_symbol=row.get("yahoo_symbol", ""),
+                        name=row.get("name", ""),
+                        market=row.get("market", ""),
+                    )
+        except OSError:
+            continue
+    return metadata
+
+
+def _filter_us_broker_tradable_paths(
+    parquet_root: Path,
+    parquet_paths: list[Path],
+    metadata_paths: list[Path],
+) -> list[Path]:
+    metadata = _load_us_security_metadata(metadata_paths)
+    kept: list[Path] = []
+    pruned_reasons: dict[str, int] = {}
+    for path in parquet_paths:
+        symbol = _symbol_name_from_path(path)
+        info = metadata.get(symbol.upper()) or metadata.get(normalize_us_symbol_key(symbol))
+        name = info.name if info is not None else symbol
+        market = info.market if info is not None else ("us_delisted" if symbol.upper().endswith("_DL") else "us_stocks")
+        reason = us_broker_untradable_reason(symbol, name, market)
+        if reason is None:
+            kept.append(path)
+            continue
+        pruned_reasons[reason] = pruned_reasons.get(reason, 0) + 1
+
+    if pruned_reasons:
+        details = ", ".join(f"{reason}={count}" for reason, count in sorted(pruned_reasons.items()))
+        print(
+            f"[panel] security_filter=broker_tradable pruned "
+            f"{sum(pruned_reasons.values())} {parquet_root.name} symbols ({details})"
+        )
+    return kept
 
 
 def _is_usd_trading_pair(path: Path) -> bool:
@@ -1026,7 +1143,7 @@ def _cache_meta_path(parquet_root: str | Path) -> Path:
 
 
 def _compute_source_hash(paths: list[Path]) -> str:
-    """Compute hash of all parquet files' mtime and size."""
+    """Compute hash of source files' mtime and size."""
     hasher = hashlib.md5()
     for path in sorted(paths):
         mtime = path.stat().st_mtime
@@ -1158,6 +1275,7 @@ def build_panel(
     usd_only_trading_pairs: bool = False,
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
+    security_filter: str | None = "none",
     strict_no_fallback: bool | None = None,
     buy_tradable_mode: str | None = None,
     sell_tradable_mode: str | None = None,
@@ -1173,6 +1291,13 @@ def build_panel(
         parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
         if not parquet_paths:
             raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
+
+    security_filter = _normalize_security_filter(security_filter)
+    security_metadata_paths = _security_filter_metadata_paths(parquet_root, security_filter)
+    if security_filter == BROKER_TRADABLE_SECURITY_FILTER:
+        parquet_paths = _filter_us_broker_tradable_paths(parquet_root, parquet_paths, security_metadata_paths)
+        if not parquet_paths:
+            raise FileNotFoundError(f"No broker-tradable US symbols found under {parquet_root}")
 
     panel_backend = str(panel_backend).strip().lower()
     valid_backends = {"auto", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
@@ -1223,11 +1348,12 @@ def build_panel(
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
-        f"trading_volume_policy={trading_volume_policy}"
+        f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}"
     )
-    source_hash = _compute_source_hash(parquet_paths)
+    source_paths = [*parquet_paths, *security_metadata_paths]
+    source_hash = _compute_source_hash(source_paths)
 
-    panel = _load_valid_panel_cache(parquet_root, parquet_paths, backend_key, source_hash)
+    panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
         _print_feature_overview(panel)
         return panel
