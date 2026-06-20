@@ -33,6 +33,7 @@ class DataConfig:
     benchmark_required: bool
     benchmark_source: str
     universe_mode: str
+    security_filter: str = "none"
     use_rapids: bool = False
     usd_only_trading_pairs: bool = False
     tradable_mode: str = "tradable"
@@ -976,6 +977,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("use_rapids", False)
     data.setdefault("usd_only_trading_pairs", False)
     data.setdefault("trading_volume_policy", "auto")
+    data.setdefault("security_filter", "none")
     data.setdefault("panel_backend", "auto")
     data.setdefault("panel_load_workers", 4)
 
@@ -1027,6 +1029,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             f"{sorted(valid_volume_policies)}, got {data.get('trading_volume_policy')!r}"
         )
     data["trading_volume_policy"] = trading_volume_policy
+    security_filter = str(data.get("security_filter", "none")).strip().lower()
+    if security_filter in {"", "off", "false"}:
+        security_filter = "none"
+    valid_security_filters = {"none", "broker_tradable"}
+    if security_filter not in valid_security_filters:
+        raise ValueError(
+            "data.security_filter must be one of "
+            f"{sorted(valid_security_filters)}, got {data.get('security_filter')!r}"
+        )
+    data["security_filter"] = security_filter
     panel_backend = str(data.get("panel_backend", "auto")).strip().lower()
     valid_panel_backends = {"auto", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
     if panel_backend not in valid_panel_backends:

@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import re
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -22,8 +23,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import yfinance as yf
 from tqdm import tqdm
+
+from stockagent.data.us_universe import is_us_broker_tradable_security
 
 try:
     import pyarrow as pa
@@ -1369,6 +1376,22 @@ def _filter_tw_records_for_supported_universe(records: list[SymbolRecord]) -> li
     return filtered
 
 
+def _filter_us_records_for_broker_tradable_universe(records: list[SymbolRecord]) -> list[SymbolRecord]:
+    return [
+        record
+        for record in records
+        if is_us_broker_tradable_security(record.code, record.name, record.market)
+    ]
+
+
+def _filter_records_for_supported_universe(asset_class: str, records: list[SymbolRecord]) -> list[SymbolRecord]:
+    if asset_class == "tw_stocks":
+        return _filter_tw_records_for_supported_universe(records)
+    if asset_class == "us_stocks":
+        return _filter_us_records_for_broker_tradable_universe(records)
+    return records
+
+
 def _apply_daily_listing_state(
     asset_class: str,
     records: list[SymbolRecord],
@@ -1747,7 +1770,7 @@ def _use_daily_update_cache_if_available(
 ) -> list[SymbolRecord] | None:
     is_daily_update = getattr(args, "mode", "") == "daily-update"
     if cached and is_daily_update and not getattr(args, "daily_discover_symbols", True):
-        records = _filter_tw_records_for_supported_universe(cached) if asset_class == "tw_stocks" else cached
+        records = _filter_records_for_supported_universe(asset_class, cached)
         pruned = len(cached) - len(records)
         message = f"[symbols] daily-update: cached manifest {asset_class} ({len(records)} symbols, skipping HTTP)"
         if pruned:
@@ -1874,6 +1897,13 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
             )
         except Exception as exc:
             print(f"[symbols] failed to load us delisted list: {exc}")
+    before_filter = len(records)
+    records = _filter_us_records_for_broker_tradable_universe(records)
+    if before_filter != len(records):
+        print(
+            f"[symbols] pruned {before_filter - len(records)} unsupported us_stocks records "
+            "outside broker-tradable stock/ETF/ADR universe"
+        )
     return records
 
 
@@ -1995,6 +2025,14 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                         f"[symbols] daily-update: pruned {active_before - len(active_records)} "
                         "unsupported tw_stocks active records outside stock/ETF universe"
                     )
+            elif asset_class == "us_stocks":
+                active_before = len(active_records)
+                active_records = _filter_us_records_for_broker_tradable_universe(active_records)
+                if active_before != len(active_records):
+                    print(
+                        f"[symbols] daily-update: pruned {active_before - len(active_records)} "
+                        "unsupported us_stocks active records outside broker-tradable universe"
+                    )
 
             manifest_records = list(cached)
             manifest_records.extend(active_records)
@@ -2006,6 +2044,14 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                         f"[symbols] daily-update: pruned {manifest_before - len(manifest_records)} "
                         "unsupported tw_stocks manifest records outside stock/ETF universe"
                     )
+            elif asset_class == "us_stocks":
+                manifest_before = len(manifest_records)
+                manifest_records = _filter_us_records_for_broker_tradable_universe(manifest_records)
+                if manifest_before != len(manifest_records):
+                    print(
+                        f"[symbols] daily-update: pruned {manifest_before - len(manifest_records)} "
+                        "unsupported us_stocks manifest records outside broker-tradable universe"
+                    )
             known_before = {record.code for record in manifest_records}
             known_symbol_keys: set[str] = set()
             for record in manifest_records:
@@ -2016,8 +2062,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
             if getattr(args, "daily_retry_known_missing_symbols", False):
                 active_codes = {record.code for record in active_records}
                 known_missing = [record for record in cached if record.code not in active_codes]
-                if asset_class == "tw_stocks":
-                    known_missing = _filter_tw_records_for_supported_universe(known_missing)
+                known_missing = _filter_records_for_supported_universe(asset_class, known_missing)
                 if known_missing:
                     print(
                         f"[symbols] daily-update: retrying {len(known_missing)} known missing "
@@ -2027,8 +2072,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
 
             if not _strict_no_fallback(args):
                 repo_candidates = _load_repo_symbol_fallback(asset_class)
-                if asset_class == "tw_stocks":
-                    repo_candidates = _filter_tw_records_for_supported_universe(repo_candidates)
+                repo_candidates = _filter_records_for_supported_universe(asset_class, repo_candidates)
                 new_from_repo = [record for record in repo_candidates if record.code not in known_before]
                 if new_from_repo:
                     print(
@@ -2051,8 +2095,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                         ) from exc
                     print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
                 else:
-                    if asset_class == "tw_stocks":
-                        discovered = _filter_tw_records_for_supported_universe(discovered)
+                    discovered = _filter_records_for_supported_universe(asset_class, discovered)
                     discovered_active_symbols: set[str] = set()
                     discovered_delisted_symbols: set[str] = set()
                     for record in discovered:
@@ -2109,6 +2152,9 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
             if asset_class == "tw_stocks":
                 active_records = _filter_tw_records_for_supported_universe(active_records)
                 manifest_records = _filter_tw_records_for_supported_universe(manifest_records)
+            elif asset_class == "us_stocks":
+                active_records = _filter_us_records_for_broker_tradable_universe(active_records)
+                manifest_records = _filter_us_records_for_broker_tradable_universe(manifest_records)
 
             active_deduped = _dedupe_records_by_code(active_records)
             manifest_deduped = _dedupe_records_by_code(manifest_records)

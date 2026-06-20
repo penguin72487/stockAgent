@@ -227,6 +227,7 @@ def main() -> None:
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
         trading_volume_policy=config.data.trading_volume_policy,
+        security_filter=config.data.security_filter,
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,

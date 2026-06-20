@@ -24,6 +24,7 @@ data:
   panel_backend: auto
   panel_load_workers: 16
   trading_volume_policy: auto
+  security_filter: broker_tradable
   tradable_mode: tradable
 
 walk_forward:
@@ -74,9 +75,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 4
-  batch_size_train: 4
-  batch_size_eval: 4
+  batch_size: 8
+  batch_size_train: 8
+  batch_size_eval: 8
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
