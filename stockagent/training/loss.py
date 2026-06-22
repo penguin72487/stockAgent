@@ -266,6 +266,7 @@ def factor_generalization_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     aux_outputs: dict[str, Tensor] | None = None,
     slope_tstat_weight: float = 1.0,
     rank_ic_weight: float = 0.5,
@@ -332,6 +333,7 @@ def factor_generalization_loss(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
         return_weights_history=False,
@@ -400,6 +402,7 @@ def portfolio_autoencoder_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     aux_outputs: dict[str, Tensor] | None = None,
     autoencoder_cost_rate: float = 0.001425,
     autoencoder_lambda_turnover: float = 0.1,
@@ -408,7 +411,7 @@ def portfolio_autoencoder_loss(
 ) -> Tensor:
     """Portfolio-level Sharpe objective for the bottleneck portfolio autoencoder."""
     del benchmark_returns, can_buy_mask, can_sell_mask, long_only
-    del buy_fee_rate, sell_fee_rate, max_turnover_ratio, gross_leverage
+    del buy_fee_rate, sell_fee_rate, max_turnover_ratio, gross_leverage, min_trade_weight
 
     weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     returns = torch.nan_to_num(
@@ -483,6 +486,7 @@ def sharpe_aware_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.1,
 ) -> Tensor:
@@ -507,6 +511,7 @@ def sharpe_aware_loss(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
         return_weights_history=False,
@@ -607,6 +612,7 @@ def risk_aware_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     gamma_sharpe: float = 1.0,
     gamma_excess: float = 1.0,
     gamma_cvar: float = 1.0,
@@ -674,6 +680,7 @@ def risk_aware_loss(
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=max_turnover_ratio,
             gross_leverage=gross_leverage,
+            min_trade_weight=min_trade_weight,
             aux_outputs=aux_outputs,
             autoencoder_cost_rate=autoencoder_cost_rate,
             autoencoder_lambda_turnover=autoencoder_lambda_turnover,
@@ -805,6 +812,7 @@ def risk_aware_loss(
             long_only=long_only,
             max_turnover_ratio=max_turnover_ratio,
             gross_leverage=gross_leverage,
+            min_trade_weight=min_trade_weight,
             can_buy_mask=can_buy,
             can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
             sample_mask=sample_mask.to(device=weights.device, dtype=torch.bool) if sample_mask is not None else None,
@@ -848,6 +856,7 @@ def risk_aware_loss(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
         return_weights_history=False,

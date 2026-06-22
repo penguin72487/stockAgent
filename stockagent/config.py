@@ -58,6 +58,7 @@ class TradingConfig:
     cash_allowed: bool
     max_turnover_ratio: float = 0.0
     gross_leverage: float = 1.0
+    min_trade_weight: float = 0.005
 
 
 @dataclass(slots=True)
@@ -1134,7 +1135,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["backtest_artifact_compression"] = backtest_artifact_compression
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
+    trading.setdefault("min_trade_weight", 0.005)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
+    trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.005)))
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
