@@ -152,6 +152,48 @@ def test_tw_daily_cache_fast_path_prunes_unsupported_cached_records(tmp_path):
     assert [record.code for record in records] == ["2330"]
 
 
+def test_us_broker_filter_keeps_delisted_common_but_excludes_special_tools():
+    records = [
+        yahoo.SymbolRecord("AAPL", "Apple Inc. - Common Stock", "us_stocks", "AAPL"),
+        yahoo.SymbolRecord("TSM", "Taiwan Semiconductor Manufacturing Company Ltd. ADR", "us_stocks", "TSM"),
+        yahoo.SymbolRecord("SPY", "SPDR S&P 500 ETF", "us_stocks", "SPY"),
+        yahoo.SymbolRecord("OLD_DL", "Old Winner Corp. - Common Stock", "us_delisted", "OLD"),
+        yahoo.SymbolRecord("AACIW", "Armada Acquisition Corp. III - Warrant", "us_stocks", "AACIW"),
+        yahoo.SymbolRecord("AACIR", "Armada Acquisition Corp. III - Rights", "us_stocks", "AACIR"),
+        yahoo.SymbolRecord("AACIU", "Armada Acquisition Corp. III - Units", "us_stocks", "AACIU"),
+        yahoo.SymbolRecord("BHFAL", "Brighthouse Financial, Inc. - Junior Subordinated Debentures due 2058", "us_stocks", "BHFAL"),
+        yahoo.SymbolRecord("ACGLN", "Arch Capital Group Ltd. - Depositary Shares representing Preferred Shares", "us_stocks", "ACGLN"),
+    ]
+
+    filtered = yahoo._filter_us_records_for_broker_tradable_universe(records)
+
+    assert [record.code for record in filtered] == ["AAPL", "TSM", "SPY", "OLD_DL"]
+
+
+def test_us_daily_resolution_prunes_cached_untradable_tools_from_manifest_and_schedule(tmp_path, monkeypatch):
+    output_dir = tmp_path / "us_stocks"
+    output_dir.mkdir()
+    pl.DataFrame(
+        [
+            {"code": "AAPL", "name": "Apple Inc. - Common Stock", "market": "us_stocks", "yahoo_symbol": "AAPL"},
+            {"code": "AACIW", "name": "Armada Acquisition Corp. III - Warrant", "market": "us_stocks", "yahoo_symbol": "AACIW"},
+            {"code": "OLD_DL", "name": "Old Winner Corp. - Common Stock", "market": "us_delisted", "yahoo_symbol": "OLD"},
+        ]
+    ).write_csv(output_dir / "symbols.csv")
+    (output_dir / "AAPL_features.parquet").write_text("placeholder", encoding="utf-8")
+    (output_dir / "AACIW_features.parquet").write_text("placeholder", encoding="utf-8")
+    (output_dir / "OLD_DL_features.parquet").write_text("placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(yahoo, "_records_from_defaults", lambda asset_class: [])
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda asset_class: [])
+    monkeypatch.setattr(yahoo, "_discover_daily_stock_records", lambda asset_class, args, cached: [])
+
+    resolution = yahoo._resolve_symbol_resolution("us_stocks", _base_args(tmp_path, asset="us_stocks"))
+
+    assert {record.code for record in resolution.scheduled_records} == {"AAPL", "OLD_DL"}
+    assert {record.code for record in resolution.manifest_records} == {"AAPL", "OLD_DL"}
+
+
 def test_unavailable_yahoo_timezone_message_is_blacklist_trigger():
     captured = "$03003T.TW: possibly delisted; no timezone found"
 
@@ -268,10 +310,10 @@ def test_daily_resolution_marks_cached_active_symbol_as_delisted(tmp_path, monke
     output_dir.mkdir()
     pl.DataFrame(
         [
-            {"code": "OLDW", "name": "old warrant", "market": "us_stocks", "yahoo_symbol": "OLDW"},
+            {"code": "OLDC", "name": "Old Champion Corp. - Common Stock", "market": "us_stocks", "yahoo_symbol": "OLDC"},
         ]
     ).write_csv(output_dir / "symbols.csv")
-    (output_dir / "OLDW_features.parquet").write_text("placeholder", encoding="utf-8")
+    (output_dir / "OLDC_features.parquet").write_text("placeholder", encoding="utf-8")
 
     monkeypatch.setattr(yahoo, "_records_from_defaults", lambda asset_class: [])
     monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda asset_class: [])
@@ -279,17 +321,17 @@ def test_daily_resolution_marks_cached_active_symbol_as_delisted(tmp_path, monke
         yahoo,
         "_discover_daily_stock_records",
         lambda asset_class, args, cached: [
-            yahoo.SymbolRecord("OLDW_DL", "old warrant", "us_delisted", "OLDW"),
+            yahoo.SymbolRecord("OLDC_DL", "Old Champion Corp. - Common Stock", "us_delisted", "OLDC"),
         ],
     )
 
     resolution = yahoo._resolve_symbol_resolution("us_stocks", _base_args(tmp_path, asset="us_stocks"))
 
     assert [(record.code, record.market, record.yahoo_symbol) for record in resolution.scheduled_records] == [
-        ("OLDW", "us_delisted", "OLDW"),
+        ("OLDC", "us_delisted", "OLDC"),
     ]
     assert [(record.code, record.market, record.yahoo_symbol) for record in resolution.manifest_records] == [
-        ("OLDW", "us_delisted", "OLDW"),
+        ("OLDC", "us_delisted", "OLDC"),
     ]
 
 

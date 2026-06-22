@@ -5,7 +5,7 @@ import polars as pl
 
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
 from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
-from stockagent.live.report_formatter import format_signal_message
+from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
 from stockagent.live.signal_engine import _build_decision_rows
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
@@ -216,25 +216,31 @@ def test_format_signal_message_stays_discord_sized() -> None:
         "estimated_trade_cost": 0.001,
         "market_notice": "今天沒有開盤，使用最後可用資料 `2026-06-19` 產生訊號。",
         "decision_explanation_path": "artifacts/live_signals/tw/2026-06-19/signal/decision_explanations.parquet",
-        "top_positions": [{"symbol": "2330", "name": "TSMC", "weight": 0.2, "current_price": 1000.0}],
+        "top_positions": [
+            {"symbol": f"S{i:02d}", "name": f"Name{i:02d}", "weight": 0.2 - i * 0.01, "current_price": 1000.0 + i}
+            for i in range(10)
+        ],
         "rebalance": [
             {
-                "symbol": "2330",
-                "name": "TSMC",
-                "delta_weight": 0.05,
-                "trade_price": 1000.0,
+                "symbol": f"S{i:02d}",
+                "name": f"Name{i:02d}",
+                "delta_weight": 0.05 - i * 0.001,
+                "trade_price": 1000.0 + i,
                 "current_weight": 0.15,
                 "target_weight": 0.2,
             }
+            for i in range(10)
         ],
     }
 
     message = format_signal_message(summary, max_rows=10)
 
     assert "stockAgent live signal" in message
-    assert "2330" in message
-    assert "TSMC" in message
+    assert "S00" in message
+    assert "Name00" in message
+    assert "10. `S09` Name09" in message
     assert "px=1000.00" in message
     assert "今天沒有開盤" in message
     assert "explain:" in message
+    assert INVESTMENT_WARNING in message
     assert len(message) < 1900

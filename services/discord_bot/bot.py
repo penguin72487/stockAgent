@@ -48,10 +48,12 @@ from stockagent.config import load_config
 from stockagent.live.capital import positive_float_or_none
 from stockagent.live.quote_provider import load_symbol_name_map
 from stockagent.live.portfolio_history import PortfolioHistoryResult, load_portfolio_history
+from stockagent.live.report_formatter import INVESTMENT_WARNING
 from stockagent.live.signal_engine import generate_live_signal
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
 
 
+MIN_DISCORD_ROWS = 10
 STATE_PATH = ROOT / "artifacts" / "discord_bot" / "state.json"
 ERROR_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "errors.log"
 AUDIT_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "audit_events.jsonl"
@@ -595,7 +597,21 @@ def _page_size(value: int | None) -> int:
         number = int(value or 20)
     except Exception:
         number = 20
-    return max(5, min(40, number))
+    return max(MIN_DISCORD_ROWS, min(40, number))
+
+
+def _top_n(value: int | None) -> int:
+    try:
+        number = int(value or 20)
+    except Exception:
+        number = 20
+    return max(MIN_DISCORD_ROWS, number)
+
+
+def _append_investment_warning(lines: list[str]) -> list[str]:
+    if INVESTMENT_WARNING not in lines:
+        lines.extend(["", INVESTMENT_WARNING])
+    return lines
 
 
 def _limit_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
@@ -687,7 +703,7 @@ def _line_pages(
     size = _page_size(page_size)
     total = len(rows)
     if total == 0:
-        return [f"**{title}**\n(no rows)"]
+        return [f"**{title}**\n(no rows)\n\n{INVESTMENT_WARNING}"]
     pages: list[str] = []
     page_count = (total + size - 1) // size
     for page_index, start in enumerate(range(0, total, size), start=1):
@@ -701,6 +717,7 @@ def _line_pages(
         for row in chunk:
             lines.append("")
             lines.append(formatter(row))
+        _append_investment_warning(lines)
         pages.extend(_split_content_pages("\n".join(lines)))
     return pages
 
@@ -1225,6 +1242,7 @@ def _decision_overview_page(
             "gate/market_delta=Transformer 市場脈絡影響；constraint=買賣/交易限制。",
         ]
     )
+    _append_investment_warning(lines)
     return "\n".join(lines)
 
 
@@ -1275,6 +1293,7 @@ def _daily_summary_message(cfg: LiveMarketConfig) -> str:
                 for index, row in enumerate(top[:5], start=1)
                 if isinstance(row, dict)
             )
+    _append_investment_warning(lines)
     return "\n".join(lines)
 
 
@@ -1365,7 +1384,7 @@ class SignalReviewView(discord.ui.View):
 
 
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
-@app_commands.describe(market="Market id", price_source="auto/panel/csv/yahoo", top_n="Rows to show", min_abs_delta="Minimum absolute weight delta")
+@app_commands.describe(market="Market id", price_source="auto/panel/csv/yahoo", top_n="Rows to show, minimum 10", min_abs_delta="Minimum absolute weight delta")
 @app_commands.autocomplete(market=market_autocomplete)
 async def signal_now(
     interaction: discord.Interaction,
@@ -1379,7 +1398,7 @@ async def signal_now(
         result = await _run_market_signal(
             market=market,
             price_source=price_source,
-            top_n=top_n,
+            top_n=_top_n(top_n),
             min_abs_delta=min_abs_delta,
         )
     except Exception as exc:
@@ -1404,7 +1423,7 @@ async def signal_now(
 @app_commands.describe(
     market="Market id",
     limit="Max rows to show. 0 means all non-zero rows.",
-    page_size="Rows per page, clamped to 5-40.",
+    page_size="Rows per page, clamped to 10-40.",
     include_zero="Include zero-weight universe rows.",
     current_capital="Current account capital used to estimate position amounts.",
 )
@@ -1467,7 +1486,7 @@ async def positions(
     market="Market id",
     threshold="Minimum absolute weight delta",
     limit="Max rows to show. 0 means all rows above threshold.",
-    page_size="Rows per page, clamped to 5-40.",
+    page_size="Rows per page, clamped to 10-40.",
     current_capital="Current account capital used to estimate trade amounts.",
 )
 @app_commands.autocomplete(market=market_autocomplete)
@@ -1557,6 +1576,7 @@ async def signal(interaction: discord.Interaction, signal_id: str) -> None:
         f"rebalance=`{summary.get('rebalance_path', 'n/a')}`",
         f"explain=`{summary.get('decision_explanation_path', 'n/a')}`",
     ]
+    _append_investment_warning(lines)
     await _send_long_response(interaction, "\n".join(lines))
 
 
@@ -1569,7 +1589,7 @@ async def signal(interaction: discord.Interaction, signal_id: str) -> None:
     sort_by="delta/score/target/return/rank.",
     detail="compact or full. full is easier to read.",
     limit="Max rows to show. 0 means all decision rows.",
-    page_size="Rows per page, clamped to 5-40.",
+    page_size="Rows per page, clamped to 10-40.",
     actionable_only="Hide HOLD rows.",
     attach_file="Upload the full markdown decision report.",
 )
@@ -1583,7 +1603,7 @@ async def explain_signal(
     sort_by: str = "delta",
     detail: str = "full",
     limit: int = 0,
-    page_size: int = 8,
+    page_size: int = 10,
     actionable_only: bool = True,
     attach_file: bool = False,
 ) -> None:
@@ -1659,7 +1679,7 @@ async def explain_signal(
     market="Market id.",
     symbol="Stock code/ticker, e.g. 2330 or 2330.TW.",
     limit="Max rows to show. Default 32. 0 means all rows.",
-    page_size="Rows per page, clamped to 5-40.",
+    page_size="Rows per page, clamped to 10-40.",
     changes_only="Only show trade/adjustment rows. If false, show recent daily state rows.",
     initial_capital="Scale fold values from the first fold NAV.",
     current_capital="Scale fold values from the latest fold NAV. Overrides initial_capital.",
@@ -1670,7 +1690,7 @@ async def stock_history_command(
     symbol: str,
     market: str = "",
     limit: int = 32,
-    page_size: int = 8,
+    page_size: int = 10,
     changes_only: bool = True,
     initial_capital: float = 0.0,
     current_capital: float = 0.0,
@@ -1727,7 +1747,7 @@ async def stock_history_command(
     market="Market id.",
     days="Trading days to show. Default 32. 0 means all days.",
     top_changes="Top holding changes per day.",
-    page_size="Days per page, clamped to 5-40.",
+    page_size="Days per page, clamped to 10-40.",
     min_abs_change="Hide weight-only changes below this absolute ratio.",
     initial_capital="Scale fold values from the first fold NAV.",
     current_capital="Scale fold values from the latest fold NAV. Overrides initial_capital.",
@@ -1738,7 +1758,7 @@ async def portfolio_history_command(
     market: str = "",
     days: int = 32,
     top_changes: int = 5,
-    page_size: int = 5,
+    page_size: int = 10,
     min_abs_change: float = 0.0,
     initial_capital: float = 0.0,
     current_capital: float = 0.0,
