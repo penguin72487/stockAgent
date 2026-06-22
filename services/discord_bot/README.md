@@ -35,8 +35,16 @@ Market configs:
 - `enabled` controls whether the bot can produce signals for the market.
 - `timezone`, `open_time`, `close_time`, `schedule_time`, `summary_time`, and
   `data_ready_time` control market-hours scheduling and data freshness checks.
+- 24/7 intraday markets such as crypto can set `schedule_interval_minutes: 15`
+  instead of `schedule_time`; the bot deduplicates one alert per completed bar.
+  `schedule_delay_seconds` waits briefly after bar close before running.
+- `history_frequency: bar` makes `/portfolio_history` and `/stock_history`
+  show recent bars instead of collapsing artifacts to daily rows.
+- `pre_signal_command` can run a data updater before scheduled signals. Crypto
+  uses `downloader/download_okx_perp_15m.py --mode incremental` before alerting.
 - `freshness_max_lag_days` is mainly for 24/7 crypto data; daily markets compare
   the latest parquet/benchmark date against the expected latest trading day.
+  For 15-minute crypto, prefer `freshness_max_lag_minutes`.
 - `trader_role_ids` / `trader_role_names` can grant restricted command access
   in addition to Discord administrator permission and the default `trader` role.
 - `initial_capital` / `current_capital` can define default capital used for
@@ -44,16 +52,21 @@ Market configs:
 
 Useful commands:
 
-- `/signal_now market:tw`
+- `/signal_now market:tw` generates immediately. With `price_source:auto`, if
+  the market is open it first runs the market data updater when configured and
+  uses current prices; when the market is closed it uses the latest panel close.
+- `/signal_now market:crypto refresh_data:true` runs the configured data updater
+  first, then generates the signal.
 - `/signal signal_id:...`
 - `/positions market:tw limit:0 page_size:20 current_capital:1000000` shows
   paged current/target weights and estimated position amounts.
 - `/rebalance market:tw limit:0 page_size:20 current_capital:1000000` shows
   paged rebalance deltas with estimated trade amounts.
-- `/portfolio_history market:tw days:32 top_changes:5` shows recent daily PnL,
+- `/portfolio_history market:tw days:32 top_changes:5` shows recent PnL,
   cumulative return, exposure, position counts, and the largest holding changes
-  per day from fold artifacts. Add `initial_capital` to scale from the fold's
-  first NAV, or `current_capital` to scale from the latest fold NAV.
+  from fold artifacts. Daily markets use days; crypto can use 15-minute bars.
+  Add `initial_capital` to scale from the fold's first NAV, or
+  `current_capital` to scale from the latest fold NAV.
 - `/stock_history market:tw symbol:2330 limit:32` shows recent per-symbol
   trade and adjustment records from the latest configured fold artifact. It
   joins model target weights, integer-share weights, holdings, and portfolio
@@ -97,5 +110,9 @@ Operational files:
   - `decision_report.md`
   - `model_explanation.json`
 
-Scheduled markets are controlled by `STOCKAGENT_SCHEDULED_MARKETS`, for example
-`tw,us`. Each market uses its own configured timezone and `schedule_time`.
+Scheduled markets are controlled by `STOCKAGENT_SCHEDULED_MARKETS`; use `all`
+to schedule every YAML under `services/discord_bot/markets/`, or set an explicit
+list such as `tw,us,crypto`. Each market uses its own configured timezone. Daily
+markets use `schedule_time`; interval markets use `schedule_interval_minutes`.
+Each scheduled signal posts the summary plus paged current/target positions and
+all rebalance rows that pass the market's configured `min_abs_delta`.

@@ -6,12 +6,15 @@ from typing import Any
 
 from stockagent.live.capital import CapitalScale, resolve_capital_scale_from_nav
 from stockagent.live.stock_history import (
+    _ROW_INDEX_COL,
     _artifact_path,
     _date_string_expr,
+    _day_string_expr,
     _read_returns,
     _read_table,
     _symbol_name,
     classify_stock_history_action,
+    is_bar_frequency,
 )
 
 
@@ -28,6 +31,48 @@ class PortfolioHistoryResult:
     benchmark_return: float | None
     profit_value: float | None
     capital: CapitalScale
+    frequency: str
+
+
+def _latest_holdings_by_date_symbol(holdings):
+    import polars as pl
+
+    value_columns = ["shares", "price", "market_value", "holding_ratio", "is_cash"]
+    if _ROW_INDEX_COL not in holdings.columns:
+        holdings = holdings.with_row_index(_ROW_INDEX_COL)
+    return (
+        holdings.sort(_ROW_INDEX_COL)
+        .group_by(["date", "symbol"], maintain_order=True)
+        .agg([pl.col(name).last().alias(name) for name in value_columns])
+    )
+
+
+def _bar_holdings_by_timestamp(holdings, timeline):
+    import polars as pl
+
+    if timeline is None or "date" not in timeline.columns:
+        return _latest_holdings_by_date_symbol(holdings)
+    timeline_dates = (
+        timeline.select("date")
+        .sort("date")
+        .with_columns(_day_string_expr())
+        .with_columns(pl.arange(0, pl.len()).over("__day").alias("__seq"))
+        .select(["__day", "__seq", pl.col("date").alias("__bar_date")])
+    )
+    attached = (
+        holdings.sort(_ROW_INDEX_COL)
+        .with_columns(
+            [
+                pl.col("date").alias("__day"),
+                (pl.col("is_cash").cast(pl.Int64).cum_sum().over("date") - 1).alias("__seq"),
+            ]
+        )
+        .join(timeline_dates, on=["__day", "__seq"], how="left")
+        .filter(pl.col("__bar_date").is_not_null())
+        .with_columns(pl.col("__bar_date").alias("date"))
+        .drop(["__day", "__seq", "__bar_date"])
+    )
+    return _latest_holdings_by_date_symbol(attached)
 
 
 def _daily_holdings_summary(holdings):
@@ -199,6 +244,7 @@ def load_portfolio_history(
     initial_capital: float | None = None,
     current_capital: float | None = None,
     symbol_names: dict[str, str] | None = None,
+    frequency: str | None = "daily",
 ) -> PortfolioHistoryResult:
     root = Path(fold_dir)
     holdings_path = _artifact_path(root, "holdings")
@@ -212,9 +258,12 @@ def load_portfolio_history(
     missing = sorted(required - set(holdings.columns))
     if missing:
         raise ValueError(f"{holdings_path} missing columns: {', '.join(missing)}")
-    holdings = holdings.select(
+    history_frequency = "bar" if is_bar_frequency(frequency) else "daily"
+    returns, returns_path = _read_returns(root, frequency=history_frequency)
+    holdings = holdings.with_row_index(_ROW_INDEX_COL).select(
         [
-            _date_string_expr(),
+            _date_string_expr("daily" if is_bar_frequency(history_frequency) else history_frequency),
+            pl.col(_ROW_INDEX_COL),
             pl.col("symbol").cast(pl.Utf8).alias("symbol"),
             pl.col("shares").cast(pl.Int64, strict=False).fill_null(0).alias("shares"),
             pl.col("price").cast(pl.Float64, strict=False).alias("price"),
@@ -223,8 +272,10 @@ def load_portfolio_history(
             pl.col("is_cash").cast(pl.Boolean).fill_null(False).alias("is_cash"),
         ]
     )
-
-    returns, returns_path = _read_returns(root)
+    if is_bar_frequency(history_frequency):
+        holdings = _bar_holdings_by_timestamp(holdings, returns)
+    else:
+        holdings = _latest_holdings_by_date_symbol(holdings)
     daily = _with_profit_estimates(_join_daily_returns(_daily_holdings_summary(holdings), returns))
     capital = resolve_capital_scale_from_nav(
         daily.select(["date", "nav"]).to_dicts(),
@@ -307,4 +358,5 @@ def load_portfolio_history(
         benchmark_return=benchmark_return,
         profit_value=profit_value,
         capital=capital,
+        frequency=history_frequency,
     )

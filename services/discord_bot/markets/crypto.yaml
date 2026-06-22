@@ -5,11 +5,25 @@ market_type: crypto
 timezone: UTC
 open_time:
 close_time:
-schedule_time: "00:00"
-summary_time: "00:10"
+schedule_time:
+schedule_interval_minutes: 15
+schedule_delay_seconds: 45
+summary_time:
 data_ready_time: "00:00"
 freshness_max_lag_days: 1
+freshness_max_lag_minutes: 90
 freshness_scan_limit: 0
+history_frequency: bar
+pre_signal_command:
+  - /home/user/miniforge3/envs/fintech/bin/python
+  - downloader/download_okx_perp_15m.py
+  - --output-dir
+  - data_okx
+  - --mode
+  - incremental
+  - --workers
+  - "16"
+pre_signal_timeout_seconds: 900
 
 config_path: configs/markets/crypto.yaml
 output_dir: artifacts/markets/crypto

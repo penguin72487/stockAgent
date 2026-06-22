@@ -6,6 +6,12 @@ from typing import Any
 
 from stockagent.live.capital import CapitalScale, resolve_fold_capital_scale
 
+_ROW_INDEX_COL = "__stockagent_row_index"
+
+
+def is_bar_frequency(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"bar", "intraday", "15m", "15min", "interval"}
+
 
 @dataclass(slots=True)
 class StockHistoryResult:
@@ -51,10 +57,67 @@ def _read_table(path: Path):
     raise ValueError(f"Unsupported table format: {path}")
 
 
-def _date_string_expr():
+def _date_string_expr(frequency: str | None = "daily"):
     import polars as pl
 
-    return pl.col("date").cast(pl.Utf8).str.slice(0, 10).alias("date")
+    text = pl.col("date").cast(pl.Utf8).str.replace("T", " ").str.replace(r"\.\d+$", "")
+    if is_bar_frequency(frequency):
+        return text.str.slice(0, 19).alias("date")
+    return text.str.slice(0, 10).alias("date")
+
+
+def _day_string_expr(source: str = "date"):
+    import polars as pl
+
+    return pl.col(source).cast(pl.Utf8).str.replace("T", " ").str.slice(0, 10).alias("__day")
+
+
+def _last_daily_snapshot(frame, value_columns: list[str]):
+    """Collapse intraday artifacts to one end-of-day row per date."""
+    import polars as pl
+
+    if _ROW_INDEX_COL not in frame.columns:
+        frame = frame.with_row_index(_ROW_INDEX_COL)
+    return (
+        frame.sort(_ROW_INDEX_COL)
+        .group_by("date", maintain_order=True)
+        .agg([pl.col(name).last().alias(name) for name in value_columns])
+    )
+
+
+def _returns_from_frame(frame, columns: list[str], *, frequency: str | None):
+    import polars as pl
+
+    if _ROW_INDEX_COL not in frame.columns:
+        frame = frame.with_row_index(_ROW_INDEX_COL)
+    selected = frame.select(
+        [
+            _date_string_expr(frequency),
+            pl.col(_ROW_INDEX_COL),
+            *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in columns],
+        ]
+    )
+    if is_bar_frequency(frequency):
+        return selected.drop(_ROW_INDEX_COL)
+
+    aggregations = []
+    for name in ("portfolio_return", "benchmark_return"):
+        if name in columns:
+            value = pl.col(name)
+            aggregations.append(
+                pl.when(value.is_not_null().any())
+                .then((value.drop_nulls() + 1.0).product() - 1.0)
+                .otherwise(None)
+                .alias(name)
+            )
+    if "turnover" in columns:
+        turnover = pl.col("turnover")
+        aggregations.append(
+            pl.when(turnover.is_not_null().any()).then(turnover.sum()).otherwise(None).alias("turnover")
+        )
+    if not aggregations:
+        return selected.select("date").unique(maintain_order=True)
+    return selected.sort(_ROW_INDEX_COL).group_by("date", maintain_order=True).agg(aggregations)
 
 
 def _resolve_symbol_value(values: list[str], requested: str) -> str | None:
@@ -78,7 +141,14 @@ def _resolve_symbol_column(columns: list[str], requested: str) -> str | None:
     return _resolve_symbol_value([name for name in columns if name != "date"], requested)
 
 
-def _read_wide_symbol_series(fold_dir: Path, stem: str, symbol: str, alias: str):
+def _read_wide_symbol_series(
+    fold_dir: Path,
+    stem: str,
+    symbol: str,
+    alias: str,
+    *,
+    frequency: str | None = "daily",
+):
     import polars as pl
 
     path = _artifact_path(fold_dir, stem)
@@ -90,19 +160,40 @@ def _read_wide_symbol_series(fold_dir: Path, stem: str, symbol: str, alias: str)
     column = _resolve_symbol_column(frame.columns, symbol)
     if column is None:
         return None, None, path
+    selected = frame.with_row_index(_ROW_INDEX_COL).select(
+        [
+            _date_string_expr(frequency),
+            pl.col(_ROW_INDEX_COL),
+            pl.col(column).cast(pl.Float64, strict=False).alias(alias),
+        ]
+    )
+    if is_bar_frequency(frequency):
+        return selected.drop(_ROW_INDEX_COL), column, path
+    return (_last_daily_snapshot(selected, [alias]), column, path)
+
+
+def _timeline_for_nonzero_symbol(frame, weight_column: str):
+    import polars as pl
+
+    if frame is None or weight_column not in frame.columns:
+        return None
     return (
-        frame.select(
-            [
-                _date_string_expr(),
-                pl.col(column).cast(pl.Float64, strict=False).alias(alias),
-            ]
-        ),
-        column,
-        path,
+        frame.select(["date", weight_column])
+        .with_columns(_day_string_expr())
+        .filter(pl.col(weight_column).abs() > 1e-12)
+        .with_columns(pl.arange(0, pl.len()).over("__day").alias("__seq"))
+        .select(["__day", "__seq", pl.col("date").alias("__bar_date")])
     )
 
 
-def _read_holdings_symbol(fold_dir: Path, symbol: str):
+def _read_holdings_symbol(
+    fold_dir: Path,
+    symbol: str,
+    *,
+    frequency: str | None = "daily",
+    timeline_frame=None,
+    timeline_weight_column: str = "actual_weight",
+):
     import polars as pl
 
     path = _artifact_path(fold_dir, "holdings")
@@ -118,30 +209,46 @@ def _read_holdings_symbol(fold_dir: Path, symbol: str):
     if resolved is None:
         return None, None, path
     selected = (
-        frame.filter(pl.col("symbol").cast(pl.Utf8) == resolved)
+        frame.with_row_index(_ROW_INDEX_COL)
+        .filter(pl.col("symbol").cast(pl.Utf8) == resolved)
         .select(
             [
-                _date_string_expr(),
+                _date_string_expr("daily"),
+                pl.col(_ROW_INDEX_COL),
                 pl.col("shares").cast(pl.Int64, strict=False).alias("shares"),
                 pl.col("price").cast(pl.Float64, strict=False).alias("price"),
                 pl.col("market_value").cast(pl.Float64, strict=False).alias("market_value"),
                 pl.col("holding_ratio").cast(pl.Float64, strict=False).alias("holding_ratio_from_holdings"),
             ]
         )
-        .group_by("date")
-        .agg(
-            [
-                pl.col("shares").sum(),
-                pl.col("price").last(),
-                pl.col("market_value").sum(),
-                pl.col("holding_ratio_from_holdings").sum(),
-            ]
-        )
     )
-    return selected, resolved, path
+    if is_bar_frequency(frequency):
+        timeline = _timeline_for_nonzero_symbol(timeline_frame, timeline_weight_column)
+        if timeline is not None:
+            selected = (
+                selected.with_columns(
+                    [
+                        pl.col("date").alias("__day"),
+                        pl.arange(0, pl.len()).over("date").alias("__seq"),
+                    ]
+                )
+                .join(timeline, on=["__day", "__seq"], how="left")
+                .with_columns(pl.coalesce([pl.col("__bar_date"), pl.col("date")]).alias("date"))
+                .drop(["__day", "__seq", "__bar_date", _ROW_INDEX_COL])
+            )
+            return selected, resolved, path
+        return selected.drop(_ROW_INDEX_COL), resolved, path
+    return (
+        _last_daily_snapshot(
+            selected,
+            ["shares", "price", "market_value", "holding_ratio_from_holdings"],
+        ),
+        resolved,
+        path,
+    )
 
 
-def _read_returns(fold_dir: Path):
+def _read_returns(fold_dir: Path, *, frequency: str | None = "daily"):
     import polars as pl
 
     path = _artifact_path(fold_dir, "integer_share_daily_portfolio_returns")
@@ -156,13 +263,7 @@ def _read_returns(fold_dir: Path):
     for name in ("portfolio_return", "benchmark_return", "turnover"):
         if name in frame.columns:
             columns.append(name)
-    selected = frame.select(
-        [
-            _date_string_expr(),
-            *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in columns if name != "date"],
-        ]
-    )
-    return selected, path
+    return _returns_from_frame(frame, [name for name in columns if name != "date"], frequency=frequency), path
 
 
 def _symbol_name(symbol_names: dict[str, str] | None, symbol: str) -> str:
@@ -269,6 +370,7 @@ def load_stock_history(
     initial_capital: float | None = None,
     current_capital: float | None = None,
     symbol_names: dict[str, str] | None = None,
+    frequency: str | None = "daily",
 ) -> StockHistoryResult:
     root = Path(fold_dir)
     if not root.exists():
@@ -278,7 +380,13 @@ def load_stock_history(
     source_paths: list[Path] = []
     resolved_symbol: str | None = None
 
-    model_frame, model_symbol, model_path = _read_wide_symbol_series(root, "daily_weights", symbol, "model_weight")
+    model_frame, model_symbol, model_path = _read_wide_symbol_series(
+        root,
+        "daily_weights",
+        symbol,
+        "model_weight",
+        frequency=frequency,
+    )
     if model_path is not None:
         source_paths.append(model_path)
     if model_frame is not None:
@@ -290,6 +398,7 @@ def load_stock_history(
         "integer_share_daily_weights",
         symbol,
         "actual_weight",
+        frequency=frequency,
     )
     if actual_path is not None:
         source_paths.append(actual_path)
@@ -297,14 +406,20 @@ def load_stock_history(
         frames.append(actual_frame)
         resolved_symbol = resolved_symbol or actual_symbol
 
-    holdings_frame, holdings_symbol, holdings_path = _read_holdings_symbol(root, symbol)
+    holdings_frame, holdings_symbol, holdings_path = _read_holdings_symbol(
+        root,
+        symbol,
+        frequency=frequency,
+        timeline_frame=actual_frame,
+        timeline_weight_column="actual_weight",
+    )
     if holdings_path is not None:
         source_paths.append(holdings_path)
     if holdings_frame is not None:
         frames.append(holdings_frame)
         resolved_symbol = resolved_symbol or holdings_symbol
 
-    returns_frame, returns_path = _read_returns(root)
+    returns_frame, returns_path = _read_returns(root, frequency=frequency)
     if returns_path is not None:
         source_paths.append(returns_path)
     if returns_frame is not None:
