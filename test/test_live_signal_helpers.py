@@ -128,6 +128,36 @@ def test_live_signal_dates_preserve_intraday_time_and_live_weights_take_preceden
     assert np.isclose(weights[0], 0.20)
 
 
+def test_daily_previous_weights_use_previous_trading_day_not_same_day_live_signal(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-06-19", "2026-06-22"],
+            "AAA": [0.15, 0.40],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    write_live_weights_history(
+        fold_dir,
+        {"asof_date": "2026-06-22"},
+        [{"symbol": "AAA", "target_weight": 0.90}],
+    )
+
+    weights, date_text, weights_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=25,
+        weights_path=None,
+        asof_date="2026-06-22",
+        prefer_live_weights=False,
+        strictly_before_asof=True,
+    )
+
+    assert weights_path == str(fold_dir / "daily_weights.parquet")
+    assert date_text == "2026-06-19"
+    assert np.isclose(weights[0], 0.15)
+
+
 def test_load_stock_history_combines_model_integer_and_holding_tables(tmp_path) -> None:
     fold_dir = tmp_path / "fold_25"
     fold_dir.mkdir()
@@ -507,6 +537,22 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
     assert "`strategy=+8.00%`" in message
     assert "`baseline=+3.00%`" in message
     assert "`excess_pnl=+5,000`" in message
+
+
+def test_format_signal_message_uses_daily_previous_period_label() -> None:
+    summary = {
+        "asof_date": "2026-06-22",
+        "panel_date": "2026-06-22",
+        "previous_weights_date": "2026-06-19",
+        "previous_period_label": "上個交易日到現在",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.002,
+    }
+
+    message = format_signal_message(summary, max_rows=0)
+
+    assert "上個交易日到現在" in message
+    assert "`2026-06-19`..`2026-06-22`" in message
 
 
 def test_format_signal_message_displays_crypto_times_in_taipei_timezone() -> None:

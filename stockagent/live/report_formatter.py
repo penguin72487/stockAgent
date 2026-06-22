@@ -115,11 +115,12 @@ def _fmt_tz_label(summary: dict[str, Any]) -> str:
 
 
 def _period_title(summary: dict[str, Any]) -> str:
+    label = str(summary.get("previous_period_label") or "上個訊號到現在").strip() or "上個訊號到現在"
     start = summary.get("previous_weights_date") or summary.get("drift_base_date")
     end = summary.get("asof_date") or summary.get("panel_date")
     if start and end:
-        return f"**上個訊號到現在** `{_fmt_time(start, summary)}`..`{_fmt_time(end, summary)}`"
-    return "**上個訊號到現在**"
+        return f"**{label}** `{_fmt_time(start, summary)}`..`{_fmt_time(end, summary)}`"
+    return f"**{label}**"
 
 
 def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str:

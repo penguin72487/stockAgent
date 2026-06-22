@@ -141,9 +141,21 @@ def _read_table(path: Path):
     raise ValueError(f"Unsupported table format: {path}")
 
 
-def _default_weights_path(output_dir: str | Path, fold_id: int) -> Path | None:
+def _is_intraday_frequency(frequency: object) -> bool:
+    text = str(frequency or "").strip().lower().replace("_", "-")
+    if not text:
+        return False
+    if text in {"bar", "intraday", "minute", "minutes", "15m", "15min", "15-min", "15-minute"}:
+        return True
+    return text.endswith("m") and text[:-1].isdigit()
+
+
+def _default_weights_path(output_dir: str | Path, fold_id: int, *, prefer_live_weights: bool = True) -> Path | None:
     fold_dir = Path(output_dir) / f"fold_{int(fold_id):02d}"
-    for name in (LIVE_SIGNAL_WEIGHTS_NAME, "live_signal_weights.csv", "daily_weights.parquet", "daily_weights.csv"):
+    live_names = (LIVE_SIGNAL_WEIGHTS_NAME, "live_signal_weights.csv")
+    artifact_names = ("daily_weights.parquet", "daily_weights.csv")
+    names = (*live_names, *artifact_names) if prefer_live_weights else (*artifact_names, *live_names)
+    for name in names:
         path = fold_dir / name
         if path.exists():
             return path
@@ -157,8 +169,14 @@ def _load_previous_weights(
     fold_id: int,
     weights_path: str | Path | None,
     asof_date: str | None,
+    prefer_live_weights: bool = True,
+    strictly_before_asof: bool = False,
 ) -> tuple[np.ndarray, str | None, str | None]:
-    path = Path(weights_path) if weights_path is not None else _default_weights_path(output_dir, fold_id)
+    path = (
+        Path(weights_path)
+        if weights_path is not None
+        else _default_weights_path(output_dir, fold_id, prefer_live_weights=prefer_live_weights)
+    )
     if path is None or not path.exists():
         return np.zeros((len(symbols),), dtype=np.float64), None, None
 
@@ -171,7 +189,12 @@ def _load_previous_weights(
         keep = []
         for raw in frame.get_column("date").to_list():
             raw_dt = _datetime64_second(raw)
-            keep.append(True if asof is None or raw_dt is None else bool(raw_dt <= asof))
+            if asof is None or raw_dt is None:
+                keep.append(True)
+            elif strictly_before_asof:
+                keep.append(bool(raw_dt < asof))
+            else:
+                keep.append(bool(raw_dt <= asof))
         if any(keep):
             import polars as pl
 
@@ -870,6 +893,8 @@ def generate_live_signal(
     source_timezone = str(data_timezone or display_timezone or DEFAULT_DISPLAY_TIMEZONE)
     display_timezone_name = str(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
     display_tz = _display_zone(display_timezone_name)
+    trading_frequency = str(getattr(config.trading, "frequency", "") or "")
+    intraday_frequency = _is_intraday_frequency(trading_frequency)
 
     runtime_device = _resolve_device(config)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
@@ -909,6 +934,8 @@ def generate_live_signal(
         fold_id=resolved_fold_id,
         weights_path=weights_path,
         asof_date=panel_date_str,
+        prefer_live_weights=intraday_frequency,
+        strictly_before_asof=True,
     )
     drift_base_idx = _find_panel_date_index(panel, previous_weights_date)
     if drift_base_idx is None:
@@ -1080,6 +1107,9 @@ def generate_live_signal(
         "market": market_id,
         "market_label": market_name,
         "panel_date": panel_date_str,
+        "trading_frequency": trading_frequency,
+        "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
+        "previous_weights_policy": "live_signal_before_asof" if intraday_frequency else "daily_weights_previous_trading_day",
         "data_timezone": source_timezone,
         "display_timezone": display_timezone_name,
         "display_timezone_label": display_timezone_label(display_timezone_name),
