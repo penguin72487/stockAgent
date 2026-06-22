@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from stockagent.backtest.simulator import _normalize_target_weights_torch, _resolve_exposure_budget
+from stockagent.backtest.simulator import (
+    _apply_min_trade_weight_torch,
+    _normalize_target_weights_torch,
+    _resolve_exposure_budget,
+)
 
 
 def _fused_log_utility_long_only_scan(
@@ -135,6 +139,7 @@ def fused_log_utility_loss_tensor(
     long_only: bool,
     max_turnover_ratio: float,
     gross_leverage: float,
+    min_trade_weight: float = 0.0,
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.0,
     concentration_weight: float = 0.0,
@@ -163,6 +168,7 @@ def fused_log_utility_loss_tensor(
         long_only=long_only,
         gross_budget=gross_budget,
     )
+    target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
 
     if long_only:
         return_sum, turnover_sum, valid_count, final_weights = _fused_log_utility_long_only_scan(
