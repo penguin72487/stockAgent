@@ -58,7 +58,7 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: auto
+  eval_model_chunk_rows: 8
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 16
@@ -69,6 +69,8 @@ training:
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
+  inference_backtest_autotune: false
+  inference_backtest_compile: false
   backtest_cpp_ext: false
   backtest_verbose: false
   strict_no_fallback: true

@@ -211,16 +211,21 @@ def _feature_path(root: Path, symbol: str | None) -> Path | None:
     return None
 
 
-def _date_to_text(value: Any) -> str | None:
+def _date_to_text(value: Any, *, date_only: bool = True) -> str | None:
     if value is None:
         return None
     text = str(value)
     if not text or text.lower() in {"none", "nat"}:
         return None
-    return text[:10]
+    text = text.replace("T", " ")
+    if date_only:
+        return text[:10]
+    if "." in text:
+        text = text.split(".", 1)[0]
+    return text[:19]
 
 
-def _max_date_from_parquet(path: Path) -> str | None:
+def _max_date_from_parquet(path: Path, *, date_only: bool = True) -> str | None:
     if pq is not None:
         try:
             meta = pq.ParquetFile(path).metadata
@@ -237,7 +242,7 @@ def _max_date_from_parquet(path: Path) -> str | None:
                     if stats is None or stats.max is None:
                         continue
                     best = stats.max if best is None or str(stats.max) > str(best) else best
-                parsed = _date_to_text(best)
+                parsed = _date_to_text(best, date_only=date_only)
                 if parsed:
                     return parsed
         except Exception:
@@ -246,9 +251,22 @@ def _max_date_from_parquet(path: Path) -> str | None:
         import polars as pl
 
         value = pl.scan_parquet(path).select(pl.col("date").max().alias("max_date")).collect().item()
-        return _date_to_text(value)
+        return _date_to_text(value, date_only=date_only)
     except Exception:
         return None
+
+
+def _parse_datetime_text(value: str, tz: ZoneInfo) -> datetime | None:
+    text = str(value or "").replace("T", " ").strip()
+    if not text:
+        return None
+    for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d %H:%M", 16), ("%Y-%m-%d", 10)):
+        try:
+            parsed = datetime.strptime(text[:size], fmt)
+            return parsed.replace(tzinfo=tz)
+        except Exception:
+            continue
+    return None
 
 
 def _parse_hhmm(value: str | None, default: time) -> time:
@@ -389,6 +407,7 @@ def data_freshness(
         return DataFreshness(parquet_root, None, None, None, None, False, "parquet root missing", 0, 0, False)
 
     market_type = infer_market_type(cfg, parquet_root)
+    crypto_intraday = market_type.lower() == "crypto"
     feature_files = sorted(parquet_root.glob(f"*{FEATURE_SUFFIX}"))
     total_files = len(feature_files)
     benchmark_path = _feature_path(parquet_root, benchmark_name)
@@ -406,10 +425,14 @@ def data_freshness(
 
     last_data_date: str | None = None
     for path in selected:
-        max_date = _max_date_from_parquet(path)
+        max_date = _max_date_from_parquet(path, date_only=not crypto_intraday)
         if max_date and (last_data_date is None or max_date > last_data_date):
             last_data_date = max_date
-    benchmark_date = _max_date_from_parquet(benchmark_path) if benchmark_path is not None else None
+    benchmark_date = (
+        _max_date_from_parquet(benchmark_path, date_only=not crypto_intraday)
+        if benchmark_path is not None
+        else None
+    )
     panel_date = last_data_date
     expected = expected_latest_data_date(cfg, market_type=market_type, now=now)
 
@@ -420,13 +443,20 @@ def data_freshness(
     elif market_type == "crypto":
         tz = ZoneInfo(cfg.timezone or "UTC")
         local_now = now.astimezone(tz) if now is not None else datetime.now(tz)
-        try:
-            age_days = (local_now.date() - date.fromisoformat(last_data_date)).days
-        except Exception:
-            age_days = 9999
-        fresh = age_days <= max(0, int(cfg.freshness_max_lag_days))
-        if not fresh:
-            reason = f"latest data {last_data_date} is {age_days} days old"
+        latest_dt = _parse_datetime_text(last_data_date, tz)
+        if cfg.freshness_max_lag_minutes is not None and latest_dt is not None:
+            age_minutes = max(0.0, (local_now - latest_dt).total_seconds() / 60.0)
+            fresh = age_minutes <= max(0, int(cfg.freshness_max_lag_minutes))
+            if not fresh:
+                reason = f"latest data {last_data_date} is {age_minutes:.1f} minutes old"
+        else:
+            try:
+                age_days = (local_now.date() - date.fromisoformat(last_data_date[:10])).days
+            except Exception:
+                age_days = 9999
+            fresh = age_days <= max(0, int(cfg.freshness_max_lag_days))
+            if not fresh:
+                reason = f"latest data {last_data_date} is {age_days} days old"
     elif expected is not None:
         benchmark_fresh = benchmark_date is None or benchmark_date >= expected
         fresh = last_data_date >= expected and benchmark_fresh
@@ -506,14 +536,16 @@ def cumulative_recent_returns(path: Path | None, *, window_days: int) -> dict[st
         if frame.height == 0:
             return None
         frame = frame.sort("date").tail(max(1, int(window_days)))
+        dates = frame.get_column("date").to_list()
+        date_only = not any(":" in str(item) for item in dates)
         strategy = [float(x or 0.0) for x in frame.get_column("portfolio_return").to_list()]
         benchmark = [float(x or 0.0) for x in frame.get_column("benchmark_return").to_list()]
         strat_ret = math.exp(sum(strategy)) - 1.0
         bench_ret = math.exp(sum(benchmark)) - 1.0
         return {
             "window_days": int(frame.height),
-            "start_date": _date_to_text(frame.get_column("date").to_list()[0]),
-            "end_date": _date_to_text(frame.get_column("date").to_list()[-1]),
+            "start_date": _date_to_text(dates[0], date_only=date_only),
+            "end_date": _date_to_text(dates[-1], date_only=date_only),
             "strategy_return": float(strat_ret),
             "benchmark_return": float(bench_ret),
             "excess_return": float(strat_ret - bench_ret),

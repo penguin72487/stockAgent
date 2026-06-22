@@ -382,6 +382,8 @@ class TrainingConfig:
     backtest_compile: bool = True
     backtest_compile_stateful: bool = True
     backtest_compile_dynamic: bool = False
+    inference_backtest_autotune: bool | None = None
+    inference_backtest_compile: bool | None = None
     backtest_cpp_ext: bool = False
     backtest_verbose: bool = False
     strict_no_fallback: bool = False
@@ -581,6 +583,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("backtest_compile", True)
     training.setdefault("backtest_compile_stateful", True)
     training.setdefault("backtest_compile_dynamic", False)
+    training.setdefault("inference_backtest_autotune", None)
+    training.setdefault("inference_backtest_compile", None)
     training.setdefault("backtest_cpp_ext", False)
     training.setdefault("backtest_verbose", False)
     training.setdefault("strict_no_fallback", False)
@@ -1191,6 +1195,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             backtest_compile=training_raw["backtest_compile"],
             backtest_compile_stateful=training_raw["backtest_compile_stateful"],
             backtest_compile_dynamic=training_raw["backtest_compile_dynamic"],
+            inference_backtest_autotune=training_raw["inference_backtest_autotune"],
+            inference_backtest_compile=training_raw["inference_backtest_compile"],
             backtest_cpp_ext=training_raw["backtest_cpp_ext"],
             backtest_verbose=training_raw["backtest_verbose"],
             strict_no_fallback=training_raw["strict_no_fallback"],

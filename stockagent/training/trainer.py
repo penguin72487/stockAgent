@@ -11,6 +11,7 @@ import sys
 import time
 import gc
 import inspect
+import csv
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import partial
@@ -2384,6 +2385,98 @@ def _write_dataframe_table(df: Any, output_path: Path) -> None:
         raise ValueError(f"Unsupported table output extension: {output_path}")
 
 
+def _state_dict_symbol_count(state_dict: Mapping[str, Any]) -> int | None:
+    for key, value in state_dict.items():
+        if str(key).endswith("symbol_position") and torch.is_tensor(value) and value.ndim == 4:
+            return int(value.size(2))
+    return None
+
+
+def _weight_table_symbols(fold_dir: Path) -> tuple[list[str], Path] | tuple[None, None]:
+    for path in (fold_dir / "daily_weights.parquet", fold_dir / "daily_weights.csv"):
+        if not path.exists():
+            continue
+        if path.suffix.lower() == ".parquet":
+            import polars as pl
+
+            columns = pl.scan_parquet(path).collect_schema().names()
+        else:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                columns = next(csv.reader(handle))
+        return [str(column) for column in columns if str(column) != "date"], path
+    return None, None
+
+
+def _subset_panel_symbols(panel: PanelData, symbols: Sequence[str]) -> PanelData:
+    index_by_symbol = {str(symbol): idx for idx, symbol in enumerate(panel.symbols)}
+    missing = [str(symbol) for symbol in symbols if str(symbol) not in index_by_symbol]
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise ValueError(
+            f"Cannot align panel to checkpoint universe; {len(missing)} trained symbols are missing "
+            f"from the current panel: {preview}"
+        )
+    indices = np.asarray([index_by_symbol[str(symbol)] for symbol in symbols], dtype=np.int64)
+    return PanelData(
+        dates=panel.dates,
+        symbols=[str(symbol) for symbol in symbols],
+        feature_names=list(panel.feature_names),
+        features=panel.features[:, indices, :],
+        returns_1d=panel.returns_1d[:, indices],
+        tradable_mask=panel.tradable_mask[:, indices],
+        alive_mask=panel.alive_mask[:, indices],
+        benchmark_returns=panel.benchmark_returns,
+        close_prices=panel.close_prices[:, indices],
+        can_buy_mask=panel.can_buy_mask[:, indices] if panel.can_buy_mask is not None else None,
+        can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
+    )
+
+
+def _align_panel_to_state_dict_universe(
+    panel: PanelData,
+    fold_dir: Path,
+    state_dict: Mapping[str, Any],
+    *,
+    context: str = "inference",
+) -> PanelData:
+    expected_symbols = _state_dict_symbol_count(state_dict)
+    if expected_symbols is None:
+        return panel
+
+    trained_symbols, weights_path = _weight_table_symbols(fold_dir)
+    if trained_symbols is None:
+        if int(panel.num_symbols) != int(expected_symbols):
+            raise ValueError(
+                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
+                f"cannot align because daily_weights table is missing in {fold_dir}."
+            )
+        return panel
+
+    if len(trained_symbols) != int(expected_symbols):
+        if int(panel.num_symbols) != int(expected_symbols):
+            raise ValueError(
+                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
+                f"{weights_path} has {len(trained_symbols)} symbols, so it cannot be used for alignment."
+            )
+        return panel
+
+    if list(trained_symbols) == list(panel.symbols):
+        return panel
+
+    trained_set = set(trained_symbols)
+    extras = [str(symbol) for symbol in panel.symbols if str(symbol) not in trained_set]
+    if int(panel.num_symbols) != int(expected_symbols) or extras:
+        preview = ", ".join(extras[:10])
+        print(
+            f"[{context}] aligning panel symbols to checkpoint universe from {weights_path}: "
+            f"current={panel.num_symbols}, checkpoint={expected_symbols}, removed={len(extras)}"
+            + (f" ({preview})" if preview else "")
+        )
+    else:
+        print(f"[{context}] reordering panel symbols to match checkpoint universe from {weights_path}")
+    return _subset_panel_symbols(panel, trained_symbols)
+
+
 def _save_holdings_table(
     output_path: Path,
     holdings: list[HoldingsRecord],
@@ -2593,6 +2686,68 @@ def _dataset_to_tensors(
     can_sell_masks = dataset.can_sell_mask_t[valid_indices]
     bench = dataset.benchmark_t[valid_indices]
     return x, returns, masks, can_buy_masks, can_sell_masks, bench
+
+
+def _windowed_targets_to_tensors(
+    split: WindowedSplitTensors,
+    *,
+    device: torch.device | None = None,
+    non_blocking: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    date_idx = split.valid_indices
+    target_device = split.future_log_returns.device
+    if date_idx.device != target_device:
+        date_idx = date_idx.to(device=target_device, dtype=torch.long)
+    else:
+        date_idx = date_idx.to(dtype=torch.long)
+    returns = split.future_log_returns[date_idx]
+    masks = split.tradable_mask[date_idx]
+    can_buy_masks = split.can_buy_mask[date_idx]
+    can_sell_masks = split.can_sell_mask[date_idx]
+    bench = split.benchmark[date_idx]
+    if device is None:
+        return returns, masks, can_buy_masks, can_sell_masks, bench
+    return (
+        returns.to(device=device, non_blocking=non_blocking),
+        masks.to(device=device, non_blocking=non_blocking),
+        can_buy_masks.to(device=device, non_blocking=non_blocking),
+        can_sell_masks.to(device=device, non_blocking=non_blocking),
+        bench.to(device=device, non_blocking=non_blocking),
+    )
+
+
+def _windowed_valid_indices_numpy(split: WindowedSplitTensors) -> np.ndarray:
+    return split.valid_indices.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
+
+
+def _resolve_inference_model_chunk_rows(
+    config: ExperimentConfig,
+    total_rows: int,
+) -> int:
+    total_rows = int(total_rows)
+    if total_rows <= 0:
+        return 1
+    if int(config.training.chunk_rows) > 0:
+        return max(1, min(int(config.training.chunk_rows), total_rows))
+
+    eval_model_chunk_rows_config = str(getattr(config.training, "eval_model_chunk_rows", "auto")).strip().lower()
+    if eval_model_chunk_rows_config not in {"", "auto"}:
+        return max(1, min(int(eval_model_chunk_rows_config), total_rows))
+
+    cap = int(getattr(config.training, "eval_auto_chunk_rows_cap", 16))
+    if cap <= 0:
+        cap = int(getattr(config.training, "batch_size_eval", 16))
+    return max(1, min(cap, total_rows))
+
+
+def _resolve_inference_backtest_chunk_rows(
+    config: ExperimentConfig,
+    model_chunk_rows: int,
+) -> int:
+    configured = max(1, int(getattr(config.training, "eval_backtest_chunk_rows", model_chunk_rows)))
+    if bool(getattr(config.training, "eval_backtest_chunk_rows_auto", True)):
+        return max(int(model_chunk_rows), configured)
+    return configured
 
 
 def _panel_indices_to_tensors(
@@ -7240,6 +7395,15 @@ def _run_inference_neural_models(
     config: ExperimentConfig,
     output_dir: str | Path,
 ) -> list[FoldResult]:
+    _configure_backtest_runtime_from_config(config)
+    if getattr(config.training, "inference_backtest_autotune", None) is not None:
+        os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = (
+            "1" if bool(config.training.inference_backtest_autotune) else "0"
+        )
+    if getattr(config.training, "inference_backtest_compile", None) is not None:
+        os.environ["STOCKAGENT_BACKTEST_COMPILE"] = (
+            "1" if bool(config.training.inference_backtest_compile) else "0"
+        )
     device = _resolve_device(config)
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
@@ -7274,43 +7438,50 @@ def _run_inference_neural_models(
             print(f"[Fold {fold.fold_id}] skip: invalid model state format")
             continue
 
+        fold_panel = _align_panel_to_state_dict_universe(
+            panel,
+            fold_dir,
+            model_state_dict,
+            context=f"inference fold {fold.fold_id}",
+        )
         model = build_model(
             config=config,
             lookback=config.training.lookback,
-            num_features=len(panel.feature_names),
-            num_symbols=panel.num_symbols,
+            num_features=len(fold_panel.feature_names),
+            num_symbols=fold_panel.num_symbols,
         ).to(device)
         _load_state_dict(model, model_state_dict)
+        panel_slab_model: nn.Module | None = None
+        if _model_supports_panel_slab_forward(model):
+            panel_slab_model = _PanelSlabForwardWrapper(model)
+            print(f"[Fold {fold.fold_id}] inference mode=windowed panel_slab_forward=eager")
+        else:
+            print(f"[Fold {fold.fold_id}] inference mode=windowed panel_forward=fallback")
 
-        val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-        test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+        val_ds = CrossSectionalDataset(fold_panel, fold.val_indices, config.training.lookback)
+        test_ds = CrossSectionalDataset(fold_panel, fold.test_indices, config.training.lookback)
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
             continue
 
-        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
-        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _prepare_split_tensors(
-            val_x,
-            val_returns,
-            val_masks,
-            val_buy_masks,
-            val_sell_masks,
-            val_bench,
+        val_windowed = _prepare_windowed_split(
+            dataset_to_windowed_tensors(val_ds),
             device,
             non_blocking,
+            name=f"inference fold {fold.fold_id} validation windowed tensors",
         )
-        val_chunk_rows = max(1, min(2048, int(val_x.size(0))))
-        if config.training.chunk_rows > 0:
-            val_chunk_rows = max(1, min(config.training.chunk_rows, int(val_x.size(0))))
+        val_chunk_rows = _resolve_inference_model_chunk_rows(config, len(val_windowed))
+        val_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(config, val_chunk_rows)
+        print(
+            f"[Fold {fold.fold_id}] inference val chunks: "
+            f"rows={len(val_windowed)} model_chunk_rows={val_chunk_rows} "
+            f"backtest_chunk_rows={val_backtest_chunk_rows}"
+        )
 
-        val_bt_t, val_ic, _ = _evaluate_tensor_batch(
+        val_bt_t, val_ic, _ = _evaluate_windowed_tensor_batch(
             model,
-            val_x,
-            val_returns,
-            val_masks,
-            val_buy_masks,
-            val_sell_masks,
-            val_bench,
+            panel_slab_model,
+            val_windowed,
             device,
             amp_dtype,
             non_blocking,
@@ -7321,8 +7492,14 @@ def _run_inference_neural_models(
             config.trading.gross_leverage,
             config.trading.min_trade_weight,
             chunk_rows=val_chunk_rows,
+            backtest_chunk_rows=val_backtest_chunk_rows,
         )
 
+        val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _windowed_targets_to_tensors(
+            val_windowed,
+            device=device,
+            non_blocking=non_blocking,
+        )
         if not np.isfinite(best_val_loss):
             best_val_loss = float(
                 _evaluated_backtest_loss(
@@ -7343,29 +7520,25 @@ def _run_inference_neural_models(
             val_bt_t.turnovers,
         )
 
-        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
-        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _prepare_split_tensors(
-            test_x,
-            test_returns,
-            test_masks,
-            test_buy_masks,
-            test_sell_masks,
-            test_bench,
+        test_windowed = _prepare_windowed_split(
+            dataset_to_windowed_tensors(test_ds),
             device,
             non_blocking,
+            shared_base=val_windowed,
+            name=f"inference fold {fold.fold_id} test windowed tensors",
         )
-        test_chunk_rows = max(1, min(2048, int(test_x.size(0))))
-        if config.training.chunk_rows > 0:
-            test_chunk_rows = max(1, min(config.training.chunk_rows, int(test_x.size(0))))
+        test_chunk_rows = _resolve_inference_model_chunk_rows(config, len(test_windowed))
+        test_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(config, test_chunk_rows)
+        print(
+            f"[Fold {fold.fold_id}] inference test chunks: "
+            f"rows={len(test_windowed)} model_chunk_rows={test_chunk_rows} "
+            f"backtest_chunk_rows={test_backtest_chunk_rows}"
+        )
 
-        test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+        test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
             model,
-            test_x,
-            test_returns,
-            test_masks,
-            test_buy_masks,
-            test_sell_masks,
-            test_bench,
+            panel_slab_model,
+            test_windowed,
             device,
             amp_dtype,
             non_blocking,
@@ -7376,10 +7549,17 @@ def _run_inference_neural_models(
             config.trading.gross_leverage,
             config.trading.min_trade_weight,
             chunk_rows=test_chunk_rows,
+            backtest_chunk_rows=test_backtest_chunk_rows,
         )
+        test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _windowed_targets_to_tensors(
+            test_windowed,
+            device=device,
+            non_blocking=non_blocking,
+        )
+        test_valid_indices = _windowed_valid_indices_numpy(test_windowed)
 
         previous_fold_model = _load_previous_fold_neural_model(
-            panel=panel,
+            panel=fold_panel,
             config=config,
             output_path=output_path,
             fold_id=fold.fold_id,
@@ -7397,7 +7577,7 @@ def _run_inference_neural_models(
             test_eval_indices,
             warmup_days,
         ) = _merge_test_backtest_with_previous_fold_warmup(
-            panel=panel,
+            panel=fold_panel,
             fold=fold,
             lookback=config.training.lookback,
             previous_model=previous_fold_model,
@@ -7407,7 +7587,7 @@ def _run_inference_neural_models(
             current_buy_masks=test_buy_masks,
             current_sell_masks=test_sell_masks,
             current_benchmark=test_bench,
-            current_valid_indices=np.asarray(test_ds.valid_indices, dtype=np.int64),
+            current_valid_indices=test_valid_indices,
             device=device,
             amp_dtype=amp_dtype,
             non_blocking=non_blocking,
@@ -7418,14 +7598,15 @@ def _run_inference_neural_models(
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
             chunk_rows=test_chunk_rows,
+            backtest_chunk_rows=test_backtest_chunk_rows,
         )
         if warmup_days > 0:
             print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
         if previous_fold_model is not None:
             del previous_fold_model
 
-        test_dates = panel.dates[test_eval_indices]
-        test_close_prices = panel.close_prices[test_eval_indices]
+        test_dates = fold_panel.dates[test_eval_indices]
+        test_close_prices = fold_panel.close_prices[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
         write_integer_holdings_table = bool(
             getattr(
@@ -7449,7 +7630,7 @@ def _run_inference_neural_models(
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
             close_prices=test_close_prices,
-            symbols=panel.symbols,
+            symbols=fold_panel.symbols,
             dates=test_dates,
             collect_holdings=write_integer_holdings_table,
         )
@@ -7485,7 +7666,7 @@ def _run_inference_neural_models(
         _maybe_save_daily_weights_table(
             fold_dir / "daily_weights.csv",
             test_dates,
-            panel.symbols,
+            fold_panel.symbols,
             test_bt.weights_history,
             enabled=bool(
                 getattr(
@@ -7510,7 +7691,7 @@ def _run_inference_neural_models(
             fold_dir,
             test_integer_bt,
             test_dates,
-            panel.symbols,
+            fold_panel.symbols,
             holdings_records,
             write_daily_weights_table=bool(
                 getattr(
