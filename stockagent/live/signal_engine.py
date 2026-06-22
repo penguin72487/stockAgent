@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ from stockagent.live.portfolio_state import (
 from stockagent.live.quote_provider import PriceSnapshot, fetch_yahoo_last_prices, load_prices_csv, load_symbol_name_map
 from stockagent.live.report_formatter import format_signal_message
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
+from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
 from stockagent.training.trainer import (
     _autocast_context,
@@ -335,6 +337,13 @@ def _make_signal_id(market: str, asof_date: str) -> str:
     prefix = str(market or "default").strip() or "default"
     stamp = datetime.now().strftime("%H%M%S")
     return f"{prefix}-{asof_date}-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _display_zone(timezone_name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(timezone_name or DEFAULT_DISPLAY_TIMEZONE))
+    except Exception:
+        return ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
 
 
 def _finite_float_or_none(value: Any) -> float | None:
@@ -836,6 +845,8 @@ def generate_live_signal(
     max_turnover_warning: float = 1.5,
     max_top_weight_warning: float = 0.1,
     max_gross_warning: float | None = None,
+    data_timezone: str | None = None,
+    display_timezone: str | None = DEFAULT_DISPLAY_TIMEZONE,
     write: bool = True,
 ) -> LiveSignalResult:
     config = load_config(config_path)
@@ -856,6 +867,9 @@ def generate_live_signal(
     resolved_fold_id, checkpoint = _resolve_checkpoint(resolved_output_dir, fold_id, checkpoint_path)
     market_id = str(market or "").strip()
     market_name = str(market_label or market_id or "").strip()
+    source_timezone = str(data_timezone or display_timezone or DEFAULT_DISPLAY_TIMEZONE)
+    display_timezone_name = str(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
+    display_tz = _display_zone(display_timezone_name)
 
     runtime_device = _resolve_device(config)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
@@ -1060,14 +1074,17 @@ def generate_live_signal(
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(display_tz).isoformat(timespec="seconds"),
         "asof_date": resolved_asof,
         "market": market_id,
         "market_label": market_name,
         "panel_date": panel_date_str,
+        "data_timezone": source_timezone,
+        "display_timezone": display_timezone_name,
+        "display_timezone_label": display_timezone_label(display_timezone_name),
         "fold_id": int(resolved_fold_id),
         "checkpoint_path": str(checkpoint),
-        "checkpoint_mtime": datetime.fromtimestamp(checkpoint.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+        "checkpoint_mtime": datetime.fromtimestamp(checkpoint.stat().st_mtime, tz=display_tz).isoformat(timespec="seconds"),
         "checkpoint_fingerprint": short_file_fingerprint(checkpoint),
         "config_path": str(config_path),
         "config_fingerprint": short_file_fingerprint(Path(config_path)),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
+
 
 INVESTMENT_WARNING = (
     "投資警語：本訊號為量化模型依歷史與當前資料產生之研究/輔助資訊，"
@@ -92,11 +94,31 @@ def _fmt_path(value: Any) -> str | None:
     return text
 
 
+def _source_timezone(summary: dict[str, Any]) -> str:
+    return str(summary.get("data_timezone") or summary.get("timezone") or summary.get("display_timezone") or DEFAULT_DISPLAY_TIMEZONE)
+
+
+def _display_timezone(summary: dict[str, Any]) -> str:
+    return str(summary.get("display_timezone") or DEFAULT_DISPLAY_TIMEZONE)
+
+
+def _fmt_time(value: Any, summary: dict[str, Any]) -> str:
+    return format_display_time(
+        value,
+        source_timezone=_source_timezone(summary),
+        display_timezone=_display_timezone(summary),
+    )
+
+
+def _fmt_tz_label(summary: dict[str, Any]) -> str:
+    return str(summary.get("display_timezone_label") or display_timezone_label(_display_timezone(summary)))
+
+
 def _period_title(summary: dict[str, Any]) -> str:
     start = summary.get("previous_weights_date") or summary.get("drift_base_date")
     end = summary.get("asof_date") or summary.get("panel_date")
     if start and end:
-        return f"**上個訊號到現在** `{start}`..`{end}`"
+        return f"**上個訊號到現在** `{_fmt_time(start, summary)}`..`{_fmt_time(end, summary)}`"
     return "**上個訊號到現在**"
 
 
@@ -118,9 +140,9 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
         title += f" {market_label}"
     lines = [
         f"{title}",
-        f"`{summary.get('asof_date', 'latest')}`",
+        f"`{_fmt_time(summary.get('asof_date', 'latest'), summary)}`  `tz={_fmt_tz_label(summary)}`",
         _kv_line(
-            ("panel", summary.get("panel_date", "n/a")),
+            ("panel", _fmt_time(summary.get("panel_date", "n/a"), summary)),
             ("fold", summary.get("fold_id", "auto")),
             ("signal", summary.get("signal_id", "n/a")),
         ),
@@ -255,7 +277,8 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
     lines.extend(["", INVESTMENT_WARNING])
 
     message = "\n".join(lines)
-    if len(message) <= 1900:
+    max_message_chars = 1850
+    if len(message) <= max_message_chars:
         return message
     suffix = "\n...\n" + INVESTMENT_WARNING
-    return message[: max(0, 1900 - len(suffix))].rstrip() + suffix
+    return message[: max(0, max_message_chars - len(suffix))].rstrip() + suffix

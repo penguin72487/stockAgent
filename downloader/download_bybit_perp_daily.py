@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -42,7 +43,14 @@ def _read_parquet(path: Path) -> pl.DataFrame:
 
 
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
-    pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        pq.write_table(frame.to_arrow(), tmp_path, compression="snappy", write_statistics=True)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 @dataclass(slots=True)
