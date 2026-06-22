@@ -84,7 +84,7 @@ def test_detach_portfolio_state_clones_independent_buffer() -> None:
     assert not torch.allclose(detached, state.detach())
 
 
-def test_min_trade_weight_zeroes_small_positions_without_renormalizing() -> None:
+def test_min_trade_weight_zeroes_small_positions_and_redistributes() -> None:
     weights = torch.tensor([[8.0, 0.02, -8.0]], dtype=torch.float32)
     returns = torch.zeros_like(weights)
     tradable = torch.ones_like(weights, dtype=torch.bool)
@@ -113,8 +113,18 @@ def test_min_trade_weight_zeroes_small_positions_without_renormalizing() -> None
 
     assert base.weights_history[0, 1].abs() > 0.0
     assert thresholded.weights_history[0, 1].item() == 0.0
-    assert torch.allclose(thresholded.weights_history[0, [0, 2]], base.weights_history[0, [0, 2]])
-    assert thresholded.weights_history[0].abs().sum() < base.weights_history[0].abs().sum()
+    assert torch.allclose(
+        thresholded.weights_history[0].abs().sum(),
+        base.weights_history[0].abs().sum(),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+    assert torch.allclose(
+        thresholded.weights_history[0, 0] / thresholded.weights_history[0, 2],
+        base.weights_history[0, 0] / base.weights_history[0, 2],
+        atol=1e-7,
+        rtol=1e-6,
+    )
 
 
 def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> None:
