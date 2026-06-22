@@ -212,6 +212,27 @@ def _normalize_target_weights_torch(
     return out
 
 
+def _apply_min_trade_weight_numpy(weights: np.ndarray, min_trade_weight: float) -> np.ndarray:
+    threshold = float(min_trade_weight)
+    if threshold <= 0.0:
+        return weights
+    return np.where(np.abs(weights) >= np.float32(threshold), weights, np.float32(0.0)).astype(np.float32, copy=False)
+
+
+def _apply_min_trade_weight_row_numpy(weights_row: np.ndarray, min_trade_weight: float) -> np.ndarray:
+    threshold = float(min_trade_weight)
+    if threshold <= 0.0:
+        return weights_row
+    return np.where(np.abs(weights_row) >= threshold, weights_row, 0.0).astype(weights_row.dtype, copy=False)
+
+
+def _apply_min_trade_weight_torch(weights: torch.Tensor, min_trade_weight: float) -> torch.Tensor:
+    threshold = float(min_trade_weight)
+    if threshold <= 0.0:
+        return weights
+    return torch.where(weights.abs() >= threshold, weights, torch.zeros_like(weights))
+
+
 def _apply_turnover_cap_numpy(
     prev_weights: np.ndarray,
     target_weights: np.ndarray,
@@ -1002,6 +1023,7 @@ class BacktestStaticInputs:
     long_only: bool
     max_turnover_ratio: float
     gross_leverage: float
+    min_trade_weight: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1035,6 +1057,7 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
             long_only=static.long_only,
             max_turnover_ratio=static.max_turnover_ratio,
             gross_leverage=static.gross_leverage,
+            min_trade_weight=static.min_trade_weight,
             can_buy_mask=static.can_buy_mask,
             can_sell_mask=static.can_sell_mask,
             return_weights_history=return_weights_history,
@@ -1061,6 +1084,7 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
             long_only=static.long_only,
             max_turnover_ratio=static.max_turnover_ratio,
             gross_leverage=static.gross_leverage,
+            min_trade_weight=static.min_trade_weight,
             can_buy_mask=static.can_buy_mask,
             can_sell_mask=static.can_sell_mask,
             sample_mask=static.sample_mask,
@@ -1099,6 +1123,7 @@ def _vectorized_backtest(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     target_weights = np.asarray(weights, dtype=np.float32).copy()
     gross_budget = _resolve_exposure_budget(gross_leverage)
@@ -1112,6 +1137,7 @@ def _vectorized_backtest(
         long_only=long_only,
         gross_budget=gross_budget,
     )
+    target_weights = _apply_min_trade_weight_numpy(target_weights, min_trade_weight)
 
     t_len, n_symbols = target_weights.shape
     weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
@@ -1428,6 +1454,7 @@ def _prepare_runner_factory(
     *,
     long_only: bool,
     gross_budget: float,
+    min_trade_weight: float,
 ):
     def _runner(
         weights: torch.Tensor,
@@ -1445,6 +1472,7 @@ def _prepare_runner_factory(
             long_only=long_only,
             gross_budget=gross_budget,
         )
+        target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
         return target_weights, tradable, buy_mask, sell_mask
 
     return _runner
@@ -1457,6 +1485,7 @@ def _prepare_compile_key(
     can_sell_mask: torch.Tensor,
     long_only: bool,
     gross_budget: float,
+    min_trade_weight: float,
 ) -> tuple:
     return (
         str(weights.device),
@@ -1468,6 +1497,7 @@ def _prepare_compile_key(
         str(can_sell_mask.dtype),
         bool(long_only),
         float(gross_budget),
+        float(min_trade_weight),
         bool(_compile_dynamic_enabled()),
     )
 
@@ -1480,8 +1510,13 @@ def _resolve_prepare_runner(
     *,
     long_only: bool,
     gross_budget: float,
+    min_trade_weight: float,
 ):
-    base_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+    base_runner = _prepare_runner_factory(
+        long_only=long_only,
+        gross_budget=gross_budget,
+        min_trade_weight=min_trade_weight,
+    )
     # When an outer torch.compile is tracing risk_aware_loss, do not create a
     # nested compiled prepare runner and do not mutate compile stats. Stats dict
     # mutation becomes a Dynamo guard and can force repeated loss recompiles.
@@ -1504,6 +1539,7 @@ def _resolve_prepare_runner(
         can_sell_mask,
         long_only,
         gross_budget,
+        min_trade_weight,
     )
     if key in _PREP_COMPILE_FAILED:
         if _strict_no_fallback_enabled():
@@ -1558,6 +1594,7 @@ def _prepare_scan_inputs(
     can_sell_mask: torch.Tensor | None,
     long_only: bool,
     gross_leverage: float,
+    min_trade_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gross_budget = _resolve_exposure_budget(gross_leverage)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="backtest input preparation")
@@ -1570,6 +1607,7 @@ def _prepare_scan_inputs(
         sell_input,
         long_only=long_only,
         gross_budget=gross_budget,
+        min_trade_weight=min_trade_weight,
     )
     try:
         return runner(weights, tradable_mask, buy_input, sell_input)
@@ -1588,6 +1626,7 @@ def _prepare_scan_inputs(
             sell_input,
             long_only,
             gross_budget,
+            min_trade_weight,
         )
         _PREP_COMPILE_FAILED.add(key)
         _PREP_COMPILED_CACHE.pop(key, None)
@@ -1604,7 +1643,11 @@ def _prepare_scan_inputs(
                 f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}): "
                 f"{type(e).__name__}: {str(e)[:300]}"
             )
-        eager_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+        eager_runner = _prepare_runner_factory(
+            long_only=long_only,
+            gross_budget=gross_budget,
+            min_trade_weight=min_trade_weight,
+        )
         return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
 
@@ -1619,6 +1662,7 @@ def _vectorized_backtest_torch(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
@@ -1646,6 +1690,7 @@ def _vectorized_backtest_torch(
                 can_sell_mask,
                 long_only,
                 gross_leverage,
+                min_trade_weight,
             )
         _add_backtest_elapsed_stat("prep_s", prep_start)
         prev_init_start = _runtime_stat_start()
@@ -1951,6 +1996,7 @@ def run_backtest(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
 ) -> BacktestResult:
@@ -1966,6 +2012,7 @@ def run_backtest(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
     )
 
     return BacktestResult(
@@ -1986,6 +2033,7 @@ def run_backtest_torch_reduced(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
     sample_mask: torch.Tensor | None = None,
@@ -2022,6 +2070,7 @@ def run_backtest_torch_reduced(
                 can_sell_mask,
                 long_only,
                 gross_leverage,
+                min_trade_weight,
             )
         _add_backtest_elapsed_stat("prep_s", prep_start)
 
@@ -2158,6 +2207,7 @@ def run_backtest_torch(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
@@ -2177,6 +2227,7 @@ def run_backtest_torch(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
         dense_mask_constraints=dense_mask_constraints,
@@ -2206,6 +2257,7 @@ def run_backtest_integer_shares(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
@@ -2294,6 +2346,7 @@ def run_backtest_integer_shares(
             long_only=long_only,
             gross_budget=gross_leverage,
         )
+        target_w = _apply_min_trade_weight_row_numpy(target_w, min_trade_weight)
 
         equity_before = float(cash + np.dot(shares.astype(np.float64), current_prices))
         equity_before = max(equity_before, 1e-12)
