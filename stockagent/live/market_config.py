@@ -29,6 +29,7 @@ class LiveMarketConfig:
     min_abs_delta: float = 0.001
     unsupported_message: str | None = None
     timezone: str = "Asia/Taipei"
+    display_timezone: str = "Asia/Taipei"
     open_time: str | None = None
     close_time: str | None = None
     schedule_time: str | None = None
@@ -73,6 +74,8 @@ class LiveMarketConfig:
             "max_turnover_warning": self.max_turnover_warning,
             "max_top_weight_warning": self.max_top_weight_warning,
             "max_gross_warning": self.max_gross_warning,
+            "data_timezone": self.timezone,
+            "display_timezone": self.display_timezone,
             "write": True,
         }
         for key, value in overrides.items():
@@ -181,6 +184,7 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         min_abs_delta=float(raw.get("min_abs_delta") if raw.get("min_abs_delta") is not None else 0.001),
         unsupported_message=_optional_str(raw.get("unsupported_message")),
         timezone=str(raw.get("timezone") or "Asia/Taipei"),
+        display_timezone=str(raw.get("display_timezone") or "Asia/Taipei"),
         open_time=_optional_str(raw.get("open_time")),
         close_time=_optional_str(raw.get("close_time")),
         schedule_time=_optional_str(raw.get("schedule_time")),

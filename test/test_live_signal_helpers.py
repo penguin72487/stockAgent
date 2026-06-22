@@ -507,3 +507,23 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
     assert "`strategy=+8.00%`" in message
     assert "`baseline=+3.00%`" in message
     assert "`excess_pnl=+5,000`" in message
+
+
+def test_format_signal_message_displays_crypto_times_in_taipei_timezone() -> None:
+    summary = {
+        "market_label": "加密貨幣",
+        "asof_date": "2026-06-22 03:45:00",
+        "panel_date": "2026-06-22 03:45:00",
+        "previous_weights_date": "2026-06-22 03:30:00",
+        "data_timezone": "UTC",
+        "display_timezone": "Asia/Taipei",
+        "display_timezone_label": "UTC+8 台北",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.002,
+    }
+
+    message = format_signal_message(summary, max_rows=0)
+
+    assert "`2026-06-22 11:45:00`  `tz=UTC+8 台北`" in message
+    assert "`panel=2026-06-22 11:45:00`" in message
+    assert "`2026-06-22 11:30:00`..`2026-06-22 11:45:00`" in message
