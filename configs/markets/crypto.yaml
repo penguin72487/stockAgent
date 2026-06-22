@@ -18,7 +18,7 @@ data:
   benchmark_name: "BTCUSDTSWAP"
   benchmark_required: false
   benchmark_source: derived_from_panel
-  universe_mode: all_daily_symbols
+  universe_mode: all_15m_symbols
   use_rapids: false
   usd_only_trading_pairs: false
   panel_backend: auto
@@ -33,7 +33,7 @@ walk_forward:
   require_future_test_year: false
 
 trading:
-  frequency: daily
+  frequency: 15m
   buy_fee_rate: 0.0005
   sell_fee_rate: 0.0005
   max_turnover_ratio: 50.0
@@ -43,7 +43,7 @@ trading:
   cash_allowed: true
 training:
   backend: pytorch
-  target: next_1d_rank
+  target: next_15m_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
@@ -58,7 +58,7 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: auto
+  eval_model_chunk_rows: 256
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 16
@@ -69,6 +69,8 @@ training:
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
+  inference_backtest_autotune: false
+  inference_backtest_compile: false
   backtest_cpp_ext: false
   backtest_verbose: false
   strict_no_fallback: true
@@ -134,6 +136,7 @@ training:
   explain_cross_asset_graph_betweenness_max_vertices: 512
   explain_cross_asset_graph_plot_max_nodes: 80
   table_output_format: parquet
+  # Legacy artifact names use "daily", but crypto rows are 15m bars.
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true
   save_integer_share_holdings_table: true

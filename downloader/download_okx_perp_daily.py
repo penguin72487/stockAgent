@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -14,6 +16,10 @@ from urllib.request import Request, urlopen
 
 import polars as pl
 import pyarrow.parquet as pq
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import resolve_end_date, run_parallel_tasks
 
@@ -34,7 +40,14 @@ def _read_parquet(path: Path) -> pl.DataFrame:
 
 
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
-    pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        pq.write_table(frame.to_arrow(), tmp_path, compression="snappy", write_statistics=True)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 @dataclass(slots=True)
@@ -70,9 +83,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="data_okx", help="Output folder.")
     parser.add_argument(
         "--mode",
-        choices=["daily-update", "full"],
-        default="daily-update",
-        help="daily-update: only fetch missing dates; full: skip existing unless --refresh.",
+        choices=["incremental", "daily-update", "full"],
+        default="incremental",
+        help="incremental: only fetch missing 15m candles; daily-update: deprecated alias; full: skip existing unless --refresh.",
     )
     parser.add_argument("--start-date", default="2019-01-01", help="Inclusive start date YYYY-MM-DD")
     parser.add_argument("--end-date", default="today", help="Inclusive end date YYYY-MM-DD or 'today'")
@@ -118,7 +131,7 @@ def _resolve_next_start_ms(existing_df: pl.DataFrame, fallback_start_ms: int) ->
 
     latest = parsed.select(pl.col("date").str.to_datetime(strict=False).max()).item()
     latest_ms = int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
-    return max(fallback_start_ms, latest_ms + CANDLE_INTERVAL_MS)
+    return max(fallback_start_ms, latest_ms - CANDLE_INTERVAL_MS)
 
 
 class OkxClient:
@@ -196,6 +209,32 @@ class OkxClient:
 
 def _ms_to_date_string(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _latest_closed_candle_start_ms(now: datetime | None = None) -> int:
+    current = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    current_ms = int(current.timestamp() * 1000)
+    return (current_ms // CANDLE_INTERVAL_MS) * CANDLE_INTERVAL_MS - CANDLE_INTERVAL_MS
+
+
+def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
+    common = [column for column in left.columns if column in right.columns]
+    if not common or left.height != right.height:
+        return False
+    return left.select(common).equals(right.select(common))
+
+
+def _merge_existing_with_fresh(existing_df: pl.DataFrame, fresh_df: pl.DataFrame, effective_start_ms: int) -> tuple[pl.DataFrame, bool]:
+    existing = _normalize_date_frame(existing_df)
+    cutoff = _ms_to_date_string(effective_start_ms)
+    kept_existing = existing.filter(pl.col("date") < cutoff) if "date" in existing.columns else existing
+    combined = (
+        pl.concat([kept_existing, fresh_df], how="diagonal_relaxed")
+        .sort("date")
+        .unique(subset=["date"], keep="last", maintain_order=True)
+        .sort("date")
+    )
+    return combined, not _frames_equal(existing, combined)
 
 
 def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
@@ -296,7 +335,7 @@ def _normalize_candles(raw_rows: list[list[str]]) -> pl.DataFrame:
     return pl.DataFrame(rows).sort("ts").unique(subset=["date"], keep="last").sort("ts").drop("ts")
 
 
-def _download_symbol_daily(
+def _download_symbol_15m(
     client: OkxClient,
     record: SymbolRecord,
     output_dir: Path,
@@ -387,9 +426,24 @@ def _download_symbol_daily(
             message="No candles returned by OKX.",
         )
 
-    filtered_rows = [row for row in all_rows if effective_start_ms <= int(row[0]) <= end_ms]
+    closed_end_ms = min(end_ms, _latest_closed_candle_start_ms())
+    filtered_rows = [
+        row
+        for row in all_rows
+        if effective_start_ms <= int(row[0]) <= closed_end_ms and (len(row) < 9 or str(row[8]) == "1")
+    ]
     df = _normalize_candles(filtered_rows)
     if df.is_empty():
+        if existing_df is not None and not existing_df.is_empty():
+            return DownloadResult(
+                asset_class="crypto_okx_perp",
+                code=record.code,
+                okx_symbol=record.okx_symbol,
+                market=record.market,
+                status="skipped_up_to_date",
+                rows=existing_df.height,
+                output_path=str(output_path),
+            )
         return DownloadResult(
             asset_class="crypto_okx_perp",
             code=record.code,
@@ -402,14 +456,8 @@ def _download_symbol_daily(
         )
 
     if existing_df is not None and not existing_df.is_empty():
-        combined = (
-            pl.concat([_normalize_date_frame(existing_df), df], how="diagonal_relaxed")
-            .sort("date")
-            .unique(subset=["date"], keep="last", maintain_order=True)
-            .sort("date")
-        )
-        added_rows = max(0, combined.height - existing_df.height)
-        if added_rows == 0:
+        combined, changed = _merge_existing_with_fresh(existing_df, df, effective_start_ms)
+        if not changed:
             return DownloadResult(
                 asset_class="crypto_okx_perp",
                 code=record.code,
@@ -459,7 +507,7 @@ def main() -> None:
     pl.DataFrame([asdict(s) for s in symbols]).write_csv(symbols_path)
 
     def _worker(record: SymbolRecord) -> DownloadResult:
-        return _download_symbol_daily(
+        return _download_symbol_15m(
             client,
             record,
             output_dir,

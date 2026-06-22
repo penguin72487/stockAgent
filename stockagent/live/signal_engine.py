@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import torch
@@ -25,11 +26,14 @@ from stockagent.live.portfolio_state import (
 from stockagent.live.quote_provider import PriceSnapshot, fetch_yahoo_last_prices, load_prices_csv, load_symbol_name_map
 from stockagent.live.report_formatter import format_signal_message
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
+from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
 from stockagent.training.trainer import (
     _autocast_context,
     _call_model,
     _extract_weights_and_aux,
+    _align_panel_to_state_dict_universe,
+    _configure_backtest_runtime_from_config,
     _load_checkpoint,
     _load_state_dict,
     _resolve_amp_dtype,
@@ -47,12 +51,38 @@ class LiveSignalResult:
     output_dir: str | None = None
 
 
+LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
+
+
 def _date_string(value: object) -> str:
+    raw_text = str(value).replace("T", " ")
+    has_time = ":" in raw_text
     try:
-        return str(np.datetime_as_string(np.asarray(value).astype("datetime64[D]"), unit="D"))
+        dt = np.asarray(value).astype("datetime64[s]")
+        text = str(np.datetime_as_string(dt, unit="s")).replace("T", " ")
+        if text.endswith(" 00:00:00") and not has_time:
+            return text[:10]
+        return text
     except Exception:
-        text = str(value)
+        text = raw_text
+        if len(text) >= 19 and not text.endswith(" 00:00:00"):
+            return text[:19]
+        if len(text) >= 19 and has_time:
+            return text[:19]
         return text[:10] if len(text) >= 10 else text
+
+
+def _datetime64_second(value: object) -> np.datetime64 | None:
+    text = str(value or "").replace("T", " ").strip()
+    if not text or text.lower() in {"nat", "none", "null"}:
+        return None
+    try:
+        return np.datetime64(text.replace(" ", "T"), "s")
+    except Exception:
+        try:
+            return np.datetime64(text[:10], "D").astype("datetime64[s]")
+        except Exception:
+            return None
 
 
 def _build_panel(config: ExperimentConfig) -> PanelData:
@@ -113,7 +143,7 @@ def _read_table(path: Path):
 
 def _default_weights_path(output_dir: str | Path, fold_id: int) -> Path | None:
     fold_dir = Path(output_dir) / f"fold_{int(fold_id):02d}"
-    for name in ("daily_weights.parquet", "daily_weights.csv"):
+    for name in (LIVE_SIGNAL_WEIGHTS_NAME, "live_signal_weights.csv", "daily_weights.parquet", "daily_weights.csv"):
         path = fold_dir / name
         if path.exists():
             return path
@@ -137,17 +167,17 @@ def _load_previous_weights(
         return np.zeros((len(symbols),), dtype=np.float64), None, str(path)
 
     if asof_date:
-        asof = np.datetime64(asof_date, "D")
+        asof = _datetime64_second(asof_date)
         keep = []
         for raw in frame.get_column("date").to_list():
-            try:
-                keep.append(np.datetime64(str(raw)[:10], "D") <= asof)
-            except Exception:
-                keep.append(True)
+            raw_dt = _datetime64_second(raw)
+            keep.append(True if asof is None or raw_dt is None else bool(raw_dt <= asof))
         if any(keep):
             import polars as pl
 
             frame = frame.filter(pl.Series(keep))
+        else:
+            return np.zeros((len(symbols),), dtype=np.float64), None, str(path)
 
     frame = frame.sort("date")
     row = frame.tail(1).to_dicts()[0]
@@ -167,9 +197,13 @@ def _resolve_panel_index(panel: PanelData, panel_date: str | None, lookback: int
     if panel_date is None or str(panel_date).strip().lower() in {"", "latest", "last"}:
         idx = int(panel.num_dates - 1)
     else:
-        target = np.datetime64(str(panel_date), "D")
-        dates = np.asarray(panel.dates).astype("datetime64[D]")
-        matches = np.flatnonzero(dates == target)
+        target_dt = _datetime64_second(panel_date)
+        dates_s = np.asarray(panel.dates).astype("datetime64[s]")
+        matches = np.flatnonzero(dates_s == target_dt) if target_dt is not None else np.array([], dtype=np.int64)
+        if matches.size == 0:
+            target = np.datetime64(str(panel_date)[:10], "D")
+            dates = np.asarray(panel.dates).astype("datetime64[D]")
+            matches = np.flatnonzero(dates == target)
         if matches.size == 0:
             raise ValueError(f"panel_date={panel_date!r} not found in panel dates")
         idx = int(matches[-1])
@@ -181,15 +215,54 @@ def _resolve_panel_index(panel: PanelData, panel_date: str | None, lookback: int
 def _find_panel_date_index(panel: PanelData, date_text: str | None) -> int | None:
     if not date_text:
         return None
-    try:
-        target = np.datetime64(str(date_text)[:10], "D")
-    except Exception:
-        return None
-    dates = np.asarray(panel.dates).astype("datetime64[D]")
-    matches = np.flatnonzero(dates == target)
+    target_dt = _datetime64_second(date_text)
+    dates_s = np.asarray(panel.dates).astype("datetime64[s]")
+    matches = np.flatnonzero(dates_s == target_dt) if target_dt is not None else np.array([], dtype=np.int64)
+    if matches.size == 0:
+        try:
+            target = np.datetime64(str(date_text)[:10], "D")
+        except Exception:
+            return None
+        dates = np.asarray(panel.dates).astype("datetime64[D]")
+        matches = np.flatnonzero(dates == target)
     if matches.size == 0:
         return None
     return int(matches[-1])
+
+
+def write_live_weights_history(
+    fold_dir: str | Path,
+    summary: dict[str, Any],
+    weights_rows: list[dict[str, Any]],
+) -> str | None:
+    if not weights_rows:
+        return None
+    date_text = str(summary.get("asof_date") or summary.get("panel_date") or "").strip()
+    if not date_text:
+        return None
+
+    import polars as pl
+
+    path = Path(fold_dir) / LIVE_SIGNAL_WEIGHTS_NAME
+    row: dict[str, Any] = {"date": date_text}
+    for item in weights_rows:
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        try:
+            row[symbol] = float(item.get("target_weight") or 0.0)
+        except Exception:
+            row[symbol] = 0.0
+    new_frame = pl.DataFrame([row], infer_schema_length=None)
+    if path.exists():
+        existing = pl.read_parquet(path)
+        combined = pl.concat([existing, new_frame], how="diagonal_relaxed")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        combined = new_frame
+    combined = combined.sort("date").unique(subset=["date"], keep="last", maintain_order=True).sort("date")
+    combined.write_parquet(path)
+    return str(path)
 
 
 def _price_snapshot(
@@ -264,6 +337,13 @@ def _make_signal_id(market: str, asof_date: str) -> str:
     prefix = str(market or "default").strip() or "default"
     stamp = datetime.now().strftime("%H%M%S")
     return f"{prefix}-{asof_date}-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _display_zone(timezone_name: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(timezone_name or DEFAULT_DISPLAY_TIMEZONE))
+    except Exception:
+        return ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
 
 
 def _finite_float_or_none(value: Any) -> float | None:
@@ -765,19 +845,48 @@ def generate_live_signal(
     max_turnover_warning: float = 1.5,
     max_top_weight_warning: float = 0.1,
     max_gross_warning: float | None = None,
+    data_timezone: str | None = None,
+    display_timezone: str | None = DEFAULT_DISPLAY_TIMEZONE,
     write: bool = True,
 ) -> LiveSignalResult:
     config = load_config(config_path)
     if device is not None:
         config.environment.device = str(device)
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if config.training.strict_no_fallback else "0"
+    _configure_backtest_runtime_from_config(config)
+    if getattr(config.training, "inference_backtest_autotune", None) is not None:
+        os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = (
+            "1" if bool(config.training.inference_backtest_autotune) else "0"
+        )
+    if getattr(config.training, "inference_backtest_compile", None) is not None:
+        os.environ["STOCKAGENT_BACKTEST_COMPILE"] = (
+            "1" if bool(config.training.inference_backtest_compile) else "0"
+        )
 
     resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
     resolved_fold_id, checkpoint = _resolve_checkpoint(resolved_output_dir, fold_id, checkpoint_path)
     market_id = str(market or "").strip()
     market_name = str(market_label or market_id or "").strip()
+    source_timezone = str(data_timezone or display_timezone or DEFAULT_DISPLAY_TIMEZONE)
+    display_timezone_name = str(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
+    display_tz = _display_zone(display_timezone_name)
+
+    runtime_device = _resolve_device(config)
+    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
+
+    checkpoint_payload = _load_checkpoint(checkpoint)
+    state_dict = checkpoint_payload.get("model_state_dict")
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
 
     panel = _build_panel(config)
+    panel = _align_panel_to_state_dict_universe(
+        panel,
+        resolved_output_dir / f"fold_{resolved_fold_id:02d}",
+        state_dict,
+        context=f"live signal {market_id or resolved_fold_id}",
+    )
     symbol_names = load_symbol_name_map(config.data.parquet_root)
     panel_idx = _resolve_panel_index(panel, panel_date, config.training.lookback)
     panel_date_str = _date_string(panel.dates[panel_idx])
@@ -807,15 +916,6 @@ def generate_live_signal(
     drift_base_date = _date_string(panel.dates[drift_base_idx])
     drift_base_prices = np.asarray(panel.close_prices[drift_base_idx], dtype=np.float64)
     drift = estimate_drifted_weights(previous_weights, drift_base_prices, current_prices)
-
-    runtime_device = _resolve_device(config)
-    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
-    non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
-
-    checkpoint_payload = _load_checkpoint(checkpoint)
-    state_dict = checkpoint_payload.get("model_state_dict")
-    if not isinstance(state_dict, dict):
-        raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
 
     model = build_model(
         config=config,
@@ -975,14 +1075,17 @@ def generate_live_signal(
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": datetime.now(display_tz).isoformat(timespec="seconds"),
         "asof_date": resolved_asof,
         "market": market_id,
         "market_label": market_name,
         "panel_date": panel_date_str,
+        "data_timezone": source_timezone,
+        "display_timezone": display_timezone_name,
+        "display_timezone_label": display_timezone_label(display_timezone_name),
         "fold_id": int(resolved_fold_id),
         "checkpoint_path": str(checkpoint),
-        "checkpoint_mtime": datetime.fromtimestamp(checkpoint.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
+        "checkpoint_mtime": datetime.fromtimestamp(checkpoint.stat().st_mtime, tz=display_tz).isoformat(timespec="seconds"),
         "checkpoint_fingerprint": short_file_fingerprint(checkpoint),
         "config_path": str(config_path),
         "config_fingerprint": short_file_fingerprint(Path(config_path)),
@@ -1051,6 +1154,9 @@ def generate_live_signal(
     if write:
         result.output_dir = _write_outputs_to_dir(result, summary["output_dir"])
         result.summary["output_dir"] = result.output_dir
+        live_weights_path = write_live_weights_history(checkpoint.parent, result.summary, result.weights_rows)
+        if live_weights_path:
+            result.summary["live_weights_path"] = live_weights_path
         (Path(result.output_dir) / "summary.json").write_text(
             json.dumps(result.summary, indent=2, ensure_ascii=False),
             encoding="utf-8",

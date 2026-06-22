@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import inspect
 import json
@@ -4056,6 +4057,96 @@ def _available_checkpoint_folds(folds: list[WalkForwardFold], output_dir: Path) 
     return sorted(available)
 
 
+def _checkpoint_symbol_count(checkpoint_path: Path) -> int | None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        return None
+    for key, value in state_dict.items():
+        if str(key).endswith("symbol_position") and torch.is_tensor(value) and value.ndim == 4:
+            return int(value.size(2))
+    return None
+
+
+def _daily_weight_symbols(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        header = next(csv.reader(handle))
+    return [str(column) for column in header if str(column) != "date"]
+
+
+def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
+    index_by_symbol = {str(symbol): idx for idx, symbol in enumerate(panel.symbols)}
+    missing = [symbol for symbol in symbols if symbol not in index_by_symbol]
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise ValueError(
+            f"Cannot align panel to checkpoint universe; {len(missing)} symbols from daily_weights.csv "
+            f"are missing in the current panel: {preview}"
+        )
+    indices = np.asarray([index_by_symbol[symbol] for symbol in symbols], dtype=np.int64)
+    return PanelData(
+        dates=panel.dates,
+        symbols=list(symbols),
+        feature_names=list(panel.feature_names),
+        features=panel.features[:, indices, :],
+        returns_1d=panel.returns_1d[:, indices],
+        tradable_mask=panel.tradable_mask[:, indices],
+        alive_mask=panel.alive_mask[:, indices],
+        benchmark_returns=panel.benchmark_returns,
+        close_prices=panel.close_prices[:, indices],
+        can_buy_mask=panel.can_buy_mask[:, indices] if panel.can_buy_mask is not None else None,
+        can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
+    )
+
+
+def _align_panel_to_checkpoint_universe(panel: PanelData, output_dir: Path, fold_id: int, checkpoint_path: Path) -> PanelData:
+    expected_symbols = _checkpoint_symbol_count(checkpoint_path)
+    if expected_symbols is None:
+        return panel
+    weights_path = _fold_dir(output_dir, fold_id) / "daily_weights.csv"
+    if not weights_path.exists():
+        if int(panel.num_symbols) != int(expected_symbols):
+            raise ValueError(
+                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
+                f"cannot align because {weights_path} is missing."
+            )
+        return panel
+
+    trained_symbols = _daily_weight_symbols(weights_path)
+    if len(trained_symbols) != int(expected_symbols):
+        if int(panel.num_symbols) != int(expected_symbols):
+            raise ValueError(
+                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
+                f"{weights_path} has {len(trained_symbols)} symbols, so it cannot be used for alignment."
+            )
+        return panel
+
+    if trained_symbols == list(panel.symbols):
+        return panel
+
+    current_symbols = set(panel.symbols)
+    trained_set = set(trained_symbols)
+    if not trained_set.issubset(current_symbols):
+        missing = sorted(trained_set - current_symbols)
+        preview = ", ".join(missing[:10])
+        raise ValueError(
+            f"Cannot align panel to checkpoint universe; {len(missing)} trained symbols are missing "
+            f"from the current panel: {preview}"
+        )
+
+    extras = [symbol for symbol in panel.symbols if symbol not in trained_set]
+    if int(panel.num_symbols) != int(expected_symbols) or extras:
+        preview = ", ".join(extras[:10])
+        print(
+            "[explain] aligning panel symbols to checkpoint universe from "
+            f"{weights_path}: current={panel.num_symbols}, checkpoint={expected_symbols}, "
+            f"removed={len(extras)}" + (f" ({preview})" if preview else "")
+        )
+    else:
+        print(f"[explain] reordering panel symbols to match checkpoint universe from {weights_path}")
+    return _subset_panel_symbols(panel, trained_symbols)
+
+
 def _first_year_indices(panel: PanelData, indices: np.ndarray) -> np.ndarray:
     if indices.size == 0:
         return indices
@@ -4131,6 +4222,7 @@ def load_explanation_context(
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
     fold, checkpoint_path = _select_fold_and_checkpoint(folds, resolved_output_dir, fold_id, checkpoint)
+    panel = _align_panel_to_checkpoint_universe(panel, resolved_output_dir, fold.fold_id, checkpoint_path)
     return LoadedExplanationContext(
         config=config,
         panel=panel,
@@ -4611,16 +4703,22 @@ def main(argv: list[str] | None = None) -> None:
             checkpoint_path = _fold_dir(resolved_output_dir, fold_id) / "checkpoint_best.pt"
             model: nn.Module | None = None
             try:
+                fold_panel = _align_panel_to_checkpoint_universe(
+                    panel,
+                    resolved_output_dir,
+                    fold_id,
+                    checkpoint_path,
+                )
                 model, checkpoint_info = load_model_from_checkpoint(
                     config,
-                    panel,
+                    fold_panel,
                     checkpoint_path,
                     device,
                     strict=args.strict,
                 )
                 out_dir = run_loaded_model_explanation(
                     config=config,
-                    panel=panel,
+                    panel=fold_panel,
                     fold=folds_by_id[int(fold_id)],
                     model=model,
                     checkpoint_path=checkpoint_path,

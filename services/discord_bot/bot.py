@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,7 +30,7 @@ def _load_env_file(path: Path) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         if key:
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
 
 
 _load_env_file(Path(__file__).resolve().with_name(".env"))
@@ -48,9 +48,10 @@ from stockagent.config import load_config
 from stockagent.live.capital import positive_float_or_none
 from stockagent.live.quote_provider import load_symbol_name_map
 from stockagent.live.portfolio_history import PortfolioHistoryResult, load_portfolio_history
-from stockagent.live.report_formatter import INVESTMENT_WARNING
-from stockagent.live.signal_engine import generate_live_signal
+from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
+from stockagent.live.signal_engine import generate_live_signal, write_live_weights_history
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
+from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
 
 
 MIN_DISCORD_ROWS = 10
@@ -90,8 +91,9 @@ class DataStaleError(BotUserError):
         detail = status.data.reason or "data freshness check failed"
         super().__init__(
             "資料過期，目前不建議使用。\n"
-            f"**{cfg.label}** latest=`{status.data.last_data_date or 'n/a'}` "
-            f"expected=`{status.data.expected_latest_date or 'n/a'}` reason=`{detail}`"
+            f"**{cfg.label}** latest=`{_display_cfg_time(cfg, status.data.last_data_date or 'n/a')}` "
+            f"expected=`{_display_cfg_time(cfg, status.data.expected_latest_date or 'n/a')}` "
+            f"display_tz=`{_display_tz_text(cfg)}` reason=`{detail}`"
         )
 
 
@@ -177,6 +179,25 @@ def _market_schedule_time(cfg: LiveMarketConfig) -> str:
     entry = _market_state(cfg.market)
     value = entry.get("schedule_time") or cfg.schedule_time or bot.signal_time
     return str(value)
+
+
+def _market_schedule_interval_minutes(cfg: LiveMarketConfig) -> int | None:
+    entry = _market_state(cfg.market)
+    value = entry.get("schedule_interval_minutes") or cfg.schedule_interval_minutes
+    try:
+        number = int(value)
+    except Exception:
+        return None
+    return number if number > 0 else None
+
+
+def _market_schedule_delay_seconds(cfg: LiveMarketConfig) -> int:
+    entry = _market_state(cfg.market)
+    value = entry.get("schedule_delay_seconds") if "schedule_delay_seconds" in entry else cfg.schedule_delay_seconds
+    try:
+        return max(0, int(value))
+    except Exception:
+        return 0
 
 
 def _market_summary_time(cfg: LiveMarketConfig) -> str | None:
@@ -354,12 +375,12 @@ def _ensure_signal_ready(cfg: LiveMarketConfig, *, scheduled: bool = False) -> M
 def _market_notice(status: MarketRuntimeStatus) -> str | None:
     if status.market_open:
         return None
-    data_date = status.data.panel_date or status.data.last_data_date or "n/a"
+    data_date = _display_cfg_time(status.cfg, status.data.panel_date or status.data.last_data_date or "n/a")
     reason = status.market_open_reason or "market closed"
     if "not a trading day" in reason:
         freshness = f"資料提醒：{status.data.reason}。" if status.data.reason else ""
-        return f"今天沒有開盤，使用最後可用資料 `{data_date}` 產生訊號。{freshness}"
-    return f"目前非交易時間，使用最後可用資料 `{data_date}` 產生訊號。"
+        return f"今天沒有開盤，使用最後可用資料 `{data_date}`（{_display_tz_text(status.cfg)}）產生訊號。{freshness}"
+    return f"目前非交易時間，使用最後可用資料 `{data_date}`（{_display_tz_text(status.cfg)}）產生訊號。"
 
 
 def _role_names_and_ids(interaction: discord.Interaction) -> tuple[set[str], set[int]]:
@@ -399,8 +420,94 @@ def _require_trader_permission(interaction: discord.Interaction, cfg: LiveMarket
 def _scheduled_markets() -> list[str]:
     raw = _env("STOCKAGENT_SCHEDULED_MARKETS")
     if raw:
-        return [item.strip() for item in raw.split(",") if item.strip()]
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+        if any(item.lower() in {"all", "*"} for item in items):
+            return sorted(_market_configs())
+        return items
     return [_default_market()]
+
+
+def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
+    interval = _market_schedule_interval_minutes(cfg)
+    if interval is not None:
+        ready_time = now - timedelta(seconds=_market_schedule_delay_seconds(cfg))
+        total_minutes = ready_time.hour * 60 + ready_time.minute
+        bucket_minutes = (total_minutes // interval) * interval
+        bucket = ready_time.replace(
+            hour=bucket_minutes // 60,
+            minute=bucket_minutes % 60,
+            second=0,
+            microsecond=0,
+        )
+        return f"{bucket.isoformat(timespec='minutes')}:{cfg.market}"
+    if now.strftime("%H:%M") != _market_schedule_time(cfg):
+        return None
+    return f"{now.strftime('%Y-%m-%d')}:{cfg.market}"
+
+
+def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
+    if not cfg.pre_signal_command:
+        return
+    command = [str(item) for item in cfg.pre_signal_command]
+    started = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=max(1, int(cfg.pre_signal_timeout_seconds)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _log_exception(f"pre_signal_command:{cfg.market}", exc)
+        raise BotUserError(f"`{cfg.market}` pre-signal data update timed out after {cfg.pre_signal_timeout_seconds}s")
+    log_path = ROOT / "artifacts" / "discord_bot" / "pre_signal_commands.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "timestamp": started,
+                    "market": cfg.market,
+                    "command": command,
+                    "returncode": result.returncode,
+                    "stdout_tail": result.stdout[-4000:],
+                    "stderr_tail": result.stderr[-4000:],
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+    if result.returncode != 0:
+        raise BotUserError(
+            f"`{cfg.market}` pre-signal data update failed rc={result.returncode}; log=`{_display_path(log_path)}`"
+        )
+
+
+def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus, requested: str | None) -> str | None:
+    text = str(requested or "").strip().lower()
+    if text and text != "auto":
+        return text
+    if not status.market_open:
+        return None
+    if cfg.pre_signal_command:
+        return "panel"
+    return "yahoo"
+
+
+def _prepare_realtime_signal_sync(
+    cfg: LiveMarketConfig,
+    *,
+    requested_price_source: str | None = "auto",
+    force_refresh: bool = False,
+) -> tuple[str | None, MarketRuntimeStatus, bool]:
+    status = _runtime_status(cfg)
+    should_refresh = bool(force_refresh or status.market_open)
+    if should_refresh:
+        _run_pre_signal_command(cfg)
+        status = _runtime_status(cfg)
+    return _auto_signal_price_source(cfg, status, requested_price_source), status, should_refresh
 
 
 async def market_autocomplete(
@@ -648,6 +755,79 @@ def _resolve_current_capital(
     return positive_float_or_none(current_capital) or _market_current_capital(cfg) or _market_initial_capital(cfg)
 
 
+def _performance_window_label(cfg: LiveMarketConfig, recent: dict[str, Any]) -> str:
+    raw_window = recent.get("window_days") or cfg.benchmark_window_days
+    try:
+        window = int(raw_window)
+    except Exception:
+        window = int(cfg.benchmark_window_days)
+    frequency = str(cfg.history_frequency or "").strip().lower()
+    if frequency in {"bar", "bars", "intraday", "15m", "15min", "15minute", "15minutes"}:
+        try:
+            market_cfg = load_config(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path))
+            trading_frequency = str(getattr(market_cfg.trading, "frequency", "") or "").strip()
+        except Exception:
+            trading_frequency = ""
+        suffix = f"根{trading_frequency}" if trading_frequency else "根K"
+        return f"過去{window}{suffix}"
+    return f"過去{window}天"
+
+
+def _rewrite_signal_artifacts(result: Any) -> None:
+    output_dir = result.output_dir or result.summary.get("output_dir")
+    if not output_dir:
+        return
+    path = _resolve_repo_path(str(output_dir)) or Path(str(output_dir))
+    if not path.exists():
+        return
+    (path / "summary.json").write_text(
+        json.dumps(result.summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (path / "discord_message.md").write_text(result.message, encoding="utf-8")
+
+
+def _enrich_signal_performance_for_discord(
+    cfg: LiveMarketConfig,
+    result: Any,
+    *,
+    max_rows: int,
+    current_capital: float | None = None,
+) -> Any:
+    capital = _resolve_current_capital(cfg, current_capital=current_capital)
+    summary = result.summary
+    if capital is not None:
+        summary["display_capital"] = float(capital)
+        portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
+        benchmark_return = _float_or_none(summary.get("benchmark_simple_return"))
+        if portfolio_return is not None:
+            summary["portfolio_pnl_value"] = portfolio_return * float(capital)
+        if benchmark_return is not None:
+            summary["benchmark_pnl_value"] = benchmark_return * float(capital)
+        if portfolio_return is not None and benchmark_return is not None:
+            summary["excess_pnl_value"] = (portfolio_return - benchmark_return) * float(capital)
+
+    recent = summary.get("recent_performance")
+    if isinstance(recent, dict):
+        recent["window_label"] = _performance_window_label(cfg, recent)
+        if capital is not None:
+            for source_key, target_key in (
+                ("strategy_return", "strategy_pnl_value"),
+                ("benchmark_return", "benchmark_pnl_value"),
+                ("excess_return", "excess_pnl_value"),
+            ):
+                value = _float_or_none(recent.get(source_key))
+                if value is not None:
+                    recent[target_key] = value * float(capital)
+
+    result.message = format_signal_message(summary, max_rows=max_rows)
+    try:
+        _rewrite_signal_artifacts(result)
+    except Exception as exc:
+        _log_exception(f"rewrite_signal_artifacts:{cfg.market}", exc)
+    return result
+
+
 def _annotate_weight_rows_with_capital(rows: list[dict[str, Any]], capital: float | None) -> list[dict[str, Any]]:
     amount = positive_float_or_none(capital)
     if amount is None:
@@ -692,6 +872,30 @@ def _kv_line(*pairs: tuple[str, Any]) -> str:
     return "  " + "  ".join(f"`{key}={value}`" for key, value in pairs)
 
 
+def _cfg_display_timezone(cfg: LiveMarketConfig) -> str:
+    return str(getattr(cfg, "display_timezone", None) or DEFAULT_DISPLAY_TIMEZONE)
+
+
+def _display_cfg_time(cfg: LiveMarketConfig, value: Any) -> str:
+    return format_display_time(
+        value,
+        source_timezone=getattr(cfg, "timezone", None),
+        display_timezone=_cfg_display_timezone(cfg),
+    )
+
+
+def _display_summary_time(summary: dict[str, Any], value: Any) -> str:
+    return format_display_time(
+        value,
+        source_timezone=summary.get("data_timezone") or summary.get("timezone"),
+        display_timezone=summary.get("display_timezone") or DEFAULT_DISPLAY_TIMEZONE,
+    )
+
+
+def _display_tz_text(cfg: LiveMarketConfig) -> str:
+    return display_timezone_label(_cfg_display_timezone(cfg))
+
+
 def _line_pages(
     *,
     title: str,
@@ -704,21 +908,41 @@ def _line_pages(
     total = len(rows)
     if total == 0:
         return [f"**{title}**\n(no rows)\n\n{INVESTMENT_WARNING}"]
-    pages: list[str] = []
-    page_count = (total + size - 1) // size
-    for page_index, start in enumerate(range(0, total, size), start=1):
-        chunk = rows[start : start + size]
+    max_chars = 1850
+    blocks = [formatter(row) for row in rows]
+
+    def render_page(page_index: int, page_count: int, start: int, chunk: list[str]) -> str:
         lines = [
             f"**{title}**",
             f"`page {page_index}/{page_count}`  `rows {start + 1}-{start + len(chunk)}/{total}`",
         ]
         if header_lines:
             lines.extend(header_lines)
-        for row in chunk:
+        for block in chunk:
             lines.append("")
-            lines.append(formatter(row))
+            lines.append(block)
         _append_investment_warning(lines)
-        pages.extend(_split_content_pages("\n".join(lines)))
+        return "\n".join(lines)
+
+    groups: list[tuple[int, list[str]]] = []
+    start = 0
+    current: list[str] = []
+    for index, block in enumerate(blocks):
+        candidate = current + [block]
+        candidate_text = render_page(999, 999, start, candidate)
+        if current and (len(candidate) > size or len(candidate_text) > max_chars):
+            groups.append((start, current))
+            start = index
+            current = [block]
+        else:
+            current = candidate
+    if current:
+        groups.append((start, current))
+
+    pages: list[str] = []
+    page_count = len(groups)
+    for page_index, (start, chunk) in enumerate(groups, start=1):
+        pages.extend(_split_content_pages(render_page(page_index, page_count, start, chunk), max_chars=max_chars))
     return pages
 
 
@@ -731,6 +955,84 @@ async def _send_paginated_response(interaction: discord.Interaction, pages: list
         await interaction.followup.send(clean_pages[0], view=view)
 
 
+async def _send_channel_pages(channel: Any, pages: list[str], *, timeout: float | None = 24 * 60 * 60) -> None:
+    clean_pages = [page if page else "(empty)" for page in pages] or ["(empty)"]
+    view = PagedTextView(clean_pages, timeout=timeout) if len(clean_pages) > 1 else None
+    if view is None:
+        await channel.send(clean_pages[0])
+    else:
+        await channel.send(clean_pages[0], view=view)
+
+
+def _active_position_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: (
+            max(_row_abs(row, "current_weight"), _row_abs(row, "target_weight"), _row_abs(row, "delta_weight")),
+            _row_abs(row, "delta_weight"),
+            _row_abs(row, "score"),
+        ),
+        reverse=True,
+    )
+    return [
+        row
+        for row in sorted_rows
+        if _row_abs(row, "current_weight") > 1e-9
+        or _row_abs(row, "target_weight") > 1e-9
+        or _row_abs(row, "delta_weight") > 1e-9
+    ]
+
+
+def _scheduled_detail_page_groups(cfg: LiveMarketConfig, result: Any) -> list[list[str]]:
+    capital = _resolve_current_capital(cfg)
+    summary = result.summary
+    output_dir = summary.get("output_dir") or result.output_dir
+    output_text = _display_path(Path(output_dir)) if output_dir else "n/a"
+    common_header = [
+        _kv_line(
+            ("market", summary.get("market", cfg.market)),
+            ("signal", summary.get("signal_id", "n/a")),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+            ("price", summary.get("price_source", "n/a")),
+        ),
+        _kv_line(("display_tz", summary.get("display_timezone_label") or _display_tz_text(cfg))),
+        f"capital: `{_capital_context_text(capital=capital)}`",
+        f"output: `{output_text}`",
+    ]
+
+    position_rows = _annotate_weight_rows_with_capital(_active_position_rows(list(result.weights_rows)), capital)
+    rebalance_rows = _annotate_weight_rows_with_capital(list(result.rebalance_rows), capital)
+
+    position_header = [
+        *common_header,
+        _kv_line(("rows", len(position_rows)), ("sort", "abs now/target/delta")),
+        f"full: `{summary.get('positions_markdown_path', summary.get('weights_path', 'n/a'))}`",
+    ]
+    rebalance_header = [
+        *common_header,
+        _kv_line(("rows", len(rebalance_rows)), ("threshold", cfg.min_abs_delta), ("sort", "abs delta")),
+        f"full: `{summary.get('rebalance_markdown_path', summary.get('rebalance_path', 'n/a'))}`",
+    ]
+
+    return [
+        _line_pages(
+            title="scheduled current / target positions",
+            rows=position_rows,
+            formatter=_position_line,
+            page_size=20,
+            header_lines=position_header,
+        ),
+        _line_pages(
+            title="scheduled rebalance",
+            rows=rebalance_rows,
+            formatter=_rebalance_line,
+            page_size=20,
+            header_lines=rebalance_header,
+        ),
+    ]
+
+
 def _status_line(key: str, cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> str:
     checkpoint = status.checkpoint
     fold = checkpoint.fold_id if checkpoint is not None and checkpoint.fold_id is not None else "none"
@@ -740,8 +1042,10 @@ def _status_line(key: str, cfg: LiveMarketConfig, status: MarketRuntimeStatus) -
     enabled = "enabled" if status.enabled else "disabled"
     return (
         f"`{key}` {cfg.label} status=`{status.status}` {enabled} "
-        f"data=`{status.data.last_data_date or 'n/a'}` panel=`{status.data.panel_date or 'n/a'}` "
-        f"benchmark=`{status.data.benchmark_date or 'n/a'}` expected=`{status.data.expected_latest_date or 'n/a'}` "
+        f"data=`{_display_cfg_time(cfg, status.data.last_data_date or 'n/a')}` "
+        f"panel=`{_display_cfg_time(cfg, status.data.panel_date or 'n/a')}` "
+        f"benchmark=`{_display_cfg_time(cfg, status.data.benchmark_date or 'n/a')}` "
+        f"expected=`{_display_cfg_time(cfg, status.data.expected_latest_date or 'n/a')}` "
         f"fold=`{fold}` ckpt_mtime=`{mtime}` test=`{test_years}` metric=`{best_metric}`"
     )
 
@@ -758,7 +1062,9 @@ def _health_lines(market: str = "") -> list[str]:
             f"config=`{status.config_path}` config_hash=`{status.config_fingerprint or 'n/a'}`",
             f"output_dir=`{status.output_dir or 'config default'}` live_output_dir=`{cfg.live_output_dir or 'auto'}`",
             f"market_open=`{status.market_open}` reason=`{status.market_open_reason or 'ok'}`",
-            f"schedule_time=`{_market_schedule_time(cfg)}` summary_time=`{_market_summary_time(cfg) or 'off'}` tz=`{cfg.timezone}`",
+            f"schedule_time=`{_market_schedule_time(cfg)}` interval=`{_market_schedule_interval_minutes(cfg) or 'off'}` "
+            f"delay_s=`{_market_schedule_delay_seconds(cfg)}` summary_time=`{_market_summary_time(cfg) or 'off'}` "
+            f"data_tz=`{cfg.timezone}` display_tz=`{_display_tz_text(cfg)}`",
             f"capital initial=`{_money(_market_initial_capital(cfg))}` current=`{_money(_market_current_capital(cfg))}`",
         ]
     lines = [
@@ -777,8 +1083,10 @@ def _markets_lines() -> list[str]:
         runtime = _runtime_status(cfg)
         lines.append(
             f"`{key}` {cfg.label} status=`{runtime.status}` enabled=`{runtime.enabled}` "
-            f"data=`{runtime.data.last_data_date or 'n/a'}` schedule=`{_market_schedule_time(cfg)}` "
-            f"config=`{cfg.config_path}` output=`{cfg.output_dir or 'config default'}` fold=`{fold}`"
+            f"data=`{_display_cfg_time(cfg, runtime.data.last_data_date or 'n/a')}` schedule=`{_market_schedule_time(cfg)}` "
+            f"interval=`{_market_schedule_interval_minutes(cfg) or 'off'}` "
+            f"display_tz=`{_display_tz_text(cfg)}` config=`{cfg.config_path}` "
+            f"output=`{cfg.output_dir or 'config default'}` fold=`{fold}`"
         )
     return lines
 
@@ -821,6 +1129,22 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
         if isinstance(summary, dict):
             return path, summary
     return None
+
+
+def _sync_latest_live_weights_to_market_artifact(cfg: LiveMarketConfig) -> str | None:
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        return None
+    summary_path, summary = latest
+    weights_path = _summary_artifact_path(summary, "weights_path", summary_path)
+    if weights_path is None or not weights_path.exists():
+        return None
+    try:
+        rows = _read_parquet_rows(weights_path)
+        return write_live_weights_history(_market_fold_dir(cfg), summary, rows)
+    except Exception as exc:
+        _log_exception(f"sync_live_weights:{cfg.market}", exc)
+        return None
 
 
 def _summary_artifact_path(summary: dict[str, Any], key: str, summary_path: Path | None = None) -> Path | None:
@@ -870,6 +1194,12 @@ def _market_symbol_names(cfg: LiveMarketConfig) -> dict[str, str]:
         return {}
 
 
+def _annotate_history_rows_with_display_time(cfg: LiveMarketConfig, rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if isinstance(row, dict):
+            row["display_date"] = _display_cfg_time(cfg, row.get("date", "n/a"))
+
+
 def _load_stock_history_for_market(
     cfg: LiveMarketConfig,
     symbol: str,
@@ -883,7 +1213,7 @@ def _load_stock_history_for_market(
         initial_capital=initial_capital,
         current_capital=current_capital,
     )
-    return load_stock_history(
+    result = load_stock_history(
         _market_fold_dir(cfg),
         symbol,
         limit=limit,
@@ -891,7 +1221,10 @@ def _load_stock_history_for_market(
         initial_capital=initial,
         current_capital=current,
         symbol_names=_market_symbol_names(cfg),
+        frequency=cfg.history_frequency,
     )
+    _annotate_history_rows_with_display_time(cfg, result.rows)
+    return result
 
 
 def _load_portfolio_history_for_market(
@@ -907,7 +1240,7 @@ def _load_portfolio_history_for_market(
         initial_capital=initial_capital,
         current_capital=current_capital,
     )
-    return load_portfolio_history(
+    result = load_portfolio_history(
         _market_fold_dir(cfg),
         days=days,
         top_changes=top_changes,
@@ -915,15 +1248,22 @@ def _load_portfolio_history_for_market(
         initial_capital=initial,
         current_capital=current,
         symbol_names=_market_symbol_names(cfg),
+        frequency=cfg.history_frequency,
     )
+    _annotate_history_rows_with_display_time(cfg, result.rows)
+    return result
 
 
 def _position_line(row: dict[str, Any]) -> str:
+    action = str(row.get("action") or "").strip().upper()
+    label = _symbol_label(row)
+    if action and action != "HOLD":
+        label = f"{label} **{action}**"
     lines = [
-        f"{_symbol_label(row)}",
+        label,
         _kv_line(
-            ("target", _pct(row.get("target_weight"))),
             ("now", _pct(row.get("current_weight"))),
+            ("target", _pct(row.get("target_weight"))),
             ("delta", _signed_pct(row.get("delta_weight"))),
         ),
     ]
@@ -977,7 +1317,7 @@ def _stock_history_block(row: dict[str, Any]) -> str:
     share_delta = int(_float_or_none(row.get("share_delta")) or 0)
     return "\n".join(
         [
-            f"`{row.get('date', 'n/a')}` **{row.get('action', 'HOLD')}**",
+            f"`{row.get('display_date', row.get('date', 'n/a'))}` **{row.get('action', 'HOLD')}**",
             _kv_line(
                 ("shares", f"{prev_shares}->{shares}"),
                 ("delta", f"{share_delta:+d}"),
@@ -1029,7 +1369,7 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
     changes = row.get("changes")
     change_rows = changes if isinstance(changes, list) else []
     lines = [
-        f"`{row.get('date', 'n/a')}`",
+        f"`{row.get('display_date', row.get('date', 'n/a'))}`",
         _kv_line(
             ("ret", _signed_pct(row.get("portfolio_return"))),
             ("bench", _signed_pct(row.get("benchmark_return"))),
@@ -1203,10 +1543,11 @@ def _decision_overview_page(
         f"`{summary.get('signal_id', summary_path.parent.name)}`",
         _kv_line(
             ("market", summary.get("market", "n/a")),
-            ("asof", summary.get("asof_date", "n/a")),
-            ("panel", summary.get("panel_date", "n/a")),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
             ("fold", summary.get("fold_id", "n/a")),
         ),
+        _kv_line(("display_tz", summary.get("display_timezone_label") or display_timezone_label(summary.get("display_timezone")))),
         _kv_line(
             ("rows", f"{len(rows_filtered)}/{len(rows_all)}"),
             ("symbol", symbol or "all"),
@@ -1253,10 +1594,11 @@ def _daily_summary_message(cfg: LiveMarketConfig) -> str:
         f"**daily summary** {cfg.label}",
         _kv_line(("status", status.status), ("generated", "yes" if latest else "no")),
         _kv_line(
-            ("data", status.data.last_data_date or "n/a"),
-            ("panel", status.data.panel_date or "n/a"),
-            ("benchmark", status.data.benchmark_date or "n/a"),
+            ("data", _display_cfg_time(cfg, status.data.last_data_date or "n/a")),
+            ("panel", _display_cfg_time(cfg, status.data.panel_date or "n/a")),
+            ("benchmark", _display_cfg_time(cfg, status.data.benchmark_date or "n/a")),
         ),
+        _kv_line(("display_tz", _display_tz_text(cfg))),
     ]
     if not status.data.fresh:
         lines.append(f"warning: 資料過期，目前不建議使用。 `{status.data.reason or 'stale'}`")
@@ -1265,23 +1607,54 @@ def _daily_summary_message(cfg: LiveMarketConfig) -> str:
         lines.append(f"notice: {notice}")
     if latest is not None:
         path, summary = latest
+        portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
+        baseline_return = _float_or_none(summary.get("benchmark_simple_return"))
+        excess_return = None if portfolio_return is None or baseline_return is None else portfolio_return - baseline_return
         lines.extend(
             [
                 "",
                 "**latest signal**",
                 _kv_line(
                     ("signal", summary.get("signal_id", path.parent.name)),
-                    ("asof", summary.get("asof_date", "n/a")),
+                    ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
                     ("fold", summary.get("fold_id", "n/a")),
                 ),
                 _kv_line(
-                    ("portfolio", _signed_pct(summary.get("portfolio_simple_return"))),
-                    ("benchmark", _signed_pct(summary.get("benchmark_simple_return"))),
+                    ("portfolio", _signed_pct(portfolio_return)),
+                    ("baseline", _signed_pct(baseline_return)),
+                    ("excess", _signed_pct(excess_return)),
                     ("turnover", _pct(summary.get("turnover"))),
                 ),
                 f"artifact: `{path}`",
             ]
         )
+        if _float_or_none(summary.get("portfolio_pnl_value")) is not None:
+            lines.append(
+                _kv_line(
+                    ("capital", _money(summary.get("display_capital"))),
+                    ("pnl", _signed_money(summary.get("portfolio_pnl_value"))),
+                    ("baseline_pnl", _signed_money(summary.get("benchmark_pnl_value"))),
+                    ("excess_pnl", _signed_money(summary.get("excess_pnl_value"))),
+                )
+            )
+        recent = summary.get("recent_performance") if isinstance(summary.get("recent_performance"), dict) else {}
+        if recent:
+            lines.append(
+                _kv_line(
+                    ("period", recent.get("window_label") or f"過去{recent.get('window_days', 'n')}期"),
+                    ("strategy", _signed_pct(recent.get("strategy_return"))),
+                    ("baseline", _signed_pct(recent.get("benchmark_return"))),
+                    ("excess", _signed_pct(recent.get("excess_return"))),
+                )
+            )
+            if _float_or_none(recent.get("strategy_pnl_value")) is not None:
+                lines.append(
+                    _kv_line(
+                        ("pnl", _signed_money(recent.get("strategy_pnl_value"))),
+                        ("baseline_pnl", _signed_money(recent.get("benchmark_pnl_value"))),
+                        ("excess_pnl", _signed_money(recent.get("excess_pnl_value"))),
+                    )
+                )
         warnings = summary.get("risk_warnings") if isinstance(summary.get("risk_warnings"), list) else []
         if warnings:
             lines.append("risk warning: " + " | ".join(str(item) for item in warnings[:3]))
@@ -1298,8 +1671,8 @@ def _daily_summary_message(cfg: LiveMarketConfig) -> str:
 
 
 class PagedTextView(discord.ui.View):
-    def __init__(self, pages: list[str]) -> None:
-        super().__init__(timeout=30 * 60)
+    def __init__(self, pages: list[str], *, timeout: float | None = 30 * 60) -> None:
+        super().__init__(timeout=timeout)
         self.pages = pages
         self.index = 0
         self._sync_buttons()
@@ -1384,7 +1757,13 @@ class SignalReviewView(discord.ui.View):
 
 
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
-@app_commands.describe(market="Market id", price_source="auto/panel/csv/yahoo", top_n="Rows to show, minimum 10", min_abs_delta="Minimum absolute weight delta")
+@app_commands.describe(
+    market="Market id",
+    price_source="auto/panel/csv/yahoo",
+    top_n="Rows to show, minimum 10",
+    min_abs_delta="Minimum absolute weight delta",
+    refresh_data="Run the market pre-signal data updater before generating.",
+)
 @app_commands.autocomplete(market=market_autocomplete)
 async def signal_now(
     interaction: discord.Interaction,
@@ -1392,15 +1771,25 @@ async def signal_now(
     price_source: str = "auto",
     top_n: int = 20,
     min_abs_delta: float = 0.001,
+    refresh_data: bool = True,
 ) -> None:
     await interaction.response.defer(thinking=True)
     try:
+        cfg = _resolve_market(market)
+        resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
+            _prepare_realtime_signal_sync,
+            cfg,
+            requested_price_source=price_source,
+            force_refresh=refresh_data,
+        )
+        await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
         result = await _run_market_signal(
             market=market,
-            price_source=price_source,
+            price_source=resolved_price_source,
             top_n=_top_n(top_n),
             min_abs_delta=min_abs_delta,
         )
+        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=_top_n(top_n))
     except Exception as exc:
         await _send_command_error(interaction, "live signal", exc)
         return
@@ -1410,6 +1799,10 @@ async def signal_now(
         interaction,
         market=str(result.summary.get("market") or market or _default_market()),
         output_dir=result.output_dir,
+        market_open=bool(status.market_open),
+        auto_refreshed=bool(auto_refreshed),
+        requested_price_source=price_source,
+        resolved_price_source=resolved_price_source or "config",
     )
     await _send_signal_response(
         interaction,
@@ -1463,8 +1856,11 @@ async def positions(
         _kv_line(
             ("market", result.summary.get("market", "n/a")),
             ("signal", result.summary.get("signal_id", "n/a")),
+            ("asof", _display_summary_time(result.summary, result.summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(result.summary, result.summary.get("panel_date", "n/a"))),
             ("rows", len(rows)),
         ),
+        _kv_line(("display_tz", result.summary.get("display_timezone_label") or _display_tz_text(cfg))),
         f"capital: `{_capital_context_text(capital=capital)}`",
         "sort: absolute target weight, then delta and score",
         f"full: `{result.summary.get('positions_markdown_path', result.summary.get('weights_path', 'n/a'))}`",
@@ -1513,9 +1909,12 @@ async def rebalance(
         _kv_line(
             ("market", result.summary.get("market", "n/a")),
             ("signal", result.summary.get("signal_id", "n/a")),
+            ("asof", _display_summary_time(result.summary, result.summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(result.summary, result.summary.get("panel_date", "n/a"))),
             ("threshold", threshold),
             ("rows", len(rows)),
         ),
+        _kv_line(("display_tz", result.summary.get("display_timezone_label") or _display_tz_text(cfg))),
         f"capital: `{_capital_context_text(capital=capital)}`",
         "sort: absolute rebalance delta",
         f"full: `{result.summary.get('rebalance_markdown_path', result.summary.get('rebalance_path', 'n/a'))}`",
@@ -1568,7 +1967,10 @@ async def signal(interaction: discord.Interaction, signal_id: str) -> None:
     risk = summary.get("target_risk", {}) if isinstance(summary.get("target_risk"), dict) else {}
     lines = [
         f"**signal** `{summary.get('signal_id', signal_id)}`",
-        f"market=`{summary.get('market', 'n/a')}` asof=`{summary.get('asof_date', 'n/a')}` panel=`{summary.get('panel_date', 'n/a')}`",
+        f"market=`{summary.get('market', 'n/a')}` "
+        f"asof=`{_display_summary_time(summary, summary.get('asof_date', 'n/a'))}` "
+        f"panel=`{_display_summary_time(summary, summary.get('panel_date', 'n/a'))}` "
+        f"display_tz=`{summary.get('display_timezone_label') or display_timezone_label(summary.get('display_timezone'))}`",
         f"fold=`{summary.get('fold_id', 'n/a')}` checkpoint=`{summary.get('checkpoint_fingerprint', 'n/a')}` config=`{summary.get('config_fingerprint', 'n/a')}`",
         f"risk gross=`{_pct(risk.get('gross'))}` top=`{_pct(risk.get('top_abs_weight'))}` turnover=`{_pct(summary.get('turnover'))}`",
         f"summary=`{path}`",
@@ -1678,9 +2080,9 @@ async def explain_signal(
 @app_commands.describe(
     market="Market id.",
     symbol="Stock code/ticker, e.g. 2330 or 2330.TW.",
-    limit="Max rows to show. Default 32. 0 means all rows.",
+    limit="Max periods/bars to show. Default 32. 0 means all rows.",
     page_size="Rows per page, clamped to 10-40.",
-    changes_only="Only show trade/adjustment rows. If false, show recent daily state rows.",
+    changes_only="Only show trade/adjustment rows. If false, show recent state rows.",
     initial_capital="Scale fold values from the first fold NAV.",
     current_capital="Scale fold values from the latest fold NAV. Overrides initial_capital.",
 )
@@ -1723,11 +2125,13 @@ async def stock_history_command(
             ("changes_only", result.changes_only),
             ("fallback_all_rows", result.fell_back_to_all_rows),
             ("rows", len(result.rows)),
+            ("freq", cfg.history_frequency),
         ),
+        _kv_line(("display_tz", _display_tz_text(cfg))),
         _kv_line(
             ("capital_mode", result.capital.mode if result.capital else "artifact"),
             ("capital", _money(result.capital.capital) if result.capital else "n/a"),
-            ("ref", result.capital.reference_date if result.capital else "n/a"),
+            ("ref", _display_cfg_time(cfg, result.capital.reference_date) if result.capital else "n/a"),
         ),
         f"sources: `{source_text}`",
         "欄位: hold=實際持倉比例；actual=整數股回測權重；model=模型目標權重；Δ=相對上一筆交易日變化。",
@@ -1742,12 +2146,12 @@ async def stock_history_command(
     await _send_paginated_response(interaction, pages)
 
 
-@bot.tree.command(name="portfolio_history", description="Show recent daily PnL and holding changes.")
+@bot.tree.command(name="portfolio_history", description="Show recent PnL and holding changes.")
 @app_commands.describe(
     market="Market id.",
-    days="Trading days to show. Default 32. 0 means all days.",
-    top_changes="Top holding changes per day.",
-    page_size="Days per page, clamped to 10-40.",
+    days="Periods to show. Daily markets use days; crypto can use 15m bars. Default 32. 0 means all.",
+    top_changes="Top holding changes per period.",
+    page_size="Periods per page, clamped to 10-40.",
     min_abs_change="Hide weight-only changes below this absolute ratio.",
     initial_capital="Scale fold values from the first fold NAV.",
     current_capital="Scale fold values from the latest fold NAV. Overrides initial_capital.",
@@ -1784,21 +2188,23 @@ async def portfolio_history_command(
         _kv_line(
             ("market", cfg.market),
             ("fold", _display_path(result.fold_dir)),
-            ("days", result.days),
+            ("periods", result.days),
+            ("freq", result.frequency),
         ),
         _kv_line(
-            ("period", f"{result.start_date or 'n/a'}..{result.end_date or 'n/a'}"),
+            ("period", f"{_display_cfg_time(cfg, result.start_date or 'n/a')}..{_display_cfg_time(cfg, result.end_date or 'n/a')}"),
             ("ret", _signed_pct(result.period_return)),
             ("benchmark", _signed_pct(result.benchmark_return)),
         ),
         _kv_line(("profit", _signed_money(result.profit_value)), ("top_changes", result.top_changes)),
+        _kv_line(("display_tz", _display_tz_text(cfg))),
         _kv_line(
             ("capital_mode", result.capital.mode),
             ("capital", _money(result.capital.capital)),
-            ("ref", result.capital.reference_date or "n/a"),
+            ("ref", _display_cfg_time(cfg, result.capital.reference_date or "n/a")),
         ),
         f"sources: `{source_text}`",
-        "欄位: pnl≈前一日 NAV x 當日報酬估算；cum=本查詢期間累積報酬；top=當天絕對持倉比例變動最大的股票。",
+        "欄位: pnl≈前一期 NAV x 本期報酬估算；cum=本查詢期間累積報酬；top=本期絕對持倉比例變動最大的標的。",
     ]
     pages = _line_pages(
         title="portfolio history",
@@ -1891,7 +2297,7 @@ async def daily_summary_command(interaction: discord.Interaction, market: str = 
     await _send_long_response(interaction, message)
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(seconds=10)
 async def scheduled_signal() -> None:
     if bot.channel_id is None:
         return
@@ -1899,15 +2305,26 @@ async def scheduled_signal() -> None:
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
-        if now.strftime("%H:%M") != _market_schedule_time(cfg):
+        key = _scheduled_signal_key(cfg, now)
+        if key is None:
             continue
-        today = now.strftime("%Y-%m-%d")
-        key = f"{today}:{market}"
         if key in bot._last_scheduled_keys:
             continue
         bot._last_scheduled_keys.add(key)
         try:
-            result = await _run_market_signal(market=market, scheduled=True)
+            resolved_price_source, _, _ = await asyncio.to_thread(
+                _prepare_realtime_signal_sync,
+                cfg,
+                requested_price_source="auto",
+                force_refresh=False,
+            )
+            await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
+            result = await _run_market_signal(
+                market=market,
+                scheduled=True,
+                price_source=resolved_price_source,
+            )
+            result = _enrich_signal_performance_for_discord(cfg, result, max_rows=_top_n(cfg.top_n))
         except BotUserError as exc:
             if not isinstance(exc, MarketClosedError):
                 await channel.send(str(exc))
@@ -1920,6 +2337,8 @@ async def scheduled_signal() -> None:
             signal_id=str(result.summary.get("signal_id")),
             market=str(result.summary.get("market") or market),
         ))
+        for pages in _scheduled_detail_page_groups(cfg, result):
+            await _send_channel_pages(channel, pages)
 
 
 @tasks.loop(minutes=1)
