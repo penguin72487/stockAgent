@@ -216,21 +216,43 @@ def _apply_min_trade_weight_numpy(weights: np.ndarray, min_trade_weight: float) 
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights
-    return np.where(np.abs(weights) >= np.float32(threshold), weights, np.float32(0.0)).astype(np.float32, copy=False)
+    gross_before = np.abs(weights).sum(axis=1, keepdims=True).astype(np.float32)
+    out = np.where(np.abs(weights) >= np.float32(threshold), weights, np.float32(0.0)).astype(np.float32, copy=False)
+    gross_after = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
+    scale = np.divide(
+        gross_before,
+        np.clip(gross_after, 1e-12, None),
+        out=np.zeros_like(gross_before, dtype=np.float32),
+        where=gross_after > 1e-12,
+    )
+    return (out * scale).astype(np.float32, copy=False)
 
 
 def _apply_min_trade_weight_row_numpy(weights_row: np.ndarray, min_trade_weight: float) -> np.ndarray:
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights_row
-    return np.where(np.abs(weights_row) >= threshold, weights_row, 0.0).astype(weights_row.dtype, copy=False)
+    gross_before = float(np.abs(weights_row).sum(dtype=np.float64))
+    out = np.where(np.abs(weights_row) >= threshold, weights_row, 0.0).astype(weights_row.dtype, copy=False)
+    gross_after = float(np.abs(out).sum(dtype=np.float64))
+    if gross_before <= 1e-12 or gross_after <= 1e-12:
+        return out
+    return (out * (gross_before / gross_after)).astype(weights_row.dtype, copy=False)
 
 
 def _apply_min_trade_weight_torch(weights: torch.Tensor, min_trade_weight: float) -> torch.Tensor:
     threshold = float(min_trade_weight)
     if threshold <= 0.0:
         return weights
-    return torch.where(weights.abs() >= threshold, weights, torch.zeros_like(weights))
+    gross_before = weights.abs().sum(dim=1, keepdim=True)
+    out = torch.where(weights.abs() >= threshold, weights, torch.zeros_like(weights))
+    gross_after = out.abs().sum(dim=1, keepdim=True)
+    scale = torch.where(
+        gross_after > 1e-12,
+        gross_before / gross_after.clamp_min(1e-12),
+        torch.zeros_like(gross_after),
+    )
+    return out * scale
 
 
 def _apply_turnover_cap_numpy(
