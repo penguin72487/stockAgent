@@ -96,6 +96,98 @@ def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
     assert "`delta_value=+40,000`" in rebalance_pages[0]
 
 
+def test_signal_now_detail_pages_include_actionable_decisions() -> None:
+    cfg = SimpleNamespace(
+        market="unit",
+        min_abs_delta=0.001,
+        current_capital=None,
+        initial_capital=None,
+    )
+    result = SimpleNamespace(
+        summary={
+            "market": "unit",
+            "signal_id": "sig-test",
+            "panel_date": "2026-06-21",
+            "price_source": "panel_close",
+            "output_dir": "artifacts/live_signals/unit/2026-06-21/sig-test",
+            "positions_markdown_path": "artifacts/live_signals/unit/target_positions.md",
+            "rebalance_markdown_path": "artifacts/live_signals/unit/rebalance.md",
+            "decision_report_path": "artifacts/live_signals/unit/decision_report.md",
+        },
+        output_dir=None,
+        weights_rows=[
+            {
+                "symbol": "AAA",
+                "name": "Alpha",
+                "action": "BUY",
+                "current_weight": 0.01,
+                "target_weight": 0.05,
+                "delta_weight": 0.04,
+                "score": 1.2,
+                "current_price": 10.0,
+                "price_return": 0.02,
+            },
+        ],
+        rebalance_rows=[
+            {
+                "symbol": "AAA",
+                "name": "Alpha",
+                "action": "BUY",
+                "current_weight": 0.01,
+                "target_weight": 0.05,
+                "delta_weight": 0.04,
+                "trade_price": 10.0,
+                "price_return": 0.02,
+            },
+        ],
+        decision_rows=[
+            {
+                "symbol": "AAA",
+                "name": "Alpha",
+                "action": "BUY",
+                "current_weight": 0.01,
+                "model_weight": 0.06,
+                "target_weight": 0.05,
+                "delta_weight": 0.04,
+                "trade_price": 10.0,
+                "price_return": 0.02,
+                "score": 1.2,
+                "abs_score_rank": 1,
+                "abs_target_rank": 1,
+                "tradable": True,
+                "can_buy": True,
+                "can_sell": True,
+                "decision_reason": "positive_score, target_increase",
+            },
+            {
+                "symbol": "BBB",
+                "name": "Beta",
+                "action": "HOLD",
+                "current_weight": 0.0,
+                "model_weight": 0.0,
+                "target_weight": 0.0,
+                "delta_weight": 0.0,
+                "score": 0.0,
+                "decision_reason": "no_change",
+            },
+        ],
+    )
+
+    position_pages, rebalance_pages, decision_pages = _scheduled_detail_page_groups(
+        cfg,
+        result,
+        title_prefix="signal_now",
+        include_decisions=True,
+    )
+
+    assert "signal_now current / target positions" in position_pages[0]
+    assert "signal_now rebalance" in rebalance_pages[0]
+    assert "signal_now decision explanations" in decision_pages[0]
+    assert "`rows=1`" in decision_pages[0]
+    assert "`AAA` Alpha **BUY**" in decision_pages[0]
+    assert "`BBB`" not in decision_pages[0]
+
+
 def test_signal_enrichment_adds_capital_pnl_and_crypto_window_label() -> None:
     cfg = SimpleNamespace(
         market="crypto",
