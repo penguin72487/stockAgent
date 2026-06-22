@@ -4,6 +4,12 @@ import math
 from typing import Any
 
 
+INVESTMENT_WARNING = (
+    "投資警語：本訊號為量化模型依歷史與當前資料產生之研究/輔助資訊，"
+    "不構成投資建議或收益保證；下單前請自行確認價格、流動性、交易成本與風險。"
+)
+
+
 def _fmt_pct(value: float | int | None, digits: int = 2) -> str:
     if value is None:
         return "n/a"
@@ -64,7 +70,7 @@ def _fmt_path(value: Any) -> str | None:
 def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str:
     """Build a Discord-sized Traditional Chinese live signal message."""
     rebalance = list(summary.get("rebalance", []))[: max(0, int(max_rows))]
-    top_positions = list(summary.get("top_positions", []))[: min(max(0, int(max_rows)), 8)]
+    top_positions = list(summary.get("top_positions", []))[: max(0, int(max_rows))]
     warnings = list(summary.get("risk_warnings", []))
     target_risk = summary.get("target_risk", {}) if isinstance(summary.get("target_risk"), dict) else {}
     recent = summary.get("recent_performance", {}) if isinstance(summary.get("recent_performance"), dict) else {}
@@ -186,7 +192,10 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
         if explain_path:
             lines.append(f"explain: `{explain_path}`")
 
+    lines.extend(["", INVESTMENT_WARNING])
+
     message = "\n".join(lines)
     if len(message) <= 1900:
         return message
-    return message[:1890].rstrip() + "\n..."
+    suffix = "\n...\n" + INVESTMENT_WARNING
+    return message[: max(0, 1900 - len(suffix))].rstrip() + suffix

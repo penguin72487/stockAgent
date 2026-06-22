@@ -69,6 +69,9 @@ Useful commands:
   - `sort_by` accepts `delta`, `score`, `target`, `return`, or `rank`.
   - `detail:full` shows multi-line readable rows; `detail:compact` is denser.
   - `attach_file:true` uploads the full markdown decision report.
+- Trading-related pages clamp visible rows to at least 10 per page and include
+  an investment warning. The warning is informational; still verify price,
+  liquidity, fees, and risk before placing orders.
 - `/markets`
 - `/health`
 - `/daily_summary market:tw`
