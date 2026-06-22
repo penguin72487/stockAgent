@@ -983,7 +983,13 @@ def _active_position_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _scheduled_detail_page_groups(cfg: LiveMarketConfig, result: Any) -> list[list[str]]:
+def _scheduled_detail_page_groups(
+    cfg: LiveMarketConfig,
+    result: Any,
+    *,
+    title_prefix: str = "scheduled",
+    include_decisions: bool = False,
+) -> list[list[str]]:
     capital = _resolve_current_capital(cfg)
     summary = result.summary
     output_dir = summary.get("output_dir") or result.output_dir
@@ -1003,6 +1009,14 @@ def _scheduled_detail_page_groups(cfg: LiveMarketConfig, result: Any) -> list[li
 
     position_rows = _annotate_weight_rows_with_capital(_active_position_rows(list(result.weights_rows)), capital)
     rebalance_rows = _annotate_weight_rows_with_capital(list(result.rebalance_rows), capital)
+    decision_rows = _sort_decision_rows(
+        _filter_decision_rows(
+            list(getattr(result, "decision_rows", [])),
+            action="actionable",
+            actionable_only=True,
+        ),
+        "delta",
+    )
 
     position_header = [
         *common_header,
@@ -1014,23 +1028,45 @@ def _scheduled_detail_page_groups(cfg: LiveMarketConfig, result: Any) -> list[li
         _kv_line(("rows", len(rebalance_rows)), ("threshold", cfg.min_abs_delta), ("sort", "abs delta")),
         f"full: `{summary.get('rebalance_markdown_path', summary.get('rebalance_path', 'n/a'))}`",
     ]
+    decision_full_path = (
+        summary.get("decision_report_path")
+        or summary.get("decision_explanation_markdown_path")
+        or summary.get("decision_explanation_path")
+        or "n/a"
+    )
+    decision_header = [
+        *common_header,
+        _kv_line(("rows", len(decision_rows)), ("filter", "actionable"), ("sort", "abs delta")),
+        f"full: `{decision_full_path}`",
+    ]
 
-    return [
+    groups = [
         _line_pages(
-            title="scheduled current / target positions",
+            title=f"{title_prefix} current / target positions",
             rows=position_rows,
             formatter=_position_line,
             page_size=20,
             header_lines=position_header,
         ),
         _line_pages(
-            title="scheduled rebalance",
+            title=f"{title_prefix} rebalance",
             rows=rebalance_rows,
             formatter=_rebalance_line,
             page_size=20,
             header_lines=rebalance_header,
         ),
     ]
+    if include_decisions:
+        groups.append(
+            _line_pages(
+                title=f"{title_prefix} decision explanations",
+                rows=decision_rows,
+                formatter=_decision_block,
+                page_size=10,
+                header_lines=decision_header,
+            )
+        )
+    return groups
 
 
 def _status_line(key: str, cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> str:
@@ -1789,7 +1825,7 @@ async def signal_now(
             top_n=_top_n(top_n),
             min_abs_delta=min_abs_delta,
         )
-        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=_top_n(top_n))
+        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0)
     except Exception as exc:
         await _send_command_error(interaction, "live signal", exc)
         return
@@ -1810,6 +1846,13 @@ async def signal_now(
         str(result.summary.get("signal_id")),
         str(result.summary.get("market") or market or _default_market()),
     )
+    for pages in _scheduled_detail_page_groups(
+        cfg,
+        result,
+        title_prefix="signal_now",
+        include_decisions=True,
+    ):
+        await _send_paginated_response(interaction, pages)
 
 
 @bot.tree.command(name="positions", description="Show target position weights.")
@@ -2324,7 +2367,7 @@ async def scheduled_signal() -> None:
                 scheduled=True,
                 price_source=resolved_price_source,
             )
-            result = _enrich_signal_performance_for_discord(cfg, result, max_rows=_top_n(cfg.top_n))
+            result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0)
         except BotUserError as exc:
             if not isinstance(exc, MarketClosedError):
                 await channel.send(str(exc))
