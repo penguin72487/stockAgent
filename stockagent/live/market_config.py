@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import shlex
 
 import yaml
 
@@ -31,10 +32,16 @@ class LiveMarketConfig:
     open_time: str | None = None
     close_time: str | None = None
     schedule_time: str | None = None
+    schedule_interval_minutes: int | None = None
+    schedule_delay_seconds: int = 0
     summary_time: str | None = None
     data_ready_time: str | None = None
     freshness_max_lag_days: int = 1
+    freshness_max_lag_minutes: int | None = None
     freshness_scan_limit: int = 0
+    history_frequency: str = "daily"
+    pre_signal_command: tuple[str, ...] = ()
+    pre_signal_timeout_seconds: int = 900
     holidays: tuple[str, ...] = ()
     benchmark_window_days: int = 20
     max_turnover_warning: float = 1.5
@@ -122,6 +129,17 @@ def _str_tuple(value: Any) -> tuple[str, ...]:
     return tuple(item.strip() for item in str(value).split(",") if item.strip())
 
 
+def _command_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value if str(item).strip())
+    text = str(value).strip()
+    if not text:
+        return ()
+    return tuple(shlex.split(text))
+
+
 def _int_tuple(value: Any) -> tuple[int, ...]:
     out: list[int] = []
     for item in _str_tuple(value):
@@ -166,10 +184,16 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         open_time=_optional_str(raw.get("open_time")),
         close_time=_optional_str(raw.get("close_time")),
         schedule_time=_optional_str(raw.get("schedule_time")),
+        schedule_interval_minutes=_optional_int(raw.get("schedule_interval_minutes")),
+        schedule_delay_seconds=int(raw.get("schedule_delay_seconds") or 0),
         summary_time=_optional_str(raw.get("summary_time")),
         data_ready_time=_optional_str(raw.get("data_ready_time")),
         freshness_max_lag_days=int(raw.get("freshness_max_lag_days") or 1),
+        freshness_max_lag_minutes=_optional_int(raw.get("freshness_max_lag_minutes")),
         freshness_scan_limit=int(raw.get("freshness_scan_limit") or 0),
+        history_frequency=str(raw.get("history_frequency") or "daily"),
+        pre_signal_command=_command_tuple(raw.get("pre_signal_command")),
+        pre_signal_timeout_seconds=int(raw.get("pre_signal_timeout_seconds") or 900),
         holidays=_str_tuple(raw.get("holidays")),
         benchmark_window_days=int(raw.get("benchmark_window_days") or 20),
         max_turnover_warning=float(raw.get("max_turnover_warning") or 1.5),

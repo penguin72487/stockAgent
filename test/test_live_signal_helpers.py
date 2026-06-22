@@ -6,7 +6,7 @@ import polars as pl
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
 from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
 from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
-from stockagent.live.signal_engine import _build_decision_rows
+from stockagent.live.signal_engine import _build_decision_rows, _date_string, _load_previous_weights, write_live_weights_history
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
 
@@ -90,6 +90,44 @@ def test_build_decision_rows_records_scores_constraints_and_reasons() -> None:
     assert rows[-1]["constraint"] == "not_tradable"
 
 
+def test_live_signal_dates_preserve_intraday_time_and_live_weights_take_precedence(tmp_path) -> None:
+    assert _date_string(np.datetime64("2026-06-22T00:15:00")) == "2026-06-22 00:15:00"
+    assert _date_string(np.datetime64("2026-06-22")) == "2026-06-22"
+
+    fold_dir = tmp_path / "fold_06"
+    fold_dir.mkdir()
+    pl.DataFrame({"date": ["2026-06-19"], "AAA": [0.90]}).write_parquet(fold_dir / "daily_weights.parquet")
+
+    first_summary = {"asof_date": "2026-06-22 00:00:00"}
+    first_rows = [{"symbol": "AAA", "target_weight": 0.10}]
+    path = write_live_weights_history(fold_dir, first_summary, first_rows)
+    second_summary = {"asof_date": "2026-06-22 00:15:00"}
+    second_rows = [{"symbol": "AAA", "target_weight": 0.20}]
+    write_live_weights_history(fold_dir, second_summary, second_rows)
+
+    weights, date_text, weights_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=6,
+        weights_path=None,
+        asof_date="2026-06-22 00:10:00",
+    )
+    assert weights_path == path
+    assert date_text == "2026-06-22 00:00:00"
+    assert np.isclose(weights[0], 0.10)
+
+    weights, date_text, weights_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=6,
+        weights_path=None,
+        asof_date="2026-06-22 00:20:00",
+    )
+    assert weights_path == path
+    assert date_text == "2026-06-22 00:15:00"
+    assert np.isclose(weights[0], 0.20)
+
+
 def test_load_stock_history_combines_model_integer_and_holding_tables(tmp_path) -> None:
     fold_dir = tmp_path / "fold_25"
     fold_dir.mkdir()
@@ -134,6 +172,103 @@ def test_load_stock_history_combines_model_integer_and_holding_tables(tmp_path) 
     assert result.rows[0]["shares"] == -5
     assert np.isclose(result.rows[0]["model_weight_delta"], -0.35)
     assert np.isclose(result.rows[1]["holding_ratio"], 0.12)
+
+
+def test_load_stock_history_collapses_intraday_snapshots_to_daily(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_06"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "AAA": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "AAA": [0.08, 0.18, 0.28],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_weights.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05"],
+            "symbol": ["AAA", "AAA", "AAA"],
+            "shares": [10, 20, 30],
+            "price": [10.0, 11.0, 12.0],
+            "market_value": [100.0, 220.0, 360.0],
+            "holding_ratio": [0.08, 0.18, 0.28],
+            "is_cash": [False, False, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "portfolio_return": [0.01, 0.02, 0.03],
+            "benchmark_return": [0.00, 0.01, -0.01],
+            "turnover": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_stock_history(fold_dir, "AAA", limit=0, changes_only=False)
+
+    assert [row["date"] for row in result.rows] == ["2026-01-05", "2026-01-02"]
+    assert np.isclose(result.rows[1]["model_weight"], 0.20)
+    assert np.isclose(result.rows[1]["actual_weight"], 0.18)
+    assert result.rows[1]["shares"] == 20
+    assert np.isclose(result.rows[1]["market_value"], 220.0)
+    assert np.isclose(result.rows[1]["portfolio_return"], 1.01 * 1.02 - 1.0)
+    assert np.isclose(result.rows[1]["turnover"], 0.30)
+    assert result.rows[0]["prev_shares"] == 20
+    assert result.rows[0]["share_delta"] == 10
+
+
+def test_load_stock_history_can_preserve_intraday_bar_rows(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_06"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "AAA": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "AAA": [0.08, 0.18, 0.28],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_weights.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05"],
+            "symbol": ["AAA", "AAA", "AAA"],
+            "shares": [10, 20, 30],
+            "price": [10.0, 11.0, 12.0],
+            "market_value": [100.0, 220.0, 360.0],
+            "holding_ratio": [0.08, 0.18, 0.28],
+            "is_cash": [False, False, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "portfolio_return": [0.01, 0.02, 0.03],
+            "benchmark_return": [0.00, 0.01, -0.01],
+            "turnover": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_stock_history(fold_dir, "AAA", limit=0, changes_only=False, frequency="bar")
+
+    assert [row["date"] for row in result.rows] == [
+        "2026-01-05 00:00:00",
+        "2026-01-02 00:15:00",
+        "2026-01-02 00:00:00",
+    ]
+    assert np.isclose(result.rows[1]["portfolio_return"], 0.02)
+    assert np.isclose(result.rows[1]["turnover"], 0.20)
+    assert result.rows[1]["shares"] == 20
+    assert np.isclose(result.rows[1]["market_value"], 220.0)
+    assert result.rows[1]["prev_shares"] == 10
 
 
 def test_load_portfolio_history_summarizes_pnl_and_holding_changes(tmp_path) -> None:
@@ -204,6 +339,97 @@ def test_load_portfolio_history_scales_values_from_current_capital(tmp_path) -> 
     assert np.isclose(result.rows[0]["changes"][0]["market_value_delta"], 200.0)
 
 
+def test_load_portfolio_history_collapses_intraday_snapshots_to_daily(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_06"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
+            "symbol": ["CASH", "AAA", "CASH", "AAA", "CASH", "AAA"],
+            "shares": [900, 10, 800, 20, 700, 30],
+            "price": [1.0, 10.0, 1.0, 11.0, 1.0, 12.0],
+            "market_value": [900.0, 100.0, 800.0, 220.0, 700.0, 360.0],
+            "holding_ratio": [0.90, 0.10, 0.80, 0.22, 0.70, 0.36],
+            "is_cash": [True, False, True, False, True, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "portfolio_return": [0.01, 0.02, 0.03],
+            "benchmark_return": [0.00, 0.01, -0.01],
+            "turnover": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_portfolio_history(fold_dir, days=2, top_changes=2, symbol_names={"AAA": "Alpha"})
+
+    assert result.days == 2
+    assert result.start_date == "2026-01-02"
+    assert result.end_date == "2026-01-05"
+    assert [row["date"] for row in result.rows] == ["2026-01-05", "2026-01-02"]
+    assert np.isclose(result.period_return, (1.01 * 1.02) * 1.03 - 1.0)
+    assert np.isclose(result.rows[1]["portfolio_return"], 1.01 * 1.02 - 1.0)
+    assert np.isclose(result.rows[1]["turnover"], 0.30)
+    assert np.isclose(result.rows[1]["nav"], 1020.0)
+    assert np.isclose(result.rows[1]["gross_exposure"], 220.0)
+    assert result.rows[1]["position_count"] == 1
+    assert result.rows[1]["changes"][0]["action"] == "OPEN_LONG"
+    assert np.isclose(result.rows[1]["changes"][0]["holding_ratio"], 0.22)
+    assert result.rows[0]["changes"][0]["action"] == "ADD_LONG"
+    assert np.isclose(result.rows[0]["changes"][0]["market_value_delta"], 140.0)
+
+
+def test_load_portfolio_history_can_preserve_intraday_bar_rows(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_06"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": [
+                "2026-01-02",
+                "2026-01-02",
+                "2026-01-02",
+                "2026-01-02",
+                "2026-01-05",
+                "2026-01-05",
+            ],
+            "symbol": ["CASH", "AAA", "CASH", "AAA", "CASH", "AAA"],
+            "shares": [900, 10, 800, 20, 700, 30],
+            "price": [1.0, 10.0, 1.0, 11.0, 1.0, 12.0],
+            "market_value": [900.0, 100.0, 800.0, 220.0, 700.0, 360.0],
+            "holding_ratio": [0.90, 0.10, 0.80, 0.22, 0.70, 0.36],
+            "is_cash": [True, False, True, False, True, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02 00:00:00", "2026-01-02 00:15:00", "2026-01-05 00:00:00"],
+            "portfolio_return": [0.01, 0.02, 0.03],
+            "benchmark_return": [0.00, 0.01, -0.01],
+            "turnover": [0.10, 0.20, 0.30],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    result = load_portfolio_history(fold_dir, days=3, top_changes=2, frequency="bar")
+
+    assert result.frequency == "bar"
+    assert result.days == 3
+    assert result.start_date == "2026-01-02 00:00:00"
+    assert result.end_date == "2026-01-05 00:00:00"
+    assert [row["date"] for row in result.rows] == [
+        "2026-01-05 00:00:00",
+        "2026-01-02 00:15:00",
+        "2026-01-02 00:00:00",
+    ]
+    assert np.isclose(result.period_return, 1.01 * 1.02 * 1.03 - 1.0)
+    assert np.isclose(result.rows[1]["portfolio_return"], 0.02)
+    assert np.isclose(result.rows[1]["turnover"], 0.20)
+    assert np.isclose(result.rows[1]["nav"], 1020.0)
+    assert np.isclose(result.rows[1]["profit_value"], 20.0)
+    assert result.rows[1]["changes"][0]["action"] == "ADD_LONG"
+    assert np.isclose(result.rows[1]["changes"][0]["market_value_delta"], 120.0)
+
+
 def test_format_signal_message_stays_discord_sized() -> None:
     summary = {
         "asof_date": "2026-06-19",
@@ -244,3 +470,40 @@ def test_format_signal_message_stays_discord_sized() -> None:
     assert "explain:" in message
     assert INVESTMENT_WARNING in message
     assert len(message) < 1900
+
+
+def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
+    summary = {
+        "asof_date": "2026-06-22 00:15:00",
+        "panel_date": "2026-06-22 00:15:00",
+        "previous_weights_date": "2026-06-22 00:00:00",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.002,
+        "display_capital": 100_000.0,
+        "portfolio_pnl_value": 1_000.0,
+        "benchmark_pnl_value": 200.0,
+        "excess_pnl_value": 800.0,
+        "recent_performance": {
+            "window_days": 32,
+            "window_label": "過去32天",
+            "strategy_return": 0.08,
+            "benchmark_return": 0.03,
+            "excess_return": 0.05,
+            "strategy_pnl_value": 8_000.0,
+            "benchmark_pnl_value": 3_000.0,
+            "excess_pnl_value": 5_000.0,
+        },
+    }
+
+    message = format_signal_message(summary, max_rows=0)
+
+    assert "上個訊號到現在" in message
+    assert "`portfolio=+1.00%`" in message
+    assert "`baseline=+0.20%`" in message
+    assert "`excess=+0.80%`" in message
+    assert "`capital=100,000`" in message
+    assert "`pnl=+1,000`" in message
+    assert "過去32天" in message
+    assert "`strategy=+8.00%`" in message
+    assert "`baseline=+3.00%`" in message
+    assert "`excess_pnl=+5,000`" in message

@@ -258,9 +258,15 @@ run_yahoo_incremental() {
   fi
 
   for asset in "${assets[@]}"; do
+    local yahoo_mode="daily-update"
+    local step_suffix="daily_update"
+    if [[ "$asset" == "crypto" ]]; then
+      yahoo_mode="incremental"
+      step_suffix="15m_update"
+    fi
     base_cmd=(
       "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py
-      --mode daily-update
+      --mode "$yahoo_mode"
       --asset "$asset"
       --end-date "$today"
       --workers "$WORKERS"
@@ -282,7 +288,7 @@ run_yahoo_incremental() {
       fi
     fi
 
-    run_step "yahoo_${asset}_daily_update" "${run_cmd[@]}" || rc=1
+    run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}" || rc=1
   done
   return "$rc"
 }
@@ -334,22 +340,22 @@ run_cex_incremental() {
 
   today="$(date +%F)"
   if [[ "$RUN_CEX_PERP" != "1" ]]; then
-    log "skip=cex_perp_daily_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
+    log "skip=cex_perp_15m_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
     return 0
   fi
 
-  run_step okx_perp_daily_update \
-    "$PYTHON_BIN" downloader/download_okx_perp_daily.py \
-    --mode daily-update \
+  run_step okx_perp_15m_update \
+    "$PYTHON_BIN" downloader/download_okx_perp_15m.py \
+    --mode incremental \
     --end-date "$today" \
     --workers "$OKX_WORKERS" \
     --request-interval "$OKX_REQUEST_INTERVAL" \
     --max-retries "$OKX_MAX_RETRIES" || rc=1
 
   read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
-  run_step bybit_perp_daily_update \
-    "$PYTHON_BIN" downloader/download_bybit_perp_daily.py \
-    --mode daily-update \
+  run_step bybit_perp_15m_update \
+    "$PYTHON_BIN" downloader/download_bybit_perp_15m.py \
+    --mode incremental \
     --end-date "$today" \
     --workers "$BYBIT_WORKERS" \
     --request-interval "$BYBIT_REQUEST_INTERVAL" \

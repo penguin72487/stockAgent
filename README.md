@@ -39,6 +39,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Use `python downloader/download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
 - Use `python downloader/download_yahoo_ohlcv.py --asset us_stocks` to download only the expanded U.S. stock universe.
 - Use `python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
+- Use `python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` to refresh only missing/stale Yahoo crypto 15-minute bars.
 - Yahoo crypto uses 15-minute bars; existing crypto parquet files that look like old daily data are rebuilt from the 15-minute source instead of being merged.
 - Use `python downloader/download_yahoo_ohlcv.py --asset forex` to download only the expanded FX universe.
 - Use `python downloader/download_forex_pepperstone.py` to download the Pepperstone-style FX universe.
@@ -47,18 +48,18 @@ Multi-asset Taiwan stock trading research workspace.
 - Use `python downloader/download_pepperstone.py` to download grouped Pepperstone-style data to `data_peperstone/24hTrading`, `data_peperstone/commodites`, `data_peperstone/crypto`, and `data_peperstone/fores`.
 - Use `python downloader/download_pepperstone.py --groups crypto fores` to download only selected groups.
 - Use `python downloader/download_pepperstone.py --mode daily-update --groups all` for daily incremental updates across groups.
-- Use `python downloader/download_okx_perp_daily.py --output-dir data_okx` to download all OKX perpetual swap 15-minute bars.
-- Use `python downloader/download_okx_perp_daily.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
-- Use `python downloader/download_okx_perp_daily.py --mode daily-update` for incremental updates (only missing candles).
-- Use `python downloader/download_okx_perp_daily.py --mode full --refresh` when you need a full re-download.
-- Use `python downloader/download_bybit_perp_daily.py --output-dir data_bybit` to download Bybit perpetual 15-minute bars.
-- Use `python downloader/download_bybit_perp_daily.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
-- Use `python downloader/download_bybit_perp_daily.py --mode daily-update` for incremental updates (only missing candles).
+- Use `python downloader/download_okx_perp_15m.py --output-dir data_okx` to download all OKX perpetual swap 15-minute bars.
+- Use `python downloader/download_okx_perp_15m.py --start-date 2020-01-01 --workers 6` to control download range and parallelism.
+- Use `python downloader/download_okx_perp_15m.py --mode incremental` for incremental updates (only missing 15-minute candles).
+- Use `python downloader/download_okx_perp_15m.py --mode full --refresh` when you need a full re-download.
+- Use `python downloader/download_bybit_perp_15m.py --output-dir data_bybit` to download Bybit perpetual 15-minute bars.
+- Use `python downloader/download_bybit_perp_15m.py --categories linear inverse --start-date 2020-01-01 --workers 6` to control Bybit categories, range, and parallelism.
+- Use `python downloader/download_bybit_perp_15m.py --mode incremental` for incremental updates (only missing 15-minute candles).
 - Use `python downloader/download_forex_frankfurter.py --mode daily-update --output-dir data_yahoo/forex` for daily incremental FX updates from Frankfurter.
 - Each asset folder includes `symbols.csv`, `download_report.csv`, and `download_summary.json` alongside `*_features.parquet` files.
 - Parquet output includes at least `date`, `open`, `max`, `min`, `close`, `adjclose`, `Trading_Volume`, and also preserves extra Yahoo columns when available (for example `Dividends`, `Stock Splits`).
 - Override the default universe with `--symbols` or `--symbols-file`, for example `python download_yahoo_ohlcv.py --asset forex --symbols EURUSD GBPUSD USDJPY`.
-- Use `python download_yahoo_ohlcv.py --mode daily-update --asset all` for daily incremental updates across Yahoo assets.
+- Use `python download_yahoo_ohlcv.py --mode incremental --asset all` for incremental updates across Yahoo assets; crypto remains 15-minute.
 
 ### Repair Mode
 
@@ -72,7 +73,7 @@ Multi-asset Taiwan stock trading research workspace.
 ### Daily All-Market Update
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
-- The script runs Yahoo all-asset daily-update (`tw_stocks`, `us_stocks`, `crypto`, `forex`), Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
+- The script runs Yahoo all-asset update (`tw_stocks`, `us_stocks`, `crypto`, `forex`; crypto uses 15-minute bars), Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
 - Set `RUN_PEPPERSTONE_GROUPS=0` to skip Pepperstone groups when you only want Yahoo+Frankfurter.
 - Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
 - Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
@@ -99,13 +100,24 @@ Multi-asset Taiwan stock trading research workspace.
   `/rebalance`, `/portfolio_history`, `/stock_history`, and `/explain_signal`
   use paged Discord responses so long lists are not truncated.
   `/portfolio_history market:tw days:32 current_capital:1000000` shows recent
-  daily PnL, current exposure, and holding changes from fold artifacts scaled to
-  the supplied capital. `/stock_history market:tw symbol:2330 limit:32` shows
-  recent per-symbol trade/adjustment records. `/positions` and `/rebalance`
-  accept `current_capital` to estimate current/target/trade amounts.
+  PnL, current exposure, and holding changes from fold artifacts scaled to the
+  supplied capital. Daily markets use days; crypto can set
+  `history_frequency: bar` to show 15-minute bars. `/stock_history market:tw
+  symbol:2330 limit:32` shows recent per-symbol trade/adjustment records.
+  `/positions` and `/rebalance` accept `current_capital` to estimate
+  current/target/trade amounts.
   `/set_capital` stores per-market default capital. `/explain_signal` can
   filter by symbol/action, sort by delta/score/target/return/rank, and
   optionally attach the full markdown decision report.
+- Crypto Discord scheduling can use `schedule_interval_minutes: 15` plus a
+  `pre_signal_command` data updater so each completed 15-minute bar is fetched
+  before the bot sends the next signal. For manual testing, run
+  `/signal_now market:crypto refresh_data:true`.
+- `/signal_now` with `price_source:auto` now treats open markets as realtime:
+  it runs the configured updater when available and uses current prices; closed
+  markets use the latest panel close.
+- Set `STOCKAGENT_SCHEDULED_MARKETS=all` to schedule every configured Discord
+  market YAML.
 
 ## Environment
 

@@ -105,6 +105,16 @@ def _strict_no_fallback(args: argparse.Namespace | None = None) -> bool:
     if args is not None and hasattr(args, "strict_no_fallback"):
         return bool(getattr(args, "strict_no_fallback"))
     return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
+
+
+def _is_incremental_mode(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "mode", "")).strip().lower() in {"incremental", "daily-update"}
+
+
+def _mode_label(args: argparse.Namespace) -> str:
+    return str(getattr(args, "mode", "") or "download")
+
+
 YF_CRYPTO_INTRADAY_INTERVAL = "15m"
 YF_CRYPTO_INTRADAY_SECONDS = 15 * 60
 YF_CRYPTO_MAX_LOOKBACK_DAYS = 59
@@ -478,12 +488,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Yahoo Finance OHLCV data into asset-specific parquet directories.")
     parser.add_argument(
         "--mode",
-        choices=["download", "repair", "daily-update"],
+        choices=["download", "repair", "incremental", "daily-update"],
         default="download",
         help=(
             "download: grab the configured universe; "
             "repair: check existing parquet files and refill missing/stale data; "
-            "daily-update: incremental refresh (same behavior as repair; crypto uses 15m bars)."
+            "incremental: refresh missing/stale data; crypto uses 15m bars; "
+            "daily-update: deprecated alias for incremental."
         ),
     )
     parser.add_argument(
@@ -553,7 +564,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=14,
         help=(
-            "Only for --mode daily-update: skip symbols whose local last date lags target end date "
+            "Only for --mode incremental/daily-update: skip symbols whose local last date lags target end date "
             "by more than this many days. Set 0 to disable."
         ),
     )
@@ -562,7 +573,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Only for --mode daily-update: merge fresh stock listings and delisted candidates "
+            "Only for --mode incremental/daily-update: merge fresh stock listings and delisted candidates "
             "from upstream symbol sources into the local tracked universe."
         ),
     )
@@ -571,7 +582,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Only for --mode daily-update: retry symbols that are already present in symbols.csv "
+            "Only for --mode incremental/daily-update: retry symbols that are already present in symbols.csv "
             "but still have no local parquet/whitelist entry. Default false prevents repeated "
             "downloads of known Yahoo-unavailable candidates."
         ),
@@ -696,7 +707,7 @@ def _previous_weekday(value: date) -> date:
 
 def _effective_repair_target_end_date(asset_class: str, args: argparse.Namespace) -> date:
     requested = _parse_date(args.end_date or _today_str()).date()
-    if getattr(args, "mode", "") != "daily-update":
+    if not _is_incremental_mode(args):
         return requested
     if asset_class not in WEEKDAY_DAILY_ASSET_CLASSES:
         return requested
@@ -1685,7 +1696,7 @@ def _load_forex_expanded_fallback() -> list[SymbolRecord]:
 
 
 def _load_local_tracked_records(asset_class: str, output_dir: Path, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    """For daily-update, prefer symbols that are already tracked locally.
+    """For incremental updates, prefer symbols that are already tracked locally.
 
     This avoids reprocessing huge historical universes from stale manifests.
     """
@@ -1768,11 +1779,11 @@ def _use_daily_update_cache_if_available(
     args: argparse.Namespace,
     cached: list[SymbolRecord],
 ) -> list[SymbolRecord] | None:
-    is_daily_update = getattr(args, "mode", "") == "daily-update"
-    if cached and is_daily_update and not getattr(args, "daily_discover_symbols", True):
+    is_incremental = _is_incremental_mode(args)
+    if cached and is_incremental and not getattr(args, "daily_discover_symbols", True):
         records = _filter_records_for_supported_universe(asset_class, cached)
         pruned = len(cached) - len(records)
-        message = f"[symbols] daily-update: cached manifest {asset_class} ({len(records)} symbols, skipping HTTP)"
+        message = f"[symbols] {_mode_label(args)}: cached manifest {asset_class} ({len(records)} symbols, skipping HTTP)"
         if pruned:
             message += f"; pruned {pruned} unsupported records"
         print(message)
@@ -1781,9 +1792,9 @@ def _use_daily_update_cache_if_available(
 
 
 def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("tw_stocks", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("tw_stocks", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     records: list[SymbolRecord] = []
     local_manifest_records = _load_tw_symbols_from_local_manifest()
@@ -1856,9 +1867,9 @@ def _discover_daily_stock_records(
 
 
 def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("us_stocks", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("us_stocks", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     repo_fallback_records = _load_repo_symbol_fallback("us_stocks")
     records = [] if _strict_no_fallback(args) else _records_from_defaults("us_stocks")
@@ -1908,9 +1919,9 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
 
 
 def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("crypto", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("crypto", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     repo_fallback_records = _load_repo_symbol_fallback("crypto")
     records = [] if _strict_no_fallback(args) else _records_from_defaults("crypto")
@@ -1941,9 +1952,9 @@ def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]
 
 
 def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("forex", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("forex", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     repo_fallback_records = _load_repo_symbol_fallback("forex")
     records = [] if _strict_no_fallback(args) else _records_from_defaults("forex")
@@ -2007,9 +2018,10 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         output_dir = _resolve_asset_output_dir(args, asset_class)
         cached = _resolve_cached_manifest(output_dir, asset_class)
         blacklist_symbols = _load_blacklist(_blacklist_file_path(output_dir))
-        is_daily_update = getattr(args, "mode", "") == "daily-update"
+        is_incremental = _is_incremental_mode(args)
+        mode_label = _mode_label(args)
 
-        if is_daily_update:
+        if is_incremental:
             active_records = _load_local_tracked_records(asset_class, output_dir, cached)
             if not _strict_no_fallback(args):
                 active_records.extend(_records_from_defaults(asset_class))
@@ -2022,7 +2034,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 active_records = _filter_tw_records_for_supported_universe(active_records)
                 if active_before != len(active_records):
                     print(
-                        f"[symbols] daily-update: pruned {active_before - len(active_records)} "
+                        f"[symbols] {mode_label}: pruned {active_before - len(active_records)} "
                         "unsupported tw_stocks active records outside stock/ETF universe"
                     )
             elif asset_class == "us_stocks":
@@ -2030,7 +2042,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 active_records = _filter_us_records_for_broker_tradable_universe(active_records)
                 if active_before != len(active_records):
                     print(
-                        f"[symbols] daily-update: pruned {active_before - len(active_records)} "
+                        f"[symbols] {mode_label}: pruned {active_before - len(active_records)} "
                         "unsupported us_stocks active records outside broker-tradable universe"
                     )
 
@@ -2041,7 +2053,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 manifest_records = _filter_tw_records_for_supported_universe(manifest_records)
                 if manifest_before != len(manifest_records):
                     print(
-                        f"[symbols] daily-update: pruned {manifest_before - len(manifest_records)} "
+                        f"[symbols] {mode_label}: pruned {manifest_before - len(manifest_records)} "
                         "unsupported tw_stocks manifest records outside stock/ETF universe"
                     )
             elif asset_class == "us_stocks":
@@ -2049,7 +2061,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 manifest_records = _filter_us_records_for_broker_tradable_universe(manifest_records)
                 if manifest_before != len(manifest_records):
                     print(
-                        f"[symbols] daily-update: pruned {manifest_before - len(manifest_records)} "
+                        f"[symbols] {mode_label}: pruned {manifest_before - len(manifest_records)} "
                         "unsupported us_stocks manifest records outside broker-tradable universe"
                     )
             known_before = {record.code for record in manifest_records}
@@ -2065,7 +2077,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 known_missing = _filter_records_for_supported_universe(asset_class, known_missing)
                 if known_missing:
                     print(
-                        f"[symbols] daily-update: retrying {len(known_missing)} known missing "
+                        f"[symbols] {mode_label}: retrying {len(known_missing)} known missing "
                         f"{asset_class} symbols from cached manifest"
                     )
                     active_records.extend(known_missing)
@@ -2076,7 +2088,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 new_from_repo = [record for record in repo_candidates if record.code not in known_before]
                 if new_from_repo:
                     print(
-                        f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
+                        f"[symbols] {mode_label}: adding {len(new_from_repo)} new symbols "
                         f"from repo fallback manifest for {asset_class}"
                     )
                     active_records.extend(new_from_repo)
@@ -2093,7 +2105,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                             f"Daily symbol discovery failed for {asset_class}; strict_no_fallback=true "
                             "so cached/repo discovery fallback is disabled."
                         ) from exc
-                    print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
+                    print(f"[symbols] {mode_label}: discovery failed for {asset_class}: {exc}")
                 else:
                     discovered = _filter_records_for_supported_universe(asset_class, discovered)
                     discovered_active_symbols: set[str] = set()
@@ -2138,7 +2150,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                     ]
                     if new_from_discovery:
                         print(
-                            f"[symbols] daily-update: adding {len(new_from_discovery)} new symbols "
+                            f"[symbols] {mode_label}: adding {len(new_from_discovery)} new symbols "
                             f"from upstream discovery for {asset_class}"
                         )
                         active_records.extend(new_from_discovery)
@@ -2162,7 +2174,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 active_deduped = active_deduped[: args.limit]
                 manifest_deduped = manifest_deduped[: args.limit]
             print(
-                f"[symbols] daily-update: scheduled {asset_class} "
+                f"[symbols] {mode_label}: scheduled {asset_class} "
                 f"({len(active_deduped)} scheduled, {len(manifest_deduped)} known; "
                 "parquet+whitelist+defaults+new_discovery)"
             )
@@ -2734,7 +2746,7 @@ def _resolve_repair_plan(
                 checks.append(_unavailable_skip(record, output_path, first_date, last_date))
                 continue
 
-            if args.mode == "daily-update" and args.daily_stale_max_lag_days > 0:
+            if _is_incremental_mode(args) and args.daily_stale_max_lag_days > 0:
                 lag_days = (target_end_dt - local_last_dt).days
                 if lag_days > args.daily_stale_max_lag_days:
                     checks.append(
@@ -2770,7 +2782,7 @@ def _resolve_repair_plan(
                 )
                 continue
             if (
-                args.mode == "daily-update"
+                _is_incremental_mode(args)
                 and checked_through_dt is not None
                 and checked_through_dt >= requested_target_end_dt
             ):
@@ -2894,7 +2906,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     )
     if adjustment_reason is not None:
         print(
-            f"[daily-update] asset={asset_class} effective_target_end={effective_target_end_dt.isoformat()} "
+            f"[{_mode_label(args)}] asset={asset_class} effective_target_end={effective_target_end_dt.isoformat()} "
             f"requested_end={requested_target_end_dt.isoformat()} reason={adjustment_reason}"
         )
 
@@ -3113,10 +3125,10 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
 
 def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dict[str, int]]:
     print(f"[{args.mode}] asset={asset_class} start={args.start_date} end={args.end_date}")
-    if args.mode == "daily-update":
+    if _is_incremental_mode(args):
         output_dir = _resolve_asset_output_dir(args, asset_class)
         if _asset_output_is_bootstrap_empty(output_dir):
-            print(f"[daily-update] asset={asset_class} bootstrap empty output; switching to download mode")
+            print(f"[{_mode_label(args)}] asset={asset_class} bootstrap empty output; switching to download mode")
             download_args = argparse.Namespace(**vars(args))
             download_args.mode = "download"
             counts = _download_asset_class(asset_class, download_args)
@@ -3160,6 +3172,8 @@ def main() -> None:
         summary_name = "download_summary.json"
     elif args.mode == "repair":
         summary_name = "repair_summary.json"
+    elif args.mode == "incremental":
+        summary_name = "incremental_update_summary.json"
     else:
         summary_name = "daily_update_summary.json"
     summary_path = Path(args.output_root) / summary_name

@@ -10,6 +10,30 @@ summary_time: "17:10"
 data_ready_time: "18:00"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
+pre_signal_command:
+  - /home/user/miniforge3/envs/fintech/bin/python
+  - downloader/download_yahoo_ohlcv.py
+  - --mode
+  - daily-update
+  - --asset
+  - forex
+  - --output-root
+  - data_yahoo
+  - --workers
+  - "16"
+  - --retries
+  - "2"
+  - --repair-overlap-days
+  - "7"
+  - --daily-stale-max-lag-days
+  - "0"
+  - --precheck-file-timeout-seconds
+  - "5"
+  - --repair-symbol-timeout-seconds
+  - "45"
+  - --no-daily-discover-symbols
+  - --no-daily-retry-known-missing-symbols
+pre_signal_timeout_seconds: 1200
 
 config_path: configs/markets/forex.yaml
 output_dir: artifacts/markets/forex
