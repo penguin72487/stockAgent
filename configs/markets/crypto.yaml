@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 6
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -55,7 +55,7 @@ training:
   compile_loss: true
   fused_log_utility_loss: true
   materialize_window_tensors: false
-  warm_start_from_previous_fold: true
+  warm_start_from_previous_fold: false
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
