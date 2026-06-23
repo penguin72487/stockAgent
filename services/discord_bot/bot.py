@@ -1263,6 +1263,200 @@ def _load_stock_history_for_market(
     return result
 
 
+def _history_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip().replace("T", " ")
+    if not text or text.lower() in {"none", "null", "nat", "n/a"}:
+        return None
+    candidates = [text]
+    if len(text) >= 19:
+        candidates.append(text[:19])
+    if len(text) >= 10:
+        candidates.append(text[:10])
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except Exception:
+            continue
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        return dt
+    return None
+
+
+def _compound_history_return(rows: list[dict[str, Any]], key: str) -> float | None:
+    total = 1.0
+    seen = False
+    for row in reversed(rows):
+        value = _float_or_none(row.get(key))
+        if value is None:
+            continue
+        total *= 1.0 + value
+        seen = True
+    return total - 1.0 if seen else None
+
+
+def _refresh_portfolio_history_window(result: PortfolioHistoryResult) -> None:
+    rows = list(result.rows)
+    cumulative = 1.0
+    for row in reversed(rows):
+        value = _float_or_none(row.get("portfolio_return"))
+        if value is None:
+            row["cumulative_return"] = None
+        else:
+            cumulative *= 1.0 + value
+            row["cumulative_return"] = cumulative - 1.0
+    result.rows = rows
+    result.days = len(rows)
+    result.start_date = str(rows[-1].get("date")) if rows else None
+    result.end_date = str(rows[0].get("date")) if rows else None
+    result.period_return = _compound_history_return(rows, "portfolio_return")
+    result.benchmark_return = _compound_history_return(rows, "benchmark_return")
+    result.profit_value = sum(float(row.get("profit_value") or 0.0) for row in rows)
+
+
+def _live_signal_change_row(row: dict[str, Any], *, capital: float | None) -> dict[str, Any]:
+    current_weight = _float_or_none(row.get("current_weight")) or 0.0
+    target_weight = _float_or_none(row.get("target_weight")) or 0.0
+    delta_weight = _float_or_none(row.get("delta_weight"))
+    if delta_weight is None:
+        delta_weight = target_weight - current_weight
+    current_value = current_weight * capital if capital is not None else None
+    target_value = target_weight * capital if capital is not None else None
+    delta_value = delta_weight * capital if capital is not None else None
+    return {
+        "symbol": str(row.get("symbol") or ""),
+        "name": str(row.get("name") or ""),
+        "action": str(row.get("action") or "HOLD"),
+        "price": row.get("trade_price", row.get("current_price")),
+        "market_value": target_value,
+        "prev_market_value": current_value,
+        "market_value_delta": delta_value,
+        "holding_ratio": target_weight,
+        "prev_holding_ratio": current_weight,
+        "holding_ratio_delta": delta_weight,
+        "is_live_signal": True,
+    }
+
+
+def _prepend_latest_signal_row_to_portfolio_history(
+    result: PortfolioHistoryResult,
+    *,
+    summary_path: Path,
+    summary: dict[str, Any],
+    max_rows: int,
+) -> bool:
+    signal_date = str(summary.get("asof_date") or summary.get("panel_date") or "").strip()
+    if not signal_date:
+        return False
+    signal_dt = _history_datetime(signal_date)
+    end_dt = _history_datetime(result.end_date)
+    if signal_dt is None or (end_dt is not None and signal_dt <= end_dt):
+        return False
+
+    capital = _float_or_none(summary.get("display_capital"))
+    result_capital = getattr(result, "capital", None)
+    if capital is None and result_capital is not None:
+        capital = _float_or_none(getattr(result_capital, "capital", None))
+    portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
+    benchmark_return = _float_or_none(summary.get("benchmark_simple_return"))
+    profit_value = _float_or_none(summary.get("portfolio_pnl_value"))
+    if profit_value is None and capital is not None and portfolio_return is not None:
+        profit_value = capital * portfolio_return
+
+    rebalance_path = _summary_artifact_path(summary, "rebalance_path", summary_path)
+    weights_path = _summary_artifact_path(summary, "weights_path", summary_path)
+    rebalance_rows: list[dict[str, Any]] = []
+    weight_rows: list[dict[str, Any]] = []
+    if rebalance_path is not None and rebalance_path.exists():
+        rebalance_rows = _read_parquet_rows(rebalance_path)
+    if weights_path is not None and weights_path.exists():
+        weight_rows = _read_parquet_rows(weights_path)
+
+    change_counts: dict[str, int] = {}
+    changes_all: list[dict[str, Any]] = []
+    for raw in rebalance_rows:
+        action = str(raw.get("action") or "HOLD").upper()
+        if action == "HOLD":
+            continue
+        change_counts[action] = change_counts.get(action, 0) + 1
+        changes_all.append(_live_signal_change_row(raw, capital=capital))
+    changes_all.sort(key=lambda row: abs(float(row.get("holding_ratio_delta") or 0.0)), reverse=True)
+
+    eps = 1e-9
+    target_weights = [_float_or_none(row.get("target_weight")) or 0.0 for row in weight_rows]
+    if target_weights:
+        position_count = sum(1 for value in target_weights if abs(value) > eps)
+        long_count = sum(1 for value in target_weights if value > eps)
+        short_count = sum(1 for value in target_weights if value < -eps)
+    else:
+        top_positions = summary.get("top_positions") if isinstance(summary.get("top_positions"), list) else []
+        position_count = len(top_positions)
+        long_count = sum(1 for row in top_positions if (_float_or_none(row.get("weight")) or 0.0) > eps)
+        short_count = sum(1 for row in top_positions if (_float_or_none(row.get("weight")) or 0.0) < -eps)
+
+    target_risk = summary.get("target_risk") if isinstance(summary.get("target_risk"), dict) else {}
+    gross = _float_or_none(target_risk.get("gross"))
+    if gross is None:
+        gross = _float_or_none(summary.get("target_gross"))
+    long_gross = _float_or_none(target_risk.get("long_gross"))
+    short_gross = _float_or_none(target_risk.get("short_gross"))
+    net = _float_or_none(target_risk.get("net"))
+    row = {
+        "date": signal_date,
+        "portfolio_return": portfolio_return,
+        "benchmark_return": benchmark_return,
+        "turnover": _float_or_none(summary.get("turnover")),
+        "profit_value": profit_value,
+        "nav": capital,
+        "gross_ratio": gross,
+        "net_ratio": net,
+        "cash_ratio": max(0.0, 1.0 - gross) if gross is not None else None,
+        "long_ratio": long_gross,
+        "short_ratio": short_gross,
+        "position_count": position_count,
+        "long_count": long_count,
+        "short_count": short_count,
+        "changes": changes_all[: max(0, int(result.top_changes))],
+        "change_counts": change_counts,
+        "change_count": sum(change_counts.values()),
+        "source": "latest_live_signal",
+    }
+
+    rows = [row, *result.rows]
+    try:
+        limit = int(max_rows)
+    except Exception:
+        limit = int(result.days or 0)
+    if limit > 0:
+        rows = rows[:limit]
+    result.rows = rows
+    source_paths = list(result.source_paths)
+    for path in (summary_path, weights_path, rebalance_path):
+        if path is not None and path.exists() and path not in source_paths:
+            source_paths.append(path)
+    result.source_paths = tuple(source_paths)
+    _refresh_portfolio_history_window(result)
+    return True
+
+
+def _include_latest_signal_in_portfolio_history(
+    cfg: LiveMarketConfig,
+    result: PortfolioHistoryResult,
+    *,
+    max_rows: int,
+) -> None:
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        return
+    summary_path, summary = latest
+    _prepend_latest_signal_row_to_portfolio_history(
+        result,
+        summary_path=summary_path,
+        summary=summary,
+        max_rows=max_rows,
+    )
+
+
 def _load_portfolio_history_for_market(
     cfg: LiveMarketConfig,
     days: int,
@@ -1286,6 +1480,7 @@ def _load_portfolio_history_for_market(
         symbol_names=_market_symbol_names(cfg),
         frequency=cfg.history_frequency,
     )
+    _include_latest_signal_in_portfolio_history(cfg, result, max_rows=days)
     _annotate_history_rows_with_display_time(cfg, result.rows)
     return result
 
@@ -1389,16 +1584,18 @@ def _portfolio_change_counts(row: dict[str, Any]) -> str:
 
 def _portfolio_change_line(row: dict[str, Any]) -> str:
     label = _symbol_label(row)
-    return (
-        f"{label} {row.get('action', 'HOLD')} "
-        f"Δhold={_signed_pct(row.get('holding_ratio_delta'))} "
-        f"hold={_pct(row.get('holding_ratio'))} "
-        f"value={_money(row.get('market_value'))} "
-        f"Δvalue={_signed_money(row.get('market_value_delta'))} "
-        f"shares={int(_float_or_none(row.get('shares')) or 0)} "
-        f"Δsh={int(_float_or_none(row.get('share_delta')) or 0):+d} "
-        f"px={_price(row.get('price'))}"
-    )
+    parts = [
+        f"{label} {row.get('action', 'HOLD')}",
+        f"Δhold={_signed_pct(row.get('holding_ratio_delta'))}",
+        f"hold={_pct(row.get('holding_ratio'))}",
+        f"value={_money(row.get('market_value'))}",
+        f"Δvalue={_signed_money(row.get('market_value_delta'))}",
+    ]
+    if row.get("shares") is not None or row.get("share_delta") is not None:
+        parts.append(f"shares={int(_float_or_none(row.get('shares')) or 0)}")
+        parts.append(f"Δsh={int(_float_or_none(row.get('share_delta')) or 0):+d}")
+    parts.append(f"px={_price(row.get('price'))}")
+    return " ".join(parts)
 
 
 def _portfolio_history_block(row: dict[str, Any]) -> str:
