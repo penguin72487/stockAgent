@@ -978,6 +978,7 @@ def generate_live_signal(
             max_turnover_ratio=config.trading.max_turnover_ratio,
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             can_buy_mask=torch.from_numpy(can_buy_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
             can_sell_mask=torch.from_numpy(can_sell_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
             return_weights_history=True,

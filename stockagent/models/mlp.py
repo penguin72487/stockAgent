@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from stockagent.models.normalization import dual_branch_softmax, masked_softmax
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax, normalize_portfolio_activation
 
 
 class CrossSectionalMLP(nn.Module):
@@ -18,6 +18,7 @@ class CrossSectionalMLP(nn.Module):
         embedding_dim: int = 64,
         hidden_layers: int = 2,
         long_only: bool = True,
+        portfolio_activation: str = "softsign",
     ) -> None:
         super().__init__()
         self.num_symbols = num_symbols
@@ -25,6 +26,7 @@ class CrossSectionalMLP(nn.Module):
         self.lookback = lookback
         self.hidden_layers = max(0, int(hidden_layers))
         self.long_only = bool(long_only)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         
         # Flatten each symbol's lookback window and compress it to embedding_dim.
         self.feature_embedding = nn.Linear(lookback * num_features, embedding_dim)
@@ -63,12 +65,8 @@ class CrossSectionalMLP(nn.Module):
         logits = self.portfolio_head(x).squeeze(-1)  # [B, S]
         
         if self.long_only:
-            # Long-only: non-negative weights that sum to 1 over tradable symbols.
-            if tradable_mask is not None:
-                weights = masked_softmax(logits, tradable_mask)
-            else:
-                weights = torch.softmax(logits, dim=1)
+            weights = masked_softmax(logits, tradable_mask, activation=self.portfolio_activation)
         else:
-            weights = dual_branch_softmax(logits, tradable_mask)
+            weights = dual_branch_softmax(logits, tradable_mask, activation=self.portfolio_activation)
         
         return weights

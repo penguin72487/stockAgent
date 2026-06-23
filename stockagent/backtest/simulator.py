@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import sys
@@ -12,6 +13,11 @@ from typing import Callable
 import numpy as np
 import torch
 
+from stockagent.models.normalization import (
+    DEFAULT_PORTFOLIO_ACTIVATION,
+    apply_portfolio_activation,
+    normalize_portfolio_activation,
+)
 from stockagent.runtime_env import normalize_cuda_env
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
@@ -160,14 +166,50 @@ def _resolve_exposure_budget(gross_leverage: float) -> float:
     return min(1.0, max(0.0, float(gross_leverage)))
 
 
+def _erf_numpy(values: np.ndarray) -> np.ndarray:
+    try:
+        from scipy import special as scipy_special  # type: ignore
+
+        return scipy_special.erf(values)
+    except Exception:
+        return np.vectorize(math.erf, otypes=[values.dtype])(values)
+
+
+def _apply_portfolio_activation_numpy(
+    values: np.ndarray,
+    dtype: np.dtype = np.dtype(np.float32),
+    activation: str | None = None,
+) -> np.ndarray:
+    activation_name = normalize_portfolio_activation(activation)
+    out = np.nan_to_num(values, nan=0.0, posinf=20.0, neginf=-20.0).astype(dtype, copy=False)
+    out = np.clip(out, dtype.type(-20.0), dtype.type(20.0))
+    if activation_name == "tanh":
+        return np.tanh(out).astype(dtype, copy=False)
+    if activation_name == "softsign":
+        return out / (dtype.type(1.0) + np.abs(out))
+    if activation_name == "isru":
+        return out / np.sqrt(dtype.type(1.0) + np.square(out))
+    if activation_name == "erf":
+        return _erf_numpy(out * dtype.type(math.sqrt(math.pi) / 2.0)).astype(dtype, copy=False)
+    if activation_name == "atan":
+        return (dtype.type(2.0 / math.pi) * np.arctan(out * dtype.type(math.pi / 2.0))).astype(dtype, copy=False)
+    if activation_name == "gudermannian":
+        return (
+            dtype.type(2.0 / math.pi)
+            * np.arctan(np.sinh(out * dtype.type(math.pi / 2.0)))
+        ).astype(dtype, copy=False)
+    raise AssertionError(f"Unhandled portfolio activation: {activation_name}")
+
+
 def _normalize_target_weights_numpy(
     weights: np.ndarray,
     *,
     long_only: bool,
     gross_budget: float,
+    portfolio_activation: str | None = None,
 ) -> np.ndarray:
-    """Normalize target weights via tanh + L1 and apply gross budget."""
-    out = np.tanh(np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False))
+    """Normalize target weights via bounded activation + L1 and apply gross budget."""
+    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), portfolio_activation)
     if long_only:
         out = np.clip(out, 0.0, None)
     l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
@@ -181,9 +223,10 @@ def _normalize_target_weights_row_numpy(
     *,
     long_only: bool,
     gross_budget: float,
+    portfolio_activation: str | None = None,
 ) -> np.ndarray:
-    """Single-row variant of tanh + L1 normalization for integer-share path."""
-    row = np.tanh(np.nan_to_num(weights_row, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False))
+    """Single-row variant of bounded activation + L1 normalization for integer-share path."""
+    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), portfolio_activation)
     if long_only:
         row = np.clip(row, 0.0, None)
     l1 = float(np.abs(row).sum(dtype=np.float64))
@@ -200,9 +243,10 @@ def _normalize_target_weights_torch(
     *,
     long_only: bool,
     gross_budget: float,
+    portfolio_activation: str | None = None,
 ) -> torch.Tensor:
-    """Torch normalization via tanh + L1 and gross budget scaling."""
-    out = torch.tanh(weights)
+    """Torch normalization via bounded activation + L1 and gross budget scaling."""
+    out = apply_portfolio_activation(weights, portfolio_activation)
     if long_only:
         out = out.clamp_min(0.0)
     l1 = out.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
@@ -1046,6 +1090,7 @@ class BacktestStaticInputs:
     max_turnover_ratio: float
     gross_leverage: float
     min_trade_weight: float = 0.0
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
 
 
 @dataclass(slots=True)
@@ -1080,6 +1125,7 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
             max_turnover_ratio=static.max_turnover_ratio,
             gross_leverage=static.gross_leverage,
             min_trade_weight=static.min_trade_weight,
+            portfolio_activation=static.portfolio_activation,
             can_buy_mask=static.can_buy_mask,
             can_sell_mask=static.can_sell_mask,
             return_weights_history=return_weights_history,
@@ -1107,6 +1153,7 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
             max_turnover_ratio=static.max_turnover_ratio,
             gross_leverage=static.gross_leverage,
             min_trade_weight=static.min_trade_weight,
+            portfolio_activation=static.portfolio_activation,
             can_buy_mask=static.can_buy_mask,
             can_sell_mask=static.can_sell_mask,
             sample_mask=static.sample_mask,
@@ -1146,6 +1193,7 @@ def _vectorized_backtest(
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     target_weights = np.asarray(weights, dtype=np.float32).copy()
     gross_budget = _resolve_exposure_budget(gross_leverage)
@@ -1158,6 +1206,7 @@ def _vectorized_backtest(
         target_weights,
         long_only=long_only,
         gross_budget=gross_budget,
+        portfolio_activation=portfolio_activation,
     )
     target_weights = _apply_min_trade_weight_numpy(target_weights, min_trade_weight)
 
@@ -1477,7 +1526,10 @@ def _prepare_runner_factory(
     long_only: bool,
     gross_budget: float,
     min_trade_weight: float,
+    portfolio_activation: str,
 ):
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+
     def _runner(
         weights: torch.Tensor,
         tradable_mask: torch.Tensor,
@@ -1493,6 +1545,7 @@ def _prepare_runner_factory(
             target_weights,
             long_only=long_only,
             gross_budget=gross_budget,
+            portfolio_activation=activation_name,
         )
         target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
         return target_weights, tradable, buy_mask, sell_mask
@@ -1508,6 +1561,7 @@ def _prepare_compile_key(
     long_only: bool,
     gross_budget: float,
     min_trade_weight: float,
+    portfolio_activation: str,
 ) -> tuple:
     return (
         str(weights.device),
@@ -1520,6 +1574,7 @@ def _prepare_compile_key(
         bool(long_only),
         float(gross_budget),
         float(min_trade_weight),
+        normalize_portfolio_activation(portfolio_activation),
         bool(_compile_dynamic_enabled()),
     )
 
@@ -1533,11 +1588,13 @@ def _resolve_prepare_runner(
     long_only: bool,
     gross_budget: float,
     min_trade_weight: float,
+    portfolio_activation: str,
 ):
     base_runner = _prepare_runner_factory(
         long_only=long_only,
         gross_budget=gross_budget,
         min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
     )
     # When an outer torch.compile is tracing risk_aware_loss, do not create a
     # nested compiled prepare runner and do not mutate compile stats. Stats dict
@@ -1562,6 +1619,7 @@ def _resolve_prepare_runner(
         long_only,
         gross_budget,
         min_trade_weight,
+        portfolio_activation,
     )
     if key in _PREP_COMPILE_FAILED:
         if _strict_no_fallback_enabled():
@@ -1617,6 +1675,7 @@ def _prepare_scan_inputs(
     long_only: bool,
     gross_leverage: float,
     min_trade_weight: float,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gross_budget = _resolve_exposure_budget(gross_leverage)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="backtest input preparation")
@@ -1630,6 +1689,7 @@ def _prepare_scan_inputs(
         long_only=long_only,
         gross_budget=gross_budget,
         min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
     )
     try:
         return runner(weights, tradable_mask, buy_input, sell_input)
@@ -1649,6 +1709,7 @@ def _prepare_scan_inputs(
             long_only,
             gross_budget,
             min_trade_weight,
+            portfolio_activation,
         )
         _PREP_COMPILE_FAILED.add(key)
         _PREP_COMPILED_CACHE.pop(key, None)
@@ -1669,6 +1730,7 @@ def _prepare_scan_inputs(
             long_only=long_only,
             gross_budget=gross_budget,
             min_trade_weight=min_trade_weight,
+            portfolio_activation=portfolio_activation,
         )
         return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
@@ -1685,6 +1747,7 @@ def _vectorized_backtest_torch(
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
@@ -1713,6 +1776,7 @@ def _vectorized_backtest_torch(
                 long_only,
                 gross_leverage,
                 min_trade_weight,
+                portfolio_activation,
             )
         _add_backtest_elapsed_stat("prep_s", prep_start)
         prev_init_start = _runtime_stat_start()
@@ -2019,6 +2083,7 @@ def run_backtest(
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
 ) -> BacktestResult:
@@ -2035,6 +2100,7 @@ def run_backtest(
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
     )
 
     return BacktestResult(
@@ -2056,6 +2122,7 @@ def run_backtest_torch_reduced(
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
     sample_mask: torch.Tensor | None = None,
@@ -2093,6 +2160,7 @@ def run_backtest_torch_reduced(
                 long_only,
                 gross_leverage,
                 min_trade_weight,
+                portfolio_activation,
             )
         _add_backtest_elapsed_stat("prep_s", prep_start)
 
@@ -2230,6 +2298,7 @@ def run_backtest_torch(
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
@@ -2250,6 +2319,7 @@ def run_backtest_torch(
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
         dense_mask_constraints=dense_mask_constraints,
@@ -2280,6 +2350,7 @@ def run_backtest_integer_shares(
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     close_prices: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
@@ -2367,6 +2438,7 @@ def run_backtest_integer_shares(
             target_w,
             long_only=long_only,
             gross_budget=gross_leverage,
+            portfolio_activation=portfolio_activation,
         )
         target_w = _apply_min_trade_weight_row_numpy(target_w, min_trade_weight)
 
@@ -2486,14 +2558,14 @@ def run_backtest_integer_shares(
         equity_after_trade = max(equity_after_trade, 1e-12)
 
         # Output normalization for holdings report:
-        # 1) tanh keeps signed direction in (-1, 1)
+        # 1) softsign keeps signed direction in (-1, 1)
         # 2) L1 normalization keeps total absolute exposure at 1.
         stock_holding_ratio_raw = stock_market_values / equity_after_trade
         cash_ratio_raw = float(cash / equity_after_trade)
         ratio_vec = np.empty(n_symbols + 1, dtype=np.float64)
         ratio_vec[0] = cash_ratio_raw
         ratio_vec[1:] = stock_holding_ratio_raw
-        ratio_vec = np.tanh(ratio_vec)
+        ratio_vec = _apply_portfolio_activation_numpy(ratio_vec, np.dtype(np.float64), portfolio_activation)
         l1 = float(np.sum(np.abs(ratio_vec), dtype=np.float64))
         if l1 > 1e-12:
             ratio_vec /= l1

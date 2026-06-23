@@ -4,7 +4,12 @@ import torch
 from torch import nn
 
 from stockagent.models.efficient_tcn_tabular_set_portfolio import LiteISAB
-from stockagent.models.normalization import finite_mask_fill_value, masked_softmax
+from stockagent.models.normalization import (
+    finite_mask_fill_value,
+    masked_activation_l1_weights,
+    masked_softmax,
+    normalize_portfolio_activation,
+)
 
 
 class CausalTCNBlock(nn.Module):
@@ -59,6 +64,7 @@ class BottleneckPortfolioAutoencoder(nn.Module):
         ffn_mult: int = 2,
         dropout: float = 0.1,
         long_short: bool = True,
+        portfolio_activation: str = "softsign",
         noise_std: float = 0.01,
         return_aux: bool = True,
         runtime_shape_check: bool = False,
@@ -73,6 +79,7 @@ class BottleneckPortfolioAutoencoder(nn.Module):
         self.temporal_type = str(temporal_type).strip().lower()
         self.asset_encoder_type = str(asset_encoder_type).strip().lower().replace("-", "_")
         self.long_short = bool(long_short)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.noise_std = float(noise_std)
         self.return_aux = bool(return_aux)
         self.runtime_shape_check = bool(runtime_shape_check)
@@ -202,10 +209,12 @@ class BottleneckPortfolioAutoencoder(nn.Module):
         return h_last.reshape(bsz, n_symbols, dim)
 
     def _long_short_weights(self, scores: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
-        raw = torch.tanh(torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0))
-        raw = raw.masked_fill(~mask_bool, 0.0)
-        denom = raw.abs().sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return raw / denom
+        return masked_activation_l1_weights(
+            scores,
+            mask_bool,
+            long_only=False,
+            activation=self.portfolio_activation,
+        )
 
     def forward(
         self,
@@ -248,7 +257,7 @@ class BottleneckPortfolioAutoencoder(nn.Module):
         if self.long_short:
             weights = self._long_short_weights(scores, mask_bool)
         else:
-            weights = masked_softmax(masked_scores, mask_bool)
+            weights = masked_softmax(masked_scores, mask_bool, activation=self.portfolio_activation)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
         if return_aux is True:

@@ -140,6 +140,7 @@ def fused_log_utility_loss_tensor(
     max_turnover_ratio: float,
     gross_leverage: float,
     min_trade_weight: float = 0.0,
+    portfolio_activation: str = "softsign",
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.0,
     concentration_weight: float = 0.0,
@@ -167,6 +168,7 @@ def fused_log_utility_loss_tensor(
         target_weights,
         long_only=long_only,
         gross_budget=gross_budget,
+        portfolio_activation=portfolio_activation,
     )
     target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
 
