@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from stockagent.models.normalization import dual_branch_softmax, masked_softmax
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax, normalize_portfolio_activation
 
 
 class _FeatureTokenizer(nn.Module):
@@ -35,6 +35,7 @@ class CrossSectionalFTTransformer(nn.Module):
         ffn_dim: int,
         dropout: float,
         long_only: bool = True,
+        portfolio_activation: str = "softsign",
         use_cls_token: bool = True,
         max_encoder_batch_rows: int = 60000,
     ) -> None:
@@ -50,6 +51,7 @@ class CrossSectionalFTTransformer(nn.Module):
         self.lookback = int(lookback)
         self.num_symbols = int(num_symbols)
         self.long_only = bool(long_only)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.use_cls_token = bool(use_cls_token)
         self.max_encoder_batch_rows = max(1, int(max_encoder_batch_rows))
         self.tokenizer = _FeatureTokenizer(num_input_features=input_dim, d_token=d_token)
@@ -116,5 +118,5 @@ class CrossSectionalFTTransformer(nn.Module):
         logits = self.head(symbol_repr).reshape(bsz, num_symbols)
 
         if self.long_only:
-            return masked_softmax(logits, tradable_mask)
-        return dual_branch_softmax(logits, tradable_mask)
+            return masked_softmax(logits, tradable_mask, activation=self.portfolio_activation)
+        return dual_branch_softmax(logits, tradable_mask, activation=self.portfolio_activation)

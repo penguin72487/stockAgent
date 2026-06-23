@@ -7,6 +7,35 @@ from typing import Any
 import yaml
 
 
+DEFAULT_PORTFOLIO_ACTIVATION = "softsign"
+
+
+def _normalize_portfolio_activation(activation: str | None) -> str:
+    normalized = str(activation or DEFAULT_PORTFOLIO_ACTIVATION).strip().lower().replace("-", "_")
+    aliases = {
+        "arc_tan": "atan",
+        "arctan": "atan",
+        "erf_scaled": "erf",
+        "gd": "gudermannian",
+        "inverse_square_root_unit": "isru",
+        "inverse_sqrt": "isru",
+        "inverse_sqrt_unit": "isru",
+        "isr": "isru",
+        "isru1": "isru",
+        "soft_sign": "softsign",
+        "x_over_1_abs_x": "softsign",
+        "x_over_sqrt_1_x2": "isru",
+    }
+    normalized = aliases.get(normalized, normalized)
+    valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian"}
+    if normalized not in valid:
+        raise ValueError(
+            "trading.portfolio_activation must be one of "
+            "'tanh', 'softsign', 'isru', 'erf', 'atan', or 'gd'"
+        )
+    return normalized
+
+
 @dataclass(slots=True)
 class RunnerConfig:
     output_dir: str = "artifacts"
@@ -59,6 +88,7 @@ class TradingConfig:
     max_turnover_ratio: float = 0.0
     gross_leverage: float = 1.0
     min_trade_weight: float = 0.005
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
 
 
 @dataclass(slots=True)
@@ -1136,8 +1166,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
     trading.setdefault("min_trade_weight", 0.005)
+    trading.setdefault("portfolio_activation", DEFAULT_PORTFOLIO_ACTIVATION)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
     trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.005)))
+    trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)

@@ -10,6 +10,7 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean,
     masked_softmax,
+    normalize_portfolio_activation,
 )
 
 
@@ -264,6 +265,7 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         residual_scale: float = 0.5,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_only",
+        portfolio_activation: str = "softsign",
         return_aux: bool = True,
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
@@ -276,6 +278,7 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         self.set_enabled = bool(set_enabled)
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.return_aux = bool(return_aux)
         self.runtime_shape_check = bool(runtime_shape_check)
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
@@ -397,10 +400,10 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
             temp = masked_scores.new_tensor(float(temperature))
         temp = torch.clamp(temp, min=0.05)
         if self.portfolio_mode == "long_only":
-            weights = masked_softmax(masked_scores / temp, mask_bool)
+            weights = masked_softmax(masked_scores / temp, mask_bool, activation=self.portfolio_activation)
         else:
             relative_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            weights = dual_branch_softmax(relative_scores / temp, mask_bool)
+            weights = dual_branch_softmax(relative_scores / temp, mask_bool, activation=self.portfolio_activation)
 
         aux = {
             "z_time": z_time,

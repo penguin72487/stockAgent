@@ -5,7 +5,7 @@ import os
 import torch
 from torch import nn
 
-from stockagent.models.normalization import dual_branch_softmax, masked_softmax
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax, normalize_portfolio_activation
 
 
 class _FeatureResBlock(nn.Module):
@@ -79,6 +79,7 @@ class CrossSectionalTCNHybridTabularResNet(nn.Module):
         tcn_kernel_size: int,
         dropout: float,
         long_only: bool = True,
+        portfolio_activation: str = "softsign",
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
     ) -> None:
@@ -87,6 +88,7 @@ class CrossSectionalTCNHybridTabularResNet(nn.Module):
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.long_only = bool(long_only)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.runtime_shape_check = bool(runtime_shape_check)
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
 
@@ -147,5 +149,5 @@ class CrossSectionalTCNHybridTabularResNet(nn.Module):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
 
         if self.long_only:
-            return masked_softmax(logits, tradable_mask)
-        return dual_branch_softmax(logits, tradable_mask)
+            return masked_softmax(logits, tradable_mask, activation=self.portfolio_activation)
+        return dual_branch_softmax(logits, tradable_mask, activation=self.portfolio_activation)
