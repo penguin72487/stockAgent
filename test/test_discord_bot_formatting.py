@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from services.discord_bot.bot import _enrich_signal_performance_for_discord, _scheduled_detail_page_groups
+import numpy as np
+import polars as pl
+
+from services.discord_bot.bot import (
+    _enrich_signal_performance_for_discord,
+    _portfolio_change_line,
+    _prepend_latest_signal_row_to_portfolio_history,
+    _scheduled_detail_page_groups,
+)
 
 
 def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:
@@ -186,6 +194,112 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
     assert "`rows=1`" in decision_pages[0]
     assert "`AAA` Alpha **BUY**" in decision_pages[0]
     assert "`BBB`" not in decision_pages[0]
+
+
+def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
+    weights_path = tmp_path / "target_weights.parquet"
+    rebalance_path = tmp_path / "rebalance.parquet"
+    pl.DataFrame(
+        {
+            "symbol": ["AAA", "BBB"],
+            "name": ["Alpha", "Beta"],
+            "target_weight": [0.10, -0.20],
+        }
+    ).write_parquet(weights_path)
+    pl.DataFrame(
+        {
+            "symbol": ["BBB", "AAA"],
+            "name": ["Beta", "Alpha"],
+            "action": ["SELL", "BUY"],
+            "current_weight": [0.0, 0.05],
+            "target_weight": [-0.20, 0.10],
+            "delta_weight": [-0.20, 0.05],
+            "trade_price": [20.0, 10.0],
+        }
+    ).write_parquet(rebalance_path)
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text("{}", encoding="utf-8")
+    result = SimpleNamespace(
+        rows=[
+            {
+                "date": "2026-01-05",
+                "portfolio_return": 0.05,
+                "benchmark_return": 0.02,
+                "profit_value": 50.0,
+                "changes": [],
+                "change_counts": {},
+            },
+            {
+                "date": "2026-01-02",
+                "portfolio_return": 0.01,
+                "benchmark_return": 0.00,
+                "profit_value": 10.0,
+                "changes": [],
+                "change_counts": {},
+            },
+        ],
+        source_paths=(),
+        days=2,
+        top_changes=1,
+        start_date="2026-01-02",
+        end_date="2026-01-05",
+        period_return=1.01 * 1.05 - 1.0,
+        benchmark_return=0.02,
+        profit_value=60.0,
+        capital=SimpleNamespace(capital=1_000.0),
+    )
+    summary = {
+        "asof_date": "2026-01-06",
+        "portfolio_simple_return": 0.03,
+        "benchmark_simple_return": 0.01,
+        "turnover": 0.20,
+        "display_capital": 1_000.0,
+        "target_risk": {"gross": 0.30, "net": -0.10, "long_gross": 0.10, "short_gross": 0.20},
+        "weights_path": str(weights_path),
+        "rebalance_path": str(rebalance_path),
+    }
+
+    inserted = _prepend_latest_signal_row_to_portfolio_history(
+        result,
+        summary_path=summary_path,
+        summary=summary,
+        max_rows=2,
+    )
+
+    assert inserted is True
+    assert [row["date"] for row in result.rows] == ["2026-01-06", "2026-01-05"]
+    assert result.start_date == "2026-01-05"
+    assert result.end_date == "2026-01-06"
+    assert result.days == 2
+    assert np.isclose(result.period_return, 1.05 * 1.03 - 1.0)
+    assert np.isclose(result.benchmark_return, 1.02 * 1.01 - 1.0)
+    assert np.isclose(result.profit_value, 80.0)
+    assert result.rows[0]["position_count"] == 2
+    assert result.rows[0]["long_count"] == 1
+    assert result.rows[0]["short_count"] == 1
+    assert result.rows[0]["change_count"] == 2
+    assert result.rows[0]["changes"][0]["symbol"] == "BBB"
+    assert "shares" not in result.rows[0]["changes"][0]
+    assert summary_path in result.source_paths
+
+
+def test_portfolio_change_line_omits_missing_live_signal_shares() -> None:
+    line = _portfolio_change_line(
+        {
+            "symbol": "AAA",
+            "name": "Alpha",
+            "action": "BUY",
+            "holding_ratio_delta": 0.05,
+            "holding_ratio": 0.10,
+            "market_value": 100.0,
+            "market_value_delta": 50.0,
+            "price": 10.0,
+        }
+    )
+
+    assert "shares=" not in line
+    assert "Δsh=" not in line
+    assert "Δhold=+5.00%" in line
 
 
 def test_signal_enrichment_adds_capital_pnl_and_crypto_window_label() -> None:
