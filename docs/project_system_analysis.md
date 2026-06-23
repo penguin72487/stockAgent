@@ -145,7 +145,7 @@ feature projection
 -> temporal attention per stock
 -> attention_mode-specific cross-asset mixing
 -> score head
--> tanh/softmax-like portfolio normalization path
+-> configured bounded activation + L1 portfolio normalization path
 ```
 
 ### attention_mode

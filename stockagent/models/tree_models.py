@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from stockagent.models.normalization import dual_branch_softmax, masked_softmax
+from stockagent.models.normalization import dual_branch_softmax, masked_softmax, normalize_portfolio_activation
 
 
 @dataclass(slots=True)
@@ -17,12 +17,20 @@ class _TreeData:
 
 
 class _CrossSectionalTreeBase(nn.Module):
-    def __init__(self, lookback: int, num_features: int, num_symbols: int, long_only: bool) -> None:
+    def __init__(
+        self,
+        lookback: int,
+        num_features: int,
+        num_symbols: int,
+        long_only: bool,
+        portfolio_activation: str = "softsign",
+    ) -> None:
         super().__init__()
         self.lookback = int(lookback)
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.long_only = bool(long_only)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.input_dim = self.lookback * self.num_features
         self._fitted = False
 
@@ -100,8 +108,8 @@ class _CrossSectionalTreeBase(nn.Module):
         logits = torch.from_numpy(logits_np).to(device=x.device, dtype=x.dtype)
 
         if self.long_only:
-            return masked_softmax(logits, tradable_mask)
-        return dual_branch_softmax(logits, tradable_mask)
+            return masked_softmax(logits, tradable_mask, activation=self.portfolio_activation)
+        return dual_branch_softmax(logits, tradable_mask, activation=self.portfolio_activation)
 
 
 class CrossSectionalLightGBM(_CrossSectionalTreeBase):
@@ -111,6 +119,7 @@ class CrossSectionalLightGBM(_CrossSectionalTreeBase):
         num_features: int,
         num_symbols: int,
         long_only: bool,
+        portfolio_activation: str = "softsign",
         *,
         use_gpu: bool,
         gpu_device_id: int,
@@ -124,7 +133,7 @@ class CrossSectionalLightGBM(_CrossSectionalTreeBase):
         n_jobs: int,
         random_state: int,
     ) -> None:
-        super().__init__(lookback, num_features, num_symbols, long_only)
+        super().__init__(lookback, num_features, num_symbols, long_only, portfolio_activation)
         self._feature_names = [f"f{i}" for i in range(self.input_dim)]
         self._use_gpu = bool(use_gpu)
         self._gpu_device_id = int(gpu_device_id)
@@ -173,6 +182,7 @@ class CrossSectionalXGBoost(_CrossSectionalTreeBase):
         num_features: int,
         num_symbols: int,
         long_only: bool,
+        portfolio_activation: str = "softsign",
         *,
         use_gpu: bool,
         gpu_device_id: int,
@@ -185,7 +195,7 @@ class CrossSectionalXGBoost(_CrossSectionalTreeBase):
         n_jobs: int,
         random_state: int,
     ) -> None:
-        super().__init__(lookback, num_features, num_symbols, long_only)
+        super().__init__(lookback, num_features, num_symbols, long_only, portfolio_activation)
         self._feature_names = [f"f{i}" for i in range(self.input_dim)]
         self._use_gpu = bool(use_gpu)
         self._gpu_device_id = int(gpu_device_id)

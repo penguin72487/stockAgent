@@ -51,7 +51,7 @@ Implementation expectations:
 - It is normal and desirable that some tensors remain FP32:
   - model parameters
   - input storage tensors
-  - portfolio weights after tanh + L1 normalization
+  - portfolio weights after configured bounded activation + L1 normalization
   - loss/backtest accumulation and numerically sensitive finance metrics
 - Do not force the entire pipeline to permanent BF16 storage just to satisfy "BF16"; use AMP for compute and keep sensitive reductions stable.
 
@@ -199,7 +199,7 @@ Notes:
   - stocks read updated market tokens through cross-attention
   - stock-level market gate applies `z = RMSNorm(z_base_or_factor + sigmoid(g_i) * market_delta)`
   - portfolio head uses three scalar heads: `mu`, `sigma`, `confidence`
-  - score is `mu / softplus(sigma) * sigmoid(confidence)`, then masked de-mean for long/short, then tanh + L1 portfolio normalization
+  - score is `mu / softplus(sigma) * sigmoid(confidence)`, then masked de-mean for long/short, then configured bounded activation + L1 portfolio normalization
 - Keep `alpha_mu`, `risk_sigma`, `confidence`, `stock_market_gate`, `z_market_delta`, dynamic token queries/deltas/gates, and market summary parts available in aux outputs when detailed explainability is requested.
 
 Modern Transformer module contract:
@@ -256,8 +256,8 @@ Guidelines:
 
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
-- Portfolio direction and sizing should use `tanh(score)` for signed direction followed by L1 normalization for gross exposure control.
-- Do not use dual-branch softmax as the active long/short position calculator. Legacy `dual_branch_softmax` / `masked_softmax` names are now compatibility wrappers around tanh + L1 portfolio normalization.
+- Portfolio direction and sizing should use `trading.portfolio_activation` for signed direction followed by L1 normalization for gross exposure control. Supported activations are `softsign`, `tanh`, `isru`, `erf`, `atan`, and `gd`/`gudermannian`; the current default is `softsign`.
+- Do not use dual-branch softmax as the active long/short position calculator. Legacy `dual_branch_softmax` / `masked_softmax` names are now compatibility wrappers around configured activation + L1 portfolio normalization.
 - If changing `trading.long_only`, understand that it affects loss/backtest interpretation, not just the model head.
 - Keep model output mode, loss assumptions, backtest assumptions, and report wording aligned. If they disagree, flag it explicitly.
 - Rank-only loss can over-concentrate positions. If using rank objectives, keep turnover/concentration/backtest regularization in mind.

@@ -254,13 +254,13 @@ $$
 
 ### （六）由分數轉換為權重與最小權重門檻
 
-模型對每檔可交易股票輸出分數 $z_{i,t}$。long-only 模式可產生非負權重；long-short 模式則先對分數做橫斷面中心化，再以 `tanh(score)` 產生方向，並以 L1 正規化控制總曝險：
+模型對每檔可交易股票輸出分數 $z_{i,t}$。long-only 模式可產生非負權重；long-short 模式則先對分數做橫斷面中心化，再以可設定的有界奇函式 $\phi(\cdot)$ 產生方向，並以 L1 正規化控制總曝險。實作中 `trading.portfolio_activation` 可選 `softsign`、`tanh`、`isru`、`erf`、`atan` 與 `gd`：
 
 $$
 w_{i,t} =
 G \cdot
-\frac{\tanh(\tilde{z}_{i,t})}
-{\sum_{j \in S_t}|\tanh(\tilde{z}_{j,t})|}
+\frac{\phi(\tilde{z}_{i,t})}
+{\sum_{j \in S_t}|\phi(\tilde{z}_{j,t})|}
 $$
 
 其中 $G$ 為總曝險預算。無效股票權重固定為零。接著加入最小交易權重門檻：
