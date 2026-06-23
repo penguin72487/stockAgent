@@ -51,6 +51,7 @@ from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
+from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.fused_loss import fused_log_utility_loss_tensor
@@ -787,6 +788,7 @@ def _evaluated_backtest_loss(
         max_turnover_ratio=config.trading.max_turnover_ratio,
         gross_leverage=config.trading.gross_leverage,
         min_trade_weight=config.trading.min_trade_weight,
+        portfolio_activation=config.trading.portfolio_activation,
         gamma_sharpe=config.evaluation.gamma_sharpe,
         gamma_excess=config.evaluation.gamma_excess,
         gamma_cvar=config.evaluation.gamma_cvar,
@@ -2901,8 +2903,9 @@ def _merge_test_backtest_with_previous_fold_warmup(
     sell_fee_rate: float,
     max_turnover_ratio: float,
     gross_leverage: float,
-    min_trade_weight: float,
-    chunk_rows: int,
+    min_trade_weight: float = 0.0,
+    chunk_rows: int = 1,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     backtest_chunk_rows: int | None = None,
 ) -> tuple[
     BacktestResultTensor,
@@ -3762,6 +3765,7 @@ def _run_eval_backtest_from_weight_buffers(
     progress_label: str | None,
     timing: TimingBreakdown,
     reset_at_rows: Sequence[int] | None,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
     num_symbols = int(weights_all.size(1))
@@ -3838,6 +3842,7 @@ def _run_eval_backtest_from_weight_buffers(
             max_turnover_ratio=max_turnover_ratio,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
+            portfolio_activation=portfolio_activation,
             can_buy_mask=buy_mask_chunk,
             can_sell_mask=sell_mask_chunk,
             return_weights_history=return_weights_history,
@@ -3895,6 +3900,7 @@ def _evaluate_tensor_batch_decoupled(
     min_trade_weight: float,
     model_chunk_rows: int,
     backtest_chunk_rows: int,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     compute_ic: bool = True,
     compute_metrics_summary: bool = True,
     return_weights_history: bool = True,
@@ -4004,6 +4010,7 @@ def _evaluate_tensor_batch_decoupled(
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             backtest_chunk_rows=backtest_chunk_rows,
+            portfolio_activation=portfolio_activation,
             compute_metrics_summary=compute_metrics_summary,
             return_weights_history=return_weights_history,
             profile_timing=profile_timing,
@@ -4047,8 +4054,9 @@ def _evaluate_tensor_batch(
     sell_fee_rate: float,
     max_turnover_ratio: float,
     gross_leverage: float,
-    min_trade_weight: float,
-    chunk_rows: int,
+    min_trade_weight: float = 0.0,
+    chunk_rows: int = 1,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     backtest_chunk_rows: int | None = None,
     compute_ic: bool = True,
     compute_metrics_summary: bool = True,
@@ -4079,6 +4087,7 @@ def _evaluate_tensor_batch(
             min_trade_weight,
             model_chunk_rows=chunk_rows,
             backtest_chunk_rows=effective_backtest_chunk_rows,
+            portfolio_activation=portfolio_activation,
             compute_ic=compute_ic,
             compute_metrics_summary=compute_metrics_summary,
             return_weights_history=return_weights_history,
@@ -4197,6 +4206,7 @@ def _evaluate_tensor_batch(
                 max_turnover_ratio=max_turnover_ratio,
                 gross_leverage=gross_leverage,
                 min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
@@ -4429,6 +4439,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
     min_trade_weight: float,
     model_chunk_rows: int,
     backtest_chunk_rows: int,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     compute_ic: bool = True,
     compute_metrics_summary: bool = True,
     return_weights_history: bool = True,
@@ -4614,6 +4625,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             backtest_chunk_rows=backtest_chunk_rows,
+            portfolio_activation=portfolio_activation,
             compute_metrics_summary=compute_metrics_summary,
             return_weights_history=return_weights_history,
             profile_timing=profile_timing,
@@ -4653,8 +4665,9 @@ def _evaluate_windowed_tensor_batch(
     sell_fee_rate: float,
     max_turnover_ratio: float,
     gross_leverage: float,
-    min_trade_weight: float,
-    chunk_rows: int,
+    min_trade_weight: float = 0.0,
+    chunk_rows: int = 1,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     backtest_chunk_rows: int | None = None,
     compute_ic: bool = True,
     compute_metrics_summary: bool = True,
@@ -4681,6 +4694,7 @@ def _evaluate_windowed_tensor_batch(
             min_trade_weight,
             model_chunk_rows=chunk_rows,
             backtest_chunk_rows=effective_backtest_chunk_rows,
+            portfolio_activation=portfolio_activation,
             compute_ic=compute_ic,
             compute_metrics_summary=compute_metrics_summary,
             return_weights_history=return_weights_history,
@@ -4869,6 +4883,7 @@ def _evaluate_windowed_tensor_batch(
                 max_turnover_ratio=max_turnover_ratio,
                 gross_leverage=gross_leverage,
                 min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
                 can_buy_mask=buy_mask_chunk,
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
@@ -6959,6 +6974,7 @@ def _run_training_tree_models(
                 config.trading.max_turnover_ratio,
                 config.trading.gross_leverage,
                 config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
             )
             val_loss = float(
@@ -6997,6 +7013,7 @@ def _run_training_tree_models(
                 config.trading.max_turnover_ratio,
                 config.trading.gross_leverage,
                 config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
             )
 
@@ -7033,6 +7050,7 @@ def _run_training_tree_models(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gross_leverage=config.trading.gross_leverage,
                 min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
             )
             if warmup_days > 0:
@@ -7062,6 +7080,7 @@ def _run_training_tree_models(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gross_leverage=config.trading.gross_leverage,
                 min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,
@@ -7204,6 +7223,7 @@ def _run_inference_tree_models(
             config.trading.max_turnover_ratio,
             config.trading.gross_leverage,
             config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
         )
         val_loss = float(
@@ -7243,6 +7263,7 @@ def _run_inference_tree_models(
             config.trading.max_turnover_ratio,
             config.trading.gross_leverage,
             config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
         )
 
@@ -7279,6 +7300,7 @@ def _run_inference_tree_models(
             max_turnover_ratio=config.trading.max_turnover_ratio,
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
         )
         if warmup_days > 0:
@@ -7308,6 +7330,7 @@ def _run_inference_tree_models(
             max_turnover_ratio=config.trading.max_turnover_ratio,
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
             symbols=panel.symbols,
             dates=test_dates,
@@ -7491,6 +7514,7 @@ def _run_inference_neural_models(
             config.trading.max_turnover_ratio,
             config.trading.gross_leverage,
             config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
             backtest_chunk_rows=val_backtest_chunk_rows,
         )
@@ -7548,6 +7572,7 @@ def _run_inference_neural_models(
             config.trading.max_turnover_ratio,
             config.trading.gross_leverage,
             config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
             backtest_chunk_rows=test_backtest_chunk_rows,
         )
@@ -7597,6 +7622,7 @@ def _run_inference_neural_models(
             max_turnover_ratio=config.trading.max_turnover_ratio,
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
             backtest_chunk_rows=test_backtest_chunk_rows,
         )
@@ -7629,6 +7655,7 @@ def _run_inference_neural_models(
             max_turnover_ratio=config.trading.max_turnover_ratio,
             gross_leverage=config.trading.gross_leverage,
             min_trade_weight=config.trading.min_trade_weight,
+            portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
             symbols=fold_panel.symbols,
             dates=test_dates,
@@ -7783,6 +7810,7 @@ def run_training(
     portfolio_autoencoder_loss_kwargs = _portfolio_autoencoder_loss_kwargs(config)
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
     risk_loss_kwargs["min_trade_weight"] = config.trading.min_trade_weight
+    risk_loss_kwargs["portfolio_activation"] = config.trading.portfolio_activation
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
 
@@ -8146,6 +8174,7 @@ def run_training(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gross_leverage=config.trading.gross_leverage,
                 min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
                 concentration_weight=config.training.multitask_loss.concentration_weight,
@@ -9124,6 +9153,7 @@ def run_training(
                         config.trading.max_turnover_ratio,
                         config.trading.gross_leverage,
                         config.trading.min_trade_weight,
+                        portfolio_activation=config.trading.portfolio_activation,
                         chunk_rows=eval_chunk_rows,
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
@@ -9151,6 +9181,7 @@ def run_training(
                         config.trading.max_turnover_ratio,
                         config.trading.gross_leverage,
                         config.trading.min_trade_weight,
+                        portfolio_activation=config.trading.portfolio_activation,
                         chunk_rows=eval_chunk_rows,
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
@@ -9266,6 +9297,7 @@ def run_training(
                             config.trading.max_turnover_ratio,
                             config.trading.gross_leverage,
                             config.trading.min_trade_weight,
+                            portfolio_activation=config.trading.portfolio_activation,
                             chunk_rows=eval_chunk_rows,
                             backtest_chunk_rows=eval_backtest_chunk_rows,
                             compute_ic=False,
@@ -9293,6 +9325,7 @@ def run_training(
                             config.trading.max_turnover_ratio,
                             config.trading.gross_leverage,
                             config.trading.min_trade_weight,
+                            portfolio_activation=config.trading.portfolio_activation,
                             chunk_rows=eval_chunk_rows,
                             backtest_chunk_rows=eval_backtest_chunk_rows,
                             compute_ic=False,
@@ -9555,6 +9588,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
@@ -9579,6 +9613,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
@@ -9652,6 +9687,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
@@ -9694,6 +9730,7 @@ def run_training(
                     config.trading.max_turnover_ratio,
                     config.trading.gross_leverage,
                     config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
@@ -9738,6 +9775,7 @@ def run_training(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gross_leverage=config.trading.gross_leverage,
                 min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=eval_chunk_rows,
                 backtest_chunk_rows=eval_backtest_chunk_rows,
             )
@@ -9788,6 +9826,7 @@ def run_training(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gross_leverage=config.trading.gross_leverage,
                 min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
                 symbols=panel.symbols,
                 dates=test_dates,

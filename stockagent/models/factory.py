@@ -118,6 +118,7 @@ def build_model(
             embedding_dim=mlp_cfg.embedding_dim,
             hidden_layers=mlp_cfg.hidden_layers,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
         )
 
     if model_name in {"ft_transformer", "ft", "transformer"}:
@@ -132,6 +133,7 @@ def build_model(
             ffn_dim=ft_cfg.ffn_dim,
             dropout=ft_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             use_cls_token=ft_cfg.use_cls_token,
         )
 
@@ -146,6 +148,7 @@ def build_model(
             n_blocks=tab_cfg.n_blocks,
             dropout=tab_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -168,6 +171,7 @@ def build_model(
             norm_type=tcn_cfg.norm_type,
             sanitize_inputs=tcn_cfg.sanitize_inputs,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -200,6 +204,7 @@ def build_model(
             residual_scale=efficient_cfg.residual_scale,
             default_temperature=efficient_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             return_aux=efficient_cfg.return_aux,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
@@ -233,6 +238,7 @@ def build_model(
             residual_scale=lfmt_cfg.residual_scale,
             default_temperature=lfmt_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             return_aux=lfmt_cfg.return_aux,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
@@ -267,6 +273,7 @@ def build_model(
             dropout=lrmt_cfg.dropout,
             default_temperature=lrmt_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             return_aux=lrmt_cfg.return_aux,
             return_aux_details=lrmt_cfg.return_aux_details,
             runtime_shape_check=config.training.runtime_shape_check,
@@ -319,6 +326,7 @@ def build_model(
             dropout=tbp_cfg.dropout,
             default_temperature=tbp_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             max_full_tokens=tbp_cfg.max_full_tokens,
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,
@@ -344,6 +352,7 @@ def build_model(
             ffn_mult=bpae_cfg.ffn_mult,
             dropout=bpae_cfg.dropout,
             long_short=bpae_cfg.long_short if not config.trading.long_only else False,
+            portfolio_activation=config.trading.portfolio_activation,
             noise_std=bpae_cfg.noise_std,
             return_aux=bpae_cfg.return_aux,
             runtime_shape_check=config.training.runtime_shape_check,
@@ -363,6 +372,7 @@ def build_model(
             tcn_kernel_size=tcn_cfg.tcn_kernel_size,
             dropout=tcn_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -381,6 +391,7 @@ def build_model(
             n_blocks=ttab_cfg.n_blocks,
             dropout=ttab_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -403,6 +414,7 @@ def build_model(
             dropout=cstpm_cfg.dropout,
             regime_classes=cstpm_cfg.regime_classes,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
             candidate_top_m=int(getattr(cstpm_cfg, "candidate_k", cstpm_cfg.candidate_top_m)),
@@ -416,6 +428,7 @@ def build_model(
             num_features=num_features,
             num_symbols=num_symbols,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             use_gpu=lgbm_cfg.use_gpu,
             gpu_device_id=lgbm_cfg.gpu_device_id,
             n_estimators=lgbm_cfg.n_estimators,
@@ -436,6 +449,7 @@ def build_model(
             num_features=num_features,
             num_symbols=num_symbols,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             use_gpu=xgb_cfg.use_gpu,
             gpu_device_id=xgb_cfg.gpu_device_id,
             n_estimators=xgb_cfg.n_estimators,

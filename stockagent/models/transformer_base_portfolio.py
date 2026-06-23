@@ -13,6 +13,7 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean,
     masked_softmax,
+    normalize_portfolio_activation,
 )
 
 
@@ -541,6 +542,7 @@ class TransformerBasePortfolioModel(nn.Module):
         dropout: float = 0.1,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_short",
+        portfolio_activation: str = "softsign",
         max_full_tokens: int = 4096,
         checkpoint_blocks: bool = False,
         return_aux: bool = True,
@@ -558,6 +560,7 @@ class TransformerBasePortfolioModel(nn.Module):
         self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.return_aux = bool(return_aux)
@@ -1234,11 +1237,11 @@ class TransformerBasePortfolioModel(nn.Module):
         temp = torch.clamp(temp, min=0.05)
 
         if self.portfolio_mode == "long_only":
-            weights = masked_softmax(masked_scores / temp, mask_bool)
+            weights = masked_softmax(masked_scores / temp, mask_bool, activation=self.portfolio_activation)
             centered_scores = scores
         else:
             centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            weights = dual_branch_softmax(centered_scores / temp, mask_bool)
+            weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation=self.portfolio_activation)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
         if return_aux is True:
