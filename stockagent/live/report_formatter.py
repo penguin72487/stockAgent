@@ -123,7 +123,7 @@ def _period_title(summary: dict[str, Any]) -> str:
     return f"**{label}**"
 
 
-def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str:
+def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug: bool = False) -> str:
     """Build a Discord-sized Traditional Chinese live signal message."""
     rebalance = list(summary.get("rebalance", []))[: max(0, int(max_rows))]
     top_positions = list(summary.get("top_positions", []))[: max(0, int(max_rows))]
@@ -144,13 +144,7 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
         f"`{_fmt_time(summary.get('asof_date', 'latest'), summary)}`  `tz={_fmt_tz_label(summary)}`",
         _kv_line(
             ("panel", _fmt_time(summary.get("panel_date", "n/a"), summary)),
-            ("fold", summary.get("fold_id", "auto")),
-            ("signal", summary.get("signal_id", "n/a")),
-        ),
-        _kv_line(
             ("price", summary.get("price_source", "panel")),
-            ("checkpoint", summary.get("checkpoint_fingerprint", "n/a")),
-            ("config", summary.get("config_fingerprint", "n/a")),
         ),
         "",
         _period_title(summary),
@@ -263,7 +257,22 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12) -> str
     weights_path = _fmt_path(summary.get("weights_path"))
     rebalance_path = _fmt_path(summary.get("rebalance_path"))
     explain_path = _fmt_path(summary.get("decision_explanation_path"))
-    if artifact or weights_path or rebalance_path or explain_path:
+    if debug:
+        lines.append("")
+        lines.append("**debug**")
+        lines.append(
+            _kv_line(
+                ("fold", summary.get("fold_id", "auto")),
+                ("signal", summary.get("signal_id", "n/a")),
+            )
+        )
+        lines.append(
+            _kv_line(
+                ("checkpoint", summary.get("checkpoint_fingerprint", "n/a")),
+                ("config", summary.get("config_fingerprint", "n/a")),
+            )
+        )
+    if debug and (artifact or weights_path or rebalance_path or explain_path):
         lines.append("")
         lines.append("**files**")
         if artifact:

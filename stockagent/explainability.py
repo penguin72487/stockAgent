@@ -77,6 +77,8 @@ PAPER_TOKENS = {
 }
 
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+_DEFAULT_MARKET_ARTIFACTS_ROOT = Path("artifacts/markets")
+_DEFAULT_MARKET_CONFIG_ROOT = Path("configs/markets")
 
 
 def _sanitize_matplotlib_axis_limits(fig: Any) -> None:
@@ -185,6 +187,13 @@ class LoadedExplanationContext:
     fold: WalkForwardFold
     split: str
     checkpoint_path: Path
+    output_dir: Path
+
+
+@dataclass(frozen=True, slots=True)
+class MarketExplainabilityRun:
+    market: str
+    config_path: Path
     output_dir: Path
 
 
@@ -4499,9 +4508,216 @@ def run_checkpoint_explanation(
     )
 
 
+def _artifact_path_market_name(path: Path, artifacts_root: Path) -> str | None:
+    try:
+        rel = Path(path).resolve().relative_to(Path(artifacts_root).resolve())
+    except ValueError:
+        return None
+    if not rel.parts:
+        return None
+    return rel.parts[0]
+
+
+def _market_output_has_checkpoint(output_dir: Path, fold_id: int | None = None) -> bool:
+    output_dir = Path(output_dir)
+    if fold_id is not None:
+        return (output_dir / f"fold_{int(fold_id):02d}" / "checkpoint_best.pt").is_file()
+    return any(output_dir.glob("fold_*/checkpoint_best.pt"))
+
+
+def _market_config_path(market: str, config_root: Path) -> Path:
+    config_path = Path(config_root) / f"{market}.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Missing config for market artifact '{market}': {config_path}")
+    return config_path
+
+
+def _discover_market_runs(
+    artifacts_root: Path,
+    config_root: Path,
+    *,
+    output_dir: Path | None = None,
+    checkpoint: Path | None = None,
+    fold_id: int | None = None,
+) -> list[MarketExplainabilityRun]:
+    artifacts_root = Path(artifacts_root)
+    config_root = Path(config_root)
+
+    if checkpoint is not None:
+        checkpoint_path = Path(checkpoint)
+        market = _artifact_path_market_name(checkpoint_path, artifacts_root)
+        if market is None:
+            raise ValueError(
+                "--checkpoint without --config must point under "
+                f"{artifacts_root}/<market>/... so the matching market config can be inferred."
+            )
+        return [
+            MarketExplainabilityRun(
+                market=market,
+                config_path=_market_config_path(market, config_root),
+                output_dir=artifacts_root / market,
+            )
+        ]
+
+    if output_dir is not None:
+        resolved_output_dir = Path(output_dir)
+        market = _artifact_path_market_name(resolved_output_dir, artifacts_root) or resolved_output_dir.name
+        if not _market_output_has_checkpoint(resolved_output_dir, fold_id=fold_id):
+            target = f"fold_{int(fold_id):02d}/checkpoint_best.pt" if fold_id is not None else "fold_*/checkpoint_best.pt"
+            raise FileNotFoundError(f"No {target} found under {resolved_output_dir}")
+        return [
+            MarketExplainabilityRun(
+                market=market,
+                config_path=_market_config_path(market, config_root),
+                output_dir=resolved_output_dir,
+            )
+        ]
+
+    if not artifacts_root.is_dir():
+        raise FileNotFoundError(f"Market artifacts root does not exist: {artifacts_root}")
+
+    runs: list[MarketExplainabilityRun] = []
+    missing_configs: list[str] = []
+    for candidate in sorted((path for path in artifacts_root.iterdir() if path.is_dir()), key=lambda path: path.name):
+        if not _market_output_has_checkpoint(candidate, fold_id=fold_id):
+            continue
+        config_path = config_root / f"{candidate.name}.yaml"
+        if not config_path.is_file():
+            missing_configs.append(f"{candidate.name} ({config_path})")
+            continue
+        runs.append(MarketExplainabilityRun(candidate.name, config_path, candidate))
+
+    if missing_configs:
+        raise FileNotFoundError(
+            "Missing configs for market artifact directories: " + ", ".join(missing_configs)
+        )
+    if not runs:
+        target = f"fold_{int(fold_id):02d}/checkpoint_best.pt" if fold_id is not None else "fold_*/checkpoint_best.pt"
+        raise FileNotFoundError(f"No market artifact directories with {target} found under {artifacts_root}")
+    return runs
+
+
+def _run_explainability_for_config(
+    args: argparse.Namespace,
+    settings: ExplainabilitySettings,
+    *,
+    config_path: Path,
+    output_dir: Path | None = None,
+    explain_output_dir: Path | None = None,
+) -> None:
+    # Default behavior: if neither --fold nor --checkpoint is provided,
+    # run explainability for all folds that have checkpoint_best.pt.
+    run_all_folds = args.fold is None and args.checkpoint is None
+    if run_all_folds:
+        config = load_config(config_path)
+        resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
+        panel = build_panel(
+            config.data.parquet_root,
+            use_rapids=config.data.use_rapids,
+            benchmark_name=config.data.benchmark_name,
+            usd_only_trading_pairs=config.data.usd_only_trading_pairs,
+            tradable_mode=config.data.tradable_mode,
+            trading_volume_policy=config.data.trading_volume_policy,
+            security_filter=config.data.security_filter,
+            strict_no_fallback=config.training.strict_no_fallback,
+            panel_backend=config.data.panel_backend,
+            panel_load_workers=config.data.panel_load_workers,
+        )
+        folds = build_expanding_year_folds(
+            dates=panel.dates,
+            min_train_years=config.walk_forward.min_train_years,
+            val_years=config.walk_forward.val_years,
+            require_future_test_year=config.walk_forward.require_future_test_year,
+        )
+        fold_ids = _available_checkpoint_folds(folds, resolved_output_dir)
+        if not fold_ids:
+            raise FileNotFoundError(f"No fold checkpoint_best.pt found under {resolved_output_dir}")
+
+        device = _device_from_config(config, args.device)
+        if device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        folds_by_id = {int(fold.fold_id): fold for fold in folds}
+        print(f"explaining folds: {fold_ids}")
+        for fold_id in fold_ids:
+            fold_output_dir = explain_output_dir
+            if fold_output_dir is not None:
+                fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
+            checkpoint_path = _fold_dir(resolved_output_dir, fold_id) / "checkpoint_best.pt"
+            model: nn.Module | None = None
+            try:
+                fold_panel = _align_panel_to_checkpoint_universe(
+                    panel,
+                    resolved_output_dir,
+                    fold_id,
+                    checkpoint_path,
+                )
+                model, checkpoint_info = load_model_from_checkpoint(
+                    config,
+                    fold_panel,
+                    checkpoint_path,
+                    device,
+                    strict=args.strict,
+                )
+                out_dir = run_loaded_model_explanation(
+                    config=config,
+                    panel=fold_panel,
+                    fold=folds_by_id[int(fold_id)],
+                    model=model,
+                    checkpoint_path=checkpoint_path,
+                    output_dir=resolved_output_dir,
+                    split=args.split,
+                    explain_output_dir=fold_output_dir,
+                    settings=settings,
+                    write_plots=bool(args.plots),
+                    plot_backend=args.plot_backend,
+                    device=device,
+                    checkpoint_info=checkpoint_info,
+                )
+            finally:
+                if model is not None:
+                    del model
+                _clear_explainability_runtime_cache()
+            print(f"explainability output (fold {fold_id}): {out_dir}")
+        if settings.fold_stability:
+            stability_dir = write_fold_stability_outputs(
+                resolved_output_dir / "explainability",
+                strict_no_fallback=bool(settings.strict_no_fallback),
+            )
+            if stability_dir is not None:
+                print(f"fold stability output: {stability_dir}")
+        return
+
+    out_dir = run_checkpoint_explanation(
+        config_path=config_path,
+        output_dir=output_dir,
+        fold_id=args.fold,
+        checkpoint=args.checkpoint,
+        split=args.split,
+        explain_output_dir=explain_output_dir,
+        settings=settings,
+        device_override=args.device,
+        strict=bool(args.strict or args.strict_no_fallback),
+        write_plots=bool(args.plots),
+        plot_backend=args.plot_backend,
+    )
+    print(f"explainability output: {out_dir}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Explain a trained stockAgent model checkpoint.")
-    parser.add_argument("--config", default="configs/experiment_baseline.yaml", type=Path)
+    parser.add_argument(
+        "--config",
+        default=None,
+        type=Path,
+        help=(
+            "Experiment config. If omitted, discover market artifact directories under "
+            "--market-artifacts-root and pair them with configs from --market-config-root."
+        ),
+    )
+    parser.add_argument("--market-artifacts-root", default=_DEFAULT_MARKET_ARTIFACTS_ROOT, type=Path)
+    parser.add_argument("--market-config-root", default=_DEFAULT_MARKET_CONFIG_ROOT, type=Path)
     parser.add_argument("--output-dir", default=None, type=Path)
     parser.add_argument("--fold", default=None, type=int, help="Fold id. If omitted, explains all folds with checkpoint_best.pt.")
     parser.add_argument("--checkpoint", default=None, type=Path, help="Optional explicit checkpoint path.")
@@ -4661,104 +4877,38 @@ def main(argv: list[str] | None = None) -> None:
         cross_asset_role_embedding=bool(args.cross_asset_role_embedding),
         strict_no_fallback=bool(args.strict_no_fallback),
     )
-    # Default behavior: if neither --fold nor --checkpoint is provided,
-    # run explainability for all folds that have checkpoint_best.pt.
-    run_all_folds = args.fold is None and args.checkpoint is None
-    if run_all_folds:
-        config = load_config(args.config)
-        resolved_output_dir = Path(args.output_dir if args.output_dir is not None else config.runner.output_dir)
-        panel = build_panel(
-            config.data.parquet_root,
-            use_rapids=config.data.use_rapids,
-            benchmark_name=config.data.benchmark_name,
-            usd_only_trading_pairs=config.data.usd_only_trading_pairs,
-            tradable_mode=config.data.tradable_mode,
-            trading_volume_policy=config.data.trading_volume_policy,
-            security_filter=config.data.security_filter,
-            strict_no_fallback=config.training.strict_no_fallback,
-            panel_backend=config.data.panel_backend,
-            panel_load_workers=config.data.panel_load_workers,
-        )
-        folds = build_expanding_year_folds(
-            dates=panel.dates,
-            min_train_years=config.walk_forward.min_train_years,
-            val_years=config.walk_forward.val_years,
-            require_future_test_year=config.walk_forward.require_future_test_year,
-        )
-        fold_ids = _available_checkpoint_folds(folds, resolved_output_dir)
-        if not fold_ids:
-            raise FileNotFoundError(f"No fold checkpoint_best.pt found under {resolved_output_dir}")
 
-        device = _device_from_config(config, args.device)
-        if device.type == "cuda":
-            torch.set_float32_matmul_precision("high")
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        folds_by_id = {int(fold.fold_id): fold for fold in folds}
-        print(f"explaining folds: {fold_ids}")
-        for fold_id in fold_ids:
-            fold_output_dir = args.explain_output_dir
-            if fold_output_dir is not None:
-                fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
-            checkpoint_path = _fold_dir(resolved_output_dir, fold_id) / "checkpoint_best.pt"
-            model: nn.Module | None = None
-            try:
-                fold_panel = _align_panel_to_checkpoint_universe(
-                    panel,
-                    resolved_output_dir,
-                    fold_id,
-                    checkpoint_path,
-                )
-                model, checkpoint_info = load_model_from_checkpoint(
-                    config,
-                    fold_panel,
-                    checkpoint_path,
-                    device,
-                    strict=args.strict,
-                )
-                out_dir = run_loaded_model_explanation(
-                    config=config,
-                    panel=fold_panel,
-                    fold=folds_by_id[int(fold_id)],
-                    model=model,
-                    checkpoint_path=checkpoint_path,
-                    output_dir=resolved_output_dir,
-                    split=args.split,
-                    explain_output_dir=fold_output_dir,
-                    settings=settings,
-                    write_plots=bool(args.plots),
-                    plot_backend=args.plot_backend,
-                    device=device,
-                    checkpoint_info=checkpoint_info,
-                )
-            finally:
-                if model is not None:
-                    del model
-                _clear_explainability_runtime_cache()
-            print(f"explainability output (fold {fold_id}): {out_dir}")
-        if settings.fold_stability:
-            stability_dir = write_fold_stability_outputs(
-                resolved_output_dir / "explainability",
-                strict_no_fallback=bool(settings.strict_no_fallback),
+    if args.config is None:
+        market_runs = _discover_market_runs(
+            args.market_artifacts_root,
+            args.market_config_root,
+            output_dir=args.output_dir,
+            checkpoint=args.checkpoint,
+            fold_id=args.fold,
+        )
+        print(f"explaining market artifact directories under {args.market_artifacts_root}: {len(market_runs)} found")
+        multi_market = len(market_runs) > 1
+        for run in market_runs:
+            explain_output_dir = args.explain_output_dir
+            if explain_output_dir is not None and multi_market:
+                explain_output_dir = Path(explain_output_dir) / run.market
+            print(f"[{run.market}] config={run.config_path} output_dir={run.output_dir}")
+            _run_explainability_for_config(
+                args,
+                settings,
+                config_path=run.config_path,
+                output_dir=run.output_dir,
+                explain_output_dir=explain_output_dir,
             )
-            if stability_dir is not None:
-                print(f"fold stability output: {stability_dir}")
         return
 
-    out_dir = run_checkpoint_explanation(
+    _run_explainability_for_config(
+        args,
+        settings,
         config_path=args.config,
         output_dir=args.output_dir,
-        fold_id=args.fold,
-        checkpoint=args.checkpoint,
-        split=args.split,
         explain_output_dir=args.explain_output_dir,
-        settings=settings,
-        device_override=args.device,
-        strict=bool(args.strict or args.strict_no_fallback),
-        write_plots=bool(args.plots),
-        plot_backend=args.plot_backend,
     )
-    print(f"explainability output: {out_dir}")
 
 
 if __name__ == "__main__":

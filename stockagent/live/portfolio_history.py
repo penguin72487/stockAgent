@@ -12,9 +12,12 @@ from stockagent.live.stock_history import (
     _day_string_expr,
     _read_returns,
     _read_table,
+    _read_price_history_map,
     _symbol_name,
     classify_stock_history_action,
     is_bar_frequency,
+    position_adjusted_stock_return,
+    position_portfolio_contribution,
 )
 
 
@@ -136,11 +139,42 @@ def _with_profit_estimates(daily):
     )
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number
+
+
+class _PriceLookup:
+    def __init__(self, price_root: str | Path | None, *, frequency: str | None):
+        self.price_root = price_root
+        self.frequency = frequency
+        self.cache: dict[str, dict[str, float]] = {}
+        self.paths: list[Path] = []
+
+    def get(self, symbol: str, date: str | None) -> float | None:
+        if self.price_root is None or not date:
+            return None
+        key = str(symbol)
+        if key not in self.cache:
+            prices, path = _read_price_history_map(self.price_root, key, frequency=self.frequency)
+            self.cache[key] = prices
+            if path is not None and path not in self.paths:
+                self.paths.append(path)
+        value = self.cache.get(key, {}).get(str(date))
+        return float(value) if value is not None else None
+
+
 def _change_row(
     symbol: str,
     current: dict[str, Any] | None,
     previous: dict[str, Any] | None,
     *,
+    date: str,
+    previous_date: str | None,
+    price_lookup: _PriceLookup | None,
     symbol_names: dict[str, str] | None,
 ) -> dict[str, Any]:
     shares = int((current or {}).get("shares") or 0)
@@ -149,6 +183,17 @@ def _change_row(
     prev_holding_ratio = float((previous or {}).get("holding_ratio") or 0.0)
     market_value = float((current or {}).get("market_value") or 0.0)
     prev_market_value = float((previous or {}).get("market_value") or 0.0)
+    price = _float_or_none((current or {}).get("price"))
+    if price is None and price_lookup is not None:
+        price = price_lookup.get(symbol, date)
+    if price is None:
+        price = _float_or_none((previous or {}).get("price"))
+    prev_price = _float_or_none((previous or {}).get("price"))
+    if prev_price is None and price_lookup is not None:
+        prev_price = price_lookup.get(symbol, previous_date)
+    price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
+    stock_return = position_adjusted_stock_return(prev_holding_ratio, price_return)
+    portfolio_contribution = position_portfolio_contribution(prev_holding_ratio, price_return)
     action = classify_stock_history_action(
         prev_shares,
         shares,
@@ -162,7 +207,11 @@ def _change_row(
         "shares": shares,
         "prev_shares": prev_shares,
         "share_delta": shares - prev_shares,
-        "price": (current or previous or {}).get("price"),
+        "price": price,
+        "prev_price": prev_price,
+        "price_return": price_return,
+        "stock_return": stock_return,
+        "portfolio_contribution": portfolio_contribution,
         "market_value": market_value,
         "prev_market_value": prev_market_value,
         "market_value_delta": market_value - prev_market_value,
@@ -195,6 +244,7 @@ def _daily_changes(
     min_abs_change: float,
     top_changes: int,
     capital_scale: float,
+    price_lookup: _PriceLookup | None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     current = holdings_by_date.get(date, {})
     previous = holdings_by_date.get(previous_date or "", {})
@@ -202,7 +252,15 @@ def _daily_changes(
     changes: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     for symbol in symbols:
-        row = _change_row(symbol, current.get(symbol), previous.get(symbol), symbol_names=symbol_names)
+        row = _change_row(
+            symbol,
+            current.get(symbol),
+            previous.get(symbol),
+            date=date,
+            previous_date=previous_date,
+            price_lookup=price_lookup,
+            symbol_names=symbol_names,
+        )
         action = str(row["action"])
         if action == "HOLD":
             continue
@@ -245,6 +303,7 @@ def load_portfolio_history(
     current_capital: float | None = None,
     symbol_names: dict[str, str] | None = None,
     frequency: str | None = "daily",
+    price_root: str | Path | None = None,
 ) -> PortfolioHistoryResult:
     root = Path(fold_dir)
     holdings_path = _artifact_path(root, "holdings")
@@ -259,6 +318,7 @@ def load_portfolio_history(
     if missing:
         raise ValueError(f"{holdings_path} missing columns: {', '.join(missing)}")
     history_frequency = "bar" if is_bar_frequency(frequency) else "daily"
+    price_lookup = _PriceLookup(price_root, frequency=history_frequency)
     returns, returns_path = _read_returns(root, frequency=history_frequency)
     holdings = holdings.with_row_index(_ROW_INDEX_COL).select(
         [
@@ -335,6 +395,7 @@ def load_portfolio_history(
             min_abs_change=float(min_abs_change),
             top_changes=top_changes,
             capital_scale=capital.scale,
+            price_lookup=price_lookup,
         )
         row = dict(row)
         row["cumulative_return"] = cumulative_values.get(date)
@@ -346,6 +407,7 @@ def load_portfolio_history(
     source_paths = [holdings_path]
     if returns_path is not None:
         source_paths.append(returns_path)
+    source_paths.extend(price_lookup.paths)
     return PortfolioHistoryResult(
         fold_dir=root,
         rows=output_rows,

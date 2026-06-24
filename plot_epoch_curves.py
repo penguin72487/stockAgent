@@ -13,6 +13,7 @@ import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
 _CURVE_FILENAMES = ("epoch_curve.parquet", "epoch_curve.jsonl", "epoch_curve.csv")
+_DEFAULT_ARTIFACTS_ROOT = Path("artifacts/markets")
 _REPORT_PARQUET_FILENAMES = (
     "attention_capture_summary.parquet",
     "daily_portfolio_returns.parquet",
@@ -37,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifacts-root",
         type=str,
-        default="artifacts",
+        default=str(_DEFAULT_ARTIFACTS_ROOT),
         help="Root directory to recursively search for epoch_curve.parquet/jsonl/csv when --curve-file is omitted.",
     )
     parser.add_argument(

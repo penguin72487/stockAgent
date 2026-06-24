@@ -260,7 +260,13 @@ def write_live_weights_history(
 ) -> str | None:
     if not weights_rows:
         return None
-    date_text = str(summary.get("asof_date") or summary.get("panel_date") or "").strip()
+    date_text = str(
+        summary.get("weights_date")
+        or summary.get("panel_data_date")
+        or summary.get("panel_date")
+        or summary.get("asof_date")
+        or ""
+    ).strip()
     if not date_text:
         return None
 
@@ -369,6 +375,43 @@ def _display_zone(timezone_name: str | None) -> ZoneInfo:
         return ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
 
 
+def _now_text(timezone_name: str | None) -> str:
+    return datetime.now(_display_zone(timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_daily_bar_time(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        second = int(parts[2]) if len(parts) > 2 else 0
+    except Exception:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
+def _daily_bar_timestamp(value: str | None, daily_bar_time: str | None) -> str | None:
+    if not value:
+        return value
+    bar_time = _normalize_daily_bar_time(daily_bar_time)
+    if bar_time is None:
+        return value
+    text = str(value).replace("T", " ").strip()
+    if len(text) < 10:
+        return value
+    normalized = text[:19]
+    time_part = normalized[11:].strip() if len(normalized) > 10 else ""
+    has_non_midnight_time = ":" in time_part and time_part not in {"00:00", "00:00:00"}
+    if has_non_midnight_time:
+        return normalized
+    return f"{text[:10]} {bar_time}"
+
+
 def _finite_float_or_none(value: Any) -> float | None:
     try:
         number = float(value)
@@ -377,6 +420,26 @@ def _finite_float_or_none(value: Any) -> float | None:
     if not np.isfinite(number):
         return None
     return number
+
+
+def _position_stock_return(weight: float, price_return: float | None) -> float | None:
+    raw_return = _finite_float_or_none(price_return)
+    if raw_return is None:
+        return None
+    position = _finite_float_or_none(weight)
+    if position is None:
+        return None
+    if abs(position) < 1e-12:
+        return 0.0
+    return raw_return if position > 0.0 else -raw_return
+
+
+def _position_portfolio_contribution(weight: float, price_return: float | None) -> float | None:
+    raw_return = _finite_float_or_none(price_return)
+    position = _finite_float_or_none(weight)
+    if raw_return is None or position is None:
+        return None
+    return position * raw_return
 
 
 def _fmt_md_value(value: Any, *, pct: bool = False, digits: int = 4) -> str:
@@ -502,6 +565,7 @@ def _build_decision_rows(
         delta_weight = float(target_weight - current_weight)
         action = classify_rebalance_action(current_weight, target_weight, delta_weight=delta_weight)
         score = _finite_float_or_none(score_arr[idx]) if score_arr is not None else None
+        raw_price_return = _finite_float_or_none(price_returns[idx])
         constraint = _constraint_note(
             tradable=bool(tradable_mask[idx]),
             can_buy=bool(can_buy_mask[idx]),
@@ -529,7 +593,9 @@ def _build_decision_rows(
                 "trade_price": _finite_float_or_none(current_prices[idx]),
                 "current_price": _finite_float_or_none(current_prices[idx]),
                 "base_price": _finite_float_or_none(base_prices[idx]),
-                "price_return": _finite_float_or_none(price_returns[idx]),
+                "price_return": raw_price_return,
+                "stock_return": _position_stock_return(current_weight, raw_price_return),
+                "portfolio_contribution": _position_portfolio_contribution(current_weight, raw_price_return),
                 "tradable": bool(tradable_mask[idx]),
                 "can_buy": bool(can_buy_mask[idx]),
                 "can_sell": bool(can_sell_mask[idx]),
@@ -709,7 +775,8 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("current", "current_weight", "pct"),
                 ("delta", "delta_weight", "pct"),
                 ("px", "current_price", "price"),
-                ("ret", "price_return", "pct"),
+                ("stock_ret", "stock_return", "pct"),
+                ("pnl_contrib", "portfolio_contribution", "pct"),
                 ("score", "score", "float"),
                 ("action", "action", "text"),
             ],
@@ -728,7 +795,8 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("now", "current_weight", "pct"),
                 ("target", "target_weight", "pct"),
                 ("px", "trade_price", "price"),
-                ("ret", "price_return", "pct"),
+                ("stock_ret", "stock_return", "pct"),
+                ("pnl_contrib", "portfolio_contribution", "pct"),
             ],
         ),
         encoding="utf-8",
@@ -748,7 +816,8 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("current", "current_weight", "pct"),
                 ("delta", "delta_weight", "pct"),
                 ("px", "trade_price", "price"),
-                ("ret", "price_return", "pct"),
+                ("stock_ret", "stock_return", "pct"),
+                ("pnl_contrib", "portfolio_contribution", "pct"),
                 ("gate", "stock_market_gate", "float"),
                 ("market_delta", "market_delta_norm", "float"),
             ],
@@ -870,6 +939,7 @@ def generate_live_signal(
     max_gross_warning: float | None = None,
     data_timezone: str | None = None,
     display_timezone: str | None = DEFAULT_DISPLAY_TIMEZONE,
+    daily_bar_time: str | None = None,
     write: bool = True,
 ) -> LiveSignalResult:
     config = load_config(config_path)
@@ -893,6 +963,7 @@ def generate_live_signal(
     source_timezone = str(data_timezone or display_timezone or DEFAULT_DISPLAY_TIMEZONE)
     display_timezone_name = str(display_timezone or DEFAULT_DISPLAY_TIMEZONE)
     display_tz = _display_zone(display_timezone_name)
+    generated_at_text = datetime.now(display_tz).isoformat(timespec="seconds")
     trading_frequency = str(getattr(config.trading, "frequency", "") or "")
     intraday_frequency = _is_intraday_frequency(trading_frequency)
 
@@ -915,7 +986,8 @@ def generate_live_signal(
     symbol_names = load_symbol_name_map(config.data.parquet_root)
     panel_idx = _resolve_panel_index(panel, panel_date, config.training.lookback)
     panel_date_str = _date_string(panel.dates[panel_idx])
-    resolved_asof = asof_date or panel_date_str
+    panel_display_date = panel_date_str if intraday_frequency else _daily_bar_timestamp(panel_date_str, daily_bar_time)
+    resolved_asof = asof_date or _now_text(source_timezone)
 
     panel_prices = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
     price_snapshot = _price_snapshot(
@@ -937,10 +1009,15 @@ def generate_live_signal(
         prefer_live_weights=intraday_frequency,
         strictly_before_asof=True,
     )
+    previous_weights_data_date = previous_weights_date
+    previous_weights_display_date = (
+        previous_weights_date if intraday_frequency else _daily_bar_timestamp(previous_weights_date, daily_bar_time)
+    )
     drift_base_idx = _find_panel_date_index(panel, previous_weights_date)
     if drift_base_idx is None:
         drift_base_idx = panel_idx
     drift_base_date = _date_string(panel.dates[drift_base_idx])
+    drift_base_display_date = drift_base_date if intraday_frequency else _daily_bar_timestamp(drift_base_date, daily_bar_time)
     drift_base_prices = np.asarray(panel.close_prices[drift_base_idx], dtype=np.float64)
     drift = estimate_drifted_weights(previous_weights, drift_base_prices, current_prices)
 
@@ -1057,6 +1134,8 @@ def generate_live_signal(
     for idx, symbol in enumerate(panel.symbols):
         delta_weight = float(target_weights[idx] - drift.weights[idx])
         action = classify_rebalance_action(float(drift.weights[idx]), float(target_weights[idx]), delta_weight=delta_weight)
+        current_weight = float(drift.weights[idx])
+        raw_price_return = float(price_return[idx]) if np.isfinite(price_return[idx]) else None
         weights_rows.append(
             {
                 "date": resolved_asof,
@@ -1066,14 +1145,16 @@ def generate_live_signal(
                 "action": action,
                 "score": _finite_float_or_none(score_values[idx]) if score_values is not None else None,
                 "model_weight": float(model_weights[idx]),
-                "current_weight": float(drift.weights[idx]),
+                "current_weight": current_weight,
                 "target_weight": float(target_weights[idx]),
                 "delta_weight": delta_weight,
                 "abs_delta_weight": abs(delta_weight),
                 "base_price": float(drift_base_prices[idx]) if np.isfinite(drift_base_prices[idx]) else None,
                 "panel_price": float(panel_prices[idx]) if np.isfinite(panel_prices[idx]) else None,
                 "current_price": float(current_prices[idx]) if np.isfinite(current_prices[idx]) else None,
-                "price_return": float(price_return[idx]) if np.isfinite(price_return[idx]) else None,
+                "price_return": raw_price_return,
+                "stock_return": _position_stock_return(current_weight, raw_price_return),
+                "portfolio_contribution": _position_portfolio_contribution(current_weight, raw_price_return),
                 "tradable": bool(mask_np[idx]),
                 "can_buy": bool(can_buy_np[idx]),
                 "can_sell": bool(can_sell_np[idx]),
@@ -1103,11 +1184,13 @@ def generate_live_signal(
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
-        "generated_at": datetime.now(display_tz).isoformat(timespec="seconds"),
+        "generated_at": generated_at_text,
         "asof_date": resolved_asof,
         "market": market_id,
         "market_label": market_name,
-        "panel_date": panel_date_str,
+        "panel_date": panel_display_date,
+        "panel_data_date": panel_date_str,
+        "weights_date": panel_date_str,
         "trading_frequency": trading_frequency,
         "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
         "previous_weights_policy": "live_signal_before_asof" if intraday_frequency else "daily_weights_previous_trading_day",
@@ -1120,9 +1203,11 @@ def generate_live_signal(
         "checkpoint_fingerprint": short_file_fingerprint(checkpoint),
         "config_path": str(config_path),
         "config_fingerprint": short_file_fingerprint(Path(config_path)),
-        "previous_weights_date": previous_weights_date,
+        "previous_weights_date": previous_weights_display_date,
+        "previous_weights_data_date": previous_weights_data_date,
         "previous_weights_path": previous_weights_path,
-        "drift_base_date": drift_base_date,
+        "drift_base_date": drift_base_display_date,
+        "drift_base_data_date": drift_base_date,
         "price_source": price_snapshot.source,
         "price_timestamp": price_snapshot.timestamp,
         "price_available_count": int(price_snapshot.available_count),

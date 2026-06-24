@@ -132,6 +132,16 @@ def build_rebalance_rows(
             if np.isfinite(base_price) and np.isfinite(current_price) and base_price > 0.0
             else float("nan")
         )
+        stock_return = (
+            0.0
+            if np.isfinite(simple_return) and abs(current_weight) < 1e-12
+            else simple_return
+            if np.isfinite(simple_return) and current_weight > 0.0
+            else -simple_return
+            if np.isfinite(simple_return) and current_weight < 0.0
+            else float("nan")
+        )
+        portfolio_contribution = current_weight * simple_return if np.isfinite(simple_return) else float("nan")
         rows.append(
             {
                 "symbol": str(symbol),
@@ -145,6 +155,8 @@ def build_rebalance_rows(
                 "current_price": current_price,
                 "base_price": base_price,
                 "price_return": float(simple_return),
+                "stock_return": float(stock_return),
+                "portfolio_contribution": float(portfolio_contribution),
             }
         )
     rows.sort(key=lambda row: float(row["abs_delta_weight"]), reverse=True)
