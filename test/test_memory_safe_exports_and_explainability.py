@@ -15,6 +15,7 @@ from stockagent.explainability import (
     _adapt_dynamic_symbol_position_state,
     _auto_explain_row_chunk_size,
     _cuda_oom_fallback_settings,
+    _discover_market_runs,
     explain_batch_row_chunked,
     parse_args,
     settings_from_training_config,
@@ -136,6 +137,9 @@ def test_strict_no_fallback_raises_on_explainability_cuda_oom(monkeypatch) -> No
 def test_explain_model_cli_defaults_are_complete_offline_explainability() -> None:
     args = parse_args([])
 
+    assert args.config is None
+    assert args.market_artifacts_root == Path("artifacts/markets")
+    assert args.market_config_root == Path("configs/markets")
     assert args.ig_steps == 8
     assert args.perturb is True
     assert args.perturb_max_auto_batch_size == 5
@@ -154,6 +158,23 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.cross_asset_source_chunk_size == 2
     assert args.cross_asset_attention_capture_rows == 4
     assert args.cross_asset_role_embedding is True
+
+
+def test_explain_model_cli_discovers_market_artifacts(tmp_path: Path) -> None:
+    artifacts_root = tmp_path / "artifacts" / "markets"
+    config_root = tmp_path / "configs" / "markets"
+    (artifacts_root / "tw" / "fold_25").mkdir(parents=True)
+    (artifacts_root / "tw" / "fold_25" / "checkpoint_best.pt").write_bytes(b"")
+    (artifacts_root / "scratch").mkdir(parents=True)
+    config_root.mkdir(parents=True)
+    (config_root / "tw.yaml").write_text("runner:\n  output_dir: artifacts/markets/tw\n", encoding="utf-8")
+
+    runs = _discover_market_runs(artifacts_root, config_root)
+
+    assert len(runs) == 1
+    assert runs[0].market == "tw"
+    assert runs[0].config_path == config_root / "tw.yaml"
+    assert runs[0].output_dir == artifacts_root / "tw"
 
 
 def test_dynamic_symbol_position_checkpoint_state_is_resized_for_explainability() -> None:

@@ -57,6 +57,79 @@ def _read_table(path: Path):
     raise ValueError(f"Unsupported table format: {path}")
 
 
+def _price_history_path(price_root: str | Path | None, symbol: str) -> Path | None:
+    if price_root is None:
+        return None
+    root = Path(price_root)
+    if not root.exists():
+        return None
+    normalized = normalize_symbol_query(symbol)
+    candidates = []
+    for value in dict.fromkeys([str(symbol or "").strip(), normalized, normalized.upper()]):
+        if not value:
+            continue
+        candidates.extend(
+            [
+                root / f"{value}_features.parquet",
+                root / f"{value}.parquet",
+                root / f"{value}_features.csv",
+                root / f"{value}.csv",
+            ]
+        )
+    for path in candidates:
+        if path.exists():
+            return path
+    for suffix in ("_features.parquet", ".parquet", "_features.csv", ".csv"):
+        matches = sorted(root.glob(f"{normalized}*{suffix}"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def _read_price_symbol_series(
+    price_root: str | Path | None,
+    symbol: str,
+    *,
+    frequency: str | None = "daily",
+    alias: str = "price_from_data",
+):
+    import polars as pl
+
+    path = _price_history_path(price_root, symbol)
+    if path is None:
+        return None, None, None
+    frame = _read_table(path)
+    if "date" not in frame.columns:
+        return None, None, path
+    price_col = "close" if "close" in frame.columns else "adjclose" if "adjclose" in frame.columns else None
+    if price_col is None:
+        return None, None, path
+    selected = frame.with_row_index(_ROW_INDEX_COL).select(
+        [
+            _date_string_expr(frequency),
+            pl.col(_ROW_INDEX_COL),
+            pl.col(price_col).cast(pl.Float64, strict=False).alias(alias),
+        ]
+    )
+    resolved = normalize_symbol_query(path.name.removesuffix("_features.parquet").removesuffix("_features.csv").split(".")[0])
+    if is_bar_frequency(frequency):
+        return selected.drop(_ROW_INDEX_COL), resolved or symbol, path
+    return _last_daily_snapshot(selected, [alias]), resolved or symbol, path
+
+
+def _read_price_history_map(
+    price_root: str | Path | None,
+    symbol: str,
+    *,
+    frequency: str | None = "daily",
+) -> tuple[dict[str, float], Path | None]:
+    frame, _, path = _read_price_symbol_series(price_root, symbol, frequency=frequency, alias="price")
+    if frame is None:
+        return {}, path
+    rows = frame.drop_nulls(["date", "price"]).to_dicts()
+    return {str(row["date"]): float(row["price"]) for row in rows}, path
+
+
 def _date_string_expr(frequency: str | None = "daily"):
     import polars as pl
 
@@ -279,6 +352,26 @@ def _symbol_name(symbol_names: dict[str, str] | None, symbol: str) -> str:
     return ""
 
 
+def position_adjusted_stock_return(weight: float | int | None, price_return: float | int | None) -> float | None:
+    try:
+        raw_return = float(price_return)
+        position = float(weight)
+    except Exception:
+        return None
+    if abs(position) < 1e-12:
+        return 0.0
+    return raw_return if position > 0.0 else -raw_return
+
+
+def position_portfolio_contribution(weight: float | int | None, price_return: float | int | None) -> float | None:
+    try:
+        raw_return = float(price_return)
+        position = float(weight)
+    except Exception:
+        return None
+    return position * raw_return
+
+
 def classify_stock_history_action(
     prev_shares: int,
     shares: int,
@@ -311,6 +404,7 @@ def _coalesce_stock_history_columns(frame):
     defaults = {
         "shares": pl.lit(None, dtype=pl.Int64),
         "price": pl.lit(None, dtype=pl.Float64),
+        "price_from_data": pl.lit(None, dtype=pl.Float64),
         "market_value": pl.lit(None, dtype=pl.Float64),
         "holding_ratio_from_holdings": pl.lit(None, dtype=pl.Float64),
         "model_weight": pl.lit(None, dtype=pl.Float64),
@@ -327,6 +421,7 @@ def _coalesce_stock_history_columns(frame):
         frame.with_columns(
             [
                 pl.coalesce([pl.col("shares"), pl.lit(0)]).cast(pl.Int64).alias("shares"),
+                pl.coalesce([pl.col("price"), pl.col("price_from_data")]).cast(pl.Float64).alias("price"),
                 pl.coalesce([pl.col("market_value"), pl.lit(0.0)]).cast(pl.Float64).alias("market_value"),
                 pl.coalesce([pl.col("model_weight"), pl.lit(0.0)]).cast(pl.Float64).alias("model_weight"),
                 pl.coalesce([pl.col("actual_weight"), pl.lit(0.0)]).cast(pl.Float64).alias("actual_weight"),
@@ -345,6 +440,7 @@ def _coalesce_stock_history_columns(frame):
         .with_columns(
             [
                 pl.col("shares").shift(1).fill_null(0).alias("prev_shares"),
+                pl.col("price").shift(1).alias("prev_price"),
                 pl.col("holding_ratio").shift(1).fill_null(0.0).alias("prev_holding_ratio"),
                 pl.col("actual_weight").shift(1).fill_null(0.0).alias("prev_actual_weight"),
                 pl.col("model_weight").shift(1).fill_null(0.0).alias("prev_model_weight"),
@@ -356,6 +452,23 @@ def _coalesce_stock_history_columns(frame):
                 (pl.col("holding_ratio") - pl.col("prev_holding_ratio")).alias("holding_ratio_delta"),
                 (pl.col("actual_weight") - pl.col("prev_actual_weight")).alias("actual_weight_delta"),
                 (pl.col("model_weight") - pl.col("prev_model_weight")).alias("model_weight_delta"),
+                pl.when((pl.col("price").is_not_null()) & (pl.col("prev_price").is_not_null()) & (pl.col("prev_price") > 0.0))
+                .then(pl.col("price") / pl.col("prev_price") - 1.0)
+                .otherwise(None)
+                .alias("price_return"),
+            ]
+        )
+        .with_columns(
+            [
+                pl.when(pl.col("price_return").is_null())
+                .then(None)
+                .when(pl.col("prev_holding_ratio").abs() < 1e-12)
+                .then(0.0)
+                .when(pl.col("prev_holding_ratio") > 0.0)
+                .then(pl.col("price_return"))
+                .otherwise(-pl.col("price_return"))
+                .alias("stock_return"),
+                (pl.col("prev_holding_ratio") * pl.col("price_return")).alias("portfolio_contribution"),
             ]
         )
     )
@@ -371,6 +484,7 @@ def load_stock_history(
     current_capital: float | None = None,
     symbol_names: dict[str, str] | None = None,
     frequency: str | None = "daily",
+    price_root: str | Path | None = None,
 ) -> StockHistoryResult:
     root = Path(fold_dir)
     if not root.exists():
@@ -418,6 +532,17 @@ def load_stock_history(
     if holdings_frame is not None:
         frames.append(holdings_frame)
         resolved_symbol = resolved_symbol or holdings_symbol
+
+    price_frame, price_symbol, price_path = _read_price_symbol_series(
+        price_root,
+        resolved_symbol or symbol,
+        frequency=frequency,
+    )
+    if price_path is not None:
+        source_paths.append(price_path)
+    if price_frame is not None:
+        frames.append(price_frame)
+        resolved_symbol = resolved_symbol or price_symbol
 
     returns_frame, returns_path = _read_returns(root, frequency=frequency)
     if returns_path is not None:
