@@ -59,7 +59,7 @@ class LatentFactorMarketTokenPortfolioModel(nn.Module):
         residual_scale: float = 0.5,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_only",
-        portfolio_activation: str = "softsign",
+        portfolio_activation: str = "gd",
         return_aux: bool = True,
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,

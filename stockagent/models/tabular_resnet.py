@@ -41,7 +41,7 @@ class CrossSectionalTabularResNet(nn.Module):
         n_blocks: int,
         dropout: float,
         long_only: bool = True,
-        portfolio_activation: str = "softsign",
+        portfolio_activation: str = "gd",
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
     ) -> None:

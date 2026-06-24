@@ -254,7 +254,7 @@ $$
 
 ### （六）由分數轉換為權重與最小權重門檻
 
-模型對每檔可交易股票輸出分數 $z_{i,t}$。long-only 模式可產生非負權重；long-short 模式則先對分數做橫斷面中心化，再以可設定的有界奇函式 $\phi(\cdot)$ 產生方向，並以 L1 正規化控制總曝險。實作中 `trading.portfolio_activation` 可選 `softsign`、`tanh`、`isru`、`erf`、`atan` 與 `gd`：
+模型對每檔可交易股票輸出分數 $z_{i,t}$。long-only 模式可產生非負權重；long-short 模式則先對分數做橫斷面中心化，再以可設定的有界奇函式 $\phi(\cdot)$ 產生方向，並以 L1 正規化控制總曝險。實作中 `trading.portfolio_activation` 可選 `softsign`、`tanh`、`isru`、`erf`、`atan` 與 `gd`，目前預設為 `gd`：
 
 $$
 w_{i,t} =
