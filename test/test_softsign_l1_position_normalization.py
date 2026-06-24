@@ -39,17 +39,17 @@ def test_masked_softsign_l1_long_short_weights_use_softsign_direction_and_l1_nor
     assert bool((weights < 0.0).any().item())
 
 
-def test_legacy_portfolio_normalizers_now_use_softsign_l1() -> None:
+def test_legacy_portfolio_normalizers_use_default_gd_l1() -> None:
     logits = torch.tensor([[1.0, -2.0, 0.25]], dtype=torch.float32)
     mask = torch.tensor([[True, True, True]])
 
     long_short = dual_branch_softmax(logits, mask)
-    expected_long_short = masked_softsign_l1_weights(logits, mask, long_only=False)
+    expected_long_short = masked_activation_l1_weights(logits, mask, long_only=False, activation="gd")
     assert torch.allclose(long_short, expected_long_short, atol=1e-7, rtol=1e-6)
     assert torch.allclose(long_short.abs().sum(dim=1), torch.ones(1), atol=1e-6)
 
     long_only = masked_softmax(logits, mask)
-    expected_long_only = masked_softsign_l1_weights(logits, mask, long_only=True)
+    expected_long_only = masked_activation_l1_weights(logits, mask, long_only=True, activation="gd")
     assert torch.allclose(long_only, expected_long_only, atol=1e-7, rtol=1e-6)
     assert torch.all(long_only >= 0.0)
     assert torch.allclose(long_only.abs().sum(dim=1), torch.ones(1), atol=1e-6)
@@ -76,7 +76,7 @@ def test_softsign_l1_empty_rows_are_zero() -> None:
     assert torch.allclose(weights, torch.zeros_like(weights))
 
 
-def test_tensor_backtest_normalizes_targets_with_softsign_l1() -> None:
+def test_tensor_backtest_normalizes_targets_with_default_gd_l1() -> None:
     target_scores = torch.tensor([[2.0, -1.0, 0.5]], dtype=torch.float32)
     returns = torch.zeros_like(target_scores)
     tradable = torch.ones_like(target_scores, dtype=torch.bool)
@@ -95,7 +95,7 @@ def test_tensor_backtest_normalizes_targets_with_softsign_l1() -> None:
         min_trade_weight=0.0,
     )
 
-    expected = masked_softsign_l1_weights(target_scores, tradable, long_only=False)
+    expected = masked_activation_l1_weights(target_scores, tradable, long_only=False, activation="gd")
     assert torch.allclose(result.weights_history, expected, atol=1e-7, rtol=1e-6)
 
 
@@ -120,7 +120,7 @@ def test_portfolio_activation_aliases_normalize() -> None:
     assert normalize_portfolio_activation("arctan") == "atan"
     assert normalize_portfolio_activation("gd") == "gudermannian"
     assert normalize_portfolio_activation("inverse_sqrt") == "isru"
-    assert normalize_portfolio_activation(None) == "softsign"
+    assert normalize_portfolio_activation(None) == "gudermannian"
 
 
 def test_tensor_backtest_portfolio_activation_switch_changes_target_normalizer() -> None:

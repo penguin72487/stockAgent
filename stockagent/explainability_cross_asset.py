@@ -205,7 +205,7 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
     mask = mask.to(device=scores.device, dtype=torch.bool)
     temp = float(getattr(model, "default_temperature", 1.0))
     temp = max(0.05, temp)
-    activation = str(getattr(model, "portfolio_activation", "softsign"))
+    activation = str(getattr(model, "portfolio_activation", "gd"))
     mode = str(getattr(model, "portfolio_mode", "long_short")).strip().lower()
     if mode in {"long", "long_only", "longonly"}:
         return masked_softmax(scores / temp, mask, activation=activation).masked_fill(~mask, 0.0)

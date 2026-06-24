@@ -35,7 +35,7 @@ class CrossSectionalFTTransformer(nn.Module):
         ffn_dim: int,
         dropout: float,
         long_only: bool = True,
-        portfolio_activation: str = "softsign",
+        portfolio_activation: str = "gd",
         use_cls_token: bool = True,
         max_encoder_batch_rows: int = 60000,
     ) -> None:
