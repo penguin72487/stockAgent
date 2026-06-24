@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 
 
-DEFAULT_PORTFOLIO_ACTIVATION = "softsign"
+DEFAULT_PORTFOLIO_ACTIVATION = "gd"
 
 
 def _normalize_portfolio_activation(activation: str | None) -> str:

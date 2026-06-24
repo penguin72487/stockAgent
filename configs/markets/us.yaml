@@ -39,7 +39,7 @@ trading:
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
   min_trade_weight: 0.005
-  portfolio_activation: softsign
+  portfolio_activation: gd
   long_only: false
   cash_allowed: true
 training:

@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 25
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda

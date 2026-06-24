@@ -2558,7 +2558,7 @@ def run_backtest_integer_shares(
         equity_after_trade = max(equity_after_trade, 1e-12)
 
         # Output normalization for holdings report:
-        # 1) softsign keeps signed direction in (-1, 1)
+        # 1) The configured bounded activation keeps signed direction in (-1, 1).
         # 2) L1 normalization keeps total absolute exposure at 1.
         stock_holding_ratio_raw = stock_market_values / equity_after_trade
         cash_ratio_raw = float(cash / equity_after_trade)

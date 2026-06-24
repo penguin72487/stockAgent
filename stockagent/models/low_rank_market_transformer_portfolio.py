@@ -307,7 +307,7 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         dropout: float = 0.1,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_only",
-        portfolio_activation: str = "softsign",
+        portfolio_activation: str = "gd",
         return_aux: bool = True,
         return_aux_details: bool = False,
         runtime_shape_check: bool = False,

@@ -542,7 +542,7 @@ class TransformerBasePortfolioModel(nn.Module):
         dropout: float = 0.1,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_short",
-        portfolio_activation: str = "softsign",
+        portfolio_activation: str = "gd",
         max_full_tokens: int = 4096,
         checkpoint_blocks: bool = False,
         return_aux: bool = True,

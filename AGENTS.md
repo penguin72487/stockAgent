@@ -256,7 +256,7 @@ Guidelines:
 
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
-- Portfolio direction and sizing should use `trading.portfolio_activation` for signed direction followed by L1 normalization for gross exposure control. Supported activations are `softsign`, `tanh`, `isru`, `erf`, `atan`, and `gd`/`gudermannian`; the current default is `softsign`.
+- Portfolio direction and sizing should use `trading.portfolio_activation` for signed direction followed by L1 normalization for gross exposure control. Supported activations are `softsign`, `tanh`, `isru`, `erf`, `atan`, and `gd`/`gudermannian`; the current default is `gd`.
 - Do not use dual-branch softmax as the active long/short position calculator. Legacy `dual_branch_softmax` / `masked_softmax` names are now compatibility wrappers around configured activation + L1 portfolio normalization.
 - If changing `trading.long_only`, understand that it affects loss/backtest interpretation, not just the model head.
 - Keep model output mode, loss assumptions, backtest assumptions, and report wording aligned. If they disagree, flag it explicitly.
