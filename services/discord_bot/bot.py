@@ -134,14 +134,15 @@ def _env_float(name: str, default: float) -> float:
 
 def _state() -> dict[str, Any]:
     if not STATE_PATH.exists():
-        return {"markets": {}}
+        return {"markets": {}, "users": {}}
     try:
         raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return {"markets": {}}
+        return {"markets": {}, "users": {}}
     if not isinstance(raw, dict):
-        return {"markets": {}}
+        return {"markets": {}, "users": {}}
     raw.setdefault("markets", {})
+    raw.setdefault("users", {})
     return raw
 
 
@@ -166,6 +167,83 @@ def _set_market_state(market: str, **values: Any) -> None:
         markets[str(market)] = entry
     entry.update(values)
     _write_state(state)
+
+
+def _normalize_watch_symbol(symbol: Any) -> str:
+    text = str(symbol or "").strip().strip("`").upper()
+    for suffix in (".TW", ".TWO"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+    return text
+
+
+def _user_state_key(user_id: Any) -> str:
+    value = str(user_id or "").strip()
+    return value if value else "anonymous"
+
+
+def _user_watchlist(user_id: Any, market: str) -> list[str]:
+    state = _state()
+    users = state.setdefault("users", {})
+    entry = users.get(_user_state_key(user_id))
+    if not isinstance(entry, dict):
+        return []
+    watchlists = entry.get("watchlists")
+    if not isinstance(watchlists, dict):
+        return []
+    items = watchlists.get(str(market), [])
+    if not isinstance(items, list):
+        return []
+    seen: set[str] = set()
+    symbols: list[str] = []
+    for item in items:
+        symbol = _normalize_watch_symbol(item)
+        if symbol and symbol not in seen:
+            symbols.append(symbol)
+            seen.add(symbol)
+    return symbols
+
+
+def _set_user_watchlist(user_id: Any, market: str, symbols: list[str]) -> list[str]:
+    state = _state()
+    users = state.setdefault("users", {})
+    user_key = _user_state_key(user_id)
+    entry = users.setdefault(user_key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        users[user_key] = entry
+    watchlists = entry.setdefault("watchlists", {})
+    if not isinstance(watchlists, dict):
+        watchlists = {}
+        entry["watchlists"] = watchlists
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in symbols:
+        symbol = _normalize_watch_symbol(item)
+        if symbol and symbol not in seen:
+            normalized.append(symbol)
+            seen.add(symbol)
+    watchlists[str(market)] = normalized
+    _write_state(state)
+    return normalized
+
+
+def _add_user_watch_symbol(user_id: Any, market: str, symbol: Any) -> list[str]:
+    items = _user_watchlist(user_id, market)
+    normalized = _normalize_watch_symbol(symbol)
+    if normalized and normalized not in items:
+        items.append(normalized)
+    return _set_user_watchlist(user_id, market, items)
+
+
+def _remove_user_watch_symbol(user_id: Any, market: str, symbol: Any) -> list[str]:
+    normalized = _normalize_watch_symbol(symbol)
+    items = [item for item in _user_watchlist(user_id, market) if item != normalized]
+    return _set_user_watchlist(user_id, market, items)
+
+
+def _clear_user_watchlist(user_id: Any, market: str) -> list[str]:
+    return _set_user_watchlist(user_id, market, [])
 
 
 def _market_enabled(cfg: LiveMarketConfig) -> bool:
@@ -921,6 +999,179 @@ def _capital_context_text(*, capital: Any = None, initial_capital: Any = None, c
     return " ".join(parts) if parts else "artifact capital"
 
 
+def _summary_with_capital_context(
+    cfg: LiveMarketConfig,
+    summary: dict[str, Any],
+    *,
+    current_capital: float | None = None,
+) -> dict[str, Any]:
+    out = dict(summary)
+    capital = _resolve_current_capital(cfg, current_capital=current_capital)
+    if capital is not None:
+        out["display_capital"] = float(capital)
+        portfolio_return = _float_or_none(out.get("portfolio_simple_return"))
+        benchmark_return = _float_or_none(out.get("benchmark_simple_return"))
+        if portfolio_return is not None:
+            out["portfolio_pnl_value"] = portfolio_return * float(capital)
+        if benchmark_return is not None:
+            out["benchmark_pnl_value"] = benchmark_return * float(capital)
+        if portfolio_return is not None and benchmark_return is not None:
+            out["excess_pnl_value"] = (portfolio_return - benchmark_return) * float(capital)
+    recent = out.get("recent_performance")
+    if isinstance(recent, dict):
+        recent = dict(recent)
+        recent["window_label"] = _performance_window_label(cfg, recent)
+        if capital is not None:
+            for source_key, target_key in (
+                ("strategy_return", "strategy_pnl_value"),
+                ("benchmark_return", "benchmark_pnl_value"),
+                ("excess_return", "excess_pnl_value"),
+            ):
+                value = _float_or_none(recent.get(source_key))
+                if value is not None:
+                    recent[target_key] = value * float(capital)
+        out["recent_performance"] = recent
+    return out
+
+
+def _config_trading_limits(cfg: LiveMarketConfig) -> tuple[float | None, float | None]:
+    try:
+        market_cfg = load_config(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path))
+    except Exception:
+        return None, None
+    gross = _float_or_none(getattr(market_cfg.trading, "gross_leverage", None))
+    turnover = _float_or_none(getattr(market_cfg.trading, "max_turnover_ratio", None))
+    return gross, turnover
+
+
+def _signal_sanity_issues(cfg: LiveMarketConfig, summary: dict[str, Any]) -> list[tuple[str, str]]:
+    issues: list[tuple[str, str]] = []
+
+    def add(severity: str, text: str) -> None:
+        issues.append((severity, text))
+
+    for key, label in (
+        ("asof_date", "signal time"),
+        ("panel_date", "panel time"),
+    ):
+        if not str(summary.get(key) or "").strip():
+            add("block", f"missing {label}")
+
+    for key, label, warn_abs, block_abs in (
+        ("portfolio_simple_return", "portfolio return", 0.20, 0.50),
+        ("benchmark_simple_return", "baseline return", 0.20, 0.50),
+    ):
+        raw = summary.get(key)
+        value = _float_or_none(raw)
+        if raw is not None and value is None:
+            add("block", f"{label} is not finite")
+            continue
+        if value is None:
+            continue
+        if abs(value) > block_abs:
+            add("block", f"{label} {_signed_pct(value)} exceeds {_pct(block_abs)}")
+        elif abs(value) > warn_abs:
+            add("warn", f"{label} {_signed_pct(value)} is unusually large")
+
+    recent = summary.get("recent_performance")
+    if isinstance(recent, dict):
+        for key, label in (
+            ("strategy_return", "recent strategy return"),
+            ("benchmark_return", "recent baseline return"),
+        ):
+            raw = recent.get(key)
+            value = _float_or_none(raw)
+            if raw is not None and value is None:
+                add("block", f"{label} is not finite")
+                continue
+            if value is None:
+                continue
+            if abs(value) > 5.0:
+                add("block", f"{label} {_signed_pct(value)} is implausible")
+            elif abs(value) > 1.0:
+                add("warn", f"{label} {_signed_pct(value)} is unusually large")
+
+    gross_limit, turnover_limit = _config_trading_limits(cfg)
+    risk = summary.get("target_risk") if isinstance(summary.get("target_risk"), dict) else {}
+    gross = _float_or_none(risk.get("gross"))
+    if gross is not None and gross_limit is not None:
+        if gross > gross_limit * 1.25:
+            add("block", f"gross exposure {_pct(gross)} exceeds configured limit {_pct(gross_limit)}")
+        elif gross > gross_limit * 1.05:
+            add("warn", f"gross exposure {_pct(gross)} is near configured limit {_pct(gross_limit)}")
+    top_abs = _float_or_none(risk.get("top_abs_weight"))
+    if top_abs is not None:
+        if top_abs > 0.80:
+            add("block", f"top position {_pct(top_abs)} is too concentrated")
+        elif top_abs > 0.25:
+            add("warn", f"top position {_pct(top_abs)} is concentrated")
+
+    turnover = _float_or_none(summary.get("turnover"))
+    if turnover is not None and turnover_limit is not None:
+        if turnover > turnover_limit * 1.20:
+            add("block", f"turnover {_pct(turnover)} exceeds configured limit {_pct(turnover_limit)}")
+        elif turnover > turnover_limit * 0.80:
+            add("warn", f"turnover {_pct(turnover)} is high")
+    cost = _float_or_none(summary.get("estimated_trade_cost"))
+    if cost is not None:
+        if cost > 0.20:
+            add("block", f"estimated fees {_pct(cost)} are implausibly high")
+        elif cost > 0.05:
+            add("warn", f"estimated fees {_pct(cost)} are high")
+
+    for item in summary.get("risk_warnings", []) if isinstance(summary.get("risk_warnings"), list) else []:
+        text = str(item or "").strip()
+        if text:
+            add("warn", text)
+    return issues
+
+
+def _signal_sanity_level(issues: list[tuple[str, str]]) -> str:
+    if any(severity == "block" for severity, _ in issues):
+        return "BLOCK"
+    if issues:
+        return "WARN"
+    return "OK"
+
+
+def _signal_sanity_line(issues: list[tuple[str, str]]) -> str:
+    level = _signal_sanity_level(issues)
+    if level == "OK":
+        return "sanity=`OK`"
+    shown = " | ".join(text for _, text in issues[:4])
+    return f"sanity=`{level}` issues=`{shown}`"
+
+
+def _signal_sanity_message(cfg: LiveMarketConfig, summary: dict[str, Any], issues: list[tuple[str, str]]) -> str:
+    lines = [
+        f"**signal sanity gate** {cfg.label}",
+        _kv_line(
+            ("market", summary.get("market", cfg.market)),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+        ),
+        _kv_line(("sanity", _signal_sanity_level(issues))),
+        "訊號異常，已暫停自動公開播報；請人工確認資料連續性、報酬與風險後再使用。",
+        "issues:",
+    ]
+    lines.extend(f"- {severity}: {text}" for severity, text in issues)
+    _append_investment_warning(lines)
+    return "\n".join(lines)
+
+
+def _prepend_sanity_notice(content: str, cfg: LiveMarketConfig, summary: dict[str, Any]) -> str:
+    issues = _signal_sanity_issues(cfg, summary)
+    if not issues:
+        return content
+    lines = [
+        f"**sanity {_signal_sanity_level(issues)}**",
+        _signal_sanity_line(issues),
+        "",
+        content,
+    ]
+    return "\n".join(lines)
+
+
 def _shorten(text: Any, max_chars: int = 220) -> str:
     value = str(text or "").strip()
     if len(value) <= max_chars:
@@ -1287,6 +1538,271 @@ def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(path)
     return pl.read_parquet(path).to_dicts()
+
+
+def _latest_signal_or_raise(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]]:
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        raise BotUserError(f"`{cfg.market}` 尚無 live signal，請先跑 `/signal_now market:{cfg.market}`。")
+    return latest
+
+
+def _latest_artifact_rows(
+    summary: dict[str, Any],
+    summary_path: Path,
+    key: str,
+    fallback_key: str,
+) -> list[dict[str, Any]]:
+    path = _summary_artifact_path(summary, key, summary_path)
+    if path is not None and path.exists():
+        return _read_parquet_rows(path)
+    fallback = summary.get(fallback_key)
+    return list(fallback) if isinstance(fallback, list) else []
+
+
+def _row_weight_value(row: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = _float_or_none(row.get(key))
+        if value is not None:
+            return value
+    return 0.0
+
+
+def _row_matches_watchlist(row: dict[str, Any], watchlist: list[str]) -> bool:
+    if not watchlist:
+        return True
+    symbol = _normalize_watch_symbol(row.get("symbol"))
+    name = str(row.get("name") or "").strip().lower()
+    for item in watchlist:
+        needle = _normalize_watch_symbol(item)
+        if not needle:
+            continue
+        if needle == symbol or needle in symbol or symbol in needle:
+            return True
+        if needle.lower() and needle.lower() in name:
+            return True
+    return False
+
+
+def _filter_watchlist_rows(rows: list[dict[str, Any]], watchlist: list[str]) -> list[dict[str, Any]]:
+    if not watchlist:
+        return rows
+    return [row for row in rows if _row_matches_watchlist(row, watchlist)]
+
+
+def _signal_action_mix(summary: dict[str, Any], rows: list[dict[str, Any]] | None = None) -> str:
+    data = rows
+    if data is None:
+        raw = summary.get("rebalance")
+        data = list(raw) if isinstance(raw, list) else []
+    return _action_count_text(data)
+
+
+def _latest_signal_message(
+    cfg: LiveMarketConfig,
+    summary_path: Path,
+    summary: dict[str, Any],
+    *,
+    top_n: int = 8,
+    current_capital: float | None = None,
+    debug: bool = False,
+) -> str:
+    del summary_path
+    enriched = _summary_with_capital_context(cfg, summary, current_capital=current_capital)
+    message = format_signal_message(enriched, max_rows=max(0, int(top_n)), debug=debug)
+    return _prepend_sanity_notice(message, cfg, enriched)
+
+
+def _latest_changes_pages(
+    cfg: LiveMarketConfig,
+    summary_path: Path,
+    summary: dict[str, Any],
+    *,
+    action: str = "actionable",
+    limit: int = 0,
+    page_size: int = 20,
+    current_capital: float | None = None,
+    watchlist: list[str] | None = None,
+    debug: bool = False,
+) -> list[str]:
+    rows = _latest_artifact_rows(summary, summary_path, "rebalance_path", "rebalance")
+    rows = _filter_decision_rows(rows, action=action, actionable_only=str(action or "").lower() in {"", "actionable"})
+    rows = _filter_watchlist_rows(rows, watchlist or [])
+    rows = _sort_decision_rows(rows, "delta")
+    rows = _limit_rows(rows, limit)
+    capital = _resolve_current_capital(cfg, current_capital=current_capital)
+    rows = _annotate_weight_rows_with_capital(rows, capital)
+    issues = _signal_sanity_issues(cfg, summary)
+    header = [
+        _kv_line(
+            ("market", summary.get("market", cfg.market)),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+            ("rows", len(rows)),
+        ),
+        _kv_line(("action_mix", _signal_action_mix(summary, rows)), ("watch", ",".join(watchlist or []) or "off")),
+        _kv_line(("sanity", _signal_sanity_level(issues))),
+        f"capital: `{_capital_context_text(capital=capital)}`",
+    ]
+    if issues:
+        header.append("issues: `" + " | ".join(text for _, text in issues[:3]) + "`")
+    if debug:
+        header.extend(
+            [
+                _kv_line(
+                    ("signal", summary.get("signal_id", summary_path.parent.name)),
+                    ("display_tz", summary.get("display_timezone_label") or _display_tz_text(cfg)),
+                ),
+                f"summary: `{_display_path(summary_path)}`",
+            ]
+        )
+    return _line_pages(
+        title=f"{cfg.label} latest changes",
+        rows=rows,
+        formatter=_rebalance_line,
+        page_size=page_size,
+        header_lines=header,
+    )
+
+
+def _performance_message(
+    cfg: LiveMarketConfig,
+    summary_path: Path,
+    summary: dict[str, Any],
+    *,
+    days: int = 32,
+    current_capital: float | None = None,
+    debug: bool = False,
+) -> str:
+    del summary_path
+    enriched = _summary_with_capital_context(cfg, summary, current_capital=current_capital)
+    portfolio_return = _float_or_none(enriched.get("portfolio_simple_return"))
+    benchmark_return = _float_or_none(enriched.get("benchmark_simple_return"))
+    excess_return = None if portfolio_return is None or benchmark_return is None else portfolio_return - benchmark_return
+    recent = enriched.get("recent_performance") if isinstance(enriched.get("recent_performance"), dict) else {}
+    issues = _signal_sanity_issues(cfg, enriched)
+    lines = [
+        f"**performance** {cfg.label}",
+        _kv_line(
+            ("asof", _display_summary_time(enriched, enriched.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(enriched, enriched.get("panel_date", "n/a"))),
+            ("sanity", _signal_sanity_level(issues)),
+        ),
+        "",
+        "**上個訊號到現在**",
+        _kv_line(
+            ("strategy", _signed_pct(portfolio_return)),
+            ("baseline", _signed_pct(benchmark_return)),
+            ("excess", _signed_pct(excess_return)),
+            ("turnover", _pct(enriched.get("turnover"))),
+        ),
+    ]
+    if _float_or_none(enriched.get("portfolio_pnl_value")) is not None:
+        lines.append(
+            _kv_line(
+                ("capital", _money(enriched.get("display_capital"))),
+                ("pnl", _signed_money(enriched.get("portfolio_pnl_value"))),
+                ("baseline_pnl", _signed_money(enriched.get("benchmark_pnl_value"))),
+                ("excess_pnl", _signed_money(enriched.get("excess_pnl_value"))),
+            )
+        )
+    if recent:
+        recent_label = recent.get("window_label") or f"過去{recent.get('window_days', 'n')}期"
+        lines.extend(
+            [
+                "",
+                f"**{recent_label}**",
+                _kv_line(
+                    ("strategy", _signed_pct(recent.get("strategy_return"))),
+                    ("baseline", _signed_pct(recent.get("benchmark_return"))),
+                    ("excess", _signed_pct(recent.get("excess_return"))),
+                ),
+            ]
+        )
+        if _float_or_none(recent.get("strategy_pnl_value")) is not None:
+            lines.append(
+                _kv_line(
+                    ("pnl", _signed_money(recent.get("strategy_pnl_value"))),
+                    ("baseline_pnl", _signed_money(recent.get("benchmark_pnl_value"))),
+                    ("excess_pnl", _signed_money(recent.get("excess_pnl_value"))),
+                )
+            )
+    try:
+        window = _load_portfolio_history_for_market(cfg, days, 0, 0.0, None, current_capital) if int(days or 0) > 0 else None
+    except Exception as exc:
+        window = None
+        if debug:
+            lines.append(f"history_load_error: `{type(exc).__name__}`")
+    if window is not None:
+        lines.extend(
+            [
+                "",
+                f"**artifact history {window.days} periods**",
+                _kv_line(
+                    ("period", f"{window.start_date}..{window.end_date}"),
+                    ("strategy", _signed_pct(window.period_return)),
+                    ("baseline", _signed_pct(window.benchmark_return)),
+                    ("profit", _signed_money(window.profit_value)),
+                ),
+            ]
+        )
+    if issues:
+        lines.extend(["", "sanity issues:"])
+        lines.extend(f"- {severity}: {text}" for severity, text in issues[:6])
+    _append_investment_warning(lines)
+    return "\n".join(lines)
+
+
+def _risk_message(
+    cfg: LiveMarketConfig,
+    summary_path: Path,
+    summary: dict[str, Any],
+    *,
+    top_n: int = 10,
+    debug: bool = False,
+) -> str:
+    risk = summary.get("target_risk") if isinstance(summary.get("target_risk"), dict) else {}
+    issues = _signal_sanity_issues(cfg, summary)
+    rows = _latest_artifact_rows(summary, summary_path, "weights_path", "top_positions")
+    rows = sorted(rows, key=lambda row: abs(_row_weight_value(row, "target_weight", "weight")), reverse=True)
+    gross_limit, turnover_limit = _config_trading_limits(cfg)
+    lines = [
+        f"**risk** {cfg.label}",
+        _kv_line(
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+            ("sanity", _signal_sanity_level(issues)),
+        ),
+        _kv_line(
+            ("gross", _pct(risk.get("gross"))),
+            ("limit", _pct(gross_limit)),
+            ("long", _pct(risk.get("long_gross"))),
+            ("short", _pct(risk.get("short_gross"))),
+            ("net", _signed_pct(risk.get("net"))),
+        ),
+        _kv_line(
+            ("top", _pct(risk.get("top_abs_weight"))),
+            ("HHI", _num(risk.get("hhi"), 3)),
+            ("turnover", _pct(summary.get("turnover"))),
+            ("turnover_limit", _pct(turnover_limit)),
+            ("fees", _pct(summary.get("estimated_trade_cost"), 3)),
+        ),
+    ]
+    if issues:
+        lines.extend(["", "**sanity issues**"])
+        lines.extend(f"- {severity}: {text}" for severity, text in issues[:8])
+    if rows:
+        lines.extend(["", "**largest positions**"])
+        for index, row in enumerate(rows[: max(1, int(top_n))], start=1):
+            weight = _row_weight_value(row, "target_weight", "weight")
+            lines.append(
+                f"{index}. {_symbol_label(row)} "
+                + _kv_inline(("weight", _signed_pct(weight)), ("px", _price(row.get("current_price"))))
+            )
+    if debug:
+        lines.extend(["", f"summary: `{_display_path(summary_path)}`"])
+    _append_investment_warning(lines)
+    return "\n".join(lines)
 
 
 def _display_path(path: Path) -> str:
@@ -2259,6 +2775,210 @@ class SignalReviewView(discord.ui.View):
         await self._handle(interaction, "mark_reviewed")
 
 
+@bot.tree.command(name="latest", description="Show the latest saved signal without rerunning inference.")
+@app_commands.describe(
+    market="Market id",
+    top_n="Rows to show in top positions and changes.",
+    current_capital="Current account capital used to estimate PnL.",
+    debug="Show signal ids, fingerprints, and artifact paths.",
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def latest(
+    interaction: discord.Interaction,
+    market: str = "",
+    top_n: int = 8,
+    current_capital: float = 0.0,
+    debug: bool = False,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        cfg = _resolve_market(market)
+        summary_path, summary = _latest_signal_or_raise(cfg)
+        message = _latest_signal_message(
+            cfg,
+            summary_path,
+            summary,
+            top_n=max(0, int(top_n or 0)),
+            current_capital=current_capital,
+            debug=debug,
+        )
+    except Exception as exc:
+        await _send_command_error(interaction, "latest", exc)
+        return
+    await _send_long_response(interaction, message)
+
+
+@bot.tree.command(name="changes", description="Show latest actionable rebalance changes.")
+@app_commands.describe(
+    market="Market id",
+    action="actionable/all/BUY/SELL/REDUCE/EXIT/HOLD.",
+    limit="Max rows to show. 0 means all matching rows.",
+    page_size="Rows per page, clamped to 10-40.",
+    watchlist_only="Only show symbols in your watchlist for this market.",
+    current_capital="Current account capital used to estimate trade amounts.",
+    debug="Show signal id, display timezone, and artifact path.",
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def changes(
+    interaction: discord.Interaction,
+    market: str = "",
+    action: str = "actionable",
+    limit: int = 0,
+    page_size: int = 20,
+    watchlist_only: bool = False,
+    current_capital: float = 0.0,
+    debug: bool = False,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        cfg = _resolve_market(market)
+        watchlist = _user_watchlist(getattr(interaction.user, "id", None), cfg.market) if watchlist_only else []
+        if watchlist_only and not watchlist:
+            await interaction.followup.send(f"`{cfg.market}` 你的 watchlist 是空的，先用 `/watch action:add symbol:<代號>` 加入。")
+            return
+        summary_path, summary = _latest_signal_or_raise(cfg)
+        pages = _latest_changes_pages(
+            cfg,
+            summary_path,
+            summary,
+            action=action,
+            limit=limit,
+            page_size=page_size,
+            current_capital=current_capital,
+            watchlist=watchlist,
+            debug=debug,
+        )
+    except Exception as exc:
+        await _send_command_error(interaction, "changes", exc)
+        return
+    await _send_paginated_response(interaction, pages)
+
+
+@bot.tree.command(name="performance", description="Show strategy performance versus baseline.")
+@app_commands.describe(
+    market="Market id",
+    days="Artifact history window to compound. Default 32 periods.",
+    current_capital="Current account capital used to estimate PnL.",
+    debug="Show history load/debug details.",
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def performance(
+    interaction: discord.Interaction,
+    market: str = "",
+    days: int = 32,
+    current_capital: float = 0.0,
+    debug: bool = False,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        cfg = _resolve_market(market)
+        summary_path, summary = _latest_signal_or_raise(cfg)
+        message = await asyncio.to_thread(
+            _performance_message,
+            cfg,
+            summary_path,
+            summary,
+            days=days,
+            current_capital=current_capital,
+            debug=debug,
+        )
+    except Exception as exc:
+        await _send_command_error(interaction, "performance", exc)
+        return
+    await _send_long_response(interaction, message)
+
+
+@bot.tree.command(name="risk", description="Show latest portfolio risk and concentration.")
+@app_commands.describe(
+    market="Market id",
+    top_n="Largest positions to show.",
+    debug="Show artifact path.",
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def risk(
+    interaction: discord.Interaction,
+    market: str = "",
+    top_n: int = 10,
+    debug: bool = False,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        cfg = _resolve_market(market)
+        summary_path, summary = _latest_signal_or_raise(cfg)
+        message = await asyncio.to_thread(
+            _risk_message,
+            cfg,
+            summary_path,
+            summary,
+            top_n=top_n,
+            debug=debug,
+        )
+    except Exception as exc:
+        await _send_command_error(interaction, "risk", exc)
+        return
+    await _send_long_response(interaction, message)
+
+
+@bot.tree.command(name="watch", description="Manage your per-market symbol watchlist.")
+@app_commands.describe(
+    market="Market id",
+    action="add/remove/list/clear",
+    symbol="Symbol to add or remove.",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="add", value="add"),
+        app_commands.Choice(name="remove", value="remove"),
+        app_commands.Choice(name="list", value="list"),
+        app_commands.Choice(name="clear", value="clear"),
+    ]
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def watchlist_command(
+    interaction: discord.Interaction,
+    action: str,
+    market: str = "",
+    symbol: str = "",
+) -> None:
+    cfg = _resolve_market(market)
+    user_id = getattr(interaction.user, "id", None)
+    action_value = str(action).strip().lower()
+    try:
+        if action_value == "add":
+            normalized = _normalize_watch_symbol(symbol)
+            if not normalized:
+                raise BotUserError("請提供要加入 watchlist 的 symbol。")
+            items = _add_user_watch_symbol(user_id, cfg.market, normalized)
+            verb = "加入"
+        elif action_value in {"remove", "delete", "del"}:
+            normalized = _normalize_watch_symbol(symbol)
+            if not normalized:
+                raise BotUserError("請提供要移除的 symbol。")
+            items = _remove_user_watch_symbol(user_id, cfg.market, normalized)
+            verb = "移除"
+        elif action_value == "clear":
+            items = _clear_user_watchlist(user_id, cfg.market)
+            verb = "清空"
+        elif action_value == "list":
+            items = _user_watchlist(user_id, cfg.market)
+            verb = "目前"
+        else:
+            raise BotUserError("action 必須是 add/remove/list/clear。")
+    except Exception as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    _record_audit_event(
+        f"watch:{cfg.market}",
+        f"watch_{action_value}",
+        interaction,
+        market=cfg.market,
+        symbol=_normalize_watch_symbol(symbol),
+        watchlist=items,
+    )
+    content = ", ".join(f"`{item}`" for item in items) if items else "(empty)"
+    await interaction.response.send_message(f"`{cfg.market}` watchlist 已{verb}: {content}", ephemeral=True)
+
+
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
 @app_commands.describe(
     market="Market id",
@@ -2266,6 +2986,7 @@ class SignalReviewView(discord.ui.View):
     top_n="Rows to show, minimum 10",
     min_abs_delta="Minimum absolute weight delta",
     refresh_data="Run the market pre-signal data updater before generating.",
+    allow_unsafe="Show the signal even when sanity gate returns BLOCK.",
     debug="Show signal ids, fingerprints, output folders, and artifact paths.",
 )
 @app_commands.autocomplete(market=market_autocomplete)
@@ -2276,6 +2997,7 @@ async def signal_now(
     top_n: int = 20,
     min_abs_delta: float = 0.001,
     refresh_data: bool = True,
+    allow_unsafe: bool = False,
     debug: bool = False,
 ) -> None:
     await interaction.response.defer(thinking=True)
@@ -2298,6 +3020,20 @@ async def signal_now(
     except Exception as exc:
         await _send_command_error(interaction, "live signal", exc)
         return
+    sanity_issues = _signal_sanity_issues(cfg, result.summary)
+    if _signal_sanity_level(sanity_issues) == "BLOCK" and not allow_unsafe:
+        _record_audit_event(
+            str(result.summary.get("signal_id")),
+            "sanity_blocked",
+            interaction,
+            market=str(result.summary.get("market") or market or _default_market()),
+            issues=[text for _, text in sanity_issues],
+            output_dir=result.output_dir,
+        )
+        await interaction.followup.send(_signal_sanity_message(cfg, result.summary, sanity_issues))
+        return
+    if sanity_issues:
+        result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
     _record_audit_event(
         str(result.summary.get("signal_id")),
         "generated",
@@ -2308,6 +3044,7 @@ async def signal_now(
         auto_refreshed=bool(auto_refreshed),
         requested_price_source=price_source,
         resolved_price_source=resolved_price_source or "config",
+        sanity=_signal_sanity_level(sanity_issues),
     )
     await _send_signal_response(
         interaction,
@@ -2831,6 +3568,12 @@ async def scheduled_signal() -> None:
                 price_source=resolved_price_source,
             )
             result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0)
+            sanity_issues = _signal_sanity_issues(cfg, result.summary)
+            if _signal_sanity_level(sanity_issues) == "BLOCK":
+                await channel.send(_signal_sanity_message(cfg, result.summary, sanity_issues))
+                continue
+            if sanity_issues:
+                result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
         except BotUserError as exc:
             if not isinstance(exc, MarketClosedError):
                 await channel.send(str(exc))
