@@ -5,7 +5,7 @@ import math
 import torch
 
 
-DEFAULT_PORTFOLIO_ACTIVATION = "softsign"
+DEFAULT_PORTFOLIO_ACTIVATION = "gd"
 
 
 def normalize_portfolio_activation(activation: str | None) -> str:

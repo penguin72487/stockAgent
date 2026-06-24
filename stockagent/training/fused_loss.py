@@ -140,7 +140,7 @@ def fused_log_utility_loss_tensor(
     max_turnover_ratio: float,
     gross_leverage: float,
     min_trade_weight: float = 0.0,
-    portfolio_activation: str = "softsign",
+    portfolio_activation: str = "gd",
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.0,
     concentration_weight: float = 0.0,
