@@ -6,8 +6,13 @@ import numpy as np
 import polars as pl
 
 from services.discord_bot.bot import (
+    _add_user_watch_symbol,
     _decision_overview_page,
     _daily_summary_message,
+    _filter_watchlist_rows,
+    _latest_changes_pages,
+    _latest_signal_message,
+    _performance_message,
     _enrich_signal_performance_for_discord,
     _position_line,
     _portfolio_change_line,
@@ -15,8 +20,13 @@ from services.discord_bot.bot import (
     _portfolio_history_block,
     _prepend_latest_signal_row_to_portfolio_history,
     _rebalance_line,
+    _remove_user_watch_symbol,
+    _risk_message,
     _scheduled_detail_page_groups,
+    _signal_sanity_issues,
+    _signal_sanity_level,
     _stock_history_header_lines,
+    _user_watchlist,
 )
 
 
@@ -218,6 +228,165 @@ def test_signal_now_detail_pages_include_actionable_decisions() -> None:
     assert "`BBB`" not in decision_pages[0]
     assert "full:" not in decision_pages[0]
     assert "full:" in debug_pages[2][0]
+
+
+def test_signal_sanity_blocks_implausible_latest_return() -> None:
+    cfg = SimpleNamespace(
+        market="unit",
+        label="Unit",
+        config_path="missing.yaml",
+    )
+    summary = {
+        "market": "unit",
+        "asof_date": "2026-06-24 13:30:00",
+        "panel_date": "2026-06-24 13:30:00",
+        "portfolio_simple_return": 0.80,
+        "benchmark_simple_return": 0.01,
+    }
+
+    issues = _signal_sanity_issues(cfg, summary)
+
+    assert _signal_sanity_level(issues) == "BLOCK"
+    assert any("portfolio return" in text for _, text in issues)
+
+
+def test_latest_signal_message_uses_saved_summary_without_debug_paths(tmp_path) -> None:
+    cfg = SimpleNamespace(
+        market="unit",
+        label="Unit",
+        current_capital=100_000.0,
+        initial_capital=None,
+        benchmark_window_days=32,
+        history_frequency="daily",
+        config_path="missing.yaml",
+    )
+    summary = {
+        "market": "unit",
+        "market_label": "Unit",
+        "signal_id": "sig-test",
+        "fold_id": 25,
+        "asof_date": "2026-06-24 13:30:00",
+        "panel_date": "2026-06-24 13:30:00",
+        "price_source": "panel_close",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.002,
+        "turnover": 0.1,
+        "weights_path": str(tmp_path / "weights.parquet"),
+        "rebalance_path": str(tmp_path / "rebalance.parquet"),
+        "top_positions": [{"symbol": "AAA", "name": "Alpha", "weight": 0.1, "current_price": 10.0}],
+        "rebalance": [{"symbol": "AAA", "name": "Alpha", "action": "BUY", "delta_weight": 0.02, "current_weight": 0.0, "target_weight": 0.02, "trade_price": 10.0}],
+    }
+
+    normal = _latest_signal_message(cfg, tmp_path / "summary.json", summary, top_n=1, debug=False)
+    debug = _latest_signal_message(cfg, tmp_path / "summary.json", summary, top_n=1, debug=True)
+
+    assert "stockAgent live signal" in normal
+    assert "`AAA` Alpha" in normal
+    assert "fold=" not in normal
+    assert "**files**" not in normal
+    assert "`fold=25`" in debug
+    assert "**files**" in debug
+
+
+def test_latest_changes_pages_can_filter_to_watchlist(tmp_path) -> None:
+    cfg = SimpleNamespace(
+        market="unit",
+        label="Unit",
+        current_capital=100_000.0,
+        initial_capital=None,
+        min_abs_delta=0.001,
+        config_path="missing.yaml",
+    )
+    summary = {
+        "market": "unit",
+        "signal_id": "sig-test",
+        "asof_date": "2026-06-24 13:30:00",
+        "panel_date": "2026-06-24 13:30:00",
+        "rebalance": [
+            {"symbol": "AAA", "name": "Alpha", "action": "BUY", "delta_weight": 0.04, "current_weight": 0.0, "target_weight": 0.04, "trade_price": 10.0},
+            {"symbol": "BBB", "name": "Beta", "action": "SELL", "delta_weight": -0.03, "current_weight": 0.03, "target_weight": 0.0, "trade_price": 20.0},
+        ],
+    }
+
+    pages = _latest_changes_pages(
+        cfg,
+        tmp_path / "summary.json",
+        summary,
+        watchlist=["AAA"],
+        current_capital=100_000.0,
+        page_size=10,
+    )
+
+    assert "`AAA` Alpha" in pages[0]
+    assert "`BBB` Beta" not in pages[0]
+    assert "`watch=AAA`" in pages[0]
+    assert "`delta_value=+4,000`" in pages[0]
+
+
+def test_performance_and_risk_messages_are_investor_facing(tmp_path) -> None:
+    cfg = SimpleNamespace(
+        market="unit",
+        label="Unit",
+        current_capital=100_000.0,
+        initial_capital=None,
+        benchmark_window_days=32,
+        history_frequency="daily",
+        config_path="missing.yaml",
+    )
+    summary = {
+        "market": "unit",
+        "asof_date": "2026-06-24 13:30:00",
+        "panel_date": "2026-06-24 13:30:00",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.002,
+        "turnover": 0.1,
+        "estimated_trade_cost": 0.001,
+        "recent_performance": {
+            "window_days": 32,
+            "strategy_return": 0.08,
+            "benchmark_return": 0.03,
+            "excess_return": 0.05,
+        },
+        "target_risk": {
+            "gross": 0.95,
+            "long_gross": 0.60,
+            "short_gross": 0.35,
+            "net": 0.25,
+            "top_abs_weight": 0.12,
+            "hhi": 0.08,
+        },
+        "top_positions": [{"symbol": "AAA", "name": "Alpha", "weight": 0.12, "current_price": 10.0}],
+    }
+
+    performance = _performance_message(cfg, tmp_path / "summary.json", summary, days=0)
+    risk = _risk_message(cfg, tmp_path / "summary.json", summary, top_n=3)
+
+    assert "**上個訊號到現在**" in performance
+    assert "**過去32天**" in performance
+    assert "`excess=+0.80%`" in performance
+    assert "**largest positions**" in risk
+    assert "`AAA` Alpha" in risk
+    assert "`sanity=OK`" in risk
+
+
+def test_user_watchlist_state_add_remove_and_filter(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("services.discord_bot.bot.STATE_PATH", tmp_path / "state.json")
+
+    items = _add_user_watch_symbol(123, "tw", "2330.TW")
+    items = _add_user_watch_symbol(123, "tw", "6669")
+    other_user_items = _user_watchlist(456, "tw")
+
+    assert items == ["2330", "6669"]
+    assert other_user_items == []
+    rows = [
+        {"symbol": "2330", "name": "台積電"},
+        {"symbol": "9999", "name": "Other"},
+    ]
+    assert _filter_watchlist_rows(rows, _user_watchlist(123, "tw")) == [rows[0]]
+
+    items = _remove_user_watch_symbol(123, "tw", "2330")
+
+    assert items == ["6669"]
 
 
 def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
