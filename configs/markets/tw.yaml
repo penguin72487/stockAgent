@@ -159,7 +159,7 @@ training:
   lr_scheduler_threshold: 0.0005
   top_k: 10
   num_workers: 0
-  weight_decay: 0.02
+  weight_decay: 0.1
   grad_clip_norm: 1.0
   finite_check_interval_steps: 0
   loss_type: log_utility
@@ -286,7 +286,7 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: last
+    temporal_pooling: attention
     temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
@@ -298,7 +298,7 @@ training:
     num_latent_factors: 16
     num_market_tokens: 4
     market_layers: 1
-    dynamic_latent_tokens: false
+    dynamic_latent_tokens: true
     dynamic_market_tokens: true
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
@@ -306,7 +306,7 @@ training:
     head_hidden_dim: 32
     head_layers: 1
     dropout: 0.0
-    default_temperature: 1.5
+    default_temperature: 1
     portfolio_mode: long_short
     max_full_tokens: 16384
     checkpoint_blocks: false
