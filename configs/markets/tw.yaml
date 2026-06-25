@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 25
 environment:
   conda_env: fintech
   device: cuda
@@ -79,10 +79,10 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 32
-  batch_size_train: 32
+  batch_size: 16
+  batch_size_train: 16
   batch_size_eval: 16
-  epochs: 1000
+  epochs: 10000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
@@ -159,7 +159,7 @@ training:
   lr_scheduler_threshold: 0.0005
   top_k: 10
   num_workers: 0
-  weight_decay: 0.1
+  weight_decay: 0.01
   grad_clip_norm: 1.0
   finite_check_interval_steps: 0
   loss_type: log_utility
@@ -287,7 +287,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: attention
-    temporal_query_mode: last_only
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
