@@ -327,6 +327,7 @@ def build_model(
             default_temperature=tbp_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
             portfolio_activation=config.trading.portfolio_activation,
+            portfolio_output_mode=tbp_cfg.portfolio_output_mode,
             max_full_tokens=tbp_cfg.max_full_tokens,
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,

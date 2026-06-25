@@ -107,6 +107,11 @@ The active model is `transformer_base_portfolio`.
 The active Transformer-base lookback-32 config is:
 
 ```yaml
+trading:
+  long_only: false
+  min_trade_weight: 0.0
+  portfolio_activation: identity
+
 training:
   model_name: transformer_base_portfolio
   lookback: 32
@@ -120,6 +125,7 @@ training:
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
   fused_log_utility_loss: true
+  loss_portfolio_activation: identity
   auto_batch_size: false
   allow_dynamic_symbols: false
   eval_model_chunk_rows: auto
@@ -148,8 +154,8 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: last
-    temporal_query_mode: last_only
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -170,6 +176,7 @@ training:
     dropout: 0.1
     default_temperature: 1.0
     portfolio_mode: long_short
+    portfolio_output_mode: logits
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false
@@ -183,10 +190,10 @@ Notes:
 - For large universes, prefer `latent` or `market_token`.
 - `return_aux_details` is useful for explainability but can increase memory pressure during training. Prefer `false` for tight VRAM training and enable it for explainability runs when needed.
 - The previous low-rank model remains available as `low_rank_market_transformer_portfolio`.
-- Latest speed baseline for TW full universe (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 32`, `batch_size_eval: 16`, and `temporal_pooling: last`.
+- Latest active TW full-universe baseline (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 32`, `batch_size_eval: 16`, and `temporal_pooling: attention`.
 - `batch_size_train: 32` improves steady-state epoch throughput versus 16 on the current benchmark, but first-epoch compile/warmup time is higher; use it for long training runs, and re-benchmark before reducing it.
-- `temporal_pooling: last` is the active user preference. It is slightly faster than attention pooling but relies on temporal blocks to carry useful history into the final token; re-check validation/test metrics after changing it.
-- For `temporal_pooling: last`, the active speed ablation uses `temporal_query_mode: last_only` to shrink the temporal autograd graph. `full_then_last` remains available as the more exact-ish path for validation ablations when metrics regress.
+- `temporal_pooling: attention` is the active user preference when trying to improve convergence; pair it with `temporal_query_mode: full_then_last` because attention pooling needs all temporal steps.
+- `temporal_pooling: last` remains the faster speed ablation. Pair it with `temporal_query_mode: last_only` to shrink the temporal autograd graph when speed is the priority.
 - The active speed ablation sets `qk_norm: false`, `dropout: 0.1`, and `dynamic_token_dropout: 0.0` to trim attention/FFN dropout and Q/K RMS-normalization autograd nodes. Treat this as a speed baseline, not proof that the regularized model is worse; re-check validation/test metrics before making investment-quality conclusions.
 - `TransformerBasePortfolioModel.forward_from_panel(features, date_indices, mask, ...)` is the preferred lazy-window path for `WindowedSplitTensors`: it projects each unique panel date once and gathers projected `[B,L,S,D]` windows before running the same downstream temporal/market-token/score path. Preserve old `forward(x, mask, ...)` API compatibility.
 - `TransformerBasePortfolioModel.forward_from_panel_slab(feature_slab, mask, ...)` is the compile-friendly fast path for contiguous lazy-window batches: pass `[B+lookback-1,S,F]` panel slabs and keep `date_indices` / gather metadata outside the compiled model graph. It must remain numerically equivalent to materialized windows and generic `forward_from_panel` for contiguous rows.
@@ -256,7 +263,15 @@ Guidelines:
 
 - Current active low-rank baseline preference: `portfolio_mode: long_short`.
 - Keep `trading.long_only: false` when the model is intended to do long/short.
-- Portfolio direction and sizing should use `trading.portfolio_activation` for signed direction followed by L1 normalization for gross exposure control. Supported activations are `softsign`, `tanh`, `isru`, `erf`, `atan`, and `gd`/`gudermannian`; the current default is `gd`.
+- Portfolio direction and sizing should default to raw score direction followed by L1 normalization for gross exposure control:
+  - `trading.portfolio_activation: identity`
+  - `trading.min_trade_weight: 0.0`
+  - no activation transform and no minimum-weight threshold suppression unless a config explicitly opts in
+  Supported optional activations are `identity`/`none`, `softsign`, `tanh`, `isru`, `erf`, `atan`, and `gd`/`gudermannian`.
+- For the active `transformer_base_portfolio` convergence baseline, keep trainable model output decoupled from trading post-processing:
+  - `transformer_base_portfolio.portfolio_output_mode: logits`
+  - `training.loss_portfolio_activation: identity`
+  - `trading.portfolio_activation` remains an optional backtest/inference post-processing knob, so activations such as `gd`, `tanh`, or `isru` can be swept without retraining, but the default is no transform.
 - Do not use dual-branch softmax as the active long/short position calculator. Legacy `dual_branch_softmax` / `masked_softmax` names are now compatibility wrappers around configured activation + L1 portfolio normalization.
 - If changing `trading.long_only`, understand that it affects loss/backtest interpretation, not just the model head.
 - Keep model output mode, loss assumptions, backtest assumptions, and report wording aligned. If they disagree, flag it explicitly.
