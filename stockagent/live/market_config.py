@@ -76,6 +76,7 @@ class LiveMarketConfig:
             "max_gross_warning": self.max_gross_warning,
             "data_timezone": self.timezone,
             "display_timezone": self.display_timezone,
+            "daily_bar_time": self.close_time,
             "write": True,
         }
         for key, value in overrides.items():

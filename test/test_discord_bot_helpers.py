@@ -19,6 +19,25 @@ def test_discord_page_size_and_top_n_floor_to_ten() -> None:
     assert discord_bot._top_n(None) == 20
 
 
+def test_discord_line_pages_can_opt_into_one_row_per_page() -> None:
+    rows = [{"symbol": f"S{i:02d}"} for i in range(3)]
+    pages = discord_bot._line_pages(
+        title="one row",
+        rows=rows,
+        formatter=lambda row: str(row["symbol"]),
+        page_size=1,
+        min_page_size=1,
+        default_page_size=1,
+    )
+
+    assert len(pages) == 3
+    assert "`rows 1-1/3`" in pages[0]
+    assert "`rows 2-2/3`" in pages[1]
+    assert "`rows 3-3/3`" in pages[2]
+    assert "S00" in pages[0]
+    assert "S01" not in pages[0]
+
+
 def test_discord_line_pages_use_minimum_ten_rows_and_warning() -> None:
     rows = [{"symbol": f"S{i:02d}"} for i in range(12)]
     pages = discord_bot._line_pages(
