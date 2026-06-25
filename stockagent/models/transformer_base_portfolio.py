@@ -542,7 +542,8 @@ class TransformerBasePortfolioModel(nn.Module):
         dropout: float = 0.1,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_short",
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
+        portfolio_output_mode: str = "activation_l1",
         max_full_tokens: int = 4096,
         checkpoint_blocks: bool = False,
         return_aux: bool = True,
@@ -561,6 +562,7 @@ class TransformerBasePortfolioModel(nn.Module):
         self.default_temperature = float(default_temperature)
         self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
+        self.portfolio_output_mode = self._normalize_portfolio_output_mode(portfolio_output_mode)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.return_aux = bool(return_aux)
@@ -763,6 +765,24 @@ class TransformerBasePortfolioModel(nn.Module):
         if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
             return "long_short"
         raise ValueError("portfolio_mode must be 'long_only' or 'long_short'")
+
+    @staticmethod
+    def _normalize_portfolio_output_mode(mode: str) -> str:
+        normalized = str(mode).strip().lower().replace("-", "_")
+        if normalized in {
+            "activation_l1",
+            "activated_l1",
+            "activation",
+            "bounded_l1",
+            "bounded_activation_l1",
+            "default",
+        }:
+            return "activation_l1"
+        if normalized in {"l1", "raw_l1", "score_l1", "linear_l1", "identity_l1"}:
+            return "l1"
+        if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
+            return "logits"
+        raise ValueError("portfolio_output_mode must be 'activation_l1', 'l1', or 'logits'")
 
     def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:
         if x.dim() != 4:
@@ -1237,11 +1257,21 @@ class TransformerBasePortfolioModel(nn.Module):
         temp = torch.clamp(temp, min=0.05)
 
         if self.portfolio_mode == "long_only":
-            weights = masked_softmax(masked_scores / temp, mask_bool, activation=self.portfolio_activation)
             centered_scores = scores
+            target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
+            if self.portfolio_output_mode == "logits":
+                weights = target_logits
+            else:
+                weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
+                weights = masked_softmax(masked_scores / temp, mask_bool, activation=weight_activation)
         else:
             centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation=self.portfolio_activation)
+            target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
+            if self.portfolio_output_mode == "logits":
+                weights = target_logits
+            else:
+                weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
+                weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation=weight_activation)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
         if return_aux is True:

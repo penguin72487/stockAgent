@@ -38,8 +38,8 @@ trading:
   sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
-  min_trade_weight: 0.005
-  portfolio_activation: gd
+  min_trade_weight: 0.0
+  portfolio_activation: identity
   long_only: false
   cash_allowed: true
 training:
@@ -56,6 +56,7 @@ training:
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
   fused_log_utility_loss: true
+  loss_portfolio_activation: identity
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
@@ -308,6 +309,7 @@ training:
     dropout: 0.0
     default_temperature: 1
     portfolio_mode: long_short
+    portfolio_output_mode: logits
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false

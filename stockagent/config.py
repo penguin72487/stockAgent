@@ -7,7 +7,7 @@ from typing import Any
 import yaml
 
 
-DEFAULT_PORTFOLIO_ACTIVATION = "gd"
+DEFAULT_PORTFOLIO_ACTIVATION = "identity"
 
 
 def _normalize_portfolio_activation(activation: str | None) -> str:
@@ -27,11 +27,13 @@ def _normalize_portfolio_activation(activation: str | None) -> str:
         "x_over_sqrt_1_x2": "isru",
     }
     normalized = aliases.get(normalized, normalized)
+    if normalized in {"identity", "linear", "none", "raw"}:
+        return "identity"
     valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian"}
     if normalized not in valid:
         raise ValueError(
             "trading.portfolio_activation must be one of "
-            "'tanh', 'softsign', 'isru', 'erf', 'atan', or 'gd'"
+            "'identity', 'tanh', 'softsign', 'isru', 'erf', 'atan', or 'gd'"
         )
     return normalized
 
@@ -87,7 +89,7 @@ class TradingConfig:
     cash_allowed: bool
     max_turnover_ratio: float = 0.0
     gross_leverage: float = 1.0
-    min_trade_weight: float = 0.005
+    min_trade_weight: float = 0.0
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -266,6 +268,7 @@ class TransformerBasePortfolioModelConfig:
     dropout: float = 0.1
     default_temperature: float = 1.0
     portfolio_mode: str = "auto"
+    portfolio_output_mode: str = "activation_l1"
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
     return_aux: bool = True
@@ -399,6 +402,7 @@ class TrainingConfig:
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
     fused_log_utility_loss: bool = True
+    loss_portfolio_activation: str = "auto"
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
     eval_model_chunk_rows: int | str = "auto"
@@ -600,6 +604,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("cuda_cache_path", "~/.cache/nv_cuda")
     training.setdefault("compile_loss", None)
     training.setdefault("fused_log_utility_loss", True)
+    training.setdefault("loss_portfolio_activation", "auto")
     training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
     training.setdefault("eval_model_chunk_rows", "auto")
@@ -861,6 +866,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("dropout", legacy_dropout)
     transformer_base_portfolio.setdefault("default_temperature", 1.0)
     transformer_base_portfolio.setdefault("portfolio_mode", "auto")
+    transformer_base_portfolio.setdefault("portfolio_output_mode", "activation_l1")
     transformer_base_portfolio.setdefault("max_full_tokens", 4096)
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
@@ -1165,11 +1171,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["backtest_artifact_compression"] = backtest_artifact_compression
     trading.setdefault("max_turnover_ratio", 0.0)
     trading.setdefault("gross_leverage", 1.0)
-    trading.setdefault("min_trade_weight", 0.005)
+    trading.setdefault("min_trade_weight", 0.0)
     trading.setdefault("portfolio_activation", DEFAULT_PORTFOLIO_ACTIVATION)
     trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
-    trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.005)))
+    trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.0)))
     trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
+    loss_activation = str(training.get("loss_portfolio_activation", "auto")).strip().lower().replace("-", "_")
+    if loss_activation in {"", "auto", "trading", "same", "same_as_trading"}:
+        training["loss_portfolio_activation"] = "auto"
+    else:
+        training["loss_portfolio_activation"] = _normalize_portfolio_activation(loss_activation)
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
@@ -1214,6 +1225,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
             fused_log_utility_loss=training_raw["fused_log_utility_loss"],
+            loss_portfolio_activation=training_raw["loss_portfolio_activation"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
             eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],

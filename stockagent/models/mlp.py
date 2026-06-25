@@ -18,7 +18,7 @@ class CrossSectionalMLP(nn.Module):
         embedding_dim: int = 64,
         hidden_layers: int = 2,
         long_only: bool = True,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
     ) -> None:
         super().__init__()
         self.num_symbols = num_symbols
