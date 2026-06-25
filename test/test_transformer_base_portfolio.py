@@ -13,6 +13,7 @@ from stockagent.models.transformer_base_portfolio import (
     SwiGLUFeedForward,
     TransformerBasePortfolioModel,
 )
+from stockagent.models.normalization import masked_activation_l1_weights
 from stockagent.training.trainer import _extract_weights_and_aux
 from stockagent.training.windowed import WindowedSplitTensors
 
@@ -416,6 +417,51 @@ def test_long_only_mode_rejects_empty_rows() -> None:
         model(x, mask, return_aux=True)
 
 
+def test_portfolio_output_mode_l1_uses_identity_l1_weights() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_activation="tanh",
+        portfolio_output_mode="l1",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected = masked_activation_l1_weights(
+        aux["centered_score_logits"],
+        mask,
+        long_only=False,
+        activation="identity",
+    )
+    assert model.portfolio_output_mode == "l1"
+    assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="logits",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected = aux["centered_score_logits"].masked_fill(~mask, 0.0)
+    assert model.portfolio_output_mode == "logits"
+    assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    assert weights[1, 10:].abs().max().item() < 1e-6
+
+
 def test_factory_builds_transformer_base_portfolio_model() -> None:
     cfg = load_config(Path("configs/experiment_baseline.yaml"))
     cfg.training.model_name = "transformer_base_portfolio"
@@ -431,6 +477,7 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.qk_norm == cfg.training.transformer_base_portfolio.qk_norm
     assert model.rope_temporal == cfg.training.transformer_base_portfolio.rope_temporal
     assert model.temporal_query_mode == cfg.training.transformer_base_portfolio.temporal_query_mode
+    assert model.portfolio_output_mode == cfg.training.transformer_base_portfolio.portfolio_output_mode
     assert model.dynamic_latent_tokens == cfg.training.transformer_base_portfolio.dynamic_latent_tokens
     assert model.dynamic_market_tokens == cfg.training.transformer_base_portfolio.dynamic_market_tokens
     if model.attention_mode == "market_token":

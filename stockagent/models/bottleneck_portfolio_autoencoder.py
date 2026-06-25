@@ -64,7 +64,7 @@ class BottleneckPortfolioAutoencoder(nn.Module):
         ffn_mult: int = 2,
         dropout: float = 0.1,
         long_short: bool = True,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
         noise_std: float = 0.01,
         return_aux: bool = True,
         runtime_shape_check: bool = False,

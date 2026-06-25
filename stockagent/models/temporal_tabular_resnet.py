@@ -49,7 +49,7 @@ class CrossSectionalTemporalTabularResNet(nn.Module):
         n_blocks: int,
         dropout: float,
         long_only: bool = True,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
     ) -> None:
