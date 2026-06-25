@@ -181,7 +181,10 @@ def _apply_portfolio_activation_numpy(
     activation: str | None = None,
 ) -> np.ndarray:
     activation_name = normalize_portfolio_activation(activation)
-    out = np.nan_to_num(values, nan=0.0, posinf=20.0, neginf=-20.0).astype(dtype, copy=False)
+    out = values.astype(dtype, copy=False)
+    if activation_name == "identity":
+        return np.where(np.isfinite(out), out, dtype.type(0.0)).astype(dtype, copy=False)
+    out = np.nan_to_num(out, nan=0.0, posinf=20.0, neginf=-20.0)
     out = np.clip(out, dtype.type(-20.0), dtype.type(20.0))
     if activation_name == "tanh":
         return np.tanh(out).astype(dtype, copy=False)

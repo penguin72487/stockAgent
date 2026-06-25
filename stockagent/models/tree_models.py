@@ -23,7 +23,7 @@ class _CrossSectionalTreeBase(nn.Module):
         num_features: int,
         num_symbols: int,
         long_only: bool,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
@@ -119,7 +119,7 @@ class CrossSectionalLightGBM(_CrossSectionalTreeBase):
         num_features: int,
         num_symbols: int,
         long_only: bool,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
         *,
         use_gpu: bool,
         gpu_device_id: int,
@@ -182,7 +182,7 @@ class CrossSectionalXGBoost(_CrossSectionalTreeBase):
         num_features: int,
         num_symbols: int,
         long_only: bool,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
         *,
         use_gpu: bool,
         gpu_device_id: int,

@@ -111,7 +111,7 @@ class CrossSectionalMultiStockTCN(nn.Module):
         norm_type: str = "none",
         sanitize_inputs: bool = False,
         long_only: bool = True,
-        portfolio_activation: str = "gd",
+        portfolio_activation: str = "identity",
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
     ) -> None:

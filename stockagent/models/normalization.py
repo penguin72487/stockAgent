@@ -5,7 +5,7 @@ import math
 import torch
 
 
-DEFAULT_PORTFOLIO_ACTIVATION = "gd"
+DEFAULT_PORTFOLIO_ACTIVATION = "identity"
 
 
 def normalize_portfolio_activation(activation: str | None) -> str:
@@ -25,17 +25,21 @@ def normalize_portfolio_activation(activation: str | None) -> str:
         "x_over_sqrt_1_x2": "isru",
     }
     normalized = aliases.get(normalized, normalized)
+    if normalized in {"identity", "linear", "none", "raw"}:
+        return "identity"
     valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian"}
     if normalized not in valid:
         raise ValueError(
             "portfolio activation must be one of "
-            "'tanh', 'softsign', 'isru', 'erf', 'atan', or 'gd'"
+            "'identity', 'tanh', 'softsign', 'isru', 'erf', 'atan', or 'gd'"
         )
     return normalized
 
 
 def apply_portfolio_activation(logits: torch.Tensor, activation: str | None = None) -> torch.Tensor:
     activation_name = normalize_portfolio_activation(activation)
+    if activation_name == "identity":
+        return torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
     logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
     if activation_name == "tanh":
         return torch.tanh(logits)
@@ -85,9 +89,10 @@ def masked_activation_l1_weights(
     activation: str | None = None,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Convert scores to portfolio weights via bounded direction + L1 normalization.
+    """Convert scores to portfolio weights via optional activation + L1 normalization.
 
-    The selected activation is the only source of signed direction.  The L1
+    With the default identity activation, raw scores are normalized directly.
+    Other activations can be selected as post-processing transforms.  The L1
     denominator controls gross exposure and keeps the row sum of absolute
     weights at 1 for non-empty active rows.  For long-only callers, negative
     activated outputs are clipped out.

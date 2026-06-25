@@ -5499,6 +5499,13 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     )
 
 
+def _training_loss_portfolio_activation(config: ExperimentConfig) -> str:
+    activation = str(getattr(config.training, "loss_portfolio_activation", "auto")).strip().lower().replace("-", "_")
+    if activation in {"", "auto", "trading", "same", "same_as_trading"}:
+        return str(config.trading.portfolio_activation)
+    return activation
+
+
 def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
     """Return (total_bytes, used_bytes, free_bytes) from nvidia-smi for one GPU."""
     try:
@@ -7808,9 +7815,10 @@ def run_training(
     loss_objective = _normalize_risk_objective(config.training.loss_type)
     factor_loss_kwargs = _factor_loss_kwargs(config)
     portfolio_autoencoder_loss_kwargs = _portfolio_autoencoder_loss_kwargs(config)
+    loss_portfolio_activation = _training_loss_portfolio_activation(config)
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
     risk_loss_kwargs["min_trade_weight"] = config.trading.min_trade_weight
-    risk_loss_kwargs["portfolio_activation"] = config.trading.portfolio_activation
+    risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
 
@@ -8174,7 +8182,7 @@ def run_training(
                 max_turnover_ratio=config.trading.max_turnover_ratio,
                 gross_leverage=config.trading.gross_leverage,
                 min_trade_weight=config.trading.min_trade_weight,
-                portfolio_activation=config.trading.portfolio_activation,
+                portfolio_activation=loss_portfolio_activation,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
                 concentration_weight=config.training.multitask_loss.concentration_weight,
