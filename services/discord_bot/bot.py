@@ -246,6 +246,92 @@ def _clear_user_watchlist(user_id: Any, market: str) -> list[str]:
     return _set_user_watchlist(user_id, market, [])
 
 
+def _user_subscriptions(user_id: Any) -> dict[str, dict[str, Any]]:
+    state = _state()
+    users = state.setdefault("users", {})
+    entry = users.get(_user_state_key(user_id))
+    if not isinstance(entry, dict):
+        return {}
+    subscriptions = entry.get("subscriptions")
+    if not isinstance(subscriptions, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for market, value in subscriptions.items():
+        if isinstance(value, dict) and value.get("enabled", True):
+            result[str(market)] = {
+                "enabled": True,
+                "watchlist_only": bool(value.get("watchlist_only", True)),
+            }
+    return result
+
+
+def _set_user_subscription(user_id: Any, market: str, *, watchlist_only: bool = True) -> dict[str, dict[str, Any]]:
+    state = _state()
+    users = state.setdefault("users", {})
+    user_key = _user_state_key(user_id)
+    entry = users.setdefault(user_key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        users[user_key] = entry
+    subscriptions = entry.setdefault("subscriptions", {})
+    if not isinstance(subscriptions, dict):
+        subscriptions = {}
+        entry["subscriptions"] = subscriptions
+    subscriptions[str(market)] = {"enabled": True, "watchlist_only": bool(watchlist_only)}
+    _write_state(state)
+    return _user_subscriptions(user_id)
+
+
+def _remove_user_subscription(user_id: Any, market: str) -> dict[str, dict[str, Any]]:
+    state = _state()
+    users = state.setdefault("users", {})
+    user_key = _user_state_key(user_id)
+    entry = users.get(user_key)
+    if isinstance(entry, dict):
+        subscriptions = entry.get("subscriptions")
+        if isinstance(subscriptions, dict):
+            subscriptions.pop(str(market), None)
+            _write_state(state)
+    return _user_subscriptions(user_id)
+
+
+def _clear_user_subscriptions(user_id: Any) -> dict[str, dict[str, Any]]:
+    state = _state()
+    users = state.setdefault("users", {})
+    user_key = _user_state_key(user_id)
+    entry = users.get(user_key)
+    if isinstance(entry, dict):
+        entry["subscriptions"] = {}
+        _write_state(state)
+    return {}
+
+
+def _subscribed_users_for_market(market: str) -> list[tuple[str, dict[str, Any]]]:
+    state = _state()
+    users = state.setdefault("users", {})
+    result: list[tuple[str, dict[str, Any]]] = []
+    if not isinstance(users, dict):
+        return result
+    for user_id, entry in users.items():
+        if not isinstance(entry, dict):
+            continue
+        subscriptions = entry.get("subscriptions")
+        if not isinstance(subscriptions, dict):
+            continue
+        subscription = subscriptions.get(str(market))
+        if isinstance(subscription, dict) and subscription.get("enabled", True):
+            result.append(
+                (
+                    str(user_id),
+                    {
+                        "enabled": True,
+                        "watchlist_only": bool(subscription.get("watchlist_only", True)),
+                    },
+                )
+            )
+    return result
+
+
 def _market_enabled(cfg: LiveMarketConfig) -> bool:
     entry = _market_state(cfg.market)
     if "enabled" in entry:
@@ -1151,7 +1237,7 @@ def _signal_sanity_message(cfg: LiveMarketConfig, summary: dict[str, Any], issue
             ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
         ),
         _kv_line(("sanity", _signal_sanity_level(issues))),
-        "訊號異常，已暫停自動公開播報；請人工確認資料連續性、報酬與風險後再使用。",
+        "訊號可能異常，但仍會提供完整訊號；請人工確認資料連續性、報酬與風險後再使用。",
         "issues:",
     ]
     lines.extend(f"- {severity}: {text}" for severity, text in issues)
@@ -1166,6 +1252,7 @@ def _prepend_sanity_notice(content: str, cfg: LiveMarketConfig, summary: dict[st
     lines = [
         f"**sanity {_signal_sanity_level(issues)}**",
         _signal_sanity_line(issues),
+        "notice: 訊號可能異常，但以下仍提供完整訊號；請人工確認資料連續性、報酬與風險。",
         "",
         content,
     ]
@@ -1803,6 +1890,115 @@ def _risk_message(
         lines.extend(["", f"summary: `{_display_path(summary_path)}`"])
     _append_investment_warning(lines)
     return "\n".join(lines)
+
+
+def _guide_message() -> str:
+    markets = ", ".join(f"`{key}`" for key in sorted(_market_configs()))
+    lines = [
+        "**stockAgent guide**",
+        f"markets: {markets or '`n/a`'}",
+        "",
+        "**日常看盤**",
+        "`/latest market:<市場>` 最新訊號，不重跑模型。",
+        "`/changes market:<市場>` 今日/最新調倉。",
+        "`/positions market:<市場>` 目前與目標持倉。",
+        "`/performance market:<市場>` 策略 vs baseline 績效。",
+        "`/risk market:<市場>` 曝險、集中度、換手與 sanity。",
+        "",
+        "**個人化提醒**",
+        "`/watch action:add market:<市場> symbol:<代號>` 加入關注。",
+        "`/watch action:list market:<市場>` 查看 watchlist。",
+        "`/subscribe action:add market:<市場> watchlist_only:true` 排程時只 DM 你的 watchlist 調倉。",
+        "`/changes market:<市場> watchlist_only:true` 手動查看 watchlist 調倉。",
+        "",
+        "**進階查詢**",
+        "`/stock_history symbol:<代號> market:<市場>` 單一標的交易與調整紀錄。",
+        "`/portfolio_history market:<市場>` 每期持倉變化與損益。",
+        "`/explain_signal market:<市場> symbol:<代號>` 決策解釋。",
+        "",
+        "**管理/重算**",
+        "`/signal_now market:<市場>` 立即更新資料並重新推論。",
+        "`/set_capital`、`/set_schedule`、`/set_market_enabled` 需要 trader/admin 權限。",
+    ]
+    return "\n".join(lines)
+
+
+def _subscription_summary_lines(user_id: Any) -> list[str]:
+    subscriptions = _user_subscriptions(user_id)
+    lines = ["**subscriptions**"]
+    if not subscriptions:
+        lines.append("(empty)")
+        return lines
+    for market, settings in sorted(subscriptions.items()):
+        watch_mode = "watchlist_only" if settings.get("watchlist_only", True) else "all_changes"
+        watchlist = ", ".join(_user_watchlist(user_id, market)) or "(empty watchlist)"
+        lines.append(f"`{market}` mode=`{watch_mode}` watch=`{watchlist}`")
+    return lines
+
+
+def _subscription_alert_pages(
+    cfg: LiveMarketConfig,
+    summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    user_id: Any,
+    settings: dict[str, Any],
+) -> list[str]:
+    watchlist_only = bool(settings.get("watchlist_only", True))
+    watchlist = _user_watchlist(user_id, cfg.market) if watchlist_only else []
+    if watchlist_only and not watchlist:
+        return []
+    filtered = _filter_decision_rows(rows, action="actionable", actionable_only=True)
+    filtered = _filter_watchlist_rows(filtered, watchlist)
+    filtered = _sort_decision_rows(filtered, "delta")
+    filtered = _limit_rows(filtered, 20)
+    if not filtered:
+        return []
+    issues = _signal_sanity_issues(cfg, summary)
+    header = [
+        _kv_line(
+            ("market", summary.get("market", cfg.market)),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+            ("rows", len(filtered)),
+        ),
+        _kv_line(
+            ("mode", "watchlist_only" if watchlist_only else "all_changes"),
+            ("watch", ",".join(watchlist) if watchlist else "off"),
+            ("sanity", _signal_sanity_level(issues)),
+        ),
+    ]
+    if issues:
+        header.append("issues: `" + " | ".join(text for _, text in issues[:3]) + "`")
+    return _line_pages(
+        title=f"{cfg.label} personal alert",
+        rows=filtered,
+        formatter=_rebalance_line,
+        page_size=10,
+        header_lines=header,
+    )
+
+
+async def _send_subscription_notifications(cfg: LiveMarketConfig, result: Any) -> None:
+    subscribers = _subscribed_users_for_market(cfg.market)
+    if not subscribers:
+        return
+    rows = list(getattr(result, "rebalance_rows", []))
+    for user_id, settings in subscribers:
+        try:
+            pages = _subscription_alert_pages(
+                cfg,
+                result.summary,
+                rows,
+                user_id=user_id,
+                settings=settings,
+            )
+            if not pages:
+                continue
+            user = await bot.fetch_user(int(user_id))
+            await _send_channel_pages(user, pages, timeout=24 * 60 * 60)
+        except Exception as exc:
+            _log_exception(f"subscription_notify:{cfg.market}:{user_id}", exc)
 
 
 def _display_path(path: Path) -> str:
@@ -2775,6 +2971,73 @@ class SignalReviewView(discord.ui.View):
         await self._handle(interaction, "mark_reviewed")
 
 
+@bot.tree.command(name="guide", description="Show the investor-friendly stockAgent command guide.")
+async def guide(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    await _send_long_response(interaction, _guide_message())
+
+
+@bot.tree.command(name="subscribe", description="Manage personal scheduled signal alerts.")
+@app_commands.describe(
+    action="add/remove/list/clear",
+    market="Market id. Omit with list, or with clear to clear all.",
+    watchlist_only="Only DM changes that match your watchlist. Recommended.",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="add", value="add"),
+        app_commands.Choice(name="remove", value="remove"),
+        app_commands.Choice(name="list", value="list"),
+        app_commands.Choice(name="clear", value="clear"),
+    ]
+)
+@app_commands.autocomplete(market=market_autocomplete)
+async def subscribe(
+    interaction: discord.Interaction,
+    action: str,
+    market: str = "",
+    watchlist_only: bool = True,
+) -> None:
+    user_id = getattr(interaction.user, "id", None)
+    action_value = str(action or "").strip().lower()
+    try:
+        market_text = str(market or "").strip()
+        if action_value == "add":
+            cfg = _resolve_market(market_text)
+            subscriptions = _set_user_subscription(user_id, cfg.market, watchlist_only=watchlist_only)
+            verb = f"`{cfg.market}` subscribed"
+        elif action_value in {"remove", "delete", "del"}:
+            cfg = _resolve_market(market_text)
+            subscriptions = _remove_user_subscription(user_id, cfg.market)
+            verb = f"`{cfg.market}` unsubscribed"
+        elif action_value == "clear":
+            if market_text:
+                cfg = _resolve_market(market_text)
+                subscriptions = _remove_user_subscription(user_id, cfg.market)
+                verb = f"`{cfg.market}` unsubscribed"
+            else:
+                subscriptions = _clear_user_subscriptions(user_id)
+                verb = "all subscriptions cleared"
+        elif action_value == "list":
+            subscriptions = _user_subscriptions(user_id)
+            verb = "current subscriptions"
+        else:
+            raise BotUserError("action 必須是 add/remove/list/clear。")
+    except Exception as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    _record_audit_event(
+        f"subscribe:{_user_state_key(user_id)}",
+        f"subscribe_{action_value}",
+        interaction,
+        market=str(market or ""),
+        watchlist_only=watchlist_only,
+        subscriptions=subscriptions,
+    )
+    lines = [f"**subscribe** {verb}", *_subscription_summary_lines(user_id)]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 @bot.tree.command(name="latest", description="Show the latest saved signal without rerunning inference.")
 @app_commands.describe(
     market="Market id",
@@ -2986,7 +3249,6 @@ async def watchlist_command(
     top_n="Rows to show, minimum 10",
     min_abs_delta="Minimum absolute weight delta",
     refresh_data="Run the market pre-signal data updater before generating.",
-    allow_unsafe="Show the signal even when sanity gate returns BLOCK.",
     debug="Show signal ids, fingerprints, output folders, and artifact paths.",
 )
 @app_commands.autocomplete(market=market_autocomplete)
@@ -2997,7 +3259,6 @@ async def signal_now(
     top_n: int = 20,
     min_abs_delta: float = 0.001,
     refresh_data: bool = True,
-    allow_unsafe: bool = False,
     debug: bool = False,
 ) -> None:
     await interaction.response.defer(thinking=True)
@@ -3021,17 +3282,6 @@ async def signal_now(
         await _send_command_error(interaction, "live signal", exc)
         return
     sanity_issues = _signal_sanity_issues(cfg, result.summary)
-    if _signal_sanity_level(sanity_issues) == "BLOCK" and not allow_unsafe:
-        _record_audit_event(
-            str(result.summary.get("signal_id")),
-            "sanity_blocked",
-            interaction,
-            market=str(result.summary.get("market") or market or _default_market()),
-            issues=[text for _, text in sanity_issues],
-            output_dir=result.output_dir,
-        )
-        await interaction.followup.send(_signal_sanity_message(cfg, result.summary, sanity_issues))
-        return
     if sanity_issues:
         result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
     _record_audit_event(
@@ -3569,9 +3819,6 @@ async def scheduled_signal() -> None:
             )
             result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0)
             sanity_issues = _signal_sanity_issues(cfg, result.summary)
-            if _signal_sanity_level(sanity_issues) == "BLOCK":
-                await channel.send(_signal_sanity_message(cfg, result.summary, sanity_issues))
-                continue
             if sanity_issues:
                 result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
         except BotUserError as exc:
@@ -3586,6 +3833,7 @@ async def scheduled_signal() -> None:
             signal_id=str(result.summary.get("signal_id")),
             market=str(result.summary.get("market") or market),
         ))
+        await _send_subscription_notifications(cfg, result)
         for pages in _scheduled_detail_page_groups(cfg, result):
             await _send_channel_pages(channel, pages)
 

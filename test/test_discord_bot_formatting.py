@@ -10,6 +10,7 @@ from services.discord_bot.bot import (
     _decision_overview_page,
     _daily_summary_message,
     _filter_watchlist_rows,
+    _guide_message,
     _latest_changes_pages,
     _latest_signal_message,
     _performance_message,
@@ -21,11 +22,17 @@ from services.discord_bot.bot import (
     _prepend_latest_signal_row_to_portfolio_history,
     _rebalance_line,
     _remove_user_watch_symbol,
+    _remove_user_subscription,
     _risk_message,
     _scheduled_detail_page_groups,
+    _set_user_subscription,
     _signal_sanity_issues,
     _signal_sanity_level,
+    _subscription_alert_pages,
+    _subscription_summary_lines,
+    _subscribed_users_for_market,
     _stock_history_header_lines,
+    _user_subscriptions,
     _user_watchlist,
 )
 
@@ -250,6 +257,37 @@ def test_signal_sanity_blocks_implausible_latest_return() -> None:
     assert any("portfolio return" in text for _, text in issues)
 
 
+def test_sanity_block_still_includes_full_latest_signal(tmp_path) -> None:
+    cfg = SimpleNamespace(
+        market="unit",
+        label="Unit",
+        current_capital=None,
+        initial_capital=None,
+        benchmark_window_days=32,
+        history_frequency="daily",
+        config_path="missing.yaml",
+    )
+    summary = {
+        "market": "unit",
+        "market_label": "Unit",
+        "signal_id": "sig-test",
+        "asof_date": "2026-06-24 13:30:00",
+        "panel_date": "2026-06-24 13:30:00",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.00,
+        "target_risk": {"gross": 1.0, "top_abs_weight": 0.9851},
+        "top_positions": [{"symbol": "AAA", "name": "Alpha", "weight": 0.9851, "current_price": 10.0}],
+    }
+
+    message = _latest_signal_message(cfg, tmp_path / "summary.json", summary, top_n=1)
+
+    assert "**sanity BLOCK**" in message
+    assert "訊號可能異常，但以下仍提供完整訊號" in message
+    assert "已暫停自動公開播報" not in message
+    assert "**stockAgent live signal** Unit" in message
+    assert "`AAA` Alpha" in message
+
+
 def test_latest_signal_message_uses_saved_summary_without_debug_paths(tmp_path) -> None:
     cfg = SimpleNamespace(
         market="unit",
@@ -387,6 +425,76 @@ def test_user_watchlist_state_add_remove_and_filter(monkeypatch, tmp_path) -> No
     items = _remove_user_watch_symbol(123, "tw", "2330")
 
     assert items == ["6669"]
+
+
+def test_guide_mentions_daily_investor_commands() -> None:
+    text = _guide_message()
+
+    assert "/latest" in text
+    assert "/changes" in text
+    assert "/performance" in text
+    assert "/risk" in text
+    assert "/subscribe" in text
+    assert "/watch" in text
+
+
+def test_user_subscriptions_are_per_user_and_per_market(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("services.discord_bot.bot.STATE_PATH", tmp_path / "state.json")
+
+    subscriptions = _set_user_subscription(123, "tw", watchlist_only=True)
+    _set_user_subscription(123, "crypto", watchlist_only=False)
+    _set_user_subscription(456, "tw", watchlist_only=False)
+
+    assert subscriptions == {"tw": {"enabled": True, "watchlist_only": True}}
+    assert _user_subscriptions(123)["crypto"]["watchlist_only"] is False
+    assert sorted(user_id for user_id, _ in _subscribed_users_for_market("tw")) == ["123", "456"]
+    lines = "\n".join(_subscription_summary_lines(123))
+    assert "`tw` mode=`watchlist_only`" in lines
+    assert "`crypto` mode=`all_changes`" in lines
+
+    _remove_user_subscription(123, "tw")
+
+    assert "tw" not in _user_subscriptions(123)
+    assert sorted(user_id for user_id, _ in _subscribed_users_for_market("tw")) == ["456"]
+
+
+def test_subscription_alert_pages_only_include_watchlist_matches(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("services.discord_bot.bot.STATE_PATH", tmp_path / "state.json")
+    _add_user_watch_symbol(123, "tw", "2330")
+    cfg = SimpleNamespace(market="tw", label="台股", config_path="missing.yaml")
+    summary = {
+        "market": "tw",
+        "asof_date": "2026-06-24 13:30:00",
+        "panel_date": "2026-06-24 13:30:00",
+        "portfolio_simple_return": 0.01,
+        "benchmark_simple_return": 0.0,
+    }
+    rows = [
+        {"symbol": "2330", "name": "台積電", "action": "BUY", "delta_weight": 0.05, "current_weight": 0.0, "target_weight": 0.05, "trade_price": 1000.0},
+        {"symbol": "6669", "name": "緯穎", "action": "SELL", "delta_weight": -0.04, "current_weight": 0.04, "target_weight": 0.0, "trade_price": 4500.0},
+    ]
+
+    pages = _subscription_alert_pages(
+        cfg,
+        summary,
+        rows,
+        user_id=123,
+        settings={"enabled": True, "watchlist_only": True},
+    )
+    all_pages = _subscription_alert_pages(
+        cfg,
+        summary,
+        rows,
+        user_id=123,
+        settings={"enabled": True, "watchlist_only": False},
+    )
+
+    assert "`2330` 台積電" in pages[0]
+    assert "`6669` 緯穎" not in pages[0]
+    assert "`mode=watchlist_only`" in pages[0]
+    assert "`2330` 台積電" in all_pages[0]
+    assert "`6669` 緯穎" in all_pages[0]
+    assert "`mode=all_changes`" in all_pages[0]
 
 
 def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
