@@ -133,6 +133,13 @@ def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     )
 
 
+def _safe_log10_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
+    """Build a plot-safe log10 NAV curve from log returns."""
+    clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    cum_log = np.nan_to_num(np.cumsum(clean), nan=0.0, posinf=_PLOT_LOG_MAX, neginf=_PLOT_LOG_MIN)
+    return np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LOG_MAX) / math.log(10.0)
+
+
 def _finite_values(values: list[float] | np.ndarray, *, nan: float = 0.0) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64)
     return np.nan_to_num(arr, nan=nan, posinf=nan, neginf=nan)
@@ -708,6 +715,49 @@ def plot_fold_first_year_returns(
     _configure_log_y_axis(ax, strat_nav, base_nav)
     ax.axhline(y=1.0, color="black", linewidth=0.8)
     ax.grid(True, alpha=0.3, which="both")
+    ax.legend()
+    combined_result = _build_plot_result(strat_sorted, base_sorted)
+    _add_metrics_box(ax, _format_risk_metrics_text(combined_result))
+
+    fig.autofmt_xdate()
+    _safe_tight_layout()
+    if output_path:
+        _save_current_figure(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    plt.close()
+
+
+def plot_fold_first_year_returns_log10(
+    all_first_year_dates: list[np.ndarray],
+    all_first_year_strategy_log: list[np.ndarray],
+    all_first_year_baseline_log: list[np.ndarray],
+    output_path: str | Path | None = None,
+) -> None:
+    """Plot all folds' first test-year daily cumulative log10 NAV."""
+    if not all_first_year_dates:
+        return
+
+    all_dates = np.concatenate(all_first_year_dates)
+    all_strategy = np.concatenate(all_first_year_strategy_log)
+    all_baseline = np.concatenate(all_first_year_baseline_log)
+
+    order = np.argsort(all_dates)
+    dates_sorted = all_dates[order]
+    strat_sorted = all_strategy[order]
+    base_sorted = all_baseline[order]
+
+    strat_log10_nav = _safe_log10_equity_for_plot(strat_sorted)
+    base_log10_nav = _safe_log10_equity_for_plot(base_sorted)
+    date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    _plot_finite_line(ax, date_values, strat_log10_nav, label="Strategy", linewidth=2.2)
+    _plot_finite_line(ax, date_values, base_log10_nav, label="Baseline", linewidth=2.2)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("log10(Cumulative NAV), start=0")
+    ax.set_title("Walkforward First-Test-Year Daily log10 Cumulative NAV (All Folds)")
+    ax.axhline(y=0.0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.3)
     ax.legend()
     combined_result = _build_plot_result(strat_sorted, base_sorted)
     _add_metrics_box(ax, _format_risk_metrics_text(combined_result))
