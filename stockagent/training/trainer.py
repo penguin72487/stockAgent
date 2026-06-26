@@ -1239,6 +1239,14 @@ def _backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "test_backtest.npz"
 
 
+def _best_val_backtest_path(fold_dir: Path) -> Path:
+    return fold_dir / "best_val_backtest.npz"
+
+
+def _best_val_snapshot_path(fold_dir: Path) -> Path:
+    return fold_dir / "best_val_snapshot.json"
+
+
 def _integer_backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "test_integer_share_backtest.npz"
 
@@ -2353,6 +2361,241 @@ def _save_backtest_artifact(
         weights_history=result.weights_history,
         dates=np.asarray(dates),
     )
+
+
+def _save_best_val_backtest_snapshot(
+    *,
+    fold_dir: Path,
+    fold: WalkForwardFold,
+    epoch: int,
+    val_loss: float,
+    val_backtest: BacktestResultTensor,
+    row_start: int,
+    row_end: int,
+    dates: np.ndarray,
+    objective: str,
+) -> None:
+    row_start = max(0, int(row_start))
+    row_end = max(row_start, int(row_end))
+    strategy_returns = val_backtest.strategy_returns[row_start:row_end].detach().cpu().numpy().astype(np.float32)
+    benchmark_returns = val_backtest.benchmark_returns[row_start:row_end].detach().cpu().numpy().astype(np.float32)
+    turnovers = val_backtest.turnovers[row_start:row_end].detach().cpu().numpy().astype(np.float32)
+    if val_backtest.weights_history.numel() and int(val_backtest.weights_history.size(0)) >= row_end:
+        weights_history = val_backtest.weights_history[row_start:row_end].detach().cpu().numpy().astype(np.float32)
+    else:
+        num_symbols = int(val_backtest.weights_history.size(1)) if val_backtest.weights_history.dim() == 2 else 0
+        weights_history = np.empty((0, num_symbols), dtype=np.float32)
+
+    snapshot_dates = np.asarray(dates)
+    result = BacktestResult(
+        strategy_returns=strategy_returns,
+        benchmark_returns=benchmark_returns,
+        turnovers=turnovers,
+        weights_history=weights_history,
+    )
+    _save_backtest_artifact(
+        _best_val_backtest_path(fold_dir),
+        result,
+        snapshot_dates,
+        compression="compressed",
+    )
+    metrics = _compute_metrics_from_tensors(
+        val_backtest.strategy_returns[row_start:row_end],
+        val_backtest.benchmark_returns[row_start:row_end],
+        val_backtest.turnovers[row_start:row_end],
+    )
+    metadata = {
+        "fold_id": int(fold.fold_id),
+        "epoch": int(epoch),
+        "split": "val",
+        "objective": str(objective),
+        "best_val_loss": float(val_loss),
+        "train_years": [int(year) for year in fold.train_years],
+        "val_years": [int(year) for year in fold.val_years],
+        "test_years": [int(year) for year in fold.test_years],
+        "rows": int(strategy_returns.shape[0]),
+        "has_weights_history": bool(weights_history.size > 0),
+        "date_start": str(snapshot_dates[0]) if snapshot_dates.size else None,
+        "date_end": str(snapshot_dates[-1]) if snapshot_dates.size else None,
+        "backtest_npz": str(_best_val_backtest_path(fold_dir).name),
+        "compression": "compressed",
+        "metrics": metrics,
+    }
+    with _best_val_snapshot_path(fold_dir).open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+
+def _save_integer_share_holdings_table_enabled(config: ExperimentConfig) -> bool:
+    return bool(
+        getattr(
+            config.training,
+            "save_integer_share_holdings_table",
+            getattr(config.training, "save_integer_share_holdings_csv", True),
+        )
+    )
+
+
+def _save_fold_output_artifacts(
+    *,
+    fold_dir: Path,
+    fold_result: FoldResult,
+    model: nn.Module,
+    test_backtest: BacktestResult,
+    test_dates: np.ndarray,
+    symbols: list[str],
+    config: ExperimentConfig,
+    test_integer_backtest: BacktestResult | None = None,
+    holdings_records: list[HoldingsRecord] | None = None,
+    backtest_artifact_compression: str | None = None,
+    print_report: bool = True,
+    write_plots: bool = True,
+) -> tuple[dict[str, float | str], dict[str, float | str]]:
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    save_start = time.perf_counter()
+    save_timing: dict[str, float | str] = {}
+    stage_start = time.perf_counter()
+    torch.save(_state_dict_for_save(model), _model_path(fold_dir))
+    save_timing["model_checkpoint_s"] = float(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
+        json.dump(asdict(fold_result), f, indent=2)
+    save_timing["metrics_json_s"] = float(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    compression = str(
+        backtest_artifact_compression
+        if backtest_artifact_compression is not None
+        else getattr(config.training, "backtest_artifact_compression", "none")
+    )
+    _save_backtest_artifact(
+        _backtest_path(fold_dir),
+        test_backtest,
+        test_dates,
+        compression=compression,
+    )
+    save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
+    save_timing["backtest_artifact_compression"] = compression
+
+    stage_start = time.perf_counter()
+    table_output_format = str(getattr(config.training, "table_output_format", "csv"))
+    _save_daily_portfolio_returns_table(
+        fold_dir / "daily_portfolio_returns",
+        test_dates,
+        test_backtest.strategy_returns,
+        test_backtest.benchmark_returns,
+        test_backtest.turnovers,
+        table_output_format=table_output_format,
+    )
+    elapsed = float(time.perf_counter() - stage_start)
+    save_timing["daily_returns_table_s"] = elapsed
+    save_timing["daily_returns_csv_s"] = elapsed if table_output_format == "csv" else 0.0
+    save_timing["daily_returns_parquet_s"] = elapsed if table_output_format == "parquet" else 0.0
+
+    stage_start = time.perf_counter()
+    _maybe_save_daily_weights_table(
+        fold_dir / "daily_weights",
+        test_dates,
+        symbols,
+        test_backtest.weights_history,
+        enabled=bool(
+            getattr(
+                config.training,
+                "save_daily_weights_table",
+                getattr(config.training, "save_daily_weights_csv", True),
+            )
+        ),
+        table_output_format=table_output_format,
+    )
+    save_timing["daily_weights_table_s"] = float(time.perf_counter() - stage_start)
+    save_timing["table_output_format"] = table_output_format
+
+    stage_start = time.perf_counter()
+    report = generate_annual_report(test_backtest, test_dates)
+    save_timing["annual_report_compute_s"] = float(time.perf_counter() - stage_start)
+    if print_report:
+        print("\n" + report)
+    stage_start = time.perf_counter()
+    with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
+        f.write(report)
+    save_timing["annual_report_write_s"] = float(time.perf_counter() - stage_start)
+    save_timing["total_s"] = float(time.perf_counter() - save_start)
+    (fold_dir / "save_timing.json").write_text(
+        json.dumps(save_timing, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    plot_start = time.perf_counter()
+    plot_timing: dict[str, float | str] = {}
+
+    def _time_plot(name: str, fn: Callable[..., Any], *args: Any) -> None:
+        item_start = time.perf_counter()
+        fn(*args)
+        plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
+
+    def _copy_plot(name: str, source: Path, target: Path) -> None:
+        item_start = time.perf_counter()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
+        plot_timing[f"{name}_copied_from"] = str(source.name)
+
+    if write_plots:
+        _time_plot("equity_curve", plot_equity_curve, test_backtest, test_dates, fold_dir / "equity_curve.png")
+        _time_plot("equity_curve_log", plot_equity_curve_log, test_backtest, test_dates, fold_dir / "equity_curve_log.png")
+        _time_plot(
+            "annual_performance",
+            plot_annual_performance,
+            test_backtest,
+            test_dates,
+            fold_dir / "annual_performance.png",
+        )
+        _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
+        _copy_plot(
+            "leverage_equity_curve_log",
+            fold_dir / "equity_curve_log.png",
+            fold_dir / "leverage_equity_curve_log.png",
+        )
+        _copy_plot(
+            "leverage_annual_performance",
+            fold_dir / "annual_performance.png",
+            fold_dir / "leverage_annual_performance.png",
+        )
+
+    if test_integer_backtest is not None:
+        audit_start = time.perf_counter()
+        integer_audit_timing = _save_integer_share_audit_artifacts(
+            fold_dir,
+            test_integer_backtest,
+            test_dates,
+            symbols,
+            holdings_records or [],
+            write_daily_weights_table=bool(
+                getattr(
+                    config.training,
+                    "save_integer_share_daily_weights_table",
+                    getattr(config.training, "save_integer_share_daily_weights_csv", True),
+                )
+            ),
+            write_holdings_table=_save_integer_share_holdings_table_enabled(config),
+            table_output_format=table_output_format,
+            backtest_artifact_compression=compression,
+        )
+        plot_timing["integer_share_audit_s"] = float(time.perf_counter() - audit_start)
+        for key, value in integer_audit_timing.items():
+            if isinstance(value, bool):
+                plot_timing[f"integer_share_audit_{key}"] = float(1 if value else 0)
+            elif isinstance(value, str):
+                plot_timing[f"integer_share_audit_{key}"] = value
+            else:
+                plot_timing[f"integer_share_audit_{key}"] = float(value)
+
+    plot_timing["total_s"] = float(time.perf_counter() - plot_start)
+    (fold_dir / "plot_timing.json").write_text(
+        json.dumps(plot_timing, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return save_timing, plot_timing
 
 
 def _normalize_table_output_format(value: str | None) -> str:
@@ -7073,13 +7316,7 @@ def _run_training_tree_models(
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
-            write_integer_holdings_table = bool(
-                getattr(
-                    config.training,
-                    "save_integer_share_holdings_table",
-                    getattr(config.training, "save_integer_share_holdings_csv", True),
-                )
-            )
+            write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt.weights_history,
                 future_returns=test_returns.detach().cpu().numpy(),
@@ -8967,6 +9204,252 @@ def run_training(
                 profile_timing=profile_timing,
             )
 
+        def _save_best_val_complete_fold_artifacts(
+            *,
+            context: FoldRuntimeContext,
+            epoch: int,
+            val_loss: float,
+            val_backtest_epoch: BacktestResultTensor,
+            val_row_start: int,
+            val_row_end: int,
+        ) -> FoldResult | None:
+            if not bool(getattr(config.training, "save_best_val_fold_artifacts", True)):
+                return None
+
+            fold = context.fold
+            fold_dir = context.fold_dir
+            artifact_start = time.perf_counter()
+            print(
+                f"[Fold {fold.fold_id}] best val improved at epoch {epoch}; "
+                "writing full fold artifacts from current checkpoint"
+            )
+
+            test_eval_start = time.perf_counter()
+            if use_windowed_tensors:
+                shared_test_base = train_windowed if train_windowed is not None else combined_val_windowed
+                if shared_test_base is None:
+                    shared_test_base = combined_test_windowed
+                test_windowed = _prepare_windowed_split(
+                    dataset_to_windowed_tensors(context.test_ds),
+                    device,
+                    non_blocking,
+                    shared_base=shared_test_base,
+                    name=f"fold {fold.fold_id} best-val test windowed tensors",
+                )
+                test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
+                    eval_model,
+                    panel_slab_model,
+                    test_windowed,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.long_only,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
+                    config.trading.gross_leverage,
+                    config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
+                    chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
+                    profile_timing=profile_timing,
+                )
+                test_date_idx = test_windowed.valid_indices.to(
+                    device=test_windowed.future_log_returns.device,
+                    dtype=torch.long,
+                )
+                test_returns = test_windowed.future_log_returns[test_date_idx]
+                test_masks = test_windowed.tradable_mask[test_date_idx]
+                test_buy_masks = test_windowed.can_buy_mask[test_date_idx]
+                test_sell_masks = test_windowed.can_sell_mask[test_date_idx]
+                test_bench = test_windowed.benchmark[test_date_idx]
+            else:
+                test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(
+                    context.test_ds
+                )
+                test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _prepare_split_tensors(
+                    test_x,
+                    test_returns,
+                    test_masks,
+                    test_buy_masks,
+                    test_sell_masks,
+                    test_bench,
+                    device,
+                    non_blocking,
+                )
+                test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+                    eval_model,
+                    test_x,
+                    test_returns,
+                    test_masks,
+                    test_buy_masks,
+                    test_sell_masks,
+                    test_bench,
+                    device,
+                    amp_dtype,
+                    non_blocking,
+                    config.trading.long_only,
+                    config.trading.buy_fee_rate,
+                    config.trading.sell_fee_rate,
+                    config.trading.max_turnover_ratio,
+                    config.trading.gross_leverage,
+                    config.trading.min_trade_weight,
+                    portfolio_activation=config.trading.portfolio_activation,
+                    chunk_rows=eval_chunk_rows,
+                    backtest_chunk_rows=eval_backtest_chunk_rows,
+                    profile_timing=profile_timing,
+                )
+
+            previous_fold_model = _load_previous_fold_neural_model(
+                panel=panel,
+                config=config,
+                output_path=output_path,
+                fold_id=fold.fold_id,
+                device=device,
+            )
+            (
+                test_bt_t,
+                test_ic,
+                test_met,
+                test_returns,
+                test_masks,
+                test_buy_masks,
+                test_sell_masks,
+                test_bench,
+                test_eval_indices,
+                warmup_days,
+            ) = _merge_test_backtest_with_previous_fold_warmup(
+                panel=panel,
+                fold=fold,
+                lookback=config.training.lookback,
+                previous_model=previous_fold_model,
+                current_backtest=test_bt_t,
+                current_returns=test_returns,
+                current_masks=test_masks,
+                current_buy_masks=test_buy_masks,
+                current_sell_masks=test_sell_masks,
+                current_benchmark=test_bench,
+                current_valid_indices=np.asarray(context.test_ds.valid_indices, dtype=np.int64),
+                device=device,
+                amp_dtype=amp_dtype,
+                non_blocking=non_blocking,
+                long_only=config.trading.long_only,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
+                min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
+                chunk_rows=eval_chunk_rows,
+                backtest_chunk_rows=eval_backtest_chunk_rows,
+            )
+            if warmup_days > 0:
+                print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
+            if previous_fold_model is not None:
+                del previous_fold_model
+            test_eval_total = time.perf_counter() - test_eval_start
+
+            val_row_start = max(0, int(val_row_start))
+            val_row_end = max(val_row_start, int(val_row_end))
+            if (
+                val_backtest_epoch.weights_history.numel()
+                and int(val_backtest_epoch.weights_history.size(0)) >= val_row_end
+            ):
+                if combined_val_windowed is not None:
+                    val_date_idx = combined_val_windowed.valid_indices.to(
+                        device=combined_val_windowed.future_log_returns.device,
+                        dtype=torch.long,
+                    )
+                    val_returns_device = combined_val_windowed.future_log_returns[val_date_idx].to(
+                        device=val_backtest_epoch.weights_history.device,
+                        non_blocking=False,
+                    )
+                    val_masks_device = combined_val_windowed.tradable_mask[val_date_idx].to(
+                        device=val_backtest_epoch.weights_history.device,
+                        non_blocking=False,
+                    )
+                else:
+                    val_returns_device = combined_val_returns.to(
+                        device=val_backtest_epoch.weights_history.device,
+                        non_blocking=False,
+                    )
+                    val_masks_device = combined_val_masks.to(
+                        device=val_backtest_epoch.weights_history.device,
+                        non_blocking=False,
+                    )
+                val_ic = ic_summary(
+                    compute_ic_series_torch(
+                        val_backtest_epoch.weights_history[val_row_start:val_row_end],
+                        val_returns_device[val_row_start:val_row_end],
+                        val_masks_device[val_row_start:val_row_end],
+                    ).cpu().numpy()
+                )
+            else:
+                val_ic = ic_summary(np.asarray([], dtype=np.float32))
+            val_met = _compute_metrics_from_tensors(
+                val_backtest_epoch.strategy_returns[val_row_start:val_row_end],
+                val_backtest_epoch.benchmark_returns[val_row_start:val_row_end],
+                val_backtest_epoch.turnovers[val_row_start:val_row_end],
+            )
+
+            test_dates = panel.dates[test_eval_indices]
+            test_close_prices = panel.close_prices[test_eval_indices]
+            test_bt = test_bt_t.to_numpy()
+            write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
+            test_integer_bt, holdings_records = run_backtest_integer_shares(
+                weights=test_bt.weights_history,
+                future_returns=test_returns.detach().cpu().numpy(),
+                tradable_mask=test_masks.detach().cpu().numpy(),
+                can_buy_mask=test_buy_masks.detach().cpu().numpy(),
+                can_sell_mask=test_sell_masks.detach().cpu().numpy(),
+                benchmark_returns=test_bt.benchmark_returns,
+                initial_capital=1_000_000.0,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                long_only=config.trading.long_only,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=config.trading.gross_leverage,
+                min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
+                close_prices=test_close_prices,
+                symbols=panel.symbols,
+                dates=test_dates,
+                collect_holdings=write_integer_holdings_table,
+            )
+            test_integer_met = compute_metrics(test_integer_bt)
+            fold_result = FoldResult(
+                fold_id=fold.fold_id,
+                train_years=fold.train_years,
+                val_years=fold.val_years,
+                test_years=fold.test_years,
+                best_val_loss=float(val_loss),
+                val_ic=val_ic,
+                val_metrics=val_met,
+                test_ic=test_ic,
+                test_metrics=test_met,
+                test_integer_metrics=test_integer_met,
+            )
+            _save_fold_output_artifacts(
+                fold_dir=fold_dir,
+                fold_result=fold_result,
+                model=model,
+                test_backtest=test_bt,
+                test_dates=test_dates,
+                symbols=panel.symbols,
+                config=config,
+                test_integer_backtest=test_integer_bt,
+                holdings_records=holdings_records,
+                backtest_artifact_compression="compressed",
+                print_report=False,
+                write_plots=bool(getattr(config.training, "save_best_val_fold_plots", True)),
+            )
+            print(
+                f"[Fold {fold.fold_id}] best-val fold artifacts written in "
+                f"{time.perf_counter() - artifact_start:.1f}s "
+                f"(test_eval={test_eval_total:.1f}s, compression=compressed): {fold_dir}"
+            )
+            return fold_result
+
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
             last_epoch = epoch
@@ -9173,7 +9656,7 @@ def run_training(
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
-                        return_weights_history=False,
+                        return_weights_history=True,
                         profile_timing=profile_timing,
                         timing_out=val_timing,
                         reset_at_rows=val_offsets,
@@ -9201,7 +9684,7 @@ def run_training(
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
-                        return_weights_history=False,
+                        return_weights_history=True,
                         profile_timing=profile_timing,
                         timing_out=val_timing,
                         reset_at_rows=val_offsets,
@@ -9393,7 +9876,9 @@ def run_training(
             if val_count > 0:
                 val_loss_values = scalar_values[scalar_offset : scalar_offset + val_count]
                 scalar_offset += val_count
-                for context, val_loss_raw in zip(deferred_val_loss_contexts, val_loss_values, strict=False):
+                for index, (context, val_loss_raw) in enumerate(
+                    zip(deferred_val_loss_contexts, val_loss_values, strict=False)
+                ):
                     val_loss = float(val_loss_raw)
                     val_losses.append(val_loss)
                     if val_loss < context.best_val_loss:
@@ -9409,6 +9894,27 @@ def run_training(
                             optimizer=optimizer,
                             scaler=scaler,
                         )
+                        _save_best_val_backtest_snapshot(
+                            fold_dir=context.fold_dir,
+                            fold=context.fold,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            val_backtest=val_backtest_epoch,
+                            row_start=val_offsets[index],
+                            row_end=val_offsets[index + 1],
+                            dates=panel.dates[context.val_ds.valid_indices],
+                            objective=loss_objective,
+                        )
+                        fold_result = _save_best_val_complete_fold_artifacts(
+                            context=context,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            val_backtest_epoch=val_backtest_epoch,
+                            val_row_start=val_offsets[index],
+                            val_row_end=val_offsets[index + 1],
+                        )
+                        if fold_result is not None:
+                            results_by_fold[context.fold.fold_id] = fold_result
                         fold_ckpt_total += time.perf_counter() - fold_ckpt_start
             if test_count > 0:
                 test_loss_values = scalar_values[scalar_offset : scalar_offset + test_count]
@@ -9820,13 +10326,7 @@ def run_training(
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
-            write_integer_holdings_table = bool(
-                getattr(
-                    config.training,
-                    "save_integer_share_holdings_table",
-                    getattr(config.training, "save_integer_share_holdings_csv", True),
-                )
-            )
+            write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt.weights_history,
                 future_returns=test_returns.detach().cpu().numpy(),
@@ -9880,131 +10380,20 @@ def run_training(
             results_by_fold[fold.fold_id] = fold_result
 
             save_start = time.perf_counter()
-            save_timing: dict[str, float | str] = {}
-            stage_start = time.perf_counter()
-            torch.save(_state_dict_for_save(model), _model_path(fold_dir))
-            save_timing["model_checkpoint_s"] = float(time.perf_counter() - stage_start)
-            stage_start = time.perf_counter()
-            with _metrics_path(fold_dir).open("w", encoding="utf-8") as f:
-                json.dump(asdict(fold_result), f, indent=2)
-            save_timing["metrics_json_s"] = float(time.perf_counter() - stage_start)
-
-            stage_start = time.perf_counter()
-            backtest_artifact_compression = str(getattr(config.training, "backtest_artifact_compression", "none"))
-            _save_backtest_artifact(
-                _backtest_path(fold_dir),
-                test_bt,
-                test_dates,
-                compression=backtest_artifact_compression,
+            _, plot_timing = _save_fold_output_artifacts(
+                fold_dir=fold_dir,
+                fold_result=fold_result,
+                model=model,
+                test_backtest=test_bt,
+                test_dates=test_dates,
+                symbols=panel.symbols,
+                config=config,
+                test_integer_backtest=test_integer_bt,
+                holdings_records=holdings_records,
+                print_report=True,
+                write_plots=True,
             )
-            save_timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
-            save_timing["backtest_artifact_compression"] = backtest_artifact_compression
-            stage_start = time.perf_counter()
-            table_output_format = str(getattr(config.training, "table_output_format", "csv"))
-            _save_daily_portfolio_returns_table(
-                fold_dir / "daily_portfolio_returns",
-                test_dates,
-                test_bt.strategy_returns,
-                test_bt.benchmark_returns,
-                test_bt.turnovers,
-                table_output_format=table_output_format,
-            )
-            elapsed = float(time.perf_counter() - stage_start)
-            save_timing["daily_returns_table_s"] = elapsed
-            save_timing["daily_returns_csv_s"] = elapsed if table_output_format == "csv" else 0.0
-            save_timing["daily_returns_parquet_s"] = elapsed if table_output_format == "parquet" else 0.0
-            stage_start = time.perf_counter()
-            _maybe_save_daily_weights_table(
-                fold_dir / "daily_weights.csv",
-                test_dates,
-                panel.symbols,
-                test_bt.weights_history,
-                enabled=bool(
-                    getattr(
-                        config.training,
-                        "save_daily_weights_table",
-                        getattr(config.training, "save_daily_weights_csv", True),
-                    )
-                ),
-                table_output_format=table_output_format,
-            )
-            save_timing["daily_weights_table_s"] = float(time.perf_counter() - stage_start)
-            save_timing["table_output_format"] = table_output_format
-            stage_start = time.perf_counter()
-            report = generate_annual_report(test_bt, test_dates)
-            save_timing["annual_report_compute_s"] = float(time.perf_counter() - stage_start)
-            print("\n" + report)
-            stage_start = time.perf_counter()
-            with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
-                f.write(report)
-            save_timing["annual_report_write_s"] = float(time.perf_counter() - stage_start)
-            save_timing["total_s"] = float(time.perf_counter() - save_start)
-            (fold_dir / "save_timing.json").write_text(
-                json.dumps(save_timing, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-
-            plot_start = time.perf_counter()
-            plot_timing: dict[str, float | str] = {}
-
-            def _time_plot(name: str, fn: Callable[..., Any], *args: Any) -> None:
-                item_start = time.perf_counter()
-                fn(*args)
-                plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
-
-            def _copy_plot(name: str, source: Path, target: Path) -> None:
-                item_start = time.perf_counter()
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, target)
-                plot_timing[f"{name}_s"] = float(time.perf_counter() - item_start)
-                plot_timing[f"{name}_copied_from"] = str(source.name)
-
-            _time_plot("equity_curve", plot_equity_curve, test_bt, test_dates, fold_dir / "equity_curve.png")
-            _time_plot("equity_curve_log", plot_equity_curve_log, test_bt, test_dates, fold_dir / "equity_curve_log.png")
-            _time_plot("annual_performance", plot_annual_performance, test_bt, test_dates, fold_dir / "annual_performance.png")
-            _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
-            _copy_plot(
-                "leverage_equity_curve_log",
-                fold_dir / "equity_curve_log.png",
-                fold_dir / "leverage_equity_curve_log.png",
-            )
-            _copy_plot(
-                "leverage_annual_performance",
-                fold_dir / "annual_performance.png",
-                fold_dir / "leverage_annual_performance.png",
-            )
-            audit_start = time.perf_counter()
-            integer_audit_timing = _save_integer_share_audit_artifacts(
-                fold_dir,
-                test_integer_bt,
-                test_dates,
-                panel.symbols,
-                holdings_records,
-                write_daily_weights_table=bool(
-                    getattr(
-                        config.training,
-                        "save_integer_share_daily_weights_table",
-                        getattr(config.training, "save_integer_share_daily_weights_csv", True),
-                    )
-                ),
-                write_holdings_table=write_integer_holdings_table,
-                table_output_format=table_output_format,
-                backtest_artifact_compression=backtest_artifact_compression,
-            )
-            plot_timing["integer_share_audit_s"] = float(time.perf_counter() - audit_start)
-            for key, value in integer_audit_timing.items():
-                if isinstance(value, bool):
-                    plot_timing[f"integer_share_audit_{key}"] = float(1 if value else 0)
-                elif isinstance(value, str):
-                    plot_timing[f"integer_share_audit_{key}"] = value
-                else:
-                    plot_timing[f"integer_share_audit_{key}"] = float(value)
-            plot_total = time.perf_counter() - plot_start
-            plot_timing["total_s"] = float(plot_total)
-            (fold_dir / "plot_timing.json").write_text(
-                json.dumps(plot_timing, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            plot_total = float(plot_timing.get("total_s", 0.0))
 
             refresh_start = time.perf_counter()
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -10020,7 +10409,7 @@ def run_training(
                 checkpoint_path=best_checkpoint_path,
             )
             plot_timing["explainability_total_s"] = float(time.perf_counter() - explain_start)
-            plot_timing["post_plot_total_s"] = float(time.perf_counter() - plot_start)
+            plot_timing["post_plot_total_s"] = float(time.perf_counter() - save_start)
             (fold_dir / "plot_timing.json").write_text(
                 json.dumps(plot_timing, indent=2, ensure_ascii=False),
                 encoding="utf-8",
