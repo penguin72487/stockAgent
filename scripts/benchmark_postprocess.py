@@ -34,6 +34,8 @@ from stockagent.training.trainer import (
     _load_state_dict,
     _resolve_amp_dtype,
     _resolve_device,
+    _resolve_inference_backtest_chunk_rows,
+    _resolve_inference_model_chunk_rows,
 )
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -106,8 +108,6 @@ def _force_raw_logits_config(config: Any) -> None:
     config.training.transformer_base_portfolio.portfolio_output_mode = "logits"
     config.training.transformer_base_portfolio.return_aux = False
     config.training.transformer_base_portfolio.return_aux_details = False
-    config.trading.portfolio_activation = "identity"
-    config.trading.min_trade_weight = 0.0
 
 
 def _select_fold_indices(fold: Any, split: str) -> Any:
@@ -346,8 +346,18 @@ def main() -> None:
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--activations", default=DEFAULT_ACTIVATIONS)
     parser.add_argument("--thresholds", default=DEFAULT_THRESHOLDS)
-    parser.add_argument("--chunk-rows", type=int, default=16, help="Model inference chunk rows.")
-    parser.add_argument("--scan-chunk-size", type=int, default=None, help="Backtest scan chunk size.")
+    parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=None,
+        help="Model inference chunk rows. Default follows training.eval_model_chunk_rows from YAML.",
+    )
+    parser.add_argument(
+        "--scan-chunk-size",
+        type=int,
+        default=None,
+        help="Backtest scan chunk size. Default follows training.eval_backtest_chunk_rows from YAML.",
+    )
     parser.add_argument("--max-rows", type=int, default=None, help="Optional smoke-test row cap.")
     parser.add_argument("--rank-metric", default="sharpe")
     parser.add_argument("--backtest-compile", action="store_true")
@@ -419,6 +429,16 @@ def main() -> None:
         )
     if len(split) <= 0:
         raise ValueError(f"fold_id={args.fold} split={args.split} has no rows")
+    chunk_rows = (
+        max(1, int(args.chunk_rows))
+        if args.chunk_rows is not None
+        else _resolve_inference_model_chunk_rows(config, len(split))
+    )
+    scan_chunk_size = (
+        max(1, int(args.scan_chunk_size))
+        if args.scan_chunk_size is not None
+        else _resolve_inference_backtest_chunk_rows(config, chunk_rows)
+    )
 
     model = build_model(
         config=config,
@@ -444,6 +464,8 @@ def main() -> None:
                 "date_end": date_end,
                 "device": str(device),
                 "amp_dtype": str(amp_dtype),
+                "chunk_rows": int(chunk_rows),
+                "scan_chunk_size": int(scan_chunk_size),
                 "activations": activations,
                 "thresholds": thresholds,
             },
@@ -459,7 +481,7 @@ def main() -> None:
         device=device,
         amp_dtype=amp_dtype,
         non_blocking=non_blocking,
-        chunk_rows=int(args.chunk_rows),
+        chunk_rows=chunk_rows,
     )
     inference_elapsed_s = time.perf_counter() - started
     print(f"raw_score_inference_s={inference_elapsed_s:.3f}", flush=True)
@@ -469,7 +491,7 @@ def main() -> None:
         activations=activations,
         thresholds=thresholds,
         config=config,
-        scan_chunk_size=args.scan_chunk_size,
+        scan_chunk_size=scan_chunk_size,
     )
     best_by = {
         metric: _best_by_metric(rows, metric)
@@ -503,6 +525,8 @@ def main() -> None:
         "date_end": date_end,
         "device": str(device),
         "amp_dtype": str(amp_dtype),
+        "chunk_rows": int(chunk_rows),
+        "scan_chunk_size": int(scan_chunk_size),
         "activations": activations,
         "thresholds": thresholds,
         "rank_metric": rank_metric,
