@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 25
 environment:
   conda_env: fintech
   device: cuda
@@ -80,10 +80,10 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 32
-  batch_size_train: 32
+  batch_size: 16
+  batch_size_train: 16
   batch_size_eval: 16
-  epochs: 1000
+  epochs: 10000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
