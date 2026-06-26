@@ -136,8 +136,16 @@ def _safe_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
 def _safe_log10_equity_for_plot(log_returns: np.ndarray) -> np.ndarray:
     """Build a plot-safe log10 NAV curve from log returns."""
     clean = np.nan_to_num(log_returns, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-    cum_log = np.nan_to_num(np.cumsum(clean), nan=0.0, posinf=_PLOT_LOG_MAX, neginf=_PLOT_LOG_MIN)
-    return np.clip(cum_log, _PLOT_LOG_MIN, _PLOT_LOG_MAX) / math.log(10.0)
+    log10_nav = np.cumsum(clean) / math.log(10.0)
+    finite = log10_nav[np.isfinite(log10_nav)]
+    if finite.size == 0:
+        return np.zeros_like(log10_nav, dtype=np.float64)
+    return np.nan_to_num(
+        log10_nav,
+        nan=0.0,
+        posinf=float(finite.max()),
+        neginf=float(finite.min()),
+    )
 
 
 def _finite_values(values: list[float] | np.ndarray, *, nan: float = 0.0) -> np.ndarray:
