@@ -35,6 +35,7 @@ from stockagent.backtest.report import (
     plot_first_year_fold_metric_bars,
     plot_first_year_turnover_concentration,
     plot_fold_first_year_returns,
+    plot_fold_first_year_returns_log10,
 )
 from stockagent.backtest.simulator import (
     BacktestResult,
@@ -5251,6 +5252,12 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
             all_first_year_strategy_log,
             all_first_year_baseline_log,
             output_path / "walkforward_first_year_cumulative_returns.png",
+        )
+        plot_fold_first_year_returns_log10(
+            all_first_year_dates,
+            all_first_year_strategy_log,
+            all_first_year_baseline_log,
+            output_path / "walkforward_first_year_cumulative_returns_log10.png",
         )
         plot_first_year_fold_metric_bars(
             all_first_year_fold_ids,
