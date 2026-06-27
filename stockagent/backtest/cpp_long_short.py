@@ -15,7 +15,10 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def cpp_long_short_enabled() -> bool:
-    return _env_truthy("STOCKAGENT_USE_CPP_BACKTEST_EXT", "0")
+    # The optional extension still assumes weighted asset log returns are the
+    # portfolio return. Keep it disabled until its forward/backward path is
+    # updated to asset-simple PnL followed by portfolio log return.
+    return False
 
 
 def _load_cpp_ext():

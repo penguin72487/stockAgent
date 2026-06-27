@@ -88,7 +88,7 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     max_turnover_ratio: float = 0.0
-    gross_leverage: float = 1.0
+    leverage: float = 1.0
     min_trade_weight: float = 0.0
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
 
@@ -497,9 +497,9 @@ class TrainingConfig:
     save_integer_share_holdings_csv: bool = True
     save_daily_weights_csv: bool = True
     backtest_artifact_compression: str = "none"
-    save_best_val_artifacts: bool = True
-    save_best_val_fold_artifacts: bool = True
-    save_best_val_fold_plots: bool = True
+    save_best_val_artifacts: bool = False
+    save_best_val_fold_artifacts: bool = False
+    save_best_val_fold_plots: bool = False
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -547,8 +547,6 @@ class TrainingConfig:
 
 @dataclass(slots=True)
 class EvaluationConfig:
-    primary_baseline: str
-    metrics: list[str]
     gamma_sharpe: float = 1.0
     gamma_excess: float = 1.0
     gamma_cvar: float = 1.0
@@ -701,7 +699,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("save_integer_share_holdings_table", training["save_integer_share_holdings_csv"])
     training.setdefault("backtest_artifact_compression", "none")
     save_best_val_artifacts = bool(
-        training.get("save_best_val_artifacts", training.get("save_best_val_fold_artifacts", True))
+        training.get("save_best_val_artifacts", training.get("save_best_val_fold_artifacts", False))
     )
     training["save_best_val_artifacts"] = save_best_val_artifacts
     training["save_best_val_fold_artifacts"] = (
@@ -1183,14 +1181,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("training.backtest_artifact_compression must be one of: none, compressed")
     training["backtest_artifact_compression"] = backtest_artifact_compression
     trading.setdefault("max_turnover_ratio", 0.0)
-    trading.setdefault("gross_leverage", 1.0)
+    legacy_gross_leverage = trading.pop("gross_leverage", None)
+    trading.setdefault("leverage", legacy_gross_leverage if legacy_gross_leverage is not None else 1.0)
     trading.setdefault("min_trade_weight", 0.0)
     trading.setdefault("portfolio_activation", DEFAULT_PORTFOLIO_ACTIVATION)
-    # Preserve the configured leverage multiplier for reporting/post-processing.
-    # Canonical backtest paths that need an exposure budget clamp it locally.
-    trading["gross_leverage"] = max(0.0, float(trading.get("gross_leverage", 1.0)))
+    # Report/post-processing leverage only. Canonical model/loss/backtest exposure stays unlevered.
+    trading["leverage"] = max(0.0, float(trading.get("leverage", 1.0)))
     trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.0)))
     trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
+    evaluation = raw.setdefault("evaluation", {})
+    evaluation.pop("primary_baseline", None)
+    evaluation.pop("metrics", None)
     loss_activation = str(training.get("loss_portfolio_activation", "auto")).strip().lower().replace("-", "_")
     if loss_activation in {"", "auto", "trading", "same", "same_as_trading"}:
         training["loss_portfolio_activation"] = "auto"

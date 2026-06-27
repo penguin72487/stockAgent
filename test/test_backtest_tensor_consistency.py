@@ -127,6 +127,51 @@ def test_min_trade_weight_zeroes_small_positions_and_redistributes() -> None:
     )
 
 
+def test_reduced_and_fused_log_utility_convert_asset_log_returns_for_short_pnl() -> None:
+    weights = torch.tensor([[-1.0]], dtype=torch.float32, requires_grad=True)
+    returns = torch.tensor([[math.log(0.4)]], dtype=torch.float32)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros((1,), dtype=torch.float32)
+    sample_mask = torch.ones((1,), dtype=torch.bool)
+    initial_weights = torch.zeros((1,), dtype=torch.float32)
+    expected_strategy_log_return = torch.tensor(math.log1p(0.6), dtype=torch.float32)
+
+    reduced = run_backtest_torch_reduced(
+        weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        gross_leverage=1.0,
+        can_buy_mask=tradable,
+        can_sell_mask=tradable,
+        sample_mask=sample_mask,
+        initial_weights=initial_weights,
+        reduction="log_utility",
+    )
+    assert torch.allclose(reduced.return_sum.cpu(), expected_strategy_log_return, atol=1e-7, rtol=1e-6)
+
+    fused_loss, final_weights = fused_log_utility_loss_tensor(
+        weights,
+        returns,
+        tradable,
+        tradable,
+        tradable,
+        sample_mask,
+        initial_weights,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+    )
+    expected_loss = -expected_strategy_log_return * 252.0
+    assert torch.allclose(fused_loss.cpu(), expected_loss, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(final_weights.cpu(), torch.tensor([-1.0]), atol=1e-7, rtol=1e-6)
+
+
 def test_compiled_loss_fallback_disables_after_cudagraph_state_overwrite() -> None:
     calls = {"compiled": 0, "eager": 0}
 

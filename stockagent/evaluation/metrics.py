@@ -105,13 +105,13 @@ def summarize_returns(strategy_returns: np.ndarray, benchmark_returns: np.ndarra
     std_b = float(b.std(ddof=0))
     ann_r = float(np.expm1(avg * 252.0))
     sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
-    baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
+    benchmark_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
     downside = np.minimum(r, 0.0)
     downside_b = np.minimum(b, 0.0)
     downside_dev = float(np.sqrt(np.mean(np.square(downside))))
     downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
     sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
-    baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+    benchmark_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
     equity = np.exp(np.cumsum(r))
     running_max = np.maximum.accumulate(equity)
     dd = equity / np.clip(running_max, 1e-12, None) - 1.0
@@ -122,12 +122,12 @@ def summarize_returns(strategy_returns: np.ndarray, benchmark_returns: np.ndarra
         "annualized_return": ann_r,
         "cagr": ann_r,
         "sharpe": sharpe,
-        "baseline_sharpe": baseline_sharpe,
+        "benchmark_sharpe": benchmark_sharpe,
         "sortino": sortino,
-        "baseline_sortino": baseline_sortino,
+        "benchmark_sortino": benchmark_sortino,
         "max_drawdown": max_dd,
         "calmar": calmar,
         "turnover": float(turnover.mean()) if turnover.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
-        "excess_return_vs_universe_average": cum_r - cum_b,
+        "excess_return_vs_benchmark": cum_r - cum_b,
     }

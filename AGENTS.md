@@ -477,8 +477,7 @@ Common commands:
 
 Known repo quirk:
 
-- Running bare `pytest` from repo root may hit an import-file mismatch between root-level `test_mlp_simple.py` and `test/test_mlp_simple.py`.
-- Prefer `python -m pytest -q -s test` for the formal test suite unless that quirk is fixed.
+- Prefer `python -m pytest -q -s test` for the formal test suite to keep collection scoped to the maintained test directory.
 
 Model-specific tests:
 

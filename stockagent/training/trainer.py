@@ -41,6 +41,8 @@ from stockagent.backtest.simulator import (
     BacktestResult,
     BacktestResultTensor,
     HoldingsRecord,
+    _asset_log_returns_to_simple_numpy,
+    _portfolio_simple_returns_to_log_numpy,
     get_backtest_compile_stats,
     get_backtest_prep_compile_stats,
     get_backtest_runtime_stats,
@@ -787,7 +789,7 @@ def _evaluated_backtest_loss(
         buy_fee_rate=config.trading.buy_fee_rate,
         sell_fee_rate=config.trading.sell_fee_rate,
         max_turnover_ratio=config.trading.max_turnover_ratio,
-        gross_leverage=config.trading.gross_leverage,
+        gross_leverage=1.0,
         min_trade_weight=config.trading.min_trade_weight,
         portfolio_activation=config.trading.portfolio_activation,
         gamma_sharpe=config.evaluation.gamma_sharpe,
@@ -1113,7 +1115,7 @@ def _objective_metric_key(objective: str) -> str:
     if objective == "log_utility":
         return "cagr"
     if objective in {"outperformance_risk_budget", "excess_cvar_drawdown"}:
-        return "excess_return_vs_universe_average"
+        return "excess_return_vs_benchmark"
     return objective
 
 
@@ -2399,8 +2401,14 @@ def _realized_leverage_backtest(
     buy_turnovers = np.clip(deltas, 0.0, None).sum(axis=1)
     sell_turnovers = np.clip(-deltas, 0.0, None).sum(axis=1)
     turnovers = buy_turnovers + sell_turnovers
-    gross_returns = np.einsum("ts,ts->t", leveraged_weights, returns)
-    strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+    asset_simple_returns = _asset_log_returns_to_simple_numpy(returns)
+    gross_simple_returns = np.einsum("ts,ts->t", leveraged_weights, asset_simple_returns)
+    net_simple_returns = (
+        gross_simple_returns
+        - float(buy_fee_rate) * buy_turnovers
+        - float(sell_fee_rate) * sell_turnovers
+    )
+    strategy_returns = _portfolio_simple_returns_to_log_numpy(net_simple_returns)
     return BacktestResult(
         strategy_returns=strategy_returns.astype(np.float32),
         benchmark_returns=np.asarray(result.benchmark_returns, dtype=np.float32),
@@ -2597,7 +2605,7 @@ def _save_fold_output_artifacts(
             test_dates,
             fold_dir / "annual_performance.png",
         )
-        leverage_multiplier = float(getattr(config.trading, "gross_leverage", 1.0))
+        leverage_multiplier = float(getattr(config.trading, "leverage", 1.0))
         plot_timing["leverage_multiplier"] = float(leverage_multiplier)
         if test_future_returns is not None:
             leverage_backtest = _realized_leverage_backtest(
@@ -4017,14 +4025,14 @@ def _compute_eval_metrics_like_legacy_online(
             "annualized_return": 0.0,
             "cagr": 0.0,
             "sharpe": 0.0,
-            "baseline_sharpe": 0.0,
+            "benchmark_sharpe": 0.0,
             "sortino": 0.0,
-            "baseline_sortino": 0.0,
+            "benchmark_sortino": 0.0,
             "max_drawdown": 0.0,
             "calmar": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
-            "excess_return_vs_universe_average": 0.0,
+            "excess_return_vs_benchmark": 0.0,
             "cumulative_benchmark": 0.0,
         }
 
@@ -4053,14 +4061,14 @@ def _compute_eval_metrics_like_legacy_online(
         "annualized_return": ann_r,
         "cagr": ann_r,
         "sharpe": float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0,
-        "baseline_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
+        "benchmark_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
         "sortino": float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0,
-        "baseline_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
+        "benchmark_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
         "max_drawdown": max_dd,
         "calmar": ann_r / abs(max_dd) if max_dd < 0.0 else 0.0,
         "turnover": float(t.sum().item()) / n,
         "daily_hit_rate": float((r > 0).to(torch.float64).sum().item()) / n,
-        "excess_return_vs_universe_average": cum_r - cum_b,
+        "excess_return_vs_benchmark": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
     }
 
@@ -4634,14 +4642,14 @@ def _evaluate_tensor_batch(
                 "annualized_return": 0.0,
                 "cagr": 0.0,
                 "sharpe": 0.0,
-                "baseline_sharpe": 0.0,
+                "benchmark_sharpe": 0.0,
                 "sortino": 0.0,
-                "baseline_sortino": 0.0,
+                "benchmark_sortino": 0.0,
                 "max_drawdown": 0.0,
                 "calmar": 0.0,
                 "turnover": 0.0,
                 "daily_hit_rate": 0.0,
-                "excess_return_vs_universe_average": 0.0,
+                "excess_return_vs_benchmark": 0.0,
                 "cumulative_benchmark": 0.0,
             }
         else:
@@ -4686,11 +4694,11 @@ def _evaluate_tensor_batch(
             cum_b = _safe_expm1(sum_b)
             ann_r = _safe_expm1(mean_r * 252.0)
             sharpe = float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0
-            baseline_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
+            benchmark_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
             downside_dev = float((sum_downside_sq_r / n) ** 0.5)
             downside_dev_b = float((sum_downside_sq_b / n) ** 0.5)
             sortino = float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0
-            baseline_sortino = float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+            benchmark_sortino = float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0
             calmar = ann_r / abs(float(min_dd_value)) if float(min_dd_value) < 0.0 else 0.0
 
             metrics = {
@@ -4698,14 +4706,14 @@ def _evaluate_tensor_batch(
                 "annualized_return": ann_r,
                 "cagr": ann_r,
                 "sharpe": sharpe,
-                "baseline_sharpe": baseline_sharpe,
+                "benchmark_sharpe": benchmark_sharpe,
                 "sortino": sortino,
-                "baseline_sortino": baseline_sortino,
+                "benchmark_sortino": benchmark_sortino,
                 "max_drawdown": float(min_dd_value),
                 "calmar": calmar,
                 "turnover": sum_turnover / n,
                 "daily_hit_rate": hit_count / n,
-                "excess_return_vs_universe_average": cum_r - cum_b,
+                "excess_return_vs_benchmark": cum_r - cum_b,
                 "cumulative_benchmark": cum_b,
             }
         timing.metrics_s += time.perf_counter() - metrics_start
@@ -5335,14 +5343,14 @@ def _evaluate_windowed_tensor_batch(
                 "annualized_return": 0.0,
                 "cagr": 0.0,
                 "sharpe": 0.0,
-                "baseline_sharpe": 0.0,
+                "benchmark_sharpe": 0.0,
                 "sortino": 0.0,
-                "baseline_sortino": 0.0,
+                "benchmark_sortino": 0.0,
                 "max_drawdown": 0.0,
                 "calmar": 0.0,
                 "turnover": 0.0,
                 "daily_hit_rate": 0.0,
-                "excess_return_vs_universe_average": 0.0,
+                "excess_return_vs_benchmark": 0.0,
                 "cumulative_benchmark": 0.0,
             }
         else:
@@ -5384,14 +5392,14 @@ def _evaluate_windowed_tensor_batch(
                 "annualized_return": ann_r,
                 "cagr": ann_r,
                 "sharpe": float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0,
-                "baseline_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
+                "benchmark_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
                 "sortino": float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0,
-                "baseline_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
+                "benchmark_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
                 "max_drawdown": float(min_dd_value),
                 "calmar": ann_r / abs(float(min_dd_value)) if float(min_dd_value) < 0.0 else 0.0,
                 "turnover": sum_turnover / n,
                 "daily_hit_rate": hit_count / n,
-                "excess_return_vs_universe_average": cum_r - cum_b,
+                "excess_return_vs_benchmark": cum_r - cum_b,
                 "cumulative_benchmark": cum_b,
             }
         timing.metrics_s += time.perf_counter() - metrics_start
@@ -7170,14 +7178,14 @@ def _compute_metrics_from_tensors(
             "annualized_return": 0.0,
             "cagr": 0.0,
             "sharpe": 0.0,
-            "baseline_sharpe": 0.0,
+            "benchmark_sharpe": 0.0,
             "sortino": 0.0,
-            "baseline_sortino": 0.0,
+            "benchmark_sortino": 0.0,
             "max_drawdown": 0.0,
             "calmar": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
-            "excess_return_vs_universe_average": 0.0,
+            "excess_return_vs_benchmark": 0.0,
             "cumulative_benchmark": 0.0,
         }
 
@@ -7192,13 +7200,13 @@ def _compute_metrics_from_tensors(
     std_b = b.std(unbiased=False)
     ann_r = float(torch.expm1(avg * 252.0).item())
     sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
-    baseline_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
+    benchmark_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
     downside = torch.minimum(r, torch.zeros_like(r))
     downside_b = torch.minimum(b, torch.zeros_like(b))
     downside_dev = torch.sqrt((downside.pow(2)).mean())
     downside_dev_b = torch.sqrt((downside_b.pow(2)).mean())
     sortino = float((avg / downside_dev * np.sqrt(252.0)).item()) if float(downside_dev.item()) > 0 else 0.0
-    baseline_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
+    benchmark_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
 
     equity = torch.exp(torch.cumsum(r, dim=0))
     running_max = torch.cummax(equity, dim=0).values
@@ -7211,14 +7219,14 @@ def _compute_metrics_from_tensors(
         "annualized_return": ann_r,
         "cagr": ann_r,
         "sharpe": sharpe,
-        "baseline_sharpe": baseline_sharpe,
+        "benchmark_sharpe": benchmark_sharpe,
         "sortino": sortino,
-        "baseline_sortino": baseline_sortino,
+        "benchmark_sortino": benchmark_sortino,
         "max_drawdown": max_dd,
         "calmar": calmar,
         "turnover": float(t.mean().item()) if t.numel() else 0.0,
         "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),
-        "excess_return_vs_universe_average": cum_r - cum_b,
+        "excess_return_vs_benchmark": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
     }
 
@@ -7308,7 +7316,7 @@ def _run_training_tree_models(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
-                config.trading.gross_leverage,
+                1.0,
                 config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
@@ -7347,7 +7355,7 @@ def _run_training_tree_models(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
-                config.trading.gross_leverage,
+                1.0,
                 config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
@@ -7384,7 +7392,7 @@ def _run_training_tree_models(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
@@ -7408,7 +7416,7 @@ def _run_training_tree_models(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
@@ -7421,8 +7429,8 @@ def _run_training_tree_models(
             objective_key = _objective_metric_key(loss_objective)
             val_objective_metric = float(val_met.get(objective_key, float("nan")))
             test_objective_metric = float(test_met.get(objective_key, float("nan")))
-            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_benchmark']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_benchmark']:+.4f}")
 
             fold_result = FoldResult(
                 fold_id=fold.fold_id,
@@ -7551,7 +7559,7 @@ def _run_inference_tree_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
@@ -7591,7 +7599,7 @@ def _run_inference_tree_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7628,7 +7636,7 @@ def _run_inference_tree_models(
             buy_fee_rate=config.trading.buy_fee_rate,
             sell_fee_rate=config.trading.sell_fee_rate,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7658,7 +7666,7 @@ def _run_inference_tree_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
@@ -7842,7 +7850,7 @@ def _run_inference_neural_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
@@ -7900,7 +7908,7 @@ def _run_inference_neural_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7950,7 +7958,7 @@ def _run_inference_neural_models(
             buy_fee_rate=config.trading.buy_fee_rate,
             sell_fee_rate=config.trading.sell_fee_rate,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7983,7 +7991,7 @@ def _run_inference_neural_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
@@ -8503,7 +8511,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=loss_portfolio_activation,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
@@ -9083,7 +9091,7 @@ def run_training(
                         buy_fee_rate=config.trading.buy_fee_rate,
                         sell_fee_rate=config.trading.sell_fee_rate,
                         max_turnover_ratio=config.trading.max_turnover_ratio,
-                        gross_leverage=config.trading.gross_leverage,
+                        gross_leverage=1.0,
                         gamma_sharpe=config.evaluation.gamma_sharpe,
                         gamma_excess=config.evaluation.gamma_excess,
                         gamma_cvar=config.evaluation.gamma_cvar,
@@ -9160,7 +9168,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.evaluation.gamma_sharpe,
                     config.evaluation.gamma_excess,
                     config.evaluation.gamma_cvar,
@@ -9205,7 +9213,7 @@ def run_training(
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
                     max_turnover_ratio=config.trading.max_turnover_ratio,
-                    gross_leverage=config.trading.gross_leverage,
+                    gross_leverage=1.0,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_excess=config.evaluation.gamma_excess,
                     gamma_cvar=config.evaluation.gamma_cvar,
@@ -9254,7 +9262,7 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_excess=config.evaluation.gamma_excess,
                 gamma_cvar=config.evaluation.gamma_cvar,
@@ -9292,9 +9300,9 @@ def run_training(
             val_row_start: int,
             val_row_end: int,
         ) -> FoldResult | None:
-            if not bool(getattr(config.training, "save_best_val_artifacts", True)):
+            if not bool(getattr(config.training, "save_best_val_artifacts", False)):
                 return None
-            if not bool(getattr(config.training, "save_best_val_fold_artifacts", True)):
+            if not bool(getattr(config.training, "save_best_val_fold_artifacts", False)):
                 return None
 
             fold = context.fold
@@ -9328,7 +9336,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -9373,7 +9381,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -9418,7 +9426,7 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=eval_chunk_rows,
@@ -9489,7 +9497,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
@@ -9672,7 +9680,7 @@ def run_training(
                             buy_fee_rate=config.trading.buy_fee_rate,
                             sell_fee_rate=config.trading.sell_fee_rate,
                             max_turnover_ratio=config.trading.max_turnover_ratio,
-                            gross_leverage=config.trading.gross_leverage,
+                            gross_leverage=1.0,
                             gamma_sharpe=config.evaluation.gamma_sharpe,
                             gamma_excess=config.evaluation.gamma_excess,
                             gamma_cvar=config.evaluation.gamma_cvar,
@@ -9731,7 +9739,7 @@ def run_training(
                         config.trading.buy_fee_rate,
                         config.trading.sell_fee_rate,
                         config.trading.max_turnover_ratio,
-                        config.trading.gross_leverage,
+                        1.0,
                         config.trading.min_trade_weight,
                         portfolio_activation=config.trading.portfolio_activation,
                         chunk_rows=eval_chunk_rows,
@@ -9759,7 +9767,7 @@ def run_training(
                         config.trading.buy_fee_rate,
                         config.trading.sell_fee_rate,
                         config.trading.max_turnover_ratio,
-                        config.trading.gross_leverage,
+                        1.0,
                         config.trading.min_trade_weight,
                         portfolio_activation=config.trading.portfolio_activation,
                         chunk_rows=eval_chunk_rows,
@@ -9836,7 +9844,7 @@ def run_training(
                             buy_fee_rate=config.trading.buy_fee_rate,
                             sell_fee_rate=config.trading.sell_fee_rate,
                             max_turnover_ratio=config.trading.max_turnover_ratio,
-                            gross_leverage=config.trading.gross_leverage,
+                            gross_leverage=1.0,
                             gamma_sharpe=config.evaluation.gamma_sharpe,
                             gamma_excess=config.evaluation.gamma_excess,
                             gamma_cvar=config.evaluation.gamma_cvar,
@@ -9875,7 +9883,7 @@ def run_training(
                             config.trading.buy_fee_rate,
                             config.trading.sell_fee_rate,
                             config.trading.max_turnover_ratio,
-                            config.trading.gross_leverage,
+                            1.0,
                             config.trading.min_trade_weight,
                             portfolio_activation=config.trading.portfolio_activation,
                             chunk_rows=eval_chunk_rows,
@@ -9903,7 +9911,7 @@ def run_training(
                             config.trading.buy_fee_rate,
                             config.trading.sell_fee_rate,
                             config.trading.max_turnover_ratio,
-                            config.trading.gross_leverage,
+                            1.0,
                             config.trading.min_trade_weight,
                             portfolio_activation=config.trading.portfolio_activation,
                             chunk_rows=eval_chunk_rows,
@@ -9976,7 +9984,7 @@ def run_training(
                             optimizer=optimizer,
                             scaler=scaler,
                         )
-                        if bool(getattr(config.training, "save_best_val_artifacts", True)):
+                        if bool(getattr(config.training, "save_best_val_artifacts", False)):
                             _save_best_val_backtest_snapshot(
                                 fold_dir=context.fold_dir,
                                 fold=context.fold,
@@ -10190,7 +10198,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10215,7 +10223,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10289,7 +10297,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10332,7 +10340,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10377,7 +10385,7 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=eval_chunk_rows,
@@ -10422,7 +10430,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
@@ -10436,8 +10444,8 @@ def run_training(
             objective_key = _objective_metric_key(loss_objective)
             val_objective_metric = float(val_met.get(objective_key, float("nan")))
             test_objective_metric = float(test_met.get(objective_key, float("nan")))
-            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_benchmark']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_benchmark']:+.4f}")
             if profile_timing:
                 _log_timing(
                     f"Train {train_years} fold {fold.fold_id} test_stage",

@@ -307,8 +307,8 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
     Returns a dict with:
-        cumulative_return, annualized_return, cagr, sharpe, baseline_sharpe, sortino, baseline_sortino,
-        max_drawdown, calmar, turnover, daily_hit_rate, excess_return_vs_universe_average,
+        cumulative_return, annualized_return, cagr, sharpe, benchmark_sharpe, sortino, benchmark_sortino,
+        max_drawdown, calmar, turnover, daily_hit_rate, excess_return_vs_benchmark,
         cumulative_benchmark
     """
     r = _clean_log_returns(result.strategy_returns)
@@ -324,13 +324,13 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     std_b = float(b.std(ddof=0))
     ann_r = _safe_expm1(float(avg * 252.0))
     sharpe = float(avg / std * math.sqrt(252.0)) if std > 0 else 0.0
-    baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
+    benchmark_sharpe = float(avg_b / std_b * math.sqrt(252.0)) if std_b > 0 else 0.0
     downside = np.minimum(r, 0.0)
     downside_b = np.minimum(b, 0.0)
     downside_dev = float(np.sqrt(np.mean(np.square(downside))))
     downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
     sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
-    baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+    benchmark_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
 
     max_dd = _max_drawdown_from_log_returns(r)
     calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
@@ -340,14 +340,14 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
         "annualized_return": ann_r,
         "cagr": ann_r,
         "sharpe": sharpe,
-        "baseline_sharpe": baseline_sharpe,
+        "benchmark_sharpe": benchmark_sharpe,
         "sortino": sortino,
-        "baseline_sortino": baseline_sortino,
+        "benchmark_sortino": benchmark_sortino,
         "max_drawdown": max_dd,
         "calmar": calmar,
         "turnover": float(_finite_values(result.turnovers).mean()) if result.turnovers.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
-        "excess_return_vs_universe_average": cum_r - cum_b,
+        "excess_return_vs_benchmark": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
     }
 
@@ -396,13 +396,13 @@ def compute_metrics_by_year(
         std_b = float(b_year.std(ddof=0)) + 1e-8
         ann_r = _safe_expm1(float(avg * 252.0))
         sharpe = float(avg / std * math.sqrt(252.0))
-        baseline_sharpe = float(avg_b / std_b * math.sqrt(252.0))
+        benchmark_sharpe = float(avg_b / std_b * math.sqrt(252.0))
         downside = np.minimum(r_year, 0.0)
         downside_b = np.minimum(b_year, 0.0)
         downside_dev = float(np.sqrt(np.mean(np.square(downside))))
         downside_dev_b = float(np.sqrt(np.mean(np.square(downside_b))))
         sortino = float(avg / downside_dev * math.sqrt(252.0)) if downside_dev > 0 else 0.0
-        baseline_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+        benchmark_sortino = float(avg_b / downside_dev_b * math.sqrt(252.0)) if downside_dev_b > 0 else 0.0
 
         max_dd = _max_drawdown_from_log_returns(r_year)
         calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
@@ -412,14 +412,14 @@ def compute_metrics_by_year(
             "annualized_return": ann_r,
             "cagr": ann_r,
             "sharpe": sharpe,
-            "baseline_sharpe": baseline_sharpe,
+            "benchmark_sharpe": benchmark_sharpe,
             "sortino": sortino,
-            "baseline_sortino": baseline_sortino,
+            "benchmark_sortino": benchmark_sortino,
             "max_drawdown": max_dd,
             "calmar": calmar,
             "turnover": float(turnover_year.mean()),
             "daily_hit_rate": float((r_year > 0).mean()),
-            "excess_return_vs_universe_average": cum_r - cum_b,
+            "excess_return_vs_benchmark": cum_r - cum_b,
             "cumulative_benchmark": cum_b,
         }
         annual_metrics[int(year)] = entry
@@ -443,12 +443,12 @@ def generate_annual_report(
     """
     annual_metrics = compute_metrics_by_year(result, dates)
 
-    # Column widths: Year(8) Strategy(12) Baseline(12) Excess(12) Sharpe(10) BaseSharpe(11) MaxDD(10) Turnover(10)
+    # Column widths: Year(8) Strategy(12) Benchmark(12) Excess(12) Sharpe(10) BenchSharpe(11) MaxDD(10) Turnover(10)
     width = 109
     lines = ["Annual Performance Report", "=" * width]
     header = (
-        f"{'Year':<8} {'Strategy':>12} {'Baseline':>12} {'Excess':>12} "
-        f"{'Sharpe':>10} {'BaseShrp':>11} {'Max DD':>10} {'Turnover':>10}"
+        f"{'Year':<8} {'Strategy':>12} {'Benchmark':>12} {'Excess':>12} "
+        f"{'Sharpe':>10} {'BenchShrp':>11} {'Max DD':>10} {'Turnover':>10}"
     )
     lines.append(header)
     lines.append("-" * width)
@@ -460,8 +460,8 @@ def generate_annual_report(
         m = annual_metrics[year]
         row = (
             f"{year:<8} {m['cumulative_return']:>11.2%} {m['cumulative_benchmark']:>12.2%} "
-            f"{m['excess_return_vs_universe_average']:>12.2%} "
-            f"{m['sharpe']:>10.3f} {m['baseline_sharpe']:>11.3f} {m['max_drawdown']:>10.2%} {m['turnover']:>10.4f}"
+            f"{m['excess_return_vs_benchmark']:>12.2%} "
+            f"{m['sharpe']:>10.3f} {m['benchmark_sharpe']:>11.3f} {m['max_drawdown']:>10.2%} {m['turnover']:>10.4f}"
         )
         lines.append(row)
 
@@ -474,29 +474,29 @@ def generate_annual_report(
     avg_b = float(b_all.mean())
     std_b = float(b_all.std(ddof=0)) + 1e-8
     sharpe_total = float(avg / std * math.sqrt(252.0))
-    baseline_sharpe_total = float(avg_b / std_b * math.sqrt(252.0))
+    benchmark_sharpe_total = float(avg_b / std_b * math.sqrt(252.0))
     downside_total = np.minimum(r_all, 0.0)
     downside_total_b = np.minimum(b_all, 0.0)
     downside_total_dev = float(np.sqrt(np.mean(np.square(downside_total))))
     downside_total_dev_b = float(np.sqrt(np.mean(np.square(downside_total_b))))
     sortino_total = float(avg / downside_total_dev * math.sqrt(252.0)) if downside_total_dev > 0 else 0.0
-    baseline_sortino_total = float(avg_b / downside_total_dev_b * math.sqrt(252.0)) if downside_total_dev_b > 0 else 0.0
+    benchmark_sortino_total = float(avg_b / downside_total_dev_b * math.sqrt(252.0)) if downside_total_dev_b > 0 else 0.0
     max_dd_total = _max_drawdown_from_log_returns(r_all)
     turnover_total = float(result.turnovers.mean()) if result.turnovers.size else 0.0
 
     summary_row = (
         f"{'TOTAL':<8} {cum_r_total:>11.2%} {cum_b_total:>12.2%} "
         f"{cum_r_total - cum_b_total:>12.2%} "
-        f"{sharpe_total:>10.3f} {baseline_sharpe_total:>11.3f} {max_dd_total:>10.2%} {turnover_total:>10.4f}"
+        f"{sharpe_total:>10.3f} {benchmark_sharpe_total:>11.3f} {max_dd_total:>10.2%} {turnover_total:>10.4f}"
     )
     lines.append(summary_row)
     lines.append(
         f"{'':<8} {'':>12} {'':>12} {'':>12} "
-        f"{'Sortino':>10} {'BaseSrt':>11} {'':>10} {'':>10}"
+        f"{'Sortino':>10} {'BenchSrt':>11} {'':>10} {'':>10}"
     )
     lines.append(
         f"{'':<8} {'':>12} {'':>12} {'':>12} "
-        f"{sortino_total:>10.3f} {baseline_sortino_total:>11.3f} {'':>10} {'':>10}"
+        f"{sortino_total:>10.3f} {benchmark_sortino_total:>11.3f} {'':>10} {'':>10}"
     )
 
     report = "\n".join(lines)
@@ -527,7 +527,7 @@ def plot_annual_performance(
     strategy_returns = _finite_values([annual_metrics[y]["cumulative_return"] for y in years])
     benchmark_returns = _finite_values([annual_metrics[y]["cumulative_benchmark"] for y in years])
     sharpe_ratios = _finite_values([annual_metrics[y]["sharpe"] for y in years])
-    baseline_sharpes = _finite_values([annual_metrics[y]["baseline_sharpe"] for y in years])
+    benchmark_sharpes = _finite_values([annual_metrics[y]["benchmark_sharpe"] for y in years])
     
     fig, axes = plt.subplots(2, 1, figsize=_figsize_17_6(8.0))
     
@@ -550,7 +550,7 @@ def plot_annual_performance(
     # Panel 2: Sharpe ratio by year
     ax = axes[1]
     _plot_finite_line(ax, np.asarray(years), sharpe_ratios, marker="o", linewidth=2, markersize=8, label="Strategy Sharpe")
-    _plot_finite_line(ax, np.asarray(years), baseline_sharpes, marker="s", linewidth=2, markersize=6, label="Baseline Sharpe")
+    _plot_finite_line(ax, np.asarray(years), benchmark_sharpes, marker="s", linewidth=2, markersize=6, label="Benchmark Sharpe")
     ax.set_xlabel("Year")
     ax.set_ylabel("Sharpe Ratio")
     ax.set_title("Annual Sharpe Ratio")
@@ -645,7 +645,7 @@ def plot_leverage_curve(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | Path | None = None,
-    target_gross_leverage: float = 1.0,
+    target_leverage: float = 1.0,
 ) -> None:
     """Plot realised daily gross leverage from weights history.
 
@@ -661,7 +661,13 @@ def plot_leverage_curve(
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, np.asarray(dates), leverage_series, label="Realized Gross Leverage", linewidth=1.8, alpha=0.9)
-    ax.axhline(y=float(target_gross_leverage), color="tab:red", linestyle="--", linewidth=1.2, label=f"Target {float(target_gross_leverage):.2f}x")
+    ax.axhline(
+        y=float(target_leverage),
+        color="tab:red",
+        linestyle="--",
+        linewidth=1.2,
+        label=f"Target {float(target_leverage):.2f}x",
+    )
     ax.set_xlabel("Date")
     ax.set_ylabel("Gross Leverage")
     ax.set_title("Daily Gross Leverage")
@@ -681,9 +687,9 @@ def plot_configured_leverage_equity_curve(
     result: BacktestResult,
     dates: np.ndarray,
     output_path: str | Path | None = None,
-    configured_gross_leverage: float = 1.0,
+    leverage: float = 1.0,
 ) -> None:
-    """Plot equity curve from strategy returns generated under configured leverage."""
+    """Plot equity curve from strategy returns generated by the reporting leverage multiplier."""
     r = _clean_log_returns(result.strategy_returns)
     b = _clean_log_returns(result.benchmark_returns)
 
@@ -695,7 +701,7 @@ def plot_configured_leverage_equity_curve(
         ax,
         np.asarray(dates),
         strategy_equity,
-        label=f"Strategy (configured leverage={float(configured_gross_leverage):.2f}x)",
+        label=f"Strategy (leverage={float(leverage):.2f}x)",
         linewidth=2.2,
         alpha=0.9,
     )
@@ -709,7 +715,7 @@ def plot_configured_leverage_equity_curve(
 
     # These are the realised risk metrics from the configured-leverage run.
     risk_text = _format_risk_metrics_text(result)
-    info_text = f"{risk_text}\nConfigured Leverage: {float(configured_gross_leverage):.2f}x"
+    info_text = f"{risk_text}\nLeverage: {float(leverage):.2f}x"
     _add_metrics_box(ax, info_text)
 
     _safe_tight_layout()
@@ -749,7 +755,7 @@ def plot_fold_first_year_returns(
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, date_values, strat_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, base_nav, label="Baseline", linewidth=2.2)
+    _plot_finite_line(ax, date_values, base_nav, label="Benchmark", linewidth=2.2)
     _annotate_max_drawdown_segment(ax, date_values, strat_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
@@ -794,7 +800,7 @@ def plot_fold_first_year_returns_log10(
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, date_values, strat_log10_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, base_log10_nav, label="Baseline", linewidth=2.2)
+    _plot_finite_line(ax, date_values, base_log10_nav, label="Benchmark", linewidth=2.2)
     ax.set_xlabel("Date")
     ax.set_ylabel("log10(Cumulative NAV), start=0")
     ax.set_title("Walkforward First-Test-Year Daily log10 Cumulative NAV (All Folds)")
@@ -855,7 +861,7 @@ def plot_first_year_fold_metric_bars(
 
     ax = axes[0, 0]
     ax.bar(x - width / 2, strategy_return, width, label="Strategy")
-    ax.bar(x + width / 2, baseline_return, width, label="Baseline")
+    ax.bar(x + width / 2, baseline_return, width, label="Benchmark")
     ax.axhline(0.0, color="black", linewidth=0.8)
     ax.set_title("First Test Year Cumulative Log Return")
     ax.set_ylabel("Log return")
@@ -865,7 +871,7 @@ def plot_first_year_fold_metric_bars(
     ax.bar(x, excess_return, color=np.where(excess_return >= 0.0, "tab:green", "tab:red"))
     ax.axhline(0.0, color="black", linewidth=0.8)
     ax.set_title("First Test Year Excess Log Return")
-    ax.set_ylabel("Strategy - Baseline")
+    ax.set_ylabel("Strategy - Benchmark")
 
     ax = axes[1, 0]
     _plot_finite_line(ax, x, sharpe, marker="o", label="Sharpe")
@@ -968,7 +974,7 @@ def plot_first_test_year_only(
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, date_values, strategy_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, baseline_nav, label="Baseline", linewidth=2.2)
+    _plot_finite_line(ax, date_values, baseline_nav, label="Benchmark", linewidth=2.2)
     _annotate_max_drawdown_segment(ax, date_values, strategy_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
