@@ -14,6 +14,39 @@ from stockagent.backtest.simulator import BacktestResult
 _PLOT_LOG_MIN = -60.0
 _PLOT_LOG_MAX = 60.0
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
+_PLOT_ASPECT_RATIO = 17.0 / 6.0
+_DEFAULT_PLOT_HEIGHT = 6.0
+
+
+def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
+    height = max(1.0, float(height))
+    return height * _PLOT_ASPECT_RATIO, height
+
+
+def _pad_saved_image_to_17_6(path: Path) -> None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return
+            current = width / height
+            if abs(current - _PLOT_ASPECT_RATIO) < 0.002:
+                return
+            if current < _PLOT_ASPECT_RATIO:
+                target_width = int(round(height * _PLOT_ASPECT_RATIO))
+                target_height = height
+            else:
+                target_width = width
+                target_height = int(round(width / _PLOT_ASPECT_RATIO))
+            target_width = max(width, target_width)
+            target_height = max(height, target_height)
+            canvas = Image.new(image.mode if image.mode in {"RGB", "RGBA"} else "RGB", (target_width, target_height), "white")
+            canvas.paste(image.convert(canvas.mode), ((target_width - width) // 2, (target_height - height) // 2))
+            canvas.save(path)
+    except Exception:
+        return
 
 
 def _sanitize_matplotlib_axis_limits(fig: object) -> None:
@@ -60,6 +93,7 @@ def _save_current_figure(output_path: str | Path, **kwargs: object) -> None:
             category=RuntimeWarning,
         )
         plt.savefig(path, **kwargs)
+    _pad_saved_image_to_17_6(path)
 
 
 def _format_risk_metrics_text(result: BacktestResult) -> str:
@@ -495,7 +529,7 @@ def plot_annual_performance(
     sharpe_ratios = _finite_values([annual_metrics[y]["sharpe"] for y in years])
     baseline_sharpes = _finite_values([annual_metrics[y]["baseline_sharpe"] for y in years])
     
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 1, figsize=_figsize_17_6(8.0))
     
     # Panel 1: Annual returns
     ax = axes[0]
@@ -550,7 +584,7 @@ def plot_equity_curve(
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
     _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
     _annotate_max_drawdown_segment(ax, dates, strategy_equity)
@@ -587,7 +621,7 @@ def plot_equity_curve_log(
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
     _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label="Benchmark", linewidth=2, alpha=0.8)
     _annotate_max_drawdown_segment(ax, dates, strategy_equity)
@@ -625,7 +659,7 @@ def plot_leverage_curve(
     if leverage_series.size == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, np.asarray(dates), leverage_series, label="Realized Gross Leverage", linewidth=1.8, alpha=0.9)
     ax.axhline(y=float(target_gross_leverage), color="tab:red", linestyle="--", linewidth=1.2, label=f"Target {float(target_gross_leverage):.2f}x")
     ax.set_xlabel("Date")
@@ -656,7 +690,7 @@ def plot_configured_leverage_equity_curve(
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(
         ax,
         np.asarray(dates),
@@ -713,7 +747,7 @@ def plot_fold_first_year_returns(
 
     date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, date_values, strat_nav, label="Strategy", linewidth=2.2)
     _plot_finite_line(ax, date_values, base_nav, label="Baseline", linewidth=2.2)
     _annotate_max_drawdown_segment(ax, date_values, strat_nav)
@@ -758,7 +792,7 @@ def plot_fold_first_year_returns_log10(
     base_log10_nav = _safe_log10_equity_for_plot(base_sorted)
     date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, date_values, strat_log10_nav, label="Strategy", linewidth=2.2)
     _plot_finite_line(ax, date_values, base_log10_nav, label="Baseline", linewidth=2.2)
     ax.set_xlabel("Date")
@@ -810,7 +844,7 @@ def plot_first_year_fold_metric_bars(
 
     x = np.arange(len(rows), dtype=np.float64)
     width = 0.36
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    fig, axes = plt.subplots(2, 2, figsize=_figsize_17_6(9.0))
 
     strategy_return = _finite_values([row["strategy_return"] for row in rows])
     baseline_return = _finite_values([row["baseline_return"] for row in rows])
@@ -889,7 +923,7 @@ def plot_first_year_turnover_concentration(
         mean_hhi.append(float(hhi.mean()))
 
     x = np.arange(len(labels), dtype=np.float64)
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=_figsize_17_6(10.0), sharex=True)
 
     axes[0].bar(x, _finite_values(mean_turnover), color="tab:blue")
     axes[0].set_title("First Test Year Mean Turnover")
@@ -932,7 +966,7 @@ def plot_first_test_year_only(
     baseline_nav = _safe_equity_for_plot(baseline)
     result = _build_plot_result(strategy, baseline)
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(ax, date_values, strategy_nav, label="Strategy", linewidth=2.2)
     _plot_finite_line(ax, date_values, baseline_nav, label="Baseline", linewidth=2.2)
     _annotate_max_drawdown_segment(ax, date_values, strategy_nav)

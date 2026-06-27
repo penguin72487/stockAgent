@@ -16,6 +16,36 @@ LineSeries = tuple[str, object, object, Color]
 ScatterSeries = tuple[str, object, object, Color]
 HeatmapLabel = tuple[int, str]
 
+_PLOT_ASPECT_RATIO = 17.0 / 6.0
+_DEFAULT_PLOT_HEIGHT_PX = 600
+_DEFAULT_PLOT_WIDTH_PX = int(round(_DEFAULT_PLOT_HEIGHT_PX * _PLOT_ASPECT_RATIO))
+
+
+def _pad_saved_image_to_17_6(path: Path) -> None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return
+            current = width / height
+            if abs(current - _PLOT_ASPECT_RATIO) < 0.002:
+                return
+            if current < _PLOT_ASPECT_RATIO:
+                target_width = int(round(height * _PLOT_ASPECT_RATIO))
+                target_height = height
+            else:
+                target_width = width
+                target_height = int(round(width / _PLOT_ASPECT_RATIO))
+            target_width = max(width, target_width)
+            target_height = max(height, target_height)
+            canvas = Image.new(image.mode if image.mode in {"RGB", "RGBA"} else "RGB", (target_width, target_height), "white")
+            canvas.paste(image.convert(canvas.mode), ((target_width - width) // 2, (target_height - height) // 2))
+            canvas.save(path)
+    except Exception:
+        return
+
 
 def _ensure_conda_cuda_path() -> None:
     if normalize_cuda_env() is not None:
@@ -198,8 +228,8 @@ def save_line_series_datashader(
     output_path: str | Path,
     title: str,
     y_label: str = "",
-    width: int = 1500,
-    height: int = 650,
+    width: int = _DEFAULT_PLOT_WIDTH_PX,
+    height: int = _DEFAULT_PLOT_HEIGHT_PX,
 ) -> None:
     cp, cudf, ds, tf = _import_rapids_stack()
     converted = []
@@ -215,6 +245,7 @@ def save_line_series_datashader(
         from PIL import Image
 
         _draw_overlay(Image.new("RGB", (width, height), "white"), title=title, y_label=y_label).save(output)
+        _pad_saved_image_to_17_6(output)
         return
     x_all = cp.concatenate([item[1] for item in converted])
     y_all = cp.concatenate([item[2] for item in converted])
@@ -232,6 +263,7 @@ def save_line_series_datashader(
         legend.append((label, color))
     image = tf.set_background(tf.stack(*images), "white")
     _draw_overlay(image.to_pil(), title=title, legend=legend, y_label=y_label).save(output)
+    _pad_saved_image_to_17_6(output)
 
 
 def save_scatter_datashader(
@@ -239,8 +271,8 @@ def save_scatter_datashader(
     *,
     output_path: str | Path,
     title: str,
-    width: int = 1100,
-    height: int = 760,
+    width: int = _DEFAULT_PLOT_WIDTH_PX,
+    height: int = _DEFAULT_PLOT_HEIGHT_PX,
 ) -> None:
     cp, cudf, ds, tf = _import_rapids_stack()
     converted = []
@@ -256,6 +288,7 @@ def save_scatter_datashader(
         from PIL import Image
 
         _draw_overlay(Image.new("RGB", (width, height), "white"), title=title).save(output)
+        _pad_saved_image_to_17_6(output)
         return
     x_all = cp.concatenate([item[1] for item in converted])
     y_all = cp.concatenate([item[2] for item in converted])
@@ -273,6 +306,7 @@ def save_scatter_datashader(
         legend.append((label, color))
     image = tf.set_background(tf.stack(*images), "white")
     _draw_overlay(image.to_pil(), title=title, legend=legend).save(output)
+    _pad_saved_image_to_17_6(output)
 
 
 def save_heatmap_points_datashader(
@@ -285,8 +319,8 @@ def save_heatmap_points_datashader(
     x_label: str = "",
     y_label: str = "",
     y_labels: Sequence[HeatmapLabel] | None = None,
-    width: int = 1100,
-    height: int = 720,
+    width: int = _DEFAULT_PLOT_WIDTH_PX,
+    height: int = _DEFAULT_PLOT_HEIGHT_PX,
 ) -> None:
     cp, cudf, ds, tf = _import_rapids_stack()
     x = _to_cupy_1d(x_values)
@@ -308,6 +342,7 @@ def save_heatmap_points_datashader(
             y_label=y_label,
             y_labels=y_labels,
         ).save(output)
+        _pad_saved_image_to_17_6(output)
         return
     x_range = _safe_range(x, pad=0.01)
     y_range = (-0.5, float(len(y_labels)) - 0.5) if y_labels else _safe_range(y, pad=0.01)
@@ -334,6 +369,7 @@ def save_heatmap_points_datashader(
         y_label=y_label,
         y_labels=y_labels,
     ).save(output)
+    _pad_saved_image_to_17_6(output)
 
 
 def run_cuml_umap(
