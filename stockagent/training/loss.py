@@ -642,6 +642,7 @@ def risk_aware_loss(
     objective: str = "sharpe",
     aux_outputs: dict[str, Tensor] | None = None,
     rank_ic_weight: float = 1.0,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
@@ -858,6 +859,11 @@ def risk_aware_loss(
             active_count = tradable_f.sum(dim=1).clamp_min(1.0)
             concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
             total_loss = total_loss + float(concentration_weight) * concentration
+        if float(return_rank_ic_weight) > 0.0:
+            rank_logits = aux_outputs.get("rank_logits") if aux_outputs else None
+            if rank_logits is None:
+                rank_logits = weights
+            total_loss = total_loss + float(return_rank_ic_weight) * masked_ic_loss(rank_logits, returns, tradable)
         return total_loss
 
     backtest_start = _loss_timer_start()
@@ -936,6 +942,11 @@ def risk_aware_loss(
             active_count = tradable_f.sum(dim=1).clamp_min(1.0)
             concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
             total_loss = total_loss + float(concentration_weight) * concentration
+        if float(return_rank_ic_weight) > 0.0:
+            rank_logits = aux_outputs.get("rank_logits") if aux_outputs else None
+            if rank_logits is None:
+                rank_logits = weights
+            total_loss = total_loss + float(return_rank_ic_weight) * masked_ic_loss(rank_logits, returns, tradable)
         valid_returns = clean_returns
         dense_valid_count = valid_count
     else:
@@ -1007,6 +1018,11 @@ def risk_aware_loss(
             active_count = tradable_f.sum(dim=1).clamp_min(1.0)
             concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
             total_loss = total_loss + float(concentration_weight) * concentration
+        if float(return_rank_ic_weight) > 0.0:
+            rank_logits = aux_outputs.get("rank_logits") if aux_outputs else None
+            if rank_logits is None:
+                rank_logits = weights
+            total_loss = total_loss + float(return_rank_ic_weight) * masked_ic_loss(rank_logits, returns, tradable)
 
     if not aux_outputs:
         if dense_valid_count is not None:

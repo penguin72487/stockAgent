@@ -321,6 +321,7 @@ class CrossSectionalTemporalPortfolioModelConfig:
 @dataclass(slots=True)
 class MultitaskLossConfig:
     rank_ic_weight: float = 0.20
+    return_rank_ic_weight: float = 0.0
     direction_weight: float = 0.05
     volatility_regime_weight: float = 0.05
     concentration_weight: float = 0.005
@@ -507,6 +508,8 @@ class TrainingConfig:
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
     lr_scheduler_t_max: int = 0
     lr_scheduler_eta_min: float = 1e-5
+    lr_scheduler_warmup_steps: int = 0
+    lr_scheduler_interval: str = "epoch"
     lr_scheduler_step_size: int = 50
     lr_scheduler_gamma: float = 0.5
     lr_scheduler_patience: int = 5
@@ -715,6 +718,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("lr_scheduler", "none")
     training.setdefault("lr_scheduler_t_max", 0)
     training.setdefault("lr_scheduler_eta_min", 1e-5)
+    training.setdefault("lr_scheduler_warmup_steps", 0)
+    training.setdefault("lr_scheduler_interval", "epoch")
     training.setdefault("lr_scheduler_step_size", 50)
     training.setdefault("lr_scheduler_gamma", 0.5)
     training.setdefault("lr_scheduler_patience", 5)
@@ -941,6 +946,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     multitask_loss = training.setdefault("multitask_loss", {})
     multitask_loss.setdefault("rank_ic_weight", 0.20)
+    multitask_loss.setdefault("return_rank_ic_weight", 0.0)
     multitask_loss.setdefault("direction_weight", 0.05)
     multitask_loss.setdefault("volatility_regime_weight", 0.05)
     multitask_loss.setdefault("concentration_weight", 0.005)
