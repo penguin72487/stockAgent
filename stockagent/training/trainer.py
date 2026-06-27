@@ -58,7 +58,7 @@ from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.fused_loss import fused_log_utility_loss_tensor
-from stockagent.training.loss import get_loss_runtime_stats, risk_aware_loss
+from stockagent.training.loss import get_loss_runtime_stats, masked_ic_loss, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
 
@@ -109,6 +109,7 @@ class TimingBreakdown:
     finite_check_s: float = 0.0
     step_s: float = 0.0
     step_cuda_s: float = 0.0
+    scheduler_s: float = 0.0
     backtest_s: float = 0.0
     backtest_prepare_s: float = 0.0
     backtest_runner_s: float = 0.0
@@ -150,6 +151,7 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "finite_check_s",
         "step_s",
         "step_cuda_s",
+        "scheduler_s",
         "backtest_s",
         "backtest_prepare_s",
         "backtest_runner_s",
@@ -192,6 +194,7 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "finite_check_s",
         "step_s",
         "step_cuda_s",
+        "scheduler_s",
         "backtest_s",
         "backtest_prepare_s",
         "backtest_runner_s",
@@ -489,6 +492,7 @@ def _profile_single_train_step(
     gamma_turnover_budget: float,
     objective: str,
     rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
@@ -520,6 +524,13 @@ def _profile_single_train_step(
                     batch["can_sell_mask"],
                     batch.get("sample_mask"),
                     None,
+                )
+                loss = _add_return_rank_ic_aux_loss(
+                    loss,
+                    weights,
+                    batch["future_log_returns"],
+                    batch["tradable_mask"],
+                    return_rank_ic_weight,
                 )
             else:
                 loss = loss_fn(
@@ -553,6 +564,7 @@ def _profile_single_train_step(
                     objective=objective,
                     aux_outputs=aux_outputs,
                     rank_ic_weight=rank_ic_weight,
+                    return_rank_ic_weight=return_rank_ic_weight,
                     direction_weight=direction_weight,
                     volatility_regime_weight=volatility_regime_weight,
                     concentration_weight=concentration_weight,
@@ -736,6 +748,18 @@ def _run_fused_log_utility_loss(
         sample_mask,
         initial_weights,
     )
+
+
+def _add_return_rank_ic_aux_loss(
+    loss: torch.Tensor,
+    rank_logits: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    return_rank_ic_weight: float,
+) -> torch.Tensor:
+    if float(return_rank_ic_weight) <= 0.0:
+        return loss
+    return loss + float(return_rank_ic_weight) * masked_ic_loss(rank_logits, future_returns, tradable_mask)
 
 
 def _loss_from_backtest_result(
@@ -1685,6 +1709,7 @@ def _timing_curve_payload(
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
         "train_step_ms_per_batch": _avg_ms(train_timing.step_s),
         "train_step_cuda_ms_per_batch": _avg_ms(train_timing.step_cuda_s),
+        "train_scheduler_ms_per_batch": _avg_ms(train_timing.scheduler_s),
         "val_eval_s": float(val_eval_s),
         "val_transfer_s": float(val_timing.transfer_s),
         "val_eval_transfer_to_gpu_s": float(val_timing.transfer_s),
@@ -1830,7 +1855,7 @@ def _timing_curve_payload(
         "fold_checkpoint_save_s": float(fold_checkpoint_save_s),
         "group_checkpoint_save_s": float(group_checkpoint_save_s),
         "checkpoint_save_s": checkpoint_total_s,
-        "scheduler_s": float(scheduler_s),
+        "scheduler_s": float(scheduler_s) + float(train_timing.scheduler_s),
         "progress_update_s": float(progress_update_s),
         "curve_record_s": float(curve_record_s),
         "scalar_sync_s": float(scalar_sync_s),
@@ -2189,13 +2214,15 @@ def _save_group_checkpoint(
 def _create_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     config: ExperimentConfig,
-) -> tuple[torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None, str, bool]:
+    *,
+    steps_per_epoch: int = 1,
+) -> tuple[torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None, str, bool, str]:
     if not bool(getattr(config.training, "enable_lr_scheduler", True)):
-        return None, "disabled", False
+        return None, "disabled", False, "epoch"
 
     name = str(getattr(config.training, "lr_scheduler", "none") or "none").strip().lower().replace("-", "_")
     if name in {"", "none", "off", "false", "disabled"}:
-        return None, "none", False
+        return None, "none", False, "epoch"
 
     if name == "cosine":
         t_max = int(config.training.lr_scheduler_t_max)
@@ -2206,7 +2233,35 @@ def _create_lr_scheduler(
             T_max=t_max,
             eta_min=float(config.training.lr_scheduler_eta_min),
         )
-        return scheduler, "cosine", False
+        return scheduler, "cosine", False, "epoch"
+
+    if name in {"warmup_cosine", "cosine_warmup", "linear_warmup_cosine"}:
+        steps_per_epoch = max(1, int(steps_per_epoch))
+        total_steps = int(config.training.lr_scheduler_t_max)
+        if total_steps <= 0:
+            total_steps = max(1, int(config.training.epochs) * steps_per_epoch)
+        warmup_steps = max(0, int(getattr(config.training, "lr_scheduler_warmup_steps", 0)))
+        warmup_steps = min(warmup_steps, max(0, total_steps - 1))
+        base_lr = max(float(config.training.learning_rate), 1e-12)
+        eta_min = max(0.0, float(config.training.lr_scheduler_eta_min))
+        eta_factor = min(1.0, eta_min / base_lr)
+
+        def lr_lambda(step: int) -> float:
+            current = max(0, int(step))
+            if warmup_steps > 0 and current < warmup_steps:
+                return max(eta_factor, float(current + 1) / float(warmup_steps))
+            if total_steps <= warmup_steps + 1:
+                return 1.0
+            progress = float(current - warmup_steps) / float(max(1, total_steps - warmup_steps - 1))
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return eta_factor + (1.0 - eta_factor) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        interval = str(getattr(config.training, "lr_scheduler_interval", "step") or "step").strip().lower()
+        if interval not in {"step", "batch"}:
+            interval = "step"
+        return scheduler, f"warmup_cosine(steps={total_steps}, warmup={warmup_steps})", False, "step"
 
     if name == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(
@@ -2214,7 +2269,7 @@ def _create_lr_scheduler(
             step_size=max(1, int(config.training.lr_scheduler_step_size)),
             gamma=float(config.training.lr_scheduler_gamma),
         )
-        return scheduler, "step", False
+        return scheduler, "step", False, "epoch"
 
     if name in {"plateau", "reduce_on_plateau", "reduce_lr_on_plateau"}:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -2224,10 +2279,35 @@ def _create_lr_scheduler(
             patience=max(1, int(config.training.lr_scheduler_patience)),
             threshold=float(config.training.lr_scheduler_threshold),
         )
-        return scheduler, "plateau", True
+        return scheduler, "plateau", True, "epoch"
 
     print(f"[train] unknown lr_scheduler='{config.training.lr_scheduler}', disabled")
-    return None, "none", False
+    return None, "none", False, "epoch"
+
+
+def _estimate_train_steps_per_epoch(
+    *,
+    train_ds_len: int,
+    train_windowed: WindowedSplitTensors | None,
+    train_x: torch.Tensor | None,
+    train_batch_size: int,
+) -> int:
+    batch_size = max(1, int(train_batch_size))
+    if train_windowed is not None:
+        return max(1, math.ceil(len(train_windowed) / batch_size))
+    if train_x is not None:
+        return max(1, int(train_x.size(0)) // batch_size)
+    return max(1, math.ceil(max(1, int(train_ds_len)) / batch_size))
+
+
+def _step_batch_lr_scheduler(
+    scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+) -> float:
+    if scheduler is None:
+        return 0.0
+    start = time.perf_counter()
+    scheduler.step()
+    return time.perf_counter() - start
 
 
 def _benchmark_input_pipeline_throughput(
@@ -6302,12 +6382,15 @@ def _train_epoch(
     grad_clip_norm: float,
     finite_check_interval_steps: int = 0,
     rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_aug_kwargs: dict[str, float] | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
@@ -6388,6 +6471,13 @@ def _train_epoch(
                         batch.get("sample_mask"),
                         portfolio_prev_weights,
                     )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        return_rank_ic_weight,
+                    )
                 else:
                     loss = loss_fn(
                         weights,
@@ -6420,6 +6510,7 @@ def _train_epoch(
                         objective=objective,
                         aux_outputs=aux_outputs,
                         rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
                         direction_weight=direction_weight,
                         volatility_regime_weight=volatility_regime_weight,
                         concentration_weight=concentration_weight,
@@ -6491,6 +6582,8 @@ def _train_epoch(
                 scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
@@ -6525,6 +6618,8 @@ def _train_epoch(
                 optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -8542,9 +8637,22 @@ def run_training(
                 weight_decay=config.training.weight_decay,
             )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
-        scheduler, scheduler_name, scheduler_requires_metric = _create_lr_scheduler(optimizer, config)
+        train_steps_per_epoch = _estimate_train_steps_per_epoch(
+            train_ds_len=len(train_ds),
+            train_windowed=train_windowed,
+            train_x=train_x,
+            train_batch_size=train_batch_size,
+        )
+        scheduler, scheduler_name, scheduler_requires_metric, scheduler_step_interval = _create_lr_scheduler(
+            optimizer,
+            config,
+            steps_per_epoch=train_steps_per_epoch,
+        )
         if scheduler is not None:
-            print(f"[Train {train_years}] lr_scheduler={scheduler_name}")
+            print(
+                f"[Train {train_years}] lr_scheduler={scheduler_name} "
+                f"interval={scheduler_step_interval} steps_per_epoch={train_steps_per_epoch}"
+            )
 
         start_epoch = 1
         resume_no_improve_epochs = 0
