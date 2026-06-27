@@ -9292,6 +9292,8 @@ def run_training(
             val_row_start: int,
             val_row_end: int,
         ) -> FoldResult | None:
+            if not bool(getattr(config.training, "save_best_val_artifacts", True)):
+                return None
             if not bool(getattr(config.training, "save_best_val_fold_artifacts", True)):
                 return None
 
@@ -9974,27 +9976,28 @@ def run_training(
                             optimizer=optimizer,
                             scaler=scaler,
                         )
-                        _save_best_val_backtest_snapshot(
-                            fold_dir=context.fold_dir,
-                            fold=context.fold,
-                            epoch=epoch,
-                            val_loss=val_loss,
-                            val_backtest=val_backtest_epoch,
-                            row_start=val_offsets[index],
-                            row_end=val_offsets[index + 1],
-                            dates=panel.dates[context.val_ds.valid_indices],
-                            objective=loss_objective,
-                        )
-                        fold_result = _save_best_val_complete_fold_artifacts(
-                            context=context,
-                            epoch=epoch,
-                            val_loss=val_loss,
-                            val_backtest_epoch=val_backtest_epoch,
-                            val_row_start=val_offsets[index],
-                            val_row_end=val_offsets[index + 1],
-                        )
-                        if fold_result is not None:
-                            results_by_fold[context.fold.fold_id] = fold_result
+                        if bool(getattr(config.training, "save_best_val_artifacts", True)):
+                            _save_best_val_backtest_snapshot(
+                                fold_dir=context.fold_dir,
+                                fold=context.fold,
+                                epoch=epoch,
+                                val_loss=val_loss,
+                                val_backtest=val_backtest_epoch,
+                                row_start=val_offsets[index],
+                                row_end=val_offsets[index + 1],
+                                dates=panel.dates[context.val_ds.valid_indices],
+                                objective=loss_objective,
+                            )
+                            fold_result = _save_best_val_complete_fold_artifacts(
+                                context=context,
+                                epoch=epoch,
+                                val_loss=val_loss,
+                                val_backtest_epoch=val_backtest_epoch,
+                                val_row_start=val_offsets[index],
+                                val_row_end=val_offsets[index + 1],
+                            )
+                            if fold_result is not None:
+                                results_by_fold[context.fold.fold_id] = fold_result
                         fold_ckpt_total += time.perf_counter() - fold_ckpt_start
             if test_count > 0:
                 test_loss_values = scalar_values[scalar_offset : scalar_offset + test_count]
