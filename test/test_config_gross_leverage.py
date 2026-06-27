@@ -5,8 +5,16 @@ import yaml
 from stockagent.config import load_config
 
 
-def test_load_config_preserves_gross_leverage_multiplier_above_one(tmp_path: Path) -> None:
+def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = None) -> Path:
     config_path = tmp_path / "config.yaml"
+    training = {
+        "backend": "pytorch",
+        "target": "next_1d_rank",
+        "batch_mode": "time_window_x_all_symbols",
+        "non_blocking_transfer": True,
+        "model_name": "transformer_base_portfolio",
+    }
+    training.update(training_overrides or {})
     config_path.write_text(
         yaml.safe_dump(
             {
@@ -37,13 +45,7 @@ def test_load_config_preserves_gross_leverage_multiplier_above_one(tmp_path: Pat
                     "cash_allowed": True,
                     "gross_leverage": 2.5,
                 },
-                "training": {
-                    "backend": "pytorch",
-                    "target": "next_1d_rank",
-                    "batch_mode": "time_window_x_all_symbols",
-                    "non_blocking_transfer": True,
-                    "model_name": "transformer_base_portfolio",
-                },
+                "training": training,
                 "evaluation": {
                     "primary_baseline": "universe_average",
                     "metrics": ["cumulative_return"],
@@ -52,7 +54,32 @@ def test_load_config_preserves_gross_leverage_multiplier_above_one(tmp_path: Pat
         ),
         encoding="utf-8",
     )
+    return config_path
+
+
+def test_load_config_preserves_gross_leverage_multiplier_above_one(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
 
     config = load_config(config_path)
 
     assert config.trading.gross_leverage == 2.5
+
+
+def test_load_config_defaults_best_val_artifact_switches_on(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+
+    config = load_config(config_path)
+
+    assert config.training.save_best_val_artifacts is True
+    assert config.training.save_best_val_fold_artifacts is True
+    assert config.training.save_best_val_fold_plots is True
+
+
+def test_load_config_best_val_artifacts_master_switch_disables_fold_artifacts(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path, training_overrides={"save_best_val_artifacts": False})
+
+    config = load_config(config_path)
+
+    assert config.training.save_best_val_artifacts is False
+    assert config.training.save_best_val_fold_artifacts is False
+    assert config.training.save_best_val_fold_plots is False

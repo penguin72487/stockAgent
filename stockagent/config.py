@@ -497,6 +497,9 @@ class TrainingConfig:
     save_integer_share_holdings_csv: bool = True
     save_daily_weights_csv: bool = True
     backtest_artifact_compression: str = "none"
+    save_best_val_artifacts: bool = True
+    save_best_val_fold_artifacts: bool = True
+    save_best_val_fold_plots: bool = True
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -697,6 +700,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     training.setdefault("save_integer_share_holdings_table", training["save_integer_share_holdings_csv"])
     training.setdefault("backtest_artifact_compression", "none")
+    save_best_val_artifacts = bool(
+        training.get("save_best_val_artifacts", training.get("save_best_val_fold_artifacts", True))
+    )
+    training["save_best_val_artifacts"] = save_best_val_artifacts
+    training["save_best_val_fold_artifacts"] = (
+        bool(training.get("save_best_val_fold_artifacts", save_best_val_artifacts)) and save_best_val_artifacts
+    )
+    training["save_best_val_fold_plots"] = (
+        bool(training.get("save_best_val_fold_plots", True)) and training["save_best_val_fold_artifacts"]
+    )
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -1324,6 +1337,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             save_integer_share_holdings_csv=training_raw["save_integer_share_holdings_csv"],
             save_daily_weights_csv=training_raw["save_daily_weights_csv"],
             backtest_artifact_compression=training_raw["backtest_artifact_compression"],
+            save_best_val_artifacts=training_raw["save_best_val_artifacts"],
+            save_best_val_fold_artifacts=training_raw["save_best_val_fold_artifacts"],
+            save_best_val_fold_plots=training_raw["save_best_val_fold_plots"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],
