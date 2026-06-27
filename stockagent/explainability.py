@@ -79,6 +79,45 @@ PAPER_TOKENS = {
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
 _DEFAULT_MARKET_ARTIFACTS_ROOT = Path("artifacts/markets")
 _DEFAULT_MARKET_CONFIG_ROOT = Path("configs/markets")
+_PLOT_ASPECT_RATIO = 17.0 / 6.0
+_DEFAULT_PLOT_HEIGHT = 6.0
+_DEFAULT_PLOT_HEIGHT_PX = 600
+_DEFAULT_PLOT_WIDTH_PX = int(round(_DEFAULT_PLOT_HEIGHT_PX * _PLOT_ASPECT_RATIO))
+
+
+def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
+    height = max(1.0, float(height))
+    return height * _PLOT_ASPECT_RATIO, height
+
+
+def _plot_width_px_17_6(height: int) -> int:
+    return max(32, int(round(max(32, int(height)) * _PLOT_ASPECT_RATIO)))
+
+
+def _pad_saved_image_to_17_6(path: Path) -> None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return
+            current = width / height
+            if abs(current - _PLOT_ASPECT_RATIO) < 0.002:
+                return
+            if current < _PLOT_ASPECT_RATIO:
+                target_width = int(round(height * _PLOT_ASPECT_RATIO))
+                target_height = height
+            else:
+                target_width = width
+                target_height = int(round(width / _PLOT_ASPECT_RATIO))
+            target_width = max(width, target_width)
+            target_height = max(height, target_height)
+            canvas = Image.new(image.mode if image.mode in {"RGB", "RGBA"} else "RGB", (target_width, target_height), "white")
+            canvas.paste(image.convert(canvas.mode), ((target_width - width) // 2, (target_height - height) // 2))
+            canvas.save(path)
+    except Exception:
+        return
 
 
 def _sanitize_matplotlib_axis_limits(fig: Any) -> None:
@@ -122,6 +161,7 @@ def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
             category=RuntimeWarning,
         )
         fig.savefig(output_path, **kwargs)
+    _pad_saved_image_to_17_6(output_path)
 
 FEATURE_GROUP_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Return", ("logret", "return", "ret_", "_ret")),
@@ -2613,7 +2653,7 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
     plt, sns = _setup_paper_plotting()
     feature_count = int(data.select(pl.col("feature_label").n_unique()).item())
     fig_height = max(5.2, 0.42 * feature_count + 2.1)
-    fig, ax = plt.subplots(figsize=(12.5, fig_height), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     palette = {
         "Grad x input": PAPER_TOKENS["blue_mid"],
         "Integrated gradients": PAPER_TOKENS["gold_mid"],
@@ -2686,7 +2726,7 @@ def _plot_paper_feature_time_heatmap(
     from matplotlib.colors import LinearSegmentedColormap
 
     fig_height = max(5.0, 0.38 * len(labels) + 2.0)
-    fig, ax = plt.subplots(figsize=(12.2, fig_height), dpi=170)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=170)
     cmap = LinearSegmentedColormap.from_list(
         "paper_blue_gold",
         [PAPER_TOKENS["blue_xlight"], PAPER_TOKENS["blue_base"], PAPER_TOKENS["blue_dark"], PAPER_TOKENS["gold_mid"]],
@@ -2726,7 +2766,7 @@ def _plot_paper_time_importance(frame: pl.DataFrame, *, output_path: Path, value
     if data.is_empty():
         return
     plt, sns = _setup_paper_plotting()
-    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=160)
     y_col = "share" if "share" in data.columns else value_col
     sns.barplot(data=_to_plot_data(data), x="lookback_from_end", y=y_col, color=PAPER_TOKENS["blue_mid"], ax=ax)
     ax.set_xlabel("Lookback day (t-0 = latest)")
@@ -2761,7 +2801,7 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
     )
     plt, sns = _setup_paper_plotting()
     fig_height = max(5.2, 0.36 * data.height + 2.0)
-    fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     sns.barplot(
         data=_to_plot_data(plot),
         y="label",
@@ -2790,7 +2830,7 @@ def _plot_paper_trust_checks(frame: pl.DataFrame, *, output_path: Path, subtitle
         return
     plt, sns = _setup_paper_plotting()
     fig_height = max(4.8, 0.48 * data.height + 2.0)
-    fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     palette = {"pass": PAPER_TOKENS["blue_mid"], "warn": PAPER_TOKENS["orange_mid"]}
     sns.barplot(data=_to_plot_data(data), y="check", x="value", hue="status", dodge=False, palette=palette, ax=ax)
     for row_idx, row in enumerate(data.iter_rows(named=True)):
@@ -2816,7 +2856,7 @@ def _plot_paper_regime(frame: pl.DataFrame, *, output_path: Path, subtitle: str)
     )
     plt, sns = _setup_paper_plotting()
     fig_height = max(4.8, 0.42 * data.height + 2.0)
-    fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in _numeric_numpy(data, "mean_strategy_log_return")]
     sns.barplot(data=_to_plot_data(data), y="label", x="mean_strategy_log_return", palette=colors, hue="label", legend=False, ax=ax)
     ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
@@ -2840,7 +2880,7 @@ def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle
     ).sort("gross_contribution")
     plt, sns = _setup_paper_plotting()
     fig_height = max(5.2, 0.28 * data.height + 2.0)
-    fig, ax = plt.subplots(figsize=(12, fig_height), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in _numeric_numpy(data, "gross_contribution")]
     sns.barplot(data=_to_plot_data(data), y="label", x="gross_contribution", palette=colors, hue="label", legend=False, ax=ax)
     ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
@@ -2861,7 +2901,7 @@ def _plot_paper_aux_summary(frame: pl.DataFrame, *, output_path: Path, subtitle:
         return
     plt, sns = _setup_paper_plotting()
     fig_height = max(4.8, 0.36 * data.height + 2.0)
-    fig, ax = plt.subplots(figsize=(11, fig_height), dpi=160)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     sns.barplot(data=_to_plot_data(data), y="name", x="mean_abs", color=PAPER_TOKENS["olive_mid"], ax=ax)
     ax.set_xlabel("Mean absolute activation")
     ax.set_ylabel("")
@@ -3247,7 +3287,7 @@ def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallbac
     data = summary.head(20)
     if not data.is_empty():
         fig_height = max(5.0, 0.36 * data.height + 2.0)
-        fig, ax = plt.subplots(figsize=(11.5, fig_height), dpi=160)
+        fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
         sns.barplot(data=_frame_to_dict(data), y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
         ax.set_xlabel("Mean attribution share across folds")
         ax.set_ylabel("")
@@ -3297,7 +3337,7 @@ def _plot_barh(
     fig_height = max(4.0, 0.28 * data.height + 1.5)
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(10, fig_height), dpi=130)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
     ax.barh(labels[::-1], values[::-1])
     ax.set_title(title)
     ax.set_xlabel(value_col)
@@ -3323,7 +3363,7 @@ def _plot_time_importance(
         return
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=130)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
     ax.bar(_string_list(data, "lookback_from_end"), _numeric_numpy(data, value_col))
     ax.set_title(title)
     ax.set_xlabel("lookback_from_end (0 = latest)")
@@ -3368,7 +3408,7 @@ def _plot_feature_time_heatmap(
     import matplotlib.pyplot as plt
 
     fig_height = max(4.0, 0.30 * len(labels) + 1.5)
-    fig, ax = plt.subplots(figsize=(9, fig_height), dpi=130)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
     image = ax.imshow(matrix, aspect="auto", interpolation="nearest")
     ax.set_title(title)
     ax.set_xlabel("lookback_from_end (0 = latest)")
@@ -3411,6 +3451,7 @@ def _plot_feature_time_heatmap_datashader(
     ).drop_nulls(subset=["feature_y"])
     if data.is_empty():
         return
+    plot_height = max(520, min(1400, 24 * len(top) + 180))
     save_heatmap_points_datashader(
         _numeric_numpy(data, "lookback_from_end"),
         _numeric_numpy(data, "feature_y"),
@@ -3420,8 +3461,8 @@ def _plot_feature_time_heatmap_datashader(
         x_label="lookback_from_end (0 = latest)",
         y_label=value_col,
         y_labels=[(feature_to_y[feature], feature) for feature in top],
-        width=1100,
-        height=max(520, min(1400, 24 * len(top) + 180)),
+        width=_plot_width_px_17_6(plot_height),
+        height=plot_height,
     )
 
 
@@ -3442,7 +3483,7 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     )
     y = np.arange(data.height)
     fig_height = max(4.0, 0.28 * data.height + 1.5)
-    fig, ax = plt.subplots(figsize=(10, fig_height), dpi=130)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
     ax.barh(y - 0.18, _numeric_numpy(data, "score_corr"), height=0.35, label="score_corr")
     if "weight_corr" in data.columns:
         ax.barh(y + 0.18, _numeric_numpy(data, "weight_corr"), height=0.35, label="weight_corr")
@@ -3477,7 +3518,7 @@ def _plot_decision_exposure(frame: pl.DataFrame, output_path: Path) -> None:
         return
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(10, 4.8), dpi=130)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
     bottom = np.zeros(len(rows))
     for side in ("long", "short", "flat"):
         if side not in columns:
@@ -3525,7 +3566,7 @@ def _plot_decision_exposure_datashader(frame: pl.DataFrame, output_path: Path) -
         output_path=output_path,
         title="Top Decision Absolute Exposure By Side",
         y_label="sum abs(weight)",
-        width=1100,
+        width=_plot_width_px_17_6(520),
         height=520,
     )
 
@@ -3542,7 +3583,7 @@ def _plot_aux_dim_datashader(frame: pl.DataFrame, *, output_path: Path, title: s
         output_path=output_path,
         title=title,
         y_label="mean_abs",
-        width=1000,
+        width=_plot_width_px_17_6(420),
         height=420,
     )
 
@@ -3576,7 +3617,13 @@ def _plot_aux_projection_datashader(frame: pl.DataFrame, *, output_path: Path, t
             )
     else:
         series.append(("points", _numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), "#1f77b4"))
-    save_scatter_datashader(series, output_path=output_path, title=title, width=1100, height=760)
+    save_scatter_datashader(
+        series,
+        output_path=output_path,
+        title=title,
+        width=_DEFAULT_PLOT_WIDTH_PX,
+        height=_DEFAULT_PLOT_HEIGHT_PX,
+    )
 
 
 def _plot_all_explanation_figures(
@@ -3773,7 +3820,7 @@ def _plot_all_explanation_figures(
                 data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
                 if data.is_empty():
                     continue
-                fig, ax = plt.subplots(figsize=(8, 6), dpi=130)
+                fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
                 ax.scatter(_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), s=4, alpha=0.5)
                 ax.set_title(f"cuML UMAP Projection: {name}")
                 ax.set_xlabel("umap_x")
@@ -3790,7 +3837,7 @@ def _plot_all_explanation_figures(
             data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
             if data.is_empty():
                 continue
-            fig, ax = plt.subplots(figsize=(8, 6), dpi=130)
+            fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
             ax.scatter(_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), s=4, alpha=0.5)
             ax.set_title(f"cuML UMAP Projection: {name}")
             ax.set_xlabel("umap_x")

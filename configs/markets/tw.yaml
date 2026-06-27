@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 25
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -38,7 +38,7 @@ trading:
   sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
   gross_leverage: 2.5
-  min_trade_weight: 0.0025
+  min_trade_weight: 0.0
   portfolio_activation: identity
   long_only: false
   cash_allowed: true
@@ -83,7 +83,7 @@ training:
   batch_size: 16
   batch_size_train: 16
   batch_size_eval: 8
-  epochs: 10000
+  epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1

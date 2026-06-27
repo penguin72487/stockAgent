@@ -25,6 +25,39 @@ _GRAPH_BACKENDS = {"auto", "polars", "cugraph"}
 _GRAPH_EDGE_KEY_COLUMNS = ["shock", "source_index", "target_index"]
 _GRAPH_EDGE_SORT_COLUMNS = ["validated_transmission", "shock", "source_index", "target_index"]
 _GRAPH_EDGE_SORT_DESCENDING = [True, False, False, False]
+_PLOT_ASPECT_RATIO = 17.0 / 6.0
+_DEFAULT_PLOT_HEIGHT = 6.0
+
+
+def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
+    height = max(1.0, float(height))
+    return height * _PLOT_ASPECT_RATIO, height
+
+
+def _pad_saved_image_to_17_6(path: Path) -> None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return
+            current = width / height
+            if abs(current - _PLOT_ASPECT_RATIO) < 0.002:
+                return
+            if current < _PLOT_ASPECT_RATIO:
+                target_width = int(round(height * _PLOT_ASPECT_RATIO))
+                target_height = height
+            else:
+                target_width = width
+                target_height = int(round(width / _PLOT_ASPECT_RATIO))
+            target_width = max(width, target_width)
+            target_height = max(height, target_height)
+            canvas = Image.new(image.mode if image.mode in {"RGB", "RGBA"} else "RGB", (target_width, target_height), "white")
+            canvas.paste(image.convert(canvas.mode), ((target_width - width) // 2, (target_height - height) // 2))
+            canvas.save(path)
+    except Exception:
+        return
 
 
 @dataclass(slots=True)
@@ -153,6 +186,7 @@ def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
             category=RuntimeWarning,
         )
         fig.savefig(output_path, **kwargs)
+    _pad_saved_image_to_17_6(output_path)
 
 
 def _call_model(model: nn.Module, x: torch.Tensor, mask: torch.Tensor, *, return_aux: bool = True) -> Any:
@@ -452,9 +486,8 @@ def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: li
     max_rows = min(30, matrix.shape[0])
     max_cols = min(30, matrix.shape[1])
     data = matrix[:max_rows, :max_cols]
-    fig_w = max(7.0, 0.32 * max_cols + 3.0)
-    fig_h = max(5.5, 0.30 * max_rows + 2.0)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=140)
+    fig_h = max(5.5, 0.30 * max_rows + 2.0, (0.32 * max_cols + 3.0) / _PLOT_ASPECT_RATIO)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_h), dpi=140)
     vmax = float(np.nanpercentile(np.abs(data), 98)) if data.size else 1.0
     if vmax <= 0:
         vmax = 1.0
@@ -482,7 +515,7 @@ def _plot_top_edges(path: Path, edges: pl.DataFrame) -> None:
         f"{row['shock']} {row['source_symbol']} -> {row['target_symbol']}"
         for row in data.select(["shock", "source_symbol", "target_symbol"]).to_dicts()
     ]
-    fig, ax = plt.subplots(figsize=(11, max(5, 0.28 * data.height + 1.5)), dpi=140)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(max(5, 0.28 * data.height + 1.5)), dpi=140)
     ax.barh(np.arange(data.height), data["validated_transmission"].to_numpy().astype(np.float64, copy=False))
     ax.set_yticks(np.arange(data.height), labels, fontsize=7)
     ax.invert_yaxis()
@@ -510,7 +543,7 @@ def _plot_graph_node_importance(path: Path, node_metrics: pl.DataFrame) -> None:
         else np.zeros_like(pagerank)
     )
     y = np.arange(data.height)
-    fig, ax = plt.subplots(figsize=(11, max(6, 0.28 * data.height + 2.0)), dpi=140)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(max(6, 0.28 * data.height + 2.0)), dpi=140)
     ax.barh(y - 0.23, pagerank, height=0.22, label="PageRank")
     ax.barh(y, hub, height=0.22, label="Hub")
     ax.barh(y + 0.23, authority, height=0.22, label="Authority")
@@ -548,7 +581,12 @@ def _plot_graph_community_flow(path: Path, community_edges: pl.DataFrame) -> Non
         dst = int(row.get("target_community", 0))
         if src in index and dst in index:
             matrix[index[src], index[dst]] += float(row.get("edge_weight", 0.0) or 0.0)
-    fig, ax = plt.subplots(figsize=(max(6.0, 0.45 * len(communities) + 3.0), max(5.0, 0.45 * len(communities) + 2.5)), dpi=140)
+    fig_h = max(
+        5.0,
+        0.45 * len(communities) + 2.5,
+        (0.45 * len(communities) + 3.0) / _PLOT_ASPECT_RATIO,
+    )
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_h), dpi=140)
     vmax = float(np.nanpercentile(matrix, 98)) if matrix.size else 1.0
     if vmax <= 0:
         vmax = 1.0
@@ -648,7 +686,7 @@ def _plot_graph_topology(path: Path, graph_edges: pl.DataFrame, node_metrics: pl
     sources = sorted(source_strength, key=lambda node: (-source_strength[node], str(node_rows.get(node, {}).get("symbol", node))))
     targets = sorted(target_strength, key=lambda node: (-target_strength[node], str(node_rows.get(node, {}).get("symbol", node))))
     max_rows = max(len(sources), len(targets))
-    fig, ax = plt.subplots(figsize=(13.5, max(7.0, 0.32 * max_rows + 2.0)), dpi=150)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(max(7.0, 0.32 * max_rows + 2.0)), dpi=150)
     ax.set_xlim(-0.34, 1.34)
     ax.set_ylim(-0.06, 1.08)
     source_y = {
@@ -753,7 +791,7 @@ def _plot_graph_transmission_matrix(path: Path, graph_edges: pl.DataFrame, node_
     if vmax <= 0:
         vmax = 1.0
     fig_size = max(8.0, min(14.0, 0.38 * len(ids) + 4.0))
-    fig, ax = plt.subplots(figsize=(fig_size + 1.5, fig_size), dpi=140)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_size), dpi=140)
     image = ax.imshow(matrix, aspect="equal", cmap="magma", vmin=0.0, vmax=vmax)
     ax.set_title("Full Cross-Asset Transmission Matrix")
     ax.set_xlabel("target / receiver")
@@ -797,7 +835,7 @@ def _plot_graph_self_influence(path: Path, graph_edges: pl.DataFrame) -> None:
     labels = data["source_symbol"].cast(pl.String).to_list()
     weights = data["edge_weight"].fill_null(0.0).to_numpy().astype(np.float64, copy=False)
     y = np.arange(data.height)
-    fig, ax = plt.subplots(figsize=(11, max(5.5, 0.28 * data.height + 1.8)), dpi=140)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(max(5.5, 0.28 * data.height + 1.8)), dpi=140)
     ax.barh(y, weights, color="#4777b3")
     ax.set_yticks(y, labels, fontsize=7)
     ax.invert_yaxis()
@@ -1841,7 +1879,7 @@ def abstract_cross_asset_transmission(
         if not role_frame.is_empty():
             try:
                 import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(8, 6), dpi=140)
+                fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=140)
                 ax.scatter(
                     role_frame["role_x"].to_numpy(),
                     role_frame["role_y"].to_numpy(),

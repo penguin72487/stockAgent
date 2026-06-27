@@ -29,6 +29,39 @@ _REPORT_PARQUET_FILENAMES = (
     "top_edges.parquet",
 )
 _DEFAULT_REPORT_CSV_BATCH_SIZE = 65_536
+_PLOT_ASPECT_RATIO = 17.0 / 6.0
+_DEFAULT_PLOT_HEIGHT = 6.0
+
+
+def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
+    height = max(1.0, float(height))
+    return height * _PLOT_ASPECT_RATIO, height
+
+
+def _pad_saved_image_to_17_6(path: Path) -> None:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return
+            current = width / height
+            if abs(current - _PLOT_ASPECT_RATIO) < 0.002:
+                return
+            if current < _PLOT_ASPECT_RATIO:
+                target_width = int(round(height * _PLOT_ASPECT_RATIO))
+                target_height = height
+            else:
+                target_width = width
+                target_height = int(round(width / _PLOT_ASPECT_RATIO))
+            target_width = max(width, target_width)
+            target_height = max(height, target_height)
+            canvas = Image.new(image.mode if image.mode in {"RGB", "RGBA"} else "RGB", (target_width, target_height), "white")
+            canvas.paste(image.convert(canvas.mode), ((target_width - width) // 2, (target_height - height) // 2))
+            canvas.save(path)
+    except Exception:
+        return
 
 
 def _parse_args() -> argparse.Namespace:
@@ -328,7 +361,7 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     all_loss_values = np.concatenate([train_loss, val_mean, test_mean])
     finite_loss_values = all_loss_values[np.isfinite(all_loss_values)]
 
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=130)
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
     ax.plot(epochs, train_loss, marker="o", linewidth=1.8, markersize=4, label="train_loss")
     ax.plot(epochs, val_mean, marker="s", linewidth=1.8, markersize=4, label="val_mean")
     ax.plot(epochs, test_mean, marker="^", linewidth=1.8, markersize=4, label="test_mean")
@@ -348,6 +381,7 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path)
+    _pad_saved_image_to_17_6(output_path)
     plt.close(fig)
 
     if not quiet:
@@ -417,7 +451,7 @@ def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, in
 
     synced = _to_float_array(rows, "timing_synchronized")
     sync_note = "CUDA synchronized" if _has_finite(synced) and np.nanmin(synced) >= 1.0 else "CUDA async/approx"
-    fig, (ax_batch, ax_epoch) = plt.subplots(2, 1, figsize=(13, 9), dpi=130, sharex=True)
+    fig, (ax_batch, ax_epoch) = plt.subplots(2, 1, figsize=_figsize_17_6(9.0), dpi=130, sharex=True)
     for key, label in batch_series:
         values = _to_float_array(rows, key)
         if _has_finite(values):
@@ -446,6 +480,7 @@ def _plot_timing_curve(rows: list[dict], curve_path: Path, output_path: Path, in
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path)
+    _pad_saved_image_to_17_6(output_path)
     plt.close(fig)
     if not quiet:
         print(f"timing_output: {output_path}")
