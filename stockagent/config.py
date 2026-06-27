@@ -1173,7 +1173,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading.setdefault("gross_leverage", 1.0)
     trading.setdefault("min_trade_weight", 0.0)
     trading.setdefault("portfolio_activation", DEFAULT_PORTFOLIO_ACTIVATION)
-    trading["gross_leverage"] = min(1.0, max(0.0, float(trading.get("gross_leverage", 1.0))))
+    # Preserve the configured leverage multiplier for reporting/post-processing.
+    # Canonical backtest paths that need an exposure budget clamp it locally.
+    trading["gross_leverage"] = max(0.0, float(trading.get("gross_leverage", 1.0)))
     trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.0)))
     trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
     loss_activation = str(training.get("loss_portfolio_activation", "auto")).strip().lower().replace("-", "_")

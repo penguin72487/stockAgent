@@ -9,7 +9,12 @@ from torch import nn
 
 from stockagent.backtest.simulator import BacktestResult, BacktestResultTensor
 from stockagent.data.walkforward import WalkForwardFold
-from stockagent.training.trainer import FoldResult, _save_best_val_backtest_snapshot, _save_fold_output_artifacts
+from stockagent.training.trainer import (
+    FoldResult,
+    _realized_leverage_backtest,
+    _save_best_val_backtest_snapshot,
+    _save_fold_output_artifacts,
+)
 
 
 def test_save_best_val_backtest_snapshot_writes_compressed_npz_and_metadata(tmp_path: Path) -> None:
@@ -120,3 +125,30 @@ def test_save_fold_output_artifacts_writes_standard_files_with_compressed_backte
         assert all(info.compress_type == ZIP_DEFLATED for info in archive_zip.infolist())
     archive = np.load(tmp_path / "test_backtest.npz")
     assert archive["weights_history"].shape == (2, 2)
+
+
+def test_realized_leverage_backtest_multiplies_realized_positions_before_returns_and_fees() -> None:
+    base = BacktestResult(
+        strategy_returns=np.zeros(2, dtype=np.float32),
+        benchmark_returns=np.array([0.01, -0.02], dtype=np.float32),
+        turnovers=np.zeros(2, dtype=np.float32),
+        weights_history=np.array([[0.5, -0.5], [0.2, -0.1]], dtype=np.float32),
+    )
+    future_returns = np.array([[0.10, 0.20], [0.05, -0.10]], dtype=np.float32)
+
+    leveraged = _realized_leverage_backtest(
+        base,
+        future_returns,
+        leverage_multiplier=2.0,
+        buy_fee_rate=0.01,
+        sell_fee_rate=0.02,
+    )
+
+    np.testing.assert_allclose(
+        leveraged.weights_history,
+        np.array([[1.0, -1.0], [0.4, -0.2]], dtype=np.float32),
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(leveraged.turnovers, np.array([2.0, 1.4], dtype=np.float32), atol=1e-7)
+    np.testing.assert_allclose(leveraged.strategy_returns, np.array([-0.13, 0.02], dtype=np.float32), atol=1e-7)
+    np.testing.assert_allclose(leveraged.benchmark_returns, base.benchmark_returns, atol=1e-7)

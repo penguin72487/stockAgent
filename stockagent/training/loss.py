@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from stockagent.backtest.simulator import run_backtest_torch, run_backtest_torch_reduced
+from stockagent.backtest.simulator import _resolve_exposure_budget, run_backtest_torch, run_backtest_torch_reduced
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION, dual_branch_softmax
 
 
@@ -375,7 +375,8 @@ def factor_generalization_loss(
         total = total + float(net_exposure_weight) * (net_exposure * valid_f).sum() / valid_count
     if float(gross_exposure_weight) > 0.0:
         gross = weights_safe.abs().sum(dim=1)
-        gross_error = (gross - float(gross_leverage)).pow(2)
+        gross_target = float(_resolve_exposure_budget(gross_leverage))
+        gross_error = (gross - gross_target).pow(2)
         total = total + float(gross_exposure_weight) * (gross_error * valid_f).sum() / valid_count
     if float(concentration_weight) > 0.0:
         tradable_f = tradable.to(dtype=weights_safe.dtype)
