@@ -50,7 +50,7 @@ BEST_HIGHER_IS_BETTER = {
     "annualized_return",
     "cagr",
     "daily_hit_rate",
-    "excess_return_vs_universe_average",
+    "excess_return_vs_benchmark",
     "max_drawdown",
 }
 BEST_LOWER_IS_BETTER = {"turnover"}
@@ -219,7 +219,7 @@ def _run_sweep(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=float(threshold),
                 portfolio_activation=activation,
                 can_buy_mask=can_buy_mask,

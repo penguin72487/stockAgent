@@ -12,9 +12,9 @@ Multi-asset Taiwan stock trading research workspace.
 ## Planned workflow
 
 1. Normalize all symbol parquet files into a shared date x symbol panel.
-2. Derive the baseline from the same-day average return of all tradable stocks.
+2. Build benchmark returns from each market config's `data.benchmark_name`; use `universe_average_return` only when an explicit universe-average benchmark is desired.
 3. Run yearly expanding-window walk-forward validation.
-4. Train GPU-enabled baseline models first, then portfolio and RL policies.
+4. Train GPU-enabled reference models first, then portfolio and RL policies.
 
 ## Training
 

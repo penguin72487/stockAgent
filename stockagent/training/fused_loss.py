@@ -5,7 +5,9 @@ from torch import Tensor
 
 from stockagent.backtest.simulator import (
     _apply_min_trade_weight_torch,
+    _asset_log_returns_to_simple_torch,
     _normalize_target_weights_torch,
+    _portfolio_simple_returns_to_log_torch,
     _resolve_exposure_budget,
 )
 
@@ -56,7 +58,8 @@ def _fused_log_utility_long_only_scan(
         sell_turnover = (-delta).clamp_min(0.0).sum()
         turnover = buy_turnover + sell_turnover
         gross_return = (next_weights * returns[idx]).sum()
-        strategy_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
+        net_simple_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
+        strategy_return = _portfolio_simple_returns_to_log_torch(net_simple_return)
 
         valid_f = valid_mask[idx].to(dtype=torch.float32)
         return_sum = return_sum + torch.nan_to_num(strategy_return.float(), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
@@ -114,7 +117,8 @@ def _fused_log_utility_long_short_scan(
         sell_turnover = (-delta).clamp_min(0.0).sum()
         turnover = buy_turnover + sell_turnover
         gross_return = (next_weights * returns[idx]).sum()
-        strategy_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
+        net_simple_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
+        strategy_return = _portfolio_simple_returns_to_log_torch(net_simple_return)
 
         valid_f = valid_mask[idx].to(dtype=torch.float32)
         return_sum = return_sum + torch.nan_to_num(strategy_return.float(), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
@@ -153,12 +157,7 @@ def fused_log_utility_loss_tensor(
     compute_dtype = weights.dtype
     device = weights.device
     gross_budget = _resolve_exposure_budget(gross_leverage)
-    returns = torch.nan_to_num(
-        future_returns.to(device=device, dtype=compute_dtype),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
+    returns = _asset_log_returns_to_simple_torch(future_returns, device=device, dtype=compute_dtype)
     tradable = tradable_mask.to(device=device, dtype=torch.bool)
     can_buy = can_buy_mask.to(device=device, dtype=torch.bool)
     can_sell = can_sell_mask.to(device=device, dtype=torch.bool)

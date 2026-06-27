@@ -1,7 +1,11 @@
+import math
 from pathlib import Path
 
+import numpy as np
+import torch
 import yaml
 
+from stockagent.backtest.simulator import _resolve_exposure_budget, run_backtest, run_backtest_torch
 from stockagent.config import load_config
 
 
@@ -47,6 +51,7 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
                 },
                 "training": training,
                 "evaluation": {
+                    # Legacy key should be ignored; market benchmark lives in data.benchmark_name.
                     "primary_baseline": "universe_average",
                     "metrics": ["cumulative_return"],
                 },
@@ -57,29 +62,109 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
     return config_path
 
 
-def test_load_config_preserves_gross_leverage_multiplier_above_one(tmp_path: Path) -> None:
+def test_load_config_migrates_legacy_gross_leverage_to_reporting_leverage(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
 
     config = load_config(config_path)
 
-    assert config.trading.gross_leverage == 2.5
+    assert config.trading.leverage == 2.5
+    assert not hasattr(config.trading, "gross_leverage")
+    assert not hasattr(config.evaluation, "primary_baseline")
+    assert not hasattr(config.evaluation, "metrics")
 
 
-def test_load_config_defaults_best_val_artifact_switches_on(tmp_path: Path) -> None:
+def test_backtest_exposure_budget_caps_multiplier_at_one() -> None:
+    assert _resolve_exposure_budget(2.5) == 1.0
+
+    weights = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
+    returns = torch.zeros_like(weights)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros((1,), dtype=torch.float32)
+
+    result = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        gross_leverage=2.5,
+    )
+
+    expected_weights = torch.tensor([[0.5, -0.5]], dtype=torch.float32)
+    assert torch.allclose(result.weights_history.cpu(), expected_weights, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(result.weights_history.abs().sum(dim=1).cpu(), torch.tensor([1.0]), atol=1e-7, rtol=1e-6)
+
+
+def test_backtest_converts_asset_log_returns_to_portfolio_log_return() -> None:
+    asset_log_return = math.log(0.4)
+    expected_strategy_log_return = math.log1p(0.6)
+
+    weights_np = np.array([[-1.0]], dtype=np.float32)
+    returns_np = np.array([[asset_log_return]], dtype=np.float32)
+    tradable_np = np.ones_like(weights_np, dtype=bool)
+    benchmark_np = np.zeros((1,), dtype=np.float32)
+
+    numpy_result = run_backtest(
+        weights_np,
+        returns_np,
+        tradable_np,
+        benchmark_np,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        gross_leverage=1.0,
+    )
+
+    weights_t = torch.from_numpy(weights_np)
+    returns_t = torch.from_numpy(returns_np)
+    tradable_t = torch.from_numpy(tradable_np)
+    benchmark_t = torch.from_numpy(benchmark_np)
+    torch_result = run_backtest_torch(
+        weights_t,
+        returns_t,
+        tradable_t,
+        benchmark_t,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        gross_leverage=1.0,
+    )
+    dense_result = run_backtest_torch(
+        weights_t,
+        returns_t,
+        tradable_t,
+        benchmark_t,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        gross_leverage=1.0,
+        can_buy_mask=tradable_t,
+        can_sell_mask=tradable_t,
+        dense_mask_constraints=True,
+    )
+
+    assert math.isclose(float(numpy_result.strategy_returns[0]), expected_strategy_log_return, rel_tol=1e-6)
+    assert math.isclose(float(torch_result.strategy_returns[0]), expected_strategy_log_return, rel_tol=1e-6)
+    assert math.isclose(float(dense_result.strategy_returns[0]), expected_strategy_log_return, rel_tol=1e-6)
+
+
+def test_load_config_defaults_best_val_artifact_switches_off(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
-
-    config = load_config(config_path)
-
-    assert config.training.save_best_val_artifacts is True
-    assert config.training.save_best_val_fold_artifacts is True
-    assert config.training.save_best_val_fold_plots is True
-
-
-def test_load_config_best_val_artifacts_master_switch_disables_fold_artifacts(tmp_path: Path) -> None:
-    config_path = _write_minimal_config(tmp_path, training_overrides={"save_best_val_artifacts": False})
 
     config = load_config(config_path)
 
     assert config.training.save_best_val_artifacts is False
     assert config.training.save_best_val_fold_artifacts is False
     assert config.training.save_best_val_fold_plots is False
+
+
+def test_load_config_best_val_artifacts_master_switch_enables_fold_artifacts(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path, training_overrides={"save_best_val_artifacts": True})
+
+    config = load_config(config_path)
+
+    assert config.training.save_best_val_artifacts is True
+    assert config.training.save_best_val_fold_artifacts is True
+    assert config.training.save_best_val_fold_plots is True

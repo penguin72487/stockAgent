@@ -53,7 +53,7 @@ def _loss_kwargs(config) -> dict:
         "buy_fee_rate": float(config.trading.buy_fee_rate),
         "sell_fee_rate": float(config.trading.sell_fee_rate),
         "max_turnover_ratio": float(config.trading.max_turnover_ratio),
-        "gross_leverage": float(config.trading.gross_leverage),
+        "gross_leverage": 1.0,
         "gamma_sharpe": float(config.evaluation.gamma_sharpe),
         "gamma_excess": float(config.evaluation.gamma_excess),
         "gamma_cvar": float(config.evaluation.gamma_cvar),
