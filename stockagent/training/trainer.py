@@ -2363,6 +2363,52 @@ def _save_backtest_artifact(
     )
 
 
+def _realized_leverage_backtest(
+    result: BacktestResult,
+    future_returns: np.ndarray | torch.Tensor,
+    *,
+    leverage_multiplier: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+) -> BacktestResult:
+    multiplier = max(0.0, float(leverage_multiplier))
+    weights = np.nan_to_num(
+        np.asarray(result.weights_history, dtype=np.float64),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    returns = np.nan_to_num(
+        future_returns.detach().cpu().numpy() if torch.is_tensor(future_returns) else np.asarray(future_returns),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float64, copy=False)
+    if weights.ndim != 2 or returns.shape != weights.shape:
+        raise ValueError(
+            "future_returns must have the same shape as weights_history for realised leverage plotting: "
+            f"weights={weights.shape}, future_returns={returns.shape}"
+        )
+
+    leveraged_weights = weights * multiplier
+    deltas = np.empty_like(leveraged_weights)
+    if leveraged_weights.shape[0] > 0:
+        deltas[0] = leveraged_weights[0]
+        if leveraged_weights.shape[0] > 1:
+            deltas[1:] = leveraged_weights[1:] - leveraged_weights[:-1]
+    buy_turnovers = np.clip(deltas, 0.0, None).sum(axis=1)
+    sell_turnovers = np.clip(-deltas, 0.0, None).sum(axis=1)
+    turnovers = buy_turnovers + sell_turnovers
+    gross_returns = np.einsum("ts,ts->t", leveraged_weights, returns)
+    strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+    return BacktestResult(
+        strategy_returns=strategy_returns.astype(np.float32),
+        benchmark_returns=np.asarray(result.benchmark_returns, dtype=np.float32),
+        turnovers=turnovers.astype(np.float32),
+        weights_history=leveraged_weights.astype(np.float32),
+    )
+
+
 def _save_best_val_backtest_snapshot(
     *,
     fold_dir: Path,
@@ -2444,6 +2490,7 @@ def _save_fold_output_artifacts(
     test_dates: np.ndarray,
     symbols: list[str],
     config: ExperimentConfig,
+    test_future_returns: np.ndarray | torch.Tensor | None = None,
     test_integer_backtest: BacktestResult | None = None,
     holdings_records: list[HoldingsRecord] | None = None,
     backtest_artifact_compression: str | None = None,
@@ -2550,17 +2597,49 @@ def _save_fold_output_artifacts(
             test_dates,
             fold_dir / "annual_performance.png",
         )
-        _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
-        _copy_plot(
-            "leverage_equity_curve_log",
-            fold_dir / "equity_curve_log.png",
-            fold_dir / "leverage_equity_curve_log.png",
-        )
-        _copy_plot(
-            "leverage_annual_performance",
-            fold_dir / "annual_performance.png",
-            fold_dir / "leverage_annual_performance.png",
-        )
+        leverage_multiplier = float(getattr(config.trading, "gross_leverage", 1.0))
+        plot_timing["leverage_multiplier"] = float(leverage_multiplier)
+        if test_future_returns is not None:
+            leverage_backtest = _realized_leverage_backtest(
+                test_backtest,
+                test_future_returns,
+                leverage_multiplier=leverage_multiplier,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+            )
+            _time_plot(
+                "leverage_equity_curve",
+                plot_equity_curve,
+                leverage_backtest,
+                test_dates,
+                fold_dir / "leverage_equity_curve.png",
+            )
+            _time_plot(
+                "leverage_equity_curve_log",
+                plot_equity_curve_log,
+                leverage_backtest,
+                test_dates,
+                fold_dir / "leverage_equity_curve_log.png",
+            )
+            _time_plot(
+                "leverage_annual_performance",
+                plot_annual_performance,
+                leverage_backtest,
+                test_dates,
+                fold_dir / "leverage_annual_performance.png",
+            )
+        else:
+            _copy_plot("leverage_equity_curve", fold_dir / "equity_curve.png", fold_dir / "leverage_equity_curve.png")
+            _copy_plot(
+                "leverage_equity_curve_log",
+                fold_dir / "equity_curve_log.png",
+                fold_dir / "leverage_equity_curve_log.png",
+            )
+            _copy_plot(
+                "leverage_annual_performance",
+                fold_dir / "annual_performance.png",
+                fold_dir / "leverage_annual_performance.png",
+            )
 
     if test_integer_backtest is not None:
         audit_start = time.perf_counter()
@@ -9213,6 +9292,8 @@ def run_training(
             val_row_start: int,
             val_row_end: int,
         ) -> FoldResult | None:
+            if not bool(getattr(config.training, "save_best_val_artifacts", True)):
+                return None
             if not bool(getattr(config.training, "save_best_val_fold_artifacts", True)):
                 return None
 
@@ -9437,6 +9518,7 @@ def run_training(
                 test_dates=test_dates,
                 symbols=panel.symbols,
                 config=config,
+                test_future_returns=test_returns,
                 test_integer_backtest=test_integer_bt,
                 holdings_records=holdings_records,
                 backtest_artifact_compression="compressed",
@@ -9894,27 +9976,28 @@ def run_training(
                             optimizer=optimizer,
                             scaler=scaler,
                         )
-                        _save_best_val_backtest_snapshot(
-                            fold_dir=context.fold_dir,
-                            fold=context.fold,
-                            epoch=epoch,
-                            val_loss=val_loss,
-                            val_backtest=val_backtest_epoch,
-                            row_start=val_offsets[index],
-                            row_end=val_offsets[index + 1],
-                            dates=panel.dates[context.val_ds.valid_indices],
-                            objective=loss_objective,
-                        )
-                        fold_result = _save_best_val_complete_fold_artifacts(
-                            context=context,
-                            epoch=epoch,
-                            val_loss=val_loss,
-                            val_backtest_epoch=val_backtest_epoch,
-                            val_row_start=val_offsets[index],
-                            val_row_end=val_offsets[index + 1],
-                        )
-                        if fold_result is not None:
-                            results_by_fold[context.fold.fold_id] = fold_result
+                        if bool(getattr(config.training, "save_best_val_artifacts", True)):
+                            _save_best_val_backtest_snapshot(
+                                fold_dir=context.fold_dir,
+                                fold=context.fold,
+                                epoch=epoch,
+                                val_loss=val_loss,
+                                val_backtest=val_backtest_epoch,
+                                row_start=val_offsets[index],
+                                row_end=val_offsets[index + 1],
+                                dates=panel.dates[context.val_ds.valid_indices],
+                                objective=loss_objective,
+                            )
+                            fold_result = _save_best_val_complete_fold_artifacts(
+                                context=context,
+                                epoch=epoch,
+                                val_loss=val_loss,
+                                val_backtest_epoch=val_backtest_epoch,
+                                val_row_start=val_offsets[index],
+                                val_row_end=val_offsets[index + 1],
+                            )
+                            if fold_result is not None:
+                                results_by_fold[context.fold.fold_id] = fold_result
                         fold_ckpt_total += time.perf_counter() - fold_ckpt_start
             if test_count > 0:
                 test_loss_values = scalar_values[scalar_offset : scalar_offset + test_count]
@@ -10388,6 +10471,7 @@ def run_training(
                 test_dates=test_dates,
                 symbols=panel.symbols,
                 config=config,
+                test_future_returns=test_returns,
                 test_integer_backtest=test_integer_bt,
                 holdings_records=holdings_records,
                 print_report=True,
