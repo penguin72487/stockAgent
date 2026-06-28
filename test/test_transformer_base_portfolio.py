@@ -13,7 +13,11 @@ from stockagent.models.transformer_base_portfolio import (
     SwiGLUFeedForward,
     TransformerBasePortfolioModel,
 )
-from stockagent.models.normalization import masked_activation_l1_weights
+from stockagent.models.normalization import (
+    masked_activation_l1_weights,
+    masked_l1_projection_weights,
+    masked_signed_action_weights,
+)
 from stockagent.training.trainer import _extract_weights_and_aux
 from stockagent.training.windowed import WindowedSplitTensors
 
@@ -459,6 +463,150 @@ def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:
     expected = aux["centered_score_logits"].masked_fill(~mask, 0.0)
     assert model.portfolio_output_mode == "logits"
     assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    assert weights[1, 10:].abs().max().item() < 1e-6
+
+
+def test_portfolio_output_mode_signed_softmax_matches_action_helper() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="signed_action_softmax",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected, expected_parts = masked_signed_action_weights(
+        aux["centered_score_logits"],
+        mask,
+        transform="softmax",
+        long_only=False,
+        return_parts=True,
+    )
+    assert model.portfolio_output_mode == "signed_softmax"
+    assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(aux["action_long_alloc"], expected_parts["action_long_alloc"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(aux["action_short_alloc"], expected_parts["action_short_alloc"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(aux["action_cash_alloc"], expected_parts["action_cash_alloc"], atol=1e-6, rtol=1e-6)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert weights[1, 10:].abs().max().item() < 1e-6
+
+
+def test_portfolio_output_mode_signed_entmax_matches_sparse_action_helper() -> None:
+    device = _device()
+    direct_logits = torch.tensor([[8.0, 1.0, -8.0, 0.0]], dtype=torch.float32, device=device)
+    direct_mask = torch.ones_like(direct_logits, dtype=torch.bool)
+    _, direct_parts = masked_signed_action_weights(
+        direct_logits,
+        direct_mask,
+        transform="entmax15",
+        long_only=False,
+        return_parts=True,
+    )
+    direct_actions = torch.cat(
+        [
+            direct_parts["action_long_alloc"],
+            direct_parts["action_short_alloc"],
+            direct_parts["action_cash_alloc"].view(1, 1),
+        ],
+        dim=1,
+    )
+    assert int((direct_actions <= 1e-7).sum().item()) >= 1
+
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="signed_entmax",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected, _ = masked_signed_action_weights(
+        aux["centered_score_logits"],
+        mask,
+        transform="entmax15",
+        long_only=False,
+        return_parts=True,
+    )
+    assert model.portfolio_output_mode == "signed_entmax15"
+    assert torch.allclose(weights, expected, atol=1e-5, rtol=1e-5)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert weights[1, 10:].abs().max().item() < 1e-6
+
+
+def test_portfolio_output_mode_signed_sparsemax_matches_sparse_action_helper() -> None:
+    device = _device()
+    direct_logits = torch.tensor([[4.0, 1.0, -4.0, 0.0]], dtype=torch.float32, device=device)
+    direct_mask = torch.ones_like(direct_logits, dtype=torch.bool)
+    _, direct_parts = masked_signed_action_weights(
+        direct_logits,
+        direct_mask,
+        transform="sparsemax",
+        long_only=False,
+        return_parts=True,
+    )
+    direct_actions = torch.cat(
+        [
+            direct_parts["action_long_alloc"],
+            direct_parts["action_short_alloc"],
+            direct_parts["action_cash_alloc"].view(1, 1),
+        ],
+        dim=1,
+    )
+    assert int((direct_actions <= 1e-7).sum().item()) >= 1
+
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="signed_sparsemax",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected, _ = masked_signed_action_weights(
+        aux["centered_score_logits"],
+        mask,
+        transform="sparsemax",
+        long_only=False,
+        return_parts=True,
+    )
+    assert model.portfolio_output_mode == "signed_sparsemax"
+    assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert weights[1, 10:].abs().max().item() < 1e-6
+
+
+def test_portfolio_output_mode_projection_l1_matches_projection_helper() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="differentiable_projection",
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected = masked_l1_projection_weights(aux["centered_score_logits"], mask, long_only=False)
+    assert model.portfolio_output_mode == "projection_l1"
+    assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert torch.allclose(aux["projection_gross_exposure"], weights.abs().sum(dim=1), atol=1e-6, rtol=1e-6)
     assert weights[1, 10:].abs().max().item() < 1e-6
 
 

@@ -7,6 +7,8 @@ from stockagent.models.normalization import (
     apply_portfolio_activation,
     dual_branch_softmax,
     masked_activation_l1_weights,
+    masked_l1_projection_weights,
+    masked_signed_action_weights,
     masked_softmax,
     masked_softsign_l1_weights,
     masked_tanh_l1_weights,
@@ -53,6 +55,76 @@ def test_legacy_portfolio_normalizers_use_default_identity_l1() -> None:
     assert torch.allclose(long_only, expected_long_only, atol=1e-7, rtol=1e-6)
     assert torch.all(long_only >= 0.0)
     assert torch.allclose(long_only.abs().sum(dim=1), torch.ones(1), atol=1e-6)
+
+
+def test_signed_action_softmax_allocates_long_short_and_cash_actions() -> None:
+    logits = torch.tensor([[3.0, 0.0, -3.0]], dtype=torch.float32)
+    mask = torch.tensor([[True, True, True]])
+
+    weights, parts = masked_signed_action_weights(
+        logits,
+        mask,
+        transform="softmax",
+        long_only=False,
+        return_parts=True,
+    )
+
+    action_sum = parts["action_long_alloc"].sum(dim=1) + parts["action_short_alloc"].sum(dim=1) + parts["action_cash_alloc"]
+    assert torch.allclose(action_sum, torch.ones_like(action_sum), atol=1e-6)
+    assert torch.allclose(weights, parts["action_long_alloc"] - parts["action_short_alloc"], atol=1e-7)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert weights[0, 0] > 0.0
+    assert weights[0, 2] < 0.0
+
+
+def test_signed_action_entmax_can_return_sparse_actions() -> None:
+    logits = torch.tensor([[8.0, 1.0, -8.0, 0.0]], dtype=torch.float32)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    weights, parts = masked_signed_action_weights(
+        logits,
+        mask,
+        transform="entmax15",
+        long_only=False,
+        return_parts=True,
+    )
+
+    action_sum = parts["action_long_alloc"].sum(dim=1) + parts["action_short_alloc"].sum(dim=1) + parts["action_cash_alloc"]
+    zero_actions = torch.cat([parts["action_long_alloc"], parts["action_short_alloc"], parts["action_cash_alloc"].view(1, 1)], dim=1)
+    assert torch.allclose(action_sum, torch.ones_like(action_sum), atol=1e-5)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert int((zero_actions <= 1e-7).sum().item()) >= 1
+
+
+def test_signed_action_sparsemax_can_return_sparse_actions() -> None:
+    logits = torch.tensor([[4.0, 1.0, -4.0, 0.0]], dtype=torch.float32)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    weights, parts = masked_signed_action_weights(
+        logits,
+        mask,
+        transform="sparsemax",
+        long_only=False,
+        return_parts=True,
+    )
+
+    action_sum = parts["action_long_alloc"].sum(dim=1) + parts["action_short_alloc"].sum(dim=1) + parts["action_cash_alloc"]
+    zero_actions = torch.cat([parts["action_long_alloc"], parts["action_short_alloc"], parts["action_cash_alloc"].view(1, 1)], dim=1)
+    assert torch.allclose(action_sum, torch.ones_like(action_sum), atol=1e-6)
+    assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert int((zero_actions <= 1e-7).sum().item()) >= 1
+
+
+def test_l1_projection_preserves_cash_inside_ball_and_sparsifies_outside_ball() -> None:
+    inside = torch.tensor([[0.2, -0.3, 0.1]], dtype=torch.float32)
+    outside = torch.tensor([[3.0, 1.0, -0.5, 0.1]], dtype=torch.float32)
+
+    inside_projected = masked_l1_projection_weights(inside, torch.ones_like(inside, dtype=torch.bool), long_only=False)
+    outside_projected = masked_l1_projection_weights(outside, torch.ones_like(outside, dtype=torch.bool), long_only=False)
+
+    assert torch.allclose(inside_projected, inside, atol=1e-7, rtol=1e-6)
+    assert torch.all(outside_projected.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert int((outside_projected.abs() <= 1e-7).sum().item()) >= 1
 
 
 def test_masked_tanh_l1_name_remains_explicit_tanh_l1_helper() -> None:
@@ -132,6 +204,7 @@ def test_portfolio_activation_aliases_normalize() -> None:
     assert normalize_portfolio_activation("gd") == "gudermannian"
     assert normalize_portfolio_activation("inverse_sqrt") == "isru"
     assert normalize_portfolio_activation("none") == "identity"
+    assert normalize_portfolio_activation("preserve_weights") == "pre_normalized"
     assert normalize_portfolio_activation(None) == "identity"
 
 
@@ -188,3 +261,26 @@ def test_tensor_backtest_identity_activation_is_raw_l1_postprocess() -> None:
 
     expected = masked_activation_l1_weights(target_scores, tradable, long_only=False, activation="identity")
     assert torch.allclose(result.weights_history, expected, atol=1e-7, rtol=1e-6)
+
+
+def test_tensor_backtest_pre_normalized_activation_preserves_underinvested_weights() -> None:
+    target_weights = torch.tensor([[0.2, -0.3, 0.0]], dtype=torch.float32)
+    asset_log_returns = torch.log1p(torch.tensor([[0.10, -0.20, 0.0]], dtype=torch.float32))
+    tradable = torch.ones_like(target_weights, dtype=torch.bool)
+    benchmark = torch.zeros((1,), dtype=torch.float32)
+
+    result = run_backtest_torch(
+        target_weights,
+        asset_log_returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+    )
+
+    expected_simple = torch.tensor(0.2 * 0.10 + (-0.3) * (-0.20), dtype=torch.float32)
+    expected_log = torch.log1p(expected_simple)
+    assert torch.allclose(result.weights_history, target_weights, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(result.strategy_returns, expected_log.view(1), atol=1e-7, rtol=1e-6)

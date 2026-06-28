@@ -11,7 +11,9 @@ from stockagent.models.latent_factor_market_token_portfolio import _safe_attenti
 from stockagent.models.normalization import (
     dual_branch_softmax,
     finite_mask_fill_value,
+    masked_l1_projection_weights,
     masked_cross_sectional_mean,
+    masked_signed_action_weights,
     masked_softmax,
     normalize_portfolio_activation,
 )
@@ -782,7 +784,36 @@ class TransformerBasePortfolioModel(nn.Module):
             return "l1"
         if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
             return "logits"
-        raise ValueError("portfolio_output_mode must be 'activation_l1', 'l1', or 'logits'")
+        if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
+            return "signed_softmax"
+        if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
+            return "signed_sparsemax"
+        if normalized in {
+            "signed_entmax",
+            "signed_entmax15",
+            "signed_entmax_15",
+            "signed_action_entmax",
+            "signed_action_entmax15",
+            "action_entmax",
+            "action_entmax15",
+            "entmax",
+            "entmax15",
+            "entmax_15",
+        }:
+            return "signed_entmax15"
+        if normalized in {
+            "projection",
+            "projection_l1",
+            "l1_projection",
+            "project_l1",
+            "differentiable_projection",
+            "differentiable_l1_projection",
+        }:
+            return "projection_l1"
+        raise ValueError(
+            "portfolio_output_mode must be 'activation_l1', 'l1', 'logits', "
+            "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
+        )
 
     def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:
         if x.dim() != 4:
@@ -1256,11 +1287,57 @@ class TransformerBasePortfolioModel(nn.Module):
             temp = masked_scores.new_tensor(float(temperature))
         temp = torch.clamp(temp, min=0.05)
 
+        output_aux: dict[str, torch.Tensor] = {}
+        include_action_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
+
         if self.portfolio_mode == "long_only":
             centered_scores = scores
             target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
+            elif self.portfolio_output_mode == "signed_softmax":
+                action_output = masked_signed_action_weights(
+                    target_logits,
+                    mask_bool,
+                    transform="softmax",
+                    long_only=True,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = action_output
+                else:
+                    weights = action_output
+            elif self.portfolio_output_mode == "signed_sparsemax":
+                action_output = masked_signed_action_weights(
+                    target_logits,
+                    mask_bool,
+                    transform="sparsemax",
+                    long_only=True,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = action_output
+                else:
+                    weights = action_output
+            elif self.portfolio_output_mode == "signed_entmax15":
+                action_output = masked_signed_action_weights(
+                    target_logits,
+                    mask_bool,
+                    transform="entmax15",
+                    long_only=True,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = action_output
+                else:
+                    weights = action_output
+            elif self.portfolio_output_mode == "projection_l1":
+                weights = masked_l1_projection_weights(target_logits, mask_bool, long_only=True)
+                if include_action_aux:
+                    output_aux = {
+                        "projection_gross_exposure": weights.abs().sum(dim=1),
+                        "implicit_cash_weight": (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0),
+                    }
             else:
                 weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
                 weights = masked_softmax(masked_scores / temp, mask_bool, activation=weight_activation)
@@ -1269,6 +1346,49 @@ class TransformerBasePortfolioModel(nn.Module):
             target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
+            elif self.portfolio_output_mode == "signed_softmax":
+                action_output = masked_signed_action_weights(
+                    target_logits,
+                    mask_bool,
+                    transform="softmax",
+                    long_only=False,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = action_output
+                else:
+                    weights = action_output
+            elif self.portfolio_output_mode == "signed_sparsemax":
+                action_output = masked_signed_action_weights(
+                    target_logits,
+                    mask_bool,
+                    transform="sparsemax",
+                    long_only=False,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = action_output
+                else:
+                    weights = action_output
+            elif self.portfolio_output_mode == "signed_entmax15":
+                action_output = masked_signed_action_weights(
+                    target_logits,
+                    mask_bool,
+                    transform="entmax15",
+                    long_only=False,
+                    return_parts=include_action_aux,
+                )
+                if include_action_aux:
+                    weights, output_aux = action_output
+                else:
+                    weights = action_output
+            elif self.portfolio_output_mode == "projection_l1":
+                weights = masked_l1_projection_weights(target_logits, mask_bool, long_only=False)
+                if include_action_aux:
+                    output_aux = {
+                        "projection_gross_exposure": weights.abs().sum(dim=1),
+                        "implicit_cash_weight": (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0),
+                    }
             else:
                 weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
                 weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation=weight_activation)
@@ -1284,6 +1404,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     "centered_score_logits": centered_scores,
                 }
             )
+            aux.update(output_aux)
             return weights, masked_scores, aux
         if return_aux is None and self.return_aux:
             output = {
@@ -1303,6 +1424,7 @@ class TransformerBasePortfolioModel(nn.Module):
                         "centered_score_logits": centered_scores,
                     }
                 )
+                aux.update(output_aux)
                 output["aux"] = aux
                 output.update(aux)
             return output

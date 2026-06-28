@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 25
 environment:
   conda_env: fintech
   device: cuda
@@ -39,7 +39,7 @@ trading:
   max_turnover_ratio: 50.0
   leverage: 2.5
   min_trade_weight: 0.0
-  portfolio_activation: identity
+  portfolio_activation: pre_normalized
   long_only: false
   cash_allowed: true
 training:
@@ -56,7 +56,7 @@ training:
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
   fused_log_utility_loss: true
-  loss_portfolio_activation: identity
+  loss_portfolio_activation: pre_normalized
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
@@ -147,7 +147,7 @@ training:
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
   backtest_artifact_compression: none
-  save_best_val_artifacts: false
+  save_best_val_artifacts: true
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
   learning_rate: 0.001
@@ -310,7 +310,7 @@ training:
     dropout: 0.0
     default_temperature: 1
     portfolio_mode: long_short
-    portfolio_output_mode: logits
+    portfolio_output_mode: signed_softmax
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false
