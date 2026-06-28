@@ -238,7 +238,7 @@ def _apply_portfolio_activation_numpy(
 ) -> np.ndarray:
     activation_name = normalize_portfolio_activation(activation)
     out = values.astype(dtype, copy=False)
-    if activation_name == "identity":
+    if activation_name in {"identity", "pre_normalized"}:
         return np.where(np.isfinite(out), out, dtype.type(0.0)).astype(dtype, copy=False)
     out = np.nan_to_num(out, nan=0.0, posinf=20.0, neginf=-20.0)
     out = np.clip(out, dtype.type(-20.0), dtype.type(20.0))
@@ -268,9 +268,16 @@ def _normalize_target_weights_numpy(
     portfolio_activation: str | None = None,
 ) -> np.ndarray:
     """Normalize target weights via bounded activation + L1 and apply gross budget."""
-    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), portfolio_activation)
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), activation_name)
     if long_only:
         out = np.clip(out, 0.0, None)
+    if activation_name == "pre_normalized":
+        l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
+        gross = np.float32(gross_budget)
+        scale = np.ones_like(l1, dtype=np.float32)
+        np.divide(gross, np.clip(l1, 1e-12, None), out=scale, where=l1 > gross)
+        return (out * scale).astype(np.float32, copy=False)
     l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
     out = out / np.clip(l1, 1e-12, None)
     out *= np.float32(gross_budget)
@@ -285,10 +292,16 @@ def _normalize_target_weights_row_numpy(
     portfolio_activation: str | None = None,
 ) -> np.ndarray:
     """Single-row variant of bounded activation + L1 normalization for integer-share path."""
-    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), portfolio_activation)
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), activation_name)
     if long_only:
         row = np.clip(row, 0.0, None)
     l1 = float(np.abs(row).sum(dtype=np.float64))
+    if activation_name == "pre_normalized":
+        gross = float(gross_budget)
+        if l1 > gross and l1 > 1e-12:
+            row = row * (gross / l1)
+        return row
     if l1 > 1e-12:
         row = row / l1
     else:
@@ -305,12 +318,17 @@ def _normalize_target_weights_torch(
     portfolio_activation: str | None = None,
 ) -> torch.Tensor:
     """Torch normalization via bounded activation + L1 and gross budget scaling."""
-    out = apply_portfolio_activation(weights, portfolio_activation)
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    out = apply_portfolio_activation(weights, activation_name)
     if long_only:
         out = out.clamp_min(0.0)
+    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
+    if activation_name == "pre_normalized":
+        l1 = out.abs().sum(dim=1, keepdim=True)
+        scale = torch.where(l1 > leverage, leverage / l1.clamp_min(1e-12), torch.ones_like(l1))
+        return out * scale
     l1 = out.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
     out = out / l1
-    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
     out = out * leverage
     return out
 
