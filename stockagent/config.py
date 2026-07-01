@@ -43,6 +43,54 @@ def _normalize_portfolio_activation(activation: str | None) -> str:
     return normalized
 
 
+def _normalize_portfolio_output_mode(mode: str | None) -> str:
+    normalized = str(mode or "activation_l1").strip().lower().replace("-", "_")
+    if normalized in {
+        "activation_l1",
+        "activated_l1",
+        "activation",
+        "bounded_l1",
+        "bounded_activation_l1",
+        "default",
+    }:
+        return "activation_l1"
+    if normalized in {"l1", "raw_l1", "score_l1", "linear_l1", "identity_l1"}:
+        return "l1"
+    if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
+        return "logits"
+    if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
+        return "signed_softmax"
+    if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
+        return "signed_sparsemax"
+    if normalized in {
+        "signed_entmax",
+        "signed_entmax15",
+        "signed_entmax_15",
+        "signed_action_entmax",
+        "signed_action_entmax15",
+        "action_entmax",
+        "action_entmax15",
+        "entmax",
+        "entmax15",
+        "entmax_15",
+    }:
+        return "signed_entmax15"
+    if normalized in {
+        "projection",
+        "projection_l1",
+        "l1_projection",
+        "project_l1",
+        "differentiable_projection",
+        "differentiable_l1_projection",
+    }:
+        return "projection_l1"
+    raise ValueError(
+        "training.transformer_base_portfolio.portfolio_output_mode must be one of "
+        "'activation_l1', 'l1', 'logits', 'signed_softmax', "
+        "'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
+    )
+
+
 @dataclass(slots=True)
 class RunnerConfig:
     output_dir: str = "artifacts"
@@ -506,6 +554,17 @@ class TrainingConfig:
     save_best_val_artifacts: bool = False
     save_best_val_fold_artifacts: bool = False
     save_best_val_fold_plots: bool = False
+    postprocess_benchmark_after_fold: bool = False
+    postprocess_benchmark_after_best_val: bool = False
+    postprocess_benchmark_split: str = "test"
+    postprocess_benchmark_activations: str = "identity,softsign,tanh,isru,erf,atan,gd"
+    postprocess_benchmark_thresholds: str = "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02"
+    postprocess_benchmark_rank_metric: str = "sharpe"
+    postprocess_benchmark_plot_metrics: str = "sharpe,sortino,cumulative_return"
+    postprocess_benchmark_plot_top_n: int = 20
+    postprocess_benchmark_backtest_compile: bool = False
+    postprocess_benchmark_max_rows: int = 0
+    postprocess_benchmark_strict: bool = False
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -716,6 +775,70 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["save_best_val_fold_plots"] = (
         bool(training.get("save_best_val_fold_plots", True)) and training["save_best_val_fold_artifacts"]
     )
+    training.setdefault("postprocess_benchmark_after_fold", False)
+    training.setdefault("postprocess_benchmark_after_best_val", False)
+    postprocess_split = str(training.get("postprocess_benchmark_split", "test")).strip().lower()
+    if postprocess_split not in {"train", "val", "test"}:
+        raise ValueError("training.postprocess_benchmark_split must be one of: train, val, test")
+    training["postprocess_benchmark_split"] = postprocess_split
+    training.setdefault("postprocess_benchmark_activations", "identity,softsign,tanh,isru,erf,atan,gd")
+    training.setdefault(
+        "postprocess_benchmark_thresholds",
+        "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02",
+    )
+    postprocess_metric = str(training.get("postprocess_benchmark_rank_metric", "sharpe")).strip().lower()
+    metric_aliases = {
+        "sharp": "sharpe",
+        "cum_return": "cumulative_return",
+        "return": "cumulative_return",
+        "returns": "cumulative_return",
+        "total_return": "cumulative_return",
+        "total_returns": "cumulative_return",
+    }
+    postprocess_metric = metric_aliases.get(postprocess_metric, postprocess_metric)
+    valid_postprocess_metrics = {
+        "sharpe",
+        "sortino",
+        "calmar",
+        "cumulative_return",
+        "annualized_return",
+        "cagr",
+        "daily_hit_rate",
+        "excess_return_vs_benchmark",
+        "max_drawdown",
+        "turnover",
+    }
+    if postprocess_metric not in valid_postprocess_metrics:
+        raise ValueError(
+            "training.postprocess_benchmark_rank_metric must be one of "
+            f"{sorted(valid_postprocess_metrics)}, got {postprocess_metric!r}"
+        )
+    training["postprocess_benchmark_rank_metric"] = postprocess_metric
+    plot_metrics: list[str] = []
+    for raw_metric in str(
+        training.get("postprocess_benchmark_plot_metrics", "sharpe,sortino,cumulative_return")
+    ).split(","):
+        metric = metric_aliases.get(raw_metric.strip().lower().replace("-", "_"), raw_metric.strip().lower().replace("-", "_"))
+        if not metric:
+            continue
+        if metric not in valid_postprocess_metrics:
+            raise ValueError(
+                "training.postprocess_benchmark_plot_metrics must contain only "
+                f"{sorted(valid_postprocess_metrics)}, got {metric!r}"
+            )
+        if metric not in plot_metrics:
+            plot_metrics.append(metric)
+    if postprocess_metric not in plot_metrics:
+        plot_metrics.insert(0, postprocess_metric)
+    training["postprocess_benchmark_plot_metrics"] = ",".join(plot_metrics)
+    training["postprocess_benchmark_plot_top_n"] = max(
+        1, int(training.get("postprocess_benchmark_plot_top_n", 20))
+    )
+    training.setdefault("postprocess_benchmark_backtest_compile", False)
+    training["postprocess_benchmark_max_rows"] = max(
+        0, int(training.get("postprocess_benchmark_max_rows", 0))
+    )
+    training.setdefault("postprocess_benchmark_strict", False)
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -888,6 +1011,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("default_temperature", 1.0)
     transformer_base_portfolio.setdefault("portfolio_mode", "auto")
     transformer_base_portfolio.setdefault("portfolio_output_mode", "activation_l1")
+    transformer_base_portfolio["portfolio_output_mode"] = _normalize_portfolio_output_mode(
+        transformer_base_portfolio.get("portfolio_output_mode")
+    )
     transformer_base_portfolio.setdefault("max_full_tokens", 4096)
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
@@ -1352,6 +1478,17 @@ def load_config(path: str | Path) -> ExperimentConfig:
             save_best_val_artifacts=training_raw["save_best_val_artifacts"],
             save_best_val_fold_artifacts=training_raw["save_best_val_fold_artifacts"],
             save_best_val_fold_plots=training_raw["save_best_val_fold_plots"],
+            postprocess_benchmark_after_fold=training_raw["postprocess_benchmark_after_fold"],
+            postprocess_benchmark_after_best_val=training_raw["postprocess_benchmark_after_best_val"],
+            postprocess_benchmark_split=training_raw["postprocess_benchmark_split"],
+            postprocess_benchmark_activations=training_raw["postprocess_benchmark_activations"],
+            postprocess_benchmark_thresholds=training_raw["postprocess_benchmark_thresholds"],
+            postprocess_benchmark_rank_metric=training_raw["postprocess_benchmark_rank_metric"],
+            postprocess_benchmark_plot_metrics=training_raw["postprocess_benchmark_plot_metrics"],
+            postprocess_benchmark_plot_top_n=training_raw["postprocess_benchmark_plot_top_n"],
+            postprocess_benchmark_backtest_compile=training_raw["postprocess_benchmark_backtest_compile"],
+            postprocess_benchmark_max_rows=training_raw["postprocess_benchmark_max_rows"],
+            postprocess_benchmark_strict=training_raw["postprocess_benchmark_strict"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],
@@ -1359,6 +1496,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             lr_scheduler=training_raw["lr_scheduler"],
             lr_scheduler_t_max=training_raw["lr_scheduler_t_max"],
             lr_scheduler_eta_min=training_raw["lr_scheduler_eta_min"],
+            lr_scheduler_warmup_steps=training_raw["lr_scheduler_warmup_steps"],
+            lr_scheduler_interval=training_raw["lr_scheduler_interval"],
             lr_scheduler_step_size=training_raw["lr_scheduler_step_size"],
             lr_scheduler_gamma=training_raw["lr_scheduler_gamma"],
             lr_scheduler_patience=training_raw["lr_scheduler_patience"],

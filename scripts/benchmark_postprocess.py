@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -54,6 +56,15 @@ BEST_HIGHER_IS_BETTER = {
     "max_drawdown",
 }
 BEST_LOWER_IS_BETTER = {"turnover"}
+SUPPORTED_RANK_METRICS = BEST_HIGHER_IS_BETTER | BEST_LOWER_IS_BETTER
+METRIC_ALIASES = {
+    "sharp": "sharpe",
+    "cum_return": "cumulative_return",
+    "return": "cumulative_return",
+    "returns": "cumulative_return",
+    "total_return": "cumulative_return",
+    "total_returns": "cumulative_return",
+}
 
 
 def _configure_runtime(backtest_compile: bool) -> None:
@@ -98,14 +109,36 @@ def _parse_thresholds(raw: str) -> list[float]:
     return values
 
 
-def _force_raw_logits_config(config: Any) -> None:
+def _normalize_metric_name(raw: str) -> str:
+    name = str(raw).strip().lower().replace("-", "_")
+    return METRIC_ALIASES.get(name, name)
+
+
+def _parse_plot_metrics(raw: str | None, rank_metric: str) -> list[str]:
+    values: list[str] = []
+    source = raw if raw is not None else rank_metric
+    for item in str(source).split(","):
+        metric = _normalize_metric_name(item)
+        if not metric:
+            continue
+        if metric not in SUPPORTED_RANK_METRICS:
+            raise ValueError(f"Unsupported plot metric: {metric}")
+        if metric not in values:
+            values.append(metric)
+    if rank_metric not in values:
+        values.insert(0, rank_metric)
+    if not values:
+        raise ValueError("At least one plot metric is required")
+    return values
+
+
+def _ensure_transformer_base_portfolio_config(config: Any) -> None:
     model_name = str(config.training.model_name).strip().lower().replace("-", "_")
     if model_name not in {"transformer_base_portfolio", "transformer_base_portfolio_model", "tbp"}:
         raise ValueError(
             "Post-processing sweep needs raw model scores. This script currently supports "
             f"transformer_base_portfolio, got model_name={config.training.model_name!r}."
         )
-    config.training.transformer_base_portfolio.portfolio_output_mode = "logits"
     config.training.transformer_base_portfolio.return_aux = False
     config.training.transformer_base_portfolio.return_aux_details = False
 
@@ -191,9 +224,296 @@ def _weight_diagnostics(weights: torch.Tensor) -> dict[str, float]:
     }
 
 
+def _run_single_backtest(
+    *,
+    buffers: dict[str, torch.Tensor],
+    config: Any,
+    activation: str,
+    threshold: float,
+    scan_chunk_size: int | None,
+    return_weights_history: bool = False,
+) -> Any:
+    return run_backtest_torch(
+        buffers["scores"],
+        buffers["future_returns"],
+        buffers["tradable_mask"],
+        buffers["benchmark"],
+        buy_fee_rate=config.trading.buy_fee_rate,
+        sell_fee_rate=config.trading.sell_fee_rate,
+        long_only=config.trading.long_only,
+        max_turnover_ratio=config.trading.max_turnover_ratio,
+        gross_leverage=1.0,
+        min_trade_weight=float(threshold),
+        portfolio_activation=activation,
+        can_buy_mask=buffers["can_buy_mask"],
+        can_sell_mask=buffers["can_sell_mask"],
+        scan_chunk_size=scan_chunk_size,
+        return_weights_history=return_weights_history,
+    )
+
+
+def _run_row_backtest(
+    *,
+    row: dict[str, Any],
+    buffers_by_mode: dict[str, dict[str, torch.Tensor]],
+    config: Any,
+    scan_chunk_size: int | None,
+    return_weights_history: bool = False,
+) -> Any:
+    mode = str(row.get("mode", "raw_logits"))
+    buffers = buffers_by_mode[mode]
+    return _run_single_backtest(
+        buffers=buffers,
+        config=config,
+        activation=str(row["activation"]),
+        threshold=float(row["min_trade_weight"]),
+        scan_chunk_size=scan_chunk_size,
+        return_weights_history=return_weights_history,
+    )
+
+
+def _to_numpy_1d(values: torch.Tensor) -> np.ndarray:
+    arr = values.detach().to(dtype=torch.float64).cpu().numpy()
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+
+
+def _equity_from_log_returns(values: torch.Tensor) -> np.ndarray:
+    returns = _to_numpy_1d(values)
+    return np.exp(np.clip(np.cumsum(returns), -60.0, 60.0))
+
+
+def _import_pyplot() -> Any:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _plot_best_equity_curve(
+    *,
+    path: Path,
+    dates: np.ndarray,
+    backtest: Any,
+    best: dict[str, Any],
+    rank_metric: str,
+) -> None:
+    plt = _import_pyplot()
+    strategy_equity = _equity_from_log_returns(backtest.strategy_returns)
+    benchmark_equity = _equity_from_log_returns(backtest.benchmark_returns)
+    x_values: np.ndarray | list[int]
+    if len(dates) == len(strategy_equity):
+        x_values = dates
+    else:
+        x_values = list(range(len(strategy_equity)))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(11.5, 6.0))
+    ax.plot(x_values, strategy_equity, label="strategy", linewidth=2.0)
+    ax.plot(x_values, benchmark_equity, label="benchmark", linewidth=1.5, alpha=0.85)
+    ax.axhline(1.0, color="black", linewidth=0.8, alpha=0.35)
+    ax.set_title(
+        "Best postprocess equity "
+        f"({rank_metric}: {float(best.get(rank_metric, 0.0)):+.4f}, "
+        f"{best.get('candidate', best['activation'])}, threshold={float(best['min_trade_weight']):.6g})"
+    )
+    ax.set_ylabel("Growth of 1.0")
+    ax.grid(True, linewidth=0.5, alpha=0.25)
+    ax.legend(loc="best")
+    details = "\n".join(
+        [
+            f"Sharpe: {float(best.get('sharpe', 0.0)):+.4f}",
+            f"Cum return: {float(best.get('cumulative_return', 0.0)) * 100.0:+.2f}%",
+            f"Max DD: {float(best.get('max_drawdown', 0.0)) * 100.0:+.2f}%",
+            f"Turnover: {float(best.get('turnover', 0.0)):.4f}",
+            f"Avg positions: {float(best.get('avg_positions', 0.0)):.1f}",
+        ]
+    )
+    ax.text(
+        0.015,
+        0.985,
+        details,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "0.8", "alpha": 0.9},
+    )
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _plot_metric_heatmap(
+    *,
+    path: Path,
+    rows: list[dict[str, Any]],
+    activations: list[str],
+    thresholds: list[float],
+    metric: str,
+) -> None:
+    plt = _import_pyplot()
+    values = np.full((len(activations), len(thresholds)), np.nan, dtype=np.float64)
+    activation_idx = {name: idx for idx, name in enumerate(activations)}
+    threshold_idx = {float(value): idx for idx, value in enumerate(thresholds)}
+    for row in rows:
+        i = activation_idx.get(str(row.get("candidate", row["activation"])))
+        j = threshold_idx.get(float(row["min_trade_weight"]))
+        if i is not None and j is not None:
+            values[i, j] = float(row.get(metric, np.nan))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    width = max(8.0, 0.78 * len(thresholds) + 2.5)
+    height = max(4.8, 0.52 * len(activations) + 2.0)
+    fig, ax = plt.subplots(figsize=(width, height))
+    cmap = "magma_r" if metric in BEST_LOWER_IS_BETTER else "viridis"
+    image = ax.imshow(values, aspect="auto", cmap=cmap)
+    ax.set_title(f"Postprocess {metric} by activation and threshold")
+    ax.set_xlabel("min_trade_weight")
+    ax.set_ylabel("candidate")
+    ax.set_xticks(range(len(thresholds)))
+    ax.set_xticklabels([f"{value:g}" for value in thresholds], rotation=35, ha="right")
+    ax.set_yticks(range(len(activations)))
+    ax.set_yticklabels(activations)
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            value = values[i, j]
+            if np.isfinite(value):
+                label = f"{value:.2f}" if abs(value) >= 10 else f"{value:.3f}"
+                ax.text(j, i, label, ha="center", va="center", fontsize=7, color="white")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _plot_top_results_bar(
+    *,
+    path: Path,
+    rows_sorted: list[dict[str, Any]],
+    metric: str,
+    top_n: int,
+) -> None:
+    if not rows_sorted:
+        return
+    plt = _import_pyplot()
+    top_rows = rows_sorted[: max(1, int(top_n))]
+    labels = [f"{row.get('candidate', row['activation'])}\n{float(row['min_trade_weight']):g}" for row in top_rows]
+    values = [float(row.get(metric, 0.0)) for row in top_rows]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(max(10.0, 0.62 * len(top_rows)), 5.6))
+    bars = ax.bar(range(len(top_rows)), values, color="#3d6f91")
+    best_color = "#b8472b" if metric not in BEST_LOWER_IS_BETTER else "#2f855a"
+    bars[0].set_color(best_color)
+    ax.set_title(f"Top {len(top_rows)} postprocess settings by {metric}")
+    ax.set_ylabel(metric)
+    ax.set_xticks(range(len(top_rows)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.grid(True, axis="y", linewidth=0.5, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _write_plots(
+    *,
+    output_dir: Path,
+    split: str,
+    rows_sorted: list[dict[str, Any]],
+    best: dict[str, Any] | None,
+    buffers_by_mode: dict[str, dict[str, torch.Tensor]],
+    config: Any,
+    scan_chunk_size: int | None,
+    dates: np.ndarray,
+    activations: list[str],
+    thresholds: list[float],
+    rank_metric: str,
+    top_n: int,
+) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    heatmap_path = output_dir / f"{split}_{rank_metric}_heatmap.png"
+    _plot_metric_heatmap(
+        path=heatmap_path,
+        rows=rows_sorted,
+        activations=activations,
+        thresholds=thresholds,
+        metric=rank_metric,
+    )
+    outputs["rank_metric_heatmap"] = str(heatmap_path)
+
+    top_path = output_dir / f"{split}_top{max(1, int(top_n))}_{rank_metric}.png"
+    _plot_top_results_bar(path=top_path, rows_sorted=rows_sorted, metric=rank_metric, top_n=top_n)
+    outputs["top_results_bar"] = str(top_path)
+
+    if best is not None:
+        backtest = _run_row_backtest(
+            row=best,
+            buffers_by_mode=buffers_by_mode,
+            config=config,
+            scan_chunk_size=scan_chunk_size,
+            return_weights_history=False,
+        )
+        best_buffers = buffers_by_mode[str(best.get("mode", "raw_logits"))]
+        if best_buffers["scores"].device.type == "cuda":
+            torch.cuda.synchronize(best_buffers["scores"].device)
+        best_path = output_dir / f"{split}_best_{rank_metric}_equity_curve.png"
+        _plot_best_equity_curve(
+            path=best_path,
+            dates=dates,
+            backtest=backtest,
+            best=best,
+            rank_metric=rank_metric,
+        )
+        outputs["best_equity_curve"] = str(best_path)
+    return outputs
+
+
+def _write_metric_plots(
+    *,
+    output_dir: Path,
+    split: str,
+    rows: list[dict[str, Any]],
+    buffers_by_mode: dict[str, dict[str, torch.Tensor]],
+    config: Any,
+    scan_chunk_size: int | None,
+    dates: np.ndarray,
+    activations: list[str],
+    thresholds: list[float],
+    metrics: list[str],
+    top_n: int,
+) -> dict[str, dict[str, str]]:
+    outputs: dict[str, dict[str, str]] = {}
+    for metric in metrics:
+        rows_sorted = sorted(
+            rows,
+            key=lambda row: float(row.get(metric, 0.0)),
+            reverse=metric not in BEST_LOWER_IS_BETTER,
+        )
+        outputs[metric] = _write_plots(
+            output_dir=output_dir,
+            split=split,
+            rows_sorted=rows_sorted,
+            best=_best_by_metric(rows, metric),
+            buffers_by_mode=buffers_by_mode,
+            config=config,
+            scan_chunk_size=scan_chunk_size,
+            dates=dates,
+            activations=activations,
+            thresholds=thresholds,
+            rank_metric=metric,
+            top_n=top_n,
+        )
+    return outputs
+
+
 def _run_sweep(
     *,
     buffers: dict[str, torch.Tensor],
+    mode: str,
+    model_output_mode: str,
     activations: list[str],
     thresholds: list[float],
     config: Any,
@@ -208,6 +528,10 @@ def _run_sweep(
     benchmark = buffers["benchmark"]
 
     for activation in activations:
+        if mode == "trained_output":
+            candidate = f"trained:{model_output_mode}"
+        else:
+            candidate = f"raw:{activation}"
         for threshold in thresholds:
             started = time.perf_counter()
             bt = run_backtest_torch(
@@ -233,6 +557,9 @@ def _run_sweep(
             metrics = _compute_metrics_from_tensors(bt.strategy_returns, bt.benchmark_returns, bt.turnovers)
             diagnostics = _weight_diagnostics(bt.weights_history)
             row: dict[str, Any] = {
+                "mode": mode,
+                "model_output_mode": model_output_mode,
+                "candidate": candidate,
                 "activation": activation,
                 "min_trade_weight": float(threshold),
                 "elapsed_s": float(elapsed_s),
@@ -243,6 +570,8 @@ def _run_sweep(
             print(
                 " ".join(
                     [
+                        f"mode={mode}",
+                        f"candidate={candidate}",
                         f"activation={activation}",
                         f"threshold={threshold:g}",
                         f"sharpe={row['sharpe']:+.4f}",
@@ -301,6 +630,8 @@ def _write_markdown(path: Path, summary: dict[str, Any], rows: list[dict[str, An
             [
                 "## Best",
                 "",
+                f"- candidate: `{best.get('candidate', best['activation'])}`",
+                f"- mode: `{best.get('mode', 'raw_logits')}`",
                 f"- activation: `{best['activation']}`",
                 f"- min_trade_weight: `{best['min_trade_weight']}`",
                 f"- sharpe: `{float(best['sharpe']):+.4f}`",
@@ -311,12 +642,57 @@ def _write_markdown(path: Path, summary: dict[str, Any], rows: list[dict[str, An
                 "",
             ]
         )
+    plot_metrics = list(summary.get("plot_metrics", [rank_metric]))
+    best_by_metric = summary.get("best_by_metric", {})
+    if best_by_metric and plot_metrics:
+        lines.extend(
+            [
+                "## Best By Metric",
+                "",
+                "| metric | candidate | mode | activation | threshold | sharpe | sortino | cum_return | max_drawdown | turnover | avg_positions |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for metric in plot_metrics:
+            row = best_by_metric.get(metric)
+            if not row:
+                continue
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"`{metric}`",
+                        f"`{row.get('candidate', row['activation'])}`",
+                        f"`{row.get('mode', 'raw_logits')}`",
+                        f"`{row['activation']}`",
+                        f"{float(row['min_trade_weight']):.6g}",
+                        f"{float(row['sharpe']):+.4f}",
+                        f"{float(row['sortino']):+.4f}",
+                        _format_pct(row["cumulative_return"]),
+                        _format_pct(row["max_drawdown"]),
+                        f"{float(row['turnover']):.4f}",
+                        f"{float(row['avg_positions']):.1f}",
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+    plot_outputs = summary.get("outputs", {}).get("plots", {})
+    if plot_outputs:
+        lines.extend(["## Plots", ""])
+        for name, plot_path in plot_outputs.items():
+            if isinstance(plot_path, dict):
+                for child_name, child_path in plot_path.items():
+                    lines.append(f"- {name}/{child_name}: `{child_path}`")
+            else:
+                lines.append(f"- {name}: `{plot_path}`")
+        lines.append("")
     lines.extend(
         [
             "## Top Results",
             "",
-            "| rank | activation | threshold | sharpe | cum_return | max_drawdown | turnover | avg_positions |",
-            "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| rank | candidate | mode | activation | threshold | sharpe | cum_return | max_drawdown | turnover | avg_positions |",
+            "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for idx, row in enumerate(sorted_rows[:20], start=1):
@@ -325,6 +701,8 @@ def _write_markdown(path: Path, summary: dict[str, Any], rows: list[dict[str, An
             + " | ".join(
                 [
                     str(idx),
+                    f"`{row.get('candidate', row['activation'])}`",
+                    f"`{row.get('mode', 'raw_logits')}`",
                     f"`{row['activation']}`",
                     f"{float(row['min_trade_weight']):.6g}",
                     f"{float(row['sharpe']):+.4f}",
@@ -360,26 +738,41 @@ def main() -> None:
     )
     parser.add_argument("--max-rows", type=int, default=None, help="Optional smoke-test row cap.")
     parser.add_argument("--rank-metric", default="sharpe")
+    parser.add_argument(
+        "--plot-metrics",
+        default=None,
+        help="Comma-separated metrics to plot. Default plots only --rank-metric.",
+    )
     parser.add_argument("--backtest-compile", action="store_true")
+    parser.add_argument("--plots", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--plot-top-n", type=int, default=20)
+    parser.add_argument(
+        "--output-root",
+        default=None,
+        help="Training artifact root that contains fold_XX directories. Default follows config.runner.output_dir.",
+    )
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
     _configure_runtime(backtest_compile=bool(args.backtest_compile))
     activations = _parse_activations(args.activations)
     thresholds = _parse_thresholds(args.thresholds)
-    rank_metric = str(args.rank_metric).strip()
-    if rank_metric not in BEST_HIGHER_IS_BETTER and rank_metric not in BEST_LOWER_IS_BETTER:
+    rank_metric = _normalize_metric_name(args.rank_metric)
+    if rank_metric not in SUPPORTED_RANK_METRICS:
         raise ValueError(f"Unsupported rank metric: {rank_metric}")
+    plot_metrics = _parse_plot_metrics(args.plot_metrics, rank_metric)
 
     config = load_config(args.config)
-    _force_raw_logits_config(config)
+    _ensure_transformer_base_portfolio_config(config)
     _configure_backtest_runtime_from_config(config)
     _configure_runtime(backtest_compile=bool(args.backtest_compile))
+    original_output_mode = str(config.training.transformer_base_portfolio.portfolio_output_mode)
+    trained_activation = normalize_portfolio_activation(config.trading.portfolio_activation)
 
     device = _resolve_device(config)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     non_blocking = bool(config.training.non_blocking_transfer and device.type == "cuda")
-    output_root = Path(config.runner.output_dir)
+    output_root = Path(args.output_root) if args.output_root else Path(config.runner.output_dir)
     fold_dir = output_root / f"fold_{int(args.fold):02d}"
     checkpoint_path = fold_dir / "checkpoint_best.pt"
 
@@ -449,6 +842,7 @@ def main() -> None:
     _load_state_dict(model, state_dict)
 
     date_indices = split.valid_indices.detach().cpu().numpy()
+    dates = np.asarray(panel.dates[date_indices])
     date_start = str(panel.dates[int(date_indices[0])])
     date_end = str(panel.dates[int(date_indices[-1])])
     print(
@@ -468,6 +862,9 @@ def main() -> None:
                 "scan_chunk_size": int(scan_chunk_size),
                 "activations": activations,
                 "thresholds": thresholds,
+                "trained_output_mode": original_output_mode,
+                "trained_activation": trained_activation,
+                "plot_metrics": plot_metrics,
             },
             sort_keys=True,
         ),
@@ -475,7 +872,7 @@ def main() -> None:
     )
 
     started = time.perf_counter()
-    buffers = _collect_raw_scores(
+    trained_buffers = _collect_raw_scores(
         model=model,
         split=split,
         device=device,
@@ -483,16 +880,47 @@ def main() -> None:
         non_blocking=non_blocking,
         chunk_rows=chunk_rows,
     )
-    inference_elapsed_s = time.perf_counter() - started
-    print(f"raw_score_inference_s={inference_elapsed_s:.3f}", flush=True)
+    trained_inference_elapsed_s = time.perf_counter() - started
+    print(f"trained_output_inference_s={trained_inference_elapsed_s:.3f}", flush=True)
 
-    rows = _run_sweep(
-        buffers=buffers,
+    if not hasattr(model, "portfolio_output_mode"):
+        raise ValueError(f"Model does not expose portfolio_output_mode: {type(model).__name__}")
+    model.portfolio_output_mode = "logits"  # type: ignore[attr-defined]
+    started = time.perf_counter()
+    raw_buffers = _collect_raw_scores(
+        model=model,
+        split=split,
+        device=device,
+        amp_dtype=amp_dtype,
+        non_blocking=non_blocking,
+        chunk_rows=chunk_rows,
+    )
+    raw_inference_elapsed_s = time.perf_counter() - started
+    print(f"raw_score_inference_s={raw_inference_elapsed_s:.3f}", flush=True)
+
+    buffers_by_mode = {
+        "trained_output": trained_buffers,
+        "raw_logits": raw_buffers,
+    }
+    trained_rows = _run_sweep(
+        buffers=trained_buffers,
+        mode="trained_output",
+        model_output_mode=original_output_mode,
+        activations=[trained_activation],
+        thresholds=thresholds,
+        config=config,
+        scan_chunk_size=scan_chunk_size,
+    )
+    raw_rows = _run_sweep(
+        buffers=raw_buffers,
+        mode="raw_logits",
+        model_output_mode="logits",
         activations=activations,
         thresholds=thresholds,
         config=config,
         scan_chunk_size=scan_chunk_size,
     )
+    rows = trained_rows + raw_rows
     best_by = {
         metric: _best_by_metric(rows, metric)
         for metric in [
@@ -529,8 +957,13 @@ def main() -> None:
         "scan_chunk_size": int(scan_chunk_size),
         "activations": activations,
         "thresholds": thresholds,
+        "trained_output_mode": original_output_mode,
+        "trained_activation": trained_activation,
         "rank_metric": rank_metric,
-        "inference_elapsed_s": float(inference_elapsed_s),
+        "plot_metrics": plot_metrics,
+        "inference_elapsed_s": float(trained_inference_elapsed_s + raw_inference_elapsed_s),
+        "trained_output_inference_elapsed_s": float(trained_inference_elapsed_s),
+        "raw_logits_inference_elapsed_s": float(raw_inference_elapsed_s),
         "best_by_rank_metric": best_rank,
         "best_by_metric": best_by,
         "outputs": {
@@ -544,11 +977,34 @@ def main() -> None:
         key=lambda row: float(row.get(rank_metric, 0.0)),
         reverse=rank_metric not in BEST_LOWER_IS_BETTER,
     )
+    if args.plots:
+        try:
+            summary["outputs"]["plots"] = _write_metric_plots(
+                output_dir=output_dir,
+                split=args.split,
+                rows=rows,
+                buffers_by_mode=buffers_by_mode,
+                config=config,
+                scan_chunk_size=scan_chunk_size,
+                dates=dates,
+                activations=list(dict.fromkeys([row["candidate"] for row in rows])),
+                thresholds=thresholds,
+                metrics=plot_metrics,
+                top_n=int(args.plot_top_n),
+            )
+        except Exception as exc:
+            summary["outputs"]["plot_error"] = repr(exc)
+            print(f"plot_error={exc!r}", flush=True)
     _write_csv(csv_path, rows_sorted)
     json_path.write_text(json.dumps({"summary": summary, "results": rows_sorted}, indent=2), encoding="utf-8")
     _write_markdown(md_path, summary, rows_sorted, rank_metric)
 
     print("BEST " + json.dumps(best_rank, sort_keys=True), flush=True)
+    print(
+        "BEST_BY_METRIC "
+        + json.dumps({metric: best_by.get(metric) for metric in plot_metrics}, sort_keys=True),
+        flush=True,
+    )
     print(json.dumps(summary["outputs"], sort_keys=True), flush=True)
 
 
