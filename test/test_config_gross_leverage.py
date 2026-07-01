@@ -2,6 +2,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import yaml
 
@@ -71,6 +72,24 @@ def test_load_config_migrates_legacy_gross_leverage_to_reporting_leverage(tmp_pa
     assert not hasattr(config.trading, "gross_leverage")
     assert not hasattr(config.evaluation, "primary_baseline")
     assert not hasattr(config.evaluation, "metrics")
+
+
+def test_load_config_preserves_lr_scheduler_warmup_fields(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={
+            "enable_lr_scheduler": True,
+            "lr_scheduler": "warmup_cosine",
+            "lr_scheduler_warmup_steps": 123,
+            "lr_scheduler_interval": "step",
+        },
+    )
+
+    config = load_config(config_path)
+
+    assert config.training.lr_scheduler == "warmup_cosine"
+    assert config.training.lr_scheduler_warmup_steps == 123
+    assert config.training.lr_scheduler_interval == "step"
 
 
 def test_backtest_exposure_budget_caps_multiplier_at_one() -> None:
@@ -168,3 +187,48 @@ def test_load_config_best_val_artifacts_master_switch_enables_fold_artifacts(tmp
     assert config.training.save_best_val_artifacts is True
     assert config.training.save_best_val_fold_artifacts is True
     assert config.training.save_best_val_fold_plots is True
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "expected_mode"),
+    [
+        ("activation-l1", "activation_l1"),
+        ("raw_l1", "l1"),
+        ("raw-scores", "logits"),
+        ("signed-action-softmax", "signed_softmax"),
+        ("signed-action-sparsemax", "signed_sparsemax"),
+        ("signed-action-entmax", "signed_entmax15"),
+        ("differentiable-projection", "projection_l1"),
+    ],
+)
+def test_load_config_normalizes_portfolio_output_mode_aliases(
+    tmp_path: Path,
+    raw_mode: str,
+    expected_mode: str,
+) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={
+            "transformer_base_portfolio": {
+                "portfolio_output_mode": raw_mode,
+            }
+        },
+    )
+
+    config = load_config(config_path)
+
+    assert config.training.transformer_base_portfolio.portfolio_output_mode == expected_mode
+
+
+def test_load_config_rejects_unknown_portfolio_output_mode(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={
+            "transformer_base_portfolio": {
+                "portfolio_output_mode": "mystery_mode",
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="portfolio_output_mode"):
+        load_config(config_path)

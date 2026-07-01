@@ -106,6 +106,7 @@ class TimingBreakdown:
     grad_s: float = 0.0
     grad_cuda_s: float = 0.0
     clip_s: float = 0.0
+    clip_cuda_s: float = 0.0
     finite_check_s: float = 0.0
     step_s: float = 0.0
     step_cuda_s: float = 0.0
@@ -148,6 +149,7 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "grad_s",
         "grad_cuda_s",
         "clip_s",
+        "clip_cuda_s",
         "finite_check_s",
         "step_s",
         "step_cuda_s",
@@ -191,6 +193,7 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "grad_s",
         "grad_cuda_s",
         "clip_s",
+        "clip_cuda_s",
         "finite_check_s",
         "step_s",
         "step_cuda_s",
@@ -1257,6 +1260,10 @@ def _metrics_path(fold_dir: Path) -> Path:
     return fold_dir / "metrics.json"
 
 
+def _fold_complete_marker_path(fold_dir: Path) -> Path:
+    return fold_dir / "fold_complete.json"
+
+
 def _model_path(fold_dir: Path) -> Path:
     return fold_dir / "model.pt"
 
@@ -1706,6 +1713,7 @@ def _timing_curve_payload(
         "train_grad_ms_per_batch": _avg_ms(train_timing.grad_s),
         "train_grad_cuda_ms_per_batch": _avg_ms(train_timing.grad_cuda_s),
         "train_clip_ms_per_batch": _avg_ms(train_timing.clip_s),
+        "train_clip_cuda_ms_per_batch": _avg_ms(train_timing.clip_cuda_s),
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
         "train_step_ms_per_batch": _avg_ms(train_timing.step_s),
         "train_step_cuda_ms_per_batch": _avg_ms(train_timing.step_cuda_s),
@@ -1913,6 +1921,42 @@ def _load_fold_result(metrics_path: Path) -> FoldResult:
     return FoldResult(**payload)
 
 
+def _write_fold_complete_marker(
+    fold_dir: Path,
+    fold_result: FoldResult,
+    *,
+    source: str,
+) -> None:
+    marker = {
+        "status": "complete",
+        "source": str(source),
+        "fold_id": int(fold_result.fold_id),
+        "train_years": [int(year) for year in fold_result.train_years],
+        "val_years": [int(year) for year in fold_result.val_years],
+        "test_years": [int(year) for year in fold_result.test_years],
+        "metrics_json": _metrics_path(fold_dir).name,
+        "model_path": _model_path(fold_dir).name,
+        "backtest_npz": _backtest_path(fold_dir).name,
+        "written_at_unix_seconds": float(time.time()),
+    }
+    marker_path = _fold_complete_marker_path(fold_dir)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    with marker_path.open("w", encoding="utf-8") as handle:
+        json.dump(marker, handle, indent=2)
+
+
+def _has_completed_fold_marker(fold_dir: Path) -> bool:
+    marker_path = _fold_complete_marker_path(fold_dir)
+    if not marker_path.exists():
+        return False
+    try:
+        with marker_path.open("r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return str(marker.get("status", "")).lower() == "complete"
+
+
 def _write_summary(results: list[FoldResult], output_path: Path) -> None:
     summary_path = _summary_path(output_path)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1922,6 +1966,53 @@ def _write_summary(results: list[FoldResult], output_path: Path) -> None:
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return getattr(model, "_orig_mod", model)
+
+
+def _clip_model_gradients_(model: nn.Module, max_norm: float) -> None:
+    params = [param for param in _unwrap_model(model).parameters() if param.grad is not None]
+    if not params:
+        return
+    try:
+        torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm=float(max_norm),
+            error_if_nonfinite=False,
+            foreach=True,
+        )
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "foreach" not in message and "not implemented" not in message and "not support" not in message:
+            raise
+        torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm=float(max_norm),
+            error_if_nonfinite=False,
+            foreach=False,
+        )
+
+
+def _run_gradient_clip_(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    *,
+    grad_clip_norm: float,
+    timing: TimingBreakdown,
+    device: torch.device,
+    profile_timing: bool,
+) -> None:
+    if float(grad_clip_norm) <= 0.0:
+        return
+    clip_start = time.perf_counter()
+    with _cuda_timing(timing, "clip_cuda_s", device):
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+        # Avoid error_if_nonfinite=True here: it turns the CUDA total norm into a
+        # Python bool and synchronizes every batch. Periodic finite checks below
+        # provide the explicit safety gate when configured.
+        _clip_model_gradients_(model, float(grad_clip_norm))
+    _maybe_sync_cuda(device, profile_timing)
+    timing.clip_s += time.perf_counter() - clip_start
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
@@ -2584,6 +2675,7 @@ def _save_fold_output_artifacts(
     backtest_artifact_compression: str | None = None,
     print_report: bool = True,
     write_plots: bool = True,
+    mark_complete: bool = False,
 ) -> tuple[dict[str, float | str], dict[str, float | str]]:
     fold_dir.mkdir(parents=True, exist_ok=True)
     save_start = time.perf_counter()
@@ -2762,6 +2854,8 @@ def _save_fold_output_artifacts(
         json.dumps(plot_timing, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    if mark_complete:
+        _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
     return save_timing, plot_timing
 
 
@@ -5725,7 +5819,12 @@ def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult |
     metrics_path = _metrics_path(fold_dir)
     model_path = _model_path(fold_dir)
     backtest_path = _backtest_path(fold_dir)
-    if metrics_path.exists() and model_path.exists() and backtest_path.exists():
+    if (
+        _has_completed_fold_marker(fold_dir)
+        and metrics_path.exists()
+        and model_path.exists()
+        and backtest_path.exists()
+    ):
         return _load_fold_result(metrics_path)
     return None
 
@@ -5921,6 +6020,217 @@ def _training_loss_portfolio_activation(config: ExperimentConfig) -> str:
     if activation in {"", "auto", "trading", "same", "same_as_trading"}:
         return str(config.trading.portfolio_activation)
     return activation
+
+
+def _postprocess_benchmark_script() -> Path:
+    return Path(__file__).resolve().parents[2] / "scripts" / "benchmark_postprocess.py"
+
+
+def _postprocess_benchmark_config_path() -> str:
+    return os.environ.get("STOCKAGENT_CONFIG_PATH", "configs/markets/tw.yaml")
+
+
+def _postprocess_benchmark_metric_name(raw: str) -> str:
+    name = str(raw).strip().lower().replace("-", "_")
+    aliases = {
+        "sharp": "sharpe",
+        "cum_return": "cumulative_return",
+        "return": "cumulative_return",
+        "returns": "cumulative_return",
+        "total_return": "cumulative_return",
+        "total_returns": "cumulative_return",
+    }
+    return aliases.get(name, name)
+
+
+def _postprocess_benchmark_plot_metrics(config: ExperimentConfig, rank_metric: str) -> list[str]:
+    raw = str(getattr(config.training, "postprocess_benchmark_plot_metrics", rank_metric))
+    metrics: list[str] = []
+    for item in raw.split(","):
+        metric = _postprocess_benchmark_metric_name(item)
+        if not metric:
+            continue
+        if metric not in metrics:
+            metrics.append(metric)
+    if rank_metric not in metrics:
+        metrics.insert(0, rank_metric)
+    return metrics
+
+
+def _run_postprocess_benchmark_after_fold(
+    *,
+    config: ExperimentConfig,
+    output_path: Path,
+    fold_id: int,
+    enabled: bool | None = None,
+) -> None:
+    if enabled is None:
+        enabled = bool(getattr(config.training, "postprocess_benchmark_after_fold", False))
+    if not bool(enabled):
+        return
+
+    script_path = _postprocess_benchmark_script()
+    if not script_path.exists():
+        message = f"[Fold {fold_id}] postprocess benchmark skipped: missing {script_path}"
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise FileNotFoundError(message)
+        print(message)
+        return
+
+    split = str(getattr(config.training, "postprocess_benchmark_split", "test")).strip().lower()
+    rank_metric = _postprocess_benchmark_metric_name(
+        str(getattr(config.training, "postprocess_benchmark_rank_metric", "sharpe"))
+    )
+    plot_metrics = _postprocess_benchmark_plot_metrics(config, rank_metric)
+    fold_dir = _fold_dir(output_path, fold_id)
+    checkpoint_path = fold_dir / "checkpoint_best.pt"
+    if not checkpoint_path.exists():
+        message = f"[Fold {fold_id}] postprocess benchmark skipped: missing {checkpoint_path}"
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise FileNotFoundError(message)
+        print(message)
+        return
+    output_dir = fold_dir / "postprocess_benchmark"
+    best_plot_paths = [output_dir / f"{split}_best_{metric}_equity_curve.png" for metric in plot_metrics]
+    json_path = output_dir / f"{split}_activation_threshold_sweep.json"
+    has_trained_output_candidate = False
+    if json_path.exists():
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
+            results = payload.get("results", []) if isinstance(payload, dict) else []
+            summary_metrics = summary.get("plot_metrics", [])
+            has_trained_output_candidate = bool(summary.get("trained_output_mode")) and any(
+                isinstance(row, dict) and row.get("mode") == "trained_output"
+                for row in results
+            )
+            has_trained_output_candidate = has_trained_output_candidate and all(
+                metric in summary_metrics for metric in plot_metrics
+            )
+        except Exception:
+            has_trained_output_candidate = False
+    if best_plot_paths and all(
+        path.exists() and path.stat().st_mtime >= checkpoint_path.stat().st_mtime
+        for path in best_plot_paths
+    ) and has_trained_output_candidate:
+        print(f"[Fold {fold_id}] postprocess benchmark already exists: {output_dir}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / f"{split}_activation_threshold_sweep.log"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--config",
+        _postprocess_benchmark_config_path(),
+        "--fold",
+        str(int(fold_id)),
+        "--split",
+        split,
+        "--activations",
+        str(getattr(config.training, "postprocess_benchmark_activations", "identity,softsign,tanh,isru,erf,atan,gd")),
+        "--thresholds",
+        str(
+            getattr(
+                config.training,
+                "postprocess_benchmark_thresholds",
+                "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02",
+            )
+        ),
+        "--rank-metric",
+        rank_metric,
+        "--plot-metrics",
+        ",".join(plot_metrics),
+        "--plot-top-n",
+        str(int(getattr(config.training, "postprocess_benchmark_plot_top_n", 20))),
+        "--output-root",
+        str(output_path),
+    ]
+    max_rows = int(getattr(config.training, "postprocess_benchmark_max_rows", 0))
+    if max_rows > 0:
+        cmd.extend(["--max-rows", str(max_rows)])
+    if bool(getattr(config.training, "postprocess_benchmark_backtest_compile", False)):
+        cmd.append("--backtest-compile")
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    started = time.perf_counter()
+    print(f"[Fold {fold_id}] running postprocess benchmark for best checkpoint: {output_dir}")
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    elapsed_s = time.perf_counter() - started
+    combined_output = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
+    log_path.write_text(combined_output, encoding="utf-8")
+
+    if proc.returncode != 0:
+        tail = "\n".join(combined_output.strip().splitlines()[-40:])
+        message = (
+            f"[Fold {fold_id}] postprocess benchmark failed in {elapsed_s:.1f}s "
+            f"(exit={proc.returncode}); log={log_path}\n{tail}"
+        )
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise RuntimeError(message)
+        print(message)
+        return
+
+    best_payload: dict[str, Any] | None = None
+    best_by_metric_payload: dict[str, Any] | None = None
+    output_payload: dict[str, Any] | None = None
+    for raw_line in combined_output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("BEST "):
+            try:
+                parsed = json.loads(line[len("BEST ") :])
+                if isinstance(parsed, dict):
+                    best_payload = parsed
+            except json.JSONDecodeError:
+                pass
+        elif line.startswith("BEST_BY_METRIC "):
+            try:
+                parsed = json.loads(line[len("BEST_BY_METRIC ") :])
+                if isinstance(parsed, dict):
+                    best_by_metric_payload = parsed
+            except json.JSONDecodeError:
+                pass
+        elif line.startswith("{") and "best_equity_curve" in line:
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    output_payload = parsed
+            except json.JSONDecodeError:
+                pass
+
+    if best_payload:
+        print(
+            f"[Fold {fold_id}] postprocess best {rank_metric}: "
+            f"activation={best_payload.get('activation')} "
+            f"threshold={float(best_payload.get('min_trade_weight', 0.0)):.6g} "
+            f"sharpe={float(best_payload.get('sharpe', 0.0)):+.4f} "
+            f"cum={float(best_payload.get('cumulative_return', 0.0)):+.4f} "
+            f"plots={output_dir}"
+        )
+        if best_by_metric_payload:
+            for metric in plot_metrics:
+                row = best_by_metric_payload.get(metric)
+                if not isinstance(row, dict):
+                    continue
+                print(
+                    f"[Fold {fold_id}] postprocess best {metric}: "
+                    f"activation={row.get('activation')} "
+                    f"threshold={float(row.get('min_trade_weight', 0.0)):.6g} "
+                    f"sharpe={float(row.get('sharpe', 0.0)):+.4f} "
+                    f"sortino={float(row.get('sortino', 0.0)):+.4f} "
+                    f"cum={float(row.get('cumulative_return', 0.0)):+.4f}"
+                )
+    elif output_payload:
+        print(f"[Fold {fold_id}] postprocess benchmark outputs: {output_payload}")
+    else:
+        print(f"[Fold {fold_id}] postprocess benchmark finished in {elapsed_s:.1f}s; log={log_path}")
 
 
 def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
@@ -6556,11 +6866,15 @@ def _train_epoch(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
-                clip_start = time.perf_counter()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6594,10 +6908,15 @@ def _train_epoch(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
-                clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6696,6 +7015,8 @@ def _train_epoch_tensor(
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_aug_kwargs: dict[str, float] | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
@@ -6862,11 +7183,15 @@ def _train_epoch_tensor(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
-                clip_start = time.perf_counter()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6888,6 +7213,8 @@ def _train_epoch_tensor(
                 scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
@@ -6898,10 +7225,15 @@ def _train_epoch_tensor(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
-                clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6922,6 +7254,8 @@ def _train_epoch_tensor(
                 optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -6993,6 +7327,8 @@ def _train_epoch_windowed_tensor(
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_aug_kwargs: dict[str, float] | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
@@ -7188,11 +7524,15 @@ def _train_epoch_windowed_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             if grad_clip_norm > 0.0:
-                clip_start = time.perf_counter()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
             gradients_are_finite = True
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -7207,6 +7547,8 @@ def _train_epoch_windowed_tensor(
                 scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
@@ -7214,10 +7556,15 @@ def _train_epoch_windowed_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             if grad_clip_norm > 0.0:
-                clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
             gradients_are_finite = True
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -7231,6 +7578,8 @@ def _train_epoch_windowed_tensor(
                 optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -7597,6 +7946,7 @@ def _run_training_tree_models(
                 write_holdings_table=write_integer_holdings_table,
                 table_output_format=table_output_format,
             )
+            _write_fold_complete_marker(fold_dir, fold_result, source="tree_training_final")
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
 
@@ -7838,6 +8188,7 @@ def _run_inference_tree_models(
             write_holdings_table=write_integer_holdings_table,
             table_output_format=table_output_format,
         )
+        _write_fold_complete_marker(fold_dir, fold_result, source="tree_inference_final")
 
     if results_by_fold:
         _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -8163,6 +8514,7 @@ def _run_inference_neural_models(
             write_holdings_table=write_integer_holdings_table,
             table_output_format=table_output_format,
         )
+        _write_fold_complete_marker(fold_dir, fold_result, source="neural_inference_final")
 
     if results_by_fold:
         _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -8284,6 +8636,14 @@ def run_training(
             if config.training.warm_start_from_previous_fold and group_checkpoint_path.exists():
                 warm_start_checkpoint_path = group_checkpoint_path
             print(f"[Train {train_years}] already completed, skipping")
+            for fold in group_folds:
+                if fold.fold_id in results_by_fold:
+                    _run_postprocess_benchmark_after_fold(
+                        config=config,
+                        output_path=output_path,
+                        fold_id=fold.fold_id,
+                        enabled=bool(getattr(config.training, "postprocess_benchmark_after_fold", False)),
+                    )
             continue
 
         print(f"\n{'='*80}")
@@ -9302,6 +9662,8 @@ def run_training(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    lr_scheduler=scheduler,
+                    lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
                 )
             if train_windowed is not None:
@@ -9347,6 +9709,8 @@ def run_training(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    lr_scheduler=scheduler,
+                    lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
                 )
             return _train_epoch_tensor(
@@ -9396,6 +9760,8 @@ def run_training(
                 regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                 regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                 factor_aug_kwargs=factor_aug_kwargs,
+                lr_scheduler=scheduler,
+                lr_scheduler_interval=scheduler_step_interval,
                 profile_timing=profile_timing,
             )
 
@@ -9646,6 +10012,13 @@ def run_training(
                 f"{time.perf_counter() - artifact_start:.1f}s "
                 f"(test_eval={test_eval_total:.1f}s, compression=compressed): {fold_dir}"
             )
+            if bool(getattr(config.training, "postprocess_benchmark_after_best_val", False)):
+                _run_postprocess_benchmark_after_fold(
+                    config=config,
+                    output_path=output_path,
+                    fold_id=fold.fold_id,
+                    enabled=bool(getattr(config.training, "postprocess_benchmark_after_best_val", False)),
+                )
             return fold_result
 
         for epoch in epoch_pbar:
@@ -10135,7 +10508,7 @@ def run_training(
                     scheduler_start = time.perf_counter()
                     if scheduler_requires_metric:
                         scheduler.step(float(np.mean(val_losses)))
-                    else:
+                    elif scheduler_step_interval != "step":
                         scheduler.step()
                     scheduler_total = time.perf_counter() - scheduler_start
 
@@ -10592,6 +10965,7 @@ def run_training(
                 holdings_records=holdings_records,
                 print_report=True,
                 write_plots=True,
+                mark_complete=True,
             )
             plot_total = float(plot_timing.get("total_s", 0.0))
 
@@ -10675,5 +11049,14 @@ def run_training(
         scheduler = None
         if device.type == "cuda":
             _release_cuda_memory(device)
+
+        for fold in group_folds:
+            if fold.fold_id in results_by_fold:
+                _run_postprocess_benchmark_after_fold(
+                    config=config,
+                    output_path=output_path,
+                    fold_id=fold.fold_id,
+                    enabled=bool(getattr(config.training, "postprocess_benchmark_after_fold", False)),
+                )
 
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

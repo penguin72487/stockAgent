@@ -96,6 +96,24 @@ def test_signed_action_entmax_can_return_sparse_actions() -> None:
     assert int((zero_actions <= 1e-7).sum().item()) >= 1
 
 
+def test_signed_action_entmax_amplifies_uniform_large_universe_gradient_vs_softmax() -> None:
+    num_symbols = 512
+    mask = torch.ones(1, num_symbols, dtype=torch.bool)
+    returns = torch.linspace(-1.0, 1.0, num_symbols, dtype=torch.float32).view(1, num_symbols)
+
+    def _grad_abs_mean(transform: str) -> torch.Tensor:
+        logits = torch.zeros(1, num_symbols, dtype=torch.float32, requires_grad=True)
+        weights = masked_signed_action_weights(logits, mask, transform=transform, long_only=False)
+        objective = (weights * returns).sum()
+        objective.backward()
+        return logits.grad.abs().mean()
+
+    softmax_grad = _grad_abs_mean("softmax")
+    entmax_grad = _grad_abs_mean("entmax15")
+
+    assert entmax_grad > softmax_grad * 10.0
+
+
 def test_signed_action_sparsemax_can_return_sparse_actions() -> None:
     logits = torch.tensor([[4.0, 1.0, -4.0, 0.0]], dtype=torch.float32)
     mask = torch.ones_like(logits, dtype=torch.bool)
