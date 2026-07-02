@@ -1,11 +1,11 @@
-experiment_name: tw-stock-transformer-fold24-25-stability
+experiment_name: tw-stock-transformer-market-public-data
 
 runner:
-  output_dir: artifacts
+  output_dir: artifacts/markets/tw_public
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 24
+  start_fold: 25
 environment:
   conda_env: fintech
   device: cuda
@@ -25,15 +25,15 @@ data:
   panel_load_workers: 16
   trading_volume_policy: auto
   tradable_mode: tw_limit_guard
-  use_tw_public_features: false
+  use_tw_public_features: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
-  # Use configs/markets/tw_public.yaml for the public-data feature experiment.
   # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
   val_years: 1
+  # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
 
 trading:
@@ -43,7 +43,7 @@ trading:
   max_turnover_ratio: 50.0
   leverage: 2.5
   min_trade_weight: 0.0
-  portfolio_activation: identity
+  portfolio_activation: pre_normalized
   long_only: false
   cash_allowed: true
 training:
@@ -60,10 +60,11 @@ training:
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
   fused_log_utility_loss: true
+  loss_portfolio_activation: pre_normalized
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: auto
+  eval_model_chunk_rows: 8
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 16
@@ -74,6 +75,8 @@ training:
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
+  inference_backtest_autotune: false
+  inference_backtest_compile: false
   backtest_cpp_ext: false
   backtest_verbose: false
   strict_no_fallback: true
@@ -81,10 +84,10 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 32
-  batch_size_train: 32
-  batch_size_eval: 16
-  epochs: 1000
+  batch_size: 16
+  batch_size_train: 16
+  batch_size_eval: 8
+  epochs: 10000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
   curve_test_interval: 1
@@ -148,21 +151,34 @@ training:
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
   backtest_artifact_compression: none
-  save_best_val_artifacts: false
+  save_best_val_artifacts: true
+  postprocess_benchmark_after_fold: true
+  postprocess_benchmark_after_best_val: true
+  postprocess_benchmark_split: test
+  postprocess_benchmark_activations: identity,softsign,tanh,isru,erf,atan,gd
+  postprocess_benchmark_thresholds: 0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02
+  postprocess_benchmark_rank_metric: cumulative_return
+  postprocess_benchmark_plot_metrics: sharpe,sortino,cumulative_return
+  postprocess_benchmark_plot_top_n: 20
+  postprocess_benchmark_backtest_compile: false
+  postprocess_benchmark_max_rows: 0
+  postprocess_benchmark_strict: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
-  learning_rate: 0.000075
-  enable_lr_scheduler: false
-  lr_scheduler: plateau
+  learning_rate: 0.0003
+  enable_lr_scheduler: true
+  lr_scheduler: warmup_cosine
   lr_scheduler_t_max: 0
   lr_scheduler_eta_min: 0.00001
+  lr_scheduler_warmup_steps: 500
+  lr_scheduler_interval: step
   lr_scheduler_step_size: 50
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 4
   lr_scheduler_threshold: 0.0005
   top_k: 10
   num_workers: 0
-  weight_decay: 0.02
+  weight_decay: 0.01
   grad_clip_norm: 1.0
   finite_check_interval_steps: 100
   loss_type: log_utility
@@ -289,8 +305,8 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: last
-    temporal_query_mode: last_only
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -301,7 +317,7 @@ training:
     num_latent_factors: 16
     num_market_tokens: 4
     market_layers: 1
-    dynamic_latent_tokens: false
+    dynamic_latent_tokens: true
     dynamic_market_tokens: true
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
@@ -309,8 +325,18 @@ training:
     head_hidden_dim: 32
     head_layers: 1
     dropout: 0.0
-    default_temperature: 1.5
+    default_temperature: 1
     portfolio_mode: long_short
+    # portfolio_output_mode design:
+    # - activation_l1: legacy activated scores -> full-gross L1 weights; good baseline, dense.
+    # - l1: raw centered scores -> full-gross L1 weights; strongest dense gradient among normalized modes.
+    # - logits: raw centered logits; pair trading/loss portfolio_activation=identity so backtest/loss normalizes.
+    # - signed_softmax: dense long/short/cash action simplex; legal cash, but weakest gradient for large S.
+    # - signed_entmax15: sparse-ish long/short/cash action simplex; recommended when large-S softmax gradients are too small.
+    # - signed_sparsemax: hardest sparse long/short/cash simplex; largest local gradients, more support-jump risk.
+    # - projection_l1: raw holdings projected to L1 ball; legal cash, sparse only when raw gross exceeds 1.
+    # For signed_* and projection_l1, keep portfolio_activation/loss_portfolio_activation=pre_normalized.
+    portfolio_output_mode: projection_l1
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false

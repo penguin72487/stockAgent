@@ -20,6 +20,8 @@ Multi-asset Taiwan stock trading research workspace.
 
 - Install dependencies from `requirements.txt` inside the `fintech` environment.
 - Run Taiwan training with `python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
+- Run the independent Taiwan public-data experiment with `python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public`.
+- `configs/markets/tw_public.yaml` enables `data.use_tw_public_features` and appends `data_tw_public/features/tw_public_stock_daily.parquet` as extra `twpub_*` features.
 - Or use the project runner: `./coda_runner.sh`.
 - Runner defaults are centralized in `configs/runner.env`.
 - Outputs include one folder per walk-forward fold and a top-level `summary.json`.
@@ -61,6 +63,20 @@ Multi-asset Taiwan stock trading research workspace.
 - Override the default universe with `--symbols` or `--symbols-file`, for example `python download_yahoo_ohlcv.py --asset forex --symbols EURUSD GBPUSD USDJPY`.
 - Use `python download_yahoo_ohlcv.py --mode incremental --asset all` for incremental updates across Yahoo assets; crypto remains 15-minute.
 
+## Taiwan Public Data Download
+
+- Run `python downloader/download_tw_public_data.py --mode daily-update --datasets all --output-dir data_tw_public` to collect Taiwan free public datasets from TWSE, TPEx, MOPS-backed OpenAPI feeds, TDCC, TAIFEX, CBC, DGBAS, and MOF.
+- The first `daily-update` run backfills historical daily datasets where the official endpoint supports dates, including TWSE/TPEx OHLCV, margin balance, institutional trades, and valuation tables. Later runs append only missing dates.
+- Snapshot-style OpenAPI feeds that only publish the latest table are stored with a `date` batch column, so daily runs accumulate same-day-replaced snapshots instead of discarding prior days.
+- Government Data Platform datasets are resolved through `data.gov.tw` metadata at runtime, then written to parquet with raw metadata under `data_tw_public/metadata/`.
+- Use tags to limit scope, for example `--datasets price`, `--datasets twse tpex`, `--datasets macro`, `--datasets taifex tdcc`, or a concrete dataset such as `twse_daily_ohlcv`.
+- Use `--mode list --datasets all` to print the bundled dataset manifest.
+- Outputs include one parquet per dataset, raw responses under `raw/` unless `--skip-raw` is set, plus `download_report.csv`, `download_summary.json`, and `dataset_manifest.json`.
+- For a smoke run, use `--start-date 2024-06-03 --end-date 2024-06-03 --datasets twse_daily_ohlcv tpex_daily_ohlcv --skip-raw`.
+- Build the training feature parquet with `python scripts/build_tw_public_training_features.py --input-dir data_tw_public --output-path data_tw_public/features/tw_public_stock_daily.parquet --symbols-root data_yahoo/tw_stocks`.
+- The feature parquet is a sparse `date` x `symbol` long table. Stock-specific rows align by ticker/date; macro/TAIFEX market rows use symbol `__MARKET__` and are broadcast to all stocks during panel build.
+- `downloader/run_daily_all_markets.sh` and `downloader/daily_downloader_daemon.sh` run this step daily by default, then rebuild `data_tw_public/features/tw_public_stock_daily.parquet`. Set `RUN_TW_PUBLIC_DATA=0` to skip raw public data, `RUN_TW_PUBLIC_FEATURES=0` to skip feature rebuild, narrow scope with `TW_PUBLIC_DATASETS="twse tpex macro"`, or set `TW_PUBLIC_SKIP_RAW=1` when raw response archives are not needed.
+
 ### Repair Mode
 
 - Use `python download_yahoo_ohlcv.py --mode repair --asset all` to check all assets and repair missing/stale parquet files toward today.
@@ -73,7 +89,9 @@ Multi-asset Taiwan stock trading research workspace.
 ### Daily All-Market Update
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
-- The script runs Yahoo all-asset update (`tw_stocks`, `us_stocks`, `crypto`, `forex`; crypto uses 15-minute bars), Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
+- The script runs Yahoo all-asset update (`tw_stocks`, `us_stocks`, `crypto`, `forex`; crypto uses 15-minute bars), Taiwan public data daily-update plus public-data feature rebuild, Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
+- Set `RUN_TW_PUBLIC_DATA=0` to skip the Taiwan public data downloader. The first enabled run may backfill many historical official-data dates.
+- Set `RUN_TW_PUBLIC_FEATURES=0` to skip rebuilding `data_tw_public/features/tw_public_stock_daily.parquet`.
 - Set `RUN_PEPPERSTONE_GROUPS=0` to skip Pepperstone groups when you only want Yahoo+Frankfurter.
 - Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
 - Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
