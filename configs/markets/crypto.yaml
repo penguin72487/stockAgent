@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 6
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -150,6 +150,7 @@ training:
   save_best_val_artifacts: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
+  save_best_val_artifacts: false
   learning_rate: 0.001
   enable_lr_scheduler: false
   lr_scheduler: plateau
