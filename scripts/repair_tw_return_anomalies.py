@@ -7,14 +7,14 @@ import json
 import math
 import shutil
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
-import pyarrow as pa
+import polars as pl
 import pyarrow.parquet as pq
 import requests
 
@@ -61,10 +61,80 @@ def _finite_positive(value: Any) -> bool:
     return bool(np.isfinite(value_f) and value_f > 0.0)
 
 
+def _not_null(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if isinstance(value, float) and np.isnan(value):
+            return False
+    except Exception:
+        pass
+    text = str(value).strip().lower()
+    return text not in {"", "nan", "nat", "none", "null"}
+
+
+def _numeric_array(frame: pl.DataFrame, column: str, default: float) -> np.ndarray:
+    if column not in frame.columns:
+        return np.full(frame.height, default, dtype=np.float64)
+    series = frame.select(pl.col(column).cast(pl.Float64, strict=False).fill_null(default).fill_nan(default)).to_series()
+    return series.to_numpy(allow_copy=True).astype(np.float64, copy=False)
+
+
+def _set_frame_values(frame: pl.DataFrame, updates: dict[str, dict[int, Any]]) -> pl.DataFrame:
+    expressions: list[pl.Series] = []
+    for column, values_by_idx in updates.items():
+        if column not in frame.columns or not values_by_idx:
+            continue
+        values = frame[column].to_list()
+        for idx, value in values_by_idx.items():
+            if 0 <= int(idx) < len(values):
+                values[int(idx)] = value
+        expressions.append(pl.Series(column, values).alias(column))
+    return frame.with_columns(expressions) if expressions else frame
+
+
+def _records_frame(records: list[dict[str, Any]], columns: list[str] | None = None) -> pl.DataFrame:
+    if records:
+        return pl.DataFrame(records, infer_schema_length=None)
+    if columns is None:
+        return pl.DataFrame()
+    return pl.DataFrame({column: [] for column in columns})
+
+
+def _value_counts(frame: pl.DataFrame, column: str) -> dict[Any, int]:
+    if frame.is_empty() or column not in frame.columns:
+        return {}
+    counts = frame.group_by(column).len(name="count")
+    return {row[column]: int(row["count"]) for row in counts.iter_rows(named=True)}
+
+
 def _date_key(value: Any) -> str:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return ""
-    return pd.Timestamp(value).strftime("%Y-%m-%d")
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "nat", "none", "null"}:
+        return ""
+    text = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).date().isoformat()
+    except ValueError:
+        try:
+            return date.fromisoformat(text[:10]).isoformat()
+        except ValueError:
+            return ""
 
 
 def _parse_date_key(value: str) -> date:
@@ -89,16 +159,13 @@ def _expand_date(value: str, days: int) -> str:
     return (_parse_date_key(value) + timedelta(days=int(days))).isoformat()
 
 
-def _read_parquet(path: Path) -> tuple[pd.DataFrame, dict[bytes, bytes] | None]:
+def _read_parquet(path: Path) -> tuple[pl.DataFrame, dict[bytes, bytes] | None]:
     table = pq.read_table(path)
-    frame = table.to_pandas()
-    if "date" in frame.columns:
-        frame["date"] = pd.to_datetime(frame["date"])
-    return frame, table.schema.metadata
+    return pl.from_arrow(table), table.schema.metadata
 
 
-def _write_parquet(frame: pd.DataFrame, path: Path, metadata: dict[bytes, bytes] | None) -> None:
-    out = pa.Table.from_pandas(frame, preserve_index=False)
+def _write_parquet(frame: pl.DataFrame, path: Path, metadata: dict[bytes, bytes] | None) -> None:
+    out = frame.to_arrow()
     if metadata:
         out = out.replace_schema_metadata(metadata)
     pq.write_table(out, path)
@@ -152,11 +219,11 @@ def _month_keys_for_intervals(intervals: list[tuple[str, str]]) -> list[date]:
     return sorted(months)
 
 
-def _local_dates_for_intervals(frame: pd.DataFrame, intervals: list[tuple[str, str]]) -> list[str]:
+def _local_dates_for_intervals(frame: pl.DataFrame, intervals: list[tuple[str, str]]) -> list[str]:
     if "date" not in frame.columns:
         return []
     dates = []
-    for value in frame["date"]:
+    for value in frame["date"].to_list():
         key = _date_key(value)
         if _date_in_intervals(key, intervals):
             dates.append(key)
@@ -309,19 +376,22 @@ def _load_yahoo_symbol_map(data_root: Path) -> dict[str, str]:
     if not path.exists():
         return {}
     try:
-        frame = pd.read_csv(path, dtype=str).fillna("")
+        frame = pl.read_csv(path, infer_schema_length=0).fill_null("")
     except Exception:
         return {}
     if "code" not in frame.columns or "yahoo_symbol" not in frame.columns:
         return {}
-    return {str(row["code"]).strip(): str(row["yahoo_symbol"]).strip() for _, row in frame.iterrows()}
+    return {
+        str(row["code"]).strip(): str(row["yahoo_symbol"]).strip()
+        for row in frame.select(["code", "yahoo_symbol"]).iter_rows(named=True)
+    }
 
 
 def _fetch_official_price_rows(
     *,
     symbol: str,
     yahoo_symbol: str,
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     intervals: list[tuple[str, str]],
     timeout_s: int,
     request_sleep_s: float,
@@ -396,18 +466,18 @@ def _fetch_official_price_rows(
     return rows, query_records
 
 
-def _collect_events(frame: pd.DataFrame, symbol: str, min_abs_log_return: float) -> list[ReturnEvent]:
+def _collect_events(frame: pl.DataFrame, symbol: str, min_abs_log_return: float) -> list[ReturnEvent]:
     if "date" not in frame.columns or "adjclose" not in frame.columns:
         return []
-    frame = frame.sort_values("date").reset_index(drop=True)
-    adj = pd.to_numeric(frame["adjclose"], errors="coerce").to_numpy(dtype=np.float64)
-    close = pd.to_numeric(frame.get("close", np.nan), errors="coerce").to_numpy(dtype=np.float64)
-    volume = pd.to_numeric(frame.get(VOLUME_COLUMN, np.nan), errors="coerce").to_numpy(dtype=np.float64)
-    dividends = pd.to_numeric(frame.get("Dividends", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    splits = pd.to_numeric(frame.get("Stock Splits", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    dates = [_date_key(value) for value in frame["date"]]
+    frame = frame.sort("date")
+    adj = _numeric_array(frame, "adjclose", float("nan"))
+    close = _numeric_array(frame, "close", float("nan"))
+    volume = _numeric_array(frame, VOLUME_COLUMN, float("nan"))
+    dividends = _numeric_array(frame, "Dividends", 0.0)
+    splits = _numeric_array(frame, "Stock Splits", 0.0)
+    dates = [_date_key(value) for value in frame["date"].to_list()]
     out: list[ReturnEvent] = []
-    for idx in range(len(frame) - 1):
+    for idx in range(frame.height - 1):
         a = adj[idx]
         b = adj[idx + 1]
         if not (np.isfinite(a) and np.isfinite(b) and a > 0.0 and b > 0.0):
@@ -493,7 +563,7 @@ def _is_etf_like_symbol(symbol: str) -> bool:
 
 def _event_verified_by_exchange(
     *,
-    repaired: pd.DataFrame,
+    repaired: pl.DataFrame,
     event: ReturnEvent,
     price_by_date: dict[str, dict[str, Any]],
     date_to_idx: dict[str, int],
@@ -507,7 +577,7 @@ def _event_verified_by_exchange(
         source_values = _finmind_row_values(source_row)
         source_close = source_values["close"]
         source_volume = source_values[VOLUME_COLUMN]
-        local_close = _safe_float(repaired.iloc[idx].get("close"))
+        local_close = _safe_float(repaired.row(idx, named=True).get("close"))
         if _relative_diff(local_close, source_close) >= mismatch_ratio:
             return False
         if np.isfinite(source_volume) and source_volume <= 0.0:
@@ -521,7 +591,7 @@ def _record_row_change(
     key: str,
     method: str,
     reason: str,
-    old_row: pd.Series,
+    old_row: Mapping[str, Any],
     new_values: dict[str, float],
     source: str,
     source_url: str | None = None,
@@ -535,7 +605,7 @@ def _record_row_change(
         "source_url": source_url or "",
     }
     for col in (*PRICE_COLUMNS, VOLUME_COLUMN, "Dividends", "Stock Splits"):
-        if col in old_row.index:
+        if col in old_row:
             record[f"old_{col}"] = old_row.get(col)
     for col, value in new_values.items():
         record[f"new_{col}"] = value
@@ -544,20 +614,20 @@ def _record_row_change(
 
 def _apply_external_price_repairs(
     *,
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     symbol: str,
     price_rows: list[dict[str, Any]],
     source_url: str,
     intervals: list[tuple[str, str]],
     mismatch_ratio: float,
     apply: bool,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
     if not price_rows or "date" not in frame.columns:
         return frame, []
     price_by_date = _finmind_price_map(price_rows)
     records: list[dict[str, Any]] = []
-    repaired = frame.copy()
-    for idx, row in frame.iterrows():
+    updates: dict[str, dict[int, Any]] = {}
+    for idx, row in enumerate(frame.iter_rows(named=True)):
         key = _date_key(row.get("date"))
         source_row = price_by_date.get(key)
         if not source_row:
@@ -570,10 +640,10 @@ def _apply_external_price_repairs(
         source_close = values["close"]
         if _relative_diff(local_close, source_close) < mismatch_ratio:
             continue
-        new_values = {col: values[col] for col in PRICE_COLUMNS if col in repaired.columns}
+        new_values = {col: values[col] for col in PRICE_COLUMNS if col in frame.columns}
         if "adjclose" in new_values and np.isfinite(local_close) and local_close > 0.0 and np.isfinite(local_adjclose) and local_adjclose > 0.0:
             new_values["adjclose"] = source_close * (local_adjclose / local_close)
-        if VOLUME_COLUMN in repaired.columns and np.isfinite(values[VOLUME_COLUMN]):
+        if VOLUME_COLUMN in frame.columns and np.isfinite(values[VOLUME_COLUMN]):
             new_values[VOLUME_COLUMN] = values[VOLUME_COLUMN]
         records.append(
             _record_row_change(
@@ -591,38 +661,38 @@ def _apply_external_price_repairs(
             )
         )
         for col, value in new_values.items():
-            repaired.at[idx, col] = value
-    return repaired, records
+            updates.setdefault(col, {})[idx] = value
+    return _set_frame_values(frame, updates), records
 
 
 def _mask_stale_no_source_rows(
     *,
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     symbol: str,
     price_rows: list[dict[str, Any]],
     source_url: str,
     intervals: list[tuple[str, str]],
     endpoint_dates: set[str],
     apply: bool,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
     price_dates = set(_finmind_price_map(price_rows))
     if not price_dates:
         return frame, []
-    repaired = frame.copy()
     records: list[dict[str, Any]] = []
-    for idx, row in frame.iterrows():
+    updates: dict[str, dict[int, Any]] = {}
+    for idx, row in enumerate(frame.iter_rows(named=True)):
         key = _date_key(row.get("date"))
         if not _date_in_intervals(key, intervals) or key in price_dates:
             continue
         if key not in endpoint_dates and not price_dates:
             continue
         volume = _safe_float(row.get(VOLUME_COLUMN))
-        prices = [_safe_float(row.get(col)) for col in OHLC_COLUMNS if col in row.index]
+        prices = [_safe_float(row.get(col)) for col in OHLC_COLUMNS if col in row]
         finite_prices = [value for value in prices if np.isfinite(value)]
         all_equal = len(finite_prices) >= 2 and (max(finite_prices) - min(finite_prices)) <= max(1e-8, abs(finite_prices[0]) * 1e-8)
         if not ((np.isfinite(volume) and volume <= 0.0) or all_equal):
             continue
-        new_values = {col: float("nan") for col in PRICE_COLUMNS if col in repaired.columns}
+        new_values = {col: float("nan") for col in PRICE_COLUMNS if col in frame.columns}
         records.append(
             _record_row_change(
                 symbol=symbol,
@@ -636,13 +706,13 @@ def _mask_stale_no_source_rows(
             )
         )
         for col, value in new_values.items():
-            repaired.at[idx, col] = value
-    return repaired, records
+            updates.setdefault(col, {})[idx] = value
+    return _set_frame_values(frame, updates), records
 
 
 def _residual_extreme_records(
     *,
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     symbol: str,
     price_rows: list[dict[str, Any]],
     min_abs_log_return: float,
@@ -651,17 +721,18 @@ def _residual_extreme_records(
     source_note: str,
     source_url: str,
     apply: bool,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    repaired = frame.copy()
+) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
+    repaired = frame.clone()
     events = _collect_events(repaired, symbol, min_abs_log_return)
     records: list[dict[str, Any]] = []
     if not events:
         return repaired, records
-    date_to_idx = {_date_key(value): idx for idx, value in enumerate(repaired["date"])}
+    date_to_idx = {_date_key(value): idx for idx, value in enumerate(repaired["date"].to_list())}
     price_by_date = _finmind_price_map(price_rows)
     if not price_by_date:
         return repaired, records
     masked_keys: set[str] = set()
+    updates: dict[str, dict[int, Any]] = {}
     for event in events:
         if not (_date_in_intervals(event.event_date, intervals) or _date_in_intervals(event.next_date, intervals)):
             continue
@@ -683,7 +754,7 @@ def _residual_extreme_records(
             if idx is None:
                 continue
             masked_keys.add(key)
-            row = repaired.iloc[idx]
+            row = repaired.row(idx, named=True)
             new_values = {col: float("nan") for col in PRICE_COLUMNS if col in repaired.columns}
             event_source_url = " | ".join(
                 sorted(
@@ -711,12 +782,12 @@ def _residual_extreme_records(
                 )
             )
             for col, value in new_values.items():
-                repaired.at[idx, col] = value
-    return repaired, records
+                updates.setdefault(col, {})[idx] = value
+    return _set_frame_values(repaired, updates), records
 
 
-def _events_to_frame(events: list[ReturnEvent]) -> pd.DataFrame:
-    return pd.DataFrame([event.__dict__ for event in events])
+def _events_to_frame(events: list[ReturnEvent]) -> pl.DataFrame:
+    return _records_frame([event.__dict__ for event in events])
 
 
 def _method_counts(records: list[dict[str, Any]]) -> dict[str, int]:
@@ -738,13 +809,14 @@ def _ledger_source_covers_date(source_url: Any, key: str) -> bool:
     return month_token in text or day_token in text or day_token_encoded in text
 
 
-def _apply_ledger_record(frame: pd.DataFrame, row_idx: int, record: pd.Series) -> list[str]:
+def _apply_ledger_record(frame: pl.DataFrame, row_idx: int, record: Mapping[str, Any]) -> tuple[pl.DataFrame, list[str]]:
     method = str(record.get("repair_method") or "")
     changed: list[str] = []
+    updates: dict[str, dict[int, Any]] = {}
     if method == "replace_yahoo_ohlc_with_exchange":
         for col in PRICE_COLUMNS:
             new_col = f"new_{col}"
-            if col in frame.columns and new_col in record.index and pd.notna(record.get(new_col)):
+            if col in frame.columns and new_col in record and _not_null(record.get(new_col)):
                 value = float(record.get(new_col))
                 if col == "adjclose":
                     old_close = _safe_float(record.get("old_close"))
@@ -752,18 +824,18 @@ def _apply_ledger_record(frame: pd.DataFrame, row_idx: int, record: pd.Series) -
                     new_close = _safe_float(record.get("new_close"))
                     if np.isfinite(old_close) and old_close > 0.0 and np.isfinite(old_adjclose) and old_adjclose > 0.0 and np.isfinite(new_close):
                         value = new_close * (old_adjclose / old_close)
-                frame.at[row_idx, col] = value
+                updates.setdefault(col, {})[row_idx] = value
                 changed.append(col)
-        new_volume = record.get(f"new_{VOLUME_COLUMN}") if f"new_{VOLUME_COLUMN}" in record.index else np.nan
-        if VOLUME_COLUMN in frame.columns and pd.notna(new_volume):
-            frame.at[row_idx, VOLUME_COLUMN] = float(new_volume)
+        new_volume = record.get(f"new_{VOLUME_COLUMN}") if f"new_{VOLUME_COLUMN}" in record else np.nan
+        if VOLUME_COLUMN in frame.columns and _not_null(new_volume):
+            updates.setdefault(VOLUME_COLUMN, {})[row_idx] = float(new_volume)
             changed.append(VOLUME_COLUMN)
     elif method == "mask_no_external_trade_stale_row":
         for col in PRICE_COLUMNS:
             if col in frame.columns:
-                frame.at[row_idx, col] = float("nan")
+                updates.setdefault(col, {})[row_idx] = float("nan")
                 changed.append(col)
-    return changed
+    return _set_frame_values(frame, updates), changed
 
 
 def apply_ledger(
@@ -779,24 +851,29 @@ def apply_ledger(
     backup_target = backup_dir / timestamp
     apply_path = output_dir / f"tw_return_anomaly_apply_ledger_{timestamp}.csv"
     summary_path = output_dir / f"tw_return_anomaly_apply_ledger_{timestamp}.md"
-    ledger = pd.read_csv(ledger_path)
+    ledger = pl.read_csv(ledger_path, infer_schema_length=None)
     applied_records: list[dict[str, Any]] = []
     touched_symbols: list[str] = []
 
-    for symbol, symbol_records in ledger.groupby(ledger["symbol"].astype(str), sort=True):
+    if "symbol" not in ledger.columns:
+        symbols: list[str] = []
+    else:
+        symbols = sorted(str(value) for value in ledger["symbol"].cast(pl.String).drop_nulls().unique().to_list())
+    for symbol in symbols:
+        symbol_records = ledger.filter(pl.col("symbol").cast(pl.String) == symbol)
         parquet_path = data_root / f"{symbol}_features.parquet"
         if not parquet_path.exists():
-            for _, record in symbol_records.iterrows():
-                out = record.to_dict()
+            for record in symbol_records.iter_rows(named=True):
+                out = dict(record)
                 out["applied"] = False
                 out["apply_skip_reason"] = "missing_parquet"
                 applied_records.append(out)
             continue
         frame, metadata = _read_parquet(parquet_path)
-        date_to_idx = {_date_key(value): idx for idx, value in enumerate(frame["date"])}
+        date_to_idx = {_date_key(value): idx for idx, value in enumerate(frame["date"].to_list())}
         changed_symbol = False
-        for _, record in symbol_records.iterrows():
-            out = record.to_dict()
+        for record in symbol_records.iter_rows(named=True):
+            out = dict(record)
             method = str(record.get("repair_method") or "")
             key = str(record.get("date") or "")
             if method not in methods:
@@ -820,7 +897,7 @@ def apply_ledger(
                 out["apply_skip_reason"] = "date_not_found"
                 applied_records.append(out)
                 continue
-            changed_cols = _apply_ledger_record(frame, row_idx, record)
+            frame, changed_cols = _apply_ledger_record(frame, row_idx, record)
             if not changed_cols:
                 out["applied"] = False
                 out["apply_skip_reason"] = "no_columns_changed"
@@ -838,27 +915,21 @@ def apply_ledger(
             _write_parquet(frame, parquet_path, metadata)
             touched_symbols.append(symbol)
 
-    applied = pd.DataFrame(applied_records)
-    applied.to_csv(apply_path, index=False)
-    applied_counts = applied["applied"].value_counts(dropna=False).to_dict() if not applied.empty else {}
-    method_counts = (
-        applied[applied["applied"] == True]["repair_method"].value_counts().to_dict()  # noqa: E712
-        if not applied.empty
-        else {}
-    )
-    skip_counts = (
-        applied[applied["applied"] != True]["apply_skip_reason"].value_counts().to_dict()  # noqa: E712
-        if not applied.empty
-        else {}
-    )
+    applied = _records_frame(applied_records)
+    applied.write_csv(apply_path)
+    applied_counts = _value_counts(applied, "applied")
+    applied_true = applied.filter(pl.col("applied") == True) if "applied" in applied.columns else pl.DataFrame()  # noqa: E712
+    applied_false = applied.filter(pl.col("applied") != True) if "applied" in applied.columns else pl.DataFrame()  # noqa: E712
+    method_counts = _value_counts(applied_true, "repair_method")
+    skip_counts = _value_counts(applied_false, "apply_skip_reason")
     lines = [
         "# TW Return Anomaly Apply Ledger",
         "",
         f"- source_ledger: `{ledger_path}`",
         f"- data_root: `{data_root}`",
         f"- selected_methods: `{','.join(sorted(methods))}`",
-        f"- records_in_ledger: `{len(ledger)}`",
-        f"- applied_records: `{int((applied['applied'] == True).sum()) if not applied.empty else 0}`",  # noqa: E712
+        f"- records_in_ledger: `{ledger.height}`",
+        f"- applied_records: `{applied_true.height}`",
         f"- touched_symbols: `{len(set(touched_symbols))}`",
         f"- backup_dir: `{backup_target}`",
         "",
@@ -907,7 +978,7 @@ def repair(
 
     parquet_paths = sorted(path for path in data_root.glob("*_features.parquet") if path.is_file())
     all_events: list[ReturnEvent] = []
-    frames: dict[str, tuple[pd.DataFrame, dict[bytes, bytes] | None, Path]] = {}
+    frames: dict[str, tuple[pl.DataFrame, dict[bytes, bytes] | None, Path]] = {}
     for path in parquet_paths:
         symbol = path.name.removesuffix("_features.parquet")
         if symbols_filter is not None and symbol not in symbols_filter:
@@ -920,7 +991,7 @@ def repair(
         all_events.extend(events)
 
     events_frame = _events_to_frame(all_events)
-    events_frame.to_csv(events_path, index=False)
+    events_frame.write_csv(events_path)
     if not all_events:
         summary_path.write_text("# TW Return Anomaly Repairs\n\nNo events found.\n", encoding="utf-8")
         print(f"events={events_path}")
@@ -963,7 +1034,7 @@ def repair(
         price_url = " | ".join(sorted({str(row.get("_source_url") or "") for row in price_rows if row.get("_source_url")}))
 
         external_checked_symbols.append(symbol)
-        repaired = frame.copy()
+        repaired = frame.clone()
         records: list[dict[str, Any]] = []
         repaired, new_records = _apply_external_price_repairs(
             frame=repaired,
@@ -1011,11 +1082,12 @@ def repair(
                 flush=True,
             )
 
-    ledger = pd.DataFrame(all_records)
-    if ledger.empty:
-        ledger = pd.DataFrame(columns=["symbol", "date", "repair_method", "repair_reason", "source", "source_url"])
-    ledger.to_csv(ledger_path, index=False)
-    pd.DataFrame(query_records).to_csv(query_path, index=False)
+    ledger = _records_frame(
+        all_records,
+        columns=["symbol", "date", "repair_method", "repair_reason", "source", "source_url"],
+    )
+    ledger.write_csv(ledger_path)
+    _records_frame(query_records).write_csv(query_path)
 
     method_counts = _method_counts(all_records)
     lines = [

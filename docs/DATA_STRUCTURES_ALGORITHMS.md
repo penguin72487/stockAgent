@@ -654,12 +654,11 @@ def compute_metrics_gpu(returns_tensor, dates_tensor, device='cuda:0'):
         metrics[year_idx, 4] = (r_year < 0).sum() / len(r_year)  # 負收益率
         metrics[year_idx, 5] = (r_year < -0.02).sum() / len(r_year)  # 下跌超 2% 的天數
     
-    # 轉回 CPU 返回 Pandas
-    return pd.DataFrame(
+    # 轉回 CPU 返回 Polars
+    return pl.DataFrame(
         metrics.cpu().numpy(),
-        columns=['mean', 'std', 'sharpe', 'max_dd', 'neg_rate', 'crash_rate', 'ic', 'ic_ir'],
-        index=[f'{y.item()}-01-01' for y in years]
-    )
+        schema=['mean', 'std', 'sharpe', 'max_dd', 'neg_rate', 'crash_rate', 'ic', 'ic_ir'],
+    ).with_columns(pl.Series('year_start', [f'{y.item()}-01-01' for y in years]))
 ```
 
 **性能對比：**

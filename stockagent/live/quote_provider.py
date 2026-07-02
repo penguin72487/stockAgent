@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
+import requests
 
 
 @dataclass(slots=True)
@@ -85,10 +88,7 @@ def fetch_yahoo_last_prices(
     period: str = "1d",
     interval: str = "1m",
 ) -> PriceSnapshot:
-    """Fetch latest Yahoo prices with yfinance and align them to panel symbols."""
-    import pandas as pd
-    import yfinance as yf
-
+    """Fetch latest Yahoo prices from the chart API and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
     tickers = [yahoo_map.get(symbol, symbol) for symbol in symbols]
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
@@ -96,43 +96,39 @@ def fetch_yahoo_last_prices(
     last_timestamp: str | None = None
 
     for start in range(0, len(symbols), max(1, int(chunk_size))):
-        sym_chunk = symbols[start : start + max(1, int(chunk_size))]
         ticker_chunk = tickers[start : start + max(1, int(chunk_size))]
-        data = yf.download(
-            tickers=" ".join(ticker_chunk),
-            period=period,
-            interval=interval,
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-        if data is None or len(data) == 0:
-            continue
-        if isinstance(data.columns, pd.MultiIndex):
-            for offset, ticker in enumerate(ticker_chunk):
-                try:
-                    close = data[(ticker, "Close")].dropna()
-                except Exception:
+        for offset, ticker in enumerate(ticker_chunk):
+            encoded = quote(str(ticker), safe="")
+            url = (
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
+                f"?range={period}&interval={interval}&includePrePost=false"
+            )
+            try:
+                response = requests.get(url, timeout=20)
+                response.raise_for_status()
+                payload = response.json()
+                result = (payload.get("chart", {}).get("result") or [None])[0]
+                if not result:
                     continue
-                if close.empty:
+                timestamps = list(result.get("timestamp") or [])
+                quote_rows = result.get("indicators", {}).get("quote") or []
+                close_values = list((quote_rows[0] if quote_rows else {}).get("close") or [])
+            except Exception:
+                continue
+
+            for idx in range(min(len(timestamps), len(close_values)) - 1, -1, -1):
+                value = float(close_values[idx]) if close_values[idx] is not None else float("nan")
+                if not (np.isfinite(value) and value > 0.0):
                     continue
-                value = float(close.iloc[-1])
-                if np.isfinite(value) and value > 0.0:
-                    prices[start + offset] = value
-                    count += 1
-                    last_timestamp = str(close.index[-1])
-        else:
-            close = data.get("Close")
-            if close is None:
-                continue
-            close = close.dropna()
-            if close.empty:
-                continue
-            value = float(close.iloc[-1])
-            if np.isfinite(value) and value > 0.0 and sym_chunk:
-                prices[start] = value
+                prices[start + offset] = value
                 count += 1
-                last_timestamp = str(close.index[-1])
+                try:
+                    last_timestamp = datetime.fromtimestamp(
+                        int(timestamps[idx]),
+                        tz=timezone.utc,
+                    ).isoformat()
+                except Exception:
+                    last_timestamp = str(timestamps[idx])
+                break
 
     return PriceSnapshot(prices=prices, source=f"yahoo:{period}/{interval}", timestamp=last_timestamp, available_count=count)

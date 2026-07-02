@@ -311,7 +311,7 @@ Experiment：experiment_baseline.yaml
 │                                                              │
 │  2. 讀取每個文件到 DataFrame      (耗時: ~7s)               │
 │     for path in parquet_paths:                              │
-│         df = pd.read_parquet(path)  ← 磁盤 I/O              │
+│         df = pl.read_parquet(path)  ← 磁盤 I/O              │
 │                                                              │
 │  3. 數據對齐 & 編碼               (耗時: ~2s)               │
 │     df = build_date_symbol_panel(frames)                    │

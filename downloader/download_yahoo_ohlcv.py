@@ -20,14 +20,13 @@ from html.parser import HTMLParser
 import math
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import yfinance as yf
 from tqdm import tqdm
 
 from stockagent.data.us_universe import is_us_broker_tradable_security
@@ -962,35 +961,17 @@ class PrecheckLoader:
             self._process = None
 
 
-def _dedupe_column_names(columns: list[str]) -> list[str]:
-    counts: dict[str, int] = {}
-    deduped: list[str] = []
-    for column in columns:
-        base = column or "column"
-        count = counts.get(base, 0)
-        counts[base] = count + 1
-        deduped.append(base if count == 0 else f"{base}_{count}")
-    return deduped
-
-
 def _yahoo_frame_to_polars(frame: object) -> object:
     _require_polars()
     if isinstance(frame, pl.DataFrame):
         return frame
-    if frame is None or bool(getattr(frame, "empty", False)):
+    if frame is None:
         return _empty_feature_frame()
-
-    reset_frame = frame.reset_index()
-    flattened_columns: list[str] = []
-    for column in list(reset_frame.columns):
-        if isinstance(column, tuple):
-            primary = str(column[0]).strip()
-            secondary = str(column[1]).strip() if len(column) > 1 else ""
-            flattened_columns.append(primary or secondary)
-        else:
-            flattened_columns.append(str(column).strip())
-    reset_frame.columns = _dedupe_column_names(flattened_columns)
-    return pl.DataFrame({column: list(reset_frame[column]) for column in reset_frame.columns})
+    if isinstance(frame, dict) or isinstance(frame, list):
+        return pl.DataFrame(frame)
+    if hasattr(frame, "to_arrow"):
+        return pl.from_arrow(frame.to_arrow())
+    raise TypeError(f"Unsupported Yahoo frame type for Polars conversion: {type(frame).__name__}")
 
 
 def _canonicalize_feature_frame(frame: object, *, keep_zero_volume: bool = True) -> object:
@@ -1130,6 +1111,106 @@ def _http_get_text(url: str, timeout: int = 30) -> str:
         return raw.decode(charset, errors="ignore")
     except LookupError:
         return raw.decode("utf-8", errors="ignore")
+
+
+def _unix_seconds_for_date_key(value: str) -> int:
+    return int(_parse_date(value).replace(tzinfo=timezone.utc).timestamp())
+
+
+def _chart_timestamp_to_datetime(value: object) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _chart_event_key(value: object) -> str:
+    parsed = _chart_timestamp_to_datetime(value)
+    return parsed.date().isoformat() if parsed is not None else ""
+
+
+def _download_yahoo_chart_frame(
+    *,
+    symbol: str,
+    start_date: str,
+    end_date_exclusive: str,
+    interval: str,
+    timeout: int = 20,
+) -> object:
+    _require_polars()
+    period1 = _unix_seconds_for_date_key(start_date)
+    period2 = _unix_seconds_for_date_key(end_date_exclusive)
+    query = urlencode(
+        {
+            "period1": str(period1),
+            "period2": str(period2),
+            "interval": interval,
+            "events": "div,splits",
+            "includeAdjustedClose": "true",
+        }
+    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}?{query}"
+    payload = json.loads(_http_get_text(url, timeout=timeout))
+    chart = payload.get("chart") or {}
+    error = chart.get("error")
+    if error:
+        description = error.get("description") if isinstance(error, dict) else str(error)
+        raise RuntimeError(description or "Yahoo chart API returned an error")
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        return _empty_feature_frame()
+
+    timestamps = list(result.get("timestamp") or [])
+    indicators = result.get("indicators") or {}
+    quote_rows = indicators.get("quote") or []
+    quote_row = quote_rows[0] if quote_rows else {}
+    adj_rows = indicators.get("adjclose") or []
+    adj_row = adj_rows[0] if adj_rows else {}
+    open_values = list(quote_row.get("open") or [])
+    high_values = list(quote_row.get("high") or [])
+    low_values = list(quote_row.get("low") or [])
+    close_values = list(quote_row.get("close") or [])
+    volume_values = list(quote_row.get("volume") or [])
+    adjclose_values = list(adj_row.get("adjclose") or close_values)
+
+    events = result.get("events") or {}
+    dividends_by_date: dict[str, float] = {}
+    for item in (events.get("dividends") or {}).values():
+        key = _chart_event_key(item.get("date"))
+        if key:
+            dividends_by_date[key] = float(item.get("amount") or 0.0)
+    splits_by_date: dict[str, float] = {}
+    for item in (events.get("splits") or {}).values():
+        key = _chart_event_key(item.get("date"))
+        numerator = float(item.get("numerator") or 0.0)
+        denominator = float(item.get("denominator") or 0.0)
+        if key and numerator > 0.0 and denominator > 0.0:
+            splits_by_date[key] = numerator / denominator
+
+    def value_at(values: list[object], idx: int) -> object:
+        return values[idx] if idx < len(values) else None
+
+    date_column = "Date" if interval == "1d" else "Datetime"
+    rows: list[dict[str, object]] = []
+    for idx, ts in enumerate(timestamps):
+        dt = _chart_timestamp_to_datetime(ts)
+        if dt is None:
+            continue
+        key = dt.date().isoformat()
+        rows.append(
+            {
+                date_column: dt,
+                "Open": value_at(open_values, idx),
+                "High": value_at(high_values, idx),
+                "Low": value_at(low_values, idx),
+                "Close": value_at(close_values, idx),
+                "Adj Close": value_at(adjclose_values, idx),
+                "Volume": value_at(volume_values, idx),
+                "Dividends": dividends_by_date.get(key, 0.0),
+                "Stock Splits": splits_by_date.get(key, 0.0),
+            }
+        )
+    return pl.DataFrame(rows, infer_schema_length=None) if rows else _empty_feature_frame()
 
 
 class _HTMLTableRowParser(HTMLParser):
@@ -2317,20 +2398,16 @@ def _download_symbol(
                 err_capture = io.StringIO()
 
                 def _download_frame() -> object:
-                    return yf.download(
-                        tickers=candidate_symbol,
-                        start=effective_start_date,
-                        end=period_end_exclusive,
+                    return _download_yahoo_chart_frame(
+                        symbol=candidate_symbol,
+                        start_date=effective_start_date,
+                        end_date_exclusive=period_end_exclusive,
                         interval=yf_interval,
-                        auto_adjust=False,
-                        actions=True,
-                        progress=False,
-                        threads=False,
                         timeout=20,
                     )
 
                 with contextlib.redirect_stdout(std_capture), contextlib.redirect_stderr(err_capture):
-                    # Guard yfinance against indefinite socket/DNS stalls.
+                    # Guard Yahoo chart API calls against indefinite socket/DNS stalls.
                     frame = _fetch_with_hard_timeout(
                         _download_frame,
                         timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
