@@ -431,7 +431,7 @@ $$
 | 作業環境 | Linux 或 Windows 11 + WSL2；Conda/Mamba 環境 |
 | 程式語言 | Python 3.x |
 | 深度學習 | PyTorch、CUDA、BF16 AMP、`torch.compile`、scaled dot-product attention |
-| 資料處理 | NumPy、Numba、Polars、PyArrow、pandas、Parquet、PyYAML |
+| 資料處理 | NumPy、Numba、Polars、PyArrow、Parquet、PyYAML |
 | 比較模型 | LightGBM、XGBoost；必要時使用 scikit-learn 或 cuML |
 | 資料取得 | Yahoo Finance 下載器、TWSE/TPEx 公開股票清單、交易日曆、當沖標的、融資融券與借券資料 |
 | 解釋與視覺化 | Integrated Gradients、SHAP surrogate、UMAP、Matplotlib、Datashader |

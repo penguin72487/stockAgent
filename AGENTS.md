@@ -65,12 +65,12 @@ Rules:
 
 - `scripts/benchmark_data_backends.py` is the reproducible scanner/benchmark for
   data-processing hotspots. Its active optimization scope is PyArrow plus Polars
-  Lazy/Streaming; pandas is kept only as the compatibility/reference path.
+  Lazy/Streaming; do not add compatibility/reference paths outside those backends.
 - Do not add DuckDB or cuDF back to the panel/runtime benchmark set unless a new
   request explicitly reopens those candidates.
 - For full US daily parquet (`16811` files, `S≈16811`) with
   `tradable_mode: tradable`, runtime `build_panel(... panel_backend="auto")`
-  should select Polars Lazy when available, then PyArrow, then pandas. Explicit
+  should select Polars Lazy when available, then PyArrow. Explicit
   `panel_backend="polars"` is an alias for `polars_lazy`; explicit
   `panel_backend="polars_streaming"` is available for measurement but is not the
   current auto default.

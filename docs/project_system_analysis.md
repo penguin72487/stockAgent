@@ -79,15 +79,14 @@ row_indices -> valid date indices -> window date indices -> features[window_idx]
 
 ```text
 parquet per symbol
--> load by pandas/polars/cuDF path
+-> load by Polars/PyArrow path
 -> feature normalization and tradable masks
 -> concat/pivot to PanelData
 -> panel_cache_v2 memmap
 ```
 
-目前 `panel_backend=auto` 會優先使用 cuDF when `use_rapids=true`，
-否則使用 polars/pandas。注意 cuDF path 最後仍會轉成 pandas frame
-去建 `PanelData`，所以它是 build-time 加速，不代表訓練 tensor 永遠留在 GPU。
+目前 `panel_backend=auto` 會優先使用 Polars Lazy，必要時回到 PyArrow。
+`PanelData` 建構仍會轉成訓練用 tensor；build-time backend 不代表訓練 tensor 永遠留在 GPU。
 
 ### Walk-forward
 

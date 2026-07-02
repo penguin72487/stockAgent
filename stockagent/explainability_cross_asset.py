@@ -945,16 +945,31 @@ def _process_edges_polars(edges: pl.DataFrame, *, top_n: int) -> _GraphProcessin
 
 
 def _cudf_to_polars(frame: Any) -> pl.DataFrame:
-    return pl.from_pandas(frame.to_pandas())
+    if frame is None:
+        return pl.DataFrame()
+    if isinstance(frame, pl.DataFrame):
+        return frame
+    if hasattr(frame, "to_arrow"):
+        return pl.from_arrow(frame.to_arrow())
+    raise TypeError(f"Unsupported cuDF conversion source: {type(frame).__name__}")
+
+
+def _polars_to_cudf(frame: pl.DataFrame) -> Any:
+    import cudf  # type: ignore[import-not-found]
+
+    return cudf.DataFrame.from_arrow(frame.to_arrow())
+
+
+def _cugraph_metric_to_polars(metric: Any, *, rename: dict[str, str]) -> pl.DataFrame:
+    frame = _cudf_to_polars(metric)
+    return frame.rename({source: target for source, target in rename.items() if source in frame.columns})
 
 
 def _process_edges_cugraph(edges: pl.DataFrame, *, top_n: int) -> _GraphProcessingResult:
     start = time.perf_counter()
-    import cudf  # type: ignore[import-not-found]
     import cugraph  # type: ignore[import-not-found]
-    import pandas as pd
 
-    gdf = cudf.from_pandas(edges.to_pandas())
+    gdf = _polars_to_cudf(edges)
     sorted_gdf = gdf.sort_values(_GRAPH_EDGE_SORT_COLUMNS, ascending=[False, True, True, True])
     top_gdf = sorted_gdf.head(top_n)
     source_summary_gdf = (
@@ -988,46 +1003,51 @@ def _process_edges_cugraph(edges: pl.DataFrame, *, top_n: int) -> _GraphProcessi
     )
 
     pagerank_error: str | None = None
-    pagerank_pdf = pd.DataFrame(columns=["symbol_index", "pagerank"])
+    pagerank_frame = pl.DataFrame({"symbol_index": [], "pagerank": []}, schema={"symbol_index": pl.Int64, "pagerank": pl.Float64})
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=r".*Pagerank expects.*", category=UserWarning)
-            pagerank_pdf = (
-                cugraph.pagerank(graph)
-                .rename(columns={"vertex": "symbol_index"})
-                .to_pandas()
+            pagerank_frame = _cugraph_metric_to_polars(
+                cugraph.pagerank(graph),
+                rename={"vertex": "symbol_index"},
             )
     except Exception as exc:
         pagerank_error = f"{type(exc).__name__}: {exc}"
 
-    source_degree_pdf = (
+    source_degree = _cudf_to_polars(
         graph_edges.groupby("source_index")["validated_transmission"]
         .sum()
         .reset_index()
         .rename(columns={"source_index": "symbol_index", "validated_transmission": "weighted_out_degree"})
-        .to_pandas()
     )
-    target_degree_pdf = (
+    target_degree = _cudf_to_polars(
         graph_edges.groupby("target_index")["validated_transmission"]
         .sum()
         .reset_index()
         .rename(columns={"target_index": "symbol_index", "validated_transmission": "weighted_in_degree"})
-        .to_pandas()
     )
     symbol_lookup: dict[int, str] = {}
     for row in edges.select(["source_index", "source_symbol"]).unique().to_dicts():
         symbol_lookup[int(row["source_index"])] = str(row["source_symbol"])
     for row in edges.select(["target_index", "target_symbol"]).unique().to_dicts():
         symbol_lookup[int(row["target_index"])] = str(row["target_symbol"])
-    node_pdf = pd.DataFrame({"symbol_index": sorted(symbol_lookup)})
-    node_pdf["symbol"] = node_pdf["symbol_index"].map(symbol_lookup)
-    node_pdf = node_pdf.merge(source_degree_pdf, on="symbol_index", how="left")
-    node_pdf = node_pdf.merge(target_degree_pdf, on="symbol_index", how="left")
-    node_pdf = node_pdf.merge(pagerank_pdf, on="symbol_index", how="left")
+    node_metrics = pl.DataFrame(
+        [{"symbol_index": idx, "symbol": symbol_lookup[idx]} for idx in sorted(symbol_lookup)],
+        schema={"symbol_index": pl.Int64, "symbol": pl.String},
+    )
+    node_metrics = (
+        node_metrics.join(source_degree, on="symbol_index", how="left")
+        .join(target_degree, on="symbol_index", how="left")
+        .join(pagerank_frame, on="symbol_index", how="left")
+    )
     for column in ("weighted_out_degree", "weighted_in_degree", "pagerank"):
-        if column in node_pdf:
-            node_pdf[column] = node_pdf[column].fillna(0.0)
-    node_metrics = pl.from_pandas(node_pdf).sort("symbol_index")
+        if column not in node_metrics.columns:
+            node_metrics = node_metrics.with_columns(pl.lit(0.0).alias(column))
+    node_metrics = node_metrics.with_columns(
+        pl.col("weighted_out_degree").fill_null(0.0),
+        pl.col("weighted_in_degree").fill_null(0.0),
+        pl.col("pagerank").fill_null(0.0),
+    ).sort("symbol_index")
 
     elapsed_s = float(time.perf_counter() - start)
     benchmark: dict[str, Any] = {
@@ -1219,7 +1239,6 @@ def _assign_graph_roles(node_metrics: pl.DataFrame) -> pl.DataFrame:
             "net_transmitter_score"
         )
     )
-    pdf = frame.to_pandas()
     numeric_columns = [
         "weighted_out_degree",
         "weighted_in_degree",
@@ -1230,10 +1249,12 @@ def _assign_graph_roles(node_metrics: pl.DataFrame) -> pl.DataFrame:
     ]
     thresholds: dict[str, float] = {}
     for column in numeric_columns:
-        if column in pdf:
-            thresholds[column] = float(pdf[column].fillna(0.0).quantile(0.75))
+        if column in frame.columns:
+            thresholds[column] = float(
+                frame.select(pl.col(column).fill_null(0.0).fill_nan(0.0).quantile(0.75)).item()
+            )
     roles: list[str] = []
-    for _, row in pdf.iterrows():
+    for row in frame.iter_rows(named=True):
         out_degree = float(row.get("weighted_out_degree", 0.0) or 0.0)
         in_degree = float(row.get("weighted_in_degree", 0.0) or 0.0)
         pagerank = float(row.get("pagerank", 0.0) or 0.0)
@@ -1254,8 +1275,7 @@ def _assign_graph_roles(node_metrics: pl.DataFrame) -> pl.DataFrame:
             roles.append("net_sink")
         else:
             roles.append("balanced")
-    pdf["primary_role"] = roles
-    return pl.from_pandas(pdf)
+    return frame.with_columns(pl.Series("primary_role", roles))
 
 
 def _build_polars_graph_explainability(edges: pl.DataFrame, *, reason: str = "polars_fallback") -> _GraphExplainabilityResult:
@@ -1345,16 +1365,14 @@ def _from_cudf_edgelist(graph: Any, frame: Any, *, store_transposed: bool | None
         graph.from_cudf_edgelist(frame, **kwargs)
 
 
-def _merge_metric_pdf(base: Any, metric: Any, *, rename: dict[str, str]) -> Any:
-    metric_pdf = metric.rename(columns=rename).to_pandas()
-    return base.merge(metric_pdf, on="symbol_index", how="left")
+def _merge_metric_frame(base: pl.DataFrame, metric: Any, *, rename: dict[str, str]) -> pl.DataFrame:
+    metric_frame = _cugraph_metric_to_polars(metric, rename=rename)
+    return base.join(metric_frame, on="symbol_index", how="left")
 
 
 def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAssetTransmissionSettings) -> _GraphExplainabilityResult:
     start = time.perf_counter()
-    import cudf  # type: ignore[import-not-found]
     import cugraph  # type: ignore[import-not-found]
-    import pandas as pd
 
     graph_edges = _aggregate_graph_edges(edges)
     nodes = _graph_base_node_frame(graph_edges)
@@ -1369,38 +1387,35 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
         }
         return _GraphExplainabilityResult("cugraph", graph_edges, nodes, pl.DataFrame(), pl.DataFrame(), summary)
 
-    edge_pdf = graph_edges.to_pandas()
-    graph_gdf = cudf.from_pandas(edge_pdf[["source_index", "target_index", "edge_weight"]])
+    graph_gdf = _polars_to_cudf(graph_edges.select(["source_index", "target_index", "edge_weight"]))
     directed = cugraph.Graph(directed=True)
     _from_cudf_edgelist(directed, graph_gdf, store_transposed=True)
     undirected = cugraph.Graph(directed=False)
     _from_cudf_edgelist(undirected, graph_gdf, store_transposed=False)
 
-    node_pdf = nodes.to_pandas()
-    source_degree_pdf = (
-        edge_pdf.groupby("source_index", as_index=False)["edge_weight"]
-        .sum()
-        .rename(columns={"source_index": "symbol_index", "edge_weight": "weighted_out_degree"})
+    source_degree = (
+        graph_edges.group_by("source_index")
+        .agg(pl.col("edge_weight").sum().alias("weighted_out_degree"))
+        .rename({"source_index": "symbol_index"})
     )
-    target_degree_pdf = (
-        edge_pdf.groupby("target_index", as_index=False)["edge_weight"]
-        .sum()
-        .rename(columns={"target_index": "symbol_index", "edge_weight": "weighted_in_degree"})
+    target_degree = (
+        graph_edges.group_by("target_index")
+        .agg(pl.col("edge_weight").sum().alias("weighted_in_degree"))
+        .rename({"target_index": "symbol_index"})
     )
-    node_pdf = node_pdf.merge(source_degree_pdf, on="symbol_index", how="left")
-    node_pdf = node_pdf.merge(target_degree_pdf, on="symbol_index", how="left")
+    node_metrics = nodes.join(source_degree, on="symbol_index", how="left").join(target_degree, on="symbol_index", how="left")
 
     algorithms: list[str] = []
     skipped: list[dict[str, str]] = []
 
     def add_metric(name: str, fn: Any, rename: dict[str, str]) -> None:
-        nonlocal node_pdf
+        nonlocal node_metrics
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r".*expects the 'store_transposed'.*", category=UserWarning)
                 warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
                 metric = fn()
-            node_pdf = _merge_metric_pdf(node_pdf, metric, rename=rename)
+            node_metrics = _merge_metric_frame(node_metrics, metric, rename=rename)
             algorithms.append(name)
         except Exception as exc:
             skipped.append({"algorithm": name, "reason": f"{type(exc).__name__}: {exc}"})
@@ -1428,8 +1443,8 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
     modularity: float | None = None
     try:
         community_frame, modularity = cugraph.louvain(undirected)
-        node_pdf = _merge_metric_pdf(
-            node_pdf,
+        node_metrics = _merge_metric_frame(
+            node_metrics,
             community_frame,
             rename={"vertex": "symbol_index", "partition": "community_id"},
         )
@@ -1438,8 +1453,8 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
         skipped.append({"algorithm": "louvain", "reason": f"{type(exc).__name__}: {exc}"})
         try:
             community_frame, modularity = cugraph.leiden(undirected)
-            node_pdf = _merge_metric_pdf(
-                node_pdf,
+            node_metrics = _merge_metric_frame(
+                node_metrics,
                 community_frame,
                 rename={"vertex": "symbol_index", "partition": "community_id"},
             )
@@ -1475,18 +1490,34 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
         "core_number",
         "triangle_count",
     ):
-        if column not in node_pdf:
-            node_pdf[column] = 0.0
-        node_pdf[column] = node_pdf[column].fillna(0.0)
-    if "community_id" not in node_pdf:
-        node_pdf["community_id"] = 0
-    node_pdf["community_id"] = node_pdf["community_id"].fillna(0).astype("int64")
+        if column not in node_metrics.columns:
+            node_metrics = node_metrics.with_columns(pl.lit(0.0).alias(column))
+    node_metrics = node_metrics.with_columns(
+        pl.col(column).fill_null(0.0).fill_nan(0.0).alias(column)
+        for column in (
+            "weighted_out_degree",
+            "weighted_in_degree",
+            "pagerank",
+            "hub_score",
+            "authority_score",
+            "eigenvector_centrality",
+            "betweenness_centrality",
+            "core_number",
+            "triangle_count",
+        )
+    )
+    if "community_id" not in node_metrics.columns:
+        node_metrics = node_metrics.with_columns(pl.lit(0).alias("community_id"))
+    node_metrics = node_metrics.with_columns(pl.col("community_id").fill_null(0).cast(pl.Int64))
     for column in ("strong_component_id", "weak_component_id"):
-        if column not in node_pdf:
-            node_pdf[column] = 0
-        node_pdf[column] = node_pdf[column].fillna(0).astype("int64")
+        if column not in node_metrics.columns:
+            node_metrics = node_metrics.with_columns(pl.lit(0).alias(column))
+    node_metrics = node_metrics.with_columns(
+        pl.col("strong_component_id").fill_null(0).cast(pl.Int64),
+        pl.col("weak_component_id").fill_null(0).cast(pl.Int64),
+    )
 
-    node_metrics = _assign_graph_roles(pl.from_pandas(node_pdf)).sort("pagerank", descending=True)
+    node_metrics = _assign_graph_roles(node_metrics).sort("pagerank", descending=True)
     src_comm = node_metrics.select(
         pl.col("symbol_index").alias("source_index"),
         pl.col("community_id").alias("source_community"),

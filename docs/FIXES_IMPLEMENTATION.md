@@ -131,7 +131,7 @@ def check_gradient_health(model, loss):
 
 ### 當前代碼 (有問題)
 ```python
-def _load_symbol_frame(path: Path) -> pd.DataFrame:
+def _load_symbol_frame(path: Path) -> pl.DataFrame:
     # ... 特徵構造 ...
     
     # ❌ 沒有標準化
@@ -529,4 +529,3 @@ if __name__ == "__main__":
 3. **第三天**: 修復 4 + 綜合測試 (60 分鐘)
 
 **預期結果**: 訓練速度 +80%, 穩定性 +70%, 準確度 +15%
-

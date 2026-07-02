@@ -296,7 +296,7 @@ Model Params        1.44M   30K      count_parameters()
 ### 安裝依賴
 
 ```bash
-pip install polars pyarrow pandas numpy torch scikit-learn
+pip install polars pyarrow numpy torch scikit-learn
 ```
 
 ### 快速開始
@@ -376,4 +376,3 @@ A: 特徵嵌入層經驗證不降精度；其他優化無精度影響
 **預期性能提升：** 10-30 倍 (單 GPU) 或 Nx (多 GPU)
 
 **祝優化順利！🚀**
-
