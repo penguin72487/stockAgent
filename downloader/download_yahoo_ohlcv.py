@@ -641,6 +641,11 @@ def _coerce_to_date(value: object) -> date | None:
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
     value_text = str(value).strip()
     if not value_text or value_text.lower() in {"nan", "nat", "none", "null"}:
         return None
@@ -745,6 +750,31 @@ def _date_bounds_from_arrow_table(table: object) -> tuple[str | None, str | None
     return first.isoformat(), last.isoformat()
 
 
+def _date_bounds_from_parquet_metadata(parquet_metadata: object, date_column_index: int) -> tuple[str | None, str | None]:
+    first: date | None = None
+    last: date | None = None
+    try:
+        row_group_count = int(parquet_metadata.num_row_groups)
+    except Exception:
+        return None, None
+    for row_group_idx in range(row_group_count):
+        try:
+            stats = parquet_metadata.row_group(row_group_idx).column(date_column_index).statistics
+        except Exception:
+            continue
+        if stats is None or not bool(getattr(stats, "has_min_max", False)):
+            continue
+        min_date = _coerce_to_date(stats.min)
+        max_date = _coerce_to_date(stats.max)
+        if min_date is not None:
+            first = min_date if first is None else min(first, min_date)
+        if max_date is not None:
+            last = max_date if last is None else max(last, max_date)
+    if first is None or last is None:
+        return None, None
+    return first.isoformat(), last.isoformat()
+
+
 def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | None:
     if pq is None:
         return None
@@ -760,6 +790,20 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
 
     if "date" not in columns:
         return ExistingFileInfo(None, None, "empty", columns, checked_through)
+
+    first_meta = _decode_metadata_date(metadata.get(PARQUET_META_FIRST_DATE_KEY))
+    last_meta = _decode_metadata_date(metadata.get(PARQUET_META_LAST_DATE_KEY))
+    if first_meta is not None and last_meta is not None:
+        return ExistingFileInfo(first_meta, last_meta, None, columns, checked_through)
+
+    try:
+        date_column_index = arrow_schema.get_field_index("date")
+    except Exception:
+        date_column_index = -1
+    if date_column_index >= 0:
+        first_date, last_date = _date_bounds_from_parquet_metadata(parquet_metadata, date_column_index)
+        if first_date is not None and last_date is not None:
+            return ExistingFileInfo(first_date, last_date, None, columns, checked_through)
 
     try:
         date_table = pq.read_table(output_path, columns=["date"], memory_map=True)

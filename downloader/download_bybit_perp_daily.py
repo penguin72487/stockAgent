@@ -42,6 +42,14 @@ def _read_parquet(path: Path) -> pl.DataFrame:
     return pl.from_arrow(pq.read_table(path))
 
 
+def _read_parquet_row_count(path: Path) -> int:
+    return int(pq.ParquetFile(path, memory_map=True).metadata.num_rows)
+
+
+def _read_date_column(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path, columns=["date"], memory_map=True))
+
+
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -78,6 +86,14 @@ class DownloadResult:
     rows: int
     output_path: str | None
     message: str | None = None
+
+
+@dataclass(slots=True)
+class ExistingCandleInfo:
+    rows: int
+    latest_ms: int | None
+    interval_ok: bool
+    error: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -160,6 +176,12 @@ def _resolve_next_start_ms(existing_df: pl.DataFrame, fallback_start_ms: int) ->
     return max(fallback_start_ms, latest_ms - CANDLE_INTERVAL_MS)
 
 
+def _resolve_next_start_ms_from_latest(latest_ms: int | None, fallback_start_ms: int) -> int:
+    if latest_ms is None:
+        return fallback_start_ms
+    return max(fallback_start_ms, int(latest_ms) - CANDLE_INTERVAL_MS)
+
+
 def _ms_to_date_string(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -225,6 +247,34 @@ def _frame_matches_15m_interval(frame: pl.DataFrame) -> bool:
     if midnight_share > 0.95 and median_delta >= 12 * 60 * 60:
         return False
     return median_delta <= (CANDLE_INTERVAL_MS / 1000) * 4
+
+
+def _latest_ms_from_date_frame(frame: pl.DataFrame) -> int | None:
+    if frame.is_empty() or "date" not in frame.columns:
+        return None
+    parsed = _normalize_date_frame(frame)
+    if parsed.is_empty():
+        return None
+    latest = parsed.select(pl.col("date").str.to_datetime(strict=False).max()).item()
+    if latest is None:
+        return None
+    return int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _load_existing_candle_info(path: Path) -> ExistingCandleInfo:
+    try:
+        row_count = _read_parquet_row_count(path)
+        schema_names = set(pq.read_schema(path).names)
+        if "date" not in schema_names:
+            return ExistingCandleInfo(row_count, None, False, "missing date column")
+        date_frame = _read_date_column(path)
+        return ExistingCandleInfo(
+            rows=row_count,
+            latest_ms=_latest_ms_from_date_frame(date_frame),
+            interval_ok=_frame_matches_15m_interval(date_frame),
+        )
+    except Exception as exc:
+        return ExistingCandleInfo(0, None, False, f"{type(exc).__name__}: {exc}")
 
 
 def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
@@ -414,35 +464,31 @@ def _download_symbol_15m(
     refresh: bool,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    existing_df: pl.DataFrame | None = None
+    existing_info: ExistingCandleInfo | None = None
     effective_start_ms = start_ms
 
     if output_path.exists() and not refresh:
-        try:
-            existing_df = _read_parquet(output_path)
-            if not _frame_matches_15m_interval(existing_df):
-                print(
-                    f"[bybit] {record.bybit_symbol}: existing parquet does not look like "
-                    f"{KLINE_INTERVAL_LABEL}; rebuilding from start_date"
-                )
-                existing_df = None
-        except Exception:
-            existing_df = None
+        existing_info = _load_existing_candle_info(output_path)
+        if existing_info.error is not None or not existing_info.interval_ok:
+            print(
+                f"[bybit] {record.bybit_symbol}: existing parquet does not look like "
+                f"{KLINE_INTERVAL_LABEL}; rebuilding from start_date"
+            )
+            existing_info = None
 
-        if mode == "full" and existing_df is not None:
-            rows = existing_df.height if existing_df is not None else 0
+        if mode == "full" and existing_info is not None:
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
                 code=record.code,
                 bybit_symbol=record.bybit_symbol,
                 market=record.market,
                 status="skipped_existing",
-                rows=rows,
+                rows=existing_info.rows,
                 output_path=str(output_path),
             )
 
-        if existing_df is not None and not existing_df.is_empty():
-            effective_start_ms = _resolve_next_start_ms(existing_df, start_ms)
+        if existing_info is not None and existing_info.rows > 0:
+            effective_start_ms = _resolve_next_start_ms_from_latest(existing_info.latest_ms, start_ms)
             if effective_start_ms > end_ms:
                 return DownloadResult(
                     asset_class="crypto_bybit_perp",
@@ -450,7 +496,7 @@ def _download_symbol_15m(
                     bybit_symbol=record.bybit_symbol,
                     market=record.market,
                     status="skipped_up_to_date",
-                    rows=existing_df.height,
+                    rows=existing_info.rows,
                     output_path=str(output_path),
                 )
 
@@ -472,14 +518,14 @@ def _download_symbol_15m(
             all_rows.extend(chunk)
 
     if not all_rows:
-        if existing_df is not None and not existing_df.is_empty():
+        if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
                 code=record.code,
                 bybit_symbol=record.bybit_symbol,
                 market=record.market,
                 status="skipped_up_to_date",
-                rows=existing_df.height,
+                rows=existing_info.rows,
                 output_path=str(output_path),
             )
         return DownloadResult(
@@ -497,14 +543,14 @@ def _download_symbol_15m(
     filtered_rows = [row for row in all_rows if effective_start_ms <= int(row[0]) <= closed_end_ms]
     df = _normalize_candles(filtered_rows)
     if df.is_empty():
-        if existing_df is not None and not existing_df.is_empty():
+        if existing_info is not None and existing_info.rows > 0:
             return DownloadResult(
                 asset_class="crypto_bybit_perp",
                 code=record.code,
                 bybit_symbol=record.bybit_symbol,
                 market=record.market,
                 status="skipped_up_to_date",
-                rows=existing_df.height,
+                rows=existing_info.rows,
                 output_path=str(output_path),
             )
         return DownloadResult(
@@ -518,7 +564,8 @@ def _download_symbol_15m(
             message="No rows in requested date range.",
         )
 
-    if existing_df is not None and not existing_df.is_empty():
+    if existing_info is not None and existing_info.rows > 0:
+        existing_df = _read_parquet(output_path)
         combined, changed = _merge_existing_with_fresh(existing_df, df, effective_start_ms)
         if not changed:
             return DownloadResult(
@@ -527,7 +574,7 @@ def _download_symbol_15m(
                 bybit_symbol=record.bybit_symbol,
                 market=record.market,
                 status="skipped_up_to_date",
-                rows=existing_df.height,
+                rows=existing_info.rows,
                 output_path=str(output_path),
             )
         df = combined

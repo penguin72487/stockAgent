@@ -59,6 +59,7 @@ export_default_runtime() {
   export MARKET_CHECK_INTERVAL_SECONDS="${MARKET_CHECK_INTERVAL_SECONDS:-300}"
   export MAX_CYCLES="${MAX_CYCLES:-0}"
   export FAIL_FAST="${FAIL_FAST:-0}"
+  export DAILY_PARALLEL_GROUPS="${DAILY_PARALLEL_GROUPS:-1}"
   export TEE_LOG="${TEE_LOG:-1}"
   export RUN_LOG_DIR
   export RUN_RECORD_FILE="${RUN_RECORD_FILE:-${RUN_LOG_DIR}/daily_runs.tsv}"
