@@ -41,6 +41,8 @@ from stockagent.backtest.simulator import (
     BacktestResult,
     BacktestResultTensor,
     HoldingsRecord,
+    _asset_log_returns_to_simple_numpy,
+    _portfolio_simple_returns_to_log_numpy,
     get_backtest_compile_stats,
     get_backtest_prep_compile_stats,
     get_backtest_runtime_stats,
@@ -56,7 +58,7 @@ from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.fused_loss import fused_log_utility_loss_tensor
-from stockagent.training.loss import get_loss_runtime_stats, risk_aware_loss
+from stockagent.training.loss import get_loss_runtime_stats, masked_ic_loss, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
 
@@ -104,9 +106,11 @@ class TimingBreakdown:
     grad_s: float = 0.0
     grad_cuda_s: float = 0.0
     clip_s: float = 0.0
+    clip_cuda_s: float = 0.0
     finite_check_s: float = 0.0
     step_s: float = 0.0
     step_cuda_s: float = 0.0
+    scheduler_s: float = 0.0
     backtest_s: float = 0.0
     backtest_prepare_s: float = 0.0
     backtest_runner_s: float = 0.0
@@ -145,9 +149,11 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "grad_s",
         "grad_cuda_s",
         "clip_s",
+        "clip_cuda_s",
         "finite_check_s",
         "step_s",
         "step_cuda_s",
+        "scheduler_s",
         "backtest_s",
         "backtest_prepare_s",
         "backtest_runner_s",
@@ -187,9 +193,11 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "grad_s",
         "grad_cuda_s",
         "clip_s",
+        "clip_cuda_s",
         "finite_check_s",
         "step_s",
         "step_cuda_s",
+        "scheduler_s",
         "backtest_s",
         "backtest_prepare_s",
         "backtest_runner_s",
@@ -487,6 +495,7 @@ def _profile_single_train_step(
     gamma_turnover_budget: float,
     objective: str,
     rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
@@ -518,6 +527,13 @@ def _profile_single_train_step(
                     batch["can_sell_mask"],
                     batch.get("sample_mask"),
                     None,
+                )
+                loss = _add_return_rank_ic_aux_loss(
+                    loss,
+                    weights,
+                    batch["future_log_returns"],
+                    batch["tradable_mask"],
+                    return_rank_ic_weight,
                 )
             else:
                 loss = loss_fn(
@@ -551,6 +567,7 @@ def _profile_single_train_step(
                     objective=objective,
                     aux_outputs=aux_outputs,
                     rank_ic_weight=rank_ic_weight,
+                    return_rank_ic_weight=return_rank_ic_weight,
                     direction_weight=direction_weight,
                     volatility_regime_weight=volatility_regime_weight,
                     concentration_weight=concentration_weight,
@@ -736,6 +753,18 @@ def _run_fused_log_utility_loss(
     )
 
 
+def _add_return_rank_ic_aux_loss(
+    loss: torch.Tensor,
+    rank_logits: torch.Tensor,
+    future_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    return_rank_ic_weight: float,
+) -> torch.Tensor:
+    if float(return_rank_ic_weight) <= 0.0:
+        return loss
+    return loss + float(return_rank_ic_weight) * masked_ic_loss(rank_logits, future_returns, tradable_mask)
+
+
 def _loss_from_backtest_result(
     backtest: BacktestResultTensor,
     config: ExperimentConfig,
@@ -787,7 +816,7 @@ def _evaluated_backtest_loss(
         buy_fee_rate=config.trading.buy_fee_rate,
         sell_fee_rate=config.trading.sell_fee_rate,
         max_turnover_ratio=config.trading.max_turnover_ratio,
-        gross_leverage=config.trading.gross_leverage,
+        gross_leverage=1.0,
         min_trade_weight=config.trading.min_trade_weight,
         portfolio_activation=config.trading.portfolio_activation,
         gamma_sharpe=config.evaluation.gamma_sharpe,
@@ -1113,7 +1142,7 @@ def _objective_metric_key(objective: str) -> str:
     if objective == "log_utility":
         return "cagr"
     if objective in {"outperformance_risk_budget", "excess_cvar_drawdown"}:
-        return "excess_return_vs_universe_average"
+        return "excess_return_vs_benchmark"
     return objective
 
 
@@ -1229,6 +1258,10 @@ def _best_checkpoint_path(fold_dir: Path) -> Path:
 
 def _metrics_path(fold_dir: Path) -> Path:
     return fold_dir / "metrics.json"
+
+
+def _fold_complete_marker_path(fold_dir: Path) -> Path:
+    return fold_dir / "fold_complete.json"
 
 
 def _model_path(fold_dir: Path) -> Path:
@@ -1680,9 +1713,11 @@ def _timing_curve_payload(
         "train_grad_ms_per_batch": _avg_ms(train_timing.grad_s),
         "train_grad_cuda_ms_per_batch": _avg_ms(train_timing.grad_cuda_s),
         "train_clip_ms_per_batch": _avg_ms(train_timing.clip_s),
+        "train_clip_cuda_ms_per_batch": _avg_ms(train_timing.clip_cuda_s),
         "train_finite_check_ms_per_batch": _avg_ms(train_timing.finite_check_s),
         "train_step_ms_per_batch": _avg_ms(train_timing.step_s),
         "train_step_cuda_ms_per_batch": _avg_ms(train_timing.step_cuda_s),
+        "train_scheduler_ms_per_batch": _avg_ms(train_timing.scheduler_s),
         "val_eval_s": float(val_eval_s),
         "val_transfer_s": float(val_timing.transfer_s),
         "val_eval_transfer_to_gpu_s": float(val_timing.transfer_s),
@@ -1828,7 +1863,7 @@ def _timing_curve_payload(
         "fold_checkpoint_save_s": float(fold_checkpoint_save_s),
         "group_checkpoint_save_s": float(group_checkpoint_save_s),
         "checkpoint_save_s": checkpoint_total_s,
-        "scheduler_s": float(scheduler_s),
+        "scheduler_s": float(scheduler_s) + float(train_timing.scheduler_s),
         "progress_update_s": float(progress_update_s),
         "curve_record_s": float(curve_record_s),
         "scalar_sync_s": float(scalar_sync_s),
@@ -1886,6 +1921,42 @@ def _load_fold_result(metrics_path: Path) -> FoldResult:
     return FoldResult(**payload)
 
 
+def _write_fold_complete_marker(
+    fold_dir: Path,
+    fold_result: FoldResult,
+    *,
+    source: str,
+) -> None:
+    marker = {
+        "status": "complete",
+        "source": str(source),
+        "fold_id": int(fold_result.fold_id),
+        "train_years": [int(year) for year in fold_result.train_years],
+        "val_years": [int(year) for year in fold_result.val_years],
+        "test_years": [int(year) for year in fold_result.test_years],
+        "metrics_json": _metrics_path(fold_dir).name,
+        "model_path": _model_path(fold_dir).name,
+        "backtest_npz": _backtest_path(fold_dir).name,
+        "written_at_unix_seconds": float(time.time()),
+    }
+    marker_path = _fold_complete_marker_path(fold_dir)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    with marker_path.open("w", encoding="utf-8") as handle:
+        json.dump(marker, handle, indent=2)
+
+
+def _has_completed_fold_marker(fold_dir: Path) -> bool:
+    marker_path = _fold_complete_marker_path(fold_dir)
+    if not marker_path.exists():
+        return False
+    try:
+        with marker_path.open("r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return str(marker.get("status", "")).lower() == "complete"
+
+
 def _write_summary(results: list[FoldResult], output_path: Path) -> None:
     summary_path = _summary_path(output_path)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1895,6 +1966,53 @@ def _write_summary(results: list[FoldResult], output_path: Path) -> None:
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return getattr(model, "_orig_mod", model)
+
+
+def _clip_model_gradients_(model: nn.Module, max_norm: float) -> None:
+    params = [param for param in _unwrap_model(model).parameters() if param.grad is not None]
+    if not params:
+        return
+    try:
+        torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm=float(max_norm),
+            error_if_nonfinite=False,
+            foreach=True,
+        )
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "foreach" not in message and "not implemented" not in message and "not support" not in message:
+            raise
+        torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm=float(max_norm),
+            error_if_nonfinite=False,
+            foreach=False,
+        )
+
+
+def _run_gradient_clip_(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    *,
+    grad_clip_norm: float,
+    timing: TimingBreakdown,
+    device: torch.device,
+    profile_timing: bool,
+) -> None:
+    if float(grad_clip_norm) <= 0.0:
+        return
+    clip_start = time.perf_counter()
+    with _cuda_timing(timing, "clip_cuda_s", device):
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+        # Avoid error_if_nonfinite=True here: it turns the CUDA total norm into a
+        # Python bool and synchronizes every batch. Periodic finite checks below
+        # provide the explicit safety gate when configured.
+        _clip_model_gradients_(model, float(grad_clip_norm))
+    _maybe_sync_cuda(device, profile_timing)
+    timing.clip_s += time.perf_counter() - clip_start
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
@@ -2187,13 +2305,15 @@ def _save_group_checkpoint(
 def _create_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     config: ExperimentConfig,
-) -> tuple[torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None, str, bool]:
+    *,
+    steps_per_epoch: int = 1,
+) -> tuple[torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None, str, bool, str]:
     if not bool(getattr(config.training, "enable_lr_scheduler", True)):
-        return None, "disabled", False
+        return None, "disabled", False, "epoch"
 
     name = str(getattr(config.training, "lr_scheduler", "none") or "none").strip().lower().replace("-", "_")
     if name in {"", "none", "off", "false", "disabled"}:
-        return None, "none", False
+        return None, "none", False, "epoch"
 
     if name == "cosine":
         t_max = int(config.training.lr_scheduler_t_max)
@@ -2204,7 +2324,35 @@ def _create_lr_scheduler(
             T_max=t_max,
             eta_min=float(config.training.lr_scheduler_eta_min),
         )
-        return scheduler, "cosine", False
+        return scheduler, "cosine", False, "epoch"
+
+    if name in {"warmup_cosine", "cosine_warmup", "linear_warmup_cosine"}:
+        steps_per_epoch = max(1, int(steps_per_epoch))
+        total_steps = int(config.training.lr_scheduler_t_max)
+        if total_steps <= 0:
+            total_steps = max(1, int(config.training.epochs) * steps_per_epoch)
+        warmup_steps = max(0, int(getattr(config.training, "lr_scheduler_warmup_steps", 0)))
+        warmup_steps = min(warmup_steps, max(0, total_steps - 1))
+        base_lr = max(float(config.training.learning_rate), 1e-12)
+        eta_min = max(0.0, float(config.training.lr_scheduler_eta_min))
+        eta_factor = min(1.0, eta_min / base_lr)
+
+        def lr_lambda(step: int) -> float:
+            current = max(0, int(step))
+            if warmup_steps > 0 and current < warmup_steps:
+                return max(eta_factor, float(current + 1) / float(warmup_steps))
+            if total_steps <= warmup_steps + 1:
+                return 1.0
+            progress = float(current - warmup_steps) / float(max(1, total_steps - warmup_steps - 1))
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return eta_factor + (1.0 - eta_factor) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        interval = str(getattr(config.training, "lr_scheduler_interval", "step") or "step").strip().lower()
+        if interval not in {"step", "batch"}:
+            interval = "step"
+        return scheduler, f"warmup_cosine(steps={total_steps}, warmup={warmup_steps})", False, "step"
 
     if name == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(
@@ -2212,7 +2360,7 @@ def _create_lr_scheduler(
             step_size=max(1, int(config.training.lr_scheduler_step_size)),
             gamma=float(config.training.lr_scheduler_gamma),
         )
-        return scheduler, "step", False
+        return scheduler, "step", False, "epoch"
 
     if name in {"plateau", "reduce_on_plateau", "reduce_lr_on_plateau"}:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -2222,10 +2370,35 @@ def _create_lr_scheduler(
             patience=max(1, int(config.training.lr_scheduler_patience)),
             threshold=float(config.training.lr_scheduler_threshold),
         )
-        return scheduler, "plateau", True
+        return scheduler, "plateau", True, "epoch"
 
     print(f"[train] unknown lr_scheduler='{config.training.lr_scheduler}', disabled")
-    return None, "none", False
+    return None, "none", False, "epoch"
+
+
+def _estimate_train_steps_per_epoch(
+    *,
+    train_ds_len: int,
+    train_windowed: WindowedSplitTensors | None,
+    train_x: torch.Tensor | None,
+    train_batch_size: int,
+) -> int:
+    batch_size = max(1, int(train_batch_size))
+    if train_windowed is not None:
+        return max(1, math.ceil(len(train_windowed) / batch_size))
+    if train_x is not None:
+        return max(1, int(train_x.size(0)) // batch_size)
+    return max(1, math.ceil(max(1, int(train_ds_len)) / batch_size))
+
+
+def _step_batch_lr_scheduler(
+    scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+) -> float:
+    if scheduler is None:
+        return 0.0
+    start = time.perf_counter()
+    scheduler.step()
+    return time.perf_counter() - start
 
 
 def _benchmark_input_pipeline_throughput(
@@ -2399,8 +2572,14 @@ def _realized_leverage_backtest(
     buy_turnovers = np.clip(deltas, 0.0, None).sum(axis=1)
     sell_turnovers = np.clip(-deltas, 0.0, None).sum(axis=1)
     turnovers = buy_turnovers + sell_turnovers
-    gross_returns = np.einsum("ts,ts->t", leveraged_weights, returns)
-    strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+    asset_simple_returns = _asset_log_returns_to_simple_numpy(returns)
+    gross_simple_returns = np.einsum("ts,ts->t", leveraged_weights, asset_simple_returns)
+    net_simple_returns = (
+        gross_simple_returns
+        - float(buy_fee_rate) * buy_turnovers
+        - float(sell_fee_rate) * sell_turnovers
+    )
+    strategy_returns = _portfolio_simple_returns_to_log_numpy(net_simple_returns)
     return BacktestResult(
         strategy_returns=strategy_returns.astype(np.float32),
         benchmark_returns=np.asarray(result.benchmark_returns, dtype=np.float32),
@@ -2496,6 +2675,7 @@ def _save_fold_output_artifacts(
     backtest_artifact_compression: str | None = None,
     print_report: bool = True,
     write_plots: bool = True,
+    mark_complete: bool = False,
 ) -> tuple[dict[str, float | str], dict[str, float | str]]:
     fold_dir.mkdir(parents=True, exist_ok=True)
     save_start = time.perf_counter()
@@ -2597,7 +2777,7 @@ def _save_fold_output_artifacts(
             test_dates,
             fold_dir / "annual_performance.png",
         )
-        leverage_multiplier = float(getattr(config.trading, "gross_leverage", 1.0))
+        leverage_multiplier = float(getattr(config.trading, "leverage", 1.0))
         plot_timing["leverage_multiplier"] = float(leverage_multiplier)
         if test_future_returns is not None:
             leverage_backtest = _realized_leverage_backtest(
@@ -2674,6 +2854,8 @@ def _save_fold_output_artifacts(
         json.dumps(plot_timing, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    if mark_complete:
+        _write_fold_complete_marker(fold_dir, fold_result, source="fold_output_artifacts")
     return save_timing, plot_timing
 
 
@@ -4017,14 +4199,14 @@ def _compute_eval_metrics_like_legacy_online(
             "annualized_return": 0.0,
             "cagr": 0.0,
             "sharpe": 0.0,
-            "baseline_sharpe": 0.0,
+            "benchmark_sharpe": 0.0,
             "sortino": 0.0,
-            "baseline_sortino": 0.0,
+            "benchmark_sortino": 0.0,
             "max_drawdown": 0.0,
             "calmar": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
-            "excess_return_vs_universe_average": 0.0,
+            "excess_return_vs_benchmark": 0.0,
             "cumulative_benchmark": 0.0,
         }
 
@@ -4053,14 +4235,14 @@ def _compute_eval_metrics_like_legacy_online(
         "annualized_return": ann_r,
         "cagr": ann_r,
         "sharpe": float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0,
-        "baseline_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
+        "benchmark_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
         "sortino": float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0,
-        "baseline_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
+        "benchmark_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
         "max_drawdown": max_dd,
         "calmar": ann_r / abs(max_dd) if max_dd < 0.0 else 0.0,
         "turnover": float(t.sum().item()) / n,
         "daily_hit_rate": float((r > 0).to(torch.float64).sum().item()) / n,
-        "excess_return_vs_universe_average": cum_r - cum_b,
+        "excess_return_vs_benchmark": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
     }
 
@@ -4634,14 +4816,14 @@ def _evaluate_tensor_batch(
                 "annualized_return": 0.0,
                 "cagr": 0.0,
                 "sharpe": 0.0,
-                "baseline_sharpe": 0.0,
+                "benchmark_sharpe": 0.0,
                 "sortino": 0.0,
-                "baseline_sortino": 0.0,
+                "benchmark_sortino": 0.0,
                 "max_drawdown": 0.0,
                 "calmar": 0.0,
                 "turnover": 0.0,
                 "daily_hit_rate": 0.0,
-                "excess_return_vs_universe_average": 0.0,
+                "excess_return_vs_benchmark": 0.0,
                 "cumulative_benchmark": 0.0,
             }
         else:
@@ -4686,11 +4868,11 @@ def _evaluate_tensor_batch(
             cum_b = _safe_expm1(sum_b)
             ann_r = _safe_expm1(mean_r * 252.0)
             sharpe = float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0
-            baseline_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
+            benchmark_sharpe = float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0
             downside_dev = float((sum_downside_sq_r / n) ** 0.5)
             downside_dev_b = float((sum_downside_sq_b / n) ** 0.5)
             sortino = float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0
-            baseline_sortino = float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0
+            benchmark_sortino = float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0
             calmar = ann_r / abs(float(min_dd_value)) if float(min_dd_value) < 0.0 else 0.0
 
             metrics = {
@@ -4698,14 +4880,14 @@ def _evaluate_tensor_batch(
                 "annualized_return": ann_r,
                 "cagr": ann_r,
                 "sharpe": sharpe,
-                "baseline_sharpe": baseline_sharpe,
+                "benchmark_sharpe": benchmark_sharpe,
                 "sortino": sortino,
-                "baseline_sortino": baseline_sortino,
+                "benchmark_sortino": benchmark_sortino,
                 "max_drawdown": float(min_dd_value),
                 "calmar": calmar,
                 "turnover": sum_turnover / n,
                 "daily_hit_rate": hit_count / n,
-                "excess_return_vs_universe_average": cum_r - cum_b,
+                "excess_return_vs_benchmark": cum_r - cum_b,
                 "cumulative_benchmark": cum_b,
             }
         timing.metrics_s += time.perf_counter() - metrics_start
@@ -5335,14 +5517,14 @@ def _evaluate_windowed_tensor_batch(
                 "annualized_return": 0.0,
                 "cagr": 0.0,
                 "sharpe": 0.0,
-                "baseline_sharpe": 0.0,
+                "benchmark_sharpe": 0.0,
                 "sortino": 0.0,
-                "baseline_sortino": 0.0,
+                "benchmark_sortino": 0.0,
                 "max_drawdown": 0.0,
                 "calmar": 0.0,
                 "turnover": 0.0,
                 "daily_hit_rate": 0.0,
-                "excess_return_vs_universe_average": 0.0,
+                "excess_return_vs_benchmark": 0.0,
                 "cumulative_benchmark": 0.0,
             }
         else:
@@ -5384,14 +5566,14 @@ def _evaluate_windowed_tensor_batch(
                 "annualized_return": ann_r,
                 "cagr": ann_r,
                 "sharpe": float(mean_r / std_r * np.sqrt(252.0)) if std_r > 0 else 0.0,
-                "baseline_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
+                "benchmark_sharpe": float(mean_b / std_b * np.sqrt(252.0)) if std_b > 0 else 0.0,
                 "sortino": float(mean_r / downside_dev * np.sqrt(252.0)) if downside_dev > 0 else 0.0,
-                "baseline_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
+                "benchmark_sortino": float(mean_b / downside_dev_b * np.sqrt(252.0)) if downside_dev_b > 0 else 0.0,
                 "max_drawdown": float(min_dd_value),
                 "calmar": ann_r / abs(float(min_dd_value)) if float(min_dd_value) < 0.0 else 0.0,
                 "turnover": sum_turnover / n,
                 "daily_hit_rate": hit_count / n,
-                "excess_return_vs_universe_average": cum_r - cum_b,
+                "excess_return_vs_benchmark": cum_r - cum_b,
                 "cumulative_benchmark": cum_b,
             }
         timing.metrics_s += time.perf_counter() - metrics_start
@@ -5637,7 +5819,12 @@ def _load_completed_fold_result(output_path: Path, fold_id: int) -> FoldResult |
     metrics_path = _metrics_path(fold_dir)
     model_path = _model_path(fold_dir)
     backtest_path = _backtest_path(fold_dir)
-    if metrics_path.exists() and model_path.exists() and backtest_path.exists():
+    if (
+        _has_completed_fold_marker(fold_dir)
+        and metrics_path.exists()
+        and model_path.exists()
+        and backtest_path.exists()
+    ):
         return _load_fold_result(metrics_path)
     return None
 
@@ -5833,6 +6020,217 @@ def _training_loss_portfolio_activation(config: ExperimentConfig) -> str:
     if activation in {"", "auto", "trading", "same", "same_as_trading"}:
         return str(config.trading.portfolio_activation)
     return activation
+
+
+def _postprocess_benchmark_script() -> Path:
+    return Path(__file__).resolve().parents[2] / "scripts" / "benchmark_postprocess.py"
+
+
+def _postprocess_benchmark_config_path() -> str:
+    return os.environ.get("STOCKAGENT_CONFIG_PATH", "configs/markets/tw.yaml")
+
+
+def _postprocess_benchmark_metric_name(raw: str) -> str:
+    name = str(raw).strip().lower().replace("-", "_")
+    aliases = {
+        "sharp": "sharpe",
+        "cum_return": "cumulative_return",
+        "return": "cumulative_return",
+        "returns": "cumulative_return",
+        "total_return": "cumulative_return",
+        "total_returns": "cumulative_return",
+    }
+    return aliases.get(name, name)
+
+
+def _postprocess_benchmark_plot_metrics(config: ExperimentConfig, rank_metric: str) -> list[str]:
+    raw = str(getattr(config.training, "postprocess_benchmark_plot_metrics", rank_metric))
+    metrics: list[str] = []
+    for item in raw.split(","):
+        metric = _postprocess_benchmark_metric_name(item)
+        if not metric:
+            continue
+        if metric not in metrics:
+            metrics.append(metric)
+    if rank_metric not in metrics:
+        metrics.insert(0, rank_metric)
+    return metrics
+
+
+def _run_postprocess_benchmark_after_fold(
+    *,
+    config: ExperimentConfig,
+    output_path: Path,
+    fold_id: int,
+    enabled: bool | None = None,
+) -> None:
+    if enabled is None:
+        enabled = bool(getattr(config.training, "postprocess_benchmark_after_fold", False))
+    if not bool(enabled):
+        return
+
+    script_path = _postprocess_benchmark_script()
+    if not script_path.exists():
+        message = f"[Fold {fold_id}] postprocess benchmark skipped: missing {script_path}"
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise FileNotFoundError(message)
+        print(message)
+        return
+
+    split = str(getattr(config.training, "postprocess_benchmark_split", "test")).strip().lower()
+    rank_metric = _postprocess_benchmark_metric_name(
+        str(getattr(config.training, "postprocess_benchmark_rank_metric", "sharpe"))
+    )
+    plot_metrics = _postprocess_benchmark_plot_metrics(config, rank_metric)
+    fold_dir = _fold_dir(output_path, fold_id)
+    checkpoint_path = fold_dir / "checkpoint_best.pt"
+    if not checkpoint_path.exists():
+        message = f"[Fold {fold_id}] postprocess benchmark skipped: missing {checkpoint_path}"
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise FileNotFoundError(message)
+        print(message)
+        return
+    output_dir = fold_dir / "postprocess_benchmark"
+    best_plot_paths = [output_dir / f"{split}_best_{metric}_equity_curve.png" for metric in plot_metrics]
+    json_path = output_dir / f"{split}_activation_threshold_sweep.json"
+    has_trained_output_candidate = False
+    if json_path.exists():
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
+            results = payload.get("results", []) if isinstance(payload, dict) else []
+            summary_metrics = summary.get("plot_metrics", [])
+            has_trained_output_candidate = bool(summary.get("trained_output_mode")) and any(
+                isinstance(row, dict) and row.get("mode") == "trained_output"
+                for row in results
+            )
+            has_trained_output_candidate = has_trained_output_candidate and all(
+                metric in summary_metrics for metric in plot_metrics
+            )
+        except Exception:
+            has_trained_output_candidate = False
+    if best_plot_paths and all(
+        path.exists() and path.stat().st_mtime >= checkpoint_path.stat().st_mtime
+        for path in best_plot_paths
+    ) and has_trained_output_candidate:
+        print(f"[Fold {fold_id}] postprocess benchmark already exists: {output_dir}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / f"{split}_activation_threshold_sweep.log"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--config",
+        _postprocess_benchmark_config_path(),
+        "--fold",
+        str(int(fold_id)),
+        "--split",
+        split,
+        "--activations",
+        str(getattr(config.training, "postprocess_benchmark_activations", "identity,softsign,tanh,isru,erf,atan,gd")),
+        "--thresholds",
+        str(
+            getattr(
+                config.training,
+                "postprocess_benchmark_thresholds",
+                "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02",
+            )
+        ),
+        "--rank-metric",
+        rank_metric,
+        "--plot-metrics",
+        ",".join(plot_metrics),
+        "--plot-top-n",
+        str(int(getattr(config.training, "postprocess_benchmark_plot_top_n", 20))),
+        "--output-root",
+        str(output_path),
+    ]
+    max_rows = int(getattr(config.training, "postprocess_benchmark_max_rows", 0))
+    if max_rows > 0:
+        cmd.extend(["--max-rows", str(max_rows)])
+    if bool(getattr(config.training, "postprocess_benchmark_backtest_compile", False)):
+        cmd.append("--backtest-compile")
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    started = time.perf_counter()
+    print(f"[Fold {fold_id}] running postprocess benchmark for best checkpoint: {output_dir}")
+    proc = subprocess.run(
+        cmd,
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    elapsed_s = time.perf_counter() - started
+    combined_output = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
+    log_path.write_text(combined_output, encoding="utf-8")
+
+    if proc.returncode != 0:
+        tail = "\n".join(combined_output.strip().splitlines()[-40:])
+        message = (
+            f"[Fold {fold_id}] postprocess benchmark failed in {elapsed_s:.1f}s "
+            f"(exit={proc.returncode}); log={log_path}\n{tail}"
+        )
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise RuntimeError(message)
+        print(message)
+        return
+
+    best_payload: dict[str, Any] | None = None
+    best_by_metric_payload: dict[str, Any] | None = None
+    output_payload: dict[str, Any] | None = None
+    for raw_line in combined_output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("BEST "):
+            try:
+                parsed = json.loads(line[len("BEST ") :])
+                if isinstance(parsed, dict):
+                    best_payload = parsed
+            except json.JSONDecodeError:
+                pass
+        elif line.startswith("BEST_BY_METRIC "):
+            try:
+                parsed = json.loads(line[len("BEST_BY_METRIC ") :])
+                if isinstance(parsed, dict):
+                    best_by_metric_payload = parsed
+            except json.JSONDecodeError:
+                pass
+        elif line.startswith("{") and "best_equity_curve" in line:
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    output_payload = parsed
+            except json.JSONDecodeError:
+                pass
+
+    if best_payload:
+        print(
+            f"[Fold {fold_id}] postprocess best {rank_metric}: "
+            f"activation={best_payload.get('activation')} "
+            f"threshold={float(best_payload.get('min_trade_weight', 0.0)):.6g} "
+            f"sharpe={float(best_payload.get('sharpe', 0.0)):+.4f} "
+            f"cum={float(best_payload.get('cumulative_return', 0.0)):+.4f} "
+            f"plots={output_dir}"
+        )
+        if best_by_metric_payload:
+            for metric in plot_metrics:
+                row = best_by_metric_payload.get(metric)
+                if not isinstance(row, dict):
+                    continue
+                print(
+                    f"[Fold {fold_id}] postprocess best {metric}: "
+                    f"activation={row.get('activation')} "
+                    f"threshold={float(row.get('min_trade_weight', 0.0)):.6g} "
+                    f"sharpe={float(row.get('sharpe', 0.0)):+.4f} "
+                    f"sortino={float(row.get('sortino', 0.0)):+.4f} "
+                    f"cum={float(row.get('cumulative_return', 0.0)):+.4f}"
+                )
+    elif output_payload:
+        print(f"[Fold {fold_id}] postprocess benchmark outputs: {output_payload}")
+    else:
+        print(f"[Fold {fold_id}] postprocess benchmark finished in {elapsed_s:.1f}s; log={log_path}")
 
 
 def _query_nvidia_smi_free_bytes(device_index: int) -> tuple[int, int, int] | None:
@@ -6294,12 +6692,15 @@ def _train_epoch(
     grad_clip_norm: float,
     finite_check_interval_steps: int = 0,
     rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_aug_kwargs: dict[str, float] | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
@@ -6380,6 +6781,13 @@ def _train_epoch(
                         batch.get("sample_mask"),
                         portfolio_prev_weights,
                     )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        return_rank_ic_weight,
+                    )
                 else:
                     loss = loss_fn(
                         weights,
@@ -6412,6 +6820,7 @@ def _train_epoch(
                         objective=objective,
                         aux_outputs=aux_outputs,
                         rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
                         direction_weight=direction_weight,
                         volatility_regime_weight=volatility_regime_weight,
                         concentration_weight=concentration_weight,
@@ -6457,11 +6866,15 @@ def _train_epoch(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
-                clip_start = time.perf_counter()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6483,6 +6896,8 @@ def _train_epoch(
                 scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
@@ -6493,10 +6908,15 @@ def _train_epoch(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
-                clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6517,6 +6937,8 @@ def _train_epoch(
                 optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -6593,6 +7015,8 @@ def _train_epoch_tensor(
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_aug_kwargs: dict[str, float] | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
@@ -6759,11 +7183,15 @@ def _train_epoch_tensor(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
-                clip_start = time.perf_counter()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6785,6 +7213,8 @@ def _train_epoch_tensor(
                 scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
@@ -6795,10 +7225,15 @@ def _train_epoch_tensor(
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
-                clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
 
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -6819,6 +7254,8 @@ def _train_epoch_tensor(
                 optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -6890,6 +7327,8 @@ def _train_epoch_windowed_tensor(
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_aug_kwargs: dict[str, float] | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
@@ -7085,11 +7524,15 @@ def _train_epoch_windowed_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             if grad_clip_norm > 0.0:
-                clip_start = time.perf_counter()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
             gradients_are_finite = True
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -7104,6 +7547,8 @@ def _train_epoch_windowed_tensor(
                 scaler.update()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
@@ -7111,10 +7556,15 @@ def _train_epoch_windowed_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             if grad_clip_norm > 0.0:
-                clip_start = time.perf_counter()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm, error_if_nonfinite=True)
-                _maybe_sync_cuda(device, profile_timing)
-                timing.clip_s += time.perf_counter() - clip_start
+                _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
             gradients_are_finite = True
             if should_check_finite:
                 finite_start = time.perf_counter()
@@ -7128,6 +7578,8 @@ def _train_epoch_windowed_tensor(
                 optimizer.step()
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
+            if lr_scheduler is not None and lr_scheduler_interval == "step":
+                timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
 
         if should_check_finite:
             finite_start = time.perf_counter()
@@ -7170,14 +7622,14 @@ def _compute_metrics_from_tensors(
             "annualized_return": 0.0,
             "cagr": 0.0,
             "sharpe": 0.0,
-            "baseline_sharpe": 0.0,
+            "benchmark_sharpe": 0.0,
             "sortino": 0.0,
-            "baseline_sortino": 0.0,
+            "benchmark_sortino": 0.0,
             "max_drawdown": 0.0,
             "calmar": 0.0,
             "turnover": 0.0,
             "daily_hit_rate": 0.0,
-            "excess_return_vs_universe_average": 0.0,
+            "excess_return_vs_benchmark": 0.0,
             "cumulative_benchmark": 0.0,
         }
 
@@ -7192,13 +7644,13 @@ def _compute_metrics_from_tensors(
     std_b = b.std(unbiased=False)
     ann_r = float(torch.expm1(avg * 252.0).item())
     sharpe = float((avg / std * np.sqrt(252.0)).item()) if float(std.item()) > 0 else 0.0
-    baseline_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
+    benchmark_sharpe = float((avg_b / std_b * np.sqrt(252.0)).item()) if float(std_b.item()) > 0 else 0.0
     downside = torch.minimum(r, torch.zeros_like(r))
     downside_b = torch.minimum(b, torch.zeros_like(b))
     downside_dev = torch.sqrt((downside.pow(2)).mean())
     downside_dev_b = torch.sqrt((downside_b.pow(2)).mean())
     sortino = float((avg / downside_dev * np.sqrt(252.0)).item()) if float(downside_dev.item()) > 0 else 0.0
-    baseline_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
+    benchmark_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
 
     equity = torch.exp(torch.cumsum(r, dim=0))
     running_max = torch.cummax(equity, dim=0).values
@@ -7211,14 +7663,14 @@ def _compute_metrics_from_tensors(
         "annualized_return": ann_r,
         "cagr": ann_r,
         "sharpe": sharpe,
-        "baseline_sharpe": baseline_sharpe,
+        "benchmark_sharpe": benchmark_sharpe,
         "sortino": sortino,
-        "baseline_sortino": baseline_sortino,
+        "benchmark_sortino": benchmark_sortino,
         "max_drawdown": max_dd,
         "calmar": calmar,
         "turnover": float(t.mean().item()) if t.numel() else 0.0,
         "daily_hit_rate": float((r > 0).to(torch.float64).mean().item()),
-        "excess_return_vs_universe_average": cum_r - cum_b,
+        "excess_return_vs_benchmark": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
     }
 
@@ -7308,7 +7760,7 @@ def _run_training_tree_models(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
-                config.trading.gross_leverage,
+                1.0,
                 config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
@@ -7347,7 +7799,7 @@ def _run_training_tree_models(
                 config.trading.buy_fee_rate,
                 config.trading.sell_fee_rate,
                 config.trading.max_turnover_ratio,
-                config.trading.gross_leverage,
+                1.0,
                 config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
@@ -7384,7 +7836,7 @@ def _run_training_tree_models(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
@@ -7408,7 +7860,7 @@ def _run_training_tree_models(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
@@ -7421,8 +7873,8 @@ def _run_training_tree_models(
             objective_key = _objective_metric_key(loss_objective)
             val_objective_metric = float(val_met.get(objective_key, float("nan")))
             test_objective_metric = float(test_met.get(objective_key, float("nan")))
-            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_benchmark']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_benchmark']:+.4f}")
 
             fold_result = FoldResult(
                 fold_id=fold.fold_id,
@@ -7494,6 +7946,7 @@ def _run_training_tree_models(
                 write_holdings_table=write_integer_holdings_table,
                 table_output_format=table_output_format,
             )
+            _write_fold_complete_marker(fold_dir, fold_result, source="tree_training_final")
 
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
 
@@ -7551,7 +8004,7 @@ def _run_inference_tree_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
@@ -7591,7 +8044,7 @@ def _run_inference_tree_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7628,7 +8081,7 @@ def _run_inference_tree_models(
             buy_fee_rate=config.trading.buy_fee_rate,
             sell_fee_rate=config.trading.sell_fee_rate,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7658,7 +8111,7 @@ def _run_inference_tree_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
@@ -7735,6 +8188,7 @@ def _run_inference_tree_models(
             write_holdings_table=write_integer_holdings_table,
             table_output_format=table_output_format,
         )
+        _write_fold_complete_marker(fold_dir, fold_result, source="tree_inference_final")
 
     if results_by_fold:
         _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -7842,7 +8296,7 @@ def _run_inference_neural_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
@@ -7900,7 +8354,7 @@ def _run_inference_neural_models(
             config.trading.buy_fee_rate,
             config.trading.sell_fee_rate,
             config.trading.max_turnover_ratio,
-            config.trading.gross_leverage,
+            1.0,
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7950,7 +8404,7 @@ def _run_inference_neural_models(
             buy_fee_rate=config.trading.buy_fee_rate,
             sell_fee_rate=config.trading.sell_fee_rate,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
@@ -7983,7 +8437,7 @@ def _run_inference_neural_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
@@ -8060,6 +8514,7 @@ def _run_inference_neural_models(
             write_holdings_table=write_integer_holdings_table,
             table_output_format=table_output_format,
         )
+        _write_fold_complete_marker(fold_dir, fold_result, source="neural_inference_final")
 
     if results_by_fold:
         _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
@@ -8181,6 +8636,14 @@ def run_training(
             if config.training.warm_start_from_previous_fold and group_checkpoint_path.exists():
                 warm_start_checkpoint_path = group_checkpoint_path
             print(f"[Train {train_years}] already completed, skipping")
+            for fold in group_folds:
+                if fold.fold_id in results_by_fold:
+                    _run_postprocess_benchmark_after_fold(
+                        config=config,
+                        output_path=output_path,
+                        fold_id=fold.fold_id,
+                        enabled=bool(getattr(config.training, "postprocess_benchmark_after_fold", False)),
+                    )
             continue
 
         print(f"\n{'='*80}")
@@ -8503,7 +8966,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=loss_portfolio_activation,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
@@ -8534,9 +8997,22 @@ def run_training(
                 weight_decay=config.training.weight_decay,
             )
         scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
-        scheduler, scheduler_name, scheduler_requires_metric = _create_lr_scheduler(optimizer, config)
+        train_steps_per_epoch = _estimate_train_steps_per_epoch(
+            train_ds_len=len(train_ds),
+            train_windowed=train_windowed,
+            train_x=train_x,
+            train_batch_size=train_batch_size,
+        )
+        scheduler, scheduler_name, scheduler_requires_metric, scheduler_step_interval = _create_lr_scheduler(
+            optimizer,
+            config,
+            steps_per_epoch=train_steps_per_epoch,
+        )
         if scheduler is not None:
-            print(f"[Train {train_years}] lr_scheduler={scheduler_name}")
+            print(
+                f"[Train {train_years}] lr_scheduler={scheduler_name} "
+                f"interval={scheduler_step_interval} steps_per_epoch={train_steps_per_epoch}"
+            )
 
         start_epoch = 1
         resume_no_improve_epochs = 0
@@ -9083,7 +9559,7 @@ def run_training(
                         buy_fee_rate=config.trading.buy_fee_rate,
                         sell_fee_rate=config.trading.sell_fee_rate,
                         max_turnover_ratio=config.trading.max_turnover_ratio,
-                        gross_leverage=config.trading.gross_leverage,
+                        gross_leverage=1.0,
                         gamma_sharpe=config.evaluation.gamma_sharpe,
                         gamma_excess=config.evaluation.gamma_excess,
                         gamma_cvar=config.evaluation.gamma_cvar,
@@ -9160,7 +9636,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.evaluation.gamma_sharpe,
                     config.evaluation.gamma_excess,
                     config.evaluation.gamma_cvar,
@@ -9186,6 +9662,8 @@ def run_training(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    lr_scheduler=scheduler,
+                    lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
                 )
             if train_windowed is not None:
@@ -9205,7 +9683,7 @@ def run_training(
                     buy_fee_rate=config.trading.buy_fee_rate,
                     sell_fee_rate=config.trading.sell_fee_rate,
                     max_turnover_ratio=config.trading.max_turnover_ratio,
-                    gross_leverage=config.trading.gross_leverage,
+                    gross_leverage=1.0,
                     gamma_sharpe=config.evaluation.gamma_sharpe,
                     gamma_excess=config.evaluation.gamma_excess,
                     gamma_cvar=config.evaluation.gamma_cvar,
@@ -9231,6 +9709,8 @@ def run_training(
                     regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                     regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                     factor_aug_kwargs=factor_aug_kwargs,
+                    lr_scheduler=scheduler,
+                    lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
                 )
             return _train_epoch_tensor(
@@ -9254,7 +9734,7 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_excess=config.evaluation.gamma_excess,
                 gamma_cvar=config.evaluation.gamma_cvar,
@@ -9280,6 +9760,8 @@ def run_training(
                 regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                 regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                 factor_aug_kwargs=factor_aug_kwargs,
+                lr_scheduler=scheduler,
+                lr_scheduler_interval=scheduler_step_interval,
                 profile_timing=profile_timing,
             )
 
@@ -9292,9 +9774,9 @@ def run_training(
             val_row_start: int,
             val_row_end: int,
         ) -> FoldResult | None:
-            if not bool(getattr(config.training, "save_best_val_artifacts", True)):
+            if not bool(getattr(config.training, "save_best_val_artifacts", False)):
                 return None
-            if not bool(getattr(config.training, "save_best_val_fold_artifacts", True)):
+            if not bool(getattr(config.training, "save_best_val_fold_artifacts", False)):
                 return None
 
             fold = context.fold
@@ -9328,7 +9810,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -9373,7 +9855,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -9418,7 +9900,7 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=eval_chunk_rows,
@@ -9489,7 +9971,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
@@ -9530,6 +10012,13 @@ def run_training(
                 f"{time.perf_counter() - artifact_start:.1f}s "
                 f"(test_eval={test_eval_total:.1f}s, compression=compressed): {fold_dir}"
             )
+            if bool(getattr(config.training, "postprocess_benchmark_after_best_val", False)):
+                _run_postprocess_benchmark_after_fold(
+                    config=config,
+                    output_path=output_path,
+                    fold_id=fold.fold_id,
+                    enabled=bool(getattr(config.training, "postprocess_benchmark_after_best_val", False)),
+                )
             return fold_result
 
         for epoch in epoch_pbar:
@@ -9672,7 +10161,7 @@ def run_training(
                             buy_fee_rate=config.trading.buy_fee_rate,
                             sell_fee_rate=config.trading.sell_fee_rate,
                             max_turnover_ratio=config.trading.max_turnover_ratio,
-                            gross_leverage=config.trading.gross_leverage,
+                            gross_leverage=1.0,
                             gamma_sharpe=config.evaluation.gamma_sharpe,
                             gamma_excess=config.evaluation.gamma_excess,
                             gamma_cvar=config.evaluation.gamma_cvar,
@@ -9731,7 +10220,7 @@ def run_training(
                         config.trading.buy_fee_rate,
                         config.trading.sell_fee_rate,
                         config.trading.max_turnover_ratio,
-                        config.trading.gross_leverage,
+                        1.0,
                         config.trading.min_trade_weight,
                         portfolio_activation=config.trading.portfolio_activation,
                         chunk_rows=eval_chunk_rows,
@@ -9759,7 +10248,7 @@ def run_training(
                         config.trading.buy_fee_rate,
                         config.trading.sell_fee_rate,
                         config.trading.max_turnover_ratio,
-                        config.trading.gross_leverage,
+                        1.0,
                         config.trading.min_trade_weight,
                         portfolio_activation=config.trading.portfolio_activation,
                         chunk_rows=eval_chunk_rows,
@@ -9836,7 +10325,7 @@ def run_training(
                             buy_fee_rate=config.trading.buy_fee_rate,
                             sell_fee_rate=config.trading.sell_fee_rate,
                             max_turnover_ratio=config.trading.max_turnover_ratio,
-                            gross_leverage=config.trading.gross_leverage,
+                            gross_leverage=1.0,
                             gamma_sharpe=config.evaluation.gamma_sharpe,
                             gamma_excess=config.evaluation.gamma_excess,
                             gamma_cvar=config.evaluation.gamma_cvar,
@@ -9875,7 +10364,7 @@ def run_training(
                             config.trading.buy_fee_rate,
                             config.trading.sell_fee_rate,
                             config.trading.max_turnover_ratio,
-                            config.trading.gross_leverage,
+                            1.0,
                             config.trading.min_trade_weight,
                             portfolio_activation=config.trading.portfolio_activation,
                             chunk_rows=eval_chunk_rows,
@@ -9903,7 +10392,7 @@ def run_training(
                             config.trading.buy_fee_rate,
                             config.trading.sell_fee_rate,
                             config.trading.max_turnover_ratio,
-                            config.trading.gross_leverage,
+                            1.0,
                             config.trading.min_trade_weight,
                             portfolio_activation=config.trading.portfolio_activation,
                             chunk_rows=eval_chunk_rows,
@@ -9976,7 +10465,7 @@ def run_training(
                             optimizer=optimizer,
                             scaler=scaler,
                         )
-                        if bool(getattr(config.training, "save_best_val_artifacts", True)):
+                        if bool(getattr(config.training, "save_best_val_artifacts", False)):
                             _save_best_val_backtest_snapshot(
                                 fold_dir=context.fold_dir,
                                 fold=context.fold,
@@ -10019,7 +10508,7 @@ def run_training(
                     scheduler_start = time.perf_counter()
                     if scheduler_requires_metric:
                         scheduler.step(float(np.mean(val_losses)))
-                    else:
+                    elif scheduler_step_interval != "step":
                         scheduler.step()
                     scheduler_total = time.perf_counter() - scheduler_start
 
@@ -10190,7 +10679,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10215,7 +10704,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10289,7 +10778,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10332,7 +10821,7 @@ def run_training(
                     config.trading.buy_fee_rate,
                     config.trading.sell_fee_rate,
                     config.trading.max_turnover_ratio,
-                    config.trading.gross_leverage,
+                    1.0,
                     config.trading.min_trade_weight,
                     portfolio_activation=config.trading.portfolio_activation,
                     chunk_rows=eval_chunk_rows,
@@ -10377,7 +10866,7 @@ def run_training(
                 buy_fee_rate=config.trading.buy_fee_rate,
                 sell_fee_rate=config.trading.sell_fee_rate,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=eval_chunk_rows,
@@ -10422,7 +10911,7 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=config.trading.gross_leverage,
+                gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
@@ -10436,8 +10925,8 @@ def run_training(
             objective_key = _objective_metric_key(loss_objective)
             val_objective_metric = float(val_met.get(objective_key, float("nan")))
             test_objective_metric = float(test_met.get(objective_key, float("nan")))
-            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_universe_average']:+.4f}")
-            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_universe_average']:+.4f}")
+            print(f"\n  [val]   IC={val_ic['ic_mean']:+.4f}  IC_IR={val_ic['ic_ir']:+.4f}  {loss_objective}={val_objective_metric:+.4f}  cum_ret={val_met['cumulative_return']:+.4f}  excess={val_met['excess_return_vs_benchmark']:+.4f}")
+            print(f"  [test]  IC={test_ic['ic_mean']:+.4f}  IC_IR={test_ic['ic_ir']:+.4f}  {loss_objective}={test_objective_metric:+.4f}  cum_ret={test_met['cumulative_return']:+.4f}  excess={test_met['excess_return_vs_benchmark']:+.4f}")
             if profile_timing:
                 _log_timing(
                     f"Train {train_years} fold {fold.fold_id} test_stage",
@@ -10476,6 +10965,7 @@ def run_training(
                 holdings_records=holdings_records,
                 print_report=True,
                 write_plots=True,
+                mark_complete=True,
             )
             plot_total = float(plot_timing.get("total_s", 0.0))
 
@@ -10559,5 +11049,14 @@ def run_training(
         scheduler = None
         if device.type == "cuda":
             _release_cuda_memory(device)
+
+        for fold in group_folds:
+            if fold.fold_id in results_by_fold:
+                _run_postprocess_benchmark_after_fold(
+                    config=config,
+                    output_path=output_path,
+                    fold_id=fold.fold_id,
+                    enabled=bool(getattr(config.training, "postprocess_benchmark_after_fold", False)),
+                )
 
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

@@ -17,25 +17,78 @@ def _normalize_portfolio_activation(activation: str | None) -> str:
         "arctan": "atan",
         "erf_scaled": "erf",
         "gd": "gudermannian",
+        "already_normalized": "pre_normalized",
         "inverse_square_root_unit": "isru",
         "inverse_sqrt": "isru",
         "inverse_sqrt_unit": "isru",
         "isr": "isru",
         "isru1": "isru",
+        "pre_normalized_weights": "pre_normalized",
+        "preserve": "pre_normalized",
+        "preserve_weights": "pre_normalized",
         "soft_sign": "softsign",
+        "weights": "pre_normalized",
         "x_over_1_abs_x": "softsign",
         "x_over_sqrt_1_x2": "isru",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized in {"identity", "linear", "none", "raw"}:
         return "identity"
-    valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian"}
+    valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian", "pre_normalized"}
     if normalized not in valid:
         raise ValueError(
             "trading.portfolio_activation must be one of "
-            "'identity', 'tanh', 'softsign', 'isru', 'erf', 'atan', or 'gd'"
+            "'identity', 'tanh', 'softsign', 'isru', 'erf', 'atan', 'gd', or 'pre_normalized'"
         )
     return normalized
+
+
+def _normalize_portfolio_output_mode(mode: str | None) -> str:
+    normalized = str(mode or "activation_l1").strip().lower().replace("-", "_")
+    if normalized in {
+        "activation_l1",
+        "activated_l1",
+        "activation",
+        "bounded_l1",
+        "bounded_activation_l1",
+        "default",
+    }:
+        return "activation_l1"
+    if normalized in {"l1", "raw_l1", "score_l1", "linear_l1", "identity_l1"}:
+        return "l1"
+    if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
+        return "logits"
+    if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
+        return "signed_softmax"
+    if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
+        return "signed_sparsemax"
+    if normalized in {
+        "signed_entmax",
+        "signed_entmax15",
+        "signed_entmax_15",
+        "signed_action_entmax",
+        "signed_action_entmax15",
+        "action_entmax",
+        "action_entmax15",
+        "entmax",
+        "entmax15",
+        "entmax_15",
+    }:
+        return "signed_entmax15"
+    if normalized in {
+        "projection",
+        "projection_l1",
+        "l1_projection",
+        "project_l1",
+        "differentiable_projection",
+        "differentiable_l1_projection",
+    }:
+        return "projection_l1"
+    raise ValueError(
+        "training.transformer_base_portfolio.portfolio_output_mode must be one of "
+        "'activation_l1', 'l1', 'logits', 'signed_softmax', "
+        "'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
+    )
 
 
 @dataclass(slots=True)
@@ -71,6 +124,9 @@ class DataConfig:
     trading_volume_policy: str = "auto"
     panel_backend: str = "auto"
     panel_load_workers: int = 4
+    use_tw_public_features: bool = False
+    tw_public_feature_path: str = "data_tw_public/features/tw_public_stock_daily.parquet"
+    tw_public_market_symbol: str = "__MARKET__"
 
 
 @dataclass(slots=True)
@@ -88,7 +144,7 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     max_turnover_ratio: float = 0.0
-    gross_leverage: float = 1.0
+    leverage: float = 1.0
     min_trade_weight: float = 0.0
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
 
@@ -321,6 +377,7 @@ class CrossSectionalTemporalPortfolioModelConfig:
 @dataclass(slots=True)
 class MultitaskLossConfig:
     rank_ic_weight: float = 0.20
+    return_rank_ic_weight: float = 0.0
     direction_weight: float = 0.05
     volatility_regime_weight: float = 0.05
     concentration_weight: float = 0.005
@@ -497,9 +554,20 @@ class TrainingConfig:
     save_integer_share_holdings_csv: bool = True
     save_daily_weights_csv: bool = True
     backtest_artifact_compression: str = "none"
-    save_best_val_artifacts: bool = True
-    save_best_val_fold_artifacts: bool = True
-    save_best_val_fold_plots: bool = True
+    save_best_val_artifacts: bool = False
+    save_best_val_fold_artifacts: bool = False
+    save_best_val_fold_plots: bool = False
+    postprocess_benchmark_after_fold: bool = False
+    postprocess_benchmark_after_best_val: bool = False
+    postprocess_benchmark_split: str = "test"
+    postprocess_benchmark_activations: str = "identity,softsign,tanh,isru,erf,atan,gd"
+    postprocess_benchmark_thresholds: str = "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02"
+    postprocess_benchmark_rank_metric: str = "sharpe"
+    postprocess_benchmark_plot_metrics: str = "sharpe,sortino,cumulative_return"
+    postprocess_benchmark_plot_top_n: int = 20
+    postprocess_benchmark_backtest_compile: bool = False
+    postprocess_benchmark_max_rows: int = 0
+    postprocess_benchmark_strict: bool = False
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
     learning_rate: float = 1e-3
@@ -507,6 +575,8 @@ class TrainingConfig:
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
     lr_scheduler_t_max: int = 0
     lr_scheduler_eta_min: float = 1e-5
+    lr_scheduler_warmup_steps: int = 0
+    lr_scheduler_interval: str = "epoch"
     lr_scheduler_step_size: int = 50
     lr_scheduler_gamma: float = 0.5
     lr_scheduler_patience: int = 5
@@ -547,8 +617,6 @@ class TrainingConfig:
 
 @dataclass(slots=True)
 class EvaluationConfig:
-    primary_baseline: str
-    metrics: list[str]
     gamma_sharpe: float = 1.0
     gamma_excess: float = 1.0
     gamma_cvar: float = 1.0
@@ -701,7 +769,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("save_integer_share_holdings_table", training["save_integer_share_holdings_csv"])
     training.setdefault("backtest_artifact_compression", "none")
     save_best_val_artifacts = bool(
-        training.get("save_best_val_artifacts", training.get("save_best_val_fold_artifacts", True))
+        training.get("save_best_val_artifacts", training.get("save_best_val_fold_artifacts", False))
     )
     training["save_best_val_artifacts"] = save_best_val_artifacts
     training["save_best_val_fold_artifacts"] = (
@@ -710,6 +778,70 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["save_best_val_fold_plots"] = (
         bool(training.get("save_best_val_fold_plots", True)) and training["save_best_val_fold_artifacts"]
     )
+    training.setdefault("postprocess_benchmark_after_fold", False)
+    training.setdefault("postprocess_benchmark_after_best_val", False)
+    postprocess_split = str(training.get("postprocess_benchmark_split", "test")).strip().lower()
+    if postprocess_split not in {"train", "val", "test"}:
+        raise ValueError("training.postprocess_benchmark_split must be one of: train, val, test")
+    training["postprocess_benchmark_split"] = postprocess_split
+    training.setdefault("postprocess_benchmark_activations", "identity,softsign,tanh,isru,erf,atan,gd")
+    training.setdefault(
+        "postprocess_benchmark_thresholds",
+        "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02",
+    )
+    postprocess_metric = str(training.get("postprocess_benchmark_rank_metric", "sharpe")).strip().lower()
+    metric_aliases = {
+        "sharp": "sharpe",
+        "cum_return": "cumulative_return",
+        "return": "cumulative_return",
+        "returns": "cumulative_return",
+        "total_return": "cumulative_return",
+        "total_returns": "cumulative_return",
+    }
+    postprocess_metric = metric_aliases.get(postprocess_metric, postprocess_metric)
+    valid_postprocess_metrics = {
+        "sharpe",
+        "sortino",
+        "calmar",
+        "cumulative_return",
+        "annualized_return",
+        "cagr",
+        "daily_hit_rate",
+        "excess_return_vs_benchmark",
+        "max_drawdown",
+        "turnover",
+    }
+    if postprocess_metric not in valid_postprocess_metrics:
+        raise ValueError(
+            "training.postprocess_benchmark_rank_metric must be one of "
+            f"{sorted(valid_postprocess_metrics)}, got {postprocess_metric!r}"
+        )
+    training["postprocess_benchmark_rank_metric"] = postprocess_metric
+    plot_metrics: list[str] = []
+    for raw_metric in str(
+        training.get("postprocess_benchmark_plot_metrics", "sharpe,sortino,cumulative_return")
+    ).split(","):
+        metric = metric_aliases.get(raw_metric.strip().lower().replace("-", "_"), raw_metric.strip().lower().replace("-", "_"))
+        if not metric:
+            continue
+        if metric not in valid_postprocess_metrics:
+            raise ValueError(
+                "training.postprocess_benchmark_plot_metrics must contain only "
+                f"{sorted(valid_postprocess_metrics)}, got {metric!r}"
+            )
+        if metric not in plot_metrics:
+            plot_metrics.append(metric)
+    if postprocess_metric not in plot_metrics:
+        plot_metrics.insert(0, postprocess_metric)
+    training["postprocess_benchmark_plot_metrics"] = ",".join(plot_metrics)
+    training["postprocess_benchmark_plot_top_n"] = max(
+        1, int(training.get("postprocess_benchmark_plot_top_n", 20))
+    )
+    training.setdefault("postprocess_benchmark_backtest_compile", False)
+    training["postprocess_benchmark_max_rows"] = max(
+        0, int(training.get("postprocess_benchmark_max_rows", 0))
+    )
+    training.setdefault("postprocess_benchmark_strict", False)
     training.setdefault("cache_train_tensors_on_gpu", True)
     training.setdefault("cache_eval_tensors_on_gpu", True)
     training.setdefault("learning_rate", 1e-3)
@@ -717,6 +849,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("lr_scheduler", "none")
     training.setdefault("lr_scheduler_t_max", 0)
     training.setdefault("lr_scheduler_eta_min", 1e-5)
+    training.setdefault("lr_scheduler_warmup_steps", 0)
+    training.setdefault("lr_scheduler_interval", "epoch")
     training.setdefault("lr_scheduler_step_size", 50)
     training.setdefault("lr_scheduler_gamma", 0.5)
     training.setdefault("lr_scheduler_patience", 5)
@@ -880,6 +1014,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("default_temperature", 1.0)
     transformer_base_portfolio.setdefault("portfolio_mode", "auto")
     transformer_base_portfolio.setdefault("portfolio_output_mode", "activation_l1")
+    transformer_base_portfolio["portfolio_output_mode"] = _normalize_portfolio_output_mode(
+        transformer_base_portfolio.get("portfolio_output_mode")
+    )
     transformer_base_portfolio.setdefault("max_full_tokens", 4096)
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
@@ -943,6 +1080,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     multitask_loss = training.setdefault("multitask_loss", {})
     multitask_loss.setdefault("rank_ic_weight", 0.20)
+    multitask_loss.setdefault("return_rank_ic_weight", 0.0)
     multitask_loss.setdefault("direction_weight", 0.05)
     multitask_loss.setdefault("volatility_regime_weight", 0.05)
     multitask_loss.setdefault("concentration_weight", 0.005)
@@ -1034,6 +1172,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("security_filter", "none")
     data.setdefault("panel_backend", "auto")
     data.setdefault("panel_load_workers", 4)
+    data.setdefault("use_tw_public_features", False)
+    data.setdefault("tw_public_feature_path", "data_tw_public/features/tw_public_stock_daily.parquet")
+    data.setdefault("tw_public_market_symbol", "__MARKET__")
 
     trading = raw.setdefault("trading", {})
 
@@ -1101,6 +1242,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data.get("panel_load_workers", 4)))
+    data["use_tw_public_features"] = bool(data.get("use_tw_public_features", False))
+    data["tw_public_feature_path"] = str(data.get("tw_public_feature_path") or "").strip()
+    data["tw_public_market_symbol"] = str(data.get("tw_public_market_symbol") or "__MARKET__").strip() or "__MARKET__"
     plot_backend = str(training.get("plot_backend", "auto")).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:
@@ -1183,14 +1327,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("training.backtest_artifact_compression must be one of: none, compressed")
     training["backtest_artifact_compression"] = backtest_artifact_compression
     trading.setdefault("max_turnover_ratio", 0.0)
-    trading.setdefault("gross_leverage", 1.0)
+    legacy_gross_leverage = trading.pop("gross_leverage", None)
+    trading.setdefault("leverage", legacy_gross_leverage if legacy_gross_leverage is not None else 1.0)
     trading.setdefault("min_trade_weight", 0.0)
     trading.setdefault("portfolio_activation", DEFAULT_PORTFOLIO_ACTIVATION)
-    # Preserve the configured leverage multiplier for reporting/post-processing.
-    # Canonical backtest paths that need an exposure budget clamp it locally.
-    trading["gross_leverage"] = max(0.0, float(trading.get("gross_leverage", 1.0)))
+    # Report/post-processing leverage only. Canonical model/loss/backtest exposure stays unlevered.
+    trading["leverage"] = max(0.0, float(trading.get("leverage", 1.0)))
     trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.0)))
     trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
+    evaluation = raw.setdefault("evaluation", {})
+    evaluation.pop("primary_baseline", None)
+    evaluation.pop("metrics", None)
     loss_activation = str(training.get("loss_portfolio_activation", "auto")).strip().lower().replace("-", "_")
     if loss_activation in {"", "auto", "trading", "same", "same_as_trading"}:
         training["loss_portfolio_activation"] = "auto"
@@ -1340,6 +1487,17 @@ def load_config(path: str | Path) -> ExperimentConfig:
             save_best_val_artifacts=training_raw["save_best_val_artifacts"],
             save_best_val_fold_artifacts=training_raw["save_best_val_fold_artifacts"],
             save_best_val_fold_plots=training_raw["save_best_val_fold_plots"],
+            postprocess_benchmark_after_fold=training_raw["postprocess_benchmark_after_fold"],
+            postprocess_benchmark_after_best_val=training_raw["postprocess_benchmark_after_best_val"],
+            postprocess_benchmark_split=training_raw["postprocess_benchmark_split"],
+            postprocess_benchmark_activations=training_raw["postprocess_benchmark_activations"],
+            postprocess_benchmark_thresholds=training_raw["postprocess_benchmark_thresholds"],
+            postprocess_benchmark_rank_metric=training_raw["postprocess_benchmark_rank_metric"],
+            postprocess_benchmark_plot_metrics=training_raw["postprocess_benchmark_plot_metrics"],
+            postprocess_benchmark_plot_top_n=training_raw["postprocess_benchmark_plot_top_n"],
+            postprocess_benchmark_backtest_compile=training_raw["postprocess_benchmark_backtest_compile"],
+            postprocess_benchmark_max_rows=training_raw["postprocess_benchmark_max_rows"],
+            postprocess_benchmark_strict=training_raw["postprocess_benchmark_strict"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
             learning_rate=training_raw["learning_rate"],
@@ -1347,6 +1505,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             lr_scheduler=training_raw["lr_scheduler"],
             lr_scheduler_t_max=training_raw["lr_scheduler_t_max"],
             lr_scheduler_eta_min=training_raw["lr_scheduler_eta_min"],
+            lr_scheduler_warmup_steps=training_raw["lr_scheduler_warmup_steps"],
+            lr_scheduler_interval=training_raw["lr_scheduler_interval"],
             lr_scheduler_step_size=training_raw["lr_scheduler_step_size"],
             lr_scheduler_gamma=training_raw["lr_scheduler_gamma"],
             lr_scheduler_patience=training_raw["lr_scheduler_patience"],

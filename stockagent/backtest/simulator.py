@@ -162,8 +162,64 @@ def _trunc_to_int64(values: np.ndarray | float) -> np.ndarray:
 
 
 def _resolve_exposure_budget(gross_leverage: float) -> float:
-    """Return the effective absolute exposure budget in [0, 1]."""
-    return min(1.0, max(0.0, float(gross_leverage)))
+    """Return the canonical unlevered absolute exposure budget in [0, 1]."""
+    value = float(gross_leverage)
+    if not math.isfinite(value):
+        return 0.0
+    return min(1.0, max(0.0, value))
+
+
+_MIN_PORTFOLIO_SIMPLE_RETURN = -0.999999
+
+
+def _asset_log_returns_to_simple_numpy(asset_log_returns: np.ndarray) -> np.ndarray:
+    clean = np.nan_to_num(
+        np.asarray(asset_log_returns, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    return np.expm1(clean).astype(np.float32, copy=False)
+
+
+def _portfolio_simple_returns_to_log_numpy(simple_returns: np.ndarray) -> np.ndarray:
+    clean = np.nan_to_num(
+        np.asarray(simple_returns, dtype=np.float32),
+        nan=0.0,
+        posinf=np.finfo(np.float32).max,
+        neginf=_MIN_PORTFOLIO_SIMPLE_RETURN,
+    )
+    clipped = np.clip(clean, _MIN_PORTFOLIO_SIMPLE_RETURN, None)
+    return np.log1p(clipped).astype(np.float32, copy=False)
+
+
+def _asset_log_returns_to_simple_torch(
+    asset_log_returns: torch.Tensor,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    clean = torch.nan_to_num(
+        asset_log_returns.to(
+            device=device if device is not None else asset_log_returns.device,
+            dtype=dtype if dtype is not None else asset_log_returns.dtype,
+        ),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    return torch.expm1(clean)
+
+
+def _portfolio_simple_returns_to_log_torch(simple_returns: torch.Tensor) -> torch.Tensor:
+    floor = torch.as_tensor(_MIN_PORTFOLIO_SIMPLE_RETURN, device=simple_returns.device, dtype=simple_returns.dtype)
+    clean = torch.nan_to_num(
+        simple_returns,
+        nan=0.0,
+        posinf=torch.finfo(simple_returns.dtype).max,
+        neginf=_MIN_PORTFOLIO_SIMPLE_RETURN,
+    )
+    return torch.log1p(clean.clamp_min(floor))
 
 
 def _erf_numpy(values: np.ndarray) -> np.ndarray:
@@ -182,7 +238,7 @@ def _apply_portfolio_activation_numpy(
 ) -> np.ndarray:
     activation_name = normalize_portfolio_activation(activation)
     out = values.astype(dtype, copy=False)
-    if activation_name == "identity":
+    if activation_name in {"identity", "pre_normalized"}:
         return np.where(np.isfinite(out), out, dtype.type(0.0)).astype(dtype, copy=False)
     out = np.nan_to_num(out, nan=0.0, posinf=20.0, neginf=-20.0)
     out = np.clip(out, dtype.type(-20.0), dtype.type(20.0))
@@ -212,9 +268,16 @@ def _normalize_target_weights_numpy(
     portfolio_activation: str | None = None,
 ) -> np.ndarray:
     """Normalize target weights via bounded activation + L1 and apply gross budget."""
-    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), portfolio_activation)
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), activation_name)
     if long_only:
         out = np.clip(out, 0.0, None)
+    if activation_name == "pre_normalized":
+        l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
+        gross = np.float32(gross_budget)
+        scale = np.ones_like(l1, dtype=np.float32)
+        np.divide(gross, np.clip(l1, 1e-12, None), out=scale, where=l1 > gross)
+        return (out * scale).astype(np.float32, copy=False)
     l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
     out = out / np.clip(l1, 1e-12, None)
     out *= np.float32(gross_budget)
@@ -229,10 +292,16 @@ def _normalize_target_weights_row_numpy(
     portfolio_activation: str | None = None,
 ) -> np.ndarray:
     """Single-row variant of bounded activation + L1 normalization for integer-share path."""
-    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), portfolio_activation)
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), activation_name)
     if long_only:
         row = np.clip(row, 0.0, None)
     l1 = float(np.abs(row).sum(dtype=np.float64))
+    if activation_name == "pre_normalized":
+        gross = float(gross_budget)
+        if l1 > gross and l1 > 1e-12:
+            row = row * (gross / l1)
+        return row
     if l1 > 1e-12:
         row = row / l1
     else:
@@ -249,12 +318,17 @@ def _normalize_target_weights_torch(
     portfolio_activation: str | None = None,
 ) -> torch.Tensor:
     """Torch normalization via bounded activation + L1 and gross budget scaling."""
-    out = apply_portfolio_activation(weights, portfolio_activation)
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    out = apply_portfolio_activation(weights, activation_name)
     if long_only:
         out = out.clamp_min(0.0)
+    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
+    if activation_name == "pre_normalized":
+        l1 = out.abs().sum(dim=1, keepdim=True)
+        scale = torch.where(l1 > leverage, leverage / l1.clamp_min(1e-12), torch.ones_like(l1))
+        return out * scale
     l1 = out.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
     out = out / l1
-    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
     out = out * leverage
     return out
 
@@ -1054,8 +1128,8 @@ def _fallback_scan_runner_after_runtime_failure(
 class BacktestResult:
     """Container for a single backtest simulation run."""
 
-    strategy_returns: np.ndarray   # [T] net daily returns after costs
-    benchmark_returns: np.ndarray  # [T] universe-average daily returns
+    strategy_returns: np.ndarray   # [T] net portfolio log returns after costs
+    benchmark_returns: np.ndarray  # [T] benchmark log returns
     turnovers: np.ndarray          # [T] total absolute weight change per day
     weights_history: np.ndarray    # [T, S] realised portfolio weights
 
@@ -1064,8 +1138,8 @@ class BacktestResult:
 class BacktestResultTensor:
     """Torch tensor container for a single backtest simulation run."""
 
-    strategy_returns: torch.Tensor   # [T]
-    benchmark_returns: torch.Tensor  # [T]
+    strategy_returns: torch.Tensor   # [T] net portfolio log returns after costs
+    benchmark_returns: torch.Tensor  # [T] benchmark log returns
     turnovers: torch.Tensor          # [T]
     weights_history: torch.Tensor    # [T, S], may be empty when caller disables history recording.
     final_weights: torch.Tensor | None = None  # [S], realised weights after the final simulated day.
@@ -1081,7 +1155,7 @@ class BacktestResultTensor:
 
 @dataclass(slots=True)
 class BacktestStaticInputs:
-    future_returns: torch.Tensor
+    future_returns: torch.Tensor  # [T, S] asset log returns
     tradable_mask: torch.Tensor
     can_buy_mask: torch.Tensor
     can_sell_mask: torch.Tensor
@@ -1258,8 +1332,10 @@ def _vectorized_backtest(
         prev = next_weights.astype(np.float32, copy=False)
 
     turnovers = (buy_turnovers + sell_turnovers).astype(np.float32)
-    gross = np.einsum("ts,ts->t", weights_history, future_returns, dtype=np.float32)
-    strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
+    asset_simple_returns = _asset_log_returns_to_simple_numpy(future_returns)
+    gross_simple = np.einsum("ts,ts->t", weights_history, asset_simple_returns, dtype=np.float32)
+    net_simple = gross_simple - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
+    strategy_returns = _portfolio_simple_returns_to_log_numpy(net_simple)
     return strategy_returns.astype(np.float32), turnovers, weights_history
 
 
@@ -1274,7 +1350,7 @@ def _vectorized_backtest_torch_scan_long_only(
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
+    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
     target_weights = weights
     tradable = tradable_mask
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
@@ -1353,7 +1429,7 @@ def _vectorized_backtest_torch_scan_long_short(
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
+    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
 
     target_weights = weights
     tradable = tradable_mask
@@ -1438,7 +1514,7 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
     gross_budget: float = 1.0,
     scan_chunk_size: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
+    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
     target_weights = weights
     tradable = tradable_mask
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="reduced torch backtest")
@@ -1511,7 +1587,12 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
             sell_turnover = (-delta).clamp_min(0.0).sum()
             turnover = buy_turnover + sell_turnover
             gross_return = (next_weights * future_returns_t[idx]).sum()
-            strategy_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
+            net_simple_return = (
+                gross_return
+                - float(buy_fee_rate) * buy_turnover
+                - float(sell_fee_rate) * sell_turnover
+            )
+            strategy_return = _portfolio_simple_returns_to_log_torch(net_simple_return)
 
             valid_f = valid_mask[idx].to(dtype=torch.float32)
             clean_return = torch.nan_to_num(strategy_return.to(dtype).float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1809,7 +1890,11 @@ def _vectorized_backtest_torch(
         _add_backtest_runtime_stat("dense_fast_path_calls")
         dense_start = _runtime_stat_start()
         with _CudaRuntimeTimer("dense_fast_path_cuda_s", prepped_weights):
-            returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
+            returns_t = _asset_log_returns_to_simple_torch(
+                future_returns,
+                device=prepped_weights.device,
+                dtype=prepped_weights.dtype,
+            )
             deltas = torch.empty_like(prepped_weights)
             deltas[0] = prepped_weights[0] - prev_init
             if int(prepped_weights.size(0)) > 1:
@@ -1819,7 +1904,12 @@ def _vectorized_backtest_torch(
             sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
             turnovers = buy_turnovers + sell_turnovers
             gross_returns = (prepped_weights * returns_t).sum(dim=1)
-            strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+            net_simple_returns = (
+                gross_returns
+                - float(buy_fee_rate) * buy_turnovers
+                - float(sell_fee_rate) * sell_turnovers
+            )
+            strategy_returns = _portfolio_simple_returns_to_log_torch(net_simple_returns)
 
             if return_weights_history:
                 weights_history = prepped_weights
@@ -2063,7 +2153,12 @@ def _vectorized_backtest_torch(
     finalize_start = _runtime_stat_start()
     with _CudaRuntimeTimer("finalize_cuda_s", prepped_weights):
         returns_dtype = prepped_weights.dtype
-        strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+        net_simple_returns = (
+            gross_returns
+            - float(buy_fee_rate) * buy_turnovers
+            - float(sell_fee_rate) * sell_turnovers
+        )
+        strategy_returns = _portfolio_simple_returns_to_log_torch(net_simple_returns)
         result = (
             strategy_returns.to(returns_dtype),
             turnovers.to(returns_dtype),

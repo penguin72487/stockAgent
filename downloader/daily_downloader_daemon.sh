@@ -64,6 +64,20 @@ export_default_runtime() {
   export RUN_RECORD_FILE="${RUN_RECORD_FILE:-${RUN_LOG_DIR}/daily_runs.tsv}"
   export LOCK_FILE="${LOCK_FILE:-${RUN_LOG_DIR}/daily.lock}"
   export SCHEDULE_STATE_FILE="${SCHEDULE_STATE_FILE:-${RUN_LOG_DIR}/market_schedule.state}"
+  export RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
+  export TW_PUBLIC_DATASETS="${TW_PUBLIC_DATASETS:-all}"
+  export TW_PUBLIC_OUTPUT_DIR="${TW_PUBLIC_OUTPUT_DIR:-data_tw_public}"
+  export TW_PUBLIC_WORKERS="${TW_PUBLIC_WORKERS:-4}"
+  export TW_PUBLIC_TIMEOUT="${TW_PUBLIC_TIMEOUT:-30}"
+  export TW_PUBLIC_RETRIES="${TW_PUBLIC_RETRIES:-3}"
+  export TW_PUBLIC_RETRY_BACKOFF="${TW_PUBLIC_RETRY_BACKOFF:-1.0}"
+  export TW_PUBLIC_SLEEP="${TW_PUBLIC_SLEEP:-0.15}"
+  export TW_PUBLIC_SKIP_RAW="${TW_PUBLIC_SKIP_RAW:-0}"
+  export TW_PUBLIC_MAX_DATES="${TW_PUBLIC_MAX_DATES:-}"
+  export RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
+  export TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
+  export TW_PUBLIC_FEATURE_SYMBOLS_ROOT="${TW_PUBLIC_FEATURE_SYMBOLS_ROOT:-data_yahoo/tw_stocks}"
+  export TW_PUBLIC_MARKET_SYMBOL="${TW_PUBLIC_MARKET_SYMBOL:-__MARKET__}"
 }
 
 start_daemon() {

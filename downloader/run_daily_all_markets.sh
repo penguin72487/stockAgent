@@ -58,6 +58,20 @@ BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
 RUN_YAHOO="${RUN_YAHOO:-1}"
 YAHOO_ASSETS="${YAHOO_ASSETS:-tw_stocks us_stocks crypto forex}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-0}"  # 0 disables timeout
+RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
+TW_PUBLIC_DATASETS="${TW_PUBLIC_DATASETS:-all}"
+TW_PUBLIC_OUTPUT_DIR="${TW_PUBLIC_OUTPUT_DIR:-data_tw_public}"
+TW_PUBLIC_WORKERS="${TW_PUBLIC_WORKERS:-4}"
+TW_PUBLIC_TIMEOUT="${TW_PUBLIC_TIMEOUT:-30}"
+TW_PUBLIC_RETRIES="${TW_PUBLIC_RETRIES:-3}"
+TW_PUBLIC_RETRY_BACKOFF="${TW_PUBLIC_RETRY_BACKOFF:-1.0}"
+TW_PUBLIC_SLEEP="${TW_PUBLIC_SLEEP:-0.15}"
+TW_PUBLIC_SKIP_RAW="${TW_PUBLIC_SKIP_RAW:-0}"
+TW_PUBLIC_MAX_DATES="${TW_PUBLIC_MAX_DATES:-}"
+RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
+TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
+TW_PUBLIC_FEATURE_SYMBOLS_ROOT="${TW_PUBLIC_FEATURE_SYMBOLS_ROOT:-data_yahoo/tw_stocks}"
+TW_PUBLIC_MARKET_SYMBOL="${TW_PUBLIC_MARKET_SYMBOL:-__MARKET__}"
 RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-1}"
 AUDIT_ROOTS="${AUDIT_ROOTS:-data_yahoo/tw_stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
 AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
@@ -364,6 +378,62 @@ run_cex_incremental() {
   return "$rc"
 }
 
+run_tw_public_data_update() {
+  local today
+  local rc=0
+  local -a datasets=()
+  local -a cmd=()
+  local -a feature_cmd=()
+
+  if [[ "$RUN_TW_PUBLIC_DATA" != "1" ]]; then
+    log "skip=tw_public_data_daily_update reason=RUN_TW_PUBLIC_DATA=${RUN_TW_PUBLIC_DATA}"
+    return 0
+  fi
+
+  today="$(date +%F)"
+  read -r -a datasets <<< "$TW_PUBLIC_DATASETS"
+  if (( ${#datasets[@]} == 0 )); then
+    log "skip=tw_public_data_daily_update reason=empty_TW_PUBLIC_DATASETS"
+    return 0
+  fi
+
+  cmd=(
+    "$PYTHON_BIN" downloader/download_tw_public_data.py
+    --mode daily-update
+    --datasets "${datasets[@]}"
+    --output-dir "$TW_PUBLIC_OUTPUT_DIR"
+    --end-date "$today"
+    --workers "$TW_PUBLIC_WORKERS"
+    --timeout "$TW_PUBLIC_TIMEOUT"
+    --retries "$TW_PUBLIC_RETRIES"
+    --retry-backoff "$TW_PUBLIC_RETRY_BACKOFF"
+    --sleep "$TW_PUBLIC_SLEEP"
+  )
+  if [[ "$TW_PUBLIC_SKIP_RAW" == "1" ]]; then
+    cmd+=(--skip-raw)
+  fi
+  if [[ -n "$TW_PUBLIC_MAX_DATES" ]]; then
+    cmd+=(--max-dates "$TW_PUBLIC_MAX_DATES")
+  fi
+
+  run_step tw_public_data_daily_update "${cmd[@]}" || rc=1
+
+  if [[ "$RUN_TW_PUBLIC_FEATURES" == "1" ]]; then
+    feature_cmd=(
+      "$PYTHON_BIN" scripts/build_tw_public_training_features.py
+      --input-dir "$TW_PUBLIC_OUTPUT_DIR"
+      --output-path "$TW_PUBLIC_FEATURE_PATH"
+      --symbols-root "$TW_PUBLIC_FEATURE_SYMBOLS_ROOT"
+      --market-symbol "$TW_PUBLIC_MARKET_SYMBOL"
+    )
+    run_step tw_public_training_feature_build "${feature_cmd[@]}" || rc=1
+  else
+    log "skip=tw_public_training_feature_build reason=RUN_TW_PUBLIC_FEATURES=${RUN_TW_PUBLIC_FEATURES}"
+  fi
+
+  return "$rc"
+}
+
 run_data_quality_audit() {
   local cycle_id="$1"
   local today
@@ -414,6 +484,7 @@ run_market_close_cycle() {
     log "market=tw due date=${tw_date} close=${TW_CLOSE_TIME} tz=${TW_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
     run_yahoo_incremental_assets "tw_stocks" || true
+    run_tw_public_data_update || true
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_TW="$tw_date"
@@ -487,6 +558,7 @@ run_once_cycle() {
   log "cycle=${cycle_id} start mode=${RUN_MODE} root=${ROOT_DIR}"
 
   run_yahoo_incremental || true
+  run_tw_public_data_update || true
   run_frankfurter_incremental || true
   run_pepperstone_incremental || true
   run_cex_incremental || true
