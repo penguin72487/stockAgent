@@ -20,7 +20,16 @@ def _read_parquet(path: Path) -> pl.DataFrame:
     return pl.from_arrow(pq.read_table(path))
 
 
+def _read_parquet_row_count(path: Path) -> int:
+    return int(pq.ParquetFile(path, memory_map=True).metadata.num_rows)
+
+
+def _read_date_column(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path, columns=["date"], memory_map=True))
+
+
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
 
 @dataclass(slots=True)
@@ -159,6 +168,30 @@ def _max_frame_date(frame: pl.DataFrame) -> str | None:
     return latest.date().isoformat()
 
 
+def _existing_row_count_and_latest_date(path: Path) -> tuple[int, str | None]:
+    rows = _read_parquet_row_count(path)
+    try:
+        metadata = pq.read_metadata(path)
+        schema = metadata.schema.to_arrow_schema()
+        date_idx = schema.get_field_index("date")
+        if date_idx >= 0:
+            latest = None
+            for row_group_idx in range(metadata.num_row_groups):
+                stats = metadata.row_group(row_group_idx).column(date_idx).statistics
+                if stats is None or not bool(getattr(stats, "has_min_max", False)):
+                    continue
+                value = stats.max
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="ignore")
+                parsed = value.date().isoformat() if isinstance(value, datetime) else str(value)[:10]
+                latest = parsed if latest is None else max(latest, parsed)
+            if latest is not None:
+                return rows, latest
+    except Exception:
+        pass
+    return rows, _max_frame_date(_read_date_column(path))
+
+
 def _normalize_rate_rows(rows: list[dict[str, object]], fetch_start_date: str, end_date: str) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
@@ -192,15 +225,14 @@ def _download_pair(
     incremental: bool,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    existing_frame: pl.DataFrame | None = None
     existing_rows = 0
+    has_existing = False
     fetch_start_date = start_date
 
     if output_path.exists() and incremental:
         try:
-            existing_frame = _read_parquet(output_path)
-            existing_rows = int(existing_frame.height)
-            latest_date = _max_frame_date(existing_frame)
+            existing_rows, latest_date = _existing_row_count_and_latest_date(output_path)
+            has_existing = existing_rows > 0
             if latest_date is not None:
                 next_date = (datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
                 fetch_start_date = max(start_date, next_date)
@@ -222,7 +254,7 @@ def _download_pair(
 
     if output_path.exists() and not refresh and not incremental:
         try:
-            rows = _read_parquet(output_path).height
+            rows = _read_parquet_row_count(output_path)
             return DownloadResult(code=record.code, status="skipped_existing", rows=int(rows), output_path=str(output_path))
         except Exception as exc:
             return DownloadResult(
@@ -267,7 +299,8 @@ def _download_pair(
         if frame.is_empty():
             return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points after date filtering")
 
-        if incremental and existing_frame is not None:
+        if incremental and has_existing:
+            existing_frame = _read_parquet(output_path)
             merged = (
                 pl.concat([_normalize_date_frame(existing_frame), frame], how="diagonal_relaxed")
                 .sort("date")

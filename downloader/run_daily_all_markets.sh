@@ -21,6 +21,7 @@ INTERVAL_SECONDS="${INTERVAL_SECONDS:-86400}"       # daemon mode sleep interval
 MARKET_CHECK_INTERVAL_SECONDS="${MARKET_CHECK_INTERVAL_SECONDS:-300}"
 MAX_CYCLES="${MAX_CYCLES:-0}"                       # 0 means unlimited
 FAIL_FAST="${FAIL_FAST:-0}"                         # 1 => fail immediately on any step error
+DAILY_PARALLEL_GROUPS="${DAILY_PARALLEL_GROUPS:-1}" # 1 => run independent provider groups concurrently
 LOCK_FILE="${LOCK_FILE:-/tmp/stockagent_daily.lock}"
 SCHEDULE_STATE_FILE="${SCHEDULE_STATE_FILE:-/tmp/stockagent_market_schedule.state}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -30,7 +31,7 @@ RUN_RECORD_FILE="${RUN_RECORD_FILE:-${RUN_LOG_DIR}/daily_runs.tsv}"
 TEE_LOG="${TEE_LOG:-1}"
 
 WORKERS="${WORKERS:-16}"
-ASSET_WORKERS="${ASSET_WORKERS:-1}"
+ASSET_WORKERS="${ASSET_WORKERS:-2}"
 RETRIES="${RETRIES:-2}"
 REPAIR_OVERLAP_DAYS="${REPAIR_OVERLAP_DAYS:-7}"
 DAILY_STALE_MAX_LAG_DAYS="${DAILY_STALE_MAX_LAG_DAYS:-14}"
@@ -45,6 +46,7 @@ FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
 FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_forex_frankfurter}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
 FRANKFURTER_SKIP_MANIFEST="${FRANKFURTER_SKIP_MANIFEST:-0}"
+RUN_FRANKFURTER="${RUN_FRANKFURTER:-1}"
 RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-1}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
@@ -72,7 +74,7 @@ RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
 TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
 TW_PUBLIC_FEATURE_SYMBOLS_ROOT="${TW_PUBLIC_FEATURE_SYMBOLS_ROOT:-data_yahoo/tw_stocks}"
 TW_PUBLIC_MARKET_SYMBOL="${TW_PUBLIC_MARKET_SYMBOL:-__MARKET__}"
-RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-1}"
+RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-0}"
 AUDIT_ROOTS="${AUDIT_ROOTS:-data_yahoo/tw_stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
 AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
 AUDIT_WORKERS="${AUDIT_WORKERS:-16}"
@@ -140,6 +142,63 @@ record_failure() {
     log "fail_fast=1 step=${step_name} action=exit"
     exit 1
   fi
+}
+
+run_parallel_groups() {
+  if [[ "$DAILY_PARALLEL_GROUPS" != "1" || "$FAIL_FAST" == "1" ]]; then
+    while (( "$#" > 0 )); do
+      local group_name="$1"
+      local group_func="$2"
+      shift 2
+      "$group_func" || true
+    done
+    return 0
+  fi
+
+  local tmp_dir
+  local pids=()
+  local names=()
+  local funcs=()
+  local idx
+  local pid
+  local name
+  local rc
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/stockagent_daily_groups.XXXXXX")"
+  while (( "$#" > 0 )); do
+    names+=("$1")
+    funcs+=("$2")
+    shift 2
+  done
+
+  for idx in "${!names[@]}"; do
+    name="${names[$idx]}"
+    (
+      "${funcs[$idx]}"
+      printf "%s\n" "$?" > "${tmp_dir}/${name}.rc"
+    ) &
+    pids+=("$!")
+    log "group=${name} pid=${pids[$idx]} start_async"
+  done
+
+  for idx in "${!pids[@]}"; do
+    pid="${pids[$idx]}"
+    name="${names[$idx]}"
+    wait "$pid" || true
+    rc=1
+    if [[ -f "${tmp_dir}/${name}.rc" ]]; then
+      rc="$(<"${tmp_dir}/${name}.rc")"
+    fi
+    if [[ "$rc" == "0" ]]; then
+      log "group=${name} done"
+    else
+      log "group=${name} failed rc=${rc}"
+      record_failure "$name"
+    fi
+  done
+
+  rm -rf "$tmp_dir"
+  return 0
 }
 
 run_step() {
@@ -271,6 +330,33 @@ run_yahoo_incremental() {
     yahoo_flags+=(--no-include-us-delisted)
   fi
 
+  if [[ "${assets[*]}" == "tw_stocks us_stocks crypto forex" ]]; then
+    base_cmd=(
+      "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py
+      --mode daily-update
+      --asset all
+      --end-date "$today"
+      --workers "$WORKERS"
+      --asset-workers "$ASSET_WORKERS"
+      --retries "$RETRIES"
+      --repair-overlap-days "$REPAIR_OVERLAP_DAYS"
+      --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
+      --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
+      --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
+      "${yahoo_flags[@]}"
+    )
+    run_cmd=("${base_cmd[@]}")
+    if [[ "$YAHOO_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$YAHOO_STEP_TIMEOUT_SECONDS" -gt 0 ]]; then
+      if command -v timeout >/dev/null 2>&1; then
+        run_cmd=(timeout --signal=TERM --kill-after=30s "${YAHOO_STEP_TIMEOUT_SECONDS}" "${base_cmd[@]}")
+      else
+        log "timeout command not found; continue without yahoo timeout"
+      fi
+    fi
+    run_step "yahoo_all_daily_update" "${run_cmd[@]}" || rc=1
+    return "$rc"
+  fi
+
   for asset in "${assets[@]}"; do
     local yahoo_mode="daily-update"
     local step_suffix="daily_update"
@@ -310,6 +396,10 @@ run_yahoo_incremental() {
 run_frankfurter_incremental() {
   local today
   local -a cmd=()
+  if [[ "$RUN_FRANKFURTER" != "1" ]]; then
+    log "skip=frankfurter_forex_incremental reason=RUN_FRANKFURTER=${RUN_FRANKFURTER}"
+    return 0
+  fi
   today="$(date +%F)"
   if [[ -f "$FRANKFURTER_SYMBOLS_FILE" ]]; then
     cmd=(
@@ -483,8 +573,10 @@ run_market_close_cycle() {
     tw_date="$(TZ="$TW_CLOSE_TZ" date +%F)"
     log "market=tw due date=${tw_date} close=${TW_CLOSE_TIME} tz=${TW_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "tw_stocks" || true
-    run_tw_public_data_update || true
+    run_market_tw_yahoo() { run_yahoo_incremental_assets "tw_stocks"; }
+    run_parallel_groups \
+      tw_yahoo run_market_tw_yahoo \
+      tw_public run_tw_public_data_update
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_TW="$tw_date"
@@ -506,9 +598,11 @@ run_market_close_cycle() {
     fx_date="$(TZ="$FOREX_CLOSE_TZ" date +%F)"
     log "market=forex due date=${fx_date} close=${FOREX_CLOSE_TIME} tz=${FOREX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "forex" || true
-    run_frankfurter_incremental || true
-    run_pepperstone_incremental || true
+    run_market_forex_yahoo() { run_yahoo_incremental_assets "forex"; }
+    run_parallel_groups \
+      forex_yahoo run_market_forex_yahoo \
+      frankfurter run_frankfurter_incremental \
+      pepperstone run_pepperstone_incremental
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_FOREX="$fx_date"
@@ -519,8 +613,10 @@ run_market_close_cycle() {
     cex_date="$(TZ="$CEX_CLOSE_TZ" date +%F)"
     log "market=cex due date=${cex_date} close=${CEX_CLOSE_TIME} tz=${CEX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "crypto" || true
-    run_cex_incremental || true
+    run_market_cex_yahoo_crypto() { run_yahoo_incremental_assets "crypto"; }
+    run_parallel_groups \
+      yahoo_crypto run_market_cex_yahoo_crypto \
+      cex_perp run_cex_incremental
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_CEX="$cex_date"
@@ -557,12 +653,14 @@ run_once_cycle() {
   cycle_start="$(date +%s)"
   log "cycle=${cycle_id} start mode=${RUN_MODE} root=${ROOT_DIR}"
 
-  run_yahoo_incremental || true
-  run_tw_public_data_update || true
-  run_frankfurter_incremental || true
-  run_pepperstone_incremental || true
-  run_cex_incremental || true
-  run_data_quality_audit "$cycle_id" || true
+  run_once_audit() { run_data_quality_audit "$cycle_id"; }
+  run_parallel_groups \
+    yahoo run_yahoo_incremental \
+    tw_public run_tw_public_data_update \
+    frankfurter run_frankfurter_incremental \
+    pepperstone run_pepperstone_incremental \
+    cex run_cex_incremental \
+    audit run_once_audit
 
   cycle_end="$(date +%s)"
   cycle_elapsed="$((cycle_end - cycle_start))"
@@ -604,6 +702,10 @@ validate_settings() {
     echo "[daily] FAIL_FAST must be 0 or 1" >&2
     exit 2
   fi
+  if [[ "$DAILY_PARALLEL_GROUPS" != "0" && "$DAILY_PARALLEL_GROUPS" != "1" ]]; then
+    echo "[daily] DAILY_PARALLEL_GROUPS must be 0 or 1" >&2
+    exit 2
+  fi
   if [[ "$TEE_LOG" != "0" && "$TEE_LOG" != "1" ]]; then
     echo "[daily] TEE_LOG must be 0 or 1" >&2
     exit 2
@@ -638,6 +740,10 @@ validate_settings() {
   fi
   if [[ "$FRANKFURTER_SKIP_MANIFEST" != "0" && "$FRANKFURTER_SKIP_MANIFEST" != "1" ]]; then
     echo "[daily] FRANKFURTER_SKIP_MANIFEST must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_FRANKFURTER" != "0" && "$RUN_FRANKFURTER" != "1" ]]; then
+    echo "[daily] RUN_FRANKFURTER must be 0 or 1" >&2
     exit 2
   fi
   if ! [[ "$YAHOO_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
@@ -690,5 +796,5 @@ init_run_logging
 validate_settings
 acquire_lock
 load_schedule_state
-log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
+log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} parallel_groups=${DAILY_PARALLEL_GROUPS} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
 run_scheduler

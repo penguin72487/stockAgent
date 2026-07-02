@@ -19,6 +19,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 import polars as pl
+import pyarrow.parquet as pq
 import requests
 from tqdm import tqdm
 from urllib3.exceptions import InsecureRequestWarning
@@ -893,6 +894,15 @@ def _read_existing(path: Path) -> pl.DataFrame:
     return pl.read_parquet(path)
 
 
+def _read_existing_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        return int(pq.ParquetFile(path, memory_map=True).metadata.num_rows)
+    except Exception:
+        return int(_read_existing(path).height)
+
+
 def _merge_frames(existing: pl.DataFrame, incoming: pl.DataFrame, *, refresh: bool) -> pl.DataFrame:
     if refresh or existing.is_empty():
         return incoming
@@ -912,7 +922,7 @@ def _merge_frames(existing: pl.DataFrame, incoming: pl.DataFrame, *, refresh: bo
 
 def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> int:
     if frame.is_empty():
-        return int(_read_existing(path).height) if path.exists() else 0
+        return _read_existing_row_count(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     merged = _merge_frames(_read_existing(path), frame, refresh=refresh)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -924,6 +934,30 @@ def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> 
 def _latest_existing_date(path: Path) -> date | None:
     if not path.exists():
         return None
+    try:
+        metadata = pq.read_metadata(path)
+        schema = metadata.schema.to_arrow_schema()
+        date_idx = schema.get_field_index(DATE_COLUMN)
+        if date_idx >= 0:
+            latest: date | None = None
+            for row_group_idx in range(metadata.num_row_groups):
+                stats = metadata.row_group(row_group_idx).column(date_idx).statistics
+                if stats is None or not bool(getattr(stats, "has_min_max", False)):
+                    continue
+                value = stats.max
+                if isinstance(value, datetime):
+                    parsed = value.date()
+                elif isinstance(value, date):
+                    parsed = value
+                else:
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", errors="ignore")
+                    parsed = _parse_date(str(value)[:10])
+                latest = parsed if latest is None else max(latest, parsed)
+            if latest is not None:
+                return latest
+    except Exception:
+        pass
     try:
         frame = pl.scan_parquet(path).select(pl.col(DATE_COLUMN).max()).collect()
     except Exception:
@@ -960,7 +994,7 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
     if args.max_dates is not None:
         dates = dates[: max(0, int(args.max_dates))]
     if not dates:
-        return DownloadResult(spec.name, "up_to_date", int(_read_existing(parquet_path).height), str(parquet_path))
+        return DownloadResult(spec.name, "up_to_date", _read_existing_row_count(parquet_path), str(parquet_path))
 
     fetched_at = _now_utc()
     frames: list[pl.DataFrame] = []
@@ -1018,7 +1052,7 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
             time.sleep(max(0.0, float(args.sleep)))
 
     if not frames:
-        rows = int(_read_existing(parquet_path).height) if parquet_path.exists() else 0
+        rows = _read_existing_row_count(parquet_path)
         return DownloadResult(
             spec.name,
             "no_new_rows",
