@@ -9,16 +9,19 @@ from services.discord_bot.bot import (
     _add_user_watch_symbol,
     _decision_overview_page,
     _daily_summary_message,
+    _ensure_signal_ready,
     _filter_watchlist_rows,
     _guide_message,
     _latest_changes_pages,
     _latest_signal_message,
+    _market_notice,
     _performance_message,
     _enrich_signal_performance_for_discord,
     _position_line,
     _portfolio_change_line,
     _portfolio_history_header_lines,
     _portfolio_history_block,
+    _include_live_signals_in_portfolio_history,
     _prepend_latest_signal_row_to_portfolio_history,
     _rebalance_line,
     _remove_user_watch_symbol,
@@ -32,8 +35,12 @@ from services.discord_bot.bot import (
     _subscription_summary_lines,
     _subscribed_users_for_market,
     _stock_history_header_lines,
+    _summary_with_capital_context,
     _user_subscriptions,
     _user_watchlist,
+    _watch_crash_delay_seconds,
+    _watch_delay_seconds,
+    _watch_poll_seconds,
 )
 
 
@@ -257,6 +264,47 @@ def test_signal_sanity_blocks_implausible_latest_return() -> None:
     assert any("portfolio return" in text for _, text in issues)
 
 
+def test_stale_data_still_allows_signal_with_notice(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw",
+        label="台股",
+        timezone="Asia/Taipei",
+        display_timezone="Asia/Taipei",
+    )
+    status = SimpleNamespace(
+        enabled=True,
+        checkpoint=object(),
+        market_open=True,
+        market_open_reason="open",
+        cfg=cfg,
+        data=SimpleNamespace(
+            fresh=False,
+            reason="latest data 2026-06-22 older than expected 2026-06-23",
+            last_data_date="2026-06-22 13:30:00",
+            panel_date="2026-06-22 13:30:00",
+            expected_latest_date="2026-06-23 13:30:00",
+        ),
+    )
+
+    monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda cfg: status)
+
+    assert _ensure_signal_ready(cfg) is status
+    notice = _market_notice(status)
+    assert notice is not None
+    assert "資料提醒" in notice
+    assert "仍會產生訊號" in notice
+
+
+def test_bot_reloader_defaults_restart_immediately_on_file_updates(monkeypatch) -> None:
+    monkeypatch.delenv("STOCKAGENT_BOT_RESTART_DELAY_SECONDS", raising=False)
+    monkeypatch.delenv("STOCKAGENT_BOT_RELOAD_POLL_SECONDS", raising=False)
+    monkeypatch.delenv("STOCKAGENT_BOT_CRASH_RESTART_DELAY_SECONDS", raising=False)
+
+    assert _watch_delay_seconds() == 0.0
+    assert _watch_poll_seconds() == 0.2
+    assert _watch_crash_delay_seconds() == 10.0
+
+
 def test_sanity_block_still_includes_full_latest_signal(tmp_path) -> None:
     cfg = SimpleNamespace(
         market="unit",
@@ -405,6 +453,41 @@ def test_performance_and_risk_messages_are_investor_facing(tmp_path) -> None:
     assert "**largest positions**" in risk
     assert "`AAA` Alpha" in risk
     assert "`sanity=OK`" in risk
+
+
+def test_summary_recent_performance_uses_live_portfolio_history(monkeypatch) -> None:
+    cfg = SimpleNamespace(market="tw", benchmark_window_days=32, current_capital=None, initial_capital=None)
+    history = SimpleNamespace(
+        days=4,
+        period_return=0.12,
+        benchmark_return=0.05,
+        start_date="2026-06-26",
+        end_date="2026-07-01",
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._load_portfolio_history_for_market",
+        lambda cfg, days, top_changes, min_abs_change, initial_capital, current_capital: history,
+    )
+
+    summary = _summary_with_capital_context(
+        cfg,
+        {
+            "portfolio_simple_return": 0.01,
+            "benchmark_simple_return": 0.0,
+            "recent_performance": {
+                "window_days": 32,
+                "strategy_return": -0.99,
+                "benchmark_return": -0.99,
+            },
+        },
+    )
+
+    recent = summary["recent_performance"]
+    assert recent["source"] == "portfolio_history_with_live_signals"
+    assert recent["window_days"] == 4
+    assert np.isclose(recent["strategy_return"], 0.12)
+    assert np.isclose(recent["benchmark_return"], 0.05)
+    assert np.isclose(recent["excess_return"], 0.07)
 
 
 def test_user_watchlist_state_add_remove_and_filter(monkeypatch, tmp_path) -> None:
@@ -642,6 +725,61 @@ def test_portfolio_history_prepend_keeps_panel_display_time(tmp_path) -> None:
     assert inserted is True
     assert result.rows[0]["date"] == "2026-06-24 00:00:00"
     assert result.rows[0]["display_date"] == "2026-06-24 13:30:00"
+
+
+def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path) -> None:
+    result = SimpleNamespace(
+        rows=[{"date": "2026-06-25", "portfolio_return": 0.01, "benchmark_return": 0.0, "profit_value": 10.0}],
+        source_paths=(),
+        days=3,
+        top_changes=1,
+        start_date="2026-06-25",
+        end_date="2026-06-25",
+        period_return=0.01,
+        benchmark_return=0.0,
+        profit_value=10.0,
+        capital=SimpleNamespace(capital=1_000.0),
+    )
+    cfg = SimpleNamespace(market="tw", live_output_dir=str(tmp_path))
+    summaries = []
+    for date_text, ret in (("2026-06-26", 0.02), ("2026-06-30", -0.01)):
+        signal_dir = tmp_path / date_text
+        signal_dir.mkdir()
+        summary_path = signal_dir / "summary.json"
+        weights_path = signal_dir / "target_weights.parquet"
+        rebalance_path = signal_dir / "rebalance.parquet"
+        pl.DataFrame({"symbol": ["AAA"], "target_weight": [0.1]}).write_parquet(weights_path)
+        pl.DataFrame(
+            {
+                "symbol": ["AAA"],
+                "action": ["BUY"],
+                "current_weight": [0.0],
+                "target_weight": [0.1],
+                "delta_weight": [0.1],
+            }
+        ).write_parquet(rebalance_path)
+        summary = {
+            "asof_date": f"{date_text} 13:15:00",
+            "panel_date": f"{date_text} 13:30:00",
+            "panel_data_date": date_text,
+            "portfolio_simple_return": ret,
+            "benchmark_simple_return": 0.0,
+            "display_capital": 1_000.0,
+            "target_risk": {"gross": 0.1, "net": 0.1, "long_gross": 0.1, "short_gross": 0.0},
+            "weights_path": str(weights_path),
+            "rebalance_path": str(rebalance_path),
+        }
+        summary_path.write_text("{}", encoding="utf-8")
+        summaries.append((summary_path, summary))
+
+    monkeypatch.setattr("services.discord_bot.bot._market_signals", lambda cfg: summaries)
+
+    _include_live_signals_in_portfolio_history(cfg, result, max_rows=3)
+
+    assert [row["date"] for row in result.rows] == ["2026-06-30", "2026-06-26", "2026-06-25"]
+    assert np.isclose(result.period_return, 1.01 * 1.02 * 0.99 - 1.0)
+    assert result.rows[0]["source"] == "latest_live_signal"
+    assert result.rows[1]["source"] == "latest_live_signal"
 
 
 def test_portfolio_change_line_omits_missing_live_signal_shares() -> None:

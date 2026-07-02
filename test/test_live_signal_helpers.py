@@ -8,10 +8,13 @@ from stockagent.live.market_config import LiveMarketConfig
 from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
 from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
 from stockagent.live.signal_engine import (
+    LIVE_SIGNAL_WEIGHTS_NAME,
     _build_decision_rows,
     _daily_bar_timestamp,
     _date_string,
     _load_previous_weights,
+    _previous_usable_panel_date,
+    _resolve_usable_panel_index,
     write_live_weights_history,
 )
 from stockagent.live.portfolio_history import load_portfolio_history
@@ -114,6 +117,42 @@ def test_live_market_config_passes_close_time_as_daily_bar_time() -> None:
     assert cfg.signal_kwargs()["daily_bar_time"] == "13:30"
 
 
+def test_resolve_usable_panel_index_skips_latest_empty_tradable_row() -> None:
+    panel = type(
+        "PanelStub",
+        (),
+        {
+            "num_dates": 4,
+            "dates": np.array(
+                [
+                    np.datetime64("2026-06-20"),
+                    np.datetime64("2026-06-21"),
+                    np.datetime64("2026-06-22"),
+                    np.datetime64("2026-06-23"),
+                ]
+            ),
+            "tradable_mask": np.array(
+                [
+                    [True, False],
+                    [False, True],
+                    [True, True],
+                    [False, False],
+                ],
+                dtype=bool,
+            ),
+        },
+    )()
+
+    idx, notice = _resolve_usable_panel_index(panel, "latest", lookback=2)
+
+    assert idx == 2
+    assert notice is not None
+    assert "沒有可交易標的" in notice
+    assert "2026-06-23" in notice
+    assert "2026-06-22" in notice
+    assert _previous_usable_panel_date(panel, 3, lookback=2) == "2026-06-22"
+
+
 def test_live_signal_dates_preserve_intraday_time_and_live_weights_take_precedence(tmp_path) -> None:
     assert _date_string(np.datetime64("2026-06-22T00:15:00")) == "2026-06-22 00:15:00"
     assert _date_string(np.datetime64("2026-06-22")) == "2026-06-22"
@@ -152,7 +191,7 @@ def test_live_signal_dates_preserve_intraday_time_and_live_weights_take_preceden
     assert np.isclose(weights[0], 0.20)
 
 
-def test_daily_previous_weights_use_previous_trading_day_not_same_day_live_signal(tmp_path) -> None:
+def test_daily_previous_weights_use_previous_live_trading_day_not_same_day_signal(tmp_path) -> None:
     fold_dir = tmp_path / "fold_25"
     fold_dir.mkdir()
     pl.DataFrame(
@@ -166,20 +205,55 @@ def test_daily_previous_weights_use_previous_trading_day_not_same_day_live_signa
         {"asof_date": "2026-06-22"},
         [{"symbol": "AAA", "target_weight": 0.90}],
     )
+    write_live_weights_history(
+        fold_dir,
+        {"asof_date": "2026-06-23"},
+        [{"symbol": "AAA", "target_weight": 0.70}],
+    )
 
     weights, date_text, weights_path = _load_previous_weights(
         ["AAA"],
         output_dir=tmp_path,
         fold_id=25,
         weights_path=None,
-        asof_date="2026-06-22",
-        prefer_live_weights=False,
+        asof_date="2026-06-23",
+        prefer_live_weights=True,
+        strictly_before_asof=True,
+    )
+
+    assert weights_path == str(fold_dir / LIVE_SIGNAL_WEIGHTS_NAME)
+    assert date_text == "2026-06-22"
+    assert np.isclose(weights[0], 0.90)
+
+
+def test_previous_weights_fall_back_to_daily_when_live_has_no_prior_row(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-06-19", "2026-06-22"],
+            "AAA": [0.15, 0.40],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    write_live_weights_history(
+        fold_dir,
+        {"asof_date": "2026-06-23"},
+        [{"symbol": "AAA", "target_weight": 0.70}],
+    )
+
+    weights, date_text, weights_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=25,
+        weights_path=None,
+        asof_date="2026-06-23",
+        prefer_live_weights=True,
         strictly_before_asof=True,
     )
 
     assert weights_path == str(fold_dir / "daily_weights.parquet")
-    assert date_text == "2026-06-19"
-    assert np.isclose(weights[0], 0.15)
+    assert date_text == "2026-06-22"
+    assert np.isclose(weights[0], 0.40)
 
 
 def test_live_weights_history_uses_panel_date_not_generation_time(tmp_path) -> None:
@@ -242,6 +316,35 @@ def test_load_stock_history_combines_model_integer_and_holding_tables(tmp_path) 
     assert np.isclose(result.rows[0]["price_return"], 0.10)
     assert np.isclose(result.rows[0]["model_weight_delta"], -0.35)
     assert np.isclose(result.rows[1]["holding_ratio"], 0.12)
+
+
+def test_load_stock_history_prefers_live_signal_weights_over_fold_daily_weights(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-06-25", "2026-06-30"],
+            "AAA": [0.10, 0.20],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    write_live_weights_history(
+        fold_dir,
+        {"weights_date": "2026-06-30 00:00:00"},
+        [{"symbol": "AAA", "target_weight": 0.50}],
+    )
+    write_live_weights_history(
+        fold_dir,
+        {"weights_date": "2026-07-01 00:00:00"},
+        [{"symbol": "AAA", "target_weight": -0.25}],
+    )
+
+    result = load_stock_history(fold_dir, "AAA", limit=0, changes_only=False)
+
+    assert [row["date"] for row in result.rows[:3]] == ["2026-07-01", "2026-06-30", "2026-06-25"]
+    assert np.isclose(result.rows[0]["model_weight"], -0.25)
+    assert np.isclose(result.rows[1]["model_weight"], 0.50)
+    assert np.isclose(result.rows[1]["model_weight_delta"], 0.40)
+    assert any(path.name == LIVE_SIGNAL_WEIGHTS_NAME for path in result.source_paths)
 
 
 def test_load_stock_history_uses_price_root_and_previous_position_for_exit_short(tmp_path) -> None:
