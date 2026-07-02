@@ -372,12 +372,12 @@ def _market_summary_time(cfg: LiveMarketConfig) -> str | None:
 
 def _market_initial_capital(cfg: LiveMarketConfig) -> float | None:
     entry = _market_state(cfg.market)
-    return positive_float_or_none(entry.get("initial_capital")) or positive_float_or_none(cfg.initial_capital)
+    return positive_float_or_none(entry.get("initial_capital")) or positive_float_or_none(getattr(cfg, "initial_capital", None))
 
 
 def _market_current_capital(cfg: LiveMarketConfig) -> float | None:
     entry = _market_state(cfg.market)
-    return positive_float_or_none(entry.get("current_capital")) or positive_float_or_none(cfg.current_capital)
+    return positive_float_or_none(entry.get("current_capital")) or positive_float_or_none(getattr(cfg, "current_capital", None))
 
 
 def _validate_hhmm(value: str) -> str:
@@ -530,21 +530,34 @@ def _ensure_signal_ready(cfg: LiveMarketConfig, *, scheduled: bool = False) -> M
         raise MarketDisabledError(cfg)
     if status.checkpoint is None:
         raise MarketUnsupportedError(cfg)
-    non_trading_day = (not status.market_open) and "not a trading day" in (status.market_open_reason or "")
-    if not status.data.fresh and not non_trading_day:
-        raise DataStaleError(cfg, status)
     return status
 
 
-def _market_notice(status: MarketRuntimeStatus) -> str | None:
-    if status.market_open:
+def _data_freshness_notice(status: MarketRuntimeStatus) -> str | None:
+    if status.data.fresh:
         return None
+    latest = _display_cfg_time(status.cfg, status.data.last_data_date or status.data.panel_date or "n/a")
+    expected = _display_cfg_time(status.cfg, status.data.expected_latest_date or "n/a")
+    reason = status.data.reason or "data freshness check failed"
+    return (
+        f"資料提醒：latest=`{latest}` expected=`{expected}` reason=`{reason}`；"
+        "仍會產生訊號，請確認資料來源後再交易。"
+    )
+
+
+def _market_notice(status: MarketRuntimeStatus) -> str | None:
+    freshness_notice = _data_freshness_notice(status)
+    if status.market_open:
+        return freshness_notice
     data_date = _display_cfg_time(status.cfg, status.data.panel_date or status.data.last_data_date or "n/a")
     reason = status.market_open_reason or "market closed"
     if "not a trading day" in reason:
-        freshness = f"資料提醒：{status.data.reason}。" if status.data.reason else ""
-        return f"今天沒有開盤，使用最後可用資料 `{data_date}`（{_display_tz_text(status.cfg)}）產生訊號。{freshness}"
-    return f"目前非交易時間，使用最後可用資料 `{data_date}`（{_display_tz_text(status.cfg)}）產生訊號。"
+        notice = f"今天沒有開盤，使用最後可用資料 `{data_date}`（{_display_tz_text(status.cfg)}）產生訊號。"
+    else:
+        notice = f"目前非交易時間，使用最後可用資料 `{data_date}`（{_display_tz_text(status.cfg)}）產生訊號。"
+    if freshness_notice:
+        return f"{notice} {freshness_notice}"
+    return notice
 
 
 def _role_names_and_ids(interaction: discord.Interaction) -> tuple[set[str], set[int]]:
@@ -979,12 +992,13 @@ def _resolve_current_capital(
 
 
 def _performance_window_label(cfg: LiveMarketConfig, recent: dict[str, Any]) -> str:
-    raw_window = recent.get("window_days") or cfg.benchmark_window_days
+    configured_window = getattr(cfg, "benchmark_window_days", 32)
+    raw_window = recent.get("window_days") or configured_window
     try:
         window = int(raw_window)
     except Exception:
-        window = int(cfg.benchmark_window_days)
-    frequency = str(cfg.history_frequency or "").strip().lower()
+        window = int(configured_window)
+    frequency = str(getattr(cfg, "history_frequency", "daily") or "").strip().lower()
     if frequency in {"bar", "bars", "intraday", "15m", "15min", "15minute", "15minutes"}:
         try:
             market_cfg = load_config(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path))
@@ -1031,6 +1045,8 @@ def _enrich_signal_performance_for_discord(
         if portfolio_return is not None and benchmark_return is not None:
             summary["excess_pnl_value"] = (portfolio_return - benchmark_return) * float(capital)
 
+    _refresh_summary_recent_performance_from_history(cfg, summary, capital=capital)
+
     recent = summary.get("recent_performance")
     if isinstance(recent, dict):
         recent["window_label"] = _performance_window_label(cfg, recent)
@@ -1050,6 +1066,65 @@ def _enrich_signal_performance_for_discord(
     except Exception as exc:
         _log_exception(f"rewrite_signal_artifacts:{cfg.market}", exc)
     return result
+
+
+def _refresh_summary_recent_performance_from_history(
+    cfg: LiveMarketConfig,
+    summary: dict[str, Any],
+    *,
+    capital: float | None = None,
+) -> None:
+    raw_recent = summary.get("recent_performance")
+    if isinstance(raw_recent, dict):
+        window = _float_or_none(raw_recent.get("window_days"))
+    else:
+        window = None
+    if window is None:
+        window = _float_or_none(getattr(cfg, "benchmark_window_days", None))
+    try:
+        days = int(window or 0)
+    except Exception:
+        days = 0
+    if days <= 0:
+        return
+    try:
+        history = _load_portfolio_history_for_market(
+            cfg,
+            days,
+            0,
+            0.0,
+            None,
+            capital,
+        )
+    except Exception as exc:
+        _log_exception(f"recent_performance_history:{cfg.market}", exc)
+        return
+    recent: dict[str, Any] = dict(raw_recent) if isinstance(raw_recent, dict) else {}
+    recent.update(
+        {
+            "window_days": int(history.days),
+            "strategy_return": history.period_return,
+            "benchmark_return": history.benchmark_return,
+            "excess_return": (
+                None
+                if history.period_return is None or history.benchmark_return is None
+                else float(history.period_return) - float(history.benchmark_return)
+            ),
+            "source": "portfolio_history_with_live_signals",
+            "start_date": history.start_date,
+            "end_date": history.end_date,
+        }
+    )
+    if capital is not None:
+        for source_key, target_key in (
+            ("strategy_return", "strategy_pnl_value"),
+            ("benchmark_return", "benchmark_pnl_value"),
+            ("excess_return", "excess_pnl_value"),
+        ):
+            value = _float_or_none(recent.get(source_key))
+            if value is not None:
+                recent[target_key] = value * float(capital)
+    summary["recent_performance"] = recent
 
 
 def _annotate_weight_rows_with_capital(rows: list[dict[str, Any]], capital: float | None) -> list[dict[str, Any]]:
@@ -1103,6 +1178,7 @@ def _summary_with_capital_context(
             out["benchmark_pnl_value"] = benchmark_return * float(capital)
         if portfolio_return is not None and benchmark_return is not None:
             out["excess_pnl_value"] = (portfolio_return - benchmark_return) * float(capital)
+    _refresh_summary_recent_performance_from_history(cfg, out, capital=capital)
     recent = out.get("recent_performance")
     if isinstance(recent, dict):
         recent = dict(recent)
@@ -1579,8 +1655,23 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
         except Exception:
             continue
         if isinstance(summary, dict):
-            return path, summary
+                return path, summary
     return None
+
+
+def _market_signals(cfg: LiveMarketConfig) -> list[tuple[Path, dict[str, Any]]]:
+    root = _resolve_repo_path(cfg.live_output_dir)
+    if root is None or not root.exists():
+        return []
+    signals: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(root.glob("**/summary.json"), key=lambda item: item.stat().st_mtime):
+        try:
+            summary = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(summary, dict):
+            signals.append((path, summary))
+    return signals
 
 
 def _sync_latest_live_weights_to_market_artifact(cfg: LiveMarketConfig) -> str | None:
@@ -2267,22 +2358,51 @@ def _prepend_latest_signal_row_to_portfolio_history(
     return True
 
 
+def _include_live_signals_in_portfolio_history(
+    cfg: LiveMarketConfig,
+    result: PortfolioHistoryResult,
+    *,
+    max_rows: int,
+) -> None:
+    def signal_date_key(summary: dict[str, Any]) -> str:
+        return str(
+            summary.get("panel_data_date")
+            or summary.get("weights_date")
+            or summary.get("panel_date")
+            or summary.get("asof_date")
+            or ""
+        ).strip()
+
+    def signal_sort_key(item: tuple[Path, dict[str, Any]]) -> tuple[datetime, str]:
+        path, summary = item
+        dt = _history_datetime(signal_date_key(summary))
+        return dt or datetime.min, str(path)
+
+    latest_by_date: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for summary_path, summary in _market_signals(cfg):
+        key = signal_date_key(summary)
+        if not key:
+            continue
+        current = latest_by_date.get(key)
+        if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:
+            latest_by_date[key] = (summary_path, summary)
+
+    for summary_path, summary in sorted(latest_by_date.values(), key=signal_sort_key):
+        _prepend_latest_signal_row_to_portfolio_history(
+            result,
+            summary_path=summary_path,
+            summary=summary,
+            max_rows=max_rows,
+        )
+
+
 def _include_latest_signal_in_portfolio_history(
     cfg: LiveMarketConfig,
     result: PortfolioHistoryResult,
     *,
     max_rows: int,
 ) -> None:
-    latest = _latest_market_signal(cfg)
-    if latest is None:
-        return
-    summary_path, summary = latest
-    _prepend_latest_signal_row_to_portfolio_history(
-        result,
-        summary_path=summary_path,
-        summary=summary,
-        max_rows=max_rows,
-    )
+    _include_live_signals_in_portfolio_history(cfg, result, max_rows=max_rows)
 
 
 def _load_portfolio_history_for_market(
@@ -2814,6 +2934,7 @@ def _daily_summary_message(cfg: LiveMarketConfig, *, debug: bool = False) -> str
         lines.append(f"notice: {notice}")
     if latest is not None:
         path, summary = latest
+        summary = _summary_with_capital_context(cfg, summary)
         portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
         baseline_return = _float_or_none(summary.get("benchmark_simple_return"))
         excess_return = None if portfolio_return is None or baseline_return is None else portfolio_return - baseline_return
@@ -3897,13 +4018,18 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _watch_delay_seconds() -> float:
-    raw = _env("STOCKAGENT_BOT_RESTART_DELAY_SECONDS", "10") or "10"
+    raw = _env("STOCKAGENT_BOT_RESTART_DELAY_SECONDS", "0") or "0"
+    return max(0.0, float(raw))
+
+
+def _watch_crash_delay_seconds() -> float:
+    raw = _env("STOCKAGENT_BOT_CRASH_RESTART_DELAY_SECONDS", "10") or "10"
     return max(0.0, float(raw))
 
 
 def _watch_poll_seconds() -> float:
-    raw = _env("STOCKAGENT_BOT_RELOAD_POLL_SECONDS", "1") or "1"
-    return max(0.2, float(raw))
+    raw = _env("STOCKAGENT_BOT_RELOAD_POLL_SECONDS", "0.2") or "0.2"
+    return max(0.05, float(raw))
 
 
 def _watch_roots() -> list[Path]:
@@ -3995,6 +4121,7 @@ def _stop_bot_child(process: subprocess.Popen, *, timeout: float = 15.0) -> None
 
 def run_with_reloader() -> None:
     delay = _watch_delay_seconds()
+    crash_delay = _watch_crash_delay_seconds()
     poll = _watch_poll_seconds()
     stop_requested = False
     child = _start_bot_child()
@@ -4013,15 +4140,16 @@ def run_with_reloader() -> None:
     signal_module.signal(signal_module.SIGTERM, request_stop)
     print(
         "[bot-reload] enabled "
-        f"delay={delay:.1f}s poll={poll:.1f}s paths={', '.join(str(path) for path in _watch_roots())}",
+        f"delay={delay:.2f}s crash_delay={crash_delay:.1f}s poll={poll:.2f}s "
+        f"paths={', '.join(str(path) for path in _watch_roots())}",
         flush=True,
     )
     try:
         while not stop_requested:
             exit_code = child.poll()
             if exit_code is not None:
-                print(f"[bot-reload] child exited code={exit_code}; restarting in {delay:.1f}s", flush=True)
-                time.sleep(delay)
+                print(f"[bot-reload] child exited code={exit_code}; restarting in {crash_delay:.1f}s", flush=True)
+                time.sleep(crash_delay)
                 if stop_requested:
                     break
                 child = _start_bot_child()
@@ -4039,7 +4167,10 @@ def run_with_reloader() -> None:
                 preview = ", ".join(Path(path).name for path in sorted(pending_changes)[:5])
                 if len(pending_changes) > 5:
                     preview += f", +{len(pending_changes) - 5} more"
-                print(f"[bot-reload] file update detected: {preview}; restart in {delay:.1f}s", flush=True)
+                if delay <= 0.0:
+                    print(f"[bot-reload] file update detected: {preview}; restarting now", flush=True)
+                else:
+                    print(f"[bot-reload] file update detected: {preview}; restart in {delay:.2f}s", flush=True)
 
             if pending_deadline is not None and time.monotonic() >= pending_deadline:
                 print("[bot-reload] restarting child after file updates", flush=True)

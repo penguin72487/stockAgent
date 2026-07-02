@@ -150,16 +150,17 @@ def _is_intraday_frequency(frequency: object) -> bool:
     return text.endswith("m") and text[:-1].isdigit()
 
 
-def _default_weights_path(output_dir: str | Path, fold_id: int, *, prefer_live_weights: bool = True) -> Path | None:
+def _candidate_weights_paths(output_dir: str | Path, fold_id: int, *, prefer_live_weights: bool = True) -> list[Path]:
     fold_dir = Path(output_dir) / f"fold_{int(fold_id):02d}"
     live_names = (LIVE_SIGNAL_WEIGHTS_NAME, "live_signal_weights.csv")
     artifact_names = ("daily_weights.parquet", "daily_weights.csv")
     names = (*live_names, *artifact_names) if prefer_live_weights else (*artifact_names, *live_names)
+    paths: list[Path] = []
     for name in names:
         path = fold_dir / name
         if path.exists():
-            return path
-    return None
+            paths.append(path)
+    return paths
 
 
 def _load_previous_weights(
@@ -172,48 +173,54 @@ def _load_previous_weights(
     prefer_live_weights: bool = True,
     strictly_before_asof: bool = False,
 ) -> tuple[np.ndarray, str | None, str | None]:
-    path = (
-        Path(weights_path)
+    paths = (
+        [Path(weights_path)]
         if weights_path is not None
-        else _default_weights_path(output_dir, fold_id, prefer_live_weights=prefer_live_weights)
+        else _candidate_weights_paths(output_dir, fold_id, prefer_live_weights=prefer_live_weights)
     )
-    if path is None or not path.exists():
+    if not paths:
         return np.zeros((len(symbols),), dtype=np.float64), None, None
 
-    frame = _read_table(path)
-    if "date" not in frame.columns or frame.height == 0:
-        return np.zeros((len(symbols),), dtype=np.float64), None, str(path)
+    last_seen_path: str | None = None
+    for path in paths:
+        if not path.exists():
+            continue
+        last_seen_path = str(path)
+        frame = _read_table(path)
+        if "date" not in frame.columns or frame.height == 0:
+            continue
 
-    if asof_date:
-        asof = _datetime64_second(asof_date)
-        keep = []
-        for raw in frame.get_column("date").to_list():
-            raw_dt = _datetime64_second(raw)
-            if asof is None or raw_dt is None:
-                keep.append(True)
-            elif strictly_before_asof:
-                keep.append(bool(raw_dt < asof))
+        if asof_date:
+            asof = _datetime64_second(asof_date)
+            keep = []
+            for raw in frame.get_column("date").to_list():
+                raw_dt = _datetime64_second(raw)
+                if asof is None or raw_dt is None:
+                    keep.append(True)
+                elif strictly_before_asof:
+                    keep.append(bool(raw_dt < asof))
+                else:
+                    keep.append(bool(raw_dt <= asof))
+            if any(keep):
+                import polars as pl
+
+                frame = frame.filter(pl.Series(keep))
             else:
-                keep.append(bool(raw_dt <= asof))
-        if any(keep):
-            import polars as pl
+                continue
 
-            frame = frame.filter(pl.Series(keep))
-        else:
-            return np.zeros((len(symbols),), dtype=np.float64), None, str(path)
-
-    frame = frame.sort("date")
-    row = frame.tail(1).to_dicts()[0]
-    weights = np.zeros((len(symbols),), dtype=np.float64)
-    for idx, symbol in enumerate(symbols):
-        value = row.get(symbol)
-        if value is None:
-            continue
-        try:
-            weights[idx] = float(value)
-        except Exception:
-            continue
-    return weights, _date_string(row.get("date")), str(path)
+        frame = frame.sort("date")
+        row = frame.tail(1).to_dicts()[0]
+        weights = np.zeros((len(symbols),), dtype=np.float64)
+        for idx, symbol in enumerate(symbols):
+            value = row.get(symbol)
+            if value is None:
+                continue
+            try:
+                weights[idx] = float(value)
+            except Exception:
+                continue
+        return weights, _date_string(row.get("date")), str(path)
+    return np.zeros((len(symbols),), dtype=np.float64), None, last_seen_path
 
 
 def _resolve_panel_index(panel: PanelData, panel_date: str | None, lookback: int) -> int:
@@ -233,6 +240,35 @@ def _resolve_panel_index(panel: PanelData, panel_date: str | None, lookback: int
     if idx < int(lookback) - 1:
         raise ValueError(f"panel index {idx} does not have lookback={lookback} history")
     return idx
+
+
+def _resolve_usable_panel_index(panel: PanelData, panel_date: str | None, lookback: int) -> tuple[int, str | None]:
+    idx = _resolve_panel_index(panel, panel_date, lookback)
+    mask = np.asarray(panel.tradable_mask[idx], dtype=bool)
+    if bool(mask.any()):
+        return idx, None
+
+    min_idx = int(lookback) - 1
+    for candidate in range(idx - 1, min_idx - 1, -1):
+        candidate_mask = np.asarray(panel.tradable_mask[candidate], dtype=bool)
+        if bool(candidate_mask.any()):
+            original = _date_string(panel.dates[idx])
+            usable = _date_string(panel.dates[candidate])
+            return candidate, f"panel `{original}` 沒有可交易標的，改用最近可用資料 `{usable}`。"
+
+    raise ValueError(
+        f"panel_date={_date_string(panel.dates[idx])!r} has no tradable symbols, "
+        f"and no earlier usable row exists with lookback={lookback}"
+    )
+
+
+def _previous_usable_panel_date(panel: PanelData, panel_idx: int, lookback: int) -> str | None:
+    min_idx = int(lookback) - 1
+    for candidate in range(int(panel_idx) - 1, min_idx - 1, -1):
+        candidate_mask = np.asarray(panel.tradable_mask[candidate], dtype=bool)
+        if bool(candidate_mask.any()):
+            return _date_string(panel.dates[candidate])
+    return None
 
 
 def _find_panel_date_index(panel: PanelData, date_text: str | None) -> int | None:
@@ -984,9 +1020,15 @@ def generate_live_signal(
         context=f"live signal {market_id or resolved_fold_id}",
     )
     symbol_names = load_symbol_name_map(config.data.parquet_root)
-    panel_idx = _resolve_panel_index(panel, panel_date, config.training.lookback)
+    panel_idx, panel_fallback_notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
     panel_date_str = _date_string(panel.dates[panel_idx])
     panel_display_date = panel_date_str if intraday_frequency else _daily_bar_timestamp(panel_date_str, daily_bar_time)
+    if panel_fallback_notice:
+        market_notice = (
+            f"{str(market_notice).strip()} {panel_fallback_notice}".strip()
+            if market_notice
+            else panel_fallback_notice
+        )
     resolved_asof = asof_date or _now_text(source_timezone)
 
     panel_prices = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
@@ -1006,13 +1048,28 @@ def generate_live_signal(
         fold_id=resolved_fold_id,
         weights_path=weights_path,
         asof_date=panel_date_str,
-        prefer_live_weights=intraday_frequency,
+        prefer_live_weights=True,
         strictly_before_asof=True,
     )
     previous_weights_data_date = previous_weights_date
     previous_weights_display_date = (
         previous_weights_date if intraday_frequency else _daily_bar_timestamp(previous_weights_date, daily_bar_time)
     )
+    expected_previous_data_date = _previous_usable_panel_date(panel, panel_idx, config.training.lookback)
+    if expected_previous_data_date and previous_weights_data_date:
+        expected_prev_dt = _datetime64_second(expected_previous_data_date)
+        actual_prev_dt = _datetime64_second(previous_weights_data_date)
+        if expected_prev_dt is not None and actual_prev_dt is not None and actual_prev_dt != expected_prev_dt:
+            expected_display = (
+                expected_previous_data_date
+                if intraday_frequency
+                else _daily_bar_timestamp(expected_previous_data_date, daily_bar_time)
+            )
+            gap_notice = (
+                f"上一筆持倉 `{previous_weights_display_date}` 不是上一個可用交易日 `{expected_display}`；"
+                "可能有缺少的 live weights，需要補推論。"
+            )
+            market_notice = f"{str(market_notice).strip()} {gap_notice}".strip() if market_notice else gap_notice
     drift_base_idx = _find_panel_date_index(panel, previous_weights_date)
     if drift_base_idx is None:
         drift_base_idx = panel_idx
@@ -1193,7 +1250,11 @@ def generate_live_signal(
         "weights_date": panel_date_str,
         "trading_frequency": trading_frequency,
         "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
-        "previous_weights_policy": "live_signal_before_asof" if intraday_frequency else "daily_weights_previous_trading_day",
+        "previous_weights_policy": (
+            "live_signal_before_asof"
+            if previous_weights_path and Path(previous_weights_path).name.startswith("live_signal_weights")
+            else "daily_weights_previous_trading_day"
+        ),
         "data_timezone": source_timezone,
         "display_timezone": display_timezone_name,
         "display_timezone_label": display_timezone_label(display_timezone_name),

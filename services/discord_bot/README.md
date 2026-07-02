@@ -8,14 +8,15 @@ Run the bot from the repository root:
 
 The entrypoint runs with a built-in reload supervisor by default. It watches
 Discord bot code/config, `stockagent/live`, `configs/markets`, and
-`scripts/live_signal.py`; after the last watched file update it waits 10 seconds
-and restarts the child bot process. Runtime artifacts are not watched, so signal
-outputs and audit logs do not trigger restart loops.
+`scripts/live_signal.py`; watched file updates restart the child bot process
+immediately on the next watcher tick. Runtime artifacts are not watched, so
+signal outputs and audit logs do not trigger restart loops.
 
 Reload controls:
 
-- `STOCKAGENT_BOT_RESTART_DELAY_SECONDS=10`
-- `STOCKAGENT_BOT_RELOAD_POLL_SECONDS=1`
+- `STOCKAGENT_BOT_RESTART_DELAY_SECONDS=0` controls file-change debounce.
+- `STOCKAGENT_BOT_RELOAD_POLL_SECONDS=0.2` controls watcher responsiveness.
+- `STOCKAGENT_BOT_CRASH_RESTART_DELAY_SECONDS=10` controls crash-loop pacing.
 - `STOCKAGENT_BOT_RELOAD=0` disables the supervisor.
 - `STOCKAGENT_BOT_WATCH_PATHS=a,b,c` overrides watched paths.
 
