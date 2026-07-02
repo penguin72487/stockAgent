@@ -47,6 +47,15 @@ def _artifact_path(fold_dir: str | Path, stem: str) -> Path | None:
     return None
 
 
+def _artifact_paths(fold_dir: str | Path, stems: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for stem in stems:
+        path = _artifact_path(fold_dir, stem)
+        if path is not None and path not in paths:
+            paths.append(path)
+    return paths
+
+
 def _read_table(path: Path):
     import polars as pl
 
@@ -243,6 +252,58 @@ def _read_wide_symbol_series(
     if is_bar_frequency(frequency):
         return selected.drop(_ROW_INDEX_COL), column, path
     return (_last_daily_snapshot(selected, [alias]), column, path)
+
+
+def _read_preferred_wide_symbol_series(
+    fold_dir: Path,
+    stems: list[str],
+    symbol: str,
+    alias: str,
+    *,
+    frequency: str | None = "daily",
+):
+    import polars as pl
+
+    selected_frames = []
+    source_paths: list[Path] = []
+    resolved_symbol: str | None = None
+    source_order = 0
+    for path in _artifact_paths(fold_dir, stems):
+        source_paths.append(path)
+        frame = _read_table(path)
+        if "date" not in frame.columns:
+            raise ValueError(f"{path} missing date column")
+        column = _resolve_symbol_column(frame.columns, symbol)
+        if column is None:
+            continue
+        selected = frame.with_row_index(_ROW_INDEX_COL).select(
+            [
+                _date_string_expr(frequency),
+                pl.lit(source_order).alias("__source_order"),
+                pl.col(_ROW_INDEX_COL),
+                pl.col(column).cast(pl.Float64, strict=False).alias(alias),
+            ]
+        )
+        selected_frames.append(selected)
+        resolved_symbol = resolved_symbol or column
+        source_order += 1
+    if not selected_frames:
+        return None, None, tuple(source_paths)
+
+    combined = pl.concat(selected_frames, how="diagonal_relaxed").sort(["date", "__source_order", _ROW_INDEX_COL])
+    if is_bar_frequency(frequency):
+        frame = (
+            combined.group_by("date", maintain_order=True)
+            .agg(pl.col(alias).last().alias(alias))
+            .sort("date")
+        )
+    else:
+        frame = (
+            combined.group_by("date", maintain_order=True)
+            .agg(pl.col(alias).last().alias(alias))
+            .sort("date")
+        )
+    return frame, resolved_symbol, tuple(source_paths)
 
 
 def _timeline_for_nonzero_symbol(frame, weight_column: str):
@@ -494,15 +555,14 @@ def load_stock_history(
     source_paths: list[Path] = []
     resolved_symbol: str | None = None
 
-    model_frame, model_symbol, model_path = _read_wide_symbol_series(
+    model_frame, model_symbol, model_paths = _read_preferred_wide_symbol_series(
         root,
-        "daily_weights",
+        ["daily_weights", "live_signal_weights"],
         symbol,
         "model_weight",
         frequency=frequency,
     )
-    if model_path is not None:
-        source_paths.append(model_path)
+    source_paths.extend(model_paths)
     if model_frame is not None:
         frames.append(model_frame)
         resolved_symbol = model_symbol or resolved_symbol
@@ -552,9 +612,9 @@ def load_stock_history(
 
     if resolved_symbol is None:
         available_hint = ""
-        if model_path is not None:
+        if model_paths:
             try:
-                columns = [name for name in _read_table(model_path).columns if name != "date"]
+                columns = [name for name in _read_table(model_paths[0]).columns if name != "date"]
                 available_hint = f"; sample symbols={', '.join(columns[:8])}"
             except Exception:
                 available_hint = ""
