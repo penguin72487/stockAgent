@@ -15,7 +15,13 @@ import pyarrow.parquet as pq
 import torch
 from torch import nn
 
-from stockagent.models.normalization import dual_branch_softmax, masked_cross_sectional_mean, masked_softmax
+from stockagent.models.normalization import (
+    dual_branch_softmax,
+    masked_cross_sectional_mean,
+    masked_l1_projection_weights,
+    masked_signed_action_weights,
+    masked_softmax,
+)
 
 
 MODULE_NAME = "abstract_cross_asset_transmission"
@@ -241,10 +247,35 @@ def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask:
     temp = max(0.05, temp)
     activation = str(getattr(model, "portfolio_activation", "identity"))
     mode = str(getattr(model, "portfolio_mode", "long_short")).strip().lower()
+    output_mode = str(getattr(model, "portfolio_output_mode", "activation_l1")).strip().lower().replace("-", "_")
     if mode in {"long", "long_only", "longonly"}:
-        return masked_softmax(scores / temp, mask, activation=activation).masked_fill(~mask, 0.0)
+        target_logits = (scores / temp).masked_fill(~mask, 0.0)
+        if output_mode == "logits":
+            return target_logits
+        if output_mode == "signed_softmax":
+            return masked_signed_action_weights(target_logits, mask, transform="softmax", long_only=True).masked_fill(~mask, 0.0)
+        if output_mode == "signed_sparsemax":
+            return masked_signed_action_weights(target_logits, mask, transform="sparsemax", long_only=True).masked_fill(~mask, 0.0)
+        if output_mode == "signed_entmax15":
+            return masked_signed_action_weights(target_logits, mask, transform="entmax15", long_only=True).masked_fill(~mask, 0.0)
+        if output_mode == "projection_l1":
+            return masked_l1_projection_weights(target_logits, mask, long_only=True).masked_fill(~mask, 0.0)
+        weight_activation = "identity" if output_mode == "l1" else activation
+        return masked_softmax(scores / temp, mask, activation=weight_activation).masked_fill(~mask, 0.0)
     centered = scores - masked_cross_sectional_mean(scores, mask)
-    return dual_branch_softmax(centered / temp, mask, activation=activation).masked_fill(~mask, 0.0)
+    target_logits = (centered / temp).masked_fill(~mask, 0.0)
+    if output_mode == "logits":
+        return target_logits
+    if output_mode == "signed_softmax":
+        return masked_signed_action_weights(target_logits, mask, transform="softmax", long_only=False).masked_fill(~mask, 0.0)
+    if output_mode == "signed_sparsemax":
+        return masked_signed_action_weights(target_logits, mask, transform="sparsemax", long_only=False).masked_fill(~mask, 0.0)
+    if output_mode == "signed_entmax15":
+        return masked_signed_action_weights(target_logits, mask, transform="entmax15", long_only=False).masked_fill(~mask, 0.0)
+    if output_mode == "projection_l1":
+        return masked_l1_projection_weights(target_logits, mask, long_only=False).masked_fill(~mask, 0.0)
+    weight_activation = "identity" if output_mode == "l1" else activation
+    return dual_branch_softmax(centered / temp, mask, activation=weight_activation).masked_fill(~mask, 0.0)
 
 
 def _rank_positions(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

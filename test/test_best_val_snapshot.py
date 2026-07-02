@@ -150,5 +150,8 @@ def test_realized_leverage_backtest_multiplies_realized_positions_before_returns
         atol=1e-7,
     )
     np.testing.assert_allclose(leveraged.turnovers, np.array([2.0, 1.4], dtype=np.float32), atol=1e-7)
-    np.testing.assert_allclose(leveraged.strategy_returns, np.array([-0.13, 0.02], dtype=np.float32), atol=1e-7)
+    expected_simple = np.einsum("ts,ts->t", leveraged.weights_history, np.expm1(future_returns))
+    expected_fees = np.array([0.03, 0.02], dtype=np.float32)
+    expected_strategy_returns = np.log1p(np.clip(expected_simple - expected_fees, -0.999999, None))
+    np.testing.assert_allclose(leveraged.strategy_returns, expected_strategy_returns.astype(np.float32), atol=1e-7)
     np.testing.assert_allclose(leveraged.benchmark_returns, base.benchmark_returns, atol=1e-7)

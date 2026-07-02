@@ -240,6 +240,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
     if args.epochs is not None:
         if args.epochs < 1:
@@ -365,6 +366,10 @@ def main() -> None:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        external_feature_path=(
+            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+        ),
+        external_market_symbol=config.data.tw_public_market_symbol,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -404,7 +409,7 @@ def main() -> None:
         json.dump([asdict(result) for result in results], handle, indent=2)
 
     for result in results:
-        configured_gross_leverage = float(config.trading.gross_leverage)
+        configured_leverage = float(config.trading.leverage)
         leveraged_sharpe = float(result.test_metrics.get("sharpe", 0.0))
         leveraged_sortino = float(result.test_metrics.get("sortino", 0.0))
         print(
@@ -415,7 +420,7 @@ def main() -> None:
                     "val_years": result.val_years,
                     "test_years": result.test_years,
                     "best_val_loss": result.best_val_loss,
-                    "configured_gross_leverage": configured_gross_leverage,
+                    "configured_leverage": configured_leverage,
                     "leveraged_sharpe": leveraged_sharpe,
                     "leveraged_sortino": leveraged_sortino,
                     "test_metrics": result.test_metrics,

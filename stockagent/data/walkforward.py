@@ -22,30 +22,34 @@ def build_expanding_year_folds(
     val_years: int = 1,
     require_future_test_year: bool = True,
 ) -> list[WalkForwardFold]:
-    """Build expanding-window folds with fixed 1-year validation.
+    """Build expanding-window folds.
 
-    For each valid train endpoint i (0-based index into unique_years):
-    - train = unique_years[:i]          (expanding, at least min_train_years)
-    - val   = [unique_years[i]]         (fixed 1 year)
-    - test  = unique_years[i+1:]        (all remaining years)
+    For each valid validation start i (0-based index into unique_years):
+    - train = unique_years[:i]                         (expanding)
+    - val   = unique_years[i:i + val_years]            (fixed window)
+    - test  = unique_years[i + val_years:]             (all future years)
 
-    i ranges from min_train_years to n-2, so there is always at least 1 test year.
-    val_years and require_future_test_year are kept for API compatibility.
+    When require_future_test_year is false, one experimental final fold is also
+    allowed with no future test year. In that final fold, the validation window
+    is reused as the test window. This intentionally overlaps val/test and is
+    useful only for latest-year experiments, not unbiased model selection.
     """
-    _ = val_years
-    _ = require_future_test_year
-
     years = np.asarray(dates, dtype="datetime64[Y]").astype(np.int64) + 1970
     unique_years = sorted(np.unique(years).astype(int).tolist())
     folds: list[WalkForwardFold] = []
 
     total_years = len(unique_years)
-    # i is the index of the val year; train = years[:i], val = [years[i]], test = years[i+1:]
-    # need at least min_train_years before val, and at least 1 year after val
-    for i in range(min_train_years, total_years - 1):
+    val_year_count = max(1, int(val_years))
+    last_start_exclusive = total_years - val_year_count
+    if not require_future_test_year:
+        last_start_exclusive += 1
+
+    for i in range(int(min_train_years), last_start_exclusive):
         train_year_slice = unique_years[:i]
-        val_year_slice = [unique_years[i]]
-        test_year_slice = unique_years[i + 1:]
+        val_year_slice = unique_years[i : i + val_year_count]
+        test_year_slice = unique_years[i + val_year_count :]
+        if not test_year_slice and not require_future_test_year:
+            test_year_slice = list(val_year_slice)
 
         train_indices = np.flatnonzero(np.isin(years, train_year_slice))
         val_indices = np.flatnonzero(np.isin(years, val_year_slice))

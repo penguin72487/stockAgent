@@ -37,7 +37,7 @@ trading:
   buy_fee_rate: 0.0001
   sell_fee_rate: 0.0001
   max_turnover_ratio: 50.0
-  gross_leverage: 2.5
+  leverage: 2.5
   min_trade_weight: 0.0
   portfolio_activation: identity
   long_only: false
@@ -147,6 +147,7 @@ training:
   save_daily_weights_csv: false
   save_best_val_artifacts: false
   backtest_artifact_compression: none
+  save_best_val_artifacts: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
   learning_rate: 0.000075
@@ -162,7 +163,7 @@ training:
   num_workers: 0
   weight_decay: 0.02
   grad_clip_norm: 1.0
-  finite_check_interval_steps: 0
+  finite_check_interval_steps: 100
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
@@ -423,17 +424,6 @@ training:
     random_state: 42
 
 evaluation:
-  primary_baseline: "2330"
-  metrics:
-    - cumulative_return
-    - annualized_return
-    - cagr
-    - sharpe
-    - sortino
-    - max_drawdown
-    - calmar
-    - turnover
-    - excess_return_vs_universe_average
   gamma_sharpe: 1.0
   gamma_excess: 1.0
   gamma_cvar: 1.0

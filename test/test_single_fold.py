@@ -31,6 +31,10 @@ def main():
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        external_feature_path=(
+            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+        ),
+        external_market_symbol=config.data.tw_public_market_symbol,
     )
     print(f"  Panel shape: {panel.features.shape} (T={panel.num_dates}, S={panel.num_symbols}, F={len(panel.feature_names)})")
     

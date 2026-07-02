@@ -1110,7 +1110,7 @@ def generate_live_signal(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=config.trading.gross_leverage,
+            gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             can_buy_mask=torch.from_numpy(can_buy_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
@@ -1158,7 +1158,7 @@ def generate_live_signal(
         target_risk=target_risk,
         max_turnover_warning=max_turnover_warning,
         max_top_weight_warning=max_top_weight_warning,
-        max_gross_warning=max_gross_warning if max_gross_warning is not None else float(config.trading.gross_leverage) * 1.05,
+        max_gross_warning=max_gross_warning if max_gross_warning is not None else 1.05,
         recent_performance=recent_performance,
     )
     score_drivers = _top_score_drivers(
