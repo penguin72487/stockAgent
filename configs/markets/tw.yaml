@@ -25,6 +25,10 @@ data:
   panel_load_workers: 16
   trading_volume_policy: auto
   tradable_mode: tw_limit_guard
+  use_tw_public_features: false
+  tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
+  tw_public_market_symbol: "__MARKET__"
+  # Use configs/markets/tw_public.yaml for the public-data feature experiment.
   # tradable_mode: tradable
 
 walk_forward:

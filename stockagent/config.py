@@ -124,6 +124,9 @@ class DataConfig:
     trading_volume_policy: str = "auto"
     panel_backend: str = "auto"
     panel_load_workers: int = 4
+    use_tw_public_features: bool = False
+    tw_public_feature_path: str = "data_tw_public/features/tw_public_stock_daily.parquet"
+    tw_public_market_symbol: str = "__MARKET__"
 
 
 @dataclass(slots=True)
@@ -1169,6 +1172,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("security_filter", "none")
     data.setdefault("panel_backend", "auto")
     data.setdefault("panel_load_workers", 4)
+    data.setdefault("use_tw_public_features", False)
+    data.setdefault("tw_public_feature_path", "data_tw_public/features/tw_public_stock_daily.parquet")
+    data.setdefault("tw_public_market_symbol", "__MARKET__")
 
     trading = raw.setdefault("trading", {})
 
@@ -1236,6 +1242,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         )
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data.get("panel_load_workers", 4)))
+    data["use_tw_public_features"] = bool(data.get("use_tw_public_features", False))
+    data["tw_public_feature_path"] = str(data.get("tw_public_feature_path") or "").strip()
+    data["tw_public_market_symbol"] = str(data.get("tw_public_market_symbol") or "__MARKET__").strip() or "__MARKET__"
     plot_backend = str(training.get("plot_backend", "auto")).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:

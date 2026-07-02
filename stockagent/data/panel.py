@@ -95,8 +95,9 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 19
+PANEL_CACHE_VERSION = 20
 FEATURE_FILE_SUFFIX = "_features.parquet"
+DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
 # Treat single-day price moves beyond +/-100% log-return magnitude as unusable
 # labels/features. The full US universe contains stale/delisted Yahoo rows with
@@ -227,8 +228,138 @@ class _SymbolPanelArrays:
     alive_mask: np.ndarray
 
 
+@dataclass(slots=True)
+class _ExternalFeatureArrays:
+    feature_names: list[str]
+    market_dates: np.ndarray
+    market_values: np.ndarray
+    by_symbol: dict[str, tuple[np.ndarray, np.ndarray]]
+
+
 def _symbol_name_from_path(path: Path) -> str:
     return path.name.removesuffix(FEATURE_FILE_SUFFIX)
+
+
+def _normalize_external_feature_path(path: str | Path | None) -> Path | None:
+    if path is None:
+        return None
+    text = str(path).strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _load_external_feature_arrays(
+    path: Path,
+    *,
+    market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+) -> _ExternalFeatureArrays:
+    if pl is None or pq is None:
+        raise RuntimeError("external TW public features require polars and pyarrow")
+    if not path.exists():
+        raise FileNotFoundError(f"external feature parquet not found: {path}")
+
+    frame = pl.from_arrow(pq.read_table(path, memory_map=True))
+    required = {"date", "symbol"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
+
+    feature_names = [
+        column
+        for column in frame.columns
+        if column not in required and not str(column).startswith("_")
+    ]
+    if not feature_names:
+        return _ExternalFeatureArrays(
+            feature_names=[],
+            market_dates=np.empty((0,), dtype="datetime64[ns]"),
+            market_values=np.empty((0, 0), dtype=np.float32),
+            by_symbol={},
+        )
+
+    frame = (
+        frame.with_columns(
+            [
+                _polars_datetime_ns_expr(frame.schema, "date"),
+                pl.col("symbol").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase().alias("symbol"),
+                *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in feature_names],
+            ]
+        )
+        .drop_nulls(["date", "symbol"])
+        .filter(pl.col("symbol") != "")
+        .group_by(["date", "symbol"])
+        .agg([pl.col(name).drop_nulls().last().alias(name) for name in feature_names])
+        .sort(["symbol", "date"])
+    )
+    if frame.is_empty():
+        return _ExternalFeatureArrays(
+            feature_names=feature_names,
+            market_dates=np.empty((0,), dtype="datetime64[ns]"),
+            market_values=np.empty((0, len(feature_names)), dtype=np.float32),
+            by_symbol={},
+        )
+
+    market_key = str(market_symbol).strip().upper()
+    market_frame = frame.filter(pl.col("symbol") == market_key).sort("date")
+    market_dates, market_values = _external_frame_to_arrays(market_frame, feature_names)
+
+    by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    stock_frame = frame.filter(pl.col("symbol") != market_key)
+    if not stock_frame.is_empty():
+        for symbol, symbol_frame in stock_frame.partition_by("symbol", as_dict=True).items():
+            key = symbol[0] if isinstance(symbol, tuple) else symbol
+            dates, values = _external_frame_to_arrays(symbol_frame.sort("date"), feature_names)
+            by_symbol[str(key).upper()] = (dates, values)
+
+    print(
+        f"[panel] external features loaded path={path} "
+        f"features={len(feature_names)} market_rows={market_dates.size} symbols={len(by_symbol)}"
+    )
+    return _ExternalFeatureArrays(
+        feature_names=feature_names,
+        market_dates=market_dates,
+        market_values=market_values,
+        by_symbol=by_symbol,
+    )
+
+
+def _external_frame_to_arrays(frame: Any, feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    if frame is None or frame.is_empty():
+        return (
+            np.empty((0,), dtype="datetime64[ns]"),
+            np.empty((0, len(feature_names)), dtype=np.float32),
+        )
+    dates = frame["date"].to_numpy().astype("datetime64[ns]", copy=False)
+    values = (
+        frame.select([pl.col(name).cast(pl.Float64, strict=False).fill_null(float("nan")) for name in feature_names])
+        .to_numpy()
+        .astype(np.float32, copy=False)
+    )
+    valid_dates = ~np.isnat(dates)
+    if not bool(valid_dates.all()):
+        dates = dates[valid_dates]
+        values = values[valid_dates]
+    return dates, values
+
+
+def _align_external_values(
+    panel_dates: np.ndarray,
+    source_dates: np.ndarray,
+    source_values: np.ndarray,
+) -> np.ndarray:
+    feature_count = int(source_values.shape[1]) if source_values.ndim == 2 else 0
+    out = np.full((int(panel_dates.size), feature_count), np.nan, dtype=np.float32)
+    if panel_dates.size == 0 or source_dates.size == 0 or feature_count == 0:
+        return out
+    row_idx = np.searchsorted(panel_dates, source_dates)
+    in_bounds = (row_idx >= 0) & (row_idx < int(panel_dates.size))
+    valid = np.zeros(source_dates.shape, dtype=bool)
+    if bool(in_bounds.any()):
+        valid[in_bounds] = panel_dates[row_idx[in_bounds]] == source_dates[in_bounds]
+    if bool(valid.any()):
+        out[row_idx[valid]] = source_values[valid]
+    return out
 
 
 def _normalize_security_filter(value: str | None) -> str:
@@ -1041,6 +1172,7 @@ def _load_symbol_arrays_polars_lazy(
 def _build_panel_from_symbol_arrays(
     symbol_arrays: list[_SymbolPanelArrays],
     benchmark_name: str = "universe_average_return",
+    external_features: _ExternalFeatureArrays | None = None,
 ) -> PanelData:
     if not symbol_arrays:
         raise RuntimeError("No valid parquet files could be loaded.")
@@ -1053,7 +1185,11 @@ def _build_panel_from_symbol_arrays(
     all_dates.sort()
     num_dates = int(all_dates.size)
     num_symbols = len(symbol_arrays)
-    num_features = len(LOG_RETURN_FEATURE_COLUMNS)
+    base_feature_names = list(LOG_RETURN_FEATURE_COLUMNS)
+    external_feature_names = list(external_features.feature_names) if external_features is not None else []
+    num_base_features = len(base_feature_names)
+    num_external_features = len(external_feature_names)
+    num_features = num_base_features + num_external_features
 
     features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
@@ -1063,6 +1199,14 @@ def _build_panel_from_symbol_arrays(
     can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
 
+    market_external = None
+    if external_features is not None and num_external_features:
+        market_external = _align_external_values(
+            all_dates,
+            external_features.market_dates,
+            external_features.market_values,
+        )
+
     for sym_idx, item in enumerate(symbol_arrays):
         if item.dates.size == 0:
             continue
@@ -1070,7 +1214,16 @@ def _build_panel_from_symbol_arrays(
         valid = (row_idx >= 0) & (row_idx < num_dates) & (all_dates[row_idx] == item.dates)
         if not bool(valid.all()):
             row_idx = row_idx[valid]
-        features[row_idx, sym_idx, :] = item.features[valid]
+        features[row_idx, sym_idx, :num_base_features] = item.features[valid]
+        if market_external is not None:
+            features[:, sym_idx, num_base_features:] = market_external
+        if external_features is not None and num_external_features:
+            symbol_external = external_features.by_symbol.get(str(item.symbol).upper())
+            if symbol_external is not None:
+                aligned_external = _align_external_values(all_dates, symbol_external[0], symbol_external[1])
+                target = features[:, sym_idx, num_base_features:]
+                value_mask = np.isfinite(aligned_external)
+                target[value_mask] = aligned_external[value_mask]
         returns_1d[row_idx, sym_idx] = item.returns_1d[valid]
         close_prices[row_idx, sym_idx] = item.close_prices[valid]
         tradable_mask[row_idx, sym_idx] = item.tradable_mask[valid]
@@ -1097,7 +1250,7 @@ def _build_panel_from_symbol_arrays(
     return PanelData(
         dates=np.asarray(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
-        feature_names=list(LOG_RETURN_FEATURE_COLUMNS),
+        feature_names=[*base_feature_names, *external_feature_names],
         features=features,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
@@ -1281,8 +1434,11 @@ def build_panel(
     sell_tradable_mode: str | None = None,
     panel_backend: str = "auto",
     panel_load_workers: int = 4,
+    external_feature_path: str | Path | None = None,
+    external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
+    external_feature_path = _normalize_external_feature_path(external_feature_path)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
@@ -1345,12 +1501,19 @@ def build_panel(
     else:
         raise RuntimeError("data.panel_backend='auto' requires pyarrow")
 
+    if external_feature_path is not None and not external_feature_path.exists():
+        raise FileNotFoundError(f"external_feature_path not found: {external_feature_path}")
+
+    external_key = str(external_feature_path) if external_feature_path is not None else "none"
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
-        f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}"
+        f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
+        f"external={external_key}|external_market_symbol={external_market_symbol}"
     )
     source_paths = [*parquet_paths, *security_metadata_paths]
+    if external_feature_path is not None:
+        source_paths.append(external_feature_path)
     source_hash = _compute_source_hash(source_paths)
 
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
@@ -1400,7 +1563,16 @@ def build_panel(
             continue
         if arrays is not None:
             valid_arrays.append(arrays)
-    panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
+    external_features = (
+        _load_external_feature_arrays(external_feature_path, market_symbol=external_market_symbol)
+        if external_feature_path is not None
+        else None
+    )
+    panel = _build_panel_from_symbol_arrays(
+        valid_arrays,
+        benchmark_name=benchmark_name,
+        external_features=external_features,
+    )
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)
