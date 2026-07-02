@@ -19,6 +19,12 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.simulator import (
+    _asset_log_returns_to_simple_torch,
+    _portfolio_simple_returns_to_log_torch,
+    _prepare_scan_inputs,
+    _resolve_exposure_budget,
+)
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -202,6 +208,91 @@ def _collect_raw_scores(
     }
 
 
+def _temperature_scalar(model: torch.nn.Module, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    value = getattr(model, "default_temperature", 1.0)
+    try:
+        value_f = float(value)
+    except Exception:
+        value_f = 1.0
+    return torch.as_tensor(max(0.05, value_f), device=device, dtype=dtype)
+
+
+def _raw_logits_from_aux(
+    *,
+    aux: dict[str, torch.Tensor] | None,
+    model: torch.nn.Module,
+    mask: torch.Tensor,
+) -> torch.Tensor | None:
+    if not isinstance(aux, dict):
+        return None
+    raw = aux.get("centered_score_logits")
+    if raw is None:
+        raw = aux.get("score_logits")
+    if raw is None:
+        return None
+    temp = _temperature_scalar(model, raw.device, raw.dtype)
+    return (raw / temp).masked_fill(~mask.to(device=raw.device, dtype=torch.bool), 0.0)
+
+
+def _collect_trained_and_raw_scores(
+    *,
+    model: torch.nn.Module,
+    split: Any,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    chunk_rows: int,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    model.eval()
+    total_rows = len(split)
+    if total_rows <= 0:
+        raise ValueError("Selected split has no rows after lookback filtering")
+    chunk_rows = max(1, int(chunk_rows))
+
+    trained_chunks: list[torch.Tensor] = []
+    raw_chunks: list[torch.Tensor] = []
+    returns_chunks: list[torch.Tensor] = []
+    tradable_chunks: list[torch.Tensor] = []
+    can_buy_chunks: list[torch.Tensor] = []
+    can_sell_chunks: list[torch.Tensor] = []
+    benchmark_chunks: list[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for start in range(0, total_rows, chunk_rows):
+            end = min(start + chunk_rows, total_rows)
+            batch = split.batch_by_rows(start, end, device=device, non_blocking=non_blocking)
+            with _autocast_context(device, amp_dtype):
+                model_output = _call_model(model, batch["x"], batch["tradable_mask"], return_aux=True)
+                trained_scores, aux = _extract_weights_and_aux(model_output)
+            raw_scores = _raw_logits_from_aux(aux=aux, model=model, mask=batch["tradable_mask"])
+            if raw_scores is None:
+                raise ValueError(
+                    "Model did not return centered_score_logits/score_logits with return_aux=True; "
+                    "cannot build raw-logit postprocess sweep from a single inference pass."
+                )
+            trained_chunks.append(trained_scores.detach().to(device=device, dtype=torch.float32))
+            raw_chunks.append(raw_scores.detach().to(device=device, dtype=torch.float32))
+            returns_chunks.append(batch["future_log_returns"].detach().to(device=device, dtype=torch.float32))
+            tradable_chunks.append(batch["tradable_mask"].detach().to(device=device, dtype=torch.bool))
+            can_buy_chunks.append(batch["can_buy_mask"].detach().to(device=device, dtype=torch.bool))
+            can_sell_chunks.append(batch["can_sell_mask"].detach().to(device=device, dtype=torch.bool))
+            benchmark_chunks.append(batch["benchmark"].detach().to(device=device, dtype=torch.float32))
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    shared = {
+        "future_returns": torch.cat(returns_chunks, dim=0).contiguous(),
+        "tradable_mask": torch.cat(tradable_chunks, dim=0).contiguous(),
+        "can_buy_mask": torch.cat(can_buy_chunks, dim=0).contiguous(),
+        "can_sell_mask": torch.cat(can_sell_chunks, dim=0).contiguous(),
+        "benchmark": torch.cat(benchmark_chunks, dim=0).contiguous(),
+    }
+    trained = {"scores": torch.cat(trained_chunks, dim=0).contiguous(), **shared}
+    raw = {"scores": torch.cat(raw_chunks, dim=0).contiguous(), **shared}
+    return trained, raw
+
+
 def _weight_diagnostics(weights: torch.Tensor) -> dict[str, float]:
     if weights.numel() == 0:
         return {
@@ -252,6 +343,15 @@ def _run_single_backtest(
     )
 
 
+def _effective_turnover_cap(*, max_turnover_ratio: float, gross_leverage: float) -> float:
+    gross_budget = _resolve_exposure_budget(gross_leverage)
+    value = float(max_turnover_ratio)
+    max_possible_turnover = 2.0 * gross_budget
+    if value >= max_possible_turnover:
+        return 0.0
+    return max(0.0, value)
+
+
 def _run_row_backtest(
     *,
     row: dict[str, Any],
@@ -270,6 +370,193 @@ def _run_row_backtest(
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
     )
+
+
+def _auto_sweep_batch_size(
+    *,
+    buffers: dict[str, torch.Tensor],
+    requested: int | None,
+    candidate_count: int,
+) -> int:
+    if candidate_count <= 0:
+        return 1
+    if requested is not None and int(requested) > 0:
+        return max(1, min(int(requested), candidate_count))
+    scores = buffers["scores"]
+    t_len = max(1, int(scores.size(0)))
+    n_symbols = max(1, int(scores.size(1)))
+    bytes_per_candidate = t_len * n_symbols * max(4, int(scores.element_size()))
+    if scores.device.type != "cuda" or not torch.cuda.is_available():
+        return max(1, min(candidate_count, os.cpu_count() or 4))
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(scores.device)
+        budget_bytes = int(float(free_bytes) * 0.35)
+        auto_size = max(1, budget_bytes // max(1, bytes_per_candidate))
+        return max(1, min(candidate_count, int(auto_size)))
+    except Exception:
+        return max(1, min(candidate_count, 8))
+
+
+def _batched_backtest_candidates(
+    *,
+    buffers: dict[str, torch.Tensor],
+    config: Any,
+    candidates: list[dict[str, Any]],
+    scan_chunk_size: int | None,
+) -> tuple[list[dict[str, Any]], float]:
+    if not candidates:
+        return [], 0.0
+
+    scores = buffers["scores"]
+    future_returns = buffers["future_returns"]
+    tradable_mask = buffers["tradable_mask"]
+    can_buy_mask = buffers["can_buy_mask"]
+    can_sell_mask = buffers["can_sell_mask"]
+    benchmark = buffers["benchmark"]
+    device = scores.device
+    dtype = scores.dtype
+    long_only = bool(config.trading.long_only)
+    gross_leverage = 1.0
+    gross_budget = _resolve_exposure_budget(gross_leverage)
+    max_turnover_ratio = _effective_turnover_cap(
+        max_turnover_ratio=float(config.trading.max_turnover_ratio),
+        gross_leverage=gross_leverage,
+    )
+    chunk_size = max(1, int(scan_chunk_size or 256))
+
+    started = time.perf_counter()
+    prepared_weights: list[torch.Tensor] = []
+    prepped_tradable: torch.Tensor | None = None
+    prepped_buy: torch.Tensor | None = None
+    prepped_sell: torch.Tensor | None = None
+
+    with torch.inference_mode():
+        for row in candidates:
+            weights, tradable, buy_mask, sell_mask = _prepare_scan_inputs(
+                scores,
+                tradable_mask,
+                can_buy_mask,
+                can_sell_mask,
+                long_only,
+                gross_leverage,
+                float(row["min_trade_weight"]),
+                str(row["activation"]),
+            )
+            prepared_weights.append(weights)
+            prepped_tradable = tradable
+            prepped_buy = buy_mask
+            prepped_sell = sell_mask
+
+        if prepped_tradable is None or prepped_buy is None or prepped_sell is None:
+            return [], 0.0
+
+        target_weights = torch.stack(prepared_weights, dim=0).contiguous()
+        candidate_count, t_len, n_symbols = target_weights.shape
+        returns_t = _asset_log_returns_to_simple_torch(
+            future_returns,
+            device=device,
+            dtype=dtype,
+        )
+        strategy_returns = torch.empty((candidate_count, t_len), device=device, dtype=dtype)
+        turnovers = torch.empty((candidate_count, t_len), device=device, dtype=dtype)
+        prev = torch.zeros((candidate_count, n_symbols), device=device, dtype=dtype)
+        cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
+        gross_cap = torch.as_tensor(gross_budget, device=device, dtype=dtype)
+        one = torch.ones((), device=device, dtype=dtype)
+
+        diag_positions = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
+        diag_gross = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
+        diag_long_gross = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
+        diag_short_gross = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
+        diag_max_abs = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
+
+        for start in range(0, t_len, chunk_size):
+            end = min(start + chunk_size, t_len)
+            target_chunk = target_weights[:, start:end, :]
+            tradable_chunk = prepped_tradable[start:end]
+            buy_chunk = prepped_buy[start:end]
+            sell_chunk = prepped_sell[start:end]
+
+            for offset in range(end - start):
+                idx = start + offset
+                target_t = torch.where(tradable_chunk[offset].unsqueeze(0), target_chunk[:, offset, :], prev)
+                delta = target_t - prev
+                buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype).unsqueeze(0)
+                sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype).unsqueeze(0)
+                if long_only:
+                    base_after_sells = prev + sell_delta
+                    buy_sum = buy_delta.sum(dim=1, keepdim=True)
+                    buy_capacity = (one - base_after_sells.sum(dim=1, keepdim=True)).clamp_min(0.0)
+                    buy_scale = torch.minimum(torch.ones_like(buy_sum), buy_capacity / buy_sum.clamp_min(1e-12))
+                    delta = sell_delta + buy_delta * buy_scale
+                else:
+                    delta = sell_delta + buy_delta
+
+                next_weights = prev + delta
+                if max_turnover_ratio > 0.0:
+                    turnover_raw = delta.abs().sum(dim=1, keepdim=True)
+                    turnover_scale = torch.minimum(
+                        torch.ones_like(turnover_raw),
+                        cap / turnover_raw.clamp_min(1e-12),
+                    )
+                    next_weights = prev + delta * turnover_scale
+                    delta = next_weights - prev
+
+                if not long_only:
+                    gross_next = next_weights.abs().sum(dim=1, keepdim=True)
+                    gross_scale = torch.minimum(
+                        torch.ones_like(gross_next),
+                        gross_cap / gross_next.clamp_min(1e-12),
+                    )
+                    next_weights = next_weights * gross_scale
+                    delta = next_weights - prev
+
+                buy_turnover = delta.clamp_min(0.0).sum(dim=1)
+                sell_turnover = (-delta).clamp_min(0.0).sum(dim=1)
+                turnover = buy_turnover + sell_turnover
+                gross_return = (next_weights * returns_t[idx].unsqueeze(0)).sum(dim=1)
+                net_simple_return = (
+                    gross_return
+                    - float(config.trading.buy_fee_rate) * buy_turnover
+                    - float(config.trading.sell_fee_rate) * sell_turnover
+                )
+                strategy_returns[:, idx] = _portfolio_simple_returns_to_log_torch(net_simple_return)
+                turnovers[:, idx] = turnover
+
+                abs_weights = next_weights.abs().to(torch.float64)
+                diag_positions += (abs_weights > 0.0).sum(dim=1).to(torch.float64)
+                diag_gross += abs_weights.sum(dim=1)
+                diag_long_gross += next_weights.clamp_min(0.0).to(torch.float64).sum(dim=1)
+                diag_short_gross += (-next_weights.clamp_max(0.0)).to(torch.float64).sum(dim=1)
+                diag_max_abs += abs_weights.max(dim=1).values
+                prev = next_weights
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed_s = time.perf_counter() - started
+
+    denom = float(max(1, int(t_len)))
+    rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(candidates):
+        metrics = _compute_metrics_from_tensors(strategy_returns[idx], benchmark, turnovers[idx])
+        diagnostics = {
+            "avg_positions": float((diag_positions[idx] / denom).detach().cpu().item()),
+            "avg_gross": float((diag_gross[idx] / denom).detach().cpu().item()),
+            "avg_long_gross": float((diag_long_gross[idx] / denom).detach().cpu().item()),
+            "avg_short_gross": float((diag_short_gross[idx] / denom).detach().cpu().item()),
+            "avg_max_abs_weight": float((diag_max_abs[idx] / denom).detach().cpu().item()),
+        }
+        rows.append(
+            {
+                **row,
+                "elapsed_s": float(elapsed_s / max(1, len(candidates))),
+                "batch_elapsed_s": float(elapsed_s),
+                "sweep_batch_size": int(len(candidates)),
+                **metrics,
+                **diagnostics,
+            }
+        )
+    return rows, elapsed_s
 
 
 def _to_numpy_1d(values: torch.Tensor) -> np.ndarray:
@@ -518,14 +805,10 @@ def _run_sweep(
     thresholds: list[float],
     config: Any,
     scan_chunk_size: int | None,
+    sweep_batch_size: int | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    scores = buffers["scores"]
-    future_returns = buffers["future_returns"]
-    tradable_mask = buffers["tradable_mask"]
-    can_buy_mask = buffers["can_buy_mask"]
-    can_sell_mask = buffers["can_sell_mask"]
-    benchmark = buffers["benchmark"]
+    candidates: list[dict[str, Any]] = []
 
     for activation in activations:
         if mode == "trained_output":
@@ -533,52 +816,46 @@ def _run_sweep(
         else:
             candidate = f"raw:{activation}"
         for threshold in thresholds:
-            started = time.perf_counter()
-            bt = run_backtest_torch(
-                scores,
-                future_returns,
-                tradable_mask,
-                benchmark,
-                buy_fee_rate=config.trading.buy_fee_rate,
-                sell_fee_rate=config.trading.sell_fee_rate,
-                long_only=config.trading.long_only,
-                max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=1.0,
-                min_trade_weight=float(threshold),
-                portfolio_activation=activation,
-                can_buy_mask=can_buy_mask,
-                can_sell_mask=can_sell_mask,
-                scan_chunk_size=scan_chunk_size,
-                return_weights_history=True,
+            candidates.append(
+                {
+                    "mode": mode,
+                    "model_output_mode": model_output_mode,
+                    "candidate": candidate,
+                    "activation": activation,
+                    "min_trade_weight": float(threshold),
+                }
             )
-            if scores.device.type == "cuda":
-                torch.cuda.synchronize(scores.device)
-            elapsed_s = time.perf_counter() - started
-            metrics = _compute_metrics_from_tensors(bt.strategy_returns, bt.benchmark_returns, bt.turnovers)
-            diagnostics = _weight_diagnostics(bt.weights_history)
-            row: dict[str, Any] = {
-                "mode": mode,
-                "model_output_mode": model_output_mode,
-                "candidate": candidate,
-                "activation": activation,
-                "min_trade_weight": float(threshold),
-                "elapsed_s": float(elapsed_s),
-                **metrics,
-                **diagnostics,
-            }
-            rows.append(row)
+    batch_size = _auto_sweep_batch_size(
+        buffers=buffers,
+        requested=sweep_batch_size,
+        candidate_count=len(candidates),
+    )
+    print(
+        f"sweep_start mode={mode} candidates={len(candidates)} sweep_batch_size={batch_size}",
+        flush=True,
+    )
+    for batch_start in range(0, len(candidates), batch_size):
+        batch = candidates[batch_start : batch_start + batch_size]
+        batch_rows, elapsed_s = _batched_backtest_candidates(
+            buffers=buffers,
+            config=config,
+            candidates=batch,
+            scan_chunk_size=scan_chunk_size,
+        )
+        rows.extend(batch_rows)
+        best_batch = _best_by_metric(batch_rows, "sharpe")
+        if best_batch is not None:
             print(
                 " ".join(
                     [
-                        f"mode={mode}",
-                        f"candidate={candidate}",
-                        f"activation={activation}",
-                        f"threshold={threshold:g}",
-                        f"sharpe={row['sharpe']:+.4f}",
-                        f"cum={row['cumulative_return']:+.4f}",
-                        f"mdd={row['max_drawdown']:+.4f}",
-                        f"turnover={row['turnover']:.4f}",
-                        f"positions={row['avg_positions']:.1f}",
+                        f"sweep_batch mode={mode}",
+                        f"done={min(batch_start + len(batch), len(candidates))}/{len(candidates)}",
+                        f"batch={len(batch)}",
+                        f"elapsed={elapsed_s:.3f}s",
+                        f"best_candidate={best_batch.get('candidate', best_batch['activation'])}",
+                        f"best_threshold={float(best_batch['min_trade_weight']):g}",
+                        f"best_sharpe={float(best_batch['sharpe']):+.4f}",
+                        f"best_cum={float(best_batch['cumulative_return']):+.4f}",
                     ]
                 ),
                 flush=True,
@@ -744,6 +1021,15 @@ def main() -> None:
         help="Comma-separated metrics to plot. Default plots only --rank-metric.",
     )
     parser.add_argument("--backtest-compile", action="store_true")
+    parser.add_argument(
+        "--sweep-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Number of activation/threshold candidates to scan together. "
+            "Use 0 for GPU-memory-aware auto sizing."
+        ),
+    )
     parser.add_argument("--plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--plot-top-n", type=int, default=20)
     parser.add_argument(
@@ -869,6 +1155,7 @@ def main() -> None:
                 "trained_output_mode": original_output_mode,
                 "trained_activation": trained_activation,
                 "plot_metrics": plot_metrics,
+                "sweep_batch_size": int(args.sweep_batch_size),
             },
             sort_keys=True,
         ),
@@ -876,7 +1163,7 @@ def main() -> None:
     )
 
     started = time.perf_counter()
-    trained_buffers = _collect_raw_scores(
+    trained_buffers, raw_buffers = _collect_trained_and_raw_scores(
         model=model,
         split=split,
         device=device,
@@ -884,23 +1171,11 @@ def main() -> None:
         non_blocking=non_blocking,
         chunk_rows=chunk_rows,
     )
-    trained_inference_elapsed_s = time.perf_counter() - started
-    print(f"trained_output_inference_s={trained_inference_elapsed_s:.3f}", flush=True)
-
-    if not hasattr(model, "portfolio_output_mode"):
-        raise ValueError(f"Model does not expose portfolio_output_mode: {type(model).__name__}")
-    model.portfolio_output_mode = "logits"  # type: ignore[attr-defined]
-    started = time.perf_counter()
-    raw_buffers = _collect_raw_scores(
-        model=model,
-        split=split,
-        device=device,
-        amp_dtype=amp_dtype,
-        non_blocking=non_blocking,
-        chunk_rows=chunk_rows,
-    )
-    raw_inference_elapsed_s = time.perf_counter() - started
-    print(f"raw_score_inference_s={raw_inference_elapsed_s:.3f}", flush=True)
+    single_pass_inference_elapsed_s = time.perf_counter() - started
+    trained_inference_elapsed_s = single_pass_inference_elapsed_s
+    raw_inference_elapsed_s = 0.0
+    print(f"single_pass_inference_s={single_pass_inference_elapsed_s:.3f}", flush=True)
+    print("raw_score_inference_s=0.000 source=aux.centered_score_logits", flush=True)
 
     buffers_by_mode = {
         "trained_output": trained_buffers,
@@ -914,6 +1189,7 @@ def main() -> None:
         thresholds=thresholds,
         config=config,
         scan_chunk_size=scan_chunk_size,
+        sweep_batch_size=int(args.sweep_batch_size),
     )
     raw_rows = _run_sweep(
         buffers=raw_buffers,
@@ -923,6 +1199,7 @@ def main() -> None:
         thresholds=thresholds,
         config=config,
         scan_chunk_size=scan_chunk_size,
+        sweep_batch_size=int(args.sweep_batch_size),
     )
     rows = trained_rows + raw_rows
     best_by = {
@@ -963,9 +1240,11 @@ def main() -> None:
         "thresholds": thresholds,
         "trained_output_mode": original_output_mode,
         "trained_activation": trained_activation,
+        "sweep_batch_size": int(args.sweep_batch_size),
         "rank_metric": rank_metric,
         "plot_metrics": plot_metrics,
         "inference_elapsed_s": float(trained_inference_elapsed_s + raw_inference_elapsed_s),
+        "single_pass_inference_elapsed_s": float(single_pass_inference_elapsed_s),
         "trained_output_inference_elapsed_s": float(trained_inference_elapsed_s),
         "raw_logits_inference_elapsed_s": float(raw_inference_elapsed_s),
         "best_by_rank_metric": best_rank,

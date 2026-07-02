@@ -20,7 +20,7 @@ Multi-asset Taiwan stock trading research workspace.
 
 - Install dependencies from `requirements.txt` inside the `fintech` environment.
 - Run Taiwan training with `python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
-- Run the independent Taiwan public-data experiment with `python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public`.
+- Run the independent Taiwan public-data experiment with `python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_all`.
 - `configs/markets/tw_public.yaml` enables `data.use_tw_public_features` and appends `data_tw_public/features/tw_public_stock_daily.parquet` as extra `twpub_*` features.
 - Or use the project runner: `./coda_runner.sh`.
 - Runner defaults are centralized in `configs/runner.env`.
@@ -75,6 +75,7 @@ Multi-asset Taiwan stock trading research workspace.
 - For a smoke run, use `--start-date 2024-06-03 --end-date 2024-06-03 --datasets twse_daily_ohlcv tpex_daily_ohlcv --skip-raw`.
 - Build the training feature parquet with `python scripts/build_tw_public_training_features.py --input-dir data_tw_public --output-path data_tw_public/features/tw_public_stock_daily.parquet --symbols-root data_yahoo/tw_stocks`.
 - The feature parquet is a sparse `date` x `symbol` long table. Stock-specific rows align by ticker/date; macro/TAIFEX market rows use symbol `__MARKET__` and are broadcast to all stocks during panel build.
+- Its `date` is the conservative availability date: daily market tables use trading date, TDCC uses data date plus a safety lag, monthly/quarterly macro uses period end plus lag when no explicit release date exists, and event tables use announcement/report date or downloader as-of date.
 - `downloader/run_daily_all_markets.sh` and `downloader/daily_downloader_daemon.sh` run this step daily by default, then rebuild `data_tw_public/features/tw_public_stock_daily.parquet`. Set `RUN_TW_PUBLIC_DATA=0` to skip raw public data, `RUN_TW_PUBLIC_FEATURES=0` to skip feature rebuild, narrow scope with `TW_PUBLIC_DATASETS="twse tpex macro"`, or set `TW_PUBLIC_SKIP_RAW=1` when raw response archives are not needed.
 
 ### Repair Mode

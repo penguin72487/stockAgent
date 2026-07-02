@@ -6156,22 +6156,32 @@ def _run_postprocess_benchmark_after_fold(
     env.setdefault("PYTHONUNBUFFERED", "1")
     started = time.perf_counter()
     print(f"[Fold {fold_id}] running postprocess benchmark for best checkpoint: {output_dir}")
-    proc = subprocess.run(
-        cmd,
-        cwd=Path(__file__).resolve().parents[2],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    output_lines: list[str] = []
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            output_lines.append(line)
+            log_handle.write(line)
+            log_handle.flush()
+            print(line, end="", flush=True)
+        return_code = proc.wait()
     elapsed_s = time.perf_counter() - started
-    combined_output = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
-    log_path.write_text(combined_output, encoding="utf-8")
+    combined_output = "".join(output_lines)
 
-    if proc.returncode != 0:
+    if return_code != 0:
         tail = "\n".join(combined_output.strip().splitlines()[-40:])
         message = (
             f"[Fold {fold_id}] postprocess benchmark failed in {elapsed_s:.1f}s "
-            f"(exit={proc.returncode}); log={log_path}\n{tail}"
+            f"(exit={return_code}); log={log_path}\n{tail}"
         )
         if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
             raise RuntimeError(message)
