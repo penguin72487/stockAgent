@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import fnmatch
 from pathlib import Path
 import csv
 import hashlib
@@ -95,7 +96,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 20
+PANEL_CACHE_VERSION = 22
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -205,6 +206,8 @@ class PanelData:
     close_prices: np.ndarray
     can_buy_mask: np.ndarray | None = None
     can_sell_mask: np.ndarray | None = None
+    can_short_open_mask: np.ndarray | None = None
+    force_short_cover_mask: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -234,6 +237,9 @@ class _ExternalFeatureArrays:
     market_dates: np.ndarray
     market_values: np.ndarray
     by_symbol: dict[str, tuple[np.ndarray, np.ndarray]]
+    rule_names: list[str]
+    market_rule_values: np.ndarray
+    by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]]
 
 
 def _symbol_name_from_path(path: Path) -> str:
@@ -265,31 +271,38 @@ def _load_external_feature_arrays(
     if missing:
         raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
 
-    feature_names = [
+    candidate_columns = [
         column
         for column in frame.columns
-        if column not in required and not str(column).startswith("_")
+        if column not in required
     ]
+    feature_names = [column for column in candidate_columns if not str(column).startswith("_")]
+    rule_names = [column for column in candidate_columns if str(column).startswith("_twpub_")]
+    value_columns = [*feature_names, *rule_names]
     if not feature_names:
-        return _ExternalFeatureArrays(
-            feature_names=[],
-            market_dates=np.empty((0,), dtype="datetime64[ns]"),
-            market_values=np.empty((0, 0), dtype=np.float32),
-            by_symbol={},
-        )
+        if not rule_names:
+            return _ExternalFeatureArrays(
+                feature_names=[],
+                market_dates=np.empty((0,), dtype="datetime64[ns]"),
+                market_values=np.empty((0, 0), dtype=np.float32),
+                by_symbol={},
+                rule_names=[],
+                market_rule_values=np.empty((0, 0), dtype=np.float32),
+                by_symbol_rules={},
+            )
 
     frame = (
         frame.with_columns(
             [
                 _polars_datetime_ns_expr(frame.schema, "date"),
                 pl.col("symbol").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase().alias("symbol"),
-                *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in feature_names],
+                *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in value_columns],
             ]
         )
         .drop_nulls(["date", "symbol"])
         .filter(pl.col("symbol") != "")
         .group_by(["date", "symbol"])
-        .agg([pl.col(name).drop_nulls().last().alias(name) for name in feature_names])
+        .agg([pl.col(name).drop_nulls().last().alias(name) for name in value_columns])
         .sort(["symbol", "date"])
     )
     if frame.is_empty():
@@ -298,29 +311,39 @@ def _load_external_feature_arrays(
             market_dates=np.empty((0,), dtype="datetime64[ns]"),
             market_values=np.empty((0, len(feature_names)), dtype=np.float32),
             by_symbol={},
+            rule_names=rule_names,
+            market_rule_values=np.empty((0, len(rule_names)), dtype=np.float32),
+            by_symbol_rules={},
         )
 
     market_key = str(market_symbol).strip().upper()
     market_frame = frame.filter(pl.col("symbol") == market_key).sort("date")
     market_dates, market_values = _external_frame_to_arrays(market_frame, feature_names)
+    _, market_rule_values = _external_frame_to_arrays(market_frame, rule_names)
 
     by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     stock_frame = frame.filter(pl.col("symbol") != market_key)
     if not stock_frame.is_empty():
         for symbol, symbol_frame in stock_frame.partition_by("symbol", as_dict=True).items():
             key = symbol[0] if isinstance(symbol, tuple) else symbol
             dates, values = _external_frame_to_arrays(symbol_frame.sort("date"), feature_names)
             by_symbol[str(key).upper()] = (dates, values)
+            rule_dates, rule_values = _external_frame_to_arrays(symbol_frame.sort("date"), rule_names)
+            by_symbol_rules[str(key).upper()] = (rule_dates, rule_values)
 
     print(
         f"[panel] external features loaded path={path} "
-        f"features={len(feature_names)} market_rows={market_dates.size} symbols={len(by_symbol)}"
+        f"features={len(feature_names)} rules={len(rule_names)} market_rows={market_dates.size} symbols={len(by_symbol)}"
     )
     return _ExternalFeatureArrays(
         feature_names=feature_names,
         market_dates=market_dates,
         market_values=market_values,
         by_symbol=by_symbol,
+        rule_names=rule_names,
+        market_rule_values=market_rule_values,
+        by_symbol_rules=by_symbol_rules,
     )
 
 
@@ -1256,9 +1279,77 @@ def _build_panel_from_symbol_arrays(
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
+        can_short_open_mask=can_sell_mask.copy(),
+        force_short_cover_mask=np.zeros_like(tradable_mask, dtype=bool),
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
+    )
+
+
+def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFeatureArrays | None) -> PanelData:
+    if external_features is None or not external_features.rule_names:
+        return panel
+
+    rule_to_idx = {name: idx for idx, name in enumerate(external_features.rule_names)}
+    up_idx = rule_to_idx.get("_twpub_tpex_next_limit_up_ret")
+    down_idx = rule_to_idx.get("_twpub_tpex_next_limit_down_ret")
+    if up_idx is None and down_idx is None:
+        return panel
+
+    can_buy = np.asarray(panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask, dtype=bool).copy()
+    can_sell = np.asarray(panel.can_sell_mask if panel.can_sell_mask is not None else panel.tradable_mask, dtype=bool).copy()
+    close_prices = np.asarray(panel.close_prices, dtype=np.float64)
+    changed_buy = 0
+    changed_sell = 0
+
+    for sym_idx, symbol in enumerate(panel.symbols):
+        rule_payload = external_features.by_symbol_rules.get(str(symbol).upper())
+        if rule_payload is None:
+            continue
+        rule_dates, rule_values = rule_payload
+        if rule_values.size == 0:
+            continue
+        aligned_rules = _align_external_values(panel.dates, rule_dates, rule_values)
+        close_ret = _safe_log_ratio_array(close_prices[:, sym_idx], _shift_array(close_prices[:, sym_idx], 1))
+
+        if up_idx is not None:
+            next_limit_up_ret = _shift_array(aligned_rules[:, up_idx], 1)
+            is_limit_up = np.isfinite(next_limit_up_ret) & np.isfinite(close_ret) & (close_ret >= (next_limit_up_ret - 1e-6))
+            before = can_buy[:, sym_idx].copy()
+            can_buy[:, sym_idx] &= ~is_limit_up
+            changed_buy += int(np.count_nonzero(before & ~can_buy[:, sym_idx]))
+
+        if down_idx is not None:
+            next_limit_down_ret = _shift_array(aligned_rules[:, down_idx], 1)
+            is_limit_down = np.isfinite(next_limit_down_ret) & np.isfinite(close_ret) & (close_ret <= (next_limit_down_ret + 1e-6))
+            before = can_sell[:, sym_idx].copy()
+            can_sell[:, sym_idx] &= ~is_limit_down
+            changed_sell += int(np.count_nonzero(before & ~can_sell[:, sym_idx]))
+
+    if changed_buy or changed_sell:
+        print(
+            "[panel] external TW public limit rules updated masks "
+            f"(blocked_buy={changed_buy}, blocked_sell={changed_sell})"
+        )
+    return PanelData(
+        dates=panel.dates,
+        symbols=panel.symbols,
+        feature_names=panel.feature_names,
+        features=panel.features,
+        returns_1d=panel.returns_1d,
+        tradable_mask=panel.tradable_mask,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        can_short_open_mask=np.asarray(
+            panel.can_short_open_mask if panel.can_short_open_mask is not None else can_sell,
+            dtype=bool,
+        )
+        & can_sell,
+        force_short_cover_mask=panel.force_short_cover_mask,
+        alive_mask=panel.alive_mask,
+        benchmark_returns=panel.benchmark_returns,
+        close_prices=panel.close_prices,
     )
 
 
@@ -1326,6 +1417,12 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
     tradable_mask = cached["tradable_mask"]
     can_buy_mask = cached["can_buy_mask"] if "can_buy_mask" in cached_keys else tradable_mask
     can_sell_mask = cached["can_sell_mask"] if "can_sell_mask" in cached_keys else tradable_mask
+    can_short_open_mask = cached["can_short_open_mask"] if "can_short_open_mask" in cached_keys else can_sell_mask
+    force_short_cover_mask = (
+        cached["force_short_cover_mask"]
+        if "force_short_cover_mask" in cached_keys
+        else np.zeros_like(tradable_mask, dtype=bool)
+    )
     return PanelData(
         dates=cached["dates"],
         symbols=cached["symbols"].tolist(),
@@ -1335,6 +1432,8 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
+        can_short_open_mask=can_short_open_mask,
+        force_short_cover_mask=force_short_cover_mask,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
         close_prices=cached["close_prices"],
@@ -1345,6 +1444,8 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
     tradable_mask = payload["tradable_mask"]
     can_buy_mask = payload.get("can_buy_mask", tradable_mask)
     can_sell_mask = payload.get("can_sell_mask", tradable_mask)
+    can_short_open_mask = payload.get("can_short_open_mask", can_sell_mask)
+    force_short_cover_mask = payload.get("force_short_cover_mask", np.zeros_like(tradable_mask, dtype=bool))
     return PanelData(
         dates=payload["dates"],
         symbols=list(payload["symbols"]),
@@ -1354,6 +1455,8 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
+        can_short_open_mask=can_short_open_mask,
+        force_short_cover_mask=force_short_cover_mask,
         alive_mask=payload["alive_mask"],
         benchmark_returns=payload["benchmark_returns"],
         close_prices=payload["close_prices"],
@@ -1363,6 +1466,107 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
 def _print_feature_overview(panel: PanelData) -> None:
     feature_list = ", ".join(panel.feature_names)
     print(f"[panel] features ({len(panel.feature_names)}): {feature_list}")
+
+
+def _normalize_feature_patterns(patterns: Any, *, label: str) -> tuple[str, ...]:
+    if patterns is None:
+        return ()
+    if isinstance(patterns, str):
+        raw_items = patterns.split(",")
+    else:
+        try:
+            raw_items = list(patterns)
+        except TypeError as exc:
+            raise ValueError(f"{label} must be a list or comma-separated string") from exc
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.startswith("#") or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+    return tuple(cleaned)
+
+
+def _feature_pattern_indices(feature_names: list[str], patterns: tuple[str, ...], *, label: str) -> list[int]:
+    name_to_index = {name: idx for idx, name in enumerate(feature_names)}
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    unmatched: list[str] = []
+    for pattern in patterns:
+        if any(char in pattern for char in "*?[]"):
+            matches = [
+                idx
+                for idx, name in enumerate(feature_names)
+                if fnmatch.fnmatchcase(name, pattern)
+            ]
+        else:
+            idx = name_to_index.get(pattern)
+            matches = [] if idx is None else [idx]
+        if not matches:
+            unmatched.append(pattern)
+            continue
+        for idx in matches:
+            if idx not in selected_set:
+                selected.append(idx)
+                selected_set.add(idx)
+
+    if unmatched:
+        sample = ", ".join(feature_names[:40])
+        suffix = "..." if len(feature_names) > 40 else ""
+        raise ValueError(
+            f"{label} did not match panel features: {unmatched}. "
+            f"Available sample: {sample}{suffix}"
+        )
+    return selected
+
+
+def _filter_panel_features(
+    panel: PanelData,
+    *,
+    feature_include: tuple[str, ...] = (),
+    feature_exclude: tuple[str, ...] = (),
+) -> PanelData:
+    if not feature_include and not feature_exclude:
+        return panel
+
+    if feature_include:
+        selected = _feature_pattern_indices(panel.feature_names, feature_include, label="feature_include")
+    else:
+        selected = list(range(len(panel.feature_names)))
+
+    if feature_exclude:
+        excluded = set(_feature_pattern_indices(panel.feature_names, feature_exclude, label="feature_exclude"))
+        selected = [idx for idx in selected if idx not in excluded]
+
+    if not selected:
+        raise ValueError("feature_include/feature_exclude removed all panel features")
+
+    if selected == list(range(len(panel.feature_names))):
+        return panel
+
+    filtered_names = [panel.feature_names[idx] for idx in selected]
+    print(
+        f"[panel] feature filter kept {len(filtered_names)}/{len(panel.feature_names)} "
+        f"(include={list(feature_include) or ['*']}, exclude={list(feature_exclude) or []})"
+    )
+    return PanelData(
+        dates=panel.dates,
+        symbols=panel.symbols,
+        feature_names=filtered_names,
+        features=np.ascontiguousarray(panel.features[:, :, selected]),
+        returns_1d=panel.returns_1d,
+        tradable_mask=panel.tradable_mask,
+        can_buy_mask=panel.can_buy_mask,
+        can_sell_mask=panel.can_sell_mask,
+        can_short_open_mask=panel.can_short_open_mask,
+        force_short_cover_mask=panel.force_short_cover_mask,
+        alive_mask=panel.alive_mask,
+        benchmark_returns=panel.benchmark_returns,
+        close_prices=panel.close_prices,
+    )
 
 
 def _check_cache_valid(cache_path: Path, meta_path: Path, parquet_paths: list[Path], backend_key: str) -> bool:
@@ -1436,9 +1640,13 @@ def build_panel(
     panel_load_workers: int = 4,
     external_feature_path: str | Path | None = None,
     external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    feature_include: Any = None,
+    feature_exclude: Any = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     external_feature_path = _normalize_external_feature_path(external_feature_path)
+    feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
+    feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
@@ -1509,7 +1717,9 @@ def build_panel(
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
-        f"external={external_key}|external_market_symbol={external_market_symbol}"
+        f"external={external_key}|external_market_symbol={external_market_symbol}|"
+        f"feature_include={list(feature_include_patterns)!r}|"
+        f"feature_exclude={list(feature_exclude_patterns)!r}"
     )
     source_paths = [*parquet_paths, *security_metadata_paths]
     if external_feature_path is not None:
@@ -1572,6 +1782,12 @@ def build_panel(
         valid_arrays,
         benchmark_name=benchmark_name,
         external_features=external_features,
+    )
+    panel = _apply_external_rule_masks(panel, external_features)
+    panel = _filter_panel_features(
+        panel,
+        feature_include=feature_include_patterns,
+        feature_exclude=feature_exclude_patterns,
     )
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")

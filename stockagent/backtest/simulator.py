@@ -740,6 +740,8 @@ def _scan_runner_factory(
         can_buy_mask: torch.Tensor | None,
         can_sell_mask: torch.Tensor | None,
         prev_init: torch.Tensor,
+        can_short_open_mask: torch.Tensor | None = None,
+        force_short_cover_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if long_only:
             return _vectorized_backtest_torch_scan_long_only(
@@ -759,6 +761,8 @@ def _scan_runner_factory(
             tradable_mask,
             can_buy_mask,
             can_sell_mask,
+            can_short_open_mask=can_short_open_mask,
+            force_short_cover_mask=force_short_cover_mask,
             prev_init=prev_init,
             max_turnover_ratio=max_turnover_ratio,
             gross_budget=gross_budget,
@@ -808,6 +812,8 @@ def _reduced_scan_runner_factory(
         can_sell_mask: torch.Tensor | None,
         sample_mask: torch.Tensor | None,
         prev_init: torch.Tensor,
+        can_short_open_mask: torch.Tensor | None = None,
+        force_short_cover_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return _vectorized_backtest_torch_scan_log_utility_reduced(
             weights,
@@ -815,6 +821,8 @@ def _reduced_scan_runner_factory(
             tradable_mask,
             can_buy_mask,
             can_sell_mask,
+            can_short_open_mask,
+            force_short_cover_mask,
             sample_mask,
             prev_init,
             buy_fee_rate=buy_fee_rate,
@@ -1168,6 +1176,8 @@ class BacktestStaticInputs:
     gross_leverage: float
     min_trade_weight: float = 0.0
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
+    can_short_open_mask: torch.Tensor | None = None
+    force_short_cover_mask: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -1205,6 +1215,8 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
             portfolio_activation=static.portfolio_activation,
             can_buy_mask=static.can_buy_mask,
             can_sell_mask=static.can_sell_mask,
+            can_short_open_mask=static.can_short_open_mask,
+            force_short_cover_mask=static.force_short_cover_mask,
             return_weights_history=return_weights_history,
             dense_mask_constraints=dense_mask_constraints,
             initial_weights=initial_weights,
@@ -1233,6 +1245,8 @@ class DifferentiableBacktestExecutor(torch.nn.Module):
             portfolio_activation=static.portfolio_activation,
             can_buy_mask=static.can_buy_mask,
             can_sell_mask=static.can_sell_mask,
+            can_short_open_mask=static.can_short_open_mask,
+            force_short_cover_mask=static.force_short_cover_mask,
             sample_mask=static.sample_mask,
             initial_weights=initial_weights,
             reduction="log_utility",
@@ -1264,6 +1278,8 @@ def _vectorized_backtest(
     tradable_mask: np.ndarray,
     can_buy_mask: np.ndarray | None,
     can_sell_mask: np.ndarray | None,
+    can_short_open_mask: np.ndarray | None,
+    force_short_cover_mask: np.ndarray | None,
     buy_fee_rate: float,
     sell_fee_rate: float,
     long_only: bool = True,
@@ -1278,6 +1294,16 @@ def _vectorized_backtest(
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="numpy backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask.astype(bool)
     sell_mask = tradable if can_sell_mask is None else can_sell_mask.astype(bool)
+    short_open_mask = (
+        sell_mask
+        if can_short_open_mask is None
+        else can_short_open_mask.astype(bool) & sell_mask & tradable
+    )
+    force_cover_mask = (
+        np.zeros_like(tradable, dtype=bool)
+        if force_short_cover_mask is None
+        else force_short_cover_mask.astype(bool) & tradable
+    )
 
     target_weights = _normalize_target_weights_numpy(
         target_weights,
@@ -1298,14 +1324,16 @@ def _vectorized_backtest(
         tradable_t = tradable[t]
         # If symbol is not tradable today, keep previous holdings instead of forcing liquidation.
         target_t[~tradable_t] = prev[~tradable_t]
+        if not long_only:
+            target_t = np.where(force_cover_mask[t] & (target_t < 0.0), 0.0, target_t)
 
         delta = target_t - prev
         buy_t = buy_mask[t]
         sell_t = sell_mask[t]
         delta[(delta > 0.0) & ~buy_t] = 0.0
-        delta[(delta < 0.0) & ~sell_t] = 0.0
 
         if long_only:
+            delta[(delta < 0.0) & ~sell_t] = 0.0
             sell_deltas = np.clip(delta, None, 0.0)
             base_after_sells = prev + sell_deltas
             buy_deltas = np.clip(delta, 0.0, None)
@@ -1314,6 +1342,21 @@ def _vectorized_backtest(
             if buy_sum > buy_capacity and buy_sum > 0.0:
                 buy_deltas *= np.float32(buy_capacity / buy_sum)
             delta = sell_deltas + buy_deltas
+        else:
+            constrained_target = prev + delta
+            down = constrained_target < prev
+            reduce_long = down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_t
+            constrained_target[reduce_long] = prev[reduce_long]
+
+            cross_from_long = down & (prev > 0.0) & (constrained_target < 0.0)
+            blocked_cross_sell = cross_from_long & ~sell_t
+            constrained_target[blocked_cross_sell] = prev[blocked_cross_sell]
+            blocked_cross_short = cross_from_long & sell_t & ~short_open_mask[t]
+            constrained_target[blocked_cross_short] = 0.0
+
+            open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_open_mask[t]
+            constrained_target[open_or_increase_short] = prev[open_or_increase_short]
+            delta = constrained_target - prev
 
         next_weights = prev + delta
         if max_turnover_ratio > 0.0:
@@ -1423,6 +1466,8 @@ def _vectorized_backtest_torch_scan_long_short(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    can_short_open_mask: torch.Tensor | None = None,
+    force_short_cover_mask: torch.Tensor | None = None,
     prev_init: torch.Tensor | None = None,
     max_turnover_ratio: float = 0.0,
     gross_budget: float = 1.0,
@@ -1436,6 +1481,16 @@ def _vectorized_backtest_torch_scan_long_short(
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask
     sell_mask = tradable if can_sell_mask is None else can_sell_mask
+    short_open_mask = (
+        sell_mask
+        if can_short_open_mask is None
+        else can_short_open_mask.to(device=weights.device, dtype=torch.bool) & sell_mask & tradable
+    )
+    force_cover_mask = (
+        torch.zeros_like(tradable, dtype=torch.bool)
+        if force_short_cover_mask is None
+        else force_short_cover_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
 
     t_len, n_symbols = target_weights.shape
     dtype = target_weights.dtype
@@ -1459,15 +1514,35 @@ def _vectorized_backtest_torch_scan_long_short(
         tradable_chunk = tradable[start:end]
         buy_chunk = buy_mask[start:end]
         sell_chunk = sell_mask[start:end]
+        short_chunk = short_open_mask[start:end]
+        force_chunk = force_cover_mask[start:end]
 
         for offset in range(end - start):
             idx = start + offset
             target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            target_t = torch.where(
+                force_chunk[offset] & (target_t < 0.0),
+                torch.zeros_like(target_t),
+                target_t,
+            )
 
             delta = target_t - prev
-            buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
-            sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
-            delta = sell_delta + buy_delta
+            constrained_target = torch.where((delta > 0.0) & ~buy_chunk[offset], prev, target_t)
+            down = constrained_target < prev
+            reduce_long = down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_chunk[offset]
+            constrained_target = torch.where(reduce_long, prev, constrained_target)
+
+            cross_from_long = down & (prev > 0.0) & (constrained_target < 0.0)
+            constrained_target = torch.where(cross_from_long & ~sell_chunk[offset], prev, constrained_target)
+            constrained_target = torch.where(
+                cross_from_long & sell_chunk[offset] & ~short_chunk[offset],
+                torch.zeros_like(constrained_target),
+                constrained_target,
+            )
+
+            open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_chunk[offset]
+            constrained_target = torch.where(open_or_increase_short, prev, constrained_target)
+            delta = constrained_target - prev
 
             next_weights = prev + delta
             if max_turnover_ratio > 0.0:
@@ -1504,6 +1579,8 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    can_short_open_mask: torch.Tensor | None,
+    force_short_cover_mask: torch.Tensor | None,
     sample_mask: torch.Tensor | None,
     prev_init: torch.Tensor,
     *,
@@ -1520,6 +1597,16 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="reduced torch backtest")
     buy_mask = tradable if can_buy_mask is None else can_buy_mask
     sell_mask = tradable if can_sell_mask is None else can_sell_mask
+    short_open_mask = (
+        sell_mask
+        if can_short_open_mask is None
+        else can_short_open_mask.to(device=weights.device, dtype=torch.bool) & sell_mask & tradable
+    )
+    force_cover_mask = (
+        torch.zeros_like(tradable, dtype=torch.bool)
+        if force_short_cover_mask is None
+        else force_short_cover_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
 
     t_len, _ = target_weights.shape
     dtype = target_weights.dtype
@@ -1544,10 +1631,18 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
         tradable_chunk = tradable[start:end]
         buy_chunk = buy_mask[start:end]
         sell_chunk = sell_mask[start:end]
+        short_chunk = short_open_mask[start:end]
+        force_chunk = force_cover_mask[start:end]
 
         for offset in range(end - start):
             idx = start + offset
             target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            if not long_only:
+                target_t = torch.where(
+                    force_chunk[offset] & (target_t < 0.0),
+                    torch.zeros_like(target_t),
+                    target_t,
+                )
             delta = target_t - prev
             buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
             sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
@@ -1562,7 +1657,22 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
                 )
                 delta = sell_delta + buy_delta * buy_scale
             else:
-                delta = sell_delta + buy_delta
+                constrained_target = torch.where((delta > 0.0) & ~buy_chunk[offset], prev, target_t)
+                down = constrained_target < prev
+                reduce_long = down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_chunk[offset]
+                constrained_target = torch.where(reduce_long, prev, constrained_target)
+
+                cross_from_long = down & (prev > 0.0) & (constrained_target < 0.0)
+                constrained_target = torch.where(cross_from_long & ~sell_chunk[offset], prev, constrained_target)
+                constrained_target = torch.where(
+                    cross_from_long & sell_chunk[offset] & ~short_chunk[offset],
+                    torch.zeros_like(constrained_target),
+                    constrained_target,
+                )
+
+                open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_chunk[offset]
+                constrained_target = torch.where(open_or_increase_short, prev, constrained_target)
+                delta = constrained_target - prev
 
             next_weights = prev + delta
             if max_turnover_ratio > 0.0:
@@ -1825,6 +1935,8 @@ def _vectorized_backtest_torch(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    can_short_open_mask: torch.Tensor | None,
+    force_short_cover_mask: torch.Tensor | None,
     buy_fee_rate: float,
     sell_fee_rate: float,
     long_only: bool = True,
@@ -1862,6 +1974,17 @@ def _vectorized_backtest_torch(
                 min_trade_weight,
                 portfolio_activation,
             )
+            prepped_short_open = (
+                prepped_sell
+                if can_short_open_mask is None
+                else can_short_open_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_sell & prepped_tradable
+            )
+            prepped_force_cover = (
+                torch.zeros_like(prepped_tradable, dtype=torch.bool)
+                if force_short_cover_mask is None
+                else force_short_cover_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_tradable
+            )
+            has_short_constraints = (can_short_open_mask is not None) or (force_short_cover_mask is not None)
         _add_backtest_elapsed_stat("prep_s", prep_start)
         prev_init_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
@@ -1885,7 +2008,7 @@ def _vectorized_backtest_torch(
         prepped_buy,
         prepped_sell,
         effective_max_turnover_ratio,
-    )
+    ) and not has_short_constraints
     if use_dense_fast_path:
         _add_backtest_runtime_stat("dense_fast_path_calls")
         dense_start = _runtime_stat_start()
@@ -1946,6 +2069,7 @@ def _vectorized_backtest_torch(
         not _torch_dynamo_is_compiling()
         and cpp_long_short_enabled()
         and not long_only
+        and not has_short_constraints
         and prepped_weights.device.type == "cuda"
         and initial_weights is None
     )
@@ -2069,6 +2193,8 @@ def _vectorized_backtest_torch(
                     prepped_buy,
                     prepped_sell,
                     prev_init,
+                    prepped_short_open,
+                    prepped_force_cover,
                 )
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
         except Exception as e:
@@ -2098,6 +2224,8 @@ def _vectorized_backtest_torch(
                     prepped_buy,
                     prepped_sell,
                     prev_init,
+                    prepped_short_open,
+                    prepped_force_cover,
                 )
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
     else:
@@ -2118,6 +2246,8 @@ def _vectorized_backtest_torch(
                 t_chunk = prepped_tradable[start:end]
                 b_chunk = prepped_buy[start:end]
                 s_chunk = prepped_sell[start:end]
+                short_chunk = prepped_short_open[start:end]
+                force_chunk = prepped_force_cover[start:end]
 
                 chunk_out = checkpoint_fn(
                     runner,
@@ -2127,6 +2257,8 @@ def _vectorized_backtest_torch(
                     b_chunk,
                     s_chunk,
                     prev,
+                    short_chunk,
+                    force_chunk,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
@@ -2184,6 +2316,8 @@ def run_backtest(
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
+    can_short_open_mask: np.ndarray | None = None,
+    force_short_cover_mask: np.ndarray | None = None,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
@@ -2192,6 +2326,8 @@ def run_backtest(
         tradable_mask,
         can_buy_mask,
         can_sell_mask,
+        can_short_open_mask,
+        force_short_cover_mask,
         buy_fee_rate,
         sell_fee_rate,
         long_only=long_only,
@@ -2223,6 +2359,8 @@ def run_backtest_torch_reduced(
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
+    can_short_open_mask: torch.Tensor | None = None,
+    force_short_cover_mask: torch.Tensor | None = None,
     sample_mask: torch.Tensor | None = None,
     initial_weights: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
@@ -2259,6 +2397,16 @@ def run_backtest_torch_reduced(
                 gross_leverage,
                 min_trade_weight,
                 portfolio_activation,
+            )
+            prepped_short_open = (
+                prepped_sell
+                if can_short_open_mask is None
+                else can_short_open_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_sell & prepped_tradable
+            )
+            prepped_force_cover = (
+                torch.zeros_like(prepped_tradable, dtype=torch.bool)
+                if force_short_cover_mask is None
+                else force_short_cover_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_tradable
             )
         _add_backtest_elapsed_stat("prep_s", prep_start)
 
@@ -2315,6 +2463,8 @@ def run_backtest_torch_reduced(
                     prepped_sell,
                     sample_mask,
                     prev_init,
+                    prepped_short_open,
+                    prepped_force_cover,
                 )
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
         except Exception as e:
@@ -2363,6 +2513,8 @@ def run_backtest_torch_reduced(
                     prepped_sell,
                     sample_mask,
                     prev_init,
+                    prepped_short_open,
+                    prepped_force_cover,
                 )
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
 
@@ -2399,6 +2551,8 @@ def run_backtest_torch(
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
+    can_short_open_mask: torch.Tensor | None = None,
+    force_short_cover_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
@@ -2411,6 +2565,8 @@ def run_backtest_torch(
         tradable_mask,
         can_buy_mask,
         can_sell_mask,
+        can_short_open_mask,
+        force_short_cover_mask,
         buy_fee_rate,
         sell_fee_rate,
         long_only=long_only,
@@ -2440,6 +2596,8 @@ def run_backtest_integer_shares(
     benchmark_returns: np.ndarray,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
+    can_short_open_mask: np.ndarray | None = None,
+    force_short_cover_mask: np.ndarray | None = None,
     *,
     initial_capital: float = 1_000_000.0,
     buy_fee_rate: float = 0.001425,
@@ -2468,6 +2626,16 @@ def run_backtest_integer_shares(
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="integer-share backtest")
     buy_m = m if can_buy_mask is None else np.asarray(can_buy_mask, dtype=bool)
     sell_m = m if can_sell_mask is None else np.asarray(can_sell_mask, dtype=bool)
+    short_m = (
+        sell_m
+        if can_short_open_mask is None
+        else np.asarray(can_short_open_mask, dtype=bool) & sell_m & m
+    )
+    force_m = (
+        np.zeros_like(m, dtype=bool)
+        if force_short_cover_mask is None
+        else np.asarray(force_short_cover_mask, dtype=bool) & m
+    )
     b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
     t_len, n_symbols = w.shape
@@ -2547,15 +2715,35 @@ def run_backtest_integer_shares(
         safe_prices = np.where(current_prices > 1e-12, current_prices, np.inf)
         raw_target_shares = desired_value / safe_prices
         desired_shares = _floor_to_int64(raw_target_shares, non_negative=True) if long_only else _trunc_to_int64(raw_target_shares)
+        if not long_only:
+            desired_shares[force_m[t] & (desired_shares < 0)] = 0
 
         # Non-tradable symbols keep existing shares.
         desired_shares[~day_mask] = shares[~day_mask]
 
         can_buy_day = buy_m[t]
         can_sell_day = sell_m[t]
+        can_short_day = short_m[t]
         delta = desired_shares - shares
-        desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
-        desired_shares[(delta < 0) & ~can_sell_day] = shares[(delta < 0) & ~can_sell_day]
+        if long_only:
+            desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
+            desired_shares[(delta < 0) & ~can_sell_day] = shares[(delta < 0) & ~can_sell_day]
+        else:
+            desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
+            constrained_shares = desired_shares.copy()
+            down = constrained_shares < shares
+            reduce_long = down & (shares > 0) & (constrained_shares >= 0) & ~can_sell_day
+            constrained_shares[reduce_long] = shares[reduce_long]
+
+            cross_from_long = down & (shares > 0) & (constrained_shares < 0)
+            blocked_cross_sell = cross_from_long & ~can_sell_day
+            constrained_shares[blocked_cross_sell] = shares[blocked_cross_sell]
+            blocked_cross_short = cross_from_long & can_sell_day & ~can_short_day
+            constrained_shares[blocked_cross_short] = 0
+
+            open_or_increase_short = down & (shares <= 0) & (constrained_shares < shares) & ~can_short_day
+            constrained_shares[open_or_increase_short] = shares[open_or_increase_short]
+            desired_shares = constrained_shares
 
         delta = desired_shares - shares
         if max_turnover_ratio > 0.0:

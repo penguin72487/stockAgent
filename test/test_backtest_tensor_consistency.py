@@ -127,6 +127,60 @@ def test_min_trade_weight_zeroes_small_positions_and_redistributes() -> None:
     )
 
 
+def test_long_short_backtest_blocks_new_borrowed_short_without_blocking_long_sell() -> None:
+    weights = torch.tensor([[0.4], [-0.4]], dtype=torch.float32)
+    returns = torch.zeros_like(weights)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros((2,), dtype=torch.float32)
+    can_buy = torch.ones_like(tradable)
+    can_sell = torch.ones_like(tradable)
+    can_short_open = torch.zeros_like(tradable)
+
+    result = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        can_short_open_mask=can_short_open,
+    )
+
+    assert torch.allclose(result.weights_history[:, 0], torch.tensor([0.4, 0.0]))
+
+
+def test_long_short_backtest_force_cover_clamps_negative_target_to_zero() -> None:
+    weights = torch.tensor([[-0.4], [-0.4]], dtype=torch.float32)
+    returns = torch.zeros_like(weights)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros((2,), dtype=torch.float32)
+    can_buy = torch.ones_like(tradable)
+    can_sell = torch.ones_like(tradable)
+    can_short_open = torch.ones_like(tradable)
+    force_cover = torch.tensor([[False], [True]], dtype=torch.bool)
+
+    result = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        can_short_open_mask=can_short_open,
+        force_short_cover_mask=force_cover,
+    )
+
+    assert torch.allclose(result.weights_history[:, 0], torch.tensor([-0.4, 0.0]))
+
+
 def test_reduced_and_fused_log_utility_convert_asset_log_returns_for_short_pnl() -> None:
     weights = torch.tensor([[-1.0]], dtype=torch.float32, requires_grad=True)
     returns = torch.tensor([[math.log(0.4)]], dtype=torch.float32)

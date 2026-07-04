@@ -1077,6 +1077,8 @@ def main() -> None:
             config.data.tw_public_feature_path if config.data.use_tw_public_features else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -1106,6 +1108,8 @@ def main() -> None:
             tradable_mask=split.tradable_mask,
             can_buy_mask=split.can_buy_mask,
             can_sell_mask=split.can_sell_mask,
+            can_short_open_mask=split.can_short_open_mask,
+            force_short_cover_mask=split.force_short_cover_mask,
             benchmark=split.benchmark,
             lookback=split.lookback,
             sample_mask=None if split.sample_mask is None else split.sample_mask[:max_rows],
@@ -1128,6 +1132,7 @@ def main() -> None:
         lookback=config.training.lookback,
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
+        feature_names=panel.feature_names,
     ).to(device)
     _load_state_dict(model, state_dict)
 

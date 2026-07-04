@@ -22,6 +22,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Run Taiwan training with `python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
 - Run the independent Taiwan public-data experiment with `python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_all`.
 - `configs/markets/tw_public.yaml` enables `data.use_tw_public_features` and appends `data_tw_public/features/tw_public_stock_daily.parquet` as extra `twpub_*` features.
+- Use `data.feature_include` and `data.feature_exclude` to manually switch panel features by exact name or glob pattern, for example `twpub_*` or `*_logret_1d`; leave both empty to keep all features.
 - Or use the project runner: `./coda_runner.sh`.
 - Runner defaults are centralized in `configs/runner.env`.
 - Outputs include one folder per walk-forward fold and a top-level `summary.json`.

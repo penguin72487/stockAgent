@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -552,6 +553,9 @@ class TransformerBasePortfolioModel(nn.Module):
         return_aux_details: bool = False,
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
+        categorical_feature_indices: Sequence[int] | None = None,
+        categorical_embedding_dim: int = 4,
+        categorical_embedding_cardinality: int = 512,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
@@ -582,7 +586,44 @@ class TransformerBasePortfolioModel(nn.Module):
         self.dynamic_latent_tokens = bool(dynamic_latent_tokens)
         self.dynamic_market_tokens = bool(dynamic_market_tokens)
 
+        raw_categorical_indices = tuple(int(idx) for idx in (categorical_feature_indices or ()))
+        categorical_indices: list[int] = []
+        seen_categorical: set[int] = set()
+        for idx in raw_categorical_indices:
+            if idx < 0 or idx >= self.num_features or idx in seen_categorical:
+                continue
+            categorical_indices.append(idx)
+            seen_categorical.add(idx)
+        self.categorical_feature_indices = tuple(categorical_indices)
+        self.categorical_embedding_dim = max(1, int(categorical_embedding_dim))
+        self.categorical_embedding_cardinality = max(2, int(categorical_embedding_cardinality))
+
         self.feature_proj = nn.Linear(self.num_features, self.d_model)
+        if self.categorical_feature_indices:
+            self.register_buffer(
+                "categorical_feature_index_tensor",
+                torch.tensor(self.categorical_feature_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.categorical_embeddings = nn.ModuleList(
+                [
+                    nn.Embedding(self.categorical_embedding_cardinality + 1, self.categorical_embedding_dim)
+                    for _ in self.categorical_feature_indices
+                ]
+            )
+            self.categorical_proj = nn.Linear(
+                len(self.categorical_feature_indices) * self.categorical_embedding_dim,
+                self.d_model,
+                bias=False,
+            )
+        else:
+            self.register_buffer(
+                "categorical_feature_index_tensor",
+                torch.empty((0,), dtype=torch.long),
+                persistent=False,
+            )
+            self.categorical_embeddings = nn.ModuleList()
+            self.categorical_proj = None
         self.input_dropout = nn.Dropout(float(input_dropout))
         self.time_position = nn.Parameter(torch.randn(1, self.lookback, 1, self.d_model) * 0.02)
         self.symbol_position = nn.Parameter(torch.randn(1, 1, self.num_symbols, self.d_model) * 0.02)
@@ -931,8 +972,36 @@ class TransformerBasePortfolioModel(nn.Module):
         )
         return torch.cat([self.symbol_position, extra], dim=2)
 
+    def _project_features(self, x: torch.Tensor) -> torch.Tensor:
+        model_device = self.feature_proj.weight.device
+        clean_fp32 = torch.nan_to_num(
+            x.to(device=model_device, dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        clean = clean_fp32.to(dtype=self.feature_proj.weight.dtype)
+        if not self.categorical_feature_indices:
+            return self.feature_proj(clean)
+
+        cat_idx = self.categorical_feature_index_tensor
+        cat_values = clean_fp32.index_select(-1, cat_idx)
+        continuous = clean.clone()
+        continuous.index_fill_(-1, cat_idx, 0.0)
+        projected = self.feature_proj(continuous)
+
+        cat_ids = torch.round(cat_values).to(dtype=torch.long).clamp_(0, self.categorical_embedding_cardinality)
+        cat_parts = [
+            embedding(cat_ids[..., idx])
+            for idx, embedding in enumerate(self.categorical_embeddings)
+        ]
+        cat_embedding = torch.cat(cat_parts, dim=-1)
+        if self.categorical_proj is None:
+            return projected
+        return projected + self.categorical_proj(cat_embedding).to(dtype=projected.dtype)
+
     def _embed_inputs(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.feature_proj(torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0))
+        h = self._project_features(x)
         if self.use_time_pos:
             h = h + self.time_position[:, : int(x.size(1)), :, :]
         if self.use_symbol_pos:
@@ -947,17 +1016,12 @@ class TransformerBasePortfolioModel(nn.Module):
         return self.input_dropout(h)
 
     def _project_panel_rows(self, features: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
-        model_device = self.feature_proj.weight.device
         row_indices = row_indices.to(device=features.device, dtype=torch.long)
         selected = features.index_select(0, row_indices)
-        selected = torch.nan_to_num(selected, nan=0.0, posinf=0.0, neginf=0.0)
-        selected = selected.to(device=model_device, dtype=self.feature_proj.weight.dtype)
-        return self.feature_proj(selected)
+        return self._project_features(selected)
 
     def _embed_windowed_from_panel_slab(self, feature_slab: torch.Tensor) -> torch.Tensor:
-        clean = torch.nan_to_num(feature_slab, nan=0.0, posinf=0.0, neginf=0.0)
-        clean = clean.to(device=self.feature_proj.weight.device, dtype=self.feature_proj.weight.dtype)
-        projected = self.feature_proj(clean)
+        projected = self._project_features(feature_slab)
         h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
         return self._add_window_positions(h, int(feature_slab.size(1)))
 

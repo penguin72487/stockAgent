@@ -15,6 +15,8 @@ ARRAY_NAMES = (
     "tradable_mask",
     "can_buy_mask",
     "can_sell_mask",
+    "can_short_open_mask",
+    "force_short_cover_mask",
     "alive_mask",
     "benchmark_returns",
     "close_prices",
@@ -92,6 +94,18 @@ def save_panel_cache_v2(
         ),
         "can_sell_mask": np.asarray(
             panel_like.can_sell_mask if panel_like.can_sell_mask is not None else panel_like.tradable_mask
+        ),
+        "can_short_open_mask": np.asarray(
+            panel_like.can_short_open_mask
+            if getattr(panel_like, "can_short_open_mask", None) is not None
+            else panel_like.can_sell_mask
+            if panel_like.can_sell_mask is not None
+            else panel_like.tradable_mask
+        ),
+        "force_short_cover_mask": np.asarray(
+            panel_like.force_short_cover_mask
+            if getattr(panel_like, "force_short_cover_mask", None) is not None
+            else np.zeros_like(panel_like.tradable_mask, dtype=bool)
         ),
         "alive_mask": np.asarray(panel_like.alive_mask),
         "benchmark_returns": np.asarray(panel_like.benchmark_returns),

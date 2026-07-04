@@ -28,6 +28,165 @@ data:
   use_tw_public_features: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
+  # Manual feature switch.
+  # Default below keeps every current panel feature enabled.
+  # To disable one feature, add "#" before that feature line.
+  # Changing this list changes model input_dim; use a fresh output_dir or resume=false.
+  # Exact feature names and glob patterns are both supported.
+  feature_include:
+    # Base price log returns
+    # - open_logret_1d
+    # - max_logret_1d
+    # - min_logret_1d
+    # - close_logret_1d
+
+    # Base volume
+    - trading_volume_logret_1d
+    - signed_vol
+
+    # Base K-bar body
+    - body_ratio
+    - signed_body_ratio
+    - delta_body_ratio
+
+    # Base close location value
+    - clv
+    - clv_centered
+    - delta_clv
+
+    # Base shadows
+    - upper_shadow
+    - lower_shadow
+    - shadow_imbalance
+
+    # TW public official daily price/volume
+    # - twpub_official_close_logret_1d
+    # - twpub_official_trading_volume_log
+    # - twpub_official_trading_value_log
+    # - twpub_official_trades_log
+    # - twpub_official_turnover_ratio
+    # - twpub_official_intraday_range
+    # - twpub_official_close_to_high
+    # - twpub_official_close_to_low
+    # - twpub_tpex_next_limit_up_ret
+    # - twpub_tpex_next_limit_down_ret
+
+    # TW public valuation
+    - twpub_pe_log
+    - twpub_pb_log
+    # - twpub_dividend_yield
+    # - twpub_dividend_per_share_log
+
+    # TW public margin / short balance
+    - twpub_margin_balance_log
+    - twpub_margin_balance_chg
+    # - twpub_short_balance_log
+    - twpub_short_balance_chg
+    - twpub_margin_buy_flow
+    - twpub_margin_sell_flow
+    - twpub_short_sell_flow
+    - twpub_short_buy_flow
+
+    # TW public institutional flow
+    - twpub_foreign_net_buy_flow
+    - twpub_investment_trust_net_buy_flow
+    - twpub_dealer_net_buy_flow
+    - twpub_institutional_net_buy_flow
+
+    # TW public TDCC holders
+    - twpub_tdcc_retail_holder_ratio
+    - twpub_tdcc_large_holder_ratio
+    - twpub_tdcc_holder_count_log
+
+    # TW public company profile
+    - twpub_company_paidin_capital_log
+    - twpub_company_issued_shares_log
+    - twpub_company_private_shares_log
+    - twpub_company_age_years
+    - twpub_company_listed_age_years
+    - twpub_company_par_value_log
+    # - twpub_company_industry_code
+    # - twpub_company_is_foreign
+    # - twpub_company_has_preferred_stock
+
+    # TW public dividend / ex-dividend
+    # - twpub_dividend_cash_per_share
+    # - twpub_dividend_stock_per_share
+    # - twpub_dividend_total_cash_log
+    # - twpub_dividend_total_stock_log
+    # - twpub_dividend_confirmed
+    # - twpub_dividend_board_approved
+    # - twpub_dividend_year
+    # - twpub_exdiv_known
+    # - twpub_exdiv_cash_dividend
+    # - twpub_exdiv_stock_dividend_ratio
+    # - twpub_exdiv_subscription_ratio
+    # - twpub_exdiv_subscription_price_log
+
+    # TW public material events / attention / disposal
+    # - twpub_material_event_count_log
+    # - twpub_material_clause_log
+    # - twpub_material_fact_lag_days
+    # - twpub_attention_flag
+    # - twpub_attention_count_log
+    # - twpub_attention_close_log
+    # - twpub_attention_pe_log
+    # - twpub_disposal_flag
+    # - twpub_disposal_count_log
+
+    # TW public market index / FX
+    # - twpub_twse_taiex_log
+    # - twpub_twse_taiex_logret_1d
+    # - twpub_twse_taiex_pct
+    # - twpub_usdtwd_log
+    # - twpub_usdtwd_logret_1d
+
+    # TW public CBC monetary data
+    # - twpub_cbc_overnight_rate
+    # - twpub_cbc_overnight_rate_chg
+    # - twpub_cbc_fx_reserves_log
+    # - twpub_cbc_fx_reserves_chg
+    # - twpub_cbc_m1b_log
+    # - twpub_cbc_m1b_yoy
+    # - twpub_cbc_m2_log
+    # - twpub_cbc_m2_yoy
+
+    # TW public macro / MOF
+    - twpub_dgbas_cpi_log
+    - twpub_dgbas_cpi_yoy
+    - twpub_dgbas_unemployment_rate
+    # - twpub_dgbas_gdp_log
+    # - twpub_dgbas_gdp_yoy
+    - twpub_mof_export_log
+    - twpub_mof_import_log
+    - twpub_mof_trade_balance_asinh
+    - twpub_mof_tax_total_log
+    - twpub_mof_securities_tax_log
+    - twpub_mof_futures_tax_log
+    - twpub_mof_business_tax_log
+
+    # TW public TAIFEX futures / options
+    # - twpub_taifex_tx_volume_log
+    # - twpub_taifex_tx_open_interest_log
+    # - twpub_taifex_tx_settlement_logret_1d
+    # - twpub_taifex_txo_call_volume_log
+    # - twpub_taifex_txo_put_volume_log
+    # - twpub_taifex_txo_put_call_volume_ratio
+    # - twpub_taifex_txo_call_oi_log
+    # - twpub_taifex_txo_put_oi_log
+    # - twpub_taifex_txo_put_call_oi_ratio
+    # - twpub_taifex_dealer_net_oi_asinh
+    # - twpub_taifex_foreign_net_oi_asinh
+    # - twpub_taifex_trust_net_oi_asinh
+    # - twpub_taifex_tx_top5_long_ratio
+    # - twpub_taifex_tx_top10_long_ratio
+    # - twpub_taifex_tx_large_oi_log
+    # - twpub_taifex_tx_final_settlement_logret
+
+  # Optional bulk deny-list. Usually keep this empty when using feature_include above.
+  feature_exclude:
+    # - twpub_company_*
+    # - twpub_dividend_*
   # tradable_mode: tradable
 
 walk_forward:
@@ -151,7 +310,7 @@ training:
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
   backtest_artifact_compression: none
-  save_best_val_artifacts: false
+  save_best_val_artifacts: true
   postprocess_benchmark_after_fold: true
   postprocess_benchmark_after_best_val: true
   postprocess_benchmark_split: test
@@ -341,6 +500,13 @@ training:
     checkpoint_blocks: false
     return_aux: false
     return_aux_details: false
+    # Categorical features are embedded by name only when the feature is enabled above.
+    categorical_feature_names:
+      - twpub_company_industry_code
+      - twpub_company_is_foreign
+      - twpub_company_has_preferred_stock
+    categorical_embedding_dim: 4
+    categorical_embedding_cardinality: 512
     # return_aux_details returns attention/factor internals; keep false for training speed.
   bottleneck_portfolio_autoencoder:
     d_model: 64
