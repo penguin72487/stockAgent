@@ -2936,6 +2936,12 @@ def _subset_panel_symbols(panel: PanelData, symbols: Sequence[str]) -> PanelData
         close_prices=panel.close_prices[:, indices],
         can_buy_mask=panel.can_buy_mask[:, indices] if panel.can_buy_mask is not None else None,
         can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
+        can_short_open_mask=(
+            panel.can_short_open_mask[:, indices] if panel.can_short_open_mask is not None else None
+        ),
+        force_short_cover_mask=(
+            panel.force_short_cover_mask[:, indices] if panel.force_short_cover_mask is not None else None
+        ),
     )
 
 
@@ -3373,6 +3379,7 @@ def _load_previous_fold_neural_model(
         lookback=config.training.lookback,
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
+        feature_names=panel.feature_names,
     ).to(device)
     try:
         _load_state_dict(previous_model, previous_state_dict)
@@ -3768,6 +3775,8 @@ def _combine_datasets_to_windowed(
         can_sell_mask=first.can_sell_mask,
         benchmark=first.benchmark,
         lookback=first.lookback,
+        can_short_open_mask=first.can_short_open_mask,
+        force_short_cover_mask=first.force_short_cover_mask,
     )
     return combined, lengths
 
@@ -3785,6 +3794,8 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             can_sell_mask=split.can_sell_mask,
             benchmark=split.benchmark,
             lookback=split.lookback,
+            can_short_open_mask=split.can_short_open_mask,
+            force_short_cover_mask=split.force_short_cover_mask,
             sample_mask=sample_mask,
         )
     padded_rows = ((total_rows + batch_size - 1) // batch_size) * batch_size
@@ -3816,6 +3827,8 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         can_sell_mask=split.can_sell_mask,
         benchmark=split.benchmark,
         lookback=split.lookback,
+        can_short_open_mask=split.can_short_open_mask,
+        force_short_cover_mask=split.force_short_cover_mask,
         sample_mask=sample_mask,
     )
 
@@ -3849,6 +3862,8 @@ def _prepare_windowed_split(
             can_sell_mask=shared_base.can_sell_mask,
             benchmark=shared_base.benchmark,
             lookback=split.lookback,
+            can_short_open_mask=shared_base.can_short_open_mask,
+            force_short_cover_mask=shared_base.force_short_cover_mask,
             sample_mask=sample_mask,
         )
     return WindowedSplitTensors(
@@ -3860,6 +3875,8 @@ def _prepare_windowed_split(
         can_sell_mask=_prepare_host_tensor(split.can_sell_mask, pin_memory),
         benchmark=_prepare_host_tensor(split.benchmark, pin_memory),
         lookback=split.lookback,
+        can_short_open_mask=_prepare_host_tensor(split.can_short_open_mask, pin_memory),
+        force_short_cover_mask=_prepare_host_tensor(split.force_short_cover_mask, pin_memory),
         sample_mask=None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory),
     )
 
@@ -3871,6 +3888,8 @@ def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor, .
         split.tradable_mask,
         split.can_buy_mask,
         split.can_sell_mask,
+        split.can_short_open_mask,
+        split.force_short_cover_mask,
         split.benchmark,
     )
 
@@ -3892,7 +3911,9 @@ def _with_windowed_base(
         tradable_mask=base_tensors[2],
         can_buy_mask=base_tensors[3],
         can_sell_mask=base_tensors[4],
-        benchmark=base_tensors[5],
+        can_short_open_mask=base_tensors[5],
+        force_short_cover_mask=base_tensors[6],
+        benchmark=base_tensors[7],
         lookback=split.lookback,
         sample_mask=split.sample_mask,
     )
@@ -3909,6 +3930,8 @@ def _with_windowed_metadata(
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
+        can_short_open_mask=split.can_short_open_mask,
+        force_short_cover_mask=split.force_short_cover_mask,
         benchmark=split.benchmark,
         lookback=split.lookback,
         sample_mask=None if split.sample_mask is None else metadata_tensors[1],
@@ -3992,6 +4015,8 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
         "tradable_mask",
         "can_buy_mask",
         "can_sell_mask",
+        "can_short_open_mask",
+        "force_short_cover_mask",
         "benchmark",
     )
     for attr in attrs:
@@ -4037,6 +4062,8 @@ def _maybe_share_windowed_base_from_cached(
         tradable_mask=cached_base.tradable_mask,
         can_buy_mask=cached_base.can_buy_mask,
         can_sell_mask=cached_base.can_sell_mask,
+        can_short_open_mask=cached_base.can_short_open_mask,
+        force_short_cover_mask=cached_base.force_short_cover_mask,
         benchmark=cached_base.benchmark,
         lookback=split.lookback,
         sample_mask=sample_mask,
@@ -7736,6 +7763,7 @@ def _run_training_tree_models(
             lookback=config.training.lookback,
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
+            feature_names=panel.feature_names,
         )
         if not hasattr(model, "fit"):
             raise TypeError(f"Tree training path expects model.fit(), got {type(model).__name__}")
@@ -8266,6 +8294,7 @@ def _run_inference_neural_models(
             lookback=config.training.lookback,
             num_features=len(fold_panel.feature_names),
             num_symbols=fold_panel.num_symbols,
+            feature_names=fold_panel.feature_names,
         ).to(device)
         _load_state_dict(model, model_state_dict)
         panel_slab_model: nn.Module | None = None
@@ -8671,6 +8700,7 @@ def run_training(
                 lookback=config.training.lookback,
                 num_features=len(panel.feature_names),
                 num_symbols=panel.num_symbols,
+                feature_names=panel.feature_names,
             )
             train_static_bytes = _estimate_model_static_bytes(estimation_model, training_mode=True)
             model_name = str(config.training.model_name).strip().lower()
@@ -8946,6 +8976,7 @@ def run_training(
             lookback=config.training.lookback,
             num_features=len(panel.feature_names),
             num_symbols=panel.num_symbols,
+            feature_names=panel.feature_names,
         ).to(device)
         if profile_timing:
             _log_timing(

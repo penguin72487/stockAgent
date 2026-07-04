@@ -218,6 +218,12 @@ def main() -> None:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        external_feature_path=(
+            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+        ),
+        external_market_symbol=config.data.tw_public_market_symbol,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -253,6 +259,8 @@ def main() -> None:
         tradable_mask=base_split.tradable_mask,
         can_buy_mask=base_split.can_buy_mask,
         can_sell_mask=base_split.can_sell_mask,
+        can_short_open_mask=base_split.can_short_open_mask,
+        force_short_cover_mask=base_split.force_short_cover_mask,
         benchmark=base_split.benchmark,
         lookback=base_split.lookback,
     )
@@ -268,6 +276,7 @@ def main() -> None:
         lookback=config.training.lookback,
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
+        feature_names=panel.feature_names,
     ).to(device)
     _load_state_dict(model, state_dict)
     model.eval()

@@ -11,6 +11,7 @@ from stockagent.data.panel import build_panel
 from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
     FEATURE_COLUMNS,
+    RULE_COLUMNS,
     build_tw_public_training_features,
 )
 
@@ -89,6 +90,7 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     assert set(out["symbol"].to_list()) == {"2330", DEFAULT_MARKET_SYMBOL}
     assert "9999" not in set(out["symbol"].to_list())
     assert set(FEATURE_COLUMNS).issubset(set(out.columns))
+    assert set(RULE_COLUMNS).issubset(set(out.columns))
     stock = out.filter(pl.col("symbol") == "2330").row(0, named=True)
     assert stock["twpub_pe_log"] is not None
     assert stock["twpub_margin_balance_log"] is not None
@@ -132,3 +134,67 @@ def test_build_panel_aligns_external_stock_and_market_features(tmp_path: Path) -
     assert panel.features[date_0103, symbol_2317, market_idx] == np.float32(0.02)
     assert panel.features[date_0103, symbol_2330, pe_idx] == np.float32(3.0)
     assert panel.features[date_0103, symbol_2317, pe_idx] == np.float32(0.0)
+
+
+def test_build_panel_manual_feature_switch_supports_glob_include_and_exclude(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "symbol": [DEFAULT_MARKET_SYMBOL, "2330"],
+            "twpub_usdtwd_logret_1d": [0.01, None],
+            "twpub_pe_log": [None, 3.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["close_logret_1d", "twpub_*"],
+        feature_exclude=["twpub_pe_log"],
+    )
+
+    assert panel.feature_names == ["close_logret_1d", "twpub_usdtwd_logret_1d"]
+    assert panel.features.shape[-1] == 2
+
+
+def test_external_tpex_limit_rule_columns_update_masks_without_becoming_features(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 110.0, 99.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "symbol": ["2330", "2330"],
+            "_twpub_tpex_next_limit_up_ret": [np.log(110.0 / 100.0), np.log(121.0 / 110.0)],
+            "_twpub_tpex_next_limit_down_ret": [np.log(90.0 / 100.0), np.log(99.0 / 110.0)],
+            "twpub_pe_log": [3.0, 3.1],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+
+    assert "_twpub_tpex_next_limit_up_ret" not in panel.feature_names
+    assert "_twpub_tpex_next_limit_down_ret" not in panel.feature_names
+    assert "twpub_pe_log" in panel.feature_names
+
+    symbol_idx = panel.symbols.index("2330")
+    date_0103 = int(np.where(panel.dates == np.datetime64("2024-01-03T00:00:00.000000000"))[0][0])
+    date_0104 = int(np.where(panel.dates == np.datetime64("2024-01-04T00:00:00.000000000"))[0][0])
+    assert bool(panel.can_buy_mask[date_0103, symbol_idx]) is False
+    assert bool(panel.can_sell_mask[date_0103, symbol_idx]) is True
+    assert bool(panel.can_buy_mask[date_0104, symbol_idx]) is True
+    assert bool(panel.can_sell_mask[date_0104, symbol_idx]) is False

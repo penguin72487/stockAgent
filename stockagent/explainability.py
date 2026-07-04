@@ -4057,6 +4057,7 @@ def load_model_from_checkpoint(
         lookback=config.training.lookback,
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
+        feature_names=panel.feature_names,
     ).to(device)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -4152,6 +4153,12 @@ def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
         close_prices=panel.close_prices[:, indices],
         can_buy_mask=panel.can_buy_mask[:, indices] if panel.can_buy_mask is not None else None,
         can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
+        can_short_open_mask=(
+            panel.can_short_open_mask[:, indices] if panel.can_short_open_mask is not None else None
+        ),
+        force_short_cover_mask=(
+            panel.force_short_cover_mask[:, indices] if panel.force_short_cover_mask is not None else None
+        ),
     )
 
 
@@ -4270,6 +4277,12 @@ def load_explanation_context(
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        external_feature_path=(
+            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+        ),
+        external_market_symbol=config.data.tw_public_market_symbol,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -4669,6 +4682,12 @@ def _run_explainability_for_config(
             strict_no_fallback=config.training.strict_no_fallback,
             panel_backend=config.data.panel_backend,
             panel_load_workers=config.data.panel_load_workers,
+            external_feature_path=(
+                config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            ),
+            external_market_symbol=config.data.tw_public_market_symbol,
+            feature_include=config.data.feature_include,
+            feature_exclude=config.data.feature_exclude,
         )
         folds = build_expanding_year_folds(
             dates=panel.dates,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+import fnmatch
+
 from torch import nn
 
 from stockagent.config import ExperimentConfig
@@ -20,6 +23,30 @@ from stockagent.models.tree_models import CrossSectionalLightGBM, CrossSectional
 
 def _normalized_model_name(model_name: str) -> str:
     return model_name.strip().lower().replace("-", "_")
+
+
+def _feature_indices_from_patterns(
+    feature_names: Sequence[str] | None,
+    patterns: Sequence[str] | None,
+) -> list[int]:
+    if not feature_names or not patterns:
+        return []
+    selected: list[int] = []
+    seen: set[int] = set()
+    names = [str(name) for name in feature_names]
+    for raw_pattern in patterns:
+        pattern = str(raw_pattern).strip()
+        if not pattern:
+            continue
+        if any(char in pattern for char in "*?[]"):
+            matches = [idx for idx, name in enumerate(names) if fnmatch.fnmatchcase(name, pattern)]
+        else:
+            matches = [idx for idx, name in enumerate(names) if name == pattern]
+        for idx in matches:
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+    return selected
 
 
 _EFFICIENT_TCN_TABULAR_SET_NAMES = {
@@ -104,6 +131,7 @@ def build_model(
     lookback: int,
     num_features: int,
     num_symbols: int,
+    feature_names: Sequence[str] | None = None,
 ) -> nn.Module:
     model_name = _normalized_model_name(config.training.model_name)
 
@@ -334,6 +362,12 @@ def build_model(
             return_aux_details=tbp_cfg.return_aux_details,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+            categorical_feature_indices=_feature_indices_from_patterns(
+                feature_names,
+                tbp_cfg.categorical_feature_names,
+            ),
+            categorical_embedding_dim=tbp_cfg.categorical_embedding_dim,
+            categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
         )
 
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:

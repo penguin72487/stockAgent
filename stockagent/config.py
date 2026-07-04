@@ -43,6 +43,25 @@ def _normalize_portfolio_activation(activation: str | None) -> str:
     return normalized
 
 
+def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raise ValueError(f"{field_name} must be a list or comma-separated string, got {type(value).__name__}")
+
+    items: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.startswith("#"):
+            continue
+        items.append(text)
+    return items
+
+
 def _normalize_portfolio_output_mode(mode: str | None) -> str:
     normalized = str(mode or "activation_l1").strip().lower().replace("-", "_")
     if normalized in {
@@ -127,6 +146,8 @@ class DataConfig:
     use_tw_public_features: bool = False
     tw_public_feature_path: str = "data_tw_public/features/tw_public_stock_daily.parquet"
     tw_public_market_symbol: str = "__MARKET__"
+    feature_include: list[str] = field(default_factory=list)
+    feature_exclude: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -329,6 +350,9 @@ class TransformerBasePortfolioModelConfig:
     checkpoint_blocks: bool = False
     return_aux: bool = True
     return_aux_details: bool = False
+    categorical_feature_names: list[str] = field(default_factory=list)
+    categorical_embedding_dim: int = 4
+    categorical_embedding_cardinality: int = 512
 
 
 @dataclass(slots=True)
@@ -1021,6 +1045,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
     transformer_base_portfolio.setdefault("return_aux_details", False)
+    transformer_base_portfolio.setdefault(
+        "categorical_feature_names",
+        [
+            "twpub_company_industry_code",
+            "twpub_company_is_foreign",
+            "twpub_company_has_preferred_stock",
+        ],
+    )
+    transformer_base_portfolio["categorical_feature_names"] = _normalize_string_list(
+        transformer_base_portfolio.get("categorical_feature_names"),
+        field_name="training.transformer_base_portfolio.categorical_feature_names",
+    )
+    transformer_base_portfolio["categorical_embedding_dim"] = max(
+        1, int(transformer_base_portfolio.get("categorical_embedding_dim", 4))
+    )
+    transformer_base_portfolio["categorical_embedding_cardinality"] = max(
+        2, int(transformer_base_portfolio.get("categorical_embedding_cardinality", 512))
+    )
 
     bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
     bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
@@ -1175,6 +1217,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("use_tw_public_features", False)
     data.setdefault("tw_public_feature_path", "data_tw_public/features/tw_public_stock_daily.parquet")
     data.setdefault("tw_public_market_symbol", "__MARKET__")
+    data.setdefault("feature_include", [])
+    data.setdefault("feature_exclude", [])
 
     trading = raw.setdefault("trading", {})
 
@@ -1245,6 +1289,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["use_tw_public_features"] = bool(data.get("use_tw_public_features", False))
     data["tw_public_feature_path"] = str(data.get("tw_public_feature_path") or "").strip()
     data["tw_public_market_symbol"] = str(data.get("tw_public_market_symbol") or "__MARKET__").strip() or "__MARKET__"
+    data["feature_include"] = _normalize_string_list(data.get("feature_include"), field_name="data.feature_include")
+    data["feature_exclude"] = _normalize_string_list(data.get("feature_exclude"), field_name="data.feature_exclude")
     plot_backend = str(training.get("plot_backend", "auto")).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:
