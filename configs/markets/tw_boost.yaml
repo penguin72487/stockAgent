@@ -1,7 +1,7 @@
 experiment_name: tw-stock-transformer-market-public-data-all
 
 runner:
-  output_dir: artifacts/markets/tw_public_all
+  output_dir: artifacts/markets/tw_boost
   mode: train
   resume: true
   post_train_infer: false
@@ -210,7 +210,7 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  model_name: transformer_base_portfolio
+  model_name: gradient_boosted_portfolio_transformer
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
@@ -231,8 +231,8 @@ training:
   detach_prev_state: true
   prefer_fp16: false
   backtest_autotune: true
-  backtest_compile: true
-  backtest_compile_stateful: true
+  backtest_compile: false
+  backtest_compile_stateful: false
   backtest_compile_dynamic: false
   inference_backtest_autotune: false
   inference_backtest_compile: false
@@ -243,8 +243,8 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 16
-  batch_size_train: 16
+  batch_size: 8
+  batch_size_train: 8
   batch_size_eval: 8
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
@@ -310,7 +310,7 @@ training:
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
   backtest_artifact_compression: none
-  save_best_val_artifacts: true
+  save_best_val_artifacts: false
   postprocess_benchmark_after_fold: true
   postprocess_benchmark_after_best_val: true
   postprocess_benchmark_split: test
@@ -339,7 +339,7 @@ training:
   num_workers: 0
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  finite_check_interval_steps: 100
+  finite_check_interval_steps: 1
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false

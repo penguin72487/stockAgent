@@ -10,6 +10,7 @@ from stockagent.models.bottleneck_portfolio_autoencoder import BottleneckPortfol
 from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSectionalTemporalPortfolioModel
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
+from stockagent.models.gradient_boosted_portfolio_transformer import GradientBoostedPortfolioTransformer
 from stockagent.models.latent_factor_market_token_portfolio import LatentFactorMarketTokenPortfolioModel
 from stockagent.models.low_rank_market_transformer_portfolio import LowRankMarketTransformerPortfolioModel
 from stockagent.models.mlp import CrossSectionalMLP
@@ -89,6 +90,15 @@ _TRANSFORMER_BASE_PORTFOLIO_NAMES = {
     "tbp",
 }
 
+_GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES = {
+    "gradient_boosted_portfolio_transformer",
+    "gradient_boosted_portfolio_transformer_model",
+    "gradient_boosted_transformer_portfolio",
+    "boosted_portfolio_transformer",
+    "boosted_transformer_portfolio",
+    "gbpt",
+}
+
 
 def model_hidden_dim_hint(config: ExperimentConfig) -> int:
     """Return a representative hidden width for VRAM/sample-size estimation."""
@@ -109,6 +119,8 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.low_rank_market_transformer_portfolio.stock_embedding_dim)
     if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
         return int(config.training.transformer_base_portfolio.d_model)
+    if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
+        return int(config.training.gradient_boosted_portfolio_transformer.d_model)
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:
         return int(config.training.bottleneck_portfolio_autoencoder.d_model)
     if model_name in {"tcn_hybrid_tabular_resnet", "tcn_hybrid", "tcn_tabresnet"}:
@@ -370,6 +382,47 @@ def build_model(
             categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
         )
 
+    if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
+        gbpt_cfg = config.training.gradient_boosted_portfolio_transformer
+        portfolio_mode = str(gbpt_cfg.portfolio_mode).strip().lower().replace("-", "_")
+        if portfolio_mode in {"", "auto"}:
+            portfolio_mode = "long_only" if config.trading.long_only else "long_short"
+        return GradientBoostedPortfolioTransformer(
+            lookback=lookback,
+            num_features=num_features,
+            num_symbols=num_symbols,
+            d_model=gbpt_cfg.d_model,
+            temporal_layers=gbpt_cfg.temporal_layers,
+            temporal_heads=gbpt_cfg.temporal_heads,
+            temporal_ffn_mult=gbpt_cfg.temporal_ffn_mult,
+            market_layers=gbpt_cfg.market_layers,
+            market_heads=gbpt_cfg.market_heads,
+            market_ffn_mult=gbpt_cfg.market_ffn_mult,
+            num_market_tokens=gbpt_cfg.num_market_tokens,
+            head_hidden_dim=gbpt_cfg.head_hidden_dim,
+            head_layers=gbpt_cfg.head_layers,
+            dropout=gbpt_cfg.dropout,
+            input_dropout=gbpt_cfg.input_dropout,
+            use_time_pos=gbpt_cfg.use_time_pos,
+            use_symbol_pos=gbpt_cfg.use_symbol_pos,
+            dynamic_market_tokens=gbpt_cfg.dynamic_market_tokens,
+            dynamic_token_gate_init=gbpt_cfg.dynamic_token_gate_init,
+            num_residual_stages=gbpt_cfg.num_residual_stages,
+            stage_eta=gbpt_cfg.stage_eta,
+            trainable_eta=gbpt_cfg.trainable_eta,
+            eta_max=gbpt_cfg.eta_max,
+            detach_stage_condition=gbpt_cfg.detach_stage_condition,
+            default_temperature=gbpt_cfg.default_temperature,
+            portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
+            portfolio_output_mode=gbpt_cfg.portfolio_output_mode,
+            center_final_logits=gbpt_cfg.center_final_logits,
+            return_aux=gbpt_cfg.return_aux,
+            return_aux_details=gbpt_cfg.return_aux_details,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+        )
+
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:
         bpae_cfg = config.training.bottleneck_portfolio_autoencoder
         return BottleneckPortfolioAutoencoder(
@@ -503,7 +556,7 @@ def build_model(
         "Supported values: mlp, ft_transformer, tabular_resnet, multi_stock_tcn, "
         "efficient_tcn_tabular_set_portfolio, tcn_hybrid_tabular_resnet, "
         "latent_factor_market_token_portfolio, low_rank_market_transformer_portfolio, "
-        "transformer_base_portfolio, "
+        "transformer_base_portfolio, gradient_boosted_portfolio_transformer, "
         "bottleneck_portfolio_autoencoder, temporal_tabular_resnet, "
         "cross_sectional_temporal_portfolio_model, lightgbm, xgboost"
     )
