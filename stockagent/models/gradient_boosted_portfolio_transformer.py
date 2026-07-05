@@ -126,8 +126,17 @@ class _FeedForward(nn.Module):
 
 
 class _SelfAttentionBlock(nn.Module):
-    def __init__(self, dim: int, heads: int, ffn_mult: int, dropout: float) -> None:
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        ffn_mult: int,
+        dropout: float,
+        *,
+        batch_limit: int = 16384,
+    ) -> None:
         super().__init__()
+        self.batch_limit = int(batch_limit)
         self.norm_attn = _RMSNorm(dim)
         self.attn = nn.MultiheadAttention(
             dim,
@@ -141,7 +150,15 @@ class _SelfAttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm_attn(x)
-        attn, _ = self.attn(h, h, h, need_weights=False)
+        if self.batch_limit > 0 and int(h.size(0)) > self.batch_limit:
+            chunks: list[torch.Tensor] = []
+            for start in range(0, int(h.size(0)), self.batch_limit):
+                end = min(start + self.batch_limit, int(h.size(0)))
+                attn_chunk, _ = self.attn(h[start:end], h[start:end], h[start:end], need_weights=False)
+                chunks.append(attn_chunk)
+            attn = torch.cat(chunks, dim=0)
+        else:
+            attn, _ = self.attn(h, h, h, need_weights=False)
         x = x + self.dropout(attn)
         x = x + self.ffn(self.norm_ffn(x))
         return x

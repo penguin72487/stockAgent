@@ -11,7 +11,7 @@ environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  target_vram_fraction: 0.85
+  target_vram_fraction: 0.9
 
 data:
   parquet_root: data_yahoo/tw_stocks
@@ -223,10 +223,10 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: 8
+  eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
-  eval_auto_chunk_rows_cap: 16
+  eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
@@ -243,9 +243,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 8
-  batch_size_train: 8
-  batch_size_eval: 8
+  batch_size: 32
+  batch_size_train: 32
+  batch_size_eval: 32
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -343,9 +343,9 @@ training:
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  vram_budget_gb: 16
-  vram_safety_margin_gb: 1.5
-  target_vram_fraction: 0.85
+  vram_budget_gb: 90
+  vram_safety_margin_gb: 4.0
+  target_vram_fraction: 0.9
   # Model branches. Only the block named by training.model_name is active.
   # Current active branch: transformer_base_portfolio.
   mlp:
