@@ -17,6 +17,8 @@ class WindowedSplitTensors:
     can_sell_mask: torch.Tensor
     benchmark: torch.Tensor
     lookback: int
+    can_short_open_mask: torch.Tensor | None = None
+    force_short_cover_mask: torch.Tensor | None = None
     sample_mask: torch.Tensor | None = None
     _window_offsets: torch.Tensor = field(init=False, repr=False)
     _valid_indices_are_contiguous: bool = field(init=False, repr=False)
@@ -31,6 +33,10 @@ class WindowedSplitTensors:
             raise ValueError(f"features must have shape [T,S,F], got {tuple(self.features.shape)}")
         if self.valid_indices.dim() != 1:
             raise ValueError("valid_indices must be 1D")
+        if self.can_short_open_mask is None:
+            self.can_short_open_mask = self.can_sell_mask
+        if self.force_short_cover_mask is None:
+            self.force_short_cover_mask = torch.zeros_like(self.tradable_mask, dtype=torch.bool)
         self._window_offsets = torch.arange(
             self.lookback - 1,
             -1,
@@ -77,6 +83,8 @@ class WindowedSplitTensors:
             can_sell_mask=self.can_sell_mask.to(device=device, non_blocking=non_blocking),
             benchmark=self.benchmark.to(device=device, non_blocking=non_blocking),
             lookback=self.lookback,
+            can_short_open_mask=self.can_short_open_mask.to(device=device, non_blocking=non_blocking),
+            force_short_cover_mask=self.force_short_cover_mask.to(device=device, non_blocking=non_blocking),
             sample_mask=(
                 None if self.sample_mask is None else self.sample_mask.to(device=device, non_blocking=non_blocking)
             ),
@@ -102,6 +110,8 @@ class WindowedSplitTensors:
             can_sell_mask=_pin(self.can_sell_mask),
             benchmark=_pin(self.benchmark),
             lookback=self.lookback,
+            can_short_open_mask=_pin(self.can_short_open_mask),
+            force_short_cover_mask=_pin(self.force_short_cover_mask),
             sample_mask=None if self.sample_mask is None else _pin(self.sample_mask),
         )
 
@@ -159,6 +169,8 @@ class WindowedSplitTensors:
             "tradable_mask": self.tradable_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "can_buy_mask": self.can_buy_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "can_sell_mask": self.can_sell_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "can_short_open_mask": self.can_short_open_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "force_short_cover_mask": self.force_short_cover_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "benchmark": self.benchmark[date_idx].to(device=device, non_blocking=non_blocking),
             "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
         }
@@ -188,6 +200,8 @@ class WindowedSplitTensors:
             "tradable_mask": self.tradable_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "can_buy_mask": self.can_buy_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "can_sell_mask": self.can_sell_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "can_short_open_mask": self.can_short_open_mask[date_idx].to(device=device, non_blocking=non_blocking),
+            "force_short_cover_mask": self.force_short_cover_mask[date_idx].to(device=device, non_blocking=non_blocking),
             "benchmark": self.benchmark[date_idx].to(device=device, non_blocking=non_blocking),
             "sample_mask": sample_mask.to(device=device, non_blocking=non_blocking),
         }
@@ -222,6 +236,14 @@ class WindowedSplitTensors:
                 non_blocking=non_blocking,
             ),
             "can_sell_mask": self.can_sell_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "can_short_open_mask": self.can_short_open_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "force_short_cover_mask": self.force_short_cover_mask.narrow(0, date_start, rows).to(
                 device=device,
                 non_blocking=non_blocking,
             ),
@@ -268,6 +290,14 @@ class WindowedSplitTensors:
                 non_blocking=non_blocking,
             ),
             "can_sell_mask": self.can_sell_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "can_short_open_mask": self.can_short_open_mask.narrow(0, date_start, rows).to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+            "force_short_cover_mask": self.force_short_cover_mask.narrow(0, date_start, rows).to(
                 device=device,
                 non_blocking=non_blocking,
             ),
@@ -356,4 +386,6 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         can_sell_mask=dataset.can_sell_mask_t,
         benchmark=dataset.benchmark_t,
         lookback=dataset.lookback,
+        can_short_open_mask=dataset.can_short_open_mask_t,
+        force_short_cover_mask=dataset.force_short_cover_mask_t,
     )

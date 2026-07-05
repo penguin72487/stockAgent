@@ -1,3 +1,11 @@
 sandbox_mode = "danger-full-access"
-
 approval_policy = "never"
+
+[projects."/root/stockAgent"]
+trust_level = "trusted"
+
+[network]
+dns_servers = ["8.8.8.8", "8.8.4.4"]
+
+[sandbox]
+network_isolation = false

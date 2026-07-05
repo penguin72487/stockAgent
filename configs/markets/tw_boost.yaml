@@ -1,17 +1,17 @@
 experiment_name: tw-stock-transformer-market-public-data-all
 
 runner:
-  output_dir: artifacts/markets/tw_public_all
+  output_dir: artifacts/markets/tw_boost
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 5
 environment:
   conda_env: fintech
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  target_vram_fraction: 0.85
+  target_vram_fraction: 0.9
 
 data:
   parquet_root: data_yahoo/tw_stocks
@@ -210,7 +210,8 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  model_name: transformer_base_portfolio
+  seed: 1
+  model_name: gradient_boosted_portfolio_transformer
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
@@ -223,16 +224,16 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: 8
+  eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
-  eval_auto_chunk_rows_cap: 16
+  eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
   detach_prev_state: true
   prefer_fp16: false
   backtest_autotune: true
-  backtest_compile: true
-  backtest_compile_stateful: true
+  backtest_compile: false
+  backtest_compile_stateful: false
   backtest_compile_dynamic: false
   inference_backtest_autotune: false
   inference_backtest_compile: false
@@ -243,9 +244,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 16
-  batch_size_train: 16
-  batch_size_eval: 8
+  batch_size: 96
+  batch_size_train: 96
+  batch_size_eval: 64
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -310,7 +311,7 @@ training:
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
   backtest_artifact_compression: none
-  save_best_val_artifacts: true
+  save_best_val_artifacts: false
   postprocess_benchmark_after_fold: true
   postprocess_benchmark_after_best_val: true
   postprocess_benchmark_split: test
@@ -339,13 +340,13 @@ training:
   num_workers: 0
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  finite_check_interval_steps: 100
+  finite_check_interval_steps: 1
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  vram_budget_gb: 16
-  vram_safety_margin_gb: 1.5
-  target_vram_fraction: 0.85
+  vram_budget_gb: 90
+  vram_safety_margin_gb: 4.0
+  target_vram_fraction: 0.9
   # Model branches. Only the block named by training.model_name is active.
   # Current active branch: transformer_base_portfolio.
   mlp:
@@ -662,6 +663,3 @@ evaluation:
   gamma_cvar_budget: 2.0
   gamma_drawdown_budget: 2.5
   gamma_turnover_budget: 0.5
-  eval_log_utility_pre_log_power: 0.0
-  eval_log_utility_periods_per_year: 252.0
-  eval_log_utility_log_shift: 0.0

@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from stockagent.config import load_config
@@ -38,6 +40,15 @@ def _configure_cuda_runtime() -> None:
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "enable_math_sdp"):
         torch.backends.cuda.enable_math_sdp(True)
+
+
+def _set_global_seed(seed: int) -> None:
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-folds", type=int, default=None, help="Run at most this many folds after --start-fold filtering.")
     parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs for benchmark/smoke runs.")
+    parser.add_argument("--seed", type=int, default=None, help="Override training.seed for PyTorch/NumPy/Python RNGs.")
     parser.add_argument(
         "--explain-after-each-fold",
         action=argparse.BooleanOptionalAction,
@@ -242,6 +254,9 @@ def main() -> None:
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    if args.seed is not None:
+        config.training.seed = int(args.seed)
+    _set_global_seed(int(config.training.seed))
     if args.epochs is not None:
         if args.epochs < 1:
             raise ValueError(f"--epochs must be >= 1, got {args.epochs}")
@@ -370,6 +385,8 @@ def main() -> None:
             config.data.tw_public_feature_path if config.data.use_tw_public_features else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
