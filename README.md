@@ -88,3 +88,10 @@ mamba env update -n fintech -f fintech_environment.yml
 
 mkdir -p "$CONDA_PREFIX/conda-meta"
 nano "$CONDA_PREFIX/conda-meta/pinned"
+
+
+rapids>0.0.1
+cuda-version >=13,<14
+python=3.12
+pydantic >=2.13.4
+transformers >= 5.12.1
