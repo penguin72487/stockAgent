@@ -95,3 +95,6 @@ cuda-version >=13,<14
 python=3.12
 pydantic >=2.13.4
 transformers >= 5.12.1
+
+git config --global user.email "agar.io6100@gmail.com"
+git config --global user.name "penguin72487"
