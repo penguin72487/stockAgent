@@ -617,6 +617,9 @@ def _loss_from_backtest_series(
     gamma_turnover_budget: float,
     objective: str = "sharpe",
     sample_mask: torch.Tensor | None = None,
+    log_utility_pre_log_power: float = 0.0,
+    log_utility_periods_per_year: float = 252.0,
+    log_utility_log_shift: float = 0.0,
 ) -> torch.Tensor:
     if sample_mask is None:
         valid_returns = strategy_returns
@@ -633,7 +636,13 @@ def _loss_from_backtest_series(
 
     objective_norm = objective.strip().lower()
     if objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
-        objective_value = -float(gamma_sharpe) * valid_returns.mean() * valid_returns.new_tensor(252.0)
+        annual_utility = _annual_log_utility_eval_value(
+            valid_returns,
+            pre_log_power=log_utility_pre_log_power,
+            periods_per_year=log_utility_periods_per_year,
+            log_shift=log_utility_log_shift,
+        )
+        objective_value = -float(gamma_sharpe) * annual_utility
     elif objective_norm in {
         "excess_cvar_drawdown",
         "cvar",
@@ -699,6 +708,26 @@ def _loss_from_backtest_series(
 
     turnover_penalty = valid_turnovers.mean() if valid_turnovers.numel() > 0 else valid_returns.new_zeros(())
     return objective_value + gamma_turnover * turnover_penalty
+
+
+def _annual_log_utility_eval_value(
+    strategy_log_returns: torch.Tensor,
+    *,
+    pre_log_power: float = 0.0,
+    periods_per_year: float = 252.0,
+    log_shift: float = 0.0,
+) -> torch.Tensor:
+    clean = torch.nan_to_num(strategy_log_returns.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    if clean.numel() == 0:
+        return clean.sum() * 0.0
+    manual_years = float(pre_log_power)
+    if manual_years > 0.0:
+        years = manual_years
+    else:
+        periods = max(float(periods_per_year), 1e-12)
+        years = float(clean.numel()) / periods
+    annual_log_return = clean.sum() / clean.new_tensor(max(years, 1e-12))
+    return annual_log_return - clean.new_tensor(float(log_shift))
 
 
 def _is_return_series_objective(objective: str) -> bool:
@@ -790,6 +819,9 @@ def _loss_from_backtest_result(
         gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
         gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
         objective=objective,
+        log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
+        log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
+        log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
     )
 
 
@@ -859,6 +891,9 @@ def _batched_loss_from_backtest_segments(
     gamma_drawdown_budget: float,
     gamma_turnover_budget: float,
     objective: str = "sharpe",
+    log_utility_pre_log_power: float = 0.0,
+    log_utility_periods_per_year: float = 252.0,
+    log_utility_log_shift: float = 0.0,
 ) -> torch.Tensor:
     """Compute one validation/test loss per fold without per-fold CPU round trips.
 
@@ -895,6 +930,9 @@ def _batched_loss_from_backtest_segments(
                 gamma_drawdown_budget=gamma_drawdown_budget,
                 gamma_turnover_budget=gamma_turnover_budget,
                 objective=objective,
+                log_utility_pre_log_power=log_utility_pre_log_power,
+                log_utility_periods_per_year=log_utility_periods_per_year,
+                log_utility_log_shift=log_utility_log_shift,
             )
             for idx in range(segment_count)
         ]
@@ -923,7 +961,21 @@ def _batched_loss_from_backtest_segments(
     annualizer = torch.sqrt(torch.as_tensor(252.0, device=device, dtype=calc_dtype))
 
     if objective_norm == "log_utility":
-        objective_value = -float(gamma_sharpe) * mean_return * torch.as_tensor(252.0, device=device, dtype=calc_dtype)
+        manual_years = float(log_utility_pre_log_power)
+        if manual_years > 0.0:
+            years = torch.full_like(count, manual_years)
+        else:
+            years = count / torch.as_tensor(
+                max(float(log_utility_periods_per_year), 1e-12),
+                device=device,
+                dtype=calc_dtype,
+            )
+        annual_utility = r.sum(dim=1) / years.clamp_min(1e-12) - torch.as_tensor(
+            float(log_utility_log_shift),
+            device=device,
+            dtype=calc_dtype,
+        )
+        objective_value = -float(gamma_sharpe) * annual_utility
     elif objective_norm == "sortino":
         downside = torch.minimum(r, torch.zeros_like(r))
         risk_dev = torch.sqrt(downside.pow(2).sum(dim=1) / count + 1e-8)
@@ -2160,18 +2212,26 @@ def _state_dict_for_save(model: nn.Module) -> dict[str, torch.Tensor]:
     return _unwrap_model(model).state_dict()
 
 
+def _all_tensors_are_finite(tensors: Iterable[torch.Tensor]) -> bool:
+    finite: torch.Tensor | None = None
+    for tensor in tensors:
+        if tensor.numel() == 0:
+            continue
+        current = torch.isfinite(tensor.detach()).all()
+        finite = current if finite is None else (finite & current.to(device=finite.device))
+    if finite is None:
+        return True
+    return bool(finite.item())
+
+
 def _model_parameters_are_finite(model: nn.Module) -> bool:
-    for param in _unwrap_model(model).parameters():
-        if not torch.isfinite(param.detach()).all():
-            return False
-    return True
+    return _all_tensors_are_finite(_unwrap_model(model).parameters())
 
 
 def _model_gradients_are_finite(model: nn.Module) -> bool:
-    for param in _unwrap_model(model).parameters():
-        if param.grad is not None and not torch.isfinite(param.grad.detach()).all():
-            return False
-    return True
+    return _all_tensors_are_finite(
+        param.grad for param in _unwrap_model(model).parameters() if param.grad is not None
+    )
 
 
 def _should_check_finite(step: int, interval_steps: int) -> bool:
@@ -2879,15 +2939,19 @@ def _unlink_table_variants(base_path: Path) -> None:
 
 def _write_dataframe_table(df: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    import polars as pl
-
-    frame = df if isinstance(df, pl.DataFrame) else pl.DataFrame(df)
     if output_path.suffix.lower() == ".parquet":
+        import pyarrow as pa
         import pyarrow.parquet as pq
 
-        pq.write_table(frame.to_arrow(), output_path, compression="snappy")
+        pq.write_table(pa.table(df), output_path, compression="snappy")
     elif output_path.suffix.lower() == ".csv":
-        frame.write_csv(output_path)
+        columns = list(df.keys())
+        values = [np.asarray(df[column]) for column in columns]
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(columns)
+            for row in zip(*values):
+                writer.writerow([value.item() if isinstance(value, np.generic) else value for value in row])
     else:
         raise ValueError(f"Unsupported table output extension: {output_path}")
 
@@ -2904,9 +2968,9 @@ def _weight_table_symbols(fold_dir: Path) -> tuple[list[str], Path] | tuple[None
         if not path.exists():
             continue
         if path.suffix.lower() == ".parquet":
-            import polars as pl
+            import pyarrow.parquet as pq
 
-            columns = pl.scan_parquet(path).collect_schema().names()
+            columns = pq.read_schema(path).names
         else:
             with path.open("r", encoding="utf-8", newline="") as handle:
                 columns = next(csv.reader(handle))
@@ -2989,28 +3053,19 @@ def _save_holdings_table(
     holdings: list[HoldingsRecord],
 ) -> None:
     """Save daily holdings detail sorted by date and absolute holding ratio."""
-    import polars as pl
-
-    df = pl.DataFrame(
+    ordered = sorted(holdings, key=lambda row: (row.date, -abs(float(row.holding_ratio)), row.symbol))
+    _write_dataframe_table(
         {
-            "date": [row.date for row in holdings],
-            "symbol": [row.symbol for row in holdings],
-            "shares": [int(row.shares) for row in holdings],
-            "price": [float(row.price) for row in holdings],
-            "market_value": [float(row.market_value) for row in holdings],
-            "holding_ratio": [float(row.holding_ratio) for row in holdings],
-            "is_cash": [bool(row.is_cash) for row in holdings],
-        }
+            "date": [row.date for row in ordered],
+            "symbol": [row.symbol for row in ordered],
+            "shares": [int(row.shares) for row in ordered],
+            "price": [float(row.price) for row in ordered],
+            "market_value": [float(row.market_value) for row in ordered],
+            "holding_ratio": [float(row.holding_ratio) for row in ordered],
+            "is_cash": [bool(row.is_cash) for row in ordered],
+        },
+        output_path,
     )
-    df = (
-        df.with_columns(pl.col("holding_ratio").abs().alias("_abs_holding_ratio"))
-        .sort(
-            by=["date", "_abs_holding_ratio", "symbol"],
-            descending=[False, True, False],
-        )
-        .drop("_abs_holding_ratio")
-    )
-    _write_dataframe_table(df, output_path)
 
 
 def _save_daily_portfolio_returns_table(
@@ -3022,18 +3077,16 @@ def _save_daily_portfolio_returns_table(
     *,
     table_output_format: str,
 ) -> None:
-    import polars as pl
-
     output_path = _table_path(base_path, table_output_format)
-    df = pl.DataFrame(
+    _write_dataframe_table(
         {
             "date": np.asarray(dates),
             "portfolio_return": np.asarray(strategy_returns, dtype=np.float64),
             "benchmark_return": np.asarray(benchmark_returns, dtype=np.float64),
             "turnover": np.asarray(turnovers, dtype=np.float64),
-        }
+        },
+        output_path,
     )
-    _write_dataframe_table(df, output_path)
     for suffix in (".csv", ".parquet"):
         stale_path = base_path.with_suffix(suffix)
         if stale_path != output_path and stale_path.exists():
@@ -3047,12 +3100,9 @@ def _save_daily_weights_table(
     weights_history: np.ndarray,
 ) -> None:
     weights = np.asarray(weights_history, dtype=np.float64)
-    import polars as pl
-
     data = {"date": np.asarray(dates)}
     data.update({symbol: weights[:, idx] for idx, symbol in enumerate(symbols)})
-    df = pl.DataFrame(data)
-    _write_dataframe_table(df, output_path)
+    _write_dataframe_table(data, output_path)
 
 
 def _maybe_save_daily_weights_table(
@@ -10295,6 +10345,9 @@ def run_training(
                     gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
                     gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                     objective=loss_objective,
+                    log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
+                    log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
+                    log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
                 )
                 val_loss_total = time.perf_counter() - val_loss_start
 
@@ -10436,6 +10489,9 @@ def run_training(
                         gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
                         gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                         objective=loss_objective,
+                        log_utility_pre_log_power=config.evaluation.eval_log_utility_pre_log_power,
+                        log_utility_periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
+                        log_utility_log_shift=config.evaluation.eval_log_utility_log_shift,
                     )
                     test_loss_total = time.perf_counter() - test_loss_start
                 curve_test_total = time.perf_counter() - curve_test_start

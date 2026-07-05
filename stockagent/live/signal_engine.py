@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -52,6 +52,31 @@ class LiveSignalResult:
 
 
 LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    *,
+    label: str,
+    step: int,
+    total: int,
+    message: str,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(
+            {
+                "label": label,
+                "step": int(step),
+                "total": int(total),
+                "message": str(message),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+    except Exception:
+        return
 
 
 def _date_string(value: object) -> str:
@@ -182,6 +207,10 @@ def _load_previous_weights(
         return np.zeros((len(symbols),), dtype=np.float64), None, None
 
     last_seen_path: str | None = None
+    best_row: dict[str, Any] | None = None
+    best_date: np.datetime64 | None = None
+    best_path: str | None = None
+    best_rank: int | None = None
     for path in paths:
         if not path.exists():
             continue
@@ -210,17 +239,32 @@ def _load_previous_weights(
 
         frame = frame.sort("date")
         row = frame.tail(1).to_dicts()[0]
-        weights = np.zeros((len(symbols),), dtype=np.float64)
-        for idx, symbol in enumerate(symbols):
-            value = row.get(symbol)
-            if value is None:
-                continue
-            try:
-                weights[idx] = float(value)
-            except Exception:
-                continue
-        return weights, _date_string(row.get("date")), str(path)
-    return np.zeros((len(symbols),), dtype=np.float64), None, last_seen_path
+        row_date = _datetime64_second(row.get("date"))
+        path_rank = paths.index(path)
+        if row_date is None:
+            if best_row is None:
+                best_row = row
+                best_path = str(path)
+                best_rank = path_rank
+            continue
+        if best_date is None or row_date > best_date or (row_date == best_date and path_rank < int(best_rank or 0)):
+            best_row = row
+            best_date = row_date
+            best_path = str(path)
+            best_rank = path_rank
+
+    if best_row is None:
+        return np.zeros((len(symbols),), dtype=np.float64), None, last_seen_path
+    weights = np.zeros((len(symbols),), dtype=np.float64)
+    for idx, symbol in enumerate(symbols):
+        value = best_row.get(symbol)
+        if value is None:
+            continue
+        try:
+            weights[idx] = float(value)
+        except Exception:
+            continue
+    return weights, _date_string(best_row.get("date")), best_path
 
 
 def _resolve_panel_index(panel: PanelData, panel_date: str | None, lookback: int) -> int:
@@ -287,6 +331,30 @@ def _find_panel_date_index(panel: PanelData, date_text: str | None) -> int | Non
     if matches.size == 0:
         return None
     return int(matches[-1])
+
+
+def _live_weights_has_date(fold_dir: str | Path, date_text: str | None) -> bool:
+    if not date_text:
+        return False
+    path = Path(fold_dir) / LIVE_SIGNAL_WEIGHTS_NAME
+    if not path.exists():
+        return False
+    try:
+        frame = _read_table(path)
+    except Exception:
+        return False
+    if "date" not in frame.columns or frame.height == 0:
+        return False
+    target = _datetime64_second(date_text)
+    for raw in frame.get_column("date").to_list():
+        raw_dt = _datetime64_second(raw)
+        if target is not None and raw_dt is not None:
+            if raw_dt == target:
+                return True
+            continue
+        if _date_string(raw) == _date_string(date_text):
+            return True
+    return False
 
 
 def write_live_weights_history(
@@ -977,7 +1045,13 @@ def generate_live_signal(
     display_timezone: str | None = DEFAULT_DISPLAY_TIMEZONE,
     daily_bar_time: str | None = None,
     write: bool = True,
+    ensure_previous_signal: bool = True,
+    progress_callback: ProgressCallback | None = None,
+    progress_label: str | None = None,
 ) -> LiveSignalResult:
+    progress_total = 17
+    progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
+    _emit_progress(progress_callback, label=progress_name, step=1, total=progress_total, message="load config")
     config = load_config(config_path)
     if device is not None:
         config.environment.device = str(device)
@@ -994,6 +1068,7 @@ def generate_live_signal(
 
     resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
     resolved_fold_id, checkpoint = _resolve_checkpoint(resolved_output_dir, fold_id, checkpoint_path)
+    _emit_progress(progress_callback, label=progress_name, step=2, total=progress_total, message=f"checkpoint fold={resolved_fold_id}")
     market_id = str(market or "").strip()
     market_name = str(market_label or market_id or "").strip()
     source_timezone = str(data_timezone or display_timezone or DEFAULT_DISPLAY_TIMEZONE)
@@ -1008,17 +1083,20 @@ def generate_live_signal(
     non_blocking = bool(config.training.non_blocking_transfer and runtime_device.type == "cuda")
 
     checkpoint_payload = _load_checkpoint(checkpoint)
+    _emit_progress(progress_callback, label=progress_name, step=3, total=progress_total, message="checkpoint loaded")
     state_dict = checkpoint_payload.get("model_state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
 
     panel = _build_panel(config)
+    _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
     panel = _align_panel_to_state_dict_universe(
         panel,
         resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         state_dict,
         context=f"live signal {market_id or resolved_fold_id}",
     )
+    _emit_progress(progress_callback, label=progress_name, step=5, total=progress_total, message="universe aligned")
     symbol_names = load_symbol_name_map(config.data.parquet_root)
     panel_idx, panel_fallback_notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
     panel_date_str = _date_string(panel.dates[panel_idx])
@@ -1030,6 +1108,13 @@ def generate_live_signal(
             else panel_fallback_notice
         )
     resolved_asof = asof_date or _now_text(source_timezone)
+    _emit_progress(
+        progress_callback,
+        label=progress_name,
+        step=6,
+        total=progress_total,
+        message=f"panel_date={panel_display_date}",
+    )
 
     panel_prices = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
     price_snapshot = _price_snapshot(
@@ -1041,6 +1126,60 @@ def generate_live_signal(
         yahoo_chunk_size=yahoo_chunk_size,
     )
     current_prices = price_snapshot.prices
+    _emit_progress(
+        progress_callback,
+        label=progress_name,
+        step=7,
+        total=progress_total,
+        message=f"prices source={price_snapshot.source} available={price_snapshot.available_count}/{panel.num_symbols}",
+    )
+
+    expected_previous_data_date = _previous_usable_panel_date(panel, panel_idx, config.training.lookback)
+    fold_dir = checkpoint.parent
+    _emit_progress(progress_callback, label=progress_name, step=8, total=progress_total, message="check previous signal")
+    if (
+        ensure_previous_signal
+        and write
+        and not intraday_frequency
+        and weights_path is None
+        and expected_previous_data_date
+        and not _live_weights_has_date(fold_dir, expected_previous_data_date)
+    ):
+        previous_asof = _daily_bar_timestamp(expected_previous_data_date, daily_bar_time) or expected_previous_data_date
+        previous_notice = (
+            f"自動補生上一交易日 `{previous_asof}` 的 live signal，作為本次上個訊號/持倉基準。"
+        )
+        generate_live_signal(
+            market=market_id,
+            market_label=market_name,
+            config_path=config_path,
+            output_dir=resolved_output_dir,
+            live_output_dir=live_output_dir,
+            fold_id=resolved_fold_id,
+            checkpoint_path=checkpoint,
+            weights_path=None,
+            panel_date=expected_previous_data_date,
+            asof_date=previous_asof,
+            price_source="panel",
+            prices_csv=None,
+            yahoo_chunk_size=yahoo_chunk_size,
+            device=device,
+            top_n=top_n,
+            min_abs_delta=min_abs_delta,
+            signal_id=None,
+            market_notice=previous_notice,
+            benchmark_window_days=benchmark_window_days,
+            max_turnover_warning=max_turnover_warning,
+            max_top_weight_warning=max_top_weight_warning,
+            max_gross_warning=max_gross_warning,
+            data_timezone=data_timezone,
+            display_timezone=display_timezone,
+            daily_bar_time=daily_bar_time,
+            write=True,
+            ensure_previous_signal=False,
+            progress_callback=progress_callback,
+            progress_label=f"{progress_name}:previous",
+        )
 
     previous_weights, previous_weights_date, previous_weights_path = _load_previous_weights(
         panel.symbols,
@@ -1055,7 +1194,13 @@ def generate_live_signal(
     previous_weights_display_date = (
         previous_weights_date if intraday_frequency else _daily_bar_timestamp(previous_weights_date, daily_bar_time)
     )
-    expected_previous_data_date = _previous_usable_panel_date(panel, panel_idx, config.training.lookback)
+    _emit_progress(
+        progress_callback,
+        label=progress_name,
+        step=9,
+        total=progress_total,
+        message=f"previous_weights={previous_weights_display_date or previous_weights_date or 'none'}",
+    )
     if expected_previous_data_date and previous_weights_data_date:
         expected_prev_dt = _datetime64_second(expected_previous_data_date)
         actual_prev_dt = _datetime64_second(previous_weights_data_date)
@@ -1077,6 +1222,7 @@ def generate_live_signal(
     drift_base_display_date = drift_base_date if intraday_frequency else _daily_bar_timestamp(drift_base_date, daily_bar_time)
     drift_base_prices = np.asarray(panel.close_prices[drift_base_idx], dtype=np.float64)
     drift = estimate_drifted_weights(previous_weights, drift_base_prices, current_prices)
+    _emit_progress(progress_callback, label=progress_name, step=10, total=progress_total, message="mark previous holdings")
 
     model = build_model(
         config=config,
@@ -1086,6 +1232,7 @@ def generate_live_signal(
     ).to(runtime_device)
     _load_state_dict(model, state_dict)
     model.eval()
+    _emit_progress(progress_callback, label=progress_name, step=11, total=progress_total, message="model ready")
 
     start = panel_idx - int(config.training.lookback) + 1
     x_np = np.nan_to_num(panel.features[start : panel_idx + 1], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -1099,6 +1246,7 @@ def generate_live_signal(
         with _autocast_context(runtime_device, amp_dtype):
             model_output = _call_model(model, x, mask, return_aux=True)
             model_weights_t, aux = _extract_weights_and_aux(model_output)
+        _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
         zero_returns = torch.zeros_like(model_weights_t, dtype=torch.float32)
         initial = torch.from_numpy(drift.weights.astype(np.float32)).to(device=runtime_device, non_blocking=non_blocking)
         backtest = run_backtest_torch(
@@ -1122,6 +1270,7 @@ def generate_live_signal(
         target_weights = backtest.final_weights.detach().float().cpu().numpy().astype(np.float64)
         turnover = float(backtest.turnovers[0].detach().float().cpu().item())
         estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
+    _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
 
     score_values: np.ndarray | None = None
     if aux is not None:
@@ -1180,6 +1329,7 @@ def generate_live_signal(
         valid_scores = np.asarray(score_values, dtype=np.float64)[mask_np]
         if valid_scores.size:
             confidence_proxy = float(np.nanstd(valid_scores))
+    _emit_progress(progress_callback, label=progress_name, step=14, total=progress_total, message="risk and explanations ready")
 
     weights_rows: list[dict[str, Any]] = []
     price_return = np.divide(
@@ -1237,6 +1387,7 @@ def generate_live_signal(
     )
     actionable_decisions = [row for row in decision_rows if str(row.get("action") or "") != "HOLD"]
     decision_action_counts = _action_counts(decision_rows)
+    _emit_progress(progress_callback, label=progress_name, step=15, total=progress_total, message="rows formatted")
 
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     summary: dict[str, Any] = {
@@ -1320,6 +1471,7 @@ def generate_live_signal(
         summary["model_explanation_path"] = str(output_path / "model_explanation.json")
         summary["discord_message_path"] = str(output_path / "discord_message.md")
     message = format_signal_message(summary, max_rows=top_n)
+    _emit_progress(progress_callback, label=progress_name, step=16, total=progress_total, message="discord message ready")
     result = LiveSignalResult(
         summary=summary,
         weights_rows=weights_rows,
@@ -1338,4 +1490,5 @@ def generate_live_signal(
             json.dumps(result.summary, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    _emit_progress(progress_callback, label=progress_name, step=17, total=progress_total, message="done")
     return result
