@@ -35,6 +35,8 @@ def main():
             config.data.tw_public_feature_path if config.data.use_tw_public_features else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
     )
     print(f"  Panel shape: {panel.features.shape} (T={panel.num_dates}, S={panel.num_symbols}, F={len(panel.feature_names)})")
     

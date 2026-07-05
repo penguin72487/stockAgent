@@ -201,3 +201,4 @@ data_bybit/*
 data_yahoo_tw_ohlcv/*
 data/*
 data_tw_public/*
+.codex/*

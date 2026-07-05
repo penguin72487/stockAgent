@@ -19,8 +19,6 @@ STOCK_FEATURE_COLUMNS = (
     "twpub_official_intraday_range",
     "twpub_official_close_to_high",
     "twpub_official_close_to_low",
-    "twpub_tpex_next_limit_up_ret",
-    "twpub_tpex_next_limit_down_ret",
     "twpub_pe_log",
     "twpub_pb_log",
     "twpub_dividend_yield",
@@ -55,7 +53,6 @@ STOCK_FEATURE_COLUMNS = (
     "twpub_dividend_total_stock_log",
     "twpub_dividend_confirmed",
     "twpub_dividend_board_approved",
-    "twpub_dividend_year",
     "twpub_exdiv_known",
     "twpub_exdiv_cash_dividend",
     "twpub_exdiv_stock_dividend_ratio",
@@ -64,11 +61,9 @@ STOCK_FEATURE_COLUMNS = (
     "twpub_material_event_count_log",
     "twpub_material_clause_log",
     "twpub_material_fact_lag_days",
-    "twpub_attention_flag",
     "twpub_attention_count_log",
     "twpub_attention_close_log",
     "twpub_attention_pe_log",
-    "twpub_disposal_flag",
     "twpub_disposal_count_log",
 )
 
@@ -117,6 +112,14 @@ MARKET_FEATURE_COLUMNS = (
 )
 
 FEATURE_COLUMNS = (*STOCK_FEATURE_COLUMNS, *MARKET_FEATURE_COLUMNS)
+RULE_COLUMNS = (
+    "_twpub_tpex_next_limit_up_ret",
+    "_twpub_tpex_next_limit_down_ret",
+    "_twpub_dividend_year",
+    "_twpub_attention_flag",
+    "_twpub_disposal_flag",
+)
+OUTPUT_COLUMNS = (*FEATURE_COLUMNS, *RULE_COLUMNS)
 KEY_COLUMNS = ("date", "symbol")
 AVAILABILITY_POLICY = {
     "historical_daily": "official session/trading date; usable for next-session labels",
@@ -191,7 +194,7 @@ def build_tw_public_training_features(
             {
                 "date": pl.Series([], dtype=pl.Date),
                 "symbol": pl.Series([], dtype=pl.Utf8),
-                **{name: pl.Series([], dtype=pl.Float64) for name in FEATURE_COLUMNS},
+                **{name: pl.Series([], dtype=pl.Float64) for name in OUTPUT_COLUMNS},
             }
         )
 
@@ -223,6 +226,7 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "market_rows": result.market_rows,
         "source_files": result.source_files,
         "feature_columns": list(FEATURE_COLUMNS),
+        "rule_columns": list(RULE_COLUMNS),
         "market_symbol": result.market_symbol,
         "availability_policy": AVAILABILITY_POLICY,
     }
@@ -261,15 +265,15 @@ def _merge_feature_frames(frames: Iterable[pl.DataFrame]) -> pl.DataFrame:
 def _finalize_feature_frame(frame: pl.DataFrame) -> pl.DataFrame:
     if frame.is_empty():
         return frame
-    feature_cols = [col for col in frame.columns if col not in KEY_COLUMNS and col in FEATURE_COLUMNS]
-    if not feature_cols:
+    output_cols = [col for col in frame.columns if col not in KEY_COLUMNS and col in OUTPUT_COLUMNS]
+    if not output_cols:
         return pl.DataFrame()
     frame = (
         frame.select(
             [
                 _date_column_expr("date").alias("date"),
                 _symbol_expr("symbol").alias("symbol"),
-                *[pl.col(col).cast(pl.Float64, strict=False).alias(col) for col in feature_cols],
+                *[pl.col(col).cast(pl.Float64, strict=False).alias(col) for col in output_cols],
             ]
         )
         .drop_nulls(["date", "symbol"])
@@ -277,13 +281,13 @@ def _finalize_feature_frame(frame: pl.DataFrame) -> pl.DataFrame:
     )
     if frame.is_empty():
         return frame
-    return frame.group_by(["date", "symbol"]).agg([pl.col(col).drop_nulls().last().alias(col) for col in feature_cols])
+    return frame.group_by(["date", "symbol"]).agg([pl.col(col).drop_nulls().last().alias(col) for col in output_cols])
 
 
 def _ensure_feature_columns(frame: pl.DataFrame) -> pl.DataFrame:
     columns = set(frame.columns)
     expressions = []
-    for name in FEATURE_COLUMNS:
+    for name in OUTPUT_COLUMNS:
         if name in columns:
             expressions.append(pl.col(name).cast(pl.Float64, strict=False).alias(name))
         else:
@@ -546,8 +550,8 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                     _safe_ratio(high - low, close).alias("twpub_official_intraday_range"),
                     _safe_ratio(close, high).alias("twpub_official_close_to_high"),
                     _safe_ratio(close, low).alias("twpub_official_close_to_low"),
-                    _safe_log_ratio(_num_expr("次日漲停價"), close).alias("twpub_tpex_next_limit_up_ret"),
-                    _safe_log_ratio(_num_expr("次日跌停價"), close).alias("twpub_tpex_next_limit_down_ret"),
+                    _safe_log_ratio(_num_expr("次日漲停價"), close).alias("_twpub_tpex_next_limit_up_ret"),
+                    _safe_log_ratio(_num_expr("次日跌停價"), close).alias("_twpub_tpex_next_limit_down_ret"),
                 ]
             )
         )
@@ -911,7 +915,7 @@ def _build_dividend_features(input_dir: Path) -> pl.DataFrame:
                     ),
                     _binary_contains_expr(columns, "決議（擬議）進度", "股東會").alias("twpub_dividend_confirmed"),
                     _binary_contains_expr(columns, "決議（擬議）進度", "董事會").alias("twpub_dividend_board_approved"),
-                    _optional_num_expr(columns, "股利年度").alias("twpub_dividend_year"),
+                    _optional_num_expr(columns, "股利年度").alias("_twpub_dividend_year"),
                 ]
             )
         )
@@ -954,7 +958,7 @@ def _build_dividend_features(input_dir: Path) -> pl.DataFrame:
                     ),
                     pl.lit(None, dtype=pl.Float64).alias("twpub_dividend_confirmed"),
                     pl.lit(1.0).alias("twpub_dividend_board_approved"),
-                    _optional_num_expr(columns, "股利年度").alias("twpub_dividend_year"),
+                    _optional_num_expr(columns, "股利年度").alias("_twpub_dividend_year"),
                 ]
             )
         )
@@ -1039,7 +1043,7 @@ def _build_attention_disposal_features(input_dir: Path) -> pl.DataFrame:
             frames.append(
                 base.group_by(["date", "symbol"]).agg(
                     [
-                        pl.lit(1.0).alias("twpub_attention_flag"),
+                        pl.lit(1.0).alias("_twpub_attention_flag"),
                         (pl.len().cast(pl.Float64) + 1.0).log().alias("twpub_attention_count_log"),
                         _positive_log1p(pl.col("_close").max()).alias("twpub_attention_close_log"),
                         _positive_log1p(pl.col("_pe").max()).alias("twpub_attention_pe_log"),
@@ -1050,7 +1054,7 @@ def _build_attention_disposal_features(input_dir: Path) -> pl.DataFrame:
             frames.append(
                 base.group_by(["date", "symbol"]).agg(
                     [
-                        pl.lit(1.0).alias("twpub_disposal_flag"),
+                        pl.lit(1.0).alias("_twpub_disposal_flag"),
                         (pl.len().cast(pl.Float64) + 1.0).log().alias("twpub_disposal_count_log"),
                     ]
                 )

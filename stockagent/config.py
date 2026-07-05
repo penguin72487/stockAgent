@@ -43,6 +43,25 @@ def _normalize_portfolio_activation(activation: str | None) -> str:
     return normalized
 
 
+def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raise ValueError(f"{field_name} must be a list or comma-separated string, got {type(value).__name__}")
+
+    items: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.startswith("#"):
+            continue
+        items.append(text)
+    return items
+
+
 def _normalize_portfolio_output_mode(mode: str | None) -> str:
     normalized = str(mode or "activation_l1").strip().lower().replace("-", "_")
     if normalized in {
@@ -127,6 +146,8 @@ class DataConfig:
     use_tw_public_features: bool = False
     tw_public_feature_path: str = "data_tw_public/features/tw_public_stock_daily.parquet"
     tw_public_market_symbol: str = "__MARKET__"
+    feature_include: list[str] = field(default_factory=list)
+    feature_exclude: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -329,6 +350,40 @@ class TransformerBasePortfolioModelConfig:
     checkpoint_blocks: bool = False
     return_aux: bool = True
     return_aux_details: bool = False
+    categorical_feature_names: list[str] = field(default_factory=list)
+    categorical_embedding_dim: int = 4
+    categorical_embedding_cardinality: int = 512
+
+
+@dataclass(slots=True)
+class GradientBoostedPortfolioTransformerConfig:
+    d_model: int = 64
+    temporal_layers: int = 2
+    temporal_heads: int = 4
+    temporal_ffn_mult: int = 2
+    market_layers: int = 1
+    market_heads: int = 4
+    market_ffn_mult: int = 2
+    num_market_tokens: int = 4
+    head_hidden_dim: int = 64
+    head_layers: int = 1
+    dropout: float = 0.1
+    input_dropout: float = 0.0
+    use_time_pos: bool = True
+    use_symbol_pos: bool = False
+    dynamic_market_tokens: bool = True
+    dynamic_token_gate_init: float = 0.1
+    num_residual_stages: int = 2
+    stage_eta: list[float] = field(default_factory=lambda: [0.5, 0.25])
+    trainable_eta: bool = True
+    eta_max: float = 1.0
+    detach_stage_condition: bool = True
+    default_temperature: float = 1.0
+    portfolio_mode: str = "auto"
+    portfolio_output_mode: str = "projection_l1"
+    center_final_logits: bool = True
+    return_aux: bool = True
+    return_aux_details: bool = False
 
 
 @dataclass(slots=True)
@@ -451,6 +506,7 @@ class TrainingConfig:
     batch_mode: str
     non_blocking_transfer: bool
     model_name: str
+    seed: int = 42
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
@@ -604,6 +660,9 @@ class TrainingConfig:
     transformer_base_portfolio: TransformerBasePortfolioModelConfig = field(
         default_factory=TransformerBasePortfolioModelConfig
     )
+    gradient_boosted_portfolio_transformer: GradientBoostedPortfolioTransformerConfig = field(
+        default_factory=GradientBoostedPortfolioTransformerConfig
+    )
     bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(default_factory=BottleneckPortfolioAutoencoderConfig)
     tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
     temporal_tabular_resnet: TemporalTabularResNetModelConfig = field(default_factory=TemporalTabularResNetModelConfig)
@@ -664,6 +723,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward.setdefault("require_future_test_year", True)
 
     training = raw.setdefault("training", {})
+    training.setdefault("seed", 42)
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
     training.setdefault("batch_size_train", training.get("batch_size", 32))
@@ -1024,6 +1084,61 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
     transformer_base_portfolio.setdefault("return_aux_details", False)
+    transformer_base_portfolio.setdefault(
+        "categorical_feature_names",
+        [
+            "twpub_company_industry_code",
+            "twpub_company_is_foreign",
+            "twpub_company_has_preferred_stock",
+        ],
+    )
+    transformer_base_portfolio["categorical_feature_names"] = _normalize_string_list(
+        transformer_base_portfolio.get("categorical_feature_names"),
+        field_name="training.transformer_base_portfolio.categorical_feature_names",
+    )
+    transformer_base_portfolio["categorical_embedding_dim"] = max(
+        1, int(transformer_base_portfolio.get("categorical_embedding_dim", 4))
+    )
+    transformer_base_portfolio["categorical_embedding_cardinality"] = max(
+        2, int(transformer_base_portfolio.get("categorical_embedding_cardinality", 512))
+    )
+
+    gradient_boosted_portfolio_transformer = training.setdefault("gradient_boosted_portfolio_transformer", {})
+    gradient_boosted_portfolio_transformer.setdefault("d_model", transformer_base_portfolio.get("d_model", 64))
+    gradient_boosted_portfolio_transformer.setdefault("temporal_layers", 2)
+    gradient_boosted_portfolio_transformer.setdefault("temporal_heads", 4)
+    gradient_boosted_portfolio_transformer.setdefault("temporal_ffn_mult", 2)
+    gradient_boosted_portfolio_transformer.setdefault("market_layers", 1)
+    gradient_boosted_portfolio_transformer.setdefault("market_heads", 4)
+    gradient_boosted_portfolio_transformer.setdefault("market_ffn_mult", 2)
+    gradient_boosted_portfolio_transformer.setdefault("num_market_tokens", 4)
+    gradient_boosted_portfolio_transformer.setdefault("head_hidden_dim", 64)
+    gradient_boosted_portfolio_transformer.setdefault("head_layers", 1)
+    gradient_boosted_portfolio_transformer.setdefault("dropout", legacy_dropout)
+    gradient_boosted_portfolio_transformer.setdefault("input_dropout", 0.0)
+    gradient_boosted_portfolio_transformer.setdefault("use_time_pos", True)
+    gradient_boosted_portfolio_transformer.setdefault("use_symbol_pos", False)
+    gradient_boosted_portfolio_transformer.setdefault("dynamic_market_tokens", True)
+    gradient_boosted_portfolio_transformer.setdefault("dynamic_token_gate_init", 0.1)
+    gradient_boosted_portfolio_transformer.setdefault("num_residual_stages", 2)
+    raw_stage_eta = gradient_boosted_portfolio_transformer.get("stage_eta", [0.5, 0.25])
+    if isinstance(raw_stage_eta, str):
+        stage_eta = [float(item.strip()) for item in raw_stage_eta.split(",") if item.strip()]
+    else:
+        stage_eta = [float(item) for item in (raw_stage_eta or [0.5, 0.25])]
+    gradient_boosted_portfolio_transformer["stage_eta"] = stage_eta or [0.5, 0.25]
+    gradient_boosted_portfolio_transformer.setdefault("trainable_eta", True)
+    gradient_boosted_portfolio_transformer.setdefault("eta_max", 1.0)
+    gradient_boosted_portfolio_transformer.setdefault("detach_stage_condition", True)
+    gradient_boosted_portfolio_transformer.setdefault("default_temperature", 1.0)
+    gradient_boosted_portfolio_transformer.setdefault("portfolio_mode", "auto")
+    gradient_boosted_portfolio_transformer.setdefault("portfolio_output_mode", "projection_l1")
+    gradient_boosted_portfolio_transformer["portfolio_output_mode"] = _normalize_portfolio_output_mode(
+        gradient_boosted_portfolio_transformer.get("portfolio_output_mode")
+    )
+    gradient_boosted_portfolio_transformer.setdefault("center_final_logits", True)
+    gradient_boosted_portfolio_transformer.setdefault("return_aux", True)
+    gradient_boosted_portfolio_transformer.setdefault("return_aux_details", False)
 
     bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
     bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
@@ -1181,6 +1296,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("use_tw_public_features", False)
     data.setdefault("tw_public_feature_path", "data_tw_public/features/tw_public_stock_daily.parquet")
     data.setdefault("tw_public_market_symbol", "__MARKET__")
+    data.setdefault("feature_include", [])
+    data.setdefault("feature_exclude", [])
 
     trading = raw.setdefault("trading", {})
 
@@ -1251,6 +1368,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["use_tw_public_features"] = bool(data.get("use_tw_public_features", False))
     data["tw_public_feature_path"] = str(data.get("tw_public_feature_path") or "").strip()
     data["tw_public_market_symbol"] = str(data.get("tw_public_market_symbol") or "__MARKET__").strip() or "__MARKET__"
+    data["feature_include"] = _normalize_string_list(data.get("feature_include"), field_name="data.feature_include")
+    data["feature_exclude"] = _normalize_string_list(data.get("feature_exclude"), field_name="data.feature_exclude")
     plot_backend = str(training.get("plot_backend", "auto")).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:
@@ -1385,6 +1504,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             batch_mode=training_raw["batch_mode"],
             non_blocking_transfer=training_raw["non_blocking_transfer"],
             model_name=training_raw["model_name"],
+            seed=training_raw["seed"],
             enable_torch_compile=training_raw["enable_torch_compile"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],
@@ -1539,6 +1659,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             transformer_base_portfolio=TransformerBasePortfolioModelConfig(
                 **training_raw["transformer_base_portfolio"]
+            ),
+            gradient_boosted_portfolio_transformer=GradientBoostedPortfolioTransformerConfig(
+                **training_raw["gradient_boosted_portfolio_transformer"]
             ),
             bottleneck_portfolio_autoencoder=BottleneckPortfolioAutoencoderConfig(
                 **training_raw["bottleneck_portfolio_autoencoder"]

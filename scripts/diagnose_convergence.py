@@ -763,6 +763,7 @@ def _load_or_build_model(
         lookback=config.training.lookback,
         num_features=len(panel.feature_names),
         num_symbols=panel.num_symbols,
+        feature_names=panel.feature_names,
     ).to(device)
     if state_dict is not None:
         _load_state_dict(model, state_dict)
@@ -1003,6 +1004,12 @@ def main() -> None:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        external_feature_path=(
+            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+        ),
+        external_market_symbol=config.data.tw_public_market_symbol,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

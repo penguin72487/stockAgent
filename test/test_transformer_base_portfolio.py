@@ -114,6 +114,29 @@ def test_full_mode_token_guard() -> None:
         model(x, mask)
 
 
+def test_categorical_feature_embedding_forward_path() -> None:
+    device = _device()
+    model = _make_model(
+        num_features=5,
+        categorical_feature_indices=[2, 4],
+        categorical_embedding_dim=3,
+        categorical_embedding_cardinality=16,
+    ).eval()
+    x = torch.randn(2, 6, 13, 5, device=device)
+    x[..., 2] = torch.randint(0, 10, x[..., 2].shape, device=device).float()
+    x[..., 4] = torch.randint(0, 2, x[..., 4].shape, device=device).float()
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        out = model(x, mask)
+
+    weights, _ = _extract_weights_and_aux(out)
+    assert model.categorical_feature_indices == (2, 4)
+    assert len(model.categorical_embeddings) == 2
+    assert weights.shape == (2, 13)
+    assert torch.isfinite(weights).all()
+
+
 def test_sdpa_batch_chunking_matches_unchunked_eval() -> None:
     device = _device()
     unchunked = _make_model(sdpa_batch_limit=0).eval()
