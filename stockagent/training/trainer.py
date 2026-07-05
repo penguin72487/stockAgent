@@ -2160,23 +2160,39 @@ def _state_dict_for_save(model: nn.Module) -> dict[str, torch.Tensor]:
     return _unwrap_model(model).state_dict()
 
 
-def _model_parameters_are_finite(model: nn.Module) -> bool:
-    for param in _unwrap_model(model).parameters():
+def _first_nonfinite_model_parameter(model: nn.Module) -> str | None:
+    for name, param in _unwrap_model(model).named_parameters():
         if not torch.isfinite(param.detach()).all():
-            return False
-    return True
+            return name
+    return None
+
+
+def _first_nonfinite_model_gradient(model: nn.Module) -> str | None:
+    for name, param in _unwrap_model(model).named_parameters():
+        if param.grad is not None and not torch.isfinite(param.grad.detach()).all():
+            return name
+    return None
+
+
+def _model_parameters_are_finite(model: nn.Module) -> bool:
+    return _first_nonfinite_model_parameter(model) is None
 
 
 def _model_gradients_are_finite(model: nn.Module) -> bool:
-    for param in _unwrap_model(model).parameters():
-        if param.grad is not None and not torch.isfinite(param.grad.detach()).all():
-            return False
-    return True
+    return _first_nonfinite_model_gradient(model) is None
 
 
-def _should_check_finite(step: int, interval_steps: int) -> bool:
+def _should_check_finite(step: int, interval_steps: int, *, final_step: bool = False) -> bool:
     interval = int(interval_steps)
-    return interval > 0 and int(step) % interval == 0
+    if interval <= 0:
+        return False
+    return bool(final_step) or int(step) % interval == 0
+
+
+def _raise_if_model_parameters_nonfinite(model: nn.Module, context: str) -> None:
+    bad_name = _first_nonfinite_model_parameter(model)
+    if bad_name is not None:
+        raise RuntimeError(f"{context}: first non-finite parameter={bad_name}")
 
 
 def _tensor_is_finite(value: torch.Tensor) -> bool:
@@ -2245,8 +2261,10 @@ def _save_fold_checkpoint(
     scaler: GradScaler,
     include_optimizer: bool = False,
 ) -> None:
-    if not _model_parameters_are_finite(model):
-        raise RuntimeError(f"Refusing to save non-finite model checkpoint: {checkpoint_path}")
+    _raise_if_model_parameters_nonfinite(
+        model,
+        f"Refusing to save non-finite model checkpoint: {checkpoint_path}",
+    )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "fold_id": fold.fold_id,
@@ -2281,8 +2299,10 @@ def _save_group_checkpoint(
     early_stopping_no_improve_ratio: float = 0.0,
     early_stop_val_interval_epochs: int = 1,
 ) -> None:
-    if not _model_parameters_are_finite(model):
-        raise RuntimeError(f"Refusing to save non-finite model checkpoint: {checkpoint_path}")
+    _raise_if_model_parameters_nonfinite(
+        model,
+        f"Refusing to save non-finite model checkpoint: {checkpoint_path}",
+    )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     scheduler_state = scheduler.state_dict() if scheduler is not None else None
     torch.save(
@@ -6866,7 +6886,11 @@ def _train_epoch(
                     )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
-        should_check_finite = _should_check_finite(batch_no, finite_check_interval_steps)
+        should_check_finite = _should_check_finite(
+            batch_no,
+            finite_check_interval_steps,
+            final_step=total_batches > 0 and batch_no >= total_batches,
+        )
         if should_check_finite:
             finite_start = time.perf_counter()
             loss_is_finite = _tensor_is_finite(loss)
@@ -6982,7 +7006,7 @@ def _train_epoch(
             parameters_are_finite = _model_parameters_are_finite(model)
             timing.finite_check_s += time.perf_counter() - finite_start
             if not parameters_are_finite:
-                raise RuntimeError("Model parameters became non-finite after optimizer step")
+                _raise_if_model_parameters_nonfinite(model, "Model parameters became non-finite after optimizer step")
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
@@ -7183,7 +7207,11 @@ def _train_epoch_tensor(
                     )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
-        should_check_finite = _should_check_finite(step_idx, finite_check_interval_steps)
+        should_check_finite = _should_check_finite(
+            step_idx,
+            finite_check_interval_steps,
+            final_step=step_idx >= num_batches,
+        )
         if should_check_finite:
             finite_start = time.perf_counter()
             loss_is_finite = _tensor_is_finite(loss)
@@ -7299,7 +7327,7 @@ def _train_epoch_tensor(
             parameters_are_finite = _model_parameters_are_finite(model)
             timing.finite_check_s += time.perf_counter() - finite_start
             if not parameters_are_finite:
-                raise RuntimeError("Model parameters became non-finite after optimizer step")
+                _raise_if_model_parameters_nonfinite(model, "Model parameters became non-finite after optimizer step")
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
@@ -7531,7 +7559,11 @@ def _train_epoch_windowed_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
 
-        should_check_finite = _should_check_finite(step_idx, finite_check_interval_steps)
+        should_check_finite = _should_check_finite(
+            step_idx,
+            finite_check_interval_steps,
+            final_step=step_idx >= num_batches,
+        )
         if should_check_finite:
             finite_start = time.perf_counter()
             loss_is_finite = _tensor_is_finite(loss)
@@ -7623,7 +7655,7 @@ def _train_epoch_windowed_tensor(
             parameters_are_finite = _model_parameters_are_finite(model)
             timing.finite_check_s += time.perf_counter() - finite_start
             if not parameters_are_finite:
-                raise RuntimeError("Model parameters became non-finite after optimizer step")
+                _raise_if_model_parameters_nonfinite(model, "Model parameters became non-finite after optimizer step")
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start

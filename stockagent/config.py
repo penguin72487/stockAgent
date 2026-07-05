@@ -356,6 +356,37 @@ class TransformerBasePortfolioModelConfig:
 
 
 @dataclass(slots=True)
+class GradientBoostedPortfolioTransformerConfig:
+    d_model: int = 64
+    temporal_layers: int = 2
+    temporal_heads: int = 4
+    temporal_ffn_mult: int = 2
+    market_layers: int = 1
+    market_heads: int = 4
+    market_ffn_mult: int = 2
+    num_market_tokens: int = 4
+    head_hidden_dim: int = 64
+    head_layers: int = 1
+    dropout: float = 0.1
+    input_dropout: float = 0.0
+    use_time_pos: bool = True
+    use_symbol_pos: bool = False
+    dynamic_market_tokens: bool = True
+    dynamic_token_gate_init: float = 0.1
+    num_residual_stages: int = 2
+    stage_eta: list[float] = field(default_factory=lambda: [0.5, 0.25])
+    trainable_eta: bool = True
+    eta_max: float = 1.0
+    detach_stage_condition: bool = True
+    default_temperature: float = 1.0
+    portfolio_mode: str = "auto"
+    portfolio_output_mode: str = "projection_l1"
+    center_final_logits: bool = True
+    return_aux: bool = True
+    return_aux_details: bool = False
+
+
+@dataclass(slots=True)
 class BottleneckPortfolioAutoencoderConfig:
     d_model: int = 128
     z_dim: int = 32
@@ -627,6 +658,9 @@ class TrainingConfig:
     )
     transformer_base_portfolio: TransformerBasePortfolioModelConfig = field(
         default_factory=TransformerBasePortfolioModelConfig
+    )
+    gradient_boosted_portfolio_transformer: GradientBoostedPortfolioTransformerConfig = field(
+        default_factory=GradientBoostedPortfolioTransformerConfig
     )
     bottleneck_portfolio_autoencoder: BottleneckPortfolioAutoencoderConfig = field(default_factory=BottleneckPortfolioAutoencoderConfig)
     tcn_hybrid_tabular_resnet: TCNHybridTabularResNetModelConfig = field(default_factory=TCNHybridTabularResNetModelConfig)
@@ -1063,6 +1097,43 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio["categorical_embedding_cardinality"] = max(
         2, int(transformer_base_portfolio.get("categorical_embedding_cardinality", 512))
     )
+
+    gradient_boosted_portfolio_transformer = training.setdefault("gradient_boosted_portfolio_transformer", {})
+    gradient_boosted_portfolio_transformer.setdefault("d_model", transformer_base_portfolio.get("d_model", 64))
+    gradient_boosted_portfolio_transformer.setdefault("temporal_layers", 2)
+    gradient_boosted_portfolio_transformer.setdefault("temporal_heads", 4)
+    gradient_boosted_portfolio_transformer.setdefault("temporal_ffn_mult", 2)
+    gradient_boosted_portfolio_transformer.setdefault("market_layers", 1)
+    gradient_boosted_portfolio_transformer.setdefault("market_heads", 4)
+    gradient_boosted_portfolio_transformer.setdefault("market_ffn_mult", 2)
+    gradient_boosted_portfolio_transformer.setdefault("num_market_tokens", 4)
+    gradient_boosted_portfolio_transformer.setdefault("head_hidden_dim", 64)
+    gradient_boosted_portfolio_transformer.setdefault("head_layers", 1)
+    gradient_boosted_portfolio_transformer.setdefault("dropout", legacy_dropout)
+    gradient_boosted_portfolio_transformer.setdefault("input_dropout", 0.0)
+    gradient_boosted_portfolio_transformer.setdefault("use_time_pos", True)
+    gradient_boosted_portfolio_transformer.setdefault("use_symbol_pos", False)
+    gradient_boosted_portfolio_transformer.setdefault("dynamic_market_tokens", True)
+    gradient_boosted_portfolio_transformer.setdefault("dynamic_token_gate_init", 0.1)
+    gradient_boosted_portfolio_transformer.setdefault("num_residual_stages", 2)
+    raw_stage_eta = gradient_boosted_portfolio_transformer.get("stage_eta", [0.5, 0.25])
+    if isinstance(raw_stage_eta, str):
+        stage_eta = [float(item.strip()) for item in raw_stage_eta.split(",") if item.strip()]
+    else:
+        stage_eta = [float(item) for item in (raw_stage_eta or [0.5, 0.25])]
+    gradient_boosted_portfolio_transformer["stage_eta"] = stage_eta or [0.5, 0.25]
+    gradient_boosted_portfolio_transformer.setdefault("trainable_eta", True)
+    gradient_boosted_portfolio_transformer.setdefault("eta_max", 1.0)
+    gradient_boosted_portfolio_transformer.setdefault("detach_stage_condition", True)
+    gradient_boosted_portfolio_transformer.setdefault("default_temperature", 1.0)
+    gradient_boosted_portfolio_transformer.setdefault("portfolio_mode", "auto")
+    gradient_boosted_portfolio_transformer.setdefault("portfolio_output_mode", "projection_l1")
+    gradient_boosted_portfolio_transformer["portfolio_output_mode"] = _normalize_portfolio_output_mode(
+        gradient_boosted_portfolio_transformer.get("portfolio_output_mode")
+    )
+    gradient_boosted_portfolio_transformer.setdefault("center_final_logits", True)
+    gradient_boosted_portfolio_transformer.setdefault("return_aux", True)
+    gradient_boosted_portfolio_transformer.setdefault("return_aux_details", False)
 
     bottleneck_portfolio_autoencoder = training.setdefault("bottleneck_portfolio_autoencoder", {})
     bottleneck_portfolio_autoencoder.setdefault("d_model", 128)
@@ -1579,6 +1650,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             transformer_base_portfolio=TransformerBasePortfolioModelConfig(
                 **training_raw["transformer_base_portfolio"]
+            ),
+            gradient_boosted_portfolio_transformer=GradientBoostedPortfolioTransformerConfig(
+                **training_raw["gradient_boosted_portfolio_transformer"]
             ),
             bottleneck_portfolio_autoencoder=BottleneckPortfolioAutoencoderConfig(
                 **training_raw["bottleneck_portfolio_autoencoder"]
