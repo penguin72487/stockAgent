@@ -7,6 +7,8 @@ import polars as pl
 
 from services.discord_bot.bot import (
     _add_user_watch_symbol,
+    _auto_signal_price_source,
+    _ConsoleProgress,
     _decision_overview_page,
     _daily_summary_message,
     _ensure_signal_ready,
@@ -29,6 +31,7 @@ from services.discord_bot.bot import (
     _risk_message,
     _scheduled_detail_page_groups,
     _set_user_subscription,
+    _signal_kwargs,
     _signal_sanity_issues,
     _signal_sanity_level,
     _subscription_alert_pages,
@@ -42,6 +45,63 @@ from services.discord_bot.bot import (
     _watch_delay_seconds,
     _watch_poll_seconds,
 )
+
+
+def test_auto_signal_price_source_uses_intraday_quotes_for_open_stock_markets() -> None:
+    status = SimpleNamespace(market_open=True)
+    cfg = SimpleNamespace(market_type="tw", history_frequency="daily", pre_signal_command=["download"])
+
+    assert _auto_signal_price_source(cfg, status, "auto") == "yahoo"
+    assert _auto_signal_price_source(cfg, status, None) == "yahoo"
+
+
+def test_auto_signal_price_source_keeps_bar_markets_on_latest_panel_bar() -> None:
+    status = SimpleNamespace(market_open=True)
+    cfg = SimpleNamespace(market_type="crypto", history_frequency="bar", pre_signal_command=["download"])
+
+    assert _auto_signal_price_source(cfg, status, "auto") == "panel"
+
+
+def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults() -> None:
+    open_status = SimpleNamespace(market_open=True)
+    closed_status = SimpleNamespace(market_open=False)
+    cfg = SimpleNamespace(market_type="tw", history_frequency="daily", pre_signal_command=["download"])
+
+    assert _auto_signal_price_source(cfg, open_status, "panel") == "panel"
+    assert _auto_signal_price_source(cfg, open_status, "yahoo") == "yahoo"
+    assert _auto_signal_price_source(cfg, closed_status, "auto") is None
+
+
+def test_console_progress_prints_backend_progress_bar(capsys) -> None:
+    progress = _ConsoleProgress(prefix="unit:tw")
+    progress({"label": "unit:tw", "step": 3, "total": 6, "message": "halfway"})
+
+    output = capsys.readouterr().out
+    assert "[signal-progress] unit:tw" in output
+    assert "03/06" in output
+    assert "50.00%" in output
+    assert "halfway" in output
+
+
+def test_signal_kwargs_forwards_progress_fields(monkeypatch) -> None:
+    captured = {}
+
+    def fake_signal_kwargs(**overrides):
+        captured.update(overrides)
+        return dict(overrides)
+
+    cfg = SimpleNamespace(market="unit", signal_kwargs=fake_signal_kwargs)
+    status = SimpleNamespace()
+    monkeypatch.setattr("services.discord_bot.bot._resolve_market", lambda market: cfg)
+    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda cfg, scheduled=False: status)
+    monkeypatch.setattr("services.discord_bot.bot._market_notice", lambda status: "notice")
+
+    callback = object()
+    result = _signal_kwargs(market="unit", progress_callback=callback, progress_label="unit-progress")
+
+    assert result["progress_callback"] is callback
+    assert result["progress_label"] == "unit-progress"
+    assert captured["market_notice"] == "notice"
 
 
 def test_scheduled_detail_pages_include_positions_and_rebalances() -> None:

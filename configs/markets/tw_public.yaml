@@ -465,3 +465,6 @@ evaluation:
   gamma_cvar_budget: 2.0
   gamma_drawdown_budget: 2.5
   gamma_turnover_budget: 0.5
+  eval_log_utility_pre_log_power: 0.0
+  eval_log_utility_periods_per_year: 252.0
+  eval_log_utility_log_shift: 0.0

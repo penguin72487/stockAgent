@@ -139,13 +139,17 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
     title = "**stockAgent live signal**"
     if market_label:
         title += f" {market_label}"
+    price_pairs: list[tuple[str, Any]] = [
+        ("panel", _fmt_time(summary.get("panel_date", "n/a"), summary)),
+        ("price", summary.get("price_source", "panel")),
+    ]
+    if summary.get("price_timestamp"):
+        price_pairs.append(("price_time", _fmt_time(summary.get("price_timestamp", "n/a"), summary)))
+
     lines = [
         f"{title}",
         f"`{_fmt_time(summary.get('asof_date', 'latest'), summary)}`  `tz={_fmt_tz_label(summary)}`",
-        _kv_line(
-            ("panel", _fmt_time(summary.get("panel_date", "n/a"), summary)),
-            ("price", summary.get("price_source", "panel")),
-        ),
+        _kv_line(*price_pairs),
         "",
         _period_title(summary),
         _kv_line(
