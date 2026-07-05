@@ -1968,10 +1968,10 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return getattr(model, "_orig_mod", model)
 
 
-def _clip_model_gradients_(model: nn.Module, max_norm: float) -> None:
+def _clip_model_gradients_(model: nn.Module, max_norm: float) -> bool:
     params = [param for param in _unwrap_model(model).parameters() if param.grad is not None]
     if not params:
-        return
+        return True
     try:
         torch.nn.utils.clip_grad_norm_(
             params,
@@ -1979,16 +1979,18 @@ def _clip_model_gradients_(model: nn.Module, max_norm: float) -> None:
             error_if_nonfinite=False,
             foreach=True,
         )
+        return True
     except RuntimeError as exc:
         message = str(exc).lower()
         if "foreach" not in message and "not implemented" not in message and "not support" not in message:
             raise
-        torch.nn.utils.clip_grad_norm_(
-            params,
-            max_norm=float(max_norm),
-            error_if_nonfinite=False,
-            foreach=False,
-        )
+    torch.nn.utils.clip_grad_norm_(
+        params,
+        max_norm=float(max_norm),
+        error_if_nonfinite=False,
+        foreach=False,
+    )
+    return True
 
 
 def _run_gradient_clip_(
@@ -2000,19 +2002,17 @@ def _run_gradient_clip_(
     timing: TimingBreakdown,
     device: torch.device,
     profile_timing: bool,
-) -> None:
+) -> bool:
     if float(grad_clip_norm) <= 0.0:
-        return
+        return True
     clip_start = time.perf_counter()
     with _cuda_timing(timing, "clip_cuda_s", device):
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
-        # Avoid error_if_nonfinite=True here: it turns the CUDA total norm into a
-        # Python bool and synchronizes every batch. Periodic finite checks below
-        # provide the explicit safety gate when configured.
-        _clip_model_gradients_(model, float(grad_clip_norm))
+        gradients_are_finite = _clip_model_gradients_(model, float(grad_clip_norm))
     _maybe_sync_cuda(device, profile_timing)
     timing.clip_s += time.perf_counter() - clip_start
+    return gradients_are_finite
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
@@ -2182,6 +2182,13 @@ def _model_gradients_are_finite(model: nn.Module) -> bool:
     return _first_nonfinite_model_gradient(model) is None
 
 
+def _stabilize_model_parameters_after_step(model: nn.Module) -> None:
+    target = _unwrap_model(model)
+    hook = getattr(target, "stabilize_parameters_after_step_", None)
+    if callable(hook):
+        hook()
+
+
 def _should_check_finite(step: int, interval_steps: int, *, final_step: bool = False) -> bool:
     interval = int(interval_steps)
     if interval <= 0:
@@ -2193,6 +2200,22 @@ def _raise_if_model_parameters_nonfinite(model: nn.Module, context: str) -> None
     bad_name = _first_nonfinite_model_parameter(model)
     if bad_name is not None:
         raise RuntimeError(f"{context}: first non-finite parameter={bad_name}")
+
+
+def _checkpoint_parameters_are_saveable(model: nn.Module, checkpoint_path: Path, label: str) -> bool:
+    _stabilize_model_parameters_after_step(model)
+    bad_name = _first_nonfinite_model_parameter(model)
+    if bad_name is None:
+        return True
+    message = (
+        f"non-finite model checkpoint not saved: {checkpoint_path}: "
+        f"first non-finite parameter={bad_name}"
+    )
+    if checkpoint_path.exists():
+        print(f"[checkpoint] skipped {label}; keeping existing checkpoint; training continues. {message}")
+        return False
+    print(f"[checkpoint] skipped {label}; no existing checkpoint yet; training continues and will retry. {message}")
+    return False
 
 
 def _tensor_is_finite(value: torch.Tensor) -> bool:
@@ -2261,10 +2284,8 @@ def _save_fold_checkpoint(
     scaler: GradScaler,
     include_optimizer: bool = False,
 ) -> None:
-    _raise_if_model_parameters_nonfinite(
-        model,
-        f"Refusing to save non-finite model checkpoint: {checkpoint_path}",
-    )
+    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "fold_best"):
+        return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "fold_id": fold.fold_id,
@@ -2299,10 +2320,8 @@ def _save_group_checkpoint(
     early_stopping_no_improve_ratio: float = 0.0,
     early_stop_val_interval_epochs: int = 1,
 ) -> None:
-    _raise_if_model_parameters_nonfinite(
-        model,
-        f"Refusing to save non-finite model checkpoint: {checkpoint_path}",
-    )
+    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "group_last"):
+        return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     scheduler_state = scheduler.state_dict() if scheduler is not None else None
     torch.save(
@@ -6104,6 +6123,16 @@ def _postprocess_benchmark_plot_metrics(config: ExperimentConfig, rank_metric: s
     return metrics
 
 
+def _postprocess_benchmark_supported(config: ExperimentConfig) -> tuple[bool, str]:
+    model_name = str(getattr(config.training, "model_name", "")).strip()
+    if model_name == "transformer_base_portfolio":
+        return True, ""
+    return False, (
+        "postprocess activation/threshold sweep needs raw transformer_base_portfolio scores; "
+        f"got model_name={model_name!r}"
+    )
+
+
 def _run_postprocess_benchmark_after_fold(
     *,
     config: ExperimentConfig,
@@ -6114,6 +6143,13 @@ def _run_postprocess_benchmark_after_fold(
     if enabled is None:
         enabled = bool(getattr(config.training, "postprocess_benchmark_after_fold", False))
     if not bool(enabled):
+        return
+    supported, reason = _postprocess_benchmark_supported(config)
+    if not supported:
+        message = f"[Fold {fold_id}] postprocess benchmark skipped: {reason}"
+        if bool(getattr(config.training, "postprocess_benchmark_strict", False)):
+            raise RuntimeError(message)
+        print(message)
         return
 
     script_path = _postprocess_benchmark_script()
@@ -6924,10 +6960,11 @@ def _train_epoch(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
+            gradients_are_finite = True
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
-                _run_gradient_clip_(
+                gradients_are_finite = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -6937,12 +6974,10 @@ def _train_epoch(
                     profile_timing=profile_timing,
                 )
 
-            if should_check_finite:
+            if gradients_are_finite and should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = _model_gradients_are_finite(model)
                 timing.finite_check_s += time.perf_counter() - finite_start
-            else:
-                gradients_are_finite = True
             if not gradients_are_finite:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite gradients")
@@ -6955,6 +6990,7 @@ def _train_epoch(
             with _cuda_timing(timing, "step_cuda_s", device):
                 scaler.step(optimizer)
                 scaler.update()
+            _stabilize_model_parameters_after_step(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -6966,10 +7002,11 @@ def _train_epoch(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
+            gradients_are_finite = True
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} grad clip")
-                _run_gradient_clip_(
+                gradients_are_finite = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -6979,12 +7016,10 @@ def _train_epoch(
                     profile_timing=profile_timing,
                 )
 
-            if should_check_finite:
+            if gradients_are_finite and should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = _model_gradients_are_finite(model)
                 timing.finite_check_s += time.perf_counter() - finite_start
-            else:
-                gradients_are_finite = True
             if not gradients_are_finite:
                 if progress_label:
                     _progress(f"{progress_label}: batch {batch_no}{suffix} skipped non-finite gradients")
@@ -6996,6 +7031,7 @@ def _train_epoch(
             step_start = time.perf_counter()
             with _cuda_timing(timing, "step_cuda_s", device):
                 optimizer.step()
+            _stabilize_model_parameters_after_step(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7245,10 +7281,11 @@ def _train_epoch_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
+            gradients_are_finite = True
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
-                _run_gradient_clip_(
+                gradients_are_finite = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -7258,12 +7295,10 @@ def _train_epoch_tensor(
                     profile_timing=profile_timing,
                 )
 
-            if should_check_finite:
+            if gradients_are_finite and should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = _model_gradients_are_finite(model)
                 timing.finite_check_s += time.perf_counter() - finite_start
-            else:
-                gradients_are_finite = True
             if not gradients_are_finite:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite gradients")
@@ -7276,6 +7311,7 @@ def _train_epoch_tensor(
             with _cuda_timing(timing, "step_cuda_s", device):
                 scaler.step(optimizer)
                 scaler.update()
+            _stabilize_model_parameters_after_step(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7287,10 +7323,11 @@ def _train_epoch_tensor(
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
+            gradients_are_finite = True
             if grad_clip_norm > 0.0:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} grad clip")
-                _run_gradient_clip_(
+                gradients_are_finite = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -7300,12 +7337,10 @@ def _train_epoch_tensor(
                     profile_timing=profile_timing,
                 )
 
-            if should_check_finite:
+            if gradients_are_finite and should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = _model_gradients_are_finite(model)
                 timing.finite_check_s += time.perf_counter() - finite_start
-            else:
-                gradients_are_finite = True
             if not gradients_are_finite:
                 if progress_label:
                     _progress(f"{progress_label}: batch {step_idx}/{num_batches} skipped non-finite gradients")
@@ -7317,6 +7352,7 @@ def _train_epoch_tensor(
             step_start = time.perf_counter()
             with _cuda_timing(timing, "step_cuda_s", device):
                 optimizer.step()
+            _stabilize_model_parameters_after_step(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7592,8 +7628,9 @@ def _train_epoch_windowed_tensor(
                 scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
+            gradients_are_finite = True
             if grad_clip_norm > 0.0:
-                _run_gradient_clip_(
+                gradients_are_finite = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -7602,8 +7639,7 @@ def _train_epoch_windowed_tensor(
                     device=device,
                     profile_timing=profile_timing,
                 )
-            gradients_are_finite = True
-            if should_check_finite:
+            if gradients_are_finite and should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = _model_gradients_are_finite(model)
                 timing.finite_check_s += time.perf_counter() - finite_start
@@ -7614,6 +7650,7 @@ def _train_epoch_windowed_tensor(
             with _cuda_timing(timing, "step_cuda_s", device):
                 scaler.step(optimizer)
                 scaler.update()
+            _stabilize_model_parameters_after_step(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7624,8 +7661,9 @@ def _train_epoch_windowed_tensor(
                 loss.backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
+            gradients_are_finite = True
             if grad_clip_norm > 0.0:
-                _run_gradient_clip_(
+                gradients_are_finite = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -7634,8 +7672,7 @@ def _train_epoch_windowed_tensor(
                     device=device,
                     profile_timing=profile_timing,
                 )
-            gradients_are_finite = True
-            if should_check_finite:
+            if gradients_are_finite and should_check_finite:
                 finite_start = time.perf_counter()
                 gradients_are_finite = _model_gradients_are_finite(model)
                 timing.finite_check_s += time.perf_counter() - finite_start
@@ -7645,6 +7682,7 @@ def _train_epoch_windowed_tensor(
             step_start = time.perf_counter()
             with _cuda_timing(timing, "step_cuda_s", device):
                 optimizer.step()
+            _stabilize_model_parameters_after_step(model)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -9391,6 +9429,12 @@ def run_training(
             f"epoch_test_curve={run_epoch_test_curve}; "
             f"curve_plot_async={bool(config.training.curve_plot_async)}"
         )
+        if int(config.training.finite_check_interval_steps) == 1 and device.type == "cuda":
+            print(
+                f"[Train {train_years}] WARN finite_check_interval_steps=1 scans loss, gradients, "
+                "and parameters every batch; this synchronizes CUDA and can make training CPU-bound. "
+                "Use 100+ for throughput runs unless debugging NaNs/Infs."
+            )
         train_loader: DataLoader | None = None
         input_pipeline_ab_test = bool(getattr(config.training, "input_pipeline_ab_test", True))
         input_pipeline_ab_test_steps = max(1, int(getattr(config.training, "input_pipeline_ab_test_steps", 20)))
@@ -11025,7 +11069,7 @@ def run_training(
             results_by_fold[fold.fold_id] = fold_result
 
             save_start = time.perf_counter()
-            _, plot_timing = _save_fold_output_artifacts(
+            save_timing, plot_timing = _save_fold_output_artifacts(
                 fold_dir=fold_dir,
                 fold_result=fold_result,
                 model=model,
@@ -11068,8 +11112,9 @@ def run_training(
                     f"Train {train_years} fold {fold.fold_id} save_plot",
                     TimingBreakdown(
                         total_s=time.perf_counter() - save_start,
-                        save_s=plot_start - save_start,
-                        plot_s=plot_total + (time.perf_counter() - explain_start),
+                        save_s=float(save_timing.get("total_s", 0.0)),
+                        plot_s=plot_total + float(plot_timing.get("walkforward_refresh_s", 0.0))
+                        + float(plot_timing.get("explainability_total_s", 0.0)),
                     ),
                 )
 

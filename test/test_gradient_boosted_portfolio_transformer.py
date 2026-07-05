@@ -3,12 +3,14 @@
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from stockagent.config import load_config
+from stockagent.data.walkforward import WalkForwardFold
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.gradient_boosted_portfolio_transformer import GradientBoostedPortfolioTransformer
-from stockagent.training.trainer import _extract_weights_and_aux
+from stockagent.training.trainer import _extract_weights_and_aux, _save_fold_checkpoint
 
 
 def _device() -> torch.device:
@@ -149,6 +151,64 @@ def test_all_masked_rows_keep_attention_and_gradients_finite() -> None:
     for param in model.parameters():
         if param.grad is not None:
             assert torch.isfinite(param.grad).all()
+
+
+def test_trainable_eta_logits_are_sanitized_for_forward_but_not_hidden() -> None:
+    device = _device()
+    model = _make_model().eval()
+    assert model.eta_logits is not None
+    with torch.no_grad():
+        model.eta_logits.copy_(torch.tensor([float("nan"), float("inf")], device=device))
+
+    eta = model._eta(device=device, dtype=torch.float32)
+    assert torch.isfinite(eta).all()
+    assert torch.all(eta >= 0)
+    assert torch.all(eta <= model.eta_max)
+
+    model.stabilize_parameters_after_step_()
+    assert not torch.isfinite(model.eta_logits).all()
+
+
+def test_stabilize_parameters_keeps_nonfinite_position_parameters_visible() -> None:
+    device = _device()
+    model = _make_model().eval()
+    assert model.base_stage.time_pos is not None
+    with torch.no_grad():
+        model.base_stage.time_pos.flatten()[0] = float("nan")
+        model.base_stage.time_pos.flatten()[1] = float("inf")
+
+    model.stabilize_parameters_after_step_()
+    assert not torch.isfinite(model.base_stage.time_pos).all()
+
+
+def test_nonfinite_checkpoint_save_is_skipped_without_stopping(tmp_path: Path) -> None:
+    model = torch.nn.Linear(2, 1)
+    with torch.no_grad():
+        model.weight.fill_(float("nan"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    fold = WalkForwardFold(
+        fold_id=1,
+        train_indices=np.asarray([0, 1]),
+        val_indices=np.asarray([2]),
+        test_indices=np.asarray([3]),
+        train_years=[2000],
+        val_years=[2001],
+        test_years=[2002],
+    )
+    checkpoint_path = tmp_path / "checkpoint_best.pt"
+
+    _save_fold_checkpoint(
+        checkpoint_path,
+        fold=fold,
+        epoch=1,
+        best_val_loss=0.0,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+    )
+
+    assert not checkpoint_path.exists()
 
 
 def test_factory_builds_gradient_boosted_portfolio_transformer() -> None:

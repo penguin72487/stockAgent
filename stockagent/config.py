@@ -506,6 +506,7 @@ class TrainingConfig:
     batch_mode: str
     non_blocking_transfer: bool
     model_name: str
+    seed: int = 42
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
@@ -719,6 +720,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward.setdefault("require_future_test_year", True)
 
     training = raw.setdefault("training", {})
+    training.setdefault("seed", 42)
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
     training.setdefault("batch_size_train", training.get("batch_size", 32))
@@ -1496,6 +1498,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             batch_mode=training_raw["batch_mode"],
             non_blocking_transfer=training_raw["non_blocking_transfer"],
             model_name=training_raw["model_name"],
+            seed=training_raw["seed"],
             enable_torch_compile=training_raw["enable_torch_compile"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],

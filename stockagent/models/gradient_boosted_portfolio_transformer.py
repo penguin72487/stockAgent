@@ -471,6 +471,8 @@ class GradientBoostedPortfolioTransformer(nn.Module):
         self.eta_max = float(eta_max)
         if self.eta_max <= 0.0:
             raise ValueError("eta_max must be positive")
+        self.eta_logit_limit = 12.0
+        self.parameter_abs_limit = 20.0
 
         stage_kwargs = {
             "lookback": self.lookback,
@@ -514,18 +516,36 @@ class GradientBoostedPortfolioTransformer(nn.Module):
         if self.trainable_eta:
             clipped = eta_values.clamp(min=1e-6, max=self.eta_max - 1e-6)
             probs = (clipped / self.eta_max).clamp(min=1e-6, max=1.0 - 1e-6)
-            self.eta_logits = nn.Parameter(torch.logit(probs))
+            self.eta_logits = nn.Parameter(torch.logit(probs).clamp(min=-self.eta_logit_limit, max=self.eta_logit_limit))
             self.register_buffer("eta_values", torch.empty(0), persistent=False)
         else:
             self.register_buffer("eta_values", eta_values.clamp(min=0.0, max=self.eta_max), persistent=True)
             self.eta_logits = None
+
+    @torch.no_grad()
+    def stabilize_parameters_after_step_(self) -> None:
+        for param in self.parameters():
+            if param is None:
+                continue
+            if not torch.isfinite(param.data).all():
+                continue
+            param.data.clamp_(min=-self.parameter_abs_limit, max=self.parameter_abs_limit)
+        if self.trainable_eta and self.eta_logits is not None:
+            if torch.isfinite(self.eta_logits.data).all():
+                self.eta_logits.data.clamp_(min=-self.eta_logit_limit, max=self.eta_logit_limit)
 
     def _eta(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self.num_residual_stages == 0:
             return torch.empty(0, device=device, dtype=dtype)
         if self.trainable_eta:
             assert self.eta_logits is not None
-            eta = self.eta_max * torch.sigmoid(self.eta_logits)
+            eta_logits = torch.nan_to_num(
+                self.eta_logits,
+                nan=0.0,
+                posinf=self.eta_logit_limit,
+                neginf=-self.eta_logit_limit,
+            ).clamp(min=-self.eta_logit_limit, max=self.eta_logit_limit)
+            eta = self.eta_max * torch.sigmoid(eta_logits)
         else:
             eta = self.eta_values
         return eta.to(device=device, dtype=dtype)

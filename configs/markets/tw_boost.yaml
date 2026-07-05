@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 5
 environment:
   conda_env: fintech
   device: cuda
@@ -210,6 +210,7 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
+  seed: 1
   model_name: gradient_boosted_portfolio_transformer
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
@@ -243,9 +244,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 32
-  batch_size_train: 32
-  batch_size_eval: 32
+  batch_size: 96
+  batch_size_train: 96
+  batch_size_eval: 64
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
