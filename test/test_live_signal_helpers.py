@@ -12,6 +12,7 @@ from stockagent.live.signal_engine import (
     _build_decision_rows,
     _daily_bar_timestamp,
     _date_string,
+    _live_weights_has_date,
     _load_previous_weights,
     _previous_usable_panel_date,
     _resolve_usable_panel_index,
@@ -254,6 +255,49 @@ def test_previous_weights_fall_back_to_daily_when_live_has_no_prior_row(tmp_path
     assert weights_path == str(fold_dir / "daily_weights.parquet")
     assert date_text == "2026-06-22"
     assert np.isclose(weights[0], 0.40)
+
+
+def test_previous_weights_choose_latest_prior_date_before_live_preference(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-06-25", "2026-07-02"],
+            "AAA": [0.15, 0.40],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    write_live_weights_history(
+        fold_dir,
+        {"asof_date": "2026-06-25"},
+        [{"symbol": "AAA", "target_weight": 0.90}],
+    )
+
+    weights, date_text, weights_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=25,
+        weights_path=None,
+        asof_date="2026-07-03",
+        prefer_live_weights=True,
+        strictly_before_asof=True,
+    )
+
+    assert weights_path == str(fold_dir / "daily_weights.parquet")
+    assert date_text == "2026-07-02"
+    assert np.isclose(weights[0], 0.40)
+
+
+def test_live_weights_has_date_matches_exact_daily_signal_date(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    write_live_weights_history(
+        fold_dir,
+        {"weights_date": "2026-07-02"},
+        [{"symbol": "AAA", "target_weight": 0.40}],
+    )
+
+    assert _live_weights_has_date(fold_dir, "2026-07-02")
+    assert not _live_weights_has_date(fold_dir, "2026-07-03")
 
 
 def test_live_weights_history_uses_panel_date_not_generation_time(tmp_path) -> None:
@@ -524,6 +568,43 @@ def test_load_portfolio_history_summarizes_pnl_and_holding_changes(tmp_path) -> 
     assert result.rows[1]["changes"][0]["name"] == "Alpha"
 
 
+def test_load_portfolio_history_skips_change_price_reads_when_top_changes_zero(monkeypatch, tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    price_root = tmp_path / "prices"
+    fold_dir.mkdir()
+    price_root.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
+            "symbol": ["CASH", "AAA", "CASH", "AAA"],
+            "shares": [900, 10, 800, 20],
+            "price": [1.0, None, 1.0, None],
+            "market_value": [900.0, 100.0, 800.0, 200.0],
+            "holding_ratio": [0.9, 0.1, 0.8, 0.2],
+            "is_cash": [True, False, True, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05"],
+            "portfolio_return": [0.01, 0.05],
+            "benchmark_return": [0.00, 0.02],
+            "turnover": [0.10, 0.20],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+
+    def fail_price_read(*args, **kwargs):
+        raise AssertionError("price history should not be read when top_changes=0")
+
+    monkeypatch.setattr("stockagent.live.portfolio_history._read_price_history_map", fail_price_read)
+
+    result = load_portfolio_history(fold_dir, days=2, top_changes=0, price_root=price_root)
+
+    assert np.isclose(result.period_return, 1.01 * 1.05 - 1.0)
+    assert [row["changes"] for row in result.rows] == [[], []]
+    assert [row["change_count"] for row in result.rows] == [0, 0]
+
+
 def test_load_portfolio_history_uses_price_root_and_previous_position_for_exit_short(tmp_path) -> None:
     fold_dir = tmp_path / "fold_25"
     price_root = tmp_path / "prices"
@@ -741,6 +822,9 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
     summary = {
         "asof_date": "2026-06-22 00:15:00",
         "panel_date": "2026-06-22 00:15:00",
+        "price_source": "yahoo:1d/1m",
+        "price_timestamp": "2026-06-22T05:15:00+00:00",
+        "display_timezone": "Asia/Taipei",
         "previous_weights_date": "2026-06-22 00:00:00",
         "portfolio_simple_return": 0.01,
         "benchmark_simple_return": 0.002,
@@ -763,6 +847,8 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
     message = format_signal_message(summary, max_rows=0)
 
     assert "上個訊號到現在" in message
+    assert "`price=yahoo:1d/1m`" in message
+    assert "`price_time=2026-06-22 13:15:00`" in message
     assert "`portfolio=+1.00%`" in message
     assert "`baseline=+0.20%`" in message
     assert "`excess=+0.80%`" in message

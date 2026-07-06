@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,47 +90,78 @@ def fetch_yahoo_last_prices(
     period: str = "1d",
     interval: str = "1m",
 ) -> PriceSnapshot:
-    """Fetch latest Yahoo prices from the chart API and align them to panel symbols."""
+    """Fetch latest Yahoo prices from the quote API and align them to panel symbols."""
     yahoo_map = load_symbol_yahoo_map(parquet_root)
     tickers = [yahoo_map.get(symbol, symbol) for symbol in symbols]
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
     count = 0
-    last_timestamp: str | None = None
+    last_timestamp_s: int | None = None
+    chunk_len = max(1, int(chunk_size))
+    chunks = [(start, tickers[start : start + chunk_len]) for start in range(0, len(tickers), chunk_len)]
+    max_parallel = int(os.getenv("STOCKAGENT_YAHOO_PARALLEL_REQUESTS", "32") or "32")
+    workers = max(1, min(len(chunks) or 1, max_parallel))
 
-    for start in range(0, len(symbols), max(1, int(chunk_size))):
-        ticker_chunk = tickers[start : start + max(1, int(chunk_size))]
+    def fetch_chunk(start: int, ticker_chunk: list[str]) -> list[tuple[int, float, int | None]]:
+        encoded = quote(",".join(str(ticker) for ticker in ticker_chunk), safe=",")
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={encoded}"
+        try:
+            response = requests.get(
+                url,
+                timeout=8,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+                    )
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            result_rows = payload.get("quoteResponse", {}).get("result") or []
+        except Exception:
+            return []
+
+        local_index: dict[str, list[int]] = {}
         for offset, ticker in enumerate(ticker_chunk):
-            encoded = quote(str(ticker), safe="")
-            url = (
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
-                f"?range={period}&interval={interval}&includePrePost=false"
+            local_index.setdefault(str(ticker), []).append(start + offset)
+        rows: list[tuple[int, float, int | None]] = []
+        for item in result_rows:
+            ticker = str(item.get("symbol") or "").strip()
+            indices = local_index.get(ticker)
+            if not indices:
+                continue
+            raw_value = (
+                item.get("regularMarketPrice")
+                or item.get("postMarketPrice")
+                or item.get("preMarketPrice")
+                or item.get("bid")
+                or item.get("ask")
             )
             try:
-                response = requests.get(url, timeout=20)
-                response.raise_for_status()
-                payload = response.json()
-                result = (payload.get("chart", {}).get("result") or [None])[0]
-                if not result:
-                    continue
-                timestamps = list(result.get("timestamp") or [])
-                quote_rows = result.get("indicators", {}).get("quote") or []
-                close_values = list((quote_rows[0] if quote_rows else {}).get("close") or [])
+                value = float(raw_value)
             except Exception:
                 continue
+            if not (np.isfinite(value) and value > 0.0):
+                continue
+            raw_time = item.get("regularMarketTime") or item.get("postMarketTime") or item.get("preMarketTime")
+            try:
+                timestamp_s = int(raw_time)
+            except Exception:
+                timestamp_s = None
+            for index in indices:
+                rows.append((index, value, timestamp_s))
+        return rows
 
-            for idx in range(min(len(timestamps), len(close_values)) - 1, -1, -1):
-                value = float(close_values[idx]) if close_values[idx] is not None else float("nan")
-                if not (np.isfinite(value) and value > 0.0):
-                    continue
-                prices[start + offset] = value
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yahoo-quote") as executor:
+        futures = [executor.submit(fetch_chunk, start, ticker_chunk) for start, ticker_chunk in chunks]
+        for future in as_completed(futures):
+            for idx, value, timestamp_s in future.result():
+                prices[idx] = value
                 count += 1
-                try:
-                    last_timestamp = datetime.fromtimestamp(
-                        int(timestamps[idx]),
-                        tz=timezone.utc,
-                    ).isoformat()
-                except Exception:
-                    last_timestamp = str(timestamps[idx])
-                break
+                if timestamp_s is not None and (last_timestamp_s is None or timestamp_s > last_timestamp_s):
+                    last_timestamp_s = timestamp_s
 
-    return PriceSnapshot(prices=prices, source=f"yahoo:{period}/{interval}", timestamp=last_timestamp, available_count=count)
+    last_timestamp = (
+        datetime.fromtimestamp(last_timestamp_s, tz=timezone.utc).isoformat() if last_timestamp_s is not None else None
+    )
+    return PriceSnapshot(prices=prices, source=f"yahoo:quote", timestamp=last_timestamp, available_count=count)

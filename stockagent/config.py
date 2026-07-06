@@ -695,6 +695,9 @@ class EvaluationConfig:
     gamma_cvar_budget: float = 1.0
     gamma_drawdown_budget: float = 1.0
     gamma_turnover_budget: float = 0.0
+    eval_log_utility_pre_log_power: float = 0.0
+    eval_log_utility_periods_per_year: float = 252.0
+    eval_log_utility_log_shift: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1287,6 +1290,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     evaluation.setdefault("gamma_cvar_budget", 1.0)
     evaluation.setdefault("gamma_drawdown_budget", 1.0)
     evaluation.setdefault("gamma_turnover_budget", 0.0)
+    evaluation.setdefault("eval_log_utility_pre_log_power", 0.0)
+    evaluation.setdefault("eval_log_utility_periods_per_year", 252.0)
+    evaluation.setdefault("eval_log_utility_log_shift", 0.0)
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)

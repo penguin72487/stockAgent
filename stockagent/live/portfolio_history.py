@@ -370,7 +370,8 @@ def load_portfolio_history(
     benchmark_return = _period_total_return(selected_rows, "benchmark_return")
     profit_value = sum(float(row.get("profit_value") or 0.0) for row in selected_rows)
 
-    holdings_by_date = _records_by_date(holdings)
+    include_changes = int(top_changes or 0) > 0
+    holdings_by_date = _records_by_date(holdings) if include_changes else {}
     date_index = {str(date): idx for idx, date in enumerate(dates)}
     output_rows: list[dict[str, Any]] = []
     cumulative = 1.0
@@ -387,16 +388,19 @@ def load_portfolio_history(
         date = str(row["date"])
         idx = date_index.get(date, 0)
         previous_date = str(dates[idx - 1]) if idx > 0 else None
-        changes, change_counts = _daily_changes(
-            date=date,
-            previous_date=previous_date,
-            holdings_by_date=holdings_by_date,
-            symbol_names=symbol_names,
-            min_abs_change=float(min_abs_change),
-            top_changes=top_changes,
-            capital_scale=capital.scale,
-            price_lookup=price_lookup,
-        )
+        if include_changes:
+            changes, change_counts = _daily_changes(
+                date=date,
+                previous_date=previous_date,
+                holdings_by_date=holdings_by_date,
+                symbol_names=symbol_names,
+                min_abs_change=float(min_abs_change),
+                top_changes=top_changes,
+                capital_scale=capital.scale,
+                price_lookup=price_lookup,
+            )
+        else:
+            changes, change_counts = [], {}
         row = dict(row)
         row["cumulative_return"] = cumulative_values.get(date)
         row["changes"] = changes
