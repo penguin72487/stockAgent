@@ -17,6 +17,58 @@ from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.trainer import run_inference, run_training
 
 
+def _resolve_cpu_thread_count(raw: object | None) -> int | None:
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value in {"", "0", "auto", "none", "off", "false"}:
+        return None
+    threads = int(value)
+    if threads < 1:
+        raise ValueError(f"CPU thread count must be >= 1, got {threads}")
+    return threads
+
+
+def _configure_cpu_parallelism(*, cpu_threads: int | None, compile_threads: int | None) -> None:
+    resolved_cpu_threads = cpu_threads
+    if resolved_cpu_threads is None:
+        raw_env = os.environ.get("STOCKAGENT_CPU_THREADS")
+        if raw_env:
+            resolved_cpu_threads = _resolve_cpu_thread_count(raw_env)
+    if resolved_cpu_threads is None:
+        resolved_cpu_threads = max(1, int(os.cpu_count() or 1))
+
+    for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[env_name] = str(resolved_cpu_threads)
+    torch.set_num_threads(resolved_cpu_threads)
+    try:
+        torch.set_num_interop_threads(resolved_cpu_threads)
+    except RuntimeError:
+        # Inter-op threads can only be set before parallel work starts.
+        pass
+
+    resolved_compile_threads = compile_threads
+    if resolved_compile_threads is None:
+        raw_env = os.environ.get("STOCKAGENT_TORCH_COMPILE_THREADS")
+        if raw_env:
+            resolved_compile_threads = _resolve_cpu_thread_count(raw_env)
+    if resolved_compile_threads is None:
+        resolved_compile_threads = resolved_cpu_threads
+    os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(resolved_compile_threads)
+    try:
+        import torch._inductor.config as inductor_config  # type: ignore
+
+        inductor_config.compile_threads = int(resolved_compile_threads)
+    except Exception:
+        pass
+    print(
+        "[runtime] cpu_parallelism "
+        f"torch_threads={torch.get_num_threads()} "
+        f"interop_threads={torch.get_num_interop_threads()} "
+        f"inductor_compile_threads={os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')}"
+    )
+
+
 def _configure_cuda_runtime() -> None:
     normalize_cuda_env()
     if not torch.cuda.is_available():
@@ -68,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         help="Override config.runner.resume for fold checkpoint resume behavior",
     )
     parser.add_argument(
+        "--retrain-completed-folds",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="When resuming, ignore completed fold markers but still load checkpoints.",
+    )
+    parser.add_argument(
         "--post-train-infer",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -80,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         help="Print detailed timing breakdowns for train/val/test stages",
     )
     parser.add_argument(
+        "--debug-timing-sync",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Synchronize CUDA at train iteration boundaries to diagnose async timing attribution.",
+    )
+    parser.add_argument(
         "--start-fold",
         type=int,
         default=None,
@@ -88,6 +152,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-folds", type=int, default=None, help="Run at most this many folds after --start-fold filtering.")
     parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs for benchmark/smoke runs.")
     parser.add_argument("--seed", type=int, default=None, help="Override training.seed for PyTorch/NumPy/Python RNGs.")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=None,
+        help="Set PyTorch/BLAS CPU worker threads. Defaults to all logical CPUs.",
+    )
+    parser.add_argument(
+        "--torch-compile-threads",
+        type=int,
+        default=None,
+        help="Set TorchInductor compile worker threads. Defaults to --cpu-threads/all logical CPUs.",
+    )
     parser.add_argument(
         "--explain-after-each-fold",
         action=argparse.BooleanOptionalAction,
@@ -247,11 +323,60 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override training.defer_epoch_curve_plot_until_end.",
     )
+    parser.add_argument(
+        "--postprocess-benchmark-after-fold",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.postprocess_benchmark_after_fold.",
+    )
+    parser.add_argument(
+        "--postprocess-benchmark-after-best-val",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.postprocess_benchmark_after_best_val.",
+    )
+    parser.add_argument(
+        "--eval-backtest-chunk-rows",
+        type=int,
+        default=None,
+        help="Override training.eval_backtest_chunk_rows.",
+    )
+    parser.add_argument(
+        "--eval-backtest-chunk-rows-auto",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.eval_backtest_chunk_rows_auto.",
+    )
+    parser.add_argument(
+        "--eval-backtest-compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compile eval/test backtest scans. Model and loss compile are controlled separately.",
+    )
+    parser.add_argument(
+        "--backtest-compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.backtest_compile.",
+    )
+    parser.add_argument(
+        "--backtest-compile-stateful",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.backtest_compile_stateful.",
+    )
+    parser.add_argument(
+        "--backtest-compile-dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.backtest_compile_dynamic.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    _configure_cpu_parallelism(cpu_threads=args.cpu_threads, compile_threads=args.torch_compile_threads)
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
     if args.seed is not None:
@@ -261,6 +386,8 @@ def main() -> None:
         if args.epochs < 1:
             raise ValueError(f"--epochs must be >= 1, got {args.epochs}")
         config.training.epochs = int(args.epochs)
+    if args.debug_timing_sync is not None:
+        config.training.debug_timing_sync = bool(args.debug_timing_sync)
     if args.explain_after_each_fold is not None:
         config.training.explain_after_each_fold = bool(args.explain_after_each_fold)
     if args.explain_max_rows is not None:
@@ -337,6 +464,23 @@ def main() -> None:
         config.training.backtest_artifact_compression = str(args.backtest_artifact_compression)
     if args.defer_epoch_curve_plot_until_end is not None:
         config.training.defer_epoch_curve_plot_until_end = bool(args.defer_epoch_curve_plot_until_end)
+    if args.postprocess_benchmark_after_fold is not None:
+        config.training.postprocess_benchmark_after_fold = bool(args.postprocess_benchmark_after_fold)
+    if args.postprocess_benchmark_after_best_val is not None:
+        config.training.postprocess_benchmark_after_best_val = bool(args.postprocess_benchmark_after_best_val)
+    if args.eval_backtest_chunk_rows is not None:
+        config.training.eval_backtest_chunk_rows = max(1, int(args.eval_backtest_chunk_rows))
+    if args.eval_backtest_chunk_rows_auto is not None:
+        config.training.eval_backtest_chunk_rows_auto = bool(args.eval_backtest_chunk_rows_auto)
+    if args.eval_backtest_compile is not None:
+        config.training.eval_backtest_compile = bool(args.eval_backtest_compile)
+        os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(args.eval_backtest_compile) else "0"
+    if args.backtest_compile is not None:
+        config.training.backtest_compile = bool(args.backtest_compile)
+    if args.backtest_compile_stateful is not None:
+        config.training.backtest_compile_stateful = bool(args.backtest_compile_stateful)
+    if args.backtest_compile_dynamic is not None:
+        config.training.backtest_compile_dynamic = bool(args.backtest_compile_dynamic)
     _configure_cuda_runtime()
 
     # Keep runtime switches consistent with YAML config.
@@ -352,6 +496,8 @@ def main() -> None:
     output_dir = args.output_dir if args.output_dir is not None else config.runner.output_dir
     mode = args.mode if args.mode is not None else config.runner.mode
     resume = args.resume if args.resume is not None else config.runner.resume
+    if args.retrain_completed_folds is not None:
+        os.environ["STOCKAGENT_RETRAIN_COMPLETED_FOLDS"] = "1" if bool(args.retrain_completed_folds) else "0"
     post_train_infer = args.post_train_infer if args.post_train_infer is not None else config.runner.post_train_infer
     start_fold = args.start_fold if args.start_fold is not None else config.runner.start_fold
 
