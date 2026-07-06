@@ -278,6 +278,61 @@ def test_forward_from_panel_slab_equivalence_for_contiguous_rows() -> None:
     assert torch.allclose(aux_x["score_logits"], aux_slab["score_logits"], atol=1e-5, rtol=1e-5)
 
 
+def test_symbol_indices_preserve_full_universe_symbol_positions() -> None:
+    device = _device()
+    symbol_indices_cpu = torch.tensor([0, 2, 5, 8], dtype=torch.long)
+    symbol_indices = symbol_indices_cpu.to(device=device)
+    full = _make_model(
+        attention_mode="market_token",
+        num_symbols=13,
+        allow_dynamic_symbols=False,
+        temporal_pooling="attention",
+        temporal_query_mode="full_then_last",
+        return_aux=True,
+        return_aux_details=False,
+    ).eval()
+    compact = _make_model(
+        attention_mode="market_token",
+        num_symbols=int(symbol_indices_cpu.numel()),
+        allow_dynamic_symbols=False,
+        temporal_pooling="attention",
+        temporal_query_mode="full_then_last",
+        return_aux=True,
+        return_aux_details=False,
+    ).eval()
+    compact_state = compact.state_dict()
+    for name, value in full.state_dict().items():
+        if name == "symbol_position":
+            compact_state[name].copy_(value.index_select(2, symbol_indices_cpu.to(device=value.device)))
+        elif name in compact_state and tuple(compact_state[name].shape) == tuple(value.shape):
+            compact_state[name].copy_(value)
+    compact.load_state_dict(compact_state)
+
+    x = torch.randn(2, 6, 4, 11, device=device)
+    mask = torch.ones(2, 4, dtype=torch.bool, device=device)
+    mask[1, 3:] = False
+    feature_slab = torch.randn(7, 4, 11, device=device)
+
+    with pytest.raises(ValueError, match="Expected num_symbols=13"):
+        full(x, mask)
+
+    with torch.no_grad():
+        weights_full, scores_full, aux_full = full(x, mask, return_aux=True, symbol_indices=symbol_indices)
+        weights_compact, scores_compact, aux_compact = compact(x, mask, return_aux=True)
+        slab_full = full.forward_from_panel_slab(
+            feature_slab,
+            mask,
+            return_aux=False,
+            symbol_indices=symbol_indices,
+        )
+        slab_compact = compact.forward_from_panel_slab(feature_slab, mask, return_aux=False)
+
+    assert torch.allclose(weights_full, weights_compact, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(scores_full, scores_compact, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(aux_full["score_logits"], aux_compact["score_logits"], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(slab_full, slab_compact, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("mode", ["axial", "latent", "market_token", "temporal_only"])
 def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
     device = _device()
@@ -380,6 +435,13 @@ def test_windowed_metadata_batch_has_no_x() -> None:
     assert indexed["date_indices"].tolist() == [2, 6]
     assert indexed["date_start"].tolist() == [2]
     assert bool(indexed["rows_are_contiguous"].item()) is False
+
+    compact = split.subset_symbols(torch.tensor([1, 3], dtype=torch.long))
+    compact_batch = compact.batch_metadata_by_rows(1, 3, torch.device("cpu"), non_blocking=False)
+    assert compact.features.shape == (8, 2, 3)
+    assert compact.symbol_indices.tolist() == [1, 3]
+    assert compact_batch["symbol_indices"].tolist() == [1, 3]
+    assert compact_batch["tradable_mask"].shape == (2, 2)
 
 
 def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:

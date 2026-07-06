@@ -12,7 +12,7 @@ import time
 import gc
 import inspect
 import csv
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
@@ -55,11 +55,25 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
+from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.fused_loss import fused_log_utility_loss_tensor
 from stockagent.training.loss import get_loss_runtime_stats, masked_ic_loss, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
+
+
+@contextmanager
+def _temporary_env(name: str, value: str):
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 @dataclass(slots=True)
@@ -92,6 +106,20 @@ class TimingBreakdown:
     fetch_s: float = 0.0
     transfer_s: float = 0.0
     batch_prepare_s: float = 0.0
+    prepare_index_build_s: float = 0.0
+    prepare_window_slice_s: float = 0.0
+    prepare_feature_gather_s: float = 0.0
+    prepare_target_gather_s: float = 0.0
+    prepare_mask_build_s: float = 0.0
+    prepare_nan_fill_s: float = 0.0
+    prepare_dtype_cast_s: float = 0.0
+    prepare_contiguous_s: float = 0.0
+    prepare_clone_s: float = 0.0
+    prepare_device_move_s: float = 0.0
+    prepare_panel_slab_batch_s: float = 0.0
+    prepare_metadata_batch_s: float = 0.0
+    prepare_materialized_batch_s: float = 0.0
+    prepare_move_windowed_batch_s: float = 0.0
     window_materialize_s: float = 0.0
     h2d_transfer_s: float = 0.0
     forward_s: float = 0.0
@@ -122,6 +150,12 @@ class TimingBreakdown:
     plot_s: float = 0.0
     sync_s: float = 0.0
     cpu_gpu_sync_s: float = 0.0
+    iter_start_sync_s: float = 0.0
+    after_prepare_sync_s: float = 0.0
+    after_forward_sync_s: float = 0.0
+    after_loss_sync_s: float = 0.0
+    after_backward_sync_s: float = 0.0
+    after_step_sync_s: float = 0.0
     gc_s: float = 0.0
     batches: int = 0
     cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
@@ -135,6 +169,20 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "fetch_s",
         "transfer_s",
         "batch_prepare_s",
+        "prepare_index_build_s",
+        "prepare_window_slice_s",
+        "prepare_feature_gather_s",
+        "prepare_target_gather_s",
+        "prepare_mask_build_s",
+        "prepare_nan_fill_s",
+        "prepare_dtype_cast_s",
+        "prepare_contiguous_s",
+        "prepare_clone_s",
+        "prepare_device_move_s",
+        "prepare_panel_slab_batch_s",
+        "prepare_metadata_batch_s",
+        "prepare_materialized_batch_s",
+        "prepare_move_windowed_batch_s",
         "window_materialize_s",
         "h2d_transfer_s",
         "forward_s",
@@ -165,6 +213,12 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "plot_s",
         "sync_s",
         "cpu_gpu_sync_s",
+        "iter_start_sync_s",
+        "after_prepare_sync_s",
+        "after_forward_sync_s",
+        "after_loss_sync_s",
+        "after_backward_sync_s",
+        "after_step_sync_s",
         "gc_s",
     ):
         value = getattr(timing, name)
@@ -179,6 +233,20 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "fetch_s",
         "transfer_s",
         "batch_prepare_s",
+        "prepare_index_build_s",
+        "prepare_window_slice_s",
+        "prepare_feature_gather_s",
+        "prepare_target_gather_s",
+        "prepare_mask_build_s",
+        "prepare_nan_fill_s",
+        "prepare_dtype_cast_s",
+        "prepare_contiguous_s",
+        "prepare_clone_s",
+        "prepare_device_move_s",
+        "prepare_panel_slab_batch_s",
+        "prepare_metadata_batch_s",
+        "prepare_materialized_batch_s",
+        "prepare_move_windowed_batch_s",
         "window_materialize_s",
         "h2d_transfer_s",
         "forward_s",
@@ -209,6 +277,12 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "plot_s",
         "sync_s",
         "cpu_gpu_sync_s",
+        "iter_start_sync_s",
+        "after_prepare_sync_s",
+        "after_forward_sync_s",
+        "after_loss_sync_s",
+        "after_backward_sync_s",
+        "after_step_sync_s",
         "gc_s",
     ):
         setattr(dst, name, getattr(dst, name) + getattr(src, name))
@@ -265,6 +339,14 @@ def _sync_cuda_for_timing(device: torch.device) -> float:
     start_t = time.perf_counter()
     torch.cuda.synchronize(device)
     return time.perf_counter() - start_t
+
+
+def _record_debug_cuda_sync(timing: TimingBreakdown, attr: str, device: torch.device, enabled: bool) -> None:
+    if not enabled or device.type != "cuda":
+        return
+    start_t = time.perf_counter()
+    torch.cuda.synchronize(device)
+    setattr(timing, attr, getattr(timing, attr) + time.perf_counter() - start_t)
 
 
 def _maybe_cudagraph_step_begin() -> None:
@@ -438,7 +520,12 @@ def _call_model(
     mask: torch.Tensor,
     *,
     return_aux: bool | None = None,
+    symbol_indices: torch.Tensor | None = None,
 ):
+    if symbol_indices is not None:
+        if return_aux is None or not _model_accepts_return_aux(model):
+            return model(x, mask, symbol_indices=symbol_indices)
+        return model(x, mask, return_aux=return_aux, symbol_indices=symbol_indices)
     if return_aux is None or not _model_accepts_return_aux(model):
         return model(x, mask)
     return model(x, mask, return_aux=return_aux)
@@ -515,67 +602,82 @@ def _profile_single_train_step(
         with_stack=False,
     ) as prof_obj:
         with _autocast_context(device, amp_dtype):
-            model_output = model(batch["x"], batch["tradable_mask"])
+            with profile_range("train_step.forward"):
+                if "feature_slab" in batch:
+                    model_output = model(
+                        batch["feature_slab"],
+                        batch["tradable_mask"],
+                        symbol_indices=batch.get("symbol_indices"),
+                    )
+                else:
+                    model_output = _call_model(
+                        model,
+                        batch["x"],
+                        batch["tradable_mask"],
+                        symbol_indices=batch.get("symbol_indices"),
+                    )
             weights, aux_outputs = _extract_weights_and_aux(model_output)
-            if fused_loss_fn is not None and _is_log_utility_objective(objective):
-                loss, _ = _run_fused_log_utility_loss(
-                    fused_loss_fn,
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    batch["can_buy_mask"],
-                    batch["can_sell_mask"],
-                    batch.get("sample_mask"),
-                    None,
-                )
-                loss = _add_return_rank_ic_aux_loss(
-                    loss,
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    return_rank_ic_weight,
-                )
-            else:
-                loss = loss_fn(
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    benchmark_returns=batch.get("benchmark"),
-                    can_buy_mask=batch["can_buy_mask"],
-                    can_sell_mask=batch["can_sell_mask"],
-                    sample_mask=batch.get("sample_mask"),
-                    long_only=long_only,
-                    buy_fee_rate=buy_fee_rate,
-                    sell_fee_rate=sell_fee_rate,
-                    max_turnover_ratio=max_turnover_ratio,
-                    gross_leverage=gross_leverage,
-                    gamma_sharpe=gamma_sharpe,
-                    gamma_excess=gamma_excess,
-                    gamma_cvar=gamma_cvar,
-                    cvar_alpha=cvar_alpha,
-                    gamma_drawdown=gamma_drawdown,
-                    drawdown_target=drawdown_target,
-                    gamma_turnover=gamma_turnover,
-                    gamma_underperformance=gamma_underperformance,
-                    excess_target=excess_target,
-                    cvar_budget=cvar_budget,
-                    drawdown_budget=drawdown_budget,
-                    turnover_budget=turnover_budget,
-                    gamma_cvar_budget=gamma_cvar_budget,
-                    gamma_drawdown_budget=gamma_drawdown_budget,
-                    gamma_turnover_budget=gamma_turnover_budget,
-                    objective=objective,
-                    aux_outputs=aux_outputs,
-                    rank_ic_weight=rank_ic_weight,
-                    return_rank_ic_weight=return_rank_ic_weight,
-                    direction_weight=direction_weight,
-                    volatility_regime_weight=volatility_regime_weight,
-                    concentration_weight=concentration_weight,
-                    regime_up_threshold=regime_up_threshold,
-                    regime_down_threshold=regime_down_threshold,
-                )
+            with profile_range("train_step.loss"):
+                if fused_loss_fn is not None and _is_log_utility_objective(objective):
+                    loss, _ = _run_fused_log_utility_loss(
+                        fused_loss_fn,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        batch["can_buy_mask"],
+                        batch["can_sell_mask"],
+                        batch.get("sample_mask"),
+                        None,
+                    )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        return_rank_ic_weight,
+                    )
+                else:
+                    loss = loss_fn(
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        benchmark_returns=batch.get("benchmark"),
+                        can_buy_mask=batch["can_buy_mask"],
+                        can_sell_mask=batch["can_sell_mask"],
+                        sample_mask=batch.get("sample_mask"),
+                        long_only=long_only,
+                        buy_fee_rate=buy_fee_rate,
+                        sell_fee_rate=sell_fee_rate,
+                        max_turnover_ratio=max_turnover_ratio,
+                        gross_leverage=gross_leverage,
+                        gamma_sharpe=gamma_sharpe,
+                        gamma_excess=gamma_excess,
+                        gamma_cvar=gamma_cvar,
+                        cvar_alpha=cvar_alpha,
+                        gamma_drawdown=gamma_drawdown,
+                        drawdown_target=drawdown_target,
+                        gamma_turnover=gamma_turnover,
+                        gamma_underperformance=gamma_underperformance,
+                        excess_target=excess_target,
+                        cvar_budget=cvar_budget,
+                        drawdown_budget=drawdown_budget,
+                        turnover_budget=turnover_budget,
+                        gamma_cvar_budget=gamma_cvar_budget,
+                        gamma_drawdown_budget=gamma_drawdown_budget,
+                        gamma_turnover_budget=gamma_turnover_budget,
+                        objective=objective,
+                        aux_outputs=aux_outputs,
+                        rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
+                        direction_weight=direction_weight,
+                        volatility_regime_weight=volatility_regime_weight,
+                        concentration_weight=concentration_weight,
+                        regime_up_threshold=regime_up_threshold,
+                        regime_down_threshold=regime_down_threshold,
+                    )
         if torch.isfinite(loss).all():
-            loss.backward()
+            with profile_range("train_step.backward"):
+                loss.backward()
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1639,6 +1741,20 @@ def _timing_curve_payload(
     def _epoch_percent(value_s: float) -> float:
         return float(value_s) * 100.0 / max(1e-12, float(epoch_total_s))
 
+    train_prepare_child_s = (
+        float(train_timing.prepare_index_build_s)
+        + float(train_timing.prepare_window_slice_s)
+        + float(train_timing.prepare_feature_gather_s)
+        + float(train_timing.prepare_target_gather_s)
+        + float(train_timing.prepare_mask_build_s)
+        + float(train_timing.prepare_nan_fill_s)
+        + float(train_timing.prepare_dtype_cast_s)
+        + float(train_timing.prepare_contiguous_s)
+        + float(train_timing.prepare_clone_s)
+        + float(train_timing.prepare_device_move_s)
+    )
+    train_prepare_unaccounted_s = float(train_timing.batch_prepare_s) - train_prepare_child_s
+
     val_metrics_value = float(val_loss_s if val_metrics_s is None else val_metrics_s)
     checkpoint_total_s = (
         float(checkpoint_save_s)
@@ -1668,6 +1784,27 @@ def _timing_curve_payload(
         "train_fetch_ms_per_batch": _avg_ms(train_timing.fetch_s),
         "train_transfer_ms_per_batch": _avg_ms(train_timing.transfer_s),
         "train_batch_prepare_ms_per_batch": _avg_ms(train_timing.batch_prepare_s),
+        "train_prepare_index_build_ms_per_batch": _avg_ms(train_timing.prepare_index_build_s),
+        "train_prepare_window_slice_ms_per_batch": _avg_ms(train_timing.prepare_window_slice_s),
+        "train_prepare_feature_gather_ms_per_batch": _avg_ms(train_timing.prepare_feature_gather_s),
+        "train_prepare_target_gather_ms_per_batch": _avg_ms(train_timing.prepare_target_gather_s),
+        "train_prepare_mask_build_ms_per_batch": _avg_ms(train_timing.prepare_mask_build_s),
+        "train_prepare_nan_fill_ms_per_batch": _avg_ms(train_timing.prepare_nan_fill_s),
+        "train_prepare_dtype_cast_ms_per_batch": _avg_ms(train_timing.prepare_dtype_cast_s),
+        "train_prepare_contiguous_ms_per_batch": _avg_ms(train_timing.prepare_contiguous_s),
+        "train_prepare_clone_ms_per_batch": _avg_ms(train_timing.prepare_clone_s),
+        "train_prepare_device_move_ms_per_batch": _avg_ms(train_timing.prepare_device_move_s),
+        "train_prepare_panel_slab_batch_ms_per_batch": _avg_ms(train_timing.prepare_panel_slab_batch_s),
+        "train_prepare_metadata_batch_ms_per_batch": _avg_ms(train_timing.prepare_metadata_batch_s),
+        "train_prepare_materialized_batch_ms_per_batch": _avg_ms(train_timing.prepare_materialized_batch_s),
+        "train_prepare_move_windowed_batch_ms_per_batch": _avg_ms(train_timing.prepare_move_windowed_batch_s),
+        "train_prepare_unaccounted_ms_per_batch": _avg_ms(train_prepare_unaccounted_s),
+        "train_iter_start_sync_ms_per_batch": _avg_ms(train_timing.iter_start_sync_s),
+        "train_after_prepare_sync_ms_per_batch": _avg_ms(train_timing.after_prepare_sync_s),
+        "train_after_forward_sync_ms_per_batch": _avg_ms(train_timing.after_forward_sync_s),
+        "train_after_loss_sync_ms_per_batch": _avg_ms(train_timing.after_loss_sync_s),
+        "train_after_backward_sync_ms_per_batch": _avg_ms(train_timing.after_backward_sync_s),
+        "train_after_step_sync_ms_per_batch": _avg_ms(train_timing.after_step_sync_s),
         "train_window_materialize_ms_per_batch": _avg_ms(train_timing.window_materialize_s),
         "train_h2d_transfer_ms_per_batch": _avg_ms(train_timing.h2d_transfer_s),
         "train_forward_ms_per_batch": _avg_ms(train_timing.forward_s),
@@ -1723,6 +1860,20 @@ def _timing_curve_payload(
         "val_eval_transfer_to_gpu_s": float(val_timing.transfer_s),
         "val_batch_prepare_s": float(val_timing.batch_prepare_s),
         "val_eval_batch_prepare_s": float(val_timing.batch_prepare_s),
+        "val_prepare_index_build_s": float(val_timing.prepare_index_build_s),
+        "val_prepare_window_slice_s": float(val_timing.prepare_window_slice_s),
+        "val_prepare_feature_gather_s": float(val_timing.prepare_feature_gather_s),
+        "val_prepare_target_gather_s": float(val_timing.prepare_target_gather_s),
+        "val_prepare_mask_build_s": float(val_timing.prepare_mask_build_s),
+        "val_prepare_nan_fill_s": float(val_timing.prepare_nan_fill_s),
+        "val_prepare_dtype_cast_s": float(val_timing.prepare_dtype_cast_s),
+        "val_prepare_contiguous_s": float(val_timing.prepare_contiguous_s),
+        "val_prepare_clone_s": float(val_timing.prepare_clone_s),
+        "val_prepare_device_move_s": float(val_timing.prepare_device_move_s),
+        "val_prepare_panel_slab_batch_s": float(val_timing.prepare_panel_slab_batch_s),
+        "val_prepare_metadata_batch_s": float(val_timing.prepare_metadata_batch_s),
+        "val_prepare_materialized_batch_s": float(val_timing.prepare_materialized_batch_s),
+        "val_prepare_move_windowed_batch_s": float(val_timing.prepare_move_windowed_batch_s),
         "val_window_materialize_s": float(val_timing.window_materialize_s),
         "val_eval_window_materialize_s": float(val_timing.window_materialize_s),
         "val_h2d_transfer_s": float(val_timing.h2d_transfer_s),
@@ -1749,6 +1900,20 @@ def _timing_curve_payload(
         "test_curve_eval_transfer_to_gpu_s": float(test_curve_timing.transfer_s),
         "test_curve_batch_prepare_s": float(test_curve_timing.batch_prepare_s),
         "test_curve_eval_batch_prepare_s": float(test_curve_timing.batch_prepare_s),
+        "test_curve_prepare_index_build_s": float(test_curve_timing.prepare_index_build_s),
+        "test_curve_prepare_window_slice_s": float(test_curve_timing.prepare_window_slice_s),
+        "test_curve_prepare_feature_gather_s": float(test_curve_timing.prepare_feature_gather_s),
+        "test_curve_prepare_target_gather_s": float(test_curve_timing.prepare_target_gather_s),
+        "test_curve_prepare_mask_build_s": float(test_curve_timing.prepare_mask_build_s),
+        "test_curve_prepare_nan_fill_s": float(test_curve_timing.prepare_nan_fill_s),
+        "test_curve_prepare_dtype_cast_s": float(test_curve_timing.prepare_dtype_cast_s),
+        "test_curve_prepare_contiguous_s": float(test_curve_timing.prepare_contiguous_s),
+        "test_curve_prepare_clone_s": float(test_curve_timing.prepare_clone_s),
+        "test_curve_prepare_device_move_s": float(test_curve_timing.prepare_device_move_s),
+        "test_curve_prepare_panel_slab_batch_s": float(test_curve_timing.prepare_panel_slab_batch_s),
+        "test_curve_prepare_metadata_batch_s": float(test_curve_timing.prepare_metadata_batch_s),
+        "test_curve_prepare_materialized_batch_s": float(test_curve_timing.prepare_materialized_batch_s),
+        "test_curve_prepare_move_windowed_batch_s": float(test_curve_timing.prepare_move_windowed_batch_s),
         "test_curve_window_materialize_s": float(test_curve_timing.window_materialize_s),
         "test_curve_eval_window_materialize_s": float(test_curve_timing.window_materialize_s),
         "test_curve_h2d_transfer_s": float(test_curve_timing.h2d_transfer_s),
@@ -2037,6 +2202,13 @@ def _model_supports_panel_slab_forward(model: nn.Module) -> bool:
     return _panel_slab_forward_module(model) is not None
 
 
+def _callable_accepts_parameter(fn: Callable[..., Any], parameter: str) -> bool:
+    try:
+        return str(parameter) in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class _PanelSlabForwardWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
@@ -2044,9 +2216,23 @@ class _PanelSlabForwardWrapper(nn.Module):
         if slab_model is None:
             raise ValueError("model does not support forward_from_panel_slab")
         self.model = slab_model
+        self._accepts_symbol_indices = _callable_accepts_parameter(
+            self.model.forward_from_panel_slab,
+            "symbol_indices",
+        )
 
-    def forward(self, feature_slab: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        return self.model.forward_from_panel_slab(feature_slab, mask, return_aux=False)
+    def forward(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        kwargs: dict[str, Any] = {"return_aux": False}
+        if symbol_indices is not None:
+            if not self._accepts_symbol_indices:
+                raise ValueError("compact symbol batches require forward_from_panel_slab(..., symbol_indices=...)")
+            kwargs["symbol_indices"] = symbol_indices
+        return self.model.forward_from_panel_slab(feature_slab, mask, **kwargs)
 
 
 def _metadata_rows_are_contiguous(batch: Mapping[str, torch.Tensor]) -> bool:
@@ -2137,13 +2323,14 @@ def _call_panel_forward_for_batch(
             rows=rows,
         )
         if feature_slab is not None:
-            return panel_slab_model(feature_slab, mask)
-    return panel_forward_model.forward_from_panel(
-        split.features,
-        batch["date_indices"],
-        mask,
-        return_aux=return_aux,
-    )
+            return panel_slab_model(feature_slab, mask, batch.get("symbol_indices"))
+    kwargs: dict[str, Any] = {"return_aux": return_aux}
+    symbol_indices = batch.get("symbol_indices")
+    if symbol_indices is not None:
+        if not _callable_accepts_parameter(panel_forward_model.forward_from_panel, "symbol_indices"):
+            raise ValueError("compact symbol batches require forward_from_panel(..., symbol_indices=...)")
+        kwargs["symbol_indices"] = symbol_indices
+    return panel_forward_model.forward_from_panel(split.features, batch["date_indices"], mask, **kwargs)
 
 
 def _training_needs_aux(objective: str, factor_aug_kwargs: dict[str, float] | None = None) -> bool:
@@ -2175,11 +2362,25 @@ def _first_nonfinite_model_gradient(model: nn.Module) -> str | None:
 
 
 def _model_parameters_are_finite(model: nn.Module) -> bool:
-    return _first_nonfinite_model_parameter(model) is None
+    finite_flag: torch.Tensor | None = None
+    for param in _unwrap_model(model).parameters():
+        current = torch.isfinite(param.detach()).all()
+        finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
+    if finite_flag is None:
+        return True
+    return bool(finite_flag.item())
 
 
 def _model_gradients_are_finite(model: nn.Module) -> bool:
-    return _first_nonfinite_model_gradient(model) is None
+    finite_flag: torch.Tensor | None = None
+    for param in _unwrap_model(model).parameters():
+        if param.grad is None:
+            continue
+        current = torch.isfinite(param.grad.detach()).all()
+        finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
+    if finite_flag is None:
+        return True
+    return bool(finite_flag.item())
 
 
 def _stabilize_model_parameters_after_step(model: nn.Module) -> None:
@@ -2193,7 +2394,7 @@ def _should_check_finite(step: int, interval_steps: int, *, final_step: bool = F
     interval = int(interval_steps)
     if interval <= 0:
         return False
-    return bool(final_step) or int(step) % interval == 0
+    return int(step) % interval == 0
 
 
 def _raise_if_model_parameters_nonfinite(model: nn.Module, context: str) -> None:
@@ -2202,8 +2403,16 @@ def _raise_if_model_parameters_nonfinite(model: nn.Module, context: str) -> None
         raise RuntimeError(f"{context}: first non-finite parameter={bad_name}")
 
 
-def _checkpoint_parameters_are_saveable(model: nn.Module, checkpoint_path: Path, label: str) -> bool:
+def _checkpoint_parameters_are_saveable(
+    model: nn.Module,
+    checkpoint_path: Path,
+    label: str,
+    *,
+    check_finite: bool = True,
+) -> bool:
     _stabilize_model_parameters_after_step(model)
+    if not bool(check_finite):
+        return True
     bad_name = _first_nonfinite_model_parameter(model)
     if bad_name is None:
         return True
@@ -2248,6 +2457,7 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
         "market_queries",
         "dynamic_latent_generator.",
         "dynamic_market_generator.",
+        "temporal_pool_score.",
         "latent_blocks.",
         "market_blocks.",
         "stock_read_latent_blocks.",
@@ -2283,8 +2493,9 @@ def _save_fold_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     include_optimizer: bool = False,
+    check_finite: bool = True,
 ) -> None:
-    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "fold_best"):
+    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "fold_best", check_finite=check_finite):
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
@@ -2319,8 +2530,9 @@ def _save_group_checkpoint(
     early_stop_patience: int = 0,
     early_stopping_no_improve_ratio: float = 0.0,
     early_stop_val_interval_epochs: int = 1,
+    check_finite: bool = True,
 ) -> None:
-    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "group_last"):
+    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "group_last", check_finite=check_finite):
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     scheduler_state = scheduler.state_dict() if scheduler is not None else None
@@ -3816,6 +4028,7 @@ def _combine_datasets_to_windowed(
         lookback=first.lookback,
         can_short_open_mask=first.can_short_open_mask,
         force_short_cover_mask=first.force_short_cover_mask,
+        symbol_indices=first.symbol_indices,
     )
     return combined, lengths
 
@@ -3836,6 +4049,7 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             can_short_open_mask=split.can_short_open_mask,
             force_short_cover_mask=split.force_short_cover_mask,
             sample_mask=sample_mask,
+            symbol_indices=split.symbol_indices,
         )
     padded_rows = ((total_rows + batch_size - 1) // batch_size) * batch_size
     sample_mask = torch.ones(total_rows, dtype=torch.bool, device=split.valid_indices.device)
@@ -3869,7 +4083,59 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         can_short_open_mask=split.can_short_open_mask,
         force_short_cover_mask=split.force_short_cover_mask,
         sample_mask=sample_mask,
+        symbol_indices=split.symbol_indices,
     )
+
+
+def _normalize_train_symbol_compaction(value: object) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"", "0", "false", "no", "off", "none", "disabled"}:
+        return "none"
+    if normalized in {"1", "true", "yes", "on", "train_union", "union", "active_union"}:
+        return "train_union"
+    raise ValueError("training.train_symbol_compaction must be 'none' or 'train_union'")
+
+
+def _maybe_compact_train_windowed_symbols(
+    split: WindowedSplitTensors,
+    config: ExperimentConfig,
+    *,
+    label: str,
+) -> WindowedSplitTensors:
+    mode = _normalize_train_symbol_compaction(getattr(config.training, "train_symbol_compaction", "none"))
+    if mode == "none":
+        return split
+    if int(split.num_symbols) <= 0 or int(split.valid_indices.numel()) == 0:
+        return split
+    row_mask = split.sample_mask
+    if row_mask is not None:
+        row_mask_cpu = row_mask.detach().to(device="cpu", dtype=torch.bool)
+        if not bool(torch.any(row_mask_cpu).item()):
+            return split
+        date_indices = split.valid_indices.detach().to(device="cpu", dtype=torch.long)[row_mask_cpu]
+    else:
+        date_indices = split.valid_indices.detach().to(device="cpu", dtype=torch.long)
+    if int(date_indices.numel()) == 0:
+        return split
+
+    tradable_source = split.tradable_mask
+    date_indices = date_indices.to(device=tradable_source.device, dtype=torch.long)
+    active = tradable_source.index_select(0, date_indices).to(dtype=torch.bool).any(dim=0)
+    active_indices = active.nonzero(as_tuple=False).reshape(-1)
+    active_count = int(active_indices.numel())
+    total_symbols = int(split.num_symbols)
+    if active_count <= 0 or active_count >= total_symbols:
+        _progress(
+            f"[{label}] train_symbol_compaction={mode}: skipped "
+            f"active_symbols={active_count}/{total_symbols}"
+        )
+        return split
+    compacted = split.subset_symbols(active_indices)
+    _progress(
+        f"[{label}] train_symbol_compaction={mode}: "
+        f"active_symbols={active_count}/{total_symbols} ({active_count / max(1, total_symbols):.1%})"
+    )
+    return compacted
 
 
 def _prepare_windowed_split(
@@ -3904,6 +4170,7 @@ def _prepare_windowed_split(
             can_short_open_mask=shared_base.can_short_open_mask,
             force_short_cover_mask=shared_base.force_short_cover_mask,
             sample_mask=sample_mask,
+            symbol_indices=shared_base.symbol_indices,
         )
     return WindowedSplitTensors(
         features=_prepare_host_tensor(split.features, pin_memory),
@@ -3917,6 +4184,7 @@ def _prepare_windowed_split(
         can_short_open_mask=_prepare_host_tensor(split.can_short_open_mask, pin_memory),
         force_short_cover_mask=_prepare_host_tensor(split.force_short_cover_mask, pin_memory),
         sample_mask=None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory),
+        symbol_indices=None if split.symbol_indices is None else _prepare_host_tensor(split.symbol_indices, pin_memory),
     )
 
 
@@ -3955,6 +4223,7 @@ def _with_windowed_base(
         benchmark=base_tensors[7],
         lookback=split.lookback,
         sample_mask=split.sample_mask,
+        symbol_indices=split.symbol_indices,
     )
 
 
@@ -3974,6 +4243,7 @@ def _with_windowed_metadata(
         benchmark=split.benchmark,
         lookback=split.lookback,
         sample_mask=None if split.sample_mask is None else metadata_tensors[1],
+        symbol_indices=split.symbol_indices,
     )
 
 
@@ -4063,6 +4333,16 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
         rhs = getattr(b, attr)
         if tuple(lhs.shape) != tuple(rhs.shape) or lhs.dtype != rhs.dtype:
             return False
+    if (a.symbol_indices is None) != (b.symbol_indices is None):
+        return False
+    if a.symbol_indices is not None and b.symbol_indices is not None:
+        if tuple(a.symbol_indices.shape) != tuple(b.symbol_indices.shape):
+            return False
+        if not torch.equal(
+            a.symbol_indices.detach().to(device="cpu", dtype=torch.long),
+            b.symbol_indices.detach().to(device="cpu", dtype=torch.long),
+        ):
+            return False
     return int(a.lookback) == int(b.lookback)
 
 
@@ -4106,6 +4386,7 @@ def _maybe_share_windowed_base_from_cached(
         benchmark=cached_base.benchmark,
         lookback=split.lookback,
         sample_mask=sample_mask,
+        symbol_indices=cached_base.symbol_indices,
     )
 
 
@@ -4402,23 +4683,29 @@ def _run_eval_backtest_from_weight_buffers(
         timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
 
         backtest_runner_start = time.perf_counter()
-        backtest_chunk = run_backtest_torch(
-            weights_chunk,
-            returns_chunk,
-            mask_chunk,
-            bench_chunk,
-            buy_fee_rate,
-            sell_fee_rate,
-            long_only=long_only,
-            max_turnover_ratio=max_turnover_ratio,
-            gross_leverage=gross_leverage,
-            min_trade_weight=min_trade_weight,
-            portfolio_activation=portfolio_activation,
-            can_buy_mask=buy_mask_chunk,
-            can_sell_mask=sell_mask_chunk,
-            return_weights_history=return_weights_history,
-            initial_weights=initial_weights_chunk,
+        compile_context = (
+            nullcontext()
+            if _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", "1")
+            else _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0")
         )
+        with compile_context:
+            backtest_chunk = run_backtest_torch(
+                weights_chunk,
+                returns_chunk,
+                mask_chunk,
+                bench_chunk,
+                buy_fee_rate,
+                sell_fee_rate,
+                long_only=long_only,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+                can_buy_mask=buy_mask_chunk,
+                can_sell_mask=sell_mask_chunk,
+                return_weights_history=return_weights_history,
+                initial_weights=initial_weights_chunk,
+            )
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
 
@@ -5061,12 +5348,36 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 _progress(f"{progress_label}: model chunk {chunk_idx}/{len(model_ranges)} rows=[{start},{end})")
             prepare_device = _windowed_prepare_device(split, device)
             batch_prepare_start = time.perf_counter()
+            direct_panel_slab = False
             if panel_forward_model is not None:
-                batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
-                date_indices_chunk = batch["date_indices"]
+                batch = None
+                if panel_slab_model is not None and int(end - start) == int(model_chunk_rows):
+                    batch = split.panel_slab_batch_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    direct_panel_slab = batch is not None
+                if batch is None:
+                    batch = split.batch_metadata_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    date_indices_chunk = batch["date_indices"]
             else:
                 window_materialize_start = time.perf_counter()
-                batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+                batch = split.batch_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
                 _maybe_sync_cuda(prepare_device, profile_timing)
                 timing.window_materialize_s += time.perf_counter() - window_materialize_start
                 x_chunk = batch["x"]
@@ -5076,9 +5387,9 @@ def _evaluate_windowed_tensor_batch_decoupled(
 
             h2d_start = time.perf_counter()
             batch = _move_windowed_batch_to_device(batch, device, non_blocking)
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and not direct_panel_slab:
                 date_indices_chunk = batch["date_indices"]
-            else:
+            elif panel_forward_model is None:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
@@ -5090,7 +5401,14 @@ def _evaluate_windowed_tensor_batch_decoupled(
             timing.h2d_transfer_s += h2d_elapsed
 
             pad_start = time.perf_counter()
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and direct_panel_slab:
+                returns_chunk_padded = returns_chunk
+                mask_chunk_padded = mask_chunk
+                buy_mask_chunk_padded = buy_mask_chunk
+                sell_mask_chunk_padded = sell_mask_chunk
+                bench_chunk_padded = bench_chunk
+                valid_rows = int(end - start)
+            elif panel_forward_model is not None:
                 (
                     date_indices_chunk,
                     returns_chunk_padded,
@@ -5136,18 +5454,27 @@ def _evaluate_windowed_tensor_batch_decoupled(
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 if panel_forward_model is not None:
-                    model_output_chunk = _call_panel_forward_for_batch(
-                        panel_forward_model=panel_forward_model,
-                        panel_slab_model=panel_slab_model,
-                        split=split,
-                        batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
-                        mask=mask_chunk_padded,
-                        device=device,
-                        non_blocking=non_blocking,
-                        return_aux=False,
-                        allow_slab=int(valid_rows) == int(model_chunk_rows),
-                        rows=int(valid_rows),
-                    )
+                    if direct_panel_slab:
+                        if panel_slab_model is None:
+                            raise RuntimeError("panel slab model unexpectedly unavailable")
+                        model_output_chunk = panel_slab_model(
+                            batch["feature_slab"],
+                            mask_chunk_padded,
+                            batch.get("symbol_indices"),
+                        )
+                    else:
+                        model_output_chunk = _call_panel_forward_for_batch(
+                            panel_forward_model=panel_forward_model,
+                            panel_slab_model=panel_slab_model,
+                            split=split,
+                            batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
+                            mask=mask_chunk_padded,
+                            device=device,
+                            non_blocking=non_blocking,
+                            return_aux=False,
+                            allow_slab=int(valid_rows) == int(model_chunk_rows),
+                            rows=int(valid_rows),
+                        )
                 else:
                     model_output_chunk = _call_model(model, x_chunk, mask_chunk_padded, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
@@ -5342,12 +5669,36 @@ def _evaluate_windowed_tensor_batch(
             log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_chunks)
             prepare_device = _windowed_prepare_device(split, device)
             batch_prepare_start = time.perf_counter()
+            direct_panel_slab = False
             if panel_forward_model is not None:
-                batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
-                date_indices_chunk = batch["date_indices"]
+                batch = None
+                if panel_slab_model is not None and int(end - start) == int(chunk_rows):
+                    batch = split.panel_slab_batch_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    direct_panel_slab = batch is not None
+                if batch is None:
+                    batch = split.batch_metadata_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    date_indices_chunk = batch["date_indices"]
             else:
                 window_materialize_start = time.perf_counter()
-                batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+                batch = split.batch_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
                 _maybe_sync_cuda(prepare_device, profile_timing)
                 timing.window_materialize_s += time.perf_counter() - window_materialize_start
                 x_chunk = batch["x"]
@@ -5357,9 +5708,9 @@ def _evaluate_windowed_tensor_batch(
 
             h2d_start = time.perf_counter()
             batch = _move_windowed_batch_to_device(batch, device, non_blocking)
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and not direct_panel_slab:
                 date_indices_chunk = batch["date_indices"]
-            else:
+            elif panel_forward_model is None:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
@@ -5371,7 +5722,9 @@ def _evaluate_windowed_tensor_batch(
             timing.h2d_transfer_s += h2d_elapsed
 
             pad_start = time.perf_counter()
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and direct_panel_slab:
+                valid_rows = int(end - start)
+            elif panel_forward_model is not None:
                 (
                     date_indices_chunk,
                     returns_chunk,
@@ -5417,18 +5770,27 @@ def _evaluate_windowed_tensor_batch(
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 if panel_forward_model is not None:
-                    model_output_chunk = _call_panel_forward_for_batch(
-                        panel_forward_model=panel_forward_model,
-                        panel_slab_model=panel_slab_model,
-                        split=split,
-                        batch=batch if int(valid_rows) == int(chunk_rows) else panel_batch_for_forward,
-                        mask=mask_chunk,
-                        device=device,
-                        non_blocking=non_blocking,
-                        return_aux=False,
-                        allow_slab=int(valid_rows) == int(chunk_rows),
-                        rows=int(valid_rows),
-                    )
+                    if direct_panel_slab:
+                        if panel_slab_model is None:
+                            raise RuntimeError("panel slab model unexpectedly unavailable")
+                        model_output_chunk = panel_slab_model(
+                            batch["feature_slab"],
+                            mask_chunk,
+                            batch.get("symbol_indices"),
+                        )
+                    else:
+                        model_output_chunk = _call_panel_forward_for_batch(
+                            panel_forward_model=panel_forward_model,
+                            panel_slab_model=panel_slab_model,
+                            split=split,
+                            batch=batch if int(valid_rows) == int(chunk_rows) else panel_batch_for_forward,
+                            mask=mask_chunk,
+                            device=device,
+                            non_blocking=non_blocking,
+                            return_aux=False,
+                            allow_slab=int(valid_rows) == int(chunk_rows),
+                            rows=int(valid_rows),
+                        )
                 else:
                     model_output_chunk = _call_model(model, x_chunk, mask_chunk, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
@@ -6073,6 +6435,9 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     os.environ["STOCKAGENT_BACKTEST_COMPILE_DYNAMIC"] = (
         "1" if bool(getattr(training, "backtest_compile_dynamic", False)) else "0"
     )
+    eval_backtest_compile = getattr(training, "eval_backtest_compile", None)
+    if eval_backtest_compile is not None:
+        os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(eval_backtest_compile) else "0"
     os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if bool(training.strict_no_fallback) else "0"
@@ -6795,6 +7160,7 @@ def _train_epoch(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
+    debug_timing_sync: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
@@ -6861,6 +7227,7 @@ def _train_epoch(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
+            _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
                 if use_fused_log_utility and fused_loss_fn is not None:
@@ -6922,6 +7289,7 @@ def _train_epoch(
                     )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
+            _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
         should_check_finite = _should_check_finite(
             batch_no,
             finite_check_interval_steps,
@@ -6956,7 +7324,8 @@ def _train_epoch(
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
-                scaler.scale(loss).backward()
+                with profile_range("train.backward.autograd"):
+                    scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -7115,6 +7484,7 @@ def _train_epoch_tensor(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
+    debug_timing_sync: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
@@ -7139,6 +7509,7 @@ def _train_epoch_tensor(
         )
 
     for step_idx, batch_idx in enumerate(batch_order, start=1):
+        _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
@@ -7168,7 +7539,12 @@ def _train_epoch_tensor(
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
             with _cuda_timing(timing, "model_forward_cuda_s", device):
-                model_output = _call_model(model, batch_x, batch_mask, return_aux=model_return_aux)
+                model_output = _call_model(
+                    model,
+                    batch_x,
+                    batch_mask,
+                    return_aux=model_return_aux,
+                )
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
@@ -7278,6 +7654,7 @@ def _train_epoch_tensor(
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
                 scaler.scale(loss).backward()
+            _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -7431,6 +7808,7 @@ def _train_epoch_windowed_tensor(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
+    debug_timing_sync: bool = False,
     progress_label: str | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
@@ -7459,6 +7837,7 @@ def _train_epoch_windowed_tensor(
         )
 
     for step_idx, batch_idx in enumerate(batch_order, start=1):
+        _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
@@ -7469,21 +7848,54 @@ def _train_epoch_windowed_tensor(
 
         prepare_device = _windowed_prepare_device(split, device)
         batch_prepare_start = time.perf_counter()
+        direct_panel_slab = False
         if use_panel_forward:
-            batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
+            batch = None
+            if panel_slab_model is not None and model_return_aux is False:
+                route_start = time.perf_counter()
+                batch = split.panel_slab_batch_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
+                timing.prepare_panel_slab_batch_s += time.perf_counter() - route_start
+                direct_panel_slab = batch is not None
+            if batch is None:
+                route_start = time.perf_counter()
+                batch = split.batch_metadata_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
+                timing.prepare_metadata_batch_s += time.perf_counter() - route_start
             batch_x = None
         else:
             window_materialize_start = time.perf_counter()
-            batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+            route_start = time.perf_counter()
+            batch = split.batch_by_rows(
+                start,
+                end,
+                device=prepare_device,
+                non_blocking=False,
+                prepare_timing=timing,
+            )
+            timing.prepare_materialized_batch_s += time.perf_counter() - route_start
             _maybe_sync_cuda(prepare_device, profile_timing)
             timing.window_materialize_s += time.perf_counter() - window_materialize_start
             batch_x = batch["x"]
         _maybe_sync_cuda(prepare_device, profile_timing)
         batch_prepare_elapsed = time.perf_counter() - batch_prepare_start
         timing.batch_prepare_s += batch_prepare_elapsed
+        _record_debug_cuda_sync(timing, "after_prepare_sync_s", device, debug_timing_sync)
 
         h2d_start = time.perf_counter()
+        move_start = time.perf_counter()
         batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
         if batch_x is not None:
             batch_x = batch["x"]
         batch_ret = batch["future_log_returns"]
@@ -7503,23 +7915,72 @@ def _train_epoch_windowed_tensor(
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
             with _cuda_timing(timing, "model_forward_cuda_s", device):
-                if use_panel_forward:
+                if PROFILE_RANGES_ENABLED:
+                    with profile_range("train.forward.model"):
+                        if use_panel_forward:
+                            if panel_forward_model is None:
+                                raise RuntimeError("panel forward model unexpectedly unavailable")
+                            if direct_panel_slab:
+                                if panel_slab_model is None:
+                                    raise RuntimeError("panel slab model unexpectedly unavailable")
+                                model_output = panel_slab_model(
+                                    batch["feature_slab"],
+                                    batch_mask,
+                                    batch.get("symbol_indices"),
+                                )
+                            else:
+                                model_output = _call_panel_forward_for_batch(
+                                    panel_forward_model=panel_forward_model,
+                                    panel_slab_model=panel_slab_model,
+                                    split=split,
+                                    batch=batch,
+                                    mask=batch_mask,
+                                    device=device,
+                                    non_blocking=non_blocking,
+                                    return_aux=model_return_aux,
+                                )
+                        else:
+                            if batch_x is None:
+                                raise RuntimeError("window tensor batch unexpectedly unavailable")
+                            model_output = _call_model(
+                                model,
+                                batch_x,
+                                batch_mask,
+                                return_aux=model_return_aux,
+                                symbol_indices=batch.get("symbol_indices"),
+                            )
+                elif use_panel_forward:
                     if panel_forward_model is None:
                         raise RuntimeError("panel forward model unexpectedly unavailable")
-                    model_output = _call_panel_forward_for_batch(
-                        panel_forward_model=panel_forward_model,
-                        panel_slab_model=panel_slab_model,
-                        split=split,
-                        batch=batch,
-                        mask=batch_mask,
-                        device=device,
-                        non_blocking=non_blocking,
-                        return_aux=model_return_aux,
-                    )
+                    if direct_panel_slab:
+                        if panel_slab_model is None:
+                            raise RuntimeError("panel slab model unexpectedly unavailable")
+                        model_output = panel_slab_model(
+                            batch["feature_slab"],
+                            batch_mask,
+                            batch.get("symbol_indices"),
+                        )
+                    else:
+                        model_output = _call_panel_forward_for_batch(
+                            panel_forward_model=panel_forward_model,
+                            panel_slab_model=panel_slab_model,
+                            split=split,
+                            batch=batch,
+                            mask=batch_mask,
+                            device=device,
+                            non_blocking=non_blocking,
+                            return_aux=model_return_aux,
+                        )
                 else:
                     if batch_x is None:
                         raise RuntimeError("window tensor batch unexpectedly unavailable")
-                    model_output = _call_model(model, batch_x, batch_mask, return_aux=model_return_aux)
+                    model_output = _call_model(
+                        model,
+                        batch_x,
+                        batch_mask,
+                        return_aux=model_return_aux,
+                        symbol_indices=batch.get("symbol_indices"),
+                    )
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
@@ -7541,9 +8002,61 @@ def _train_epoch_windowed_tensor(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
+            _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
-                if use_fused_log_utility and fused_loss_fn is not None:
+                if PROFILE_RANGES_ENABLED:
+                    with profile_range("train.forward.loss"):
+                        if use_fused_log_utility and fused_loss_fn is not None:
+                            loss, fused_next_prev = _run_fused_log_utility_loss(
+                                fused_loss_fn,
+                                weights,
+                                batch_ret,
+                                batch_mask,
+                                batch_buy_mask,
+                                batch_sell_mask,
+                                batch_sample_mask,
+                                portfolio_prev_weights,
+                            )
+                        else:
+                            loss = loss_fn(
+                                weights,
+                                batch_ret,
+                                batch_mask,
+                                benchmark_returns=batch_bench,
+                                can_buy_mask=batch_buy_mask,
+                                can_sell_mask=batch_sell_mask,
+                                sample_mask=batch_sample_mask,
+                                long_only=long_only,
+                                buy_fee_rate=buy_fee_rate,
+                                sell_fee_rate=sell_fee_rate,
+                                max_turnover_ratio=max_turnover_ratio,
+                                gross_leverage=gross_leverage,
+                                gamma_sharpe=gamma_sharpe,
+                                gamma_excess=gamma_excess,
+                                gamma_cvar=gamma_cvar,
+                                cvar_alpha=cvar_alpha,
+                                gamma_drawdown=gamma_drawdown,
+                                drawdown_target=drawdown_target,
+                                gamma_turnover=gamma_turnover,
+                                gamma_underperformance=gamma_underperformance,
+                                excess_target=excess_target,
+                                cvar_budget=cvar_budget,
+                                drawdown_budget=drawdown_budget,
+                                turnover_budget=turnover_budget,
+                                gamma_cvar_budget=gamma_cvar_budget,
+                                gamma_drawdown_budget=gamma_drawdown_budget,
+                                gamma_turnover_budget=gamma_turnover_budget,
+                                objective=objective,
+                                aux_outputs=aux_outputs,
+                                rank_ic_weight=rank_ic_weight,
+                                direction_weight=direction_weight,
+                                volatility_regime_weight=volatility_regime_weight,
+                                concentration_weight=concentration_weight,
+                                regime_up_threshold=regime_up_threshold,
+                                regime_down_threshold=regime_down_threshold,
+                            )
+                elif use_fused_log_utility and fused_loss_fn is not None:
                     loss, fused_next_prev = _run_fused_log_utility_loss(
                         fused_loss_fn,
                         weights,
@@ -7594,6 +8107,7 @@ def _train_epoch_windowed_tensor(
                     )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
+            _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
         should_check_finite = _should_check_finite(
             step_idx,
@@ -7651,6 +8165,7 @@ def _train_epoch_windowed_tensor(
                 scaler.step(optimizer)
                 scaler.update()
             _stabilize_model_parameters_after_step(model)
+            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7658,7 +8173,12 @@ def _train_epoch_windowed_tensor(
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
-                loss.backward()
+                if PROFILE_RANGES_ENABLED:
+                    with profile_range("train.backward.autograd"):
+                        loss.backward()
+                else:
+                    loss.backward()
+            _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
@@ -7683,6 +8203,7 @@ def _train_epoch_windowed_tensor(
             with _cuda_timing(timing, "step_cuda_s", device):
                 optimizer.step()
             _stabilize_model_parameters_after_step(model)
+            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -8709,13 +9230,16 @@ def run_training(
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
 
-    if resume:
+    retrain_completed_folds = _env_truthy("STOCKAGENT_RETRAIN_COMPLETED_FOLDS", "0")
+    if resume and not retrain_completed_folds:
         for fold in fold_list:
             completed = _load_completed_fold_result(output_path, fold.fold_id)
             if completed is not None:
                 results_by_fold[fold.fold_id] = completed
         if results_by_fold:
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+    elif resume and retrain_completed_folds:
+        print("[resume] retrain_completed_folds=true: ignoring completed fold markers")
 
     grouped_folds: dict[tuple[int, ...], list[WalkForwardFold]] = {}
     for fold in fold_list:
@@ -8839,6 +9363,11 @@ def run_training(
         if use_windowed_tensors:
             _progress(f"[Train {train_years}] setup train tensors: lazy windowed split")
             train_windowed = _pad_windowed_training_split(dataset_to_windowed_tensors(train_ds), train_batch_size)
+            train_windowed = _maybe_compact_train_windowed_symbols(
+                train_windowed,
+                config,
+                label=f"Train {train_years}",
+            )
             train_windowed = _prepare_windowed_split(
                 train_windowed,
                 device,
@@ -9637,6 +10166,7 @@ def run_training(
 
         if _should_profile_train_step():
             profile_batch: dict[str, torch.Tensor] | None = None
+            profile_model: nn.Module = compiled_train_model
             try:
                 if train_loader is not None:
                     raw_batch = next(iter(train_loader))
@@ -9644,12 +10174,22 @@ def run_training(
                 elif train_windowed is not None:
                     slice_end = min(train_batch_size, len(train_windowed))
                     if slice_end > 0:
-                        profile_batch = train_windowed.batch_by_rows(
-                            0,
-                            slice_end,
-                            device=device,
-                            non_blocking=non_blocking,
-                        )
+                        if panel_slab_model is not None:
+                            profile_batch = train_windowed.panel_slab_batch_by_rows(
+                                0,
+                                slice_end,
+                                device=device,
+                                non_blocking=non_blocking,
+                            )
+                            if profile_batch is not None:
+                                profile_model = panel_slab_model
+                        if profile_batch is None:
+                            profile_batch = train_windowed.batch_by_rows(
+                                0,
+                                slice_end,
+                                device=device,
+                                non_blocking=non_blocking,
+                            )
                 else:
                     slice_end = min(train_batch_size, int(train_x.size(0)))
                     if slice_end > 0:
@@ -9666,7 +10206,7 @@ def run_training(
                             profile_batch["sample_mask"] = train_sample_mask[:slice_end].to(device=device, non_blocking=non_blocking)
                 if profile_batch is not None:
                     _profile_single_train_step(
-                        model=compiled_train_model,
+                        model=profile_model,
                         loss_fn=compiled_loss_fn,
                         fused_loss_fn=fused_log_utility_loss_fn,
                         batch=profile_batch,
@@ -9782,6 +10322,7 @@ def run_training(
                     lr_scheduler=scheduler,
                     lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
+                    debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
                 )
             if train_windowed is not None:
                 return _train_epoch_windowed_tensor(
@@ -9829,6 +10370,7 @@ def run_training(
                     lr_scheduler=scheduler,
                     lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
+                    debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
                 )
             return _train_epoch_tensor(
                 train_model,
@@ -10220,7 +10762,11 @@ def run_training(
                             cuda_sync_s=cuda_sync_total,
                             scalar_sync_s=scalar_sync_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
-                            timing_synchronized=(device.type != "cuda" or profile_timing),
+                            timing_synchronized=(
+                                device.type != "cuda"
+                                or profile_timing
+                                or bool(getattr(config.training, "debug_timing_sync", False))
+                            ),
                             backtest_compile_stats=bt_stats_after,
                             backtest_prep_compile_stats=bt_prep_stats_after,
                             backtest_runtime_stats=bt_runtime_after,
@@ -10319,6 +10865,7 @@ def run_training(
                                 model=model,
                                 optimizer=optimizer,
                                 scaler=scaler,
+                                check_finite=config.training.checkpoint_finite_check,
                             )
                             fold_ckpt_total += time.perf_counter() - fold_ckpt_start
                 val_eval_total = max(0.0, time.perf_counter() - val_eval_start - fold_ckpt_total)
@@ -10581,6 +11128,7 @@ def run_training(
                             model=model,
                             optimizer=optimizer,
                             scaler=scaler,
+                            check_finite=config.training.checkpoint_finite_check,
                         )
                         if bool(getattr(config.training, "save_best_val_artifacts", False)):
                             _save_best_val_backtest_snapshot(
@@ -10642,6 +11190,7 @@ def run_training(
                     early_stop_patience=early_stop_patience,
                     early_stopping_no_improve_ratio=early_stop_ratio,
                     early_stop_val_interval_epochs=val_interval,
+                    check_finite=config.training.checkpoint_finite_check,
                 )
                 group_ckpt_total = time.perf_counter() - group_ckpt_start
 
@@ -10741,7 +11290,11 @@ def run_training(
                             scalar_sync_s=scalar_sync_total,
                             gc_s=gc_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
-                            timing_synchronized=(device.type != "cuda" or profile_timing),
+                            timing_synchronized=(
+                                device.type != "cuda"
+                                or profile_timing
+                                or bool(getattr(config.training, "debug_timing_sync", False))
+                            ),
                             backtest_compile_stats=bt_stats_after,
                             backtest_prep_compile_stats=bt_prep_stats_after,
                             backtest_runtime_stats=bt_runtime_after,
@@ -11130,6 +11683,7 @@ def run_training(
             early_stop_patience=early_stop_patience,
             early_stopping_no_improve_ratio=early_stop_ratio,
             early_stop_val_interval_epochs=val_interval,
+            check_finite=config.training.checkpoint_finite_check,
         )
 
         if config.training.warm_start_from_previous_fold:

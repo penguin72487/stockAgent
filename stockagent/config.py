@@ -521,8 +521,10 @@ class TrainingConfig:
     eval_model_chunk_rows: int | str = "auto"
     eval_backtest_chunk_rows: int = 512
     eval_backtest_chunk_rows_auto: bool = True
+    eval_backtest_compile: bool | None = None
     eval_auto_chunk_rows_cap: int = 16
     train_symbol_subsample_ratio: float = 1.0
+    train_symbol_compaction: str = "none"
     detach_prev_state: bool = True
     prefer_fp16: bool = False
     backtest_autotune: bool = True
@@ -558,6 +560,7 @@ class TrainingConfig:
     defer_epoch_curve_plot_until_end: bool = True
     input_pipeline_ab_test: bool = True
     input_pipeline_ab_test_steps: int = 20
+    debug_timing_sync: bool = False
     explain_after_each_fold: bool = False
     explain_first_test_year_only: bool = True
     explain_top_k: int = 20
@@ -642,6 +645,7 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     grad_clip_norm: float = 1.0
     finite_check_interval_steps: int = 0
+    checkpoint_finite_check: bool = True
     materialize_window_tensors: bool = False
     loss_type: str = "mse"  # "mse", "pure_rank", "rank_ic", "sharpe", "sortino", "log_utility", etc.
     mlp: MLPModelConfig = field(default_factory=MLPModelConfig)
@@ -741,8 +745,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("eval_model_chunk_rows", "auto")
     training.setdefault("eval_backtest_chunk_rows", 512)
     training.setdefault("eval_backtest_chunk_rows_auto", True)
+    training.setdefault("eval_backtest_compile", None)
     training.setdefault("eval_auto_chunk_rows_cap", 16)
     training.setdefault("train_symbol_subsample_ratio", 1.0)
+    training.setdefault("train_symbol_compaction", "none")
     training.setdefault("detach_prev_state", True)
     training.setdefault("prefer_fp16", False)
     training.setdefault("backtest_autotune", True)
@@ -772,6 +778,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("defer_epoch_curve_plot_until_end", True)
     training.setdefault("input_pipeline_ab_test", True)
     training.setdefault("input_pipeline_ab_test_steps", 20)
+    training.setdefault("debug_timing_sync", False)
     training.setdefault("explain_after_each_fold", False)
     training.setdefault("explain_first_test_year_only", True)
     training.setdefault("explain_top_k", 20)
@@ -921,6 +928,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("weight_decay", 1e-5)
     training.setdefault("grad_clip_norm", 1.0)
     training.setdefault("finite_check_interval_steps", 0)
+    training.setdefault("checkpoint_finite_check", True)
     training.setdefault("materialize_window_tensors", False)
     training.setdefault("loss_type", "mse")
 
@@ -1513,8 +1521,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
             eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],
             eval_backtest_chunk_rows=training_raw["eval_backtest_chunk_rows"],
             eval_backtest_chunk_rows_auto=training_raw["eval_backtest_chunk_rows_auto"],
+            eval_backtest_compile=training_raw["eval_backtest_compile"],
             eval_auto_chunk_rows_cap=training_raw["eval_auto_chunk_rows_cap"],
             train_symbol_subsample_ratio=training_raw["train_symbol_subsample_ratio"],
+            train_symbol_compaction=training_raw["train_symbol_compaction"],
             detach_prev_state=training_raw["detach_prev_state"],
             prefer_fp16=training_raw["prefer_fp16"],
             backtest_autotune=training_raw["backtest_autotune"],
@@ -1550,6 +1560,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             defer_epoch_curve_plot_until_end=training_raw["defer_epoch_curve_plot_until_end"],
             input_pipeline_ab_test=training_raw["input_pipeline_ab_test"],
             input_pipeline_ab_test_steps=training_raw["input_pipeline_ab_test_steps"],
+            debug_timing_sync=training_raw["debug_timing_sync"],
             explain_after_each_fold=training_raw["explain_after_each_fold"],
             explain_first_test_year_only=training_raw["explain_first_test_year_only"],
             explain_top_k=training_raw["explain_top_k"],
@@ -1636,6 +1647,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             weight_decay=training_raw["weight_decay"],
             grad_clip_norm=training_raw["grad_clip_norm"],
             finite_check_interval_steps=training_raw["finite_check_interval_steps"],
+            checkpoint_finite_check=training_raw["checkpoint_finite_check"],
             materialize_window_tensors=training_raw["materialize_window_tensors"],
             loss_type=training_raw["loss_type"],
             mlp=MLPModelConfig(**training_raw["mlp"]),

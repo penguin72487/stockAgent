@@ -3,9 +3,9 @@ experiment_name: tw-stock-transformer-market-public-data-all
 runner:
   output_dir: artifacts/markets/tw_boost
   mode: train
-  resume: true
+  resume: false
   post_train_infer: false
-  start_fold: 5
+  start_fold: 11
 environment:
   conda_env: fintech
   device: cuda
