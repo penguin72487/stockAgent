@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -31,11 +33,26 @@ except ImportError:  # pragma: no cover - direct script execution from downloade
 
 
 DATA_GOV_DATASET_API = "https://data.gov.tw/api/v2/rest/dataset/{dataset_id}"
-USER_AGENT = "stockAgent-tw-public-data-downloader/1.0"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 stockAgent/1.0"
+)
 DATE_COLUMN = "date"
 ROC_DATE_PATTERN = re.compile(r"^\d{2,3}/\d{1,2}/\d{1,2}$")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+_HTTP_LOCAL = threading.local()
+
+
+def _http_session() -> requests.Session:
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _HTTP_LOCAL.session = session
+    return session
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +82,15 @@ class DownloadResult:
     raw_path: str | None = None
     fetched_dates: int = 0
     skipped_dates: int = 0
+
+
+@dataclass(slots=True)
+class HistoricalDateResult:
+    day: date
+    url: str
+    frame: pl.DataFrame
+    raw_path: str | None = None
+    error: str | None = None
 
 
 HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
@@ -432,10 +458,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-date", default="today", help="Historical end date, today, or now.")
     parser.add_argument("--output-dir", default="data_tw_public", help="Output directory.")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent historical dataset workers.")
+    parser.add_argument(
+        "--date-workers",
+        type=int,
+        default=4,
+        help="Concurrent date requests inside each historical dataset.",
+    )
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds.")
     parser.add_argument("--retries", type=int, default=3, help="Transient HTTP retry count per request.")
     parser.add_argument("--retry-backoff", type=float, default=1.0, help="Base seconds for exponential retry backoff.")
     parser.add_argument("--sleep", type=float, default=0.15, help="Delay between historical date requests per dataset.")
+    parser.add_argument(
+        "--flush-every-dates",
+        type=int,
+        default=250,
+        help="Write historical parquet after this many fetched dates; 0 writes once at the end.",
+    )
     parser.add_argument("--max-dates", type=int, default=None, help="Optional smoke-test cap per historical dataset.")
     parser.add_argument("--refresh", action="store_true", help="Overwrite existing parquet instead of merging.")
     parser.add_argument("--skip-raw", action="store_true", help="Do not persist raw response bytes.")
@@ -521,21 +559,25 @@ def _http_get(
 ) -> requests.Response:
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "application/json,text/csv,text/plain,application/xml,text/xml,*/*",
+        "Accept": "application/json,text/csv,text/plain,text/javascript,application/xml,text/xml,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Referer": "https://www.twse.com.tw/",
+        "X-Requested-With": "XMLHttpRequest",
     }
     retry_count = max(0, int(retries))
-    transient_statuses = {429, 500, 502, 503, 504}
+    transient_statuses = {403, 408, 429, 500, 502, 503, 504}
     last_error: requests.exceptions.RequestException | None = None
 
     for attempt in range(retry_count + 1):
         try:
+            session = _http_session()
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=timeout, verify=verify_ssl)
+                response = session.get(url, params=params, headers=headers, timeout=timeout, verify=verify_ssl)
             except requests.exceptions.SSLError:
                 if not verify_ssl:
                     raise
                 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-                response = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+                response = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
             if response.status_code in transient_statuses and attempt < retry_count:
                 time.sleep(_retry_delay_seconds(response, attempt, retry_backoff))
                 continue
@@ -978,6 +1020,46 @@ def _latest_existing_date(path: Path) -> date | None:
         return None
 
 
+def _download_historical_date(
+    spec: DatasetSpec,
+    day: date,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> HistoricalDateResult:
+    assert spec.url_template is not None
+    url = spec.url_template.format(date=_format_date(day, spec.date_format))
+    try:
+        response = _http_get(
+            url,
+            timeout=args.timeout,
+            verify_ssl=bool(args.verify_ssl),
+            retries=int(args.retries),
+            retry_backoff=float(args.retry_backoff),
+        )
+        payload = response.json()
+        frame = _parse_json_table_payload(payload, spec, day)
+        raw_path: Path | None = None
+        if not frame.is_empty() and not args.skip_raw:
+            raw_path = _write_raw(
+                response.content,
+                output_dir / "raw" / spec.name,
+                spec.name,
+                ".json",
+                stem=day.isoformat(),
+            )
+        return HistoricalDateResult(
+            day=day,
+            url=url,
+            frame=frame,
+            raw_path=str(raw_path) if raw_path else None,
+        )
+    except Exception as exc:
+        return HistoricalDateResult(day=day, url=url, frame=pl.DataFrame(), error=str(exc))
+    finally:
+        if args.sleep:
+            time.sleep(max(0.0, float(args.sleep)))
+
+
 def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir: Path) -> DownloadResult:
     assert spec.url_template is not None
     parquet_path = output_dir / f"{spec.name}.parquet"
@@ -1001,77 +1083,102 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
     fetched_dates = 0
     skipped_dates = 0
     new_rows = 0
-    raw_path: Path | None = None
+    raw_path: str | None = None
     last_error: str | None = None
+    rows = _read_existing_row_count(parquet_path)
+    wrote_any = False
+    flush_every_dates = max(0, int(getattr(args, "flush_every_dates", 0) or 0))
+    date_workers = max(1, int(getattr(args, "date_workers", 1) or 1))
     progress_iter = tqdm(
-        dates,
+        total=len(dates),
         desc=f"{spec.name}:dates",
         unit="day",
         leave=False,
         mininterval=0.5,
         disable=not bool(getattr(args, "progress", True)),
     )
-    for day in progress_iter:
-        url = spec.url_template.format(date=_format_date(day, spec.date_format))
-        try:
-            response = _http_get(
-                url,
-                timeout=args.timeout,
-                verify_ssl=bool(args.verify_ssl),
-                retries=int(args.retries),
-                retry_backoff=float(args.retry_backoff),
+
+    def flush_frames(*, final: bool = False) -> None:
+        nonlocal frames, rows, wrote_any
+        if not frames:
+            return
+        incoming = pl.concat(frames, how="diagonal_relaxed")
+        rows = _write_parquet_merged(parquet_path, incoming, refresh=bool(args.refresh) and not wrote_any)
+        frames = []
+        wrote_any = True
+        if final or bool(getattr(args, "progress", True)):
+            progress_iter.set_postfix(
+                fetched=fetched_dates,
+                skipped=skipped_dates,
+                rows=rows,
+                flushed=int(wrote_any),
             )
-            payload = response.json()
-            frame = _parse_json_table_payload(payload, spec, day)
-        except Exception as exc:
-            last_error = str(exc)
+
+    def consume(result: HistoricalDateResult) -> None:
+        nonlocal fetched_dates, skipped_dates, new_rows, raw_path, last_error
+        if result.error is not None:
+            last_error = result.error
             skipped_dates += 1
-            continue
-        if frame.is_empty():
+        elif result.frame.is_empty():
             skipped_dates += 1
         else:
-            frames.append(_append_common_columns(frame, spec, fetched_at=fetched_at, url=url))
+            frames.append(_append_common_columns(result.frame, spec, fetched_at=fetched_at, url=result.url))
             fetched_dates += 1
-            new_rows += int(frame.height)
-            if not args.skip_raw:
-                raw_path = _write_raw(
-                    response.content,
-                    output_dir / "raw" / spec.name,
-                    spec.name,
-                    ".json",
-                    stem=day.isoformat(),
-                )
+            new_rows += int(result.frame.height)
+            raw_path = result.raw_path or raw_path
+            if flush_every_dates and len(frames) >= flush_every_dates:
+                flush_frames()
         if bool(getattr(args, "progress", True)):
             progress_iter.set_postfix(
                 fetched=fetched_dates,
                 skipped=skipped_dates,
-                rows=new_rows,
-                refresh=False,
+                rows=(rows + new_rows if not wrote_any else rows),
+                refresh=bool(args.refresh),
+                date_workers=date_workers,
             )
-        if args.sleep:
-            time.sleep(max(0.0, float(args.sleep)))
 
-    if not frames:
-        rows = _read_existing_row_count(parquet_path)
+    completed: dict[date, HistoricalDateResult] = {}
+    next_idx = 0
+    try:
+        with ThreadPoolExecutor(max_workers=date_workers) as executor:
+            futures = {
+                executor.submit(_download_historical_date, spec, day, args, output_dir): day
+                for day in dates
+            }
+            for future in as_completed(futures):
+                day = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = HistoricalDateResult(day=day, url="", frame=pl.DataFrame(), error=str(exc))
+                completed[day] = result
+                progress_iter.update(1)
+                while next_idx < len(dates) and dates[next_idx] in completed:
+                    consume(completed.pop(dates[next_idx]))
+                    next_idx += 1
+        flush_frames(final=True)
+    finally:
+        progress_iter.close()
+
+    if not wrote_any:
+        status = "failed" if last_error is not None and fetched_dates == 0 else "no_new_rows"
         return DownloadResult(
             spec.name,
-            "no_new_rows",
+            status,
             rows,
             str(parquet_path) if parquet_path.exists() else None,
             message=last_error,
-            raw_path=str(raw_path) if raw_path else None,
+            raw_path=raw_path,
             fetched_dates=fetched_dates,
             skipped_dates=skipped_dates,
         )
 
-    incoming = pl.concat(frames, how="diagonal_relaxed")
-    rows = _write_parquet_merged(parquet_path, incoming, refresh=bool(args.refresh))
     return DownloadResult(
         spec.name,
         "ok",
         rows,
         str(parquet_path),
-        raw_path=str(raw_path) if raw_path else None,
+        raw_path=raw_path,
         fetched_dates=fetched_dates,
         skipped_dates=skipped_dates,
     )

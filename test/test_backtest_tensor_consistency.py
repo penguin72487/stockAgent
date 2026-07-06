@@ -27,6 +27,7 @@ from stockagent.training.trainer import (
     _pad_training_tensors,
     _pad_windowed_training_split,
     _prepare_windowed_split,
+    _loss_from_backtest_series,
     TimingBreakdown,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
@@ -1090,6 +1091,74 @@ def test_log_utility_loss_uses_fee_adjusted_canonical_tensor_backtest_returns() 
     assert torch.isfinite(weights.grad).all()
 
 
+def test_eval_log_utility_can_transform_geometric_utility_returns() -> None:
+    strategy_returns = torch.tensor([0.02, -0.01, 0.03, 0.01], dtype=torch.float32)
+    benchmark_returns = torch.zeros_like(strategy_returns)
+    turnovers = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32)
+
+    loss = _loss_from_backtest_series(
+        strategy_returns,
+        benchmark_returns,
+        turnovers,
+        gamma_sharpe=1.0,
+        gamma_excess=0.0,
+        gamma_cvar=0.0,
+        cvar_alpha=0.05,
+        gamma_drawdown=0.0,
+        drawdown_target=0.0,
+        gamma_turnover=0.0,
+        gamma_underperformance=0.0,
+        excess_target=0.0,
+        cvar_budget=0.0,
+        drawdown_budget=0.0,
+        turnover_budget=0.0,
+        gamma_cvar_budget=0.0,
+        gamma_drawdown_budget=0.0,
+        gamma_turnover_budget=0.0,
+        objective="log_utility",
+        log_utility_pre_log_power=0.0,
+        log_utility_periods_per_year=2.0,
+        log_utility_log_shift=0.001,
+    )
+
+    expected = -(strategy_returns.sum() / 2.0 - 0.001)
+    assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+
+
+def test_eval_log_utility_manual_power_means_manual_years() -> None:
+    strategy_returns = torch.tensor([0.02, 0.01, -0.005], dtype=torch.float32)
+    benchmark_returns = torch.zeros_like(strategy_returns)
+    turnovers = torch.zeros_like(strategy_returns)
+
+    loss = _loss_from_backtest_series(
+        strategy_returns,
+        benchmark_returns,
+        turnovers,
+        gamma_sharpe=1.0,
+        gamma_excess=0.0,
+        gamma_cvar=0.0,
+        cvar_alpha=0.05,
+        gamma_drawdown=0.0,
+        drawdown_target=0.0,
+        gamma_turnover=0.0,
+        gamma_underperformance=0.0,
+        excess_target=0.0,
+        cvar_budget=0.0,
+        drawdown_budget=0.0,
+        turnover_budget=0.0,
+        gamma_cvar_budget=0.0,
+        gamma_drawdown_budget=0.0,
+        gamma_turnover_budget=0.0,
+        objective="log_utility",
+        log_utility_pre_log_power=3.0,
+        log_utility_periods_per_year=252.0,
+        log_utility_log_shift=0.0,
+    )
+
+    expected = -(strategy_returns.sum() / 3.0)
+    assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+
+
 def test_dense_masked_clean_mean_matches_boolean_indexing_semantics() -> None:
     values = torch.tensor(
         [0.01, float("nan"), -0.02, float("inf"), -float("inf"), 0.03],
@@ -1445,6 +1514,47 @@ def test_segmented_log_utility_eval_loss_matches_fused_backtest_rules() -> None:
         objective="log_utility",
     )
     assert torch.allclose(eval_losses, torch.stack(fused_losses), atol=1e-7, rtol=1e-6)
+
+
+def test_segmented_log_utility_eval_loss_applies_geometric_utility_transform() -> None:
+    strategy_returns = torch.tensor([0.02, -0.01, 0.03, 0.01, -0.02, 0.04], dtype=torch.float32)
+    benchmark_returns = torch.zeros_like(strategy_returns)
+    turnovers = torch.zeros_like(strategy_returns)
+    offsets = [0, 4, 6]
+
+    eval_losses = _batched_loss_from_backtest_segments(
+        strategy_returns,
+        benchmark_returns,
+        turnovers,
+        offsets,
+        gamma_sharpe=1.0,
+        gamma_excess=0.0,
+        gamma_cvar=0.0,
+        cvar_alpha=0.05,
+        gamma_drawdown=0.0,
+        drawdown_target=0.0,
+        gamma_turnover=0.0,
+        gamma_underperformance=0.0,
+        excess_target=0.0,
+        cvar_budget=0.0,
+        drawdown_budget=0.0,
+        turnover_budget=0.0,
+        gamma_cvar_budget=0.0,
+        gamma_drawdown_budget=0.0,
+        gamma_turnover_budget=0.0,
+        objective="log_utility",
+        log_utility_pre_log_power=0.0,
+        log_utility_periods_per_year=2.0,
+        log_utility_log_shift=0.0005,
+    )
+
+    expected = torch.stack(
+        [
+            -(strategy_returns[0:4].sum() / 2.0 - 0.0005),
+            -(strategy_returns[4:6].sum() / 1.0 - 0.0005),
+        ]
+    )
+    assert torch.allclose(eval_losses, expected, atol=1e-7, rtol=1e-6)
 
 
 def test_fused_log_utility_loss_compile_fullgraph_smoke() -> None:

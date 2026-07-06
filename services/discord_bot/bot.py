@@ -132,6 +132,13 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _state() -> dict[str, Any]:
     if not STATE_PATH.exists():
         return {"markets": {}, "users": {}}
@@ -668,7 +675,9 @@ def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus
         return text
     if not status.market_open:
         return None
-    if cfg.pre_signal_command:
+    market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
+    frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
+    if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "15m"}:
         return "panel"
     return "yahoo"
 
@@ -710,6 +719,8 @@ def _signal_kwargs(
     min_abs_delta: float | None = None,
     signal_id: str | None = None,
     scheduled: bool = False,
+    progress_callback: Any | None = None,
+    progress_label: str | None = None,
 ) -> dict:
     cfg = _resolve_market(market)
     status = _ensure_signal_ready(cfg, scheduled=scheduled)
@@ -719,6 +730,8 @@ def _signal_kwargs(
         "min_abs_delta": min_abs_delta,
         "signal_id": signal_id,
         "market_notice": _market_notice(status),
+        "progress_callback": progress_callback,
+        "progress_label": progress_label,
     }
     return cfg.signal_kwargs(**overrides)
 
@@ -768,7 +781,39 @@ class StockAgentBot(discord.Client):
 bot = StockAgentBot()
 
 
+class _ConsoleProgress:
+    def __init__(self, *, prefix: str = "discord") -> None:
+        self.prefix = str(prefix or "discord")
+        self.started_at = time.perf_counter()
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        label = str(event.get("label") or self.prefix)
+        message = str(event.get("message") or "")
+        try:
+            step = int(event.get("step") or 0)
+            total = max(1, int(event.get("total") or 1))
+        except Exception:
+            step = 0
+            total = 1
+        step = min(max(step, 0), total)
+        width = 28
+        filled = int(round(width * step / total))
+        bar = "#" * filled + "-" * (width - filled)
+        pct = 100.0 * step / total
+        elapsed = time.perf_counter() - self.started_at
+        print(
+            f"[signal-progress] {label} [{bar}] {step:02d}/{total:02d} {pct:6.2f}% "
+            f"{elapsed:7.1f}s {message}",
+            flush=True,
+        )
+
+
 def _run_market_signal_sync(**kwargs):
+    if _env_bool("STOCKAGENT_BOT_PROGRESS", True) and kwargs.get("progress_callback") is None:
+        market = str(kwargs.get("market") or _default_market()).strip() or _default_market()
+        label = str(kwargs.get("progress_label") or f"discord:{market}").strip()
+        kwargs["progress_callback"] = _ConsoleProgress(prefix=label)
+        kwargs["progress_label"] = label
     return generate_live_signal(**_signal_kwargs(**kwargs))
 
 
@@ -1475,14 +1520,17 @@ def _scheduled_detail_page_groups(
     summary = result.summary
     output_dir = summary.get("output_dir") or result.output_dir
     output_text = _display_path(Path(output_dir)) if output_dir else "n/a"
+    header_pairs = [
+        ("market", summary.get("market", cfg.market)),
+        ("signal", summary.get("signal_id", "n/a")),
+        ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+        ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
+        ("price", summary.get("price_source", "n/a")),
+    ]
+    if summary.get("price_timestamp"):
+        header_pairs.append(("price_time", _display_summary_time(summary, summary.get("price_timestamp"))))
     common_header = [
-        _kv_line(
-            ("market", summary.get("market", cfg.market)),
-            ("signal", summary.get("signal_id", "n/a")),
-            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
-            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
-            ("price", summary.get("price_source", "n/a")),
-        ),
+        _kv_line(*header_pairs),
         f"capital: `{_capital_context_text(capital=capital)}`",
     ]
     if debug:
@@ -3177,14 +3225,14 @@ async def latest(
     await interaction.response.defer(thinking=True)
     try:
         cfg = _resolve_market(market)
-        summary_path, summary = _latest_signal_or_raise(cfg)
-        message = _latest_signal_message(
-            cfg,
-            summary_path,
-            summary,
-            top_n=max(0, int(top_n or 0)),
-            current_capital=current_capital,
-            debug=debug,
+        message = await asyncio.to_thread(
+            lambda: _latest_signal_message(
+                cfg,
+                *_latest_signal_or_raise(cfg),
+                top_n=max(0, int(top_n or 0)),
+                current_capital=current_capital,
+                debug=debug,
+            )
         )
     except Exception as exc:
         await _send_command_error(interaction, "latest", exc)
@@ -3220,17 +3268,17 @@ async def changes(
         if watchlist_only and not watchlist:
             await interaction.followup.send(f"`{cfg.market}` 你的 watchlist 是空的，先用 `/watch action:add symbol:<代號>` 加入。")
             return
-        summary_path, summary = _latest_signal_or_raise(cfg)
-        pages = _latest_changes_pages(
-            cfg,
-            summary_path,
-            summary,
-            action=action,
-            limit=limit,
-            page_size=page_size,
-            current_capital=current_capital,
-            watchlist=watchlist,
-            debug=debug,
+        pages = await asyncio.to_thread(
+            lambda: _latest_changes_pages(
+                cfg,
+                *_latest_signal_or_raise(cfg),
+                action=action,
+                limit=limit,
+                page_size=page_size,
+                current_capital=current_capital,
+                watchlist=watchlist,
+                debug=debug,
+            )
         )
     except Exception as exc:
         await _send_command_error(interaction, "changes", exc)
@@ -3397,6 +3445,7 @@ async def signal_now(
             price_source=resolved_price_source,
             top_n=_top_n(top_n),
             min_abs_delta=min_abs_delta,
+            progress_label=f"signal_now:{cfg.market}",
         )
         result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
     except Exception as exc:
@@ -3937,6 +3986,7 @@ async def scheduled_signal() -> None:
                 market=market,
                 scheduled=True,
                 price_source=resolved_price_source,
+                progress_label=f"scheduled:{market}",
             )
             result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0)
             sanity_issues = _signal_sanity_issues(cfg, result.summary)
