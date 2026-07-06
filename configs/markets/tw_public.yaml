@@ -449,7 +449,7 @@ training:
     return_aux_details: false
   # Active model branch for this experiment.
   transformer_base_portfolio:
-    d_model: 16
+    d_model: 32
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
@@ -479,13 +479,13 @@ training:
     # 175.1ms/batch on fold18 by training only the fold's active symbol union.
     # d_model=8 was faster at 3.35s but collapsed the 2-epoch fold18
     # validation/test loss, so it is only a lower bound probe, not active.
-    temporal_layers: 1
-    temporal_heads: 1
-    temporal_ffn_mult: 1
+    temporal_layers: 2
+    temporal_heads: 4
+    temporal_ffn_mult: 2
     temporal_pooling: attention
     temporal_query_mode: full_then_last
     cross_layers: 1
-    cross_heads: 2
+    cross_heads: 4
     cross_ffn_mult: 2
     joint_layers: 2
     joint_heads: 4
@@ -499,7 +499,7 @@ training:
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
     dynamic_token_dropout: 0.0
-    head_hidden_dim: 16
+    head_hidden_dim: 32
     head_layers: 1
     dropout: 0.0
     default_temperature: 1
