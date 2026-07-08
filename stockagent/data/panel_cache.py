@@ -20,6 +20,7 @@ ARRAY_NAMES = (
     "alive_mask",
     "benchmark_returns",
     "close_prices",
+    "daily_volumes",
 )
 
 
@@ -110,6 +111,11 @@ def save_panel_cache_v2(
         "alive_mask": np.asarray(panel_like.alive_mask),
         "benchmark_returns": np.asarray(panel_like.benchmark_returns),
         "close_prices": np.asarray(panel_like.close_prices),
+        "daily_volumes": np.asarray(
+            getattr(panel_like, "daily_volumes", None)
+            if getattr(panel_like, "daily_volumes", None) is not None
+            else np.full_like(panel_like.close_prices, np.nan, dtype=np.float32)
+        ),
     }
     array_meta = {name: _save_array(cache_dir, name, array) for name, array in arrays.items()}
     _write_json(_json_file(cache_dir, "symbols"), list(panel_like.symbols))

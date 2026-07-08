@@ -19,6 +19,7 @@ class WindowedSplitTensors:
     can_sell_mask: torch.Tensor
     benchmark: torch.Tensor
     lookback: int
+    volume_notional: torch.Tensor | None = None
     can_short_open_mask: torch.Tensor | None = None
     force_short_cover_mask: torch.Tensor | None = None
     sample_mask: torch.Tensor | None = None
@@ -39,6 +40,13 @@ class WindowedSplitTensors:
         if self.valid_indices.dim() != 1:
             raise ValueError("valid_indices must be 1D")
         self._valid_indices_cpu = self.valid_indices.detach().to(device=torch.device("cpu"), dtype=torch.long)
+        if self.volume_notional is None:
+            self.volume_notional = torch.full_like(self.future_log_returns, float("inf"), dtype=torch.float32)
+        if self.volume_notional.shape != self.future_log_returns.shape:
+            raise ValueError(
+                "volume_notional must have the same shape as future_log_returns: "
+                f"{tuple(self.volume_notional.shape)} != {tuple(self.future_log_returns.shape)}"
+            )
         if self.can_short_open_mask is None:
             self.can_short_open_mask = self.can_sell_mask
         if self.force_short_cover_mask is None:
@@ -134,6 +142,11 @@ class WindowedSplitTensors:
             can_sell_mask=self.can_sell_mask.to(device=device, non_blocking=non_blocking),
             benchmark=self.benchmark.to(device=device, non_blocking=non_blocking),
             lookback=self.lookback,
+            volume_notional=(
+                None
+                if self.volume_notional is None
+                else self.volume_notional.to(device=device, non_blocking=non_blocking)
+            ),
             can_short_open_mask=self.can_short_open_mask.to(device=device, non_blocking=non_blocking),
             force_short_cover_mask=self.force_short_cover_mask.to(device=device, non_blocking=non_blocking),
             sample_mask=(
@@ -164,6 +177,7 @@ class WindowedSplitTensors:
             can_sell_mask=_pin(self.can_sell_mask),
             benchmark=_pin(self.benchmark),
             lookback=self.lookback,
+            volume_notional=None if self.volume_notional is None else _pin(self.volume_notional),
             can_short_open_mask=_pin(self.can_short_open_mask),
             force_short_cover_mask=_pin(self.force_short_cover_mask),
             sample_mask=None if self.sample_mask is None else _pin(self.sample_mask),
@@ -190,10 +204,87 @@ class WindowedSplitTensors:
             can_sell_mask=self.can_sell_mask.index_select(1, local_indices),
             benchmark=self.benchmark,
             lookback=self.lookback,
+            volume_notional=(
+                None
+                if self.volume_notional is None
+                else self.volume_notional.index_select(1, local_indices)
+            ),
             can_short_open_mask=self.can_short_open_mask.index_select(1, local_indices),
             force_short_cover_mask=self.force_short_cover_mask.index_select(1, local_indices),
             sample_mask=self.sample_mask,
             symbol_indices=original_indices,
+        )
+
+    def pad_symbols(self, target_symbols: int, *, pad_symbol_index: int | None = None) -> "WindowedSplitTensors":
+        target_symbols = int(target_symbols)
+        current_symbols = int(self.features.size(1))
+        if target_symbols < current_symbols:
+            raise ValueError(
+                f"target_symbols must be >= current symbol count: {target_symbols} < {current_symbols}"
+            )
+        if target_symbols == current_symbols:
+            return self
+        if current_symbols <= 0:
+            raise ValueError("cannot pad an empty symbol dimension")
+
+        pad_count = target_symbols - current_symbols
+
+        def _pad_symbol_dim(tensor: torch.Tensor, fill_value: int | float | bool = 0) -> torch.Tensor:
+            if tensor.dim() < 2 or int(tensor.size(1)) != current_symbols:
+                raise ValueError(
+                    "symbol-wise tensor must have symbol dimension at axis 1: "
+                    f"shape={tuple(tensor.shape)}, expected_symbols={current_symbols}"
+                )
+            pad_shape = (int(tensor.size(0)), pad_count, *tuple(tensor.shape[2:]))
+            pad = tensor.new_full(pad_shape, fill_value)
+            return torch.cat((tensor, pad), dim=1)
+
+        padded_symbol_indices = self.symbol_indices
+        if self.symbol_indices is not None:
+            if pad_symbol_index is None:
+                pad_symbol_index = int(self.symbol_indices[0].detach().cpu().item())
+            index_pad = self.symbol_indices.new_full((pad_count,), int(pad_symbol_index))
+            padded_symbol_indices = torch.cat((self.symbol_indices, index_pad), dim=0)
+
+        return WindowedSplitTensors(
+            features=_pad_symbol_dim(self.features, 0.0),
+            valid_indices=self.valid_indices,
+            future_log_returns=_pad_symbol_dim(self.future_log_returns, 0.0),
+            tradable_mask=_pad_symbol_dim(self.tradable_mask, False),
+            can_buy_mask=_pad_symbol_dim(self.can_buy_mask, False),
+            can_sell_mask=_pad_symbol_dim(self.can_sell_mask, False),
+            benchmark=self.benchmark,
+            lookback=self.lookback,
+            volume_notional=None if self.volume_notional is None else _pad_symbol_dim(self.volume_notional, 0.0),
+            can_short_open_mask=_pad_symbol_dim(self.can_short_open_mask, False),
+            force_short_cover_mask=_pad_symbol_dim(self.force_short_cover_mask, False),
+            sample_mask=self.sample_mask,
+            symbol_indices=padded_symbol_indices,
+        )
+
+    def clamp_symbol_indices(self, max_symbols: int) -> "WindowedSplitTensors":
+        if self.symbol_indices is None:
+            return self
+        max_symbols = int(max_symbols)
+        if max_symbols <= 0:
+            raise ValueError("max_symbols must be positive")
+        clamped_indices = self.symbol_indices.clamp(0, max_symbols - 1)
+        if bool(torch.equal(clamped_indices, self.symbol_indices)):
+            return self
+        return WindowedSplitTensors(
+            features=self.features,
+            valid_indices=self.valid_indices,
+            future_log_returns=self.future_log_returns,
+            tradable_mask=self.tradable_mask,
+            can_buy_mask=self.can_buy_mask,
+            can_sell_mask=self.can_sell_mask,
+            benchmark=self.benchmark,
+            lookback=self.lookback,
+            volume_notional=self.volume_notional,
+            can_short_open_mask=self.can_short_open_mask,
+            force_short_cover_mask=self.force_short_cover_mask,
+            sample_mask=self.sample_mask,
+            symbol_indices=clamped_indices,
         )
 
     def _window_indices_for_rows(self, row_indices: torch.Tensor) -> torch.Tensor:
@@ -259,6 +350,7 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
         benchmark = self.benchmark[date_idx]
+        volume_notional = None if self.volume_notional is None else self.volume_notional[date_idx]
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
         timer = self._prepare_timer_start()
         tradable_mask = self.tradable_mask[date_idx]
@@ -275,6 +367,11 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            **(
+                {}
+                if volume_notional is None
+                else {"volume_notional": self._to_device(volume_notional, device, non_blocking, prepare_timing)}
+            ),
             "tradable_mask": self._to_device(tradable_mask, device, non_blocking, prepare_timing),
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
@@ -318,6 +415,7 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
         benchmark = self.benchmark[date_idx]
+        volume_notional = None if self.volume_notional is None else self.volume_notional[date_idx]
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
         return {
             "date_indices": self._to_device(date_idx, device, non_blocking, prepare_timing),
@@ -329,6 +427,11 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            **(
+                {}
+                if volume_notional is None
+                else {"volume_notional": self._to_device(volume_notional, device, non_blocking, prepare_timing)}
+            ),
             "tradable_mask": self._to_device(tradable_mask, device, non_blocking, prepare_timing),
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
@@ -368,6 +471,7 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
         benchmark = self.benchmark[date_idx]
+        volume_notional = None if self.volume_notional is None else self.volume_notional[date_idx]
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
         return {
             "date_indices": self._to_device(date_idx, device, non_blocking, prepare_timing),
@@ -379,6 +483,11 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            **(
+                {}
+                if volume_notional is None
+                else {"volume_notional": self._to_device(volume_notional, device, non_blocking, prepare_timing)}
+            ),
             "tradable_mask": self._to_device(tradable_mask, device, non_blocking, prepare_timing),
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
@@ -408,6 +517,7 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns.narrow(0, date_start, rows)
         benchmark = self.benchmark.narrow(0, date_start, rows)
+        volume_notional = None if self.volume_notional is None else self.volume_notional.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
         timer = self._prepare_timer_start()
         tradable_mask = self.tradable_mask.narrow(0, date_start, rows)
@@ -424,6 +534,11 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            **(
+                {}
+                if volume_notional is None
+                else {"volume_notional": self._to_device(volume_notional, device, non_blocking, prepare_timing)}
+            ),
             "tradable_mask": self._to_device(tradable_mask, device, non_blocking, prepare_timing),
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
@@ -459,6 +574,7 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns.narrow(0, date_start, rows)
         benchmark = self.benchmark.narrow(0, date_start, rows)
+        volume_notional = None if self.volume_notional is None else self.volume_notional.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
         timer = self._prepare_timer_start()
         tradable_mask = self.tradable_mask.narrow(0, date_start, rows)
@@ -477,6 +593,11 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            **(
+                {}
+                if volume_notional is None
+                else {"volume_notional": self._to_device(volume_notional, device, non_blocking, prepare_timing)}
+            ),
             "tradable_mask": self._to_device(tradable_mask, device, non_blocking, prepare_timing),
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
@@ -513,6 +634,7 @@ class WindowedSplitTensors:
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns.narrow(0, date_start, rows)
         benchmark = self.benchmark.narrow(0, date_start, rows)
+        volume_notional = None if self.volume_notional is None else self.volume_notional.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "target_gather", timer)
         timer = self._prepare_timer_start()
         tradable_mask = self.tradable_mask.narrow(0, date_start, rows)
@@ -529,6 +651,11 @@ class WindowedSplitTensors:
                 else {"symbol_indices": self._to_device(self.symbol_indices, device, non_blocking, prepare_timing)}
             ),
             "future_log_returns": self._to_device(future_log_returns, device, non_blocking, prepare_timing),
+            **(
+                {}
+                if volume_notional is None
+                else {"volume_notional": self._to_device(volume_notional, device, non_blocking, prepare_timing)}
+            ),
             "tradable_mask": self._to_device(tradable_mask, device, non_blocking, prepare_timing),
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
@@ -638,6 +765,7 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         can_sell_mask=dataset.can_sell_mask_t,
         benchmark=dataset.benchmark_t,
         lookback=dataset.lookback,
+        volume_notional=dataset.volume_notional_t,
         can_short_open_mask=dataset.can_short_open_mask_t,
         force_short_cover_mask=dataset.force_short_cover_mask_t,
     )

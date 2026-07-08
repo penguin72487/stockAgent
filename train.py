@@ -4,17 +4,116 @@ import argparse
 import json
 import os
 import random
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
+
+# Set allocator policy before torch can initialize CUDA.  The dual-GPU compiled
+# DataParallel path has large transient backward allocations on GPU0, and
+# expandable segments reduce allocator fragmentation across compile/eval phases.
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
 import torch
 
 from stockagent.config import load_config
-from stockagent.data.panel import build_panel
-from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.runtime_env import normalize_cuda_env
-from stockagent.training.trainer import run_inference, run_training
+
+
+def _normalize_multi_gpu_strategy(value: object) -> str:
+    strategy = str(value or "none").strip().lower().replace("-", "_")
+    aliases = {
+        "": "none",
+        "0": "none",
+        "false": "none",
+        "off": "none",
+        "no": "none",
+        "single": "none",
+        "single_gpu": "none",
+        "dp": "data_parallel",
+        "dataparallel": "data_parallel",
+        "torch_data_parallel": "data_parallel",
+        "ddp": "distributed_data_parallel",
+        "distributed": "distributed_data_parallel",
+        "torch_ddp": "distributed_data_parallel",
+    }
+    return aliases.get(strategy, strategy)
+
+
+def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
+    strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
+    if args.multi_gpu_strategy is not None:
+        strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+    if strategy != "distributed_data_parallel":
+        return
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1 or os.environ.get("STOCKAGENT_DDP_LAUNCHED") == "1":
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("training.multi_gpu_strategy=distributed_data_parallel requires CUDA")
+
+    raw_ids = list(getattr(config.training, "data_parallel_device_ids", []) or [])
+    visible_count = int(torch.cuda.device_count())
+    if not raw_ids:
+        raw_ids = list(range(visible_count))
+    device_ids: list[int] = []
+    for raw_id in raw_ids:
+        device_id = int(raw_id)
+        if device_id < 0 or device_id >= visible_count:
+            raise RuntimeError(
+                "training.data_parallel_device_ids contains an unavailable CUDA device "
+                f"{device_id}; visible CUDA device_count={visible_count}"
+            )
+        if device_id not in device_ids:
+            device_ids.append(device_id)
+    if len(device_ids) < 2:
+        raise RuntimeError(
+            "training.multi_gpu_strategy=distributed_data_parallel needs at least two visible CUDA devices; "
+            f"resolved device_ids={device_ids}, cuda_device_count={visible_count}"
+        )
+
+    env = os.environ.copy()
+    env["STOCKAGENT_DDP_LAUNCHED"] = "1"
+    env.setdefault("CUDA_VISIBLE_DEVICES", ",".join(str(device_id) for device_id in device_ids))
+    world_size = len(device_ids)
+    configured_cpu_threads = _resolve_cpu_thread_count(
+        args.cpu_threads if args.cpu_threads is not None else getattr(config.environment, "cpu_threads", None)
+    )
+    if configured_cpu_threads is not None:
+        env.setdefault("STOCKAGENT_CPU_THREADS", str(max(1, configured_cpu_threads // world_size)))
+    configured_compile_threads = _resolve_cpu_thread_count(
+        args.torch_compile_threads
+        if args.torch_compile_threads is not None
+        else getattr(config.environment, "torch_compile_threads", None)
+    )
+    if configured_compile_threads is not None:
+        env.setdefault("STOCKAGENT_TORCH_COMPILE_THREADS", str(max(1, configured_compile_threads // world_size)))
+    env.setdefault("OMP_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    env.setdefault("MKL_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    env.setdefault("OPENBLAS_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    env.setdefault("NUMEXPR_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    env.setdefault("POLARS_MAX_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    env.setdefault("RAYON_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", env.get("STOCKAGENT_TORCH_COMPILE_THREADS", "16"))
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(world_size),
+        *sys.argv,
+    ]
+    print(
+        "[ddp] relaunching under torchrun "
+        f"world_size={world_size} device_ids={device_ids} "
+        f"cmd={' '.join(cmd)}",
+        flush=True,
+    )
+    raise SystemExit(subprocess.call(cmd, env=env))
 
 
 def _resolve_cpu_thread_count(raw: object | None) -> int | None:
@@ -40,6 +139,15 @@ def _configure_cpu_parallelism(*, cpu_threads: int | None, compile_threads: int 
 
     for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[env_name] = str(resolved_cpu_threads)
+
+    raw_polars_threads = os.environ.get("STOCKAGENT_POLARS_THREADS")
+    resolved_polars_threads = _resolve_cpu_thread_count(raw_polars_threads) if raw_polars_threads else 1
+    # Panel loading already parallelizes across symbol parquet files. Keep
+    # Polars/Rayon single-threaded per file to avoid 128 outer workers each
+    # spawning a full inner CPU pool.
+    os.environ.setdefault("POLARS_MAX_THREADS", str(resolved_polars_threads))
+    os.environ.setdefault("RAYON_NUM_THREADS", str(resolved_polars_threads))
+
     torch.set_num_threads(resolved_cpu_threads)
     try:
         torch.set_num_interop_threads(resolved_cpu_threads)
@@ -65,7 +173,9 @@ def _configure_cpu_parallelism(*, cpu_threads: int | None, compile_threads: int 
         "[runtime] cpu_parallelism "
         f"torch_threads={torch.get_num_threads()} "
         f"interop_threads={torch.get_num_interop_threads()} "
-        f"inductor_compile_threads={os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')}"
+        f"inductor_compile_threads={os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')} "
+        f"polars_threads={os.environ.get('POLARS_MAX_THREADS')} "
+        f"rayon_threads={os.environ.get('RAYON_NUM_THREADS')}"
     )
 
 
@@ -163,6 +273,43 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Set TorchInductor compile worker threads. Defaults to --cpu-threads/all logical CPUs.",
+    )
+    parser.add_argument(
+        "--multi-gpu-strategy",
+        choices=("none", "data_parallel", "distributed_data_parallel", "ddp"),
+        default=None,
+        help="Override training.multi_gpu_strategy for efficiency A/B runs.",
+    )
+    parser.add_argument(
+        "--data-parallel-device-ids",
+        default=None,
+        help="Comma-separated CUDA device ids for DataParallel, e.g. 0,1.",
+    )
+    parser.add_argument(
+        "--data-parallel-threaded-replicas",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override STOCKAGENT_DP_THREADED_REPLICAS for the persistent compiled DataParallel wrapper.",
+    )
+    parser.add_argument("--batch-size-train", type=int, default=None, help="Override training.batch_size_train.")
+    parser.add_argument("--batch-size-eval", type=int, default=None, help="Override training.batch_size_eval.")
+    parser.add_argument(
+        "--cache-train-tensors-on-gpu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.cache_train_tensors_on_gpu.",
+    )
+    parser.add_argument(
+        "--cache-eval-tensors-on-gpu",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.cache_eval_tensors_on_gpu.",
+    )
+    parser.add_argument(
+        "--compile-fused-log-utility-loss",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.compile_fused_log_utility_loss.",
     )
     parser.add_argument(
         "--explain-after-each-fold",
@@ -376,11 +523,64 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _configure_cpu_parallelism(cpu_threads=args.cpu_threads, compile_threads=args.torch_compile_threads)
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    _maybe_relaunch_for_ddp(config, args)
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    config_strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
+    cli_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
+    active_strategy = cli_strategy or config_strategy
+    configured_cpu_threads = args.cpu_threads if args.cpu_threads is not None else config.environment.cpu_threads
+    if active_strategy == "distributed_data_parallel" and world_size > 1 and configured_cpu_threads is not None:
+        cpu_threads = max(1, int(configured_cpu_threads) // world_size)
+    else:
+        cpu_threads = configured_cpu_threads
+    compile_threads = (
+        args.torch_compile_threads
+        if args.torch_compile_threads is not None
+        else config.environment.torch_compile_threads
+    )
+    if active_strategy == "distributed_data_parallel" and world_size > 1 and compile_threads is not None:
+        compile_threads = max(1, int(compile_threads) // world_size)
+    _configure_cpu_parallelism(cpu_threads=cpu_threads, compile_threads=compile_threads)
+
+    from stockagent.data.panel import build_panel
+    from stockagent.data.walkforward import build_expanding_year_folds
+    from stockagent.training.trainer import run_inference, run_training
+
     if args.seed is not None:
         config.training.seed = int(args.seed)
+    if args.multi_gpu_strategy is not None:
+        config.training.multi_gpu_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+        if config.training.multi_gpu_strategy == "none":
+            config.training.data_parallel_device_ids = []
+    if args.data_parallel_device_ids is not None:
+        ids = [
+            int(value.strip())
+            for value in str(args.data_parallel_device_ids).split(",")
+            if value.strip()
+        ]
+        config.training.data_parallel_device_ids = ids
+        if ids and (args.multi_gpu_strategy is None):
+            config.training.multi_gpu_strategy = "data_parallel"
+    if args.data_parallel_threaded_replicas is not None:
+        os.environ["STOCKAGENT_DP_THREADED_REPLICAS"] = (
+            "1" if bool(args.data_parallel_threaded_replicas) else "0"
+        )
+    if args.batch_size_train is not None:
+        if args.batch_size_train < 1:
+            raise ValueError(f"--batch-size-train must be >= 1, got {args.batch_size_train}")
+        config.training.batch_size_train = int(args.batch_size_train)
+    if args.batch_size_eval is not None:
+        if args.batch_size_eval < 1:
+            raise ValueError(f"--batch-size-eval must be >= 1, got {args.batch_size_eval}")
+        config.training.batch_size_eval = int(args.batch_size_eval)
+    if args.cache_train_tensors_on_gpu is not None:
+        config.training.cache_train_tensors_on_gpu = bool(args.cache_train_tensors_on_gpu)
+    if args.cache_eval_tensors_on_gpu is not None:
+        config.training.cache_eval_tensors_on_gpu = bool(args.cache_eval_tensors_on_gpu)
+    if args.compile_fused_log_utility_loss is not None:
+        config.training.compile_fused_log_utility_loss = bool(args.compile_fused_log_utility_loss)
     _set_global_seed(int(config.training.seed))
     if args.epochs is not None:
         if args.epochs < 1:
@@ -566,31 +766,36 @@ def main() -> None:
             print("[post-train] running inference+plot pass on saved models...")
             results = run_inference(panel, folds, config, output_dir)
 
-    summary_path = Path(output_dir) / "summary.json"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    with summary_path.open("w", encoding="utf-8") as handle:
-        json.dump([asdict(result) for result in results], handle, indent=2)
+    dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+    is_rank0 = (not dist_ready) or int(torch.distributed.get_rank()) == 0
+    if is_rank0:
+        summary_path = Path(output_dir) / "summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump([asdict(result) for result in results], handle, indent=2)
 
-    for result in results:
-        configured_leverage = float(config.trading.leverage)
-        leveraged_sharpe = float(result.test_metrics.get("sharpe", 0.0))
-        leveraged_sortino = float(result.test_metrics.get("sortino", 0.0))
-        print(
-            json.dumps(
-                {
-                    "fold_id": result.fold_id,
-                    "train_years": result.train_years,
-                    "val_years": result.val_years,
-                    "test_years": result.test_years,
-                    "best_val_loss": result.best_val_loss,
-                    "configured_leverage": configured_leverage,
-                    "leveraged_sharpe": leveraged_sharpe,
-                    "leveraged_sortino": leveraged_sortino,
-                    "test_metrics": result.test_metrics,
-                },
-                ensure_ascii=False,
+        for result in results:
+            configured_leverage = float(config.trading.leverage)
+            leveraged_sharpe = float(result.test_metrics.get("sharpe", 0.0))
+            leveraged_sortino = float(result.test_metrics.get("sortino", 0.0))
+            print(
+                json.dumps(
+                    {
+                        "fold_id": result.fold_id,
+                        "train_years": result.train_years,
+                        "val_years": result.val_years,
+                        "test_years": result.test_years,
+                        "best_val_loss": result.best_val_loss,
+                        "configured_leverage": configured_leverage,
+                        "leveraged_sharpe": leveraged_sharpe,
+                        "leveraged_sortino": leveraged_sortino,
+                        "test_metrics": result.test_metrics,
+                    },
+                    ensure_ascii=False,
+                )
             )
-        )
+    if dist_ready:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
