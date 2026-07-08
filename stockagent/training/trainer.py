@@ -12,7 +12,9 @@ import time
 import gc
 import inspect
 import csv
-from contextlib import nullcontext
+import copy
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
@@ -20,9 +22,16 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_f
+try:
+    import torch.distributed._functional_collectives as dist_fc
+except Exception:  # pragma: no cover - older torch fallback
+    dist_fc = None
 from torch.profiler import ProfilerActivity, profile
 from torch import nn
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -55,11 +64,77 @@ from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
+from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.dataset import CrossSectionalDataset, collate_batch
 from stockagent.training.fused_loss import fused_log_utility_loss_tensor
 from stockagent.training.loss import get_loss_runtime_stats, masked_ic_loss, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
+
+
+def _distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _distributed_rank() -> int:
+    if _distributed_is_initialized():
+        return int(dist.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def _distributed_world_size() -> int:
+    if _distributed_is_initialized():
+        return int(dist.get_world_size())
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _distributed_is_rank0() -> bool:
+    return _distributed_rank() == 0
+
+
+def _distributed_should_write() -> bool:
+    return _distributed_world_size() <= 1 or _distributed_is_rank0()
+
+
+def _distributed_barrier() -> None:
+    if _distributed_is_initialized() and _distributed_world_size() > 1:
+        if torch.cuda.is_available():
+            try:
+                dist.barrier(device_ids=[torch.cuda.current_device()])
+                return
+            except TypeError:
+                pass
+        dist.barrier()
+
+
+def _all_gather_autograd(x: torch.Tensor) -> torch.Tensor:
+    if _distributed_world_size() <= 1:
+        return x
+    if dist_fc is not None and hasattr(dist_fc, "all_gather_tensor"):
+        return dist_fc.all_gather_tensor(x, 0, group=dist.group.WORLD)
+    parts = dist_nn_f.all_gather(x)
+    return torch.cat(tuple(parts), dim=0)
+
+
+def _all_gather_no_grad(x: torch.Tensor) -> torch.Tensor:
+    if _distributed_world_size() <= 1:
+        return x
+    parts = [torch.empty_like(x) for _ in range(_distributed_world_size())]
+    dist.all_gather(parts, x)
+    return torch.cat(parts, dim=0)
+
+
+@contextmanager
+def _temporary_env(name: str, value: str):
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 @dataclass(slots=True)
@@ -92,6 +167,20 @@ class TimingBreakdown:
     fetch_s: float = 0.0
     transfer_s: float = 0.0
     batch_prepare_s: float = 0.0
+    prepare_index_build_s: float = 0.0
+    prepare_window_slice_s: float = 0.0
+    prepare_feature_gather_s: float = 0.0
+    prepare_target_gather_s: float = 0.0
+    prepare_mask_build_s: float = 0.0
+    prepare_nan_fill_s: float = 0.0
+    prepare_dtype_cast_s: float = 0.0
+    prepare_contiguous_s: float = 0.0
+    prepare_clone_s: float = 0.0
+    prepare_device_move_s: float = 0.0
+    prepare_panel_slab_batch_s: float = 0.0
+    prepare_metadata_batch_s: float = 0.0
+    prepare_materialized_batch_s: float = 0.0
+    prepare_move_windowed_batch_s: float = 0.0
     window_materialize_s: float = 0.0
     h2d_transfer_s: float = 0.0
     forward_s: float = 0.0
@@ -122,6 +211,12 @@ class TimingBreakdown:
     plot_s: float = 0.0
     sync_s: float = 0.0
     cpu_gpu_sync_s: float = 0.0
+    iter_start_sync_s: float = 0.0
+    after_prepare_sync_s: float = 0.0
+    after_forward_sync_s: float = 0.0
+    after_loss_sync_s: float = 0.0
+    after_backward_sync_s: float = 0.0
+    after_step_sync_s: float = 0.0
     gc_s: float = 0.0
     batches: int = 0
     cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
@@ -135,6 +230,20 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "fetch_s",
         "transfer_s",
         "batch_prepare_s",
+        "prepare_index_build_s",
+        "prepare_window_slice_s",
+        "prepare_feature_gather_s",
+        "prepare_target_gather_s",
+        "prepare_mask_build_s",
+        "prepare_nan_fill_s",
+        "prepare_dtype_cast_s",
+        "prepare_contiguous_s",
+        "prepare_clone_s",
+        "prepare_device_move_s",
+        "prepare_panel_slab_batch_s",
+        "prepare_metadata_batch_s",
+        "prepare_materialized_batch_s",
+        "prepare_move_windowed_batch_s",
         "window_materialize_s",
         "h2d_transfer_s",
         "forward_s",
@@ -165,6 +274,12 @@ def _log_timing(label: str, timing: TimingBreakdown) -> None:
         "plot_s",
         "sync_s",
         "cpu_gpu_sync_s",
+        "iter_start_sync_s",
+        "after_prepare_sync_s",
+        "after_forward_sync_s",
+        "after_loss_sync_s",
+        "after_backward_sync_s",
+        "after_step_sync_s",
         "gc_s",
     ):
         value = getattr(timing, name)
@@ -179,6 +294,20 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "fetch_s",
         "transfer_s",
         "batch_prepare_s",
+        "prepare_index_build_s",
+        "prepare_window_slice_s",
+        "prepare_feature_gather_s",
+        "prepare_target_gather_s",
+        "prepare_mask_build_s",
+        "prepare_nan_fill_s",
+        "prepare_dtype_cast_s",
+        "prepare_contiguous_s",
+        "prepare_clone_s",
+        "prepare_device_move_s",
+        "prepare_panel_slab_batch_s",
+        "prepare_metadata_batch_s",
+        "prepare_materialized_batch_s",
+        "prepare_move_windowed_batch_s",
         "window_materialize_s",
         "h2d_transfer_s",
         "forward_s",
@@ -209,6 +338,12 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
         "plot_s",
         "sync_s",
         "cpu_gpu_sync_s",
+        "iter_start_sync_s",
+        "after_prepare_sync_s",
+        "after_forward_sync_s",
+        "after_loss_sync_s",
+        "after_backward_sync_s",
+        "after_step_sync_s",
         "gc_s",
     ):
         setattr(dst, name, getattr(dst, name) + getattr(src, name))
@@ -265,6 +400,14 @@ def _sync_cuda_for_timing(device: torch.device) -> float:
     start_t = time.perf_counter()
     torch.cuda.synchronize(device)
     return time.perf_counter() - start_t
+
+
+def _record_debug_cuda_sync(timing: TimingBreakdown, attr: str, device: torch.device, enabled: bool) -> None:
+    if not enabled or device.type != "cuda":
+        return
+    start_t = time.perf_counter()
+    torch.cuda.synchronize(device)
+    setattr(timing, attr, getattr(timing, attr) + time.perf_counter() - start_t)
 
 
 def _maybe_cudagraph_step_begin() -> None:
@@ -387,6 +530,8 @@ def _strict_no_fallback_enabled() -> bool:
 
 
 def _progress(message: str) -> None:
+    if not _distributed_should_write():
+        return
     print(message, flush=True)
 
 
@@ -438,7 +583,12 @@ def _call_model(
     mask: torch.Tensor,
     *,
     return_aux: bool | None = None,
+    symbol_indices: torch.Tensor | None = None,
 ):
+    if symbol_indices is not None:
+        if return_aux is None or not _model_accepts_return_aux(model):
+            return model(x, mask, symbol_indices=symbol_indices)
+        return model(x, mask, return_aux=return_aux, symbol_indices=symbol_indices)
     if return_aux is None or not _model_accepts_return_aux(model):
         return model(x, mask)
     return model(x, mask, return_aux=return_aux)
@@ -502,6 +652,8 @@ def _profile_single_train_step(
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     fold_id: int = 0,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> None:
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":
@@ -515,67 +667,91 @@ def _profile_single_train_step(
         with_stack=False,
     ) as prof_obj:
         with _autocast_context(device, amp_dtype):
-            model_output = model(batch["x"], batch["tradable_mask"])
+            with profile_range("train_step.forward"):
+                if "feature_slab" in batch:
+                    model_output = model(
+                        batch["feature_slab"],
+                        batch["tradable_mask"],
+                        symbol_indices=batch.get("symbol_indices"),
+                    )
+                else:
+                    model_output = _call_model(
+                        model,
+                        batch["x"],
+                        batch["tradable_mask"],
+                        symbol_indices=batch.get("symbol_indices"),
+                    )
             weights, aux_outputs = _extract_weights_and_aux(model_output)
-            if fused_loss_fn is not None and _is_log_utility_objective(objective):
-                loss, _ = _run_fused_log_utility_loss(
-                    fused_loss_fn,
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    batch["can_buy_mask"],
-                    batch["can_sell_mask"],
-                    batch.get("sample_mask"),
-                    None,
-                )
-                loss = _add_return_rank_ic_aux_loss(
-                    loss,
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    return_rank_ic_weight,
-                )
-            else:
-                loss = loss_fn(
-                    weights,
-                    batch["future_log_returns"],
-                    batch["tradable_mask"],
-                    benchmark_returns=batch.get("benchmark"),
-                    can_buy_mask=batch["can_buy_mask"],
-                    can_sell_mask=batch["can_sell_mask"],
-                    sample_mask=batch.get("sample_mask"),
-                    long_only=long_only,
-                    buy_fee_rate=buy_fee_rate,
-                    sell_fee_rate=sell_fee_rate,
-                    max_turnover_ratio=max_turnover_ratio,
-                    gross_leverage=gross_leverage,
-                    gamma_sharpe=gamma_sharpe,
-                    gamma_excess=gamma_excess,
-                    gamma_cvar=gamma_cvar,
-                    cvar_alpha=cvar_alpha,
-                    gamma_drawdown=gamma_drawdown,
-                    drawdown_target=drawdown_target,
-                    gamma_turnover=gamma_turnover,
-                    gamma_underperformance=gamma_underperformance,
-                    excess_target=excess_target,
-                    cvar_budget=cvar_budget,
-                    drawdown_budget=drawdown_budget,
-                    turnover_budget=turnover_budget,
-                    gamma_cvar_budget=gamma_cvar_budget,
-                    gamma_drawdown_budget=gamma_drawdown_budget,
-                    gamma_turnover_budget=gamma_turnover_budget,
-                    objective=objective,
-                    aux_outputs=aux_outputs,
-                    rank_ic_weight=rank_ic_weight,
-                    return_rank_ic_weight=return_rank_ic_weight,
-                    direction_weight=direction_weight,
-                    volatility_regime_weight=volatility_regime_weight,
-                    concentration_weight=concentration_weight,
-                    regime_up_threshold=regime_up_threshold,
-                    regime_down_threshold=regime_down_threshold,
-                )
+            volume_limit_weights = _volume_limit_weights_from_notional(
+                batch.get("volume_notional"),
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights.dtype,
+            )
+            with profile_range("train_step.loss"):
+                if fused_loss_fn is not None and _is_log_utility_objective(objective):
+                    loss, _ = _run_fused_log_utility_loss(
+                        fused_loss_fn,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        batch["can_buy_mask"],
+                        batch["can_sell_mask"],
+                        batch.get("sample_mask"),
+                        None,
+                        volume_limit_weights,
+                    )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        return_rank_ic_weight,
+                    )
+                else:
+                    loss = loss_fn(
+                        weights,
+                        batch["future_log_returns"],
+                        batch["tradable_mask"],
+                        benchmark_returns=batch.get("benchmark"),
+                        can_buy_mask=batch["can_buy_mask"],
+                        can_sell_mask=batch["can_sell_mask"],
+                        sample_mask=batch.get("sample_mask"),
+                        long_only=long_only,
+                        buy_fee_rate=buy_fee_rate,
+                        sell_fee_rate=sell_fee_rate,
+                        max_turnover_ratio=max_turnover_ratio,
+                        volume_limit_weights=volume_limit_weights,
+                        gross_leverage=gross_leverage,
+                        gamma_sharpe=gamma_sharpe,
+                        gamma_excess=gamma_excess,
+                        gamma_cvar=gamma_cvar,
+                        cvar_alpha=cvar_alpha,
+                        gamma_drawdown=gamma_drawdown,
+                        drawdown_target=drawdown_target,
+                        gamma_turnover=gamma_turnover,
+                        gamma_underperformance=gamma_underperformance,
+                        excess_target=excess_target,
+                        cvar_budget=cvar_budget,
+                        drawdown_budget=drawdown_budget,
+                        turnover_budget=turnover_budget,
+                        gamma_cvar_budget=gamma_cvar_budget,
+                        gamma_drawdown_budget=gamma_drawdown_budget,
+                        gamma_turnover_budget=gamma_turnover_budget,
+                        objective=objective,
+                        aux_outputs=aux_outputs,
+                        rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
+                        direction_weight=direction_weight,
+                        volatility_regime_weight=volatility_regime_weight,
+                        concentration_weight=concentration_weight,
+                        regime_up_threshold=regime_up_threshold,
+                        regime_down_threshold=regime_down_threshold,
+                    )
         if torch.isfinite(loss).all():
-            loss.backward()
+            with profile_range("train_step.backward"):
+                loss.backward()
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -753,6 +929,31 @@ def _is_log_utility_objective(objective: str) -> bool:
     return objective.strip().lower() in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}
 
 
+def _volume_participation_enabled(max_volume_participation: float, volume_participation_equity: float) -> bool:
+    return float(max_volume_participation) > 0.0 and float(volume_participation_equity) > 0.0
+
+
+def _volume_limit_weights_from_notional(
+    volume_notional: torch.Tensor | None,
+    *,
+    max_volume_participation: float,
+    volume_participation_equity: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if volume_notional is None:
+        return None
+    if not _volume_participation_enabled(max_volume_participation, volume_participation_equity):
+        return None
+    notional = volume_notional.to(device=device, dtype=dtype)
+    cap = notional * (float(max_volume_participation) / float(volume_participation_equity))
+    return torch.where(
+        torch.isfinite(cap) & (cap >= 0.0),
+        cap,
+        torch.full_like(cap, float("inf")),
+    )
+
+
 def _run_fused_log_utility_loss(
     fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     weights: torch.Tensor,
@@ -762,6 +963,7 @@ def _run_fused_log_utility_loss(
     can_sell_mask: torch.Tensor,
     sample_mask: torch.Tensor | None,
     initial_weights: torch.Tensor | None,
+    volume_limit_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if sample_mask is None:
         sample_mask = torch.ones((weights.size(0),), device=weights.device, dtype=torch.bool)
@@ -779,6 +981,7 @@ def _run_fused_log_utility_loss(
         can_sell_mask,
         sample_mask,
         initial_weights,
+        volume_limit_weights=volume_limit_weights,
     )
 
 
@@ -1392,6 +1595,8 @@ def _group_curve_path(output_path: Path, train_years: list[int]) -> Path:
 
 
 def _trim_group_curve(path: Path, start_epoch: int) -> None:
+    if not _distributed_should_write():
+        return
     if not path.exists() or start_epoch <= 1:
         return
     kept: list[str] = []
@@ -1485,6 +1690,8 @@ def _resume_no_improve_epochs_from_checkpoint(
 
 
 def _append_group_curve(path: Path, payload: dict[str, float | int | None]) -> None:
+    if not _distributed_should_write():
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -1691,6 +1898,20 @@ def _timing_curve_payload(
     def _epoch_percent(value_s: float) -> float:
         return float(value_s) * 100.0 / max(1e-12, float(epoch_total_s))
 
+    train_prepare_child_s = (
+        float(train_timing.prepare_index_build_s)
+        + float(train_timing.prepare_window_slice_s)
+        + float(train_timing.prepare_feature_gather_s)
+        + float(train_timing.prepare_target_gather_s)
+        + float(train_timing.prepare_mask_build_s)
+        + float(train_timing.prepare_nan_fill_s)
+        + float(train_timing.prepare_dtype_cast_s)
+        + float(train_timing.prepare_contiguous_s)
+        + float(train_timing.prepare_clone_s)
+        + float(train_timing.prepare_device_move_s)
+    )
+    train_prepare_unaccounted_s = float(train_timing.batch_prepare_s) - train_prepare_child_s
+
     val_metrics_value = float(val_loss_s if val_metrics_s is None else val_metrics_s)
     checkpoint_total_s = (
         float(checkpoint_save_s)
@@ -1720,6 +1941,27 @@ def _timing_curve_payload(
         "train_fetch_ms_per_batch": _avg_ms(train_timing.fetch_s),
         "train_transfer_ms_per_batch": _avg_ms(train_timing.transfer_s),
         "train_batch_prepare_ms_per_batch": _avg_ms(train_timing.batch_prepare_s),
+        "train_prepare_index_build_ms_per_batch": _avg_ms(train_timing.prepare_index_build_s),
+        "train_prepare_window_slice_ms_per_batch": _avg_ms(train_timing.prepare_window_slice_s),
+        "train_prepare_feature_gather_ms_per_batch": _avg_ms(train_timing.prepare_feature_gather_s),
+        "train_prepare_target_gather_ms_per_batch": _avg_ms(train_timing.prepare_target_gather_s),
+        "train_prepare_mask_build_ms_per_batch": _avg_ms(train_timing.prepare_mask_build_s),
+        "train_prepare_nan_fill_ms_per_batch": _avg_ms(train_timing.prepare_nan_fill_s),
+        "train_prepare_dtype_cast_ms_per_batch": _avg_ms(train_timing.prepare_dtype_cast_s),
+        "train_prepare_contiguous_ms_per_batch": _avg_ms(train_timing.prepare_contiguous_s),
+        "train_prepare_clone_ms_per_batch": _avg_ms(train_timing.prepare_clone_s),
+        "train_prepare_device_move_ms_per_batch": _avg_ms(train_timing.prepare_device_move_s),
+        "train_prepare_panel_slab_batch_ms_per_batch": _avg_ms(train_timing.prepare_panel_slab_batch_s),
+        "train_prepare_metadata_batch_ms_per_batch": _avg_ms(train_timing.prepare_metadata_batch_s),
+        "train_prepare_materialized_batch_ms_per_batch": _avg_ms(train_timing.prepare_materialized_batch_s),
+        "train_prepare_move_windowed_batch_ms_per_batch": _avg_ms(train_timing.prepare_move_windowed_batch_s),
+        "train_prepare_unaccounted_ms_per_batch": _avg_ms(train_prepare_unaccounted_s),
+        "train_iter_start_sync_ms_per_batch": _avg_ms(train_timing.iter_start_sync_s),
+        "train_after_prepare_sync_ms_per_batch": _avg_ms(train_timing.after_prepare_sync_s),
+        "train_after_forward_sync_ms_per_batch": _avg_ms(train_timing.after_forward_sync_s),
+        "train_after_loss_sync_ms_per_batch": _avg_ms(train_timing.after_loss_sync_s),
+        "train_after_backward_sync_ms_per_batch": _avg_ms(train_timing.after_backward_sync_s),
+        "train_after_step_sync_ms_per_batch": _avg_ms(train_timing.after_step_sync_s),
         "train_window_materialize_ms_per_batch": _avg_ms(train_timing.window_materialize_s),
         "train_h2d_transfer_ms_per_batch": _avg_ms(train_timing.h2d_transfer_s),
         "train_forward_ms_per_batch": _avg_ms(train_timing.forward_s),
@@ -1775,6 +2017,20 @@ def _timing_curve_payload(
         "val_eval_transfer_to_gpu_s": float(val_timing.transfer_s),
         "val_batch_prepare_s": float(val_timing.batch_prepare_s),
         "val_eval_batch_prepare_s": float(val_timing.batch_prepare_s),
+        "val_prepare_index_build_s": float(val_timing.prepare_index_build_s),
+        "val_prepare_window_slice_s": float(val_timing.prepare_window_slice_s),
+        "val_prepare_feature_gather_s": float(val_timing.prepare_feature_gather_s),
+        "val_prepare_target_gather_s": float(val_timing.prepare_target_gather_s),
+        "val_prepare_mask_build_s": float(val_timing.prepare_mask_build_s),
+        "val_prepare_nan_fill_s": float(val_timing.prepare_nan_fill_s),
+        "val_prepare_dtype_cast_s": float(val_timing.prepare_dtype_cast_s),
+        "val_prepare_contiguous_s": float(val_timing.prepare_contiguous_s),
+        "val_prepare_clone_s": float(val_timing.prepare_clone_s),
+        "val_prepare_device_move_s": float(val_timing.prepare_device_move_s),
+        "val_prepare_panel_slab_batch_s": float(val_timing.prepare_panel_slab_batch_s),
+        "val_prepare_metadata_batch_s": float(val_timing.prepare_metadata_batch_s),
+        "val_prepare_materialized_batch_s": float(val_timing.prepare_materialized_batch_s),
+        "val_prepare_move_windowed_batch_s": float(val_timing.prepare_move_windowed_batch_s),
         "val_window_materialize_s": float(val_timing.window_materialize_s),
         "val_eval_window_materialize_s": float(val_timing.window_materialize_s),
         "val_h2d_transfer_s": float(val_timing.h2d_transfer_s),
@@ -1801,6 +2057,20 @@ def _timing_curve_payload(
         "test_curve_eval_transfer_to_gpu_s": float(test_curve_timing.transfer_s),
         "test_curve_batch_prepare_s": float(test_curve_timing.batch_prepare_s),
         "test_curve_eval_batch_prepare_s": float(test_curve_timing.batch_prepare_s),
+        "test_curve_prepare_index_build_s": float(test_curve_timing.prepare_index_build_s),
+        "test_curve_prepare_window_slice_s": float(test_curve_timing.prepare_window_slice_s),
+        "test_curve_prepare_feature_gather_s": float(test_curve_timing.prepare_feature_gather_s),
+        "test_curve_prepare_target_gather_s": float(test_curve_timing.prepare_target_gather_s),
+        "test_curve_prepare_mask_build_s": float(test_curve_timing.prepare_mask_build_s),
+        "test_curve_prepare_nan_fill_s": float(test_curve_timing.prepare_nan_fill_s),
+        "test_curve_prepare_dtype_cast_s": float(test_curve_timing.prepare_dtype_cast_s),
+        "test_curve_prepare_contiguous_s": float(test_curve_timing.prepare_contiguous_s),
+        "test_curve_prepare_clone_s": float(test_curve_timing.prepare_clone_s),
+        "test_curve_prepare_device_move_s": float(test_curve_timing.prepare_device_move_s),
+        "test_curve_prepare_panel_slab_batch_s": float(test_curve_timing.prepare_panel_slab_batch_s),
+        "test_curve_prepare_metadata_batch_s": float(test_curve_timing.prepare_metadata_batch_s),
+        "test_curve_prepare_materialized_batch_s": float(test_curve_timing.prepare_materialized_batch_s),
+        "test_curve_prepare_move_windowed_batch_s": float(test_curve_timing.prepare_move_windowed_batch_s),
         "test_curve_window_materialize_s": float(test_curve_timing.window_materialize_s),
         "test_curve_eval_window_materialize_s": float(test_curve_timing.window_materialize_s),
         "test_curve_h2d_transfer_s": float(test_curve_timing.h2d_transfer_s),
@@ -1979,6 +2249,8 @@ def _write_fold_complete_marker(
     *,
     source: str,
 ) -> None:
+    if not _distributed_should_write():
+        return
     marker = {
         "status": "complete",
         "source": str(source),
@@ -2010,14 +2282,329 @@ def _has_completed_fold_marker(fold_dir: Path) -> bool:
 
 
 def _write_summary(results: list[FoldResult], output_path: Path) -> None:
+    if not _distributed_should_write():
+        return
     summary_path = _summary_path(output_path)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump([asdict(result) for result in results], handle, indent=2)
 
 
+class _StockAgentDataParallel(nn.DataParallel):
+    def scatter(
+        self,
+        inputs: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        device_ids: Sequence[int],
+    ):
+        symbol_indices = None
+        if kwargs and "symbol_indices" in kwargs:
+            kwargs = dict(kwargs)
+            symbol_indices = kwargs.pop("symbol_indices")
+        scattered_inputs, scattered_kwargs = super().scatter(inputs, kwargs, device_ids)
+        if symbol_indices is None:
+            return scattered_inputs, scattered_kwargs
+
+        updated_kwargs: list[dict[str, Any]] = []
+        for idx, replica_kwargs in enumerate(scattered_kwargs):
+            target_kwargs = dict(replica_kwargs)
+            if torch.is_tensor(symbol_indices):
+                target_device = torch.device("cuda", int(device_ids[idx]))
+                target_kwargs["symbol_indices"] = symbol_indices.to(device=target_device, non_blocking=True)
+            else:
+                target_kwargs["symbol_indices"] = symbol_indices
+            updated_kwargs.append(target_kwargs)
+        return scattered_inputs, tuple(updated_kwargs)
+
+
+class _PersistentCompiledDataParallel(nn.Module):
+    """Compile-friendly data parallel wrapper with persistent replicas.
+
+    PyTorch DataParallel rebuilds replicas and uses Python threads inside
+    forward. Compiling that wrapper creates many unstable graphs. This wrapper
+    keeps one model replica per device, compiles each replica once, and leaves
+    split/gather orchestration in eager Python.  The first unseen shape is
+    warmed serially, then warmed shapes may run replicas from worker threads.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        *,
+        device_ids: Sequence[int],
+        output_device: int,
+        compile_mode: str | None,
+    ) -> None:
+        super().__init__()
+        if len(device_ids) < 2:
+            raise ValueError("_PersistentCompiledDataParallel requires at least two devices")
+        self.device_ids = [int(device_id) for device_id in device_ids]
+        self.output_device = int(output_device)
+        self.output_torch_device = torch.device("cuda", self.output_device)
+        self.module = module
+        self.replica_modules = nn.ModuleList([module])
+        for device_id in self.device_ids[1:]:
+            self.replica_modules.append(copy.deepcopy(module).to(torch.device("cuda", device_id)))
+
+        self._grad_hooks: list[Any] = []
+        self._register_replica_grad_hooks()
+        with torch._inductor.config.patch({"triton.cudagraphs": False}):
+            self.compiled_replicas: list[nn.Module] = [
+                torch.compile(replica, mode=compile_mode, dynamic=False)
+                for replica in self.replica_modules
+            ]
+        self._serial_warmed_keys: set[tuple[Any, ...]] = set()
+        self._streams = [torch.cuda.Stream(device=torch.device("cuda", device_id)) for device_id in self.device_ids]
+        threaded_value = os.environ.get("STOCKAGENT_DP_THREADED_REPLICAS", "1").strip().lower()
+        self._threaded_replicas = threaded_value not in {"0", "false", "off", "no"}
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=len(self.device_ids),
+            thread_name_prefix="stockagent_dp_replica",
+        )
+        self.sync_replica_parameters_()
+
+    def _register_replica_grad_hooks(self) -> None:
+        primary_params = list(self.replica_modules[0].parameters())
+        for replica in self.replica_modules[1:]:
+            for primary_param, replica_param in zip(primary_params, replica.parameters(), strict=True):
+                self._grad_hooks.append(replica_param.register_hook(self._make_grad_hook(primary_param)))
+
+    @staticmethod
+    def _make_grad_hook(primary_param: torch.nn.Parameter):
+        def _hook(grad: torch.Tensor) -> torch.Tensor:
+            grad_on_primary = grad.detach().to(device=primary_param.device, non_blocking=True)
+            if primary_param.grad is None:
+                primary_param.grad = grad_on_primary.clone(memory_format=torch.contiguous_format)
+            else:
+                primary_param.grad.add_(grad_on_primary)
+            return grad
+
+        return _hook
+
+    @torch.no_grad()
+    def sync_replica_parameters_(self) -> None:
+        primary_state = list(self.replica_modules[0].state_dict().values())
+        for replica in self.replica_modules[1:]:
+            for replica_value, primary_value in zip(replica.state_dict().values(), primary_state, strict=True):
+                replica_value.copy_(primary_value.to(device=replica_value.device, non_blocking=True))
+
+    def zero_secondary_gradients_(self) -> None:
+        for replica in self.replica_modules[1:]:
+            replica.zero_grad(set_to_none=True)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        for compiled_replica in self.compiled_replicas:
+            compiled_replica.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    def _scatter_tensor(self, value: torch.Tensor, *, split: bool, chunks: int) -> list[torch.Tensor]:
+        if split:
+            parts = list(torch.chunk(value, chunks, dim=0))
+        else:
+            parts = [value for _ in range(chunks)]
+        return [
+            part.to(device=torch.device("cuda", self.device_ids[idx]), non_blocking=True)
+            for idx, part in enumerate(parts)
+        ]
+
+    def _gather_outputs(self, outputs: Sequence[Any]) -> Any:
+        first = outputs[0]
+        if torch.is_tensor(first):
+            return torch.cat([out.to(device=self.output_torch_device, non_blocking=True) for out in outputs], dim=0)
+        if isinstance(first, dict):
+            gathered: dict[str, Any] = {}
+            for key in first.keys():
+                values = [out[key] for out in outputs]
+                if torch.is_tensor(values[0]) and values[0].dim() > 0 and int(values[0].size(0)) == int(outputs[0][key].size(0)):
+                    try:
+                        gathered[key] = torch.cat(
+                            [value.to(device=self.output_torch_device, non_blocking=True) for value in values],
+                            dim=0,
+                        )
+                    except Exception:
+                        gathered[key] = values[0].to(device=self.output_torch_device, non_blocking=True)
+                elif torch.is_tensor(values[0]):
+                    gathered[key] = values[0].to(device=self.output_torch_device, non_blocking=True)
+                else:
+                    gathered[key] = values[0]
+            return gathered
+        if isinstance(first, tuple):
+            return tuple(self._gather_outputs([out[idx] for out in outputs]) for idx in range(len(first)))
+        if isinstance(first, list):
+            return [self._gather_outputs([out[idx] for out in outputs]) for idx in range(len(first))]
+        return first
+
+    @staticmethod
+    def _tensor_compile_key(value: torch.Tensor | None) -> tuple[Any, ...] | None:
+        if value is None:
+            return None
+        return (tuple(int(dim) for dim in value.shape), str(value.dtype), bool(value.requires_grad))
+
+    def _parallel_compile_key(
+        self,
+        *,
+        x_chunks: Sequence[torch.Tensor],
+        mask_chunks: Sequence[torch.Tensor | None],
+        return_aux: bool | None,
+        symbol_indices: torch.Tensor | None,
+    ) -> tuple[Any, ...]:
+        first_mask = mask_chunks[0] if mask_chunks else None
+        return (
+            bool(self.training),
+            bool(torch.is_grad_enabled()),
+            len(x_chunks),
+            self._tensor_compile_key(x_chunks[0]),
+            self._tensor_compile_key(first_mask),
+            None if symbol_indices is None else (tuple(int(dim) for dim in symbol_indices.shape), str(symbol_indices.dtype)),
+            None if return_aux is None else bool(return_aux),
+        )
+
+    def _serial_apply_once(
+        self,
+        modules: Sequence[nn.Module],
+        replica_inputs: Sequence[tuple[Any, ...]],
+        replica_kwargs: Sequence[dict[str, Any]],
+        *,
+        active: int,
+    ) -> list[Any]:
+        outputs: list[Any] = []
+        for idx in range(active):
+            device = torch.device("cuda", self.device_ids[idx])
+            with torch.cuda.device(device), torch.cuda.stream(self._streams[idx]):
+                outputs.append(modules[idx](*replica_inputs[idx], **replica_kwargs[idx]))
+        for idx in range(active):
+            device = torch.device("cuda", self.device_ids[idx])
+            with torch.cuda.device(device):
+                torch.cuda.current_stream(device).wait_stream(self._streams[idx])
+        return outputs
+
+    @staticmethod
+    def _cuda_autocast_state() -> tuple[bool, torch.dtype]:
+        try:
+            enabled = bool(torch.is_autocast_enabled("cuda"))
+        except TypeError:
+            enabled = bool(torch.is_autocast_enabled())
+        try:
+            dtype = torch.get_autocast_dtype("cuda")
+        except (AttributeError, TypeError):
+            dtype = torch.get_autocast_gpu_dtype()
+        return enabled, dtype
+
+    def _threaded_apply_once(
+        self,
+        modules: Sequence[nn.Module],
+        replica_inputs: Sequence[tuple[Any, ...]],
+        replica_kwargs: Sequence[dict[str, Any]],
+        *,
+        active: int,
+    ) -> list[Any]:
+        grad_enabled = torch.is_grad_enabled()
+        autocast_enabled, autocast_dtype = self._cuda_autocast_state()
+
+        def _worker(idx: int) -> Any:
+            device = torch.device("cuda", self.device_ids[idx])
+            with torch.set_grad_enabled(grad_enabled):
+                with torch.cuda.device(device), torch.cuda.stream(self._streams[idx]):
+                    with autocast(
+                        device_type="cuda",
+                        enabled=autocast_enabled,
+                        dtype=autocast_dtype,
+                    ):
+                        return modules[idx](*replica_inputs[idx], **replica_kwargs[idx])
+
+        futures = [self._thread_pool.submit(_worker, idx) for idx in range(active)]
+        outputs = [future.result() for future in futures]
+        for idx in range(active):
+            device = torch.device("cuda", self.device_ids[idx])
+            with torch.cuda.device(device):
+                torch.cuda.current_stream(device).wait_stream(self._streams[idx])
+        return outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        *args: Any,
+        return_aux: bool | None = None,
+        symbol_indices: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        active = min(len(self.compiled_replicas), int(x.size(0)))
+        if active <= 1:
+            device = torch.device("cuda", self.device_ids[0])
+            call_kwargs = dict(kwargs)
+            if return_aux is not None:
+                call_kwargs["return_aux"] = return_aux
+            if symbol_indices is not None:
+                call_kwargs["symbol_indices"] = symbol_indices.to(device=device, non_blocking=True)
+            return self.compiled_replicas[0](
+                x.to(device=device, non_blocking=True),
+                None if mask is None else mask.to(device=device, non_blocking=True),
+                *args,
+                **call_kwargs,
+            )
+
+        self.sync_replica_parameters_()
+        self.zero_secondary_gradients_()
+
+        modules = self.compiled_replicas[:active]
+        x_chunks = self._scatter_tensor(x, split=True, chunks=active)
+        mask_chunks = (
+            [None] * active
+            if mask is None
+            else self._scatter_tensor(mask, split=True, chunks=active)
+        )
+        replica_inputs = [(x_chunks[idx], mask_chunks[idx], *args) for idx in range(active)]
+        replica_kwargs: list[dict[str, Any]] = []
+        for idx in range(active):
+            device = torch.device("cuda", self.device_ids[idx])
+            call_kwargs = dict(kwargs)
+            if return_aux is not None:
+                call_kwargs["return_aux"] = return_aux
+            if symbol_indices is not None:
+                call_kwargs["symbol_indices"] = symbol_indices.to(device=device, non_blocking=True)
+            replica_kwargs.append(call_kwargs)
+        compile_key = self._parallel_compile_key(
+            x_chunks=x_chunks,
+            mask_chunks=mask_chunks,
+            return_aux=return_aux,
+            symbol_indices=symbol_indices,
+        )
+        if (not self._threaded_replicas) or compile_key not in self._serial_warmed_keys:
+            outputs = self._serial_apply_once(modules, replica_inputs, replica_kwargs, active=active)
+            self._serial_warmed_keys.add(compile_key)
+        else:
+            outputs = self._threaded_apply_once(modules, replica_inputs, replica_kwargs, active=active)
+        return self._gather_outputs(outputs)
+
+
 def _unwrap_model(model: nn.Module) -> nn.Module:
-    return getattr(model, "_orig_mod", model)
+    target = model
+    seen: set[int] = set()
+    while True:
+        if id(target) in seen:
+            return target
+        seen.add(id(target))
+        next_target = getattr(target, "_orig_mod", None)
+        if next_target is None and isinstance(target, _PersistentCompiledDataParallel):
+            next_target = getattr(target, "module", None)
+        if next_target is None and isinstance(target, nn.DataParallel):
+            next_target = getattr(target, "module", None)
+        if next_target is None and isinstance(target, DistributedDataParallel):
+            next_target = getattr(target, "module", None)
+        if next_target is None or next_target is target:
+            return target
+        target = next_target
+
+
+def _unwrap_distributed_data_parallel(model: nn.Module) -> nn.Module:
+    if isinstance(model, DistributedDataParallel):
+        return getattr(model, "module", model)
+    return model
 
 
 def _clip_model_gradients_(model: nn.Module, max_norm: float) -> bool:
@@ -2068,6 +2655,8 @@ def _run_gradient_clip_(
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
+    if bool(getattr(model, "_stockagent_disable_panel_forward", False)):
+        return None
     if hasattr(model, "forward_from_panel"):
         return model
     unwrapped = _unwrap_model(model)
@@ -2079,6 +2668,8 @@ def _model_supports_panel_forward(model: nn.Module) -> bool:
 
 
 def _panel_slab_forward_module(model: nn.Module) -> nn.Module | None:
+    if bool(getattr(model, "_stockagent_disable_panel_forward", False)):
+        return None
     if hasattr(model, "forward_from_panel_slab"):
         return model
     unwrapped = _unwrap_model(model)
@@ -2089,6 +2680,13 @@ def _model_supports_panel_slab_forward(model: nn.Module) -> bool:
     return _panel_slab_forward_module(model) is not None
 
 
+def _callable_accepts_parameter(fn: Callable[..., Any], parameter: str) -> bool:
+    try:
+        return str(parameter) in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class _PanelSlabForwardWrapper(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
@@ -2096,9 +2694,23 @@ class _PanelSlabForwardWrapper(nn.Module):
         if slab_model is None:
             raise ValueError("model does not support forward_from_panel_slab")
         self.model = slab_model
+        self._accepts_symbol_indices = _callable_accepts_parameter(
+            self.model.forward_from_panel_slab,
+            "symbol_indices",
+        )
 
-    def forward(self, feature_slab: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        return self.model.forward_from_panel_slab(feature_slab, mask, return_aux=False)
+    def forward(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        kwargs: dict[str, Any] = {"return_aux": False}
+        if symbol_indices is not None:
+            if not self._accepts_symbol_indices:
+                raise ValueError("compact symbol batches require forward_from_panel_slab(..., symbol_indices=...)")
+            kwargs["symbol_indices"] = symbol_indices
+        return self.model.forward_from_panel_slab(feature_slab, mask, **kwargs)
 
 
 def _metadata_rows_are_contiguous(batch: Mapping[str, torch.Tensor]) -> bool:
@@ -2189,13 +2801,14 @@ def _call_panel_forward_for_batch(
             rows=rows,
         )
         if feature_slab is not None:
-            return panel_slab_model(feature_slab, mask)
-    return panel_forward_model.forward_from_panel(
-        split.features,
-        batch["date_indices"],
-        mask,
-        return_aux=return_aux,
-    )
+            return panel_slab_model(feature_slab, mask, batch.get("symbol_indices"))
+    kwargs: dict[str, Any] = {"return_aux": return_aux}
+    symbol_indices = batch.get("symbol_indices")
+    if symbol_indices is not None:
+        if not _callable_accepts_parameter(panel_forward_model.forward_from_panel, "symbol_indices"):
+            raise ValueError("compact symbol batches require forward_from_panel(..., symbol_indices=...)")
+        kwargs["symbol_indices"] = symbol_indices
+    return panel_forward_model.forward_from_panel(split.features, batch["date_indices"], mask, **kwargs)
 
 
 def _training_needs_aux(objective: str, factor_aug_kwargs: dict[str, float] | None = None) -> bool:
@@ -2227,11 +2840,25 @@ def _first_nonfinite_model_gradient(model: nn.Module) -> str | None:
 
 
 def _model_parameters_are_finite(model: nn.Module) -> bool:
-    return _first_nonfinite_model_parameter(model) is None
+    finite_flag: torch.Tensor | None = None
+    for param in _unwrap_model(model).parameters():
+        current = torch.isfinite(param.detach()).all()
+        finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
+    if finite_flag is None:
+        return True
+    return bool(finite_flag.item())
 
 
 def _model_gradients_are_finite(model: nn.Module) -> bool:
-    return _first_nonfinite_model_gradient(model) is None
+    finite_flag: torch.Tensor | None = None
+    for param in _unwrap_model(model).parameters():
+        if param.grad is None:
+            continue
+        current = torch.isfinite(param.grad.detach()).all()
+        finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
+    if finite_flag is None:
+        return True
+    return bool(finite_flag.item())
 
 
 def _stabilize_model_parameters_after_step(model: nn.Module) -> None:
@@ -2245,7 +2872,7 @@ def _should_check_finite(step: int, interval_steps: int, *, final_step: bool = F
     interval = int(interval_steps)
     if interval <= 0:
         return False
-    return bool(final_step) or int(step) % interval == 0
+    return int(step) % interval == 0
 
 
 def _raise_if_model_parameters_nonfinite(model: nn.Module, context: str) -> None:
@@ -2254,8 +2881,16 @@ def _raise_if_model_parameters_nonfinite(model: nn.Module, context: str) -> None
         raise RuntimeError(f"{context}: first non-finite parameter={bad_name}")
 
 
-def _checkpoint_parameters_are_saveable(model: nn.Module, checkpoint_path: Path, label: str) -> bool:
+def _checkpoint_parameters_are_saveable(
+    model: nn.Module,
+    checkpoint_path: Path,
+    label: str,
+    *,
+    check_finite: bool = True,
+) -> bool:
     _stabilize_model_parameters_after_step(model)
+    if not bool(check_finite):
+        return True
     bad_name = _first_nonfinite_model_parameter(model)
     if bad_name is None:
         return True
@@ -2276,7 +2911,7 @@ def _tensor_is_finite(value: torch.Tensor) -> bool:
 
 def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
     cleaned_state_dict = {
-        key.removeprefix("_orig_mod."): value for key, value in state_dict.items()
+        key.removeprefix("_orig_mod.").removeprefix("module."): value for key, value in state_dict.items()
     }
     target = _unwrap_model(model)
     try:
@@ -2300,6 +2935,7 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
         "market_queries",
         "dynamic_latent_generator.",
         "dynamic_market_generator.",
+        "temporal_pool_score.",
         "latent_blocks.",
         "market_blocks.",
         "stock_read_latent_blocks.",
@@ -2335,8 +2971,11 @@ def _save_fold_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
     include_optimizer: bool = False,
+    check_finite: bool = True,
 ) -> None:
-    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "fold_best"):
+    if not _distributed_should_write():
+        return
+    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "fold_best", check_finite=check_finite):
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
@@ -2371,8 +3010,11 @@ def _save_group_checkpoint(
     early_stop_patience: int = 0,
     early_stopping_no_improve_ratio: float = 0.0,
     early_stop_val_interval_epochs: int = 1,
+    check_finite: bool = True,
 ) -> None:
-    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "group_last"):
+    if not _distributed_should_write():
+        return
+    if not _checkpoint_parameters_are_saveable(model, checkpoint_path, "group_last", check_finite=check_finite):
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     scheduler_state = scheduler.state_dict() if scheduler is not None else None
@@ -2616,6 +3258,8 @@ def _save_backtest_artifact(
     *,
     compression: str = "none",
 ) -> None:
+    if not _distributed_should_write():
+        return
     writer = np.savez_compressed if str(compression).strip().lower() == "compressed" else np.savez
     writer(
         output_path,
@@ -2691,6 +3335,8 @@ def _save_best_val_backtest_snapshot(
     dates: np.ndarray,
     objective: str,
 ) -> None:
+    if not _distributed_should_write():
+        return
     row_start = max(0, int(row_start))
     row_end = max(row_start, int(row_end))
     strategy_returns = val_backtest.strategy_returns[row_start:row_end].detach().cpu().numpy().astype(np.float32)
@@ -2768,6 +3414,8 @@ def _save_fold_output_artifacts(
     write_plots: bool = True,
     mark_complete: bool = False,
 ) -> tuple[dict[str, float | str], dict[str, float | str]]:
+    if not _distributed_should_write():
+        return {"skipped_nonzero_rank": "1", "total_s": 0.0}, {"skipped_nonzero_rank": "1", "total_s": 0.0}
     fold_dir.mkdir(parents=True, exist_ok=True)
     save_start = time.perf_counter()
     save_timing: dict[str, float | str] = {}
@@ -3282,6 +3930,11 @@ def _dataset_to_tensors(
     return x, returns, masks, can_buy_masks, can_sell_masks, bench
 
 
+def _dataset_volume_notional_to_tensor(dataset: CrossSectionalDataset) -> torch.Tensor:
+    valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
+    return dataset.volume_notional_t[valid_indices]
+
+
 def _windowed_targets_to_tensors(
     split: WindowedSplitTensors,
     *,
@@ -3500,6 +4153,8 @@ def _merge_test_backtest_with_previous_fold_warmup(
     chunk_rows: int = 1,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     backtest_chunk_rows: int | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[
     BacktestResultTensor,
     dict[str, float],
@@ -3574,6 +4229,15 @@ def _merge_test_backtest_with_previous_fold_warmup(
             0,
         )
 
+    if panel.daily_volumes is None:
+        warmup_volume_notional = torch.full_like(warmup_returns, float("inf"))
+    else:
+        warmup_volume_notional_np = (
+            np.asarray(panel.daily_volumes[warmup_indices], dtype=np.float32)
+            * np.asarray(panel.close_prices[warmup_indices], dtype=np.float32)
+        ).astype(np.float32, copy=False)
+        warmup_volume_notional = torch.from_numpy(warmup_volume_notional_np)
+
     warmup_x, warmup_returns, warmup_masks, warmup_buy_masks, warmup_sell_masks, warmup_bench = _prepare_split_tensors(
         warmup_x,
         warmup_returns,
@@ -3583,6 +4247,10 @@ def _merge_test_backtest_with_previous_fold_warmup(
         warmup_bench,
         device,
         non_blocking,
+    )
+    warmup_volume_notional = _prepare_host_tensor(
+        warmup_volume_notional,
+        pin_memory=(device.type == "cuda" and non_blocking),
     )
 
     warmup_bt_t, _, _ = _evaluate_tensor_batch(
@@ -3605,6 +4273,9 @@ def _merge_test_backtest_with_previous_fold_warmup(
         chunk_rows=max(1, min(int(chunk_rows), int(warmup_x.size(0)))),
         backtest_chunk_rows=backtest_chunk_rows,
         compute_metrics_summary=False,
+        volume_notional=warmup_volume_notional,
+        max_volume_participation=max_volume_participation,
+        volume_participation_equity=volume_participation_equity,
     )
 
     merged_backtest = _concat_backtest_tensors(warmup_bt_t, current_backtest)
@@ -3833,6 +4504,10 @@ def _combine_datasets_to_tensors(
     )
 
 
+def _combine_dataset_volume_notional_to_tensor(datasets: list[CrossSectionalDataset]) -> torch.Tensor:
+    return torch.cat([_dataset_volume_notional_to_tensor(dataset) for dataset in datasets], dim=0)
+
+
 def _combine_datasets_to_windowed(
     datasets: list[CrossSectionalDataset],
 ) -> tuple[WindowedSplitTensors, list[int]]:
@@ -3856,8 +4531,10 @@ def _combine_datasets_to_windowed(
         can_sell_mask=first.can_sell_mask,
         benchmark=first.benchmark,
         lookback=first.lookback,
+        volume_notional=first.volume_notional,
         can_short_open_mask=first.can_short_open_mask,
         force_short_cover_mask=first.force_short_cover_mask,
+        symbol_indices=first.symbol_indices,
     )
     return combined, lengths
 
@@ -3875,9 +4552,11 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             can_sell_mask=split.can_sell_mask,
             benchmark=split.benchmark,
             lookback=split.lookback,
+            volume_notional=split.volume_notional,
             can_short_open_mask=split.can_short_open_mask,
             force_short_cover_mask=split.force_short_cover_mask,
             sample_mask=sample_mask,
+            symbol_indices=split.symbol_indices,
         )
     padded_rows = ((total_rows + batch_size - 1) // batch_size) * batch_size
     sample_mask = torch.ones(total_rows, dtype=torch.bool, device=split.valid_indices.device)
@@ -3908,10 +4587,117 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         can_sell_mask=split.can_sell_mask,
         benchmark=split.benchmark,
         lookback=split.lookback,
+        volume_notional=split.volume_notional,
         can_short_open_mask=split.can_short_open_mask,
         force_short_cover_mask=split.force_short_cover_mask,
         sample_mask=sample_mask,
+        symbol_indices=split.symbol_indices,
     )
+
+
+def _normalize_train_symbol_compaction(value: object) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"", "0", "false", "no", "off", "none", "disabled"}:
+        return "none"
+    if normalized in {"1", "true", "yes", "on", "train_union", "union", "active_union"}:
+        return "train_union"
+    raise ValueError("training.train_symbol_compaction must be 'none' or 'train_union'")
+
+
+def _normalize_train_symbol_compaction_bucket_size(value: object) -> int:
+    if value is None:
+        return 0
+    bucket_size = int(value)
+    if bucket_size < 0:
+        raise ValueError("training.train_symbol_compaction_bucket_size must be >= 0")
+    return bucket_size
+
+
+def _bucketed_symbol_count(active_count: int, total_symbols: int, bucket_size: int) -> int:
+    active_count = int(active_count)
+    total_symbols = int(total_symbols)
+    bucket_size = int(bucket_size)
+    if active_count <= 0:
+        return active_count
+    if bucket_size <= 0:
+        return active_count
+    bucketed = ((active_count + bucket_size - 1) // bucket_size) * bucket_size
+    return min(total_symbols, max(active_count, bucketed))
+
+
+def _maybe_compact_train_windowed_symbols(
+    split: WindowedSplitTensors,
+    config: ExperimentConfig,
+    *,
+    label: str,
+) -> WindowedSplitTensors:
+    mode = _normalize_train_symbol_compaction(getattr(config.training, "train_symbol_compaction", "none"))
+    if mode == "none":
+        return split
+    if int(split.num_symbols) <= 0 or int(split.valid_indices.numel()) == 0:
+        return split
+    row_mask = split.sample_mask
+    if row_mask is not None:
+        row_mask_cpu = row_mask.detach().to(device="cpu", dtype=torch.bool)
+        if not bool(torch.any(row_mask_cpu).item()):
+            return split
+        date_indices = split.valid_indices.detach().to(device="cpu", dtype=torch.long)[row_mask_cpu]
+    else:
+        date_indices = split.valid_indices.detach().to(device="cpu", dtype=torch.long)
+    if int(date_indices.numel()) == 0:
+        return split
+
+    tradable_source = split.tradable_mask
+    date_indices = date_indices.to(device=tradable_source.device, dtype=torch.long)
+    active = tradable_source.index_select(0, date_indices).to(dtype=torch.bool).any(dim=0)
+    active_indices = active.nonzero(as_tuple=False).reshape(-1)
+    active_count = int(active_indices.numel())
+    total_symbols = int(split.num_symbols)
+    if active_count <= 0 or active_count >= total_symbols:
+        _progress(
+            f"[{label}] train_symbol_compaction={mode}: skipped "
+            f"active_symbols={active_count}/{total_symbols}"
+        )
+        return split
+    compacted = split.subset_symbols(active_indices)
+    bucket_size = _normalize_train_symbol_compaction_bucket_size(
+        getattr(config.training, "train_symbol_compaction_bucket_size", 0)
+    )
+    target_symbols = _bucketed_symbol_count(active_count, total_symbols, bucket_size)
+    padded_symbols = int(compacted.num_symbols)
+    if target_symbols > padded_symbols:
+        pad_symbol_index = None
+        if compacted.symbol_indices is not None:
+            pad_symbol_index = int(compacted.symbol_indices[0].detach().cpu().item())
+        compacted = compacted.pad_symbols(target_symbols, pad_symbol_index=pad_symbol_index)
+        padded_symbols = int(compacted.num_symbols)
+    symbol_index_note = ""
+    if compacted.symbol_indices is not None:
+        before_indices = compacted.symbol_indices.detach()
+        before_min = int(before_indices.min().detach().cpu().item())
+        before_max = int(before_indices.max().detach().cpu().item())
+        compacted_clamped = compacted.clamp_symbol_indices(total_symbols)
+        clamped = compacted_clamped is not compacted
+        compacted = compacted_clamped
+        after_indices = compacted.symbol_indices.detach()
+        after_min = int(after_indices.min().detach().cpu().item())
+        after_max = int(after_indices.max().detach().cpu().item())
+        if clamped:
+            symbol_index_note = (
+                f", symbol_index_range=[{after_min},{after_max}]"
+                f", clamped_from=[{before_min},{before_max}]"
+            )
+        else:
+            symbol_index_note = f", symbol_index_range=[{after_min},{after_max}]"
+    bucket_note = ""
+    if bucket_size > 0:
+        bucket_note = f", padded_symbols={padded_symbols}, bucket_size={bucket_size}"
+    _progress(
+        f"[{label}] train_symbol_compaction={mode}: "
+        f"active_symbols={active_count}/{total_symbols} ({active_count / max(1, total_symbols):.1%})"
+        f"{bucket_note}{symbol_index_note}"
+    )
+    return compacted
 
 
 def _prepare_windowed_split(
@@ -3922,6 +4708,7 @@ def _prepare_windowed_split(
     shared_base: WindowedSplitTensors | None = None,
     name: str | None = None,
 ) -> WindowedSplitTensors:
+    start = time.perf_counter()
     pin_memory = device.type == "cuda" and non_blocking
     if shared_base is not None and _windowed_base_compatible(split, shared_base):
         if name:
@@ -3934,7 +4721,7 @@ def _prepare_windowed_split(
         else:
             valid_indices = _prepare_host_tensor(split.valid_indices, pin_memory)
             sample_mask = None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory)
-        return WindowedSplitTensors(
+        prepared = WindowedSplitTensors(
             features=shared_base.features,
             valid_indices=valid_indices,
             future_log_returns=shared_base.future_log_returns,
@@ -3943,11 +4730,25 @@ def _prepare_windowed_split(
             can_sell_mask=shared_base.can_sell_mask,
             benchmark=shared_base.benchmark,
             lookback=split.lookback,
+            volume_notional=shared_base.volume_notional,
             can_short_open_mask=shared_base.can_short_open_mask,
             force_short_cover_mask=shared_base.force_short_cover_mask,
             sample_mask=sample_mask,
+            symbol_indices=shared_base.symbol_indices,
         )
-    return WindowedSplitTensors(
+        if name:
+            _progress(
+                f"[windowed base] prepared {name} rows={len(prepared)} symbols={prepared.num_symbols} "
+                f"shared_base=true device={prepared.features.device} elapsed={time.perf_counter() - start:.2f}s"
+            )
+        return prepared
+    if name:
+        shared_note = "incompatible" if shared_base is not None else "none"
+        _progress(
+            f"[windowed base] preparing independent base for {name} "
+            f"rows={len(split)} symbols={split.num_symbols} shared_base={shared_note}"
+        )
+    prepared = WindowedSplitTensors(
         features=_prepare_host_tensor(split.features, pin_memory),
         valid_indices=_prepare_host_tensor(split.valid_indices, pin_memory),
         future_log_returns=_prepare_host_tensor(split.future_log_returns, pin_memory),
@@ -3956,10 +4757,20 @@ def _prepare_windowed_split(
         can_sell_mask=_prepare_host_tensor(split.can_sell_mask, pin_memory),
         benchmark=_prepare_host_tensor(split.benchmark, pin_memory),
         lookback=split.lookback,
+        volume_notional=(
+            None if split.volume_notional is None else _prepare_host_tensor(split.volume_notional, pin_memory)
+        ),
         can_short_open_mask=_prepare_host_tensor(split.can_short_open_mask, pin_memory),
         force_short_cover_mask=_prepare_host_tensor(split.force_short_cover_mask, pin_memory),
         sample_mask=None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory),
+        symbol_indices=None if split.symbol_indices is None else _prepare_host_tensor(split.symbol_indices, pin_memory),
     )
+    if name:
+        _progress(
+            f"[windowed base] prepared {name} rows={len(prepared)} symbols={prepared.num_symbols} "
+            f"shared_base=false device={prepared.features.device} elapsed={time.perf_counter() - start:.2f}s"
+        )
+    return prepared
 
 
 def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor, ...]:
@@ -3972,6 +4783,7 @@ def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor, .
         split.can_short_open_mask,
         split.force_short_cover_mask,
         split.benchmark,
+        split.volume_notional,
     )
 
 
@@ -3995,8 +4807,10 @@ def _with_windowed_base(
         can_short_open_mask=base_tensors[5],
         force_short_cover_mask=base_tensors[6],
         benchmark=base_tensors[7],
+        volume_notional=base_tensors[8],
         lookback=split.lookback,
         sample_mask=split.sample_mask,
+        symbol_indices=split.symbol_indices,
     )
 
 
@@ -4014,8 +4828,10 @@ def _with_windowed_metadata(
         can_short_open_mask=split.can_short_open_mask,
         force_short_cover_mask=split.force_short_cover_mask,
         benchmark=split.benchmark,
+        volume_notional=split.volume_notional,
         lookback=split.lookback,
         sample_mask=None if split.sample_mask is None else metadata_tensors[1],
+        symbol_indices=split.symbol_indices,
     )
 
 
@@ -4099,11 +4915,22 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
         "can_short_open_mask",
         "force_short_cover_mask",
         "benchmark",
+        "volume_notional",
     )
     for attr in attrs:
         lhs = getattr(a, attr)
         rhs = getattr(b, attr)
         if tuple(lhs.shape) != tuple(rhs.shape) or lhs.dtype != rhs.dtype:
+            return False
+    if (a.symbol_indices is None) != (b.symbol_indices is None):
+        return False
+    if a.symbol_indices is not None and b.symbol_indices is not None:
+        if tuple(a.symbol_indices.shape) != tuple(b.symbol_indices.shape):
+            return False
+        if not torch.equal(
+            a.symbol_indices.detach().to(device="cpu", dtype=torch.long),
+            b.symbol_indices.detach().to(device="cpu", dtype=torch.long),
+        ):
             return False
     return int(a.lookback) == int(b.lookback)
 
@@ -4146,8 +4973,10 @@ def _maybe_share_windowed_base_from_cached(
         can_short_open_mask=cached_base.can_short_open_mask,
         force_short_cover_mask=cached_base.force_short_cover_mask,
         benchmark=cached_base.benchmark,
+        volume_notional=cached_base.volume_notional,
         lookback=split.lookback,
         sample_mask=sample_mask,
+        symbol_indices=cached_base.symbol_indices,
     )
 
 
@@ -4379,6 +5208,9 @@ def _run_eval_backtest_from_weight_buffers(
     timing: TimingBreakdown,
     reset_at_rows: Sequence[int] | None,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    volume_notional_all: torch.Tensor | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
     num_symbols = int(weights_all.size(1))
@@ -4422,6 +5254,11 @@ def _run_eval_backtest_from_weight_buffers(
         buy_mask_chunk = can_buy_mask_all[start:end].to(device=device, non_blocking=non_blocking)
         sell_mask_chunk = can_sell_mask_all[start:end].to(device=device, non_blocking=non_blocking)
         bench_chunk = benchmark_all[start:end].to(device=device, non_blocking=non_blocking)
+        volume_notional_chunk = (
+            None
+            if volume_notional_all is None
+            else volume_notional_all[start:end].to(device=device, non_blocking=non_blocking)
+        )
         (
             weights_chunk,
             returns_chunk,
@@ -4439,28 +5276,44 @@ def _run_eval_backtest_from_weight_buffers(
             bench_chunk,
             target_rows=backtest_chunk_rows,
         )
+        if volume_notional_chunk is not None and int(volume_notional_chunk.size(0)) < int(weights_chunk.size(0)):
+            volume_notional_chunk = _pad_rows(volume_notional_chunk, int(weights_chunk.size(0)), fill_value=float("nan"))
+        volume_limit_chunk = _volume_limit_weights_from_notional(
+            volume_notional_chunk,
+            max_volume_participation=max_volume_participation,
+            volume_participation_equity=volume_participation_equity,
+            device=device,
+            dtype=weights_chunk.dtype,
+        )
         initial_weights_chunk = prev_weights
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
 
         backtest_runner_start = time.perf_counter()
-        backtest_chunk = run_backtest_torch(
-            weights_chunk,
-            returns_chunk,
-            mask_chunk,
-            bench_chunk,
-            buy_fee_rate,
-            sell_fee_rate,
-            long_only=long_only,
-            max_turnover_ratio=max_turnover_ratio,
-            gross_leverage=gross_leverage,
-            min_trade_weight=min_trade_weight,
-            portfolio_activation=portfolio_activation,
-            can_buy_mask=buy_mask_chunk,
-            can_sell_mask=sell_mask_chunk,
-            return_weights_history=return_weights_history,
-            initial_weights=initial_weights_chunk,
+        compile_context = (
+            nullcontext()
+            if _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", "1")
+            else _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0")
         )
+        with compile_context:
+            backtest_chunk = run_backtest_torch(
+                weights_chunk,
+                returns_chunk,
+                mask_chunk,
+                bench_chunk,
+                buy_fee_rate,
+                sell_fee_rate,
+                long_only=long_only,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+                can_buy_mask=buy_mask_chunk,
+                can_sell_mask=sell_mask_chunk,
+                return_weights_history=return_weights_history,
+                initial_weights=initial_weights_chunk,
+                volume_limit_weights=volume_limit_chunk,
+            )
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
 
@@ -4521,6 +5374,9 @@ def _evaluate_tensor_batch_decoupled(
     progress_label: str | None = None,
     timing_out: TimingBreakdown | None = None,
     reset_at_rows: Sequence[int] | None = None,
+    volume_notional: torch.Tensor | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     timing = TimingBreakdown()
@@ -4553,6 +5409,11 @@ def _evaluate_tensor_batch_decoupled(
     can_buy_mask_all = can_buy_mask.to(device=device, non_blocking=non_blocking)
     can_sell_mask_all = can_sell_mask.to(device=device, non_blocking=non_blocking)
     benchmark_all = benchmark.to(device=device, non_blocking=non_blocking)
+    volume_notional_all = (
+        None
+        if volume_notional is None
+        else volume_notional.to(device=device, non_blocking=non_blocking)
+    )
     _maybe_sync_cuda(device, profile_timing)
     timing.transfer_s += time.perf_counter() - static_start
 
@@ -4630,6 +5491,9 @@ def _evaluate_tensor_batch_decoupled(
             progress_label=progress_label,
             timing=timing,
             reset_at_rows=reset_at_rows,
+            volume_notional_all=volume_notional_all,
+            max_volume_participation=max_volume_participation,
+            volume_participation_equity=volume_participation_equity,
         )
 
         ic_start = time.perf_counter()
@@ -4678,6 +5542,9 @@ def _evaluate_tensor_batch(
     progress_label: str | None = None,
     timing_out: TimingBreakdown | None = None,
     reset_at_rows: Sequence[int] | None = None,
+    volume_notional: torch.Tensor | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     effective_backtest_chunk_rows = int(backtest_chunk_rows) if backtest_chunk_rows is not None else int(chunk_rows)
     if effective_backtest_chunk_rows != int(chunk_rows):
@@ -4708,6 +5575,9 @@ def _evaluate_tensor_batch(
             progress_label=progress_label,
             timing_out=timing_out,
             reset_at_rows=reset_at_rows,
+            volume_notional=volume_notional,
+            max_volume_participation=max_volume_participation,
+            volume_participation_equity=volume_participation_equity,
         )
     model.eval()
     weights_chunks: list[torch.Tensor] = []
@@ -4769,6 +5639,11 @@ def _evaluate_tensor_batch(
             buy_mask_chunk = can_buy_mask[start:end].to(device=device, non_blocking=non_blocking)
             sell_mask_chunk = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
             bench_chunk = benchmark[start:end].to(device=device, non_blocking=non_blocking)
+            volume_notional_chunk = (
+                None
+                if volume_notional is None
+                else volume_notional[start:end].to(device=device, non_blocking=non_blocking)
+            )
             (
                 x_chunk,
                 returns_chunk,
@@ -4786,6 +5661,8 @@ def _evaluate_tensor_batch(
                 bench_chunk,
                 target_rows=chunk_rows,
             )
+            if volume_notional_chunk is not None and int(volume_notional_chunk.size(0)) < int(x_chunk.size(0)):
+                volume_notional_chunk = _pad_rows(volume_notional_chunk, int(x_chunk.size(0)), fill_value=float("nan"))
             _maybe_sync_cuda(device, profile_timing)
             timing.transfer_s += time.perf_counter() - chunk_start
 
@@ -4795,6 +5672,13 @@ def _evaluate_tensor_batch(
             with _autocast_context(device, amp_dtype):
                 model_output_chunk = _call_model(model, x_chunk, mask_chunk, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
+            volume_limit_chunk = _volume_limit_weights_from_notional(
+                volume_notional_chunk,
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights_chunk.dtype,
+            )
             _maybe_sync_cuda(device, profile_timing)
             chunk_forward_elapsed = time.perf_counter() - forward_start
             timing.forward_s += chunk_forward_elapsed
@@ -4824,6 +5708,7 @@ def _evaluate_tensor_batch(
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
                 initial_weights=initial_weights_chunk,
+                volume_limit_weights=volume_limit_chunk,
             )
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
@@ -5060,6 +5945,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
     progress_label: str | None = None,
     timing_out: TimingBreakdown | None = None,
     reset_at_rows: Sequence[int] | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     model.eval()
     if panel_slab_model is not None:
@@ -5093,6 +5980,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
     buy_mask_all: torch.Tensor | None = None
     sell_mask_all: torch.Tensor | None = None
     benchmark_all: torch.Tensor | None = None
+    volume_notional_all: torch.Tensor | None = None
     panel_forward_model = _panel_forward_module(model)
 
     with torch.inference_mode():
@@ -5103,12 +5991,36 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 _progress(f"{progress_label}: model chunk {chunk_idx}/{len(model_ranges)} rows=[{start},{end})")
             prepare_device = _windowed_prepare_device(split, device)
             batch_prepare_start = time.perf_counter()
+            direct_panel_slab = False
             if panel_forward_model is not None:
-                batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
-                date_indices_chunk = batch["date_indices"]
+                batch = None
+                if panel_slab_model is not None and int(end - start) == int(model_chunk_rows):
+                    batch = split.panel_slab_batch_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    direct_panel_slab = batch is not None
+                if batch is None:
+                    batch = split.batch_metadata_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    date_indices_chunk = batch["date_indices"]
             else:
                 window_materialize_start = time.perf_counter()
-                batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+                batch = split.batch_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
                 _maybe_sync_cuda(prepare_device, profile_timing)
                 timing.window_materialize_s += time.perf_counter() - window_materialize_start
                 x_chunk = batch["x"]
@@ -5118,21 +6030,29 @@ def _evaluate_windowed_tensor_batch_decoupled(
 
             h2d_start = time.perf_counter()
             batch = _move_windowed_batch_to_device(batch, device, non_blocking)
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and not direct_panel_slab:
                 date_indices_chunk = batch["date_indices"]
-            else:
+            elif panel_forward_model is None:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
+            volume_notional_chunk = batch.get("volume_notional")
             _maybe_sync_cuda(device, profile_timing)
             h2d_elapsed = time.perf_counter() - h2d_start
             timing.h2d_transfer_s += h2d_elapsed
 
             pad_start = time.perf_counter()
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and direct_panel_slab:
+                returns_chunk_padded = returns_chunk
+                mask_chunk_padded = mask_chunk
+                buy_mask_chunk_padded = buy_mask_chunk
+                sell_mask_chunk_padded = sell_mask_chunk
+                bench_chunk_padded = bench_chunk
+                valid_rows = int(end - start)
+            elif panel_forward_model is not None:
                 (
                     date_indices_chunk,
                     returns_chunk_padded,
@@ -5178,18 +6098,27 @@ def _evaluate_windowed_tensor_batch_decoupled(
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 if panel_forward_model is not None:
-                    model_output_chunk = _call_panel_forward_for_batch(
-                        panel_forward_model=panel_forward_model,
-                        panel_slab_model=panel_slab_model,
-                        split=split,
-                        batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
-                        mask=mask_chunk_padded,
-                        device=device,
-                        non_blocking=non_blocking,
-                        return_aux=False,
-                        allow_slab=int(valid_rows) == int(model_chunk_rows),
-                        rows=int(valid_rows),
-                    )
+                    if direct_panel_slab:
+                        if panel_slab_model is None:
+                            raise RuntimeError("panel slab model unexpectedly unavailable")
+                        model_output_chunk = panel_slab_model(
+                            batch["feature_slab"],
+                            mask_chunk_padded,
+                            batch.get("symbol_indices"),
+                        )
+                    else:
+                        model_output_chunk = _call_panel_forward_for_batch(
+                            panel_forward_model=panel_forward_model,
+                            panel_slab_model=panel_slab_model,
+                            split=split,
+                            batch=batch if int(valid_rows) == int(model_chunk_rows) else panel_batch_for_forward,
+                            mask=mask_chunk_padded,
+                            device=device,
+                            non_blocking=non_blocking,
+                            return_aux=False,
+                            allow_slab=int(valid_rows) == int(model_chunk_rows),
+                            rows=int(valid_rows),
+                        )
                 else:
                     model_output_chunk = _call_model(model, x_chunk, mask_chunk_padded, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
@@ -5205,12 +6134,20 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 buy_mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=buy_mask_chunk.dtype)
                 sell_mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=sell_mask_chunk.dtype)
                 benchmark_all = torch.empty((total_rows,), device=device, dtype=bench_chunk.dtype)
+                if volume_notional_chunk is not None:
+                    volume_notional_all = torch.empty(
+                        (total_rows, split.num_symbols),
+                        device=device,
+                        dtype=volume_notional_chunk.dtype,
+                    )
             weights_all[start:end].copy_(weights_chunk[:valid_rows])
             returns_all[start:end].copy_(returns_chunk_padded[:valid_rows])
             mask_all[start:end].copy_(mask_chunk_padded[:valid_rows])
             buy_mask_all[start:end].copy_(buy_mask_chunk_padded[:valid_rows])
             sell_mask_all[start:end].copy_(sell_mask_chunk_padded[:valid_rows])
             benchmark_all[start:end].copy_(bench_chunk_padded[:valid_rows])
+            if volume_notional_all is not None and volume_notional_chunk is not None:
+                volume_notional_all[start:end].copy_(volume_notional_chunk[:valid_rows])
 
         if (
             weights_all is None
@@ -5245,6 +6182,9 @@ def _evaluate_windowed_tensor_batch_decoupled(
             progress_label=progress_label,
             timing=timing,
             reset_at_rows=reset_at_rows,
+            volume_notional_all=volume_notional_all,
+            max_volume_participation=max_volume_participation,
+            volume_participation_equity=volume_participation_equity,
         )
 
         ic_start = time.perf_counter()
@@ -5289,6 +6229,8 @@ def _evaluate_windowed_tensor_batch(
     progress_label: str | None = None,
     timing_out: TimingBreakdown | None = None,
     reset_at_rows: Sequence[int] | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     effective_backtest_chunk_rows = int(backtest_chunk_rows) if backtest_chunk_rows is not None else int(chunk_rows)
     if effective_backtest_chunk_rows != int(chunk_rows):
@@ -5315,6 +6257,8 @@ def _evaluate_windowed_tensor_batch(
             progress_label=progress_label,
             timing_out=timing_out,
             reset_at_rows=reset_at_rows,
+            max_volume_participation=max_volume_participation,
+            volume_participation_equity=volume_participation_equity,
         )
     model.eval()
     if panel_slab_model is not None:
@@ -5384,12 +6328,36 @@ def _evaluate_windowed_tensor_batch(
             log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_chunks)
             prepare_device = _windowed_prepare_device(split, device)
             batch_prepare_start = time.perf_counter()
+            direct_panel_slab = False
             if panel_forward_model is not None:
-                batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
-                date_indices_chunk = batch["date_indices"]
+                batch = None
+                if panel_slab_model is not None and int(end - start) == int(chunk_rows):
+                    batch = split.panel_slab_batch_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    direct_panel_slab = batch is not None
+                if batch is None:
+                    batch = split.batch_metadata_by_rows(
+                        start,
+                        end,
+                        device=prepare_device,
+                        non_blocking=False,
+                        prepare_timing=timing,
+                    )
+                    date_indices_chunk = batch["date_indices"]
             else:
                 window_materialize_start = time.perf_counter()
-                batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+                batch = split.batch_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
                 _maybe_sync_cuda(prepare_device, profile_timing)
                 timing.window_materialize_s += time.perf_counter() - window_materialize_start
                 x_chunk = batch["x"]
@@ -5399,21 +6367,24 @@ def _evaluate_windowed_tensor_batch(
 
             h2d_start = time.perf_counter()
             batch = _move_windowed_batch_to_device(batch, device, non_blocking)
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and not direct_panel_slab:
                 date_indices_chunk = batch["date_indices"]
-            else:
+            elif panel_forward_model is None:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
             bench_chunk = batch["benchmark"]
+            volume_notional_chunk = batch.get("volume_notional")
             _maybe_sync_cuda(device, profile_timing)
             h2d_elapsed = time.perf_counter() - h2d_start
             timing.h2d_transfer_s += h2d_elapsed
 
             pad_start = time.perf_counter()
-            if panel_forward_model is not None:
+            if panel_forward_model is not None and direct_panel_slab:
+                valid_rows = int(end - start)
+            elif panel_forward_model is not None:
                 (
                     date_indices_chunk,
                     returns_chunk,
@@ -5431,6 +6402,8 @@ def _evaluate_windowed_tensor_batch(
                     bench_chunk,
                     target_rows=chunk_rows,
                 )
+                if volume_notional_chunk is not None and int(volume_notional_chunk.size(0)) < int(chunk_rows):
+                    volume_notional_chunk = _pad_rows(volume_notional_chunk, int(chunk_rows), fill_value=float("nan"))
                 panel_batch_for_forward = dict(batch)
                 panel_batch_for_forward["date_indices"] = date_indices_chunk
             else:
@@ -5451,6 +6424,8 @@ def _evaluate_windowed_tensor_batch(
                     bench_chunk,
                     target_rows=chunk_rows,
                 )
+                if volume_notional_chunk is not None and int(volume_notional_chunk.size(0)) < int(chunk_rows):
+                    volume_notional_chunk = _pad_rows(volume_notional_chunk, int(chunk_rows), fill_value=float("nan"))
             _maybe_sync_cuda(device, profile_timing)
             pad_elapsed = time.perf_counter() - pad_start
             timing.batch_prepare_s += pad_elapsed
@@ -5459,18 +6434,27 @@ def _evaluate_windowed_tensor_batch(
             forward_start = time.perf_counter()
             with _autocast_context(device, amp_dtype):
                 if panel_forward_model is not None:
-                    model_output_chunk = _call_panel_forward_for_batch(
-                        panel_forward_model=panel_forward_model,
-                        panel_slab_model=panel_slab_model,
-                        split=split,
-                        batch=batch if int(valid_rows) == int(chunk_rows) else panel_batch_for_forward,
-                        mask=mask_chunk,
-                        device=device,
-                        non_blocking=non_blocking,
-                        return_aux=False,
-                        allow_slab=int(valid_rows) == int(chunk_rows),
-                        rows=int(valid_rows),
-                    )
+                    if direct_panel_slab:
+                        if panel_slab_model is None:
+                            raise RuntimeError("panel slab model unexpectedly unavailable")
+                        model_output_chunk = panel_slab_model(
+                            batch["feature_slab"],
+                            mask_chunk,
+                            batch.get("symbol_indices"),
+                        )
+                    else:
+                        model_output_chunk = _call_panel_forward_for_batch(
+                            panel_forward_model=panel_forward_model,
+                            panel_slab_model=panel_slab_model,
+                            split=split,
+                            batch=batch if int(valid_rows) == int(chunk_rows) else panel_batch_for_forward,
+                            mask=mask_chunk,
+                            device=device,
+                            non_blocking=non_blocking,
+                            return_aux=False,
+                            allow_slab=int(valid_rows) == int(chunk_rows),
+                            rows=int(valid_rows),
+                        )
                 else:
                     model_output_chunk = _call_model(model, x_chunk, mask_chunk, return_aux=False)
                 weights_chunk, _ = _extract_weights_and_aux(model_output_chunk)
@@ -5482,6 +6466,13 @@ def _evaluate_windowed_tensor_batch(
             backtest_start = time.perf_counter()
             backtest_prepare_start = time.perf_counter()
             initial_weights_chunk = prev_weights
+            volume_limit_chunk = _volume_limit_weights_from_notional(
+                volume_notional_chunk,
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights_chunk.dtype,
+            )
             timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
 
             backtest_runner_start = time.perf_counter()
@@ -5501,6 +6492,7 @@ def _evaluate_windowed_tensor_batch(
                 can_sell_mask=sell_mask_chunk,
                 return_weights_history=return_weights_history,
                 initial_weights=initial_weights_chunk,
+                volume_limit_weights=volume_limit_chunk,
             )
             _maybe_sync_cuda(device, profile_timing)
             timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
@@ -5810,6 +6802,8 @@ def _estimate_eval_chunk_rows(
 
 
 def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult]) -> None:
+    if not _distributed_should_write():
+        return
     _write_summary(results, output_path)
 
     stale_combined_log_plot = output_path / "walkforward_equity_curve_log.png"
@@ -5895,6 +6889,8 @@ def _run_fold_explainability(
     device: torch.device,
     checkpoint_path: Path,
 ) -> Path | None:
+    if not _distributed_should_write():
+        return None
     if not bool(getattr(config.training, "explain_after_each_fold", False)):
         return None
 
@@ -5948,6 +6944,85 @@ def _resolve_device(config: ExperimentConfig) -> torch.device:
             "Training is aborted to avoid silently falling back to CPU."
         )
     return torch.device(requested)
+
+
+def _resolve_data_parallel_device_ids(config: ExperimentConfig, device: torch.device) -> list[int]:
+    strategy = str(getattr(config.training, "multi_gpu_strategy", "none") or "none").strip().lower().replace("-", "_")
+    if strategy in {"", "none", "off", "false", "single", "single_gpu"}:
+        return []
+    if strategy in {"distributed_data_parallel", "ddp", "distributed", "torch_ddp"}:
+        return []
+    if strategy not in {"data_parallel", "dp"}:
+        raise ValueError(f"Unsupported training.multi_gpu_strategy={strategy!r}")
+    if device.type != "cuda":
+        raise RuntimeError("training.multi_gpu_strategy=data_parallel requires environment.device=cuda")
+    if not torch.cuda.is_available():
+        raise RuntimeError("training.multi_gpu_strategy=data_parallel requires CUDA, but CUDA is unavailable")
+
+    visible_count = int(torch.cuda.device_count())
+    raw_ids = list(getattr(config.training, "data_parallel_device_ids", []) or range(visible_count))
+    device_ids: list[int] = []
+    for raw_id in raw_ids:
+        device_id = int(raw_id)
+        if device_id < 0 or device_id >= visible_count:
+            raise RuntimeError(
+                "training.data_parallel_device_ids contains an unavailable CUDA device "
+                f"{device_id}; visible CUDA device_count={visible_count}"
+            )
+        if device_id not in device_ids:
+            device_ids.append(device_id)
+    if len(device_ids) < 2:
+        message = (
+            "training.multi_gpu_strategy=data_parallel needs at least two visible CUDA devices; "
+            f"resolved device_ids={device_ids}, cuda_device_count={visible_count}"
+        )
+        if bool(getattr(config.training, "strict_no_fallback", False)):
+            raise RuntimeError(message)
+        print(f"[multi-gpu] {message}; falling back to single-GPU training")
+        return []
+    return device_ids
+
+
+def _resolve_distributed_data_parallel(config: ExperimentConfig, device: torch.device) -> bool:
+    strategy = str(getattr(config.training, "multi_gpu_strategy", "none") or "none").strip().lower().replace("-", "_")
+    if strategy not in {"distributed_data_parallel", "ddp", "distributed", "torch_ddp"}:
+        return False
+    if device.type != "cuda":
+        raise RuntimeError("training.multi_gpu_strategy=distributed_data_parallel requires environment.device=cuda")
+    if not torch.cuda.is_available():
+        raise RuntimeError("training.multi_gpu_strategy=distributed_data_parallel requires CUDA, but CUDA is unavailable")
+    if not _distributed_is_initialized():
+        raise RuntimeError(
+            "training.multi_gpu_strategy=distributed_data_parallel requires torchrun. "
+            "Run via train.py so it can relaunch automatically, or launch with torchrun manually."
+        )
+    if _distributed_world_size() < 2:
+        raise RuntimeError("distributed_data_parallel requires WORLD_SIZE >= 2")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if local_rank < 0 or local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is unavailable; visible CUDA device_count={torch.cuda.device_count()}"
+        )
+    torch.cuda.set_device(local_rank)
+    return True
+
+
+def _wrap_distributed_data_parallel_model(
+    module: nn.Module,
+    *,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> DistributedDataParallel:
+    ddp_kwargs: dict[str, Any] = {
+        "device_ids": [device.index] if device.type == "cuda" else None,
+        "output_device": device.index if device.type == "cuda" else None,
+        "bucket_cap_mb": int(getattr(config.training, "ddp_bucket_cap_mb", 4)),
+        "find_unused_parameters": False,
+    }
+    try:
+        return DistributedDataParallel(module, static_graph=True, **ddp_kwargs)
+    except TypeError:
+        return DistributedDataParallel(module, **ddp_kwargs)
 
 
 def _resolve_amp_dtype(amp_dtype: str) -> torch.dtype | None:
@@ -6077,12 +7152,41 @@ def _prepend_compile_toolchain_paths() -> None:
         os.environ["PATH"] = os.pathsep.join([*prepend, existing])
 
 
+def _configure_torch_compile_runtime() -> None:
+    try:
+        import torch._dynamo.config as dynamo_config
+
+        dynamo_config.log_compilation_metrics = False
+    except Exception:
+        pass
+    try:
+        import torch._inductor.config as inductor_config
+
+        # PyTorch CUDA 13 / RTX 5090 currently hits an Inductor scheduler
+        # assertion in MixOrderReduction for some compiled backward shapes
+        # such as S=1024, D=32. Keep Inductor/Triton compile enabled but avoid
+        # this one unstable fusion pass unless explicitly re-enabled.
+        inductor_config.triton.mix_order_reduction = _env_truthy(
+            "STOCKAGENT_INDUCTOR_MIX_ORDER_REDUCTION",
+            "0",
+        )
+    except Exception:
+        pass
+    try:
+        from torch._dynamo.utils import CompileEventLogger
+
+        CompileEventLogger.compilation_metric = staticmethod(lambda *args, **kwargs: None)
+    except Exception:
+        pass
+
+
 def _can_enable_torch_compile(device: torch.device) -> tuple[bool, str]:
     """Return whether torch.compile is safe to enable in current environment."""
     if device.type != "cuda":
         return False, "torch.compile is only enabled for CUDA in this project"
 
     _prepend_compile_toolchain_paths()
+    _configure_torch_compile_runtime()
 
     # Inductor+Triton on CUDA needs a host C compiler at runtime.
     cc, cxx = _resolve_host_compilers()
@@ -6107,6 +7211,7 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
         force=True,
     )
     _prepend_compile_toolchain_paths()
+    _configure_torch_compile_runtime()
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if bool(training.backtest_autotune) else "0"
     os.environ["STOCKAGENT_BACKTEST_COMPILE"] = "1" if bool(training.backtest_compile) else "0"
     os.environ["STOCKAGENT_BACKTEST_COMPILE_STATEFUL"] = (
@@ -6115,6 +7220,9 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     os.environ["STOCKAGENT_BACKTEST_COMPILE_DYNAMIC"] = (
         "1" if bool(getattr(training, "backtest_compile_dynamic", False)) else "0"
     )
+    eval_backtest_compile = getattr(training, "eval_backtest_compile", None)
+    if eval_backtest_compile is not None:
+        os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(eval_backtest_compile) else "0"
     os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if bool(training.strict_no_fallback) else "0"
@@ -6182,6 +7290,8 @@ def _run_postprocess_benchmark_after_fold(
     fold_id: int,
     enabled: bool | None = None,
 ) -> None:
+    if not _distributed_should_write():
+        return
     if enabled is None:
         enabled = bool(getattr(config.training, "postprocess_benchmark_after_fold", False))
     if not bool(enabled):
@@ -6837,7 +7947,10 @@ def _train_epoch(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
+    debug_timing_sync: bool = False,
     progress_label: str | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
@@ -6883,6 +7996,13 @@ def _train_epoch(
             with _cuda_timing(timing, "model_forward_cuda_s", device):
                 model_output = model(batch["x"], batch["tradable_mask"])
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
+            batch_volume_limit_weights = _volume_limit_weights_from_notional(
+                batch.get("volume_notional"),
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights.dtype,
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
@@ -6903,6 +8023,7 @@ def _train_epoch(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
+            _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
                 if use_fused_log_utility and fused_loss_fn is not None:
@@ -6915,6 +8036,7 @@ def _train_epoch(
                         batch["can_sell_mask"],
                         batch.get("sample_mask"),
                         portfolio_prev_weights,
+                        batch_volume_limit_weights,
                     )
                     loss = _add_return_rank_ic_aux_loss(
                         loss,
@@ -6936,6 +8058,7 @@ def _train_epoch(
                         buy_fee_rate=buy_fee_rate,
                         sell_fee_rate=sell_fee_rate,
                         max_turnover_ratio=max_turnover_ratio,
+                        volume_limit_weights=batch_volume_limit_weights,
                         gross_leverage=gross_leverage,
                         gamma_sharpe=gamma_sharpe,
                         gamma_excess=gamma_excess,
@@ -6964,6 +8087,7 @@ def _train_epoch(
                     )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
+            _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
         should_check_finite = _should_check_finite(
             batch_no,
             finite_check_interval_steps,
@@ -6998,7 +8122,8 @@ def _train_epoch(
         if scaler.is_enabled():
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
-                scaler.scale(loss).backward()
+                with profile_range("train.backward.autograd"):
+                    scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -7157,7 +8282,11 @@ def _train_epoch_tensor(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
+    debug_timing_sync: bool = False,
     progress_label: str | None = None,
+    volume_notional: torch.Tensor | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     total_rows = int(x.size(0))
@@ -7181,6 +8310,7 @@ def _train_epoch_tensor(
         )
 
     for step_idx, batch_idx in enumerate(batch_order, start=1):
+        _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
@@ -7199,6 +8329,11 @@ def _train_epoch_tensor(
         batch_sell_mask = can_sell_mask[start:end].to(device=device, non_blocking=non_blocking)
         batch_bench = benchmark[start:end].to(device=device, non_blocking=non_blocking)
         batch_sample_mask = sample_mask[start:end].to(device=device, non_blocking=non_blocking)
+        batch_volume_notional = (
+            None
+            if volume_notional is None
+            else volume_notional[start:end].to(device=device, non_blocking=non_blocking)
+        )
         _maybe_sync_cuda(device, profile_timing)
         timing.transfer_s += time.perf_counter() - transfer_start
 
@@ -7210,8 +8345,20 @@ def _train_epoch_tensor(
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
             with _cuda_timing(timing, "model_forward_cuda_s", device):
-                model_output = _call_model(model, batch_x, batch_mask, return_aux=model_return_aux)
+                model_output = _call_model(
+                    model,
+                    batch_x,
+                    batch_mask,
+                    return_aux=model_return_aux,
+                )
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
+            batch_volume_limit_weights = _volume_limit_weights_from_notional(
+                batch_volume_notional,
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights.dtype,
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
@@ -7244,6 +8391,7 @@ def _train_epoch_tensor(
                         batch_sell_mask,
                         batch_sample_mask,
                         portfolio_prev_weights,
+                        batch_volume_limit_weights,
                     )
                 else:
                     loss = loss_fn(
@@ -7258,6 +8406,7 @@ def _train_epoch_tensor(
                         buy_fee_rate=buy_fee_rate,
                         sell_fee_rate=sell_fee_rate,
                         max_turnover_ratio=max_turnover_ratio,
+                        volume_limit_weights=batch_volume_limit_weights,
                         gross_leverage=gross_leverage,
                         gamma_sharpe=gamma_sharpe,
                         gamma_excess=gamma_excess,
@@ -7320,6 +8469,7 @@ def _train_epoch_tensor(
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
                 scaler.scale(loss).backward()
+            _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
 
@@ -7473,7 +8623,10 @@ def _train_epoch_windowed_tensor(
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
+    debug_timing_sync: bool = False,
     progress_label: str | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     model.train()
     if panel_slab_model is not None:
@@ -7501,6 +8654,7 @@ def _train_epoch_windowed_tensor(
         )
 
     for step_idx, batch_idx in enumerate(batch_order, start=1):
+        _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
         batch_start = time.perf_counter()
         start = batch_idx * batch_size
         end = min(start + batch_size, total_rows)
@@ -7511,21 +8665,54 @@ def _train_epoch_windowed_tensor(
 
         prepare_device = _windowed_prepare_device(split, device)
         batch_prepare_start = time.perf_counter()
+        direct_panel_slab = False
         if use_panel_forward:
-            batch = split.batch_metadata_by_rows(start, end, device=prepare_device, non_blocking=False)
+            batch = None
+            if panel_slab_model is not None and model_return_aux is False:
+                route_start = time.perf_counter()
+                batch = split.panel_slab_batch_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
+                timing.prepare_panel_slab_batch_s += time.perf_counter() - route_start
+                direct_panel_slab = batch is not None
+            if batch is None:
+                route_start = time.perf_counter()
+                batch = split.batch_metadata_by_rows(
+                    start,
+                    end,
+                    device=prepare_device,
+                    non_blocking=False,
+                    prepare_timing=timing,
+                )
+                timing.prepare_metadata_batch_s += time.perf_counter() - route_start
             batch_x = None
         else:
             window_materialize_start = time.perf_counter()
-            batch = split.batch_by_rows(start, end, device=prepare_device, non_blocking=False)
+            route_start = time.perf_counter()
+            batch = split.batch_by_rows(
+                start,
+                end,
+                device=prepare_device,
+                non_blocking=False,
+                prepare_timing=timing,
+            )
+            timing.prepare_materialized_batch_s += time.perf_counter() - route_start
             _maybe_sync_cuda(prepare_device, profile_timing)
             timing.window_materialize_s += time.perf_counter() - window_materialize_start
             batch_x = batch["x"]
         _maybe_sync_cuda(prepare_device, profile_timing)
         batch_prepare_elapsed = time.perf_counter() - batch_prepare_start
         timing.batch_prepare_s += batch_prepare_elapsed
+        _record_debug_cuda_sync(timing, "after_prepare_sync_s", device, debug_timing_sync)
 
         h2d_start = time.perf_counter()
+        move_start = time.perf_counter()
         batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
         if batch_x is not None:
             batch_x = batch["x"]
         batch_ret = batch["future_log_returns"]
@@ -7545,24 +8732,80 @@ def _train_epoch_windowed_tensor(
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
             with _cuda_timing(timing, "model_forward_cuda_s", device):
-                if use_panel_forward:
+                if PROFILE_RANGES_ENABLED:
+                    with profile_range("train.forward.model"):
+                        if use_panel_forward:
+                            if panel_forward_model is None:
+                                raise RuntimeError("panel forward model unexpectedly unavailable")
+                            if direct_panel_slab:
+                                if panel_slab_model is None:
+                                    raise RuntimeError("panel slab model unexpectedly unavailable")
+                                model_output = panel_slab_model(
+                                    batch["feature_slab"],
+                                    batch_mask,
+                                    batch.get("symbol_indices"),
+                                )
+                            else:
+                                model_output = _call_panel_forward_for_batch(
+                                    panel_forward_model=panel_forward_model,
+                                    panel_slab_model=panel_slab_model,
+                                    split=split,
+                                    batch=batch,
+                                    mask=batch_mask,
+                                    device=device,
+                                    non_blocking=non_blocking,
+                                    return_aux=model_return_aux,
+                                )
+                        else:
+                            if batch_x is None:
+                                raise RuntimeError("window tensor batch unexpectedly unavailable")
+                            model_output = _call_model(
+                                model,
+                                batch_x,
+                                batch_mask,
+                                return_aux=model_return_aux,
+                                symbol_indices=batch.get("symbol_indices"),
+                            )
+                elif use_panel_forward:
                     if panel_forward_model is None:
                         raise RuntimeError("panel forward model unexpectedly unavailable")
-                    model_output = _call_panel_forward_for_batch(
-                        panel_forward_model=panel_forward_model,
-                        panel_slab_model=panel_slab_model,
-                        split=split,
-                        batch=batch,
-                        mask=batch_mask,
-                        device=device,
-                        non_blocking=non_blocking,
-                        return_aux=model_return_aux,
-                    )
+                    if direct_panel_slab:
+                        if panel_slab_model is None:
+                            raise RuntimeError("panel slab model unexpectedly unavailable")
+                        model_output = panel_slab_model(
+                            batch["feature_slab"],
+                            batch_mask,
+                            batch.get("symbol_indices"),
+                        )
+                    else:
+                        model_output = _call_panel_forward_for_batch(
+                            panel_forward_model=panel_forward_model,
+                            panel_slab_model=panel_slab_model,
+                            split=split,
+                            batch=batch,
+                            mask=batch_mask,
+                            device=device,
+                            non_blocking=non_blocking,
+                            return_aux=model_return_aux,
+                        )
                 else:
                     if batch_x is None:
                         raise RuntimeError("window tensor batch unexpectedly unavailable")
-                    model_output = _call_model(model, batch_x, batch_mask, return_aux=model_return_aux)
+                    model_output = _call_model(
+                        model,
+                        batch_x,
+                        batch_mask,
+                        return_aux=model_return_aux,
+                        symbol_indices=batch.get("symbol_indices"),
+                    )
                 weights, aux_outputs = _extract_weights_and_aux(model_output)
+            batch_volume_limit_weights = _volume_limit_weights_from_notional(
+                batch.get("volume_notional"),
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights.dtype,
+            )
             _maybe_sync_cuda(device, profile_timing)
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
@@ -7583,9 +8826,63 @@ def _train_epoch_windowed_tensor(
                 aux_outputs = dict(aux_outputs or {})
                 aux_outputs["initial_weights"] = portfolio_prev_weights
 
+            _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
-                if use_fused_log_utility and fused_loss_fn is not None:
+                if PROFILE_RANGES_ENABLED:
+                    with profile_range("train.forward.loss"):
+                        if use_fused_log_utility and fused_loss_fn is not None:
+                            loss, fused_next_prev = _run_fused_log_utility_loss(
+                                fused_loss_fn,
+                                weights,
+                                batch_ret,
+                                batch_mask,
+                                batch_buy_mask,
+                                batch_sell_mask,
+                                batch_sample_mask,
+                                portfolio_prev_weights,
+                                batch_volume_limit_weights,
+                            )
+                        else:
+                            loss = loss_fn(
+                                weights,
+                                batch_ret,
+                                batch_mask,
+                                benchmark_returns=batch_bench,
+                                can_buy_mask=batch_buy_mask,
+                                can_sell_mask=batch_sell_mask,
+                                sample_mask=batch_sample_mask,
+                                long_only=long_only,
+                                buy_fee_rate=buy_fee_rate,
+                                sell_fee_rate=sell_fee_rate,
+                                max_turnover_ratio=max_turnover_ratio,
+                                volume_limit_weights=batch_volume_limit_weights,
+                                gross_leverage=gross_leverage,
+                                gamma_sharpe=gamma_sharpe,
+                                gamma_excess=gamma_excess,
+                                gamma_cvar=gamma_cvar,
+                                cvar_alpha=cvar_alpha,
+                                gamma_drawdown=gamma_drawdown,
+                                drawdown_target=drawdown_target,
+                                gamma_turnover=gamma_turnover,
+                                gamma_underperformance=gamma_underperformance,
+                                excess_target=excess_target,
+                                cvar_budget=cvar_budget,
+                                drawdown_budget=drawdown_budget,
+                                turnover_budget=turnover_budget,
+                                gamma_cvar_budget=gamma_cvar_budget,
+                                gamma_drawdown_budget=gamma_drawdown_budget,
+                                gamma_turnover_budget=gamma_turnover_budget,
+                                objective=objective,
+                                aux_outputs=aux_outputs,
+                                rank_ic_weight=rank_ic_weight,
+                                direction_weight=direction_weight,
+                                volatility_regime_weight=volatility_regime_weight,
+                                concentration_weight=concentration_weight,
+                                regime_up_threshold=regime_up_threshold,
+                                regime_down_threshold=regime_down_threshold,
+                            )
+                elif use_fused_log_utility and fused_loss_fn is not None:
                     loss, fused_next_prev = _run_fused_log_utility_loss(
                         fused_loss_fn,
                         weights,
@@ -7595,6 +8892,7 @@ def _train_epoch_windowed_tensor(
                         batch_sell_mask,
                         batch_sample_mask,
                         portfolio_prev_weights,
+                        batch_volume_limit_weights,
                     )
                 else:
                     loss = loss_fn(
@@ -7609,6 +8907,7 @@ def _train_epoch_windowed_tensor(
                         buy_fee_rate=buy_fee_rate,
                         sell_fee_rate=sell_fee_rate,
                         max_turnover_ratio=max_turnover_ratio,
+                        volume_limit_weights=batch_volume_limit_weights,
                         gross_leverage=gross_leverage,
                         gamma_sharpe=gamma_sharpe,
                         gamma_excess=gamma_excess,
@@ -7636,6 +8935,7 @@ def _train_epoch_windowed_tensor(
                     )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
+            _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
         should_check_finite = _should_check_finite(
             step_idx,
@@ -7693,6 +8993,7 @@ def _train_epoch_windowed_tensor(
                 scaler.step(optimizer)
                 scaler.update()
             _stabilize_model_parameters_after_step(model)
+            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7700,7 +9001,12 @@ def _train_epoch_windowed_tensor(
         else:
             grad_start = time.perf_counter()
             with _cuda_timing(timing, "grad_cuda_s", device):
-                loss.backward()
+                if PROFILE_RANGES_ENABLED:
+                    with profile_range("train.backward.autograd"):
+                        loss.backward()
+                else:
+                    loss.backward()
+            _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
@@ -7725,6 +9031,7 @@ def _train_epoch_windowed_tensor(
             with _cuda_timing(timing, "step_cuda_s", device):
                 optimizer.step()
             _stabilize_model_parameters_after_step(model)
+            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.step_s += time.perf_counter() - step_start
             if lr_scheduler is not None and lr_scheduler_interval == "step":
@@ -7743,6 +9050,273 @@ def _train_epoch_windowed_tensor(
         total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
         steps += 1
         if progress_label:
+            _progress(
+                f"{progress_label}: batch {step_idx}/{num_batches} done "
+                f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
+            )
+
+    timing.total_s = time.perf_counter() - total_start
+    timing.batches = steps
+    if steps == 0:
+        return total_loss_t.detach(), timing
+    return (total_loss_t / steps).detach(), timing
+
+
+def _train_epoch_windowed_tensor_ddp(
+    model: nn.Module,
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    split: WindowedSplitTensors,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    batch_size: int,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    non_blocking: bool,
+    objective: str,
+    grad_clip_norm: float,
+    finite_check_interval_steps: int = 0,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    lr_scheduler_interval: str = "epoch",
+    profile_timing: bool = False,
+    debug_timing_sync: bool = False,
+    progress_label: str | None = None,
+    max_volume_participation: float = 0.0,
+    volume_participation_equity: float = 1_000_000.0,
+) -> tuple[torch.Tensor, TimingBreakdown]:
+    if not _is_log_utility_objective(objective):
+        raise RuntimeError("DDP windowed hotpath currently requires log_utility objective")
+    world_size = _distributed_world_size()
+    rank = _distributed_rank()
+    if world_size <= 1 or not _distributed_is_initialized():
+        raise RuntimeError("DDP windowed hotpath requires an initialized distributed process group")
+    if int(batch_size) % world_size != 0:
+        raise RuntimeError(
+            f"DDP global batch_size must be divisible by world_size; got batch_size={batch_size}, world_size={world_size}"
+        )
+    local_batch_size = int(batch_size) // world_size
+    if local_batch_size <= 0:
+        raise RuntimeError(f"DDP local batch size must be positive; got {local_batch_size}")
+
+    model.train()
+    total_rows = len(split)
+    if total_rows == 0:
+        return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
+    if total_rows % int(batch_size) != 0:
+        raise RuntimeError(
+            f"DDP windowed split must be padded to the global batch size; rows={total_rows}, batch_size={batch_size}"
+        )
+
+    num_batches = total_rows // int(batch_size)
+    portfolio_prev_weights: torch.Tensor | None = None
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    steps = 0
+    timing = TimingBreakdown()
+    total_start = time.perf_counter()
+    if progress_label and _distributed_is_rank0():
+        _progress(
+            f"{progress_label}: train epoch start mode=windowed_ddp rows={total_rows} "
+            f"global_batch_size={batch_size} local_batch_size={local_batch_size} "
+            f"batches={num_batches} world_size={world_size} objective={objective}"
+        )
+
+    prepare_device = _windowed_prepare_device(split, device)
+    for step_idx in range(1, num_batches + 1):
+        _record_debug_cuda_sync(timing, "iter_start_sync_s", device, debug_timing_sync)
+        batch_start = time.perf_counter()
+        global_start = (step_idx - 1) * int(batch_size)
+        local_start = global_start + rank * local_batch_size
+        local_end = local_start + local_batch_size
+        if progress_label and _distributed_is_rank0():
+            _progress(
+                f"{progress_label}: batch {step_idx}/{num_batches} "
+                f"global_rows=[{global_start},{global_start + int(batch_size)})"
+            )
+        _maybe_sync_cuda(device, profile_timing)
+        timing.fetch_s += time.perf_counter() - batch_start
+
+        batch_prepare_start = time.perf_counter()
+        route_start = time.perf_counter()
+        batch = split.batch_by_rows(
+            local_start,
+            local_end,
+            device=prepare_device,
+            non_blocking=False,
+            prepare_timing=timing,
+        )
+        timing.prepare_materialized_batch_s += time.perf_counter() - route_start
+        _maybe_sync_cuda(prepare_device, profile_timing)
+        batch_prepare_elapsed = time.perf_counter() - batch_prepare_start
+        timing.batch_prepare_s += batch_prepare_elapsed
+        timing.window_materialize_s += batch_prepare_elapsed
+        _record_debug_cuda_sync(timing, "after_prepare_sync_s", device, debug_timing_sync)
+
+        h2d_start = time.perf_counter()
+        move_start = time.perf_counter()
+        batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
+        batch_x = batch["x"]
+        batch_mask = batch["tradable_mask"]
+        _maybe_sync_cuda(device, profile_timing)
+        h2d_elapsed = time.perf_counter() - h2d_start
+        timing.h2d_transfer_s += h2d_elapsed
+        timing.transfer_s += batch_prepare_elapsed + h2d_elapsed
+
+        _maybe_cudagraph_step_begin()
+        optimizer.zero_grad(set_to_none=True)
+        forward_start = time.perf_counter()
+        with _autocast_context(device, amp_dtype):
+            model_forward_start = time.perf_counter()
+            with _cuda_timing(timing, "model_forward_cuda_s", device):
+                model_output = _call_model(
+                    model,
+                    batch_x,
+                    batch_mask,
+                    return_aux=False,
+                    symbol_indices=batch.get("symbol_indices"),
+                )
+                local_weights, _ = _extract_weights_and_aux(model_output)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.model_forward_s += time.perf_counter() - model_forward_start
+
+            gather_start = time.perf_counter()
+            weights = _all_gather_autograd(local_weights.contiguous())
+            future_returns = _all_gather_no_grad(batch["future_log_returns"].contiguous())
+            tradable_mask = _all_gather_no_grad(batch["tradable_mask"].contiguous())
+            can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
+            can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
+            sample_mask = _all_gather_no_grad(batch["sample_mask"].contiguous())
+            volume_notional = (
+                _all_gather_no_grad(batch["volume_notional"].contiguous())
+                if _volume_participation_enabled(max_volume_participation, volume_participation_equity)
+                and "volume_notional" in batch
+                else None
+            )
+            volume_limit_weights = _volume_limit_weights_from_notional(
+                volume_notional,
+                max_volume_participation=max_volume_participation,
+                volume_participation_equity=volume_participation_equity,
+                device=device,
+                dtype=weights.dtype,
+            )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.factor_aug_s += time.perf_counter() - gather_start
+
+            _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
+            loss_start = time.perf_counter()
+            with _cuda_timing(timing, "loss_cuda_s", device):
+                loss, fused_next_prev = _run_fused_log_utility_loss(
+                    fused_loss_fn,
+                    weights,
+                    future_returns,
+                    tradable_mask,
+                    can_buy_mask,
+                    can_sell_mask,
+                    sample_mask,
+                    portfolio_prev_weights,
+                    volume_limit_weights,
+                )
+            _maybe_sync_cuda(device, profile_timing)
+            timing.loss_s += time.perf_counter() - loss_start
+            _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
+
+        should_check_finite = _should_check_finite(
+            step_idx,
+            finite_check_interval_steps,
+            final_step=step_idx >= num_batches,
+        )
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            loss_is_finite = _tensor_is_finite(loss)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not loss_is_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+        state_start = time.perf_counter()
+        portfolio_prev_weights = _detach_portfolio_state(fused_next_prev)
+        _maybe_sync_cuda(device, profile_timing)
+        timing.portfolio_state_s += time.perf_counter() - state_start
+        timing.forward_s += time.perf_counter() - forward_start
+
+        backward_start = time.perf_counter()
+        if scaler.is_enabled():
+            grad_start = time.perf_counter()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                scaler.scale(loss).backward()
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+            gradients_are_finite = True
+            if float(grad_clip_norm) > 0.0:
+                gradients_are_finite = _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
+            if gradients_are_finite and should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            if not gradients_are_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            step_start = time.perf_counter()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                scaler.step(optimizer)
+                scaler.update()
+            _stabilize_model_parameters_after_step(model)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+        else:
+            grad_start = time.perf_counter()
+            with _cuda_timing(timing, "grad_cuda_s", device):
+                loss.backward()
+            _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.grad_s += time.perf_counter() - grad_start
+            gradients_are_finite = True
+            if float(grad_clip_norm) > 0.0:
+                gradients_are_finite = _run_gradient_clip_(
+                    model,
+                    optimizer,
+                    scaler,
+                    grad_clip_norm=grad_clip_norm,
+                    timing=timing,
+                    device=device,
+                    profile_timing=profile_timing,
+                )
+            if gradients_are_finite and should_check_finite:
+                finite_start = time.perf_counter()
+                gradients_are_finite = _model_gradients_are_finite(model)
+                timing.finite_check_s += time.perf_counter() - finite_start
+            if not gradients_are_finite:
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            step_start = time.perf_counter()
+            with _cuda_timing(timing, "step_cuda_s", device):
+                optimizer.step()
+            _stabilize_model_parameters_after_step(model)
+            _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.step_s += time.perf_counter() - step_start
+        if lr_scheduler is not None and lr_scheduler_interval == "step":
+            timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
+
+        if should_check_finite:
+            finite_start = time.perf_counter()
+            parameters_are_finite = _model_parameters_are_finite(model)
+            timing.finite_check_s += time.perf_counter() - finite_start
+            if not parameters_are_finite:
+                _raise_if_model_parameters_nonfinite(model, "Model parameters became non-finite after optimizer step")
+
+        _maybe_sync_cuda(device, profile_timing)
+        timing.backward_s += time.perf_counter() - backward_start
+        total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
+        steps += 1
+        if progress_label and _distributed_is_rank0():
             _progress(
                 f"{progress_label}: batch {step_idx}/{num_batches} done "
                 f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
@@ -7855,7 +9429,12 @@ def _run_training_tree_models(
     eval_chunk_rows = 2048
     loss_objective = _normalize_risk_objective(config.training.loss_type)
 
-    for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
+    for train_years_key, group_folds in tqdm(
+        grouped_folds.items(),
+        desc="Train groups",
+        unit="group",
+        disable=not _distributed_is_rank0(),
+    ):
         train_years = list(train_years_key)
         pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
         if not pending_folds:
@@ -7895,6 +9474,7 @@ def _run_training_tree_models(
             fold_dir.mkdir(parents=True, exist_ok=True)
 
             val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+            val_volume_notional = _dataset_volume_notional_to_tensor(val_ds)
             val_bt_t, val_ic, _ = _evaluate_tensor_batch(
                 model,
                 val_x,
@@ -7914,6 +9494,9 @@ def _run_training_tree_models(
                 config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(val_x.size(0)))),
+                volume_notional=val_volume_notional,
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
             )
             val_loss = float(
                 _evaluated_backtest_loss(
@@ -7934,6 +9517,7 @@ def _run_training_tree_models(
             )
 
             test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+            test_volume_notional = _dataset_volume_notional_to_tensor(test_ds)
             test_bt_t, test_ic, _ = _evaluate_tensor_batch(
                 model,
                 test_x,
@@ -7953,6 +9537,9 @@ def _run_training_tree_models(
                 config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
+                volume_notional=test_volume_notional,
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
             )
 
             previous_fold_model = _load_previous_fold_tree_model(output_path, fold.fold_id)
@@ -7990,12 +9577,15 @@ def _run_training_tree_models(
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
             )
             if warmup_days > 0:
                 print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
 
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
+            test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
@@ -8010,10 +9600,12 @@ def _run_training_tree_models(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                max_volume_participation=config.trading.max_volume_participation,
                 gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
+                daily_volumes=test_daily_volumes,
                 symbols=panel.symbols,
                 dates=test_dates,
                 collect_holdings=write_integer_holdings_table,
@@ -8138,6 +9730,7 @@ def _run_inference_tree_models(
             continue
 
         val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+        val_volume_notional = _dataset_volume_notional_to_tensor(val_ds)
         val_chunk_rows = max(1, min(2048, int(val_x.size(0))))
         val_bt_t, val_ic, _ = _evaluate_tensor_batch(
             model,
@@ -8158,6 +9751,9 @@ def _run_inference_tree_models(
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
+            volume_notional=val_volume_notional,
+            max_volume_participation=config.trading.max_volume_participation,
+            volume_participation_equity=config.trading.volume_participation_equity,
         )
         val_loss = float(
             _evaluated_backtest_loss(
@@ -8178,6 +9774,7 @@ def _run_inference_tree_models(
         )
 
         test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+        test_volume_notional = _dataset_volume_notional_to_tensor(test_ds)
         test_chunk_rows = max(1, min(2048, int(test_x.size(0))))
         test_bt_t, test_ic, _ = _evaluate_tensor_batch(
             model,
@@ -8198,6 +9795,9 @@ def _run_inference_tree_models(
             config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
+            volume_notional=test_volume_notional,
+            max_volume_participation=config.trading.max_volume_participation,
+            volume_participation_equity=config.trading.volume_participation_equity,
         )
 
         previous_fold_model = _load_previous_fold_tree_model(output_path, fold.fold_id)
@@ -8235,12 +9835,15 @@ def _run_inference_tree_models(
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
+            max_volume_participation=config.trading.max_volume_participation,
+            volume_participation_equity=config.trading.volume_participation_equity,
         )
         if warmup_days > 0:
             print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
 
         test_dates = panel.dates[test_eval_indices]
         test_close_prices = panel.close_prices[test_eval_indices]
+        test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
         write_integer_holdings_table = bool(
             getattr(
@@ -8261,10 +9864,12 @@ def _run_inference_tree_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
+            max_volume_participation=config.trading.max_volume_participation,
             gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
+            daily_volumes=test_daily_volumes,
             symbols=panel.symbols,
             dates=test_dates,
             collect_holdings=write_integer_holdings_table,
@@ -8452,6 +10057,8 @@ def _run_inference_neural_models(
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=val_chunk_rows,
             backtest_chunk_rows=val_backtest_chunk_rows,
+            max_volume_participation=config.trading.max_volume_participation,
+            volume_participation_equity=config.trading.volume_participation_equity,
         )
 
         val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _windowed_targets_to_tensors(
@@ -8510,6 +10117,8 @@ def _run_inference_neural_models(
             portfolio_activation=config.trading.portfolio_activation,
             chunk_rows=test_chunk_rows,
             backtest_chunk_rows=test_backtest_chunk_rows,
+            max_volume_participation=config.trading.max_volume_participation,
+            volume_participation_equity=config.trading.volume_participation_equity,
         )
         test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _windowed_targets_to_tensors(
             test_windowed,
@@ -8568,6 +10177,7 @@ def _run_inference_neural_models(
 
         test_dates = fold_panel.dates[test_eval_indices]
         test_close_prices = fold_panel.close_prices[test_eval_indices]
+        test_daily_volumes = None if fold_panel.daily_volumes is None else fold_panel.daily_volumes[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
         write_integer_holdings_table = bool(
             getattr(
@@ -8588,10 +10198,12 @@ def _run_inference_neural_models(
             sell_fee_rate=config.trading.sell_fee_rate,
             long_only=config.trading.long_only,
             max_turnover_ratio=config.trading.max_turnover_ratio,
+            max_volume_participation=config.trading.max_volume_participation,
             gross_leverage=1.0,
             min_trade_weight=config.trading.min_trade_weight,
             portfolio_activation=config.trading.portfolio_activation,
             close_prices=test_close_prices,
+            daily_volumes=test_daily_volumes,
             symbols=fold_panel.symbols,
             dates=test_dates,
             collect_holdings=write_integer_holdings_table,
@@ -8696,6 +10308,25 @@ def run_training(
         return _run_training_tree_models(panel, folds, config, output_dir, resume=resume)
 
     device = _resolve_device(config)
+    multi_gpu_strategy = str(getattr(config.training, "multi_gpu_strategy", "none") or "none").strip().lower().replace("-", "_")
+    distributed_data_parallel_enabled = multi_gpu_strategy in {
+        "distributed_data_parallel",
+        "ddp",
+        "distributed",
+        "torch_ddp",
+    }
+    if distributed_data_parallel_enabled and not _distributed_is_initialized():
+        backend = "nccl" if device.type == "cuda" else "gloo"
+        dist.init_process_group(backend=backend)
+    if distributed_data_parallel_enabled:
+        _resolve_distributed_data_parallel(config, device)
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device = torch.device(f"cuda:{local_rank}")
+    data_parallel_device_ids = [] if distributed_data_parallel_enabled else _resolve_data_parallel_device_ids(config, device)
+    if data_parallel_device_ids:
+        primary_device_id = int(data_parallel_device_ids[0])
+        torch.cuda.set_device(primary_device_id)
+        device = torch.device(f"cuda:{primary_device_id}")
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     _configure_backtest_runtime_from_config(config)
@@ -8723,10 +10354,25 @@ def run_training(
         except Exception:
             pass
     print(
-        f"[runtime] device={device.type} "
+        f"[runtime] device={device} "
         f"cuda_available={torch.cuda.is_available()} "
         f"num_gpus={torch.cuda.device_count()}"
     )
+    if data_parallel_device_ids:
+        names = [torch.cuda.get_device_name(device_id) for device_id in data_parallel_device_ids]
+        print(
+            "[multi-gpu] strategy=data_parallel "
+            f"device_ids={data_parallel_device_ids} "
+            f"devices={names}"
+        )
+    if distributed_data_parallel_enabled:
+        print(
+            "[multi-gpu] strategy=distributed_data_parallel "
+            f"rank={_distributed_rank()}/{_distributed_world_size()} "
+            f"local_rank={os.environ.get('LOCAL_RANK', '0')} "
+            f"device={device} "
+            f"device_name={torch.cuda.get_device_name(device) if device.type == 'cuda' else 'cpu'}"
+        )
     if device.type == "cuda":
         amp_mode = "tf32" if amp_dtype is None else str(amp_dtype).replace("torch.", "")
         print(
@@ -8751,13 +10397,16 @@ def run_training(
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
 
-    if resume:
+    retrain_completed_folds = _env_truthy("STOCKAGENT_RETRAIN_COMPLETED_FOLDS", "0")
+    if resume and not retrain_completed_folds:
         for fold in fold_list:
             completed = _load_completed_fold_result(output_path, fold.fold_id)
             if completed is not None:
                 results_by_fold[fold.fold_id] = completed
         if results_by_fold:
             _refresh_walkforward_artifacts(output_path, list(results_by_fold.values()))
+    elif resume and retrain_completed_folds:
+        print("[resume] retrain_completed_folds=true: ignoring completed fold markers")
 
     grouped_folds: dict[tuple[int, ...], list[WalkForwardFold]] = {}
     for fold in fold_list:
@@ -8878,9 +10527,15 @@ def run_training(
         train_sell_masks: torch.Tensor | None
         train_benchmark: torch.Tensor | None
         train_sample_mask: torch.Tensor | None
+        train_volume_notional: torch.Tensor | None
         if use_windowed_tensors:
             _progress(f"[Train {train_years}] setup train tensors: lazy windowed split")
             train_windowed = _pad_windowed_training_split(dataset_to_windowed_tensors(train_ds), train_batch_size)
+            train_windowed = _maybe_compact_train_windowed_symbols(
+                train_windowed,
+                config,
+                label=f"Train {train_years}",
+            )
             train_windowed = _prepare_windowed_split(
                 train_windowed,
                 device,
@@ -8894,9 +10549,11 @@ def run_training(
             train_sell_masks = None
             train_benchmark = None
             train_sample_mask = None
+            train_volume_notional = None
         else:
             _progress(f"[Train {train_years}] setup train tensors: materialize dataset -> tensors")
             train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark = _dataset_to_tensors(train_ds)
+            train_volume_notional = _dataset_volume_notional_to_tensor(train_ds)
             _progress(f"[Train {train_years}] setup train tensors: pad to batch_size={train_batch_size}")
             train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark, train_sample_mask = _pad_training_tensors(
                 train_x,
@@ -8907,6 +10564,7 @@ def run_training(
                 train_benchmark,
                 train_batch_size,
             )
+            train_volume_notional = _pad_rows(train_volume_notional, int(train_returns.size(0)), fill_value=float("inf"))
             _progress(f"[Train {train_years}] setup train tensors: prepare host/device memory")
             train_x, train_returns, train_masks, train_buy_masks, train_sell_masks, train_benchmark = _prepare_split_tensors(
                 train_x,
@@ -8920,6 +10578,10 @@ def run_training(
             )
             train_sample_mask = _prepare_host_tensor(
                 train_sample_mask,
+                pin_memory=(device.type == "cuda" and non_blocking),
+            )
+            train_volume_notional = _prepare_host_tensor(
+                train_volume_notional,
                 pin_memory=(device.type == "cuda" and non_blocking),
             )
         if profile_timing:
@@ -8973,6 +10635,7 @@ def run_training(
             train_sell_masks = None
             train_benchmark = None
             train_sample_mask = None
+            train_volume_notional = None
             if device.type == "cuda":
                 _release_cuda_memory(device)
             continue
@@ -8995,11 +10658,13 @@ def run_training(
             combined_val_buy_masks = None
             combined_val_sell_masks = None
             combined_val_bench = None
+            combined_val_volume_notional = None
         else:
             _progress(f"[Train {train_years}] setup validation tensors")
             combined_val_x, combined_val_returns, combined_val_masks, combined_val_buy_masks, combined_val_sell_masks, combined_val_bench, val_lengths = _combine_datasets_to_tensors(
                 val_datasets,  # type: ignore[arg-type]
             )
+            combined_val_volume_notional = _combine_dataset_volume_notional_to_tensor(val_datasets)
             combined_val_x, combined_val_returns, combined_val_masks, combined_val_buy_masks, combined_val_sell_masks, combined_val_bench = _prepare_split_tensors(
                 combined_val_x,
                 combined_val_returns,
@@ -9009,6 +10674,10 @@ def run_training(
                 combined_val_bench,
                 device,
                 non_blocking,
+            )
+            combined_val_volume_notional = _prepare_host_tensor(
+                combined_val_volume_notional,
+                pin_memory=(device.type == "cuda" and non_blocking),
             )
         val_offsets: list[int] = [0]
         for length in val_lengths:
@@ -9052,11 +10721,13 @@ def run_training(
             combined_test_buy_masks = None
             combined_test_sell_masks = None
             combined_test_bench = None
+            combined_test_volume_notional = None
         else:
             _progress(f"[Train {train_years}] setup test tensors")
             combined_test_x, combined_test_returns, combined_test_masks, combined_test_buy_masks, combined_test_sell_masks, combined_test_bench, test_lengths = _combine_datasets_to_tensors(
                 test_datasets,  # type: ignore[arg-type]
             )
+            combined_test_volume_notional = _combine_dataset_volume_notional_to_tensor(test_datasets)
             combined_test_x, combined_test_returns, combined_test_masks, combined_test_buy_masks, combined_test_sell_masks, combined_test_bench = _prepare_split_tensors(
                 combined_test_x,
                 combined_test_returns,
@@ -9066,6 +10737,10 @@ def run_training(
                 combined_test_bench,
                 device,
                 non_blocking,
+            )
+            combined_test_volume_notional = _prepare_host_tensor(
+                combined_test_volume_notional,
+                pin_memory=(device.type == "cuda" and non_blocking),
             )
         curve_test_start_row = 0
         curve_test_end_row = int(test_lengths[0])
@@ -9106,7 +10781,44 @@ def run_training(
         eval_model: nn.Module = model
         panel_slab_model: nn.Module | None = None
         panel_slab_compile_status = "off"
-        if use_windowed_tensors and _model_supports_panel_slab_forward(model):
+        data_parallel_enabled = bool(data_parallel_device_ids)
+        ddp_enabled = bool(distributed_data_parallel_enabled)
+        data_parallel_output_device: int | None = None
+        if data_parallel_enabled:
+            output_device_raw = getattr(config.training, "data_parallel_output_device", None)
+            data_parallel_output_device = (
+                int(output_device_raw) if output_device_raw is not None else int(data_parallel_device_ids[0])
+            )
+            if data_parallel_output_device not in data_parallel_device_ids:
+                raise RuntimeError(
+                    "training.data_parallel_output_device must be one of "
+                    f"training.data_parallel_device_ids; got output_device={data_parallel_output_device}, "
+                    f"device_ids={data_parallel_device_ids}"
+                )
+            compiled_train_model = _StockAgentDataParallel(
+                model,
+                device_ids=data_parallel_device_ids,
+                output_device=data_parallel_output_device,
+            )
+            if bool(getattr(config.training, "data_parallel_disable_panel_forward", True)):
+                setattr(compiled_train_model, "_stockagent_disable_panel_forward", True)
+                panel_slab_compile_status = "disabled:data_parallel"
+            eval_model = compiled_train_model
+            print(
+                f"[Train {train_years}] multi_gpu=DataParallel "
+                f"device_ids={data_parallel_device_ids}, output_device={data_parallel_output_device}; "
+                "panel-forward fast paths are disabled for safe batch splitting"
+            )
+        if ddp_enabled:
+            panel_slab_compile_status = "disabled:distributed_data_parallel"
+            print(
+                f"[Train {train_years}] multi_gpu=DistributedDataParallel "
+                f"rank={_distributed_rank()}/{_distributed_world_size()} "
+                f"local_batch={max(1, int(train_batch_size) // max(1, _distributed_world_size()))}; "
+                "wrapper is applied after torch.compile setup; "
+                "panel-forward fast paths are disabled for safe row sharding"
+            )
+        if (not data_parallel_enabled) and (not ddp_enabled) and use_windowed_tensors and _model_supports_panel_slab_forward(model):
             panel_slab_model = _PanelSlabForwardWrapper(model)
             panel_slab_compile_status = "eager"
         compiled_loss_fn: Callable[..., torch.Tensor] = partial(risk_aware_loss, **risk_loss_kwargs)
@@ -9125,6 +10837,7 @@ def run_training(
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
                 concentration_weight=config.training.multitask_loss.concentration_weight,
+                manual_backward=bool(getattr(config.training, "fused_log_utility_manual_backward", False)),
             )
 
         if device.type == "cuda":
@@ -9213,10 +10926,14 @@ def run_training(
         record_epoch_curve = bool(getattr(config.training, "record_epoch_curve", True))
         if record_epoch_curve:
             _trim_group_curve(group_curve_path, start_epoch)
-            curve_plotter: _AsyncEpochCurvePlotter | None = _AsyncEpochCurvePlotter(
-                group_curve_path,
-                interval=int(config.training.curve_plot_interval),
-                async_enabled=bool(config.training.curve_plot_async),
+            curve_plotter: _AsyncEpochCurvePlotter | None = (
+                _AsyncEpochCurvePlotter(
+                    group_curve_path,
+                    interval=int(config.training.curve_plot_interval),
+                    async_enabled=bool(config.training.curve_plot_async),
+                )
+                if _distributed_should_write()
+                else None
             )
         else:
             curve_plotter = None
@@ -9325,6 +11042,26 @@ def run_training(
         config_compile_loss = bool(getattr(config.training, "compile_loss", auto_compile_risk))
         default_compile_loss = "1" if config_compile_loss else "0"
         compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
+        config_compile_fused_loss = getattr(config.training, "compile_fused_log_utility_loss", None)
+        if config_compile_fused_loss is None:
+            default_compile_fused_loss = "1" if compile_loss else "0"
+        else:
+            default_compile_fused_loss = "1" if bool(config_compile_fused_loss) else "0"
+        compile_fused_log_utility_loss = compile_loss and _env_truthy(
+            "STOCKAGENT_COMPILE_FUSED_LOG_UTILITY_LOSS",
+            default_compile_fused_loss,
+        )
+        data_parallel_compile_model = (
+            data_parallel_enabled and bool(getattr(config.training, "data_parallel_compile_model", False))
+        )
+        if data_parallel_enabled and should_enable_compile and not data_parallel_compile_model:
+            should_enable_compile = False
+            model_compile_status = "off:data_parallel"
+            print(
+                f"[Train {train_years}] torch.compile model disabled because "
+                "training.multi_gpu_strategy=data_parallel is enabled and "
+                "training.data_parallel_compile_model=false"
+            )
 
         if should_enable_compile:
             can_compile, reason = _can_enable_torch_compile(device)
@@ -9334,15 +11071,52 @@ def run_training(
                     compile_mode = str(getattr(config.training, "torch_compile_mode", "reduce-overhead") or "default")
                     compile_mode_arg = None if compile_mode == "default" else compile_mode
                     print(f"[Train {train_years}] compile warmup may take extra time at epoch 0")
-                    compiled_train_model = torch.compile(model, mode=compile_mode_arg, dynamic=False)
-                    eval_model = compiled_train_model
                     compile_source = f"auto({loss_objective})" if (auto_compile_risk and not config.training.enable_torch_compile) else "config"
-                    print(
-                        f"[Train {train_years}] torch.compile enabled "
-                        f"(mode={compile_mode}, dynamic=False, source={compile_source}, {reason})"
-                    )
-                    model_compile_status = f"enabled:{compile_source}"
-                    if panel_slab_model is not None:
+                    if data_parallel_enabled:
+                        replica_compile_mode = compile_mode
+                        replica_compile_mode_arg = compile_mode_arg
+                        if compile_mode != "default":
+                            replica_compile_mode = "default"
+                            replica_compile_mode_arg = None
+                        compiled_train_model = _PersistentCompiledDataParallel(
+                            model,
+                            device_ids=data_parallel_device_ids,
+                            output_device=int(data_parallel_output_device if data_parallel_output_device is not None else data_parallel_device_ids[0]),
+                            compile_mode=replica_compile_mode_arg,
+                        )
+                        if bool(getattr(config.training, "data_parallel_disable_panel_forward", True)):
+                            setattr(compiled_train_model, "_stockagent_disable_panel_forward", True)
+                        eval_model = compiled_train_model
+                        threaded_replicas = _env_truthy("STOCKAGENT_DP_THREADED_REPLICAS", "1")
+                        replica_schedule = "warm_then_threaded" if threaded_replicas else "serial"
+                        print(
+                            f"[Train {train_years}] torch.compile persistent DataParallel replicas enabled "
+                            f"(schedule={replica_schedule}, mode={replica_compile_mode}, "
+                            f"requested_mode={compile_mode}, dynamic=False, cudagraphs=False, "
+                            f"source={compile_source}, {reason})"
+                        )
+                        model_compile_status = f"enabled:persistent_data_parallel_{replica_schedule}:{compile_source}"
+                    elif ddp_enabled:
+                        compiled_train_model = torch.compile(
+                            model,
+                            mode=compile_mode_arg,
+                            dynamic=False,
+                        )
+                        eval_model = compiled_train_model
+                        print(
+                            f"[Train {train_years}] torch.compile model-before-DDP enabled "
+                            f"(mode={compile_mode}, dynamic=False, source={compile_source}, {reason})"
+                        )
+                        model_compile_status = f"enabled:model_before_ddp:{compile_source}"
+                    else:
+                        compiled_train_model = torch.compile(model, mode=compile_mode_arg, dynamic=False)
+                        eval_model = compiled_train_model
+                        print(
+                            f"[Train {train_years}] torch.compile enabled "
+                            f"(mode={compile_mode}, dynamic=False, source={compile_source}, {reason})"
+                        )
+                        model_compile_status = f"enabled:{compile_source}"
+                    if (not data_parallel_enabled) and (not ddp_enabled) and panel_slab_model is not None:
                         try:
                             panel_slab_model = torch.compile(
                                 panel_slab_model,
@@ -9367,34 +11141,41 @@ def run_training(
                             )
 
                     if compile_loss and fused_log_utility_loss_fn is not None:
-                        try:
-                            raw_compiled_fused_loss_fn = torch.compile(
-                                fused_log_utility_loss_fn,
-                                dynamic=False,
-                                fullgraph=True,
-                                options={"triton.cudagraphs": False},
-                            )
-                            fused_log_utility_loss_fn = _CompiledFusedLossFallback(
-                                raw_compiled_fused_loss_fn,
-                                fused_log_utility_loss_fn,
-                                label=f"Train {train_years}",
-                            )
+                        if not compile_fused_log_utility_loss:
+                            loss_compile_status = "skipped:fused_recurrent_scan"
                             print(
-                                f"[Train {train_years}] torch.compile fused log-utility loss enabled "
-                                "(fullgraph=True, dynamic=False, cudagraphs=False)"
+                                f"[Train {train_years}] torch.compile fused log-utility loss skipped "
+                                "(compile_fused_log_utility_loss=false; recurrent scan stays eager)"
                             )
-                            loss_compile_status = "enabled:fused_log_utility"
-                        except Exception as e:
-                            if bool(config.training.strict_no_fallback):
-                                raise RuntimeError(
-                                    f"[Train {train_years}] torch.compile fused log-utility loss setup failed; "
-                                    "strict_no_fallback=true so eager fused-loss fallback is disabled."
-                                ) from e
-                            loss_compile_status = "fallback:fused_eager"
-                            print(
-                                f"[Train {train_years}] torch.compile fused log-utility loss setup failed, "
-                                f"falling back to eager fused loss: {e}"
-                            )
+                        else:
+                            try:
+                                raw_compiled_fused_loss_fn = torch.compile(
+                                    fused_log_utility_loss_fn,
+                                    dynamic=False,
+                                    fullgraph=True,
+                                    options={"triton.cudagraphs": False},
+                                )
+                                fused_log_utility_loss_fn = _CompiledFusedLossFallback(
+                                    raw_compiled_fused_loss_fn,
+                                    fused_log_utility_loss_fn,
+                                    label=f"Train {train_years}",
+                                )
+                                print(
+                                    f"[Train {train_years}] torch.compile fused log-utility loss enabled "
+                                    "(fullgraph=True, dynamic=False, cudagraphs=False)"
+                                )
+                                loss_compile_status = "enabled:fused_log_utility"
+                            except Exception as e:
+                                if bool(config.training.strict_no_fallback):
+                                    raise RuntimeError(
+                                        f"[Train {train_years}] torch.compile fused log-utility loss setup failed; "
+                                        "strict_no_fallback=true so eager fused-loss fallback is disabled."
+                                    ) from e
+                                loss_compile_status = "fallback:fused_eager"
+                                print(
+                                    f"[Train {train_years}] torch.compile fused log-utility loss setup failed, "
+                                    f"falling back to eager fused loss: {e}"
+                                )
                     elif compile_loss:
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
@@ -9449,17 +11230,114 @@ def run_training(
                 model_compile_status = f"skipped:{reason}"
                 loss_compile_status = "eager"
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")
+        elif compile_loss and data_parallel_enabled:
+            can_compile_loss, reason = _can_enable_torch_compile(device)
+            if can_compile_loss:
+                if fused_log_utility_loss_fn is not None:
+                    if not compile_fused_log_utility_loss:
+                        loss_compile_status = "skipped:fused_recurrent_scan"
+                        print(
+                            f"[Train {train_years}] torch.compile fused log-utility loss skipped "
+                            "(compile_fused_log_utility_loss=false; recurrent scan stays eager)"
+                        )
+                    else:
+                        try:
+                            raw_compiled_fused_loss_fn = torch.compile(
+                                fused_log_utility_loss_fn,
+                                dynamic=False,
+                                fullgraph=True,
+                                options={"triton.cudagraphs": False},
+                            )
+                            fused_log_utility_loss_fn = _CompiledFusedLossFallback(
+                                raw_compiled_fused_loss_fn,
+                                fused_log_utility_loss_fn,
+                                label=f"Train {train_years}",
+                            )
+                            print(
+                                f"[Train {train_years}] torch.compile fused log-utility loss enabled "
+                                "(DataParallel model, fullgraph=True, dynamic=False, cudagraphs=False)"
+                            )
+                            loss_compile_status = "enabled:fused_log_utility"
+                        except Exception as e:
+                            if bool(config.training.strict_no_fallback):
+                                raise RuntimeError(
+                                    f"[Train {train_years}] torch.compile fused log-utility loss setup failed; "
+                                    "strict_no_fallback=true so eager fused-loss fallback is disabled."
+                                ) from e
+                            loss_compile_status = "fallback:fused_eager"
+                            print(
+                                f"[Train {train_years}] torch.compile fused log-utility loss setup failed, "
+                                f"falling back to eager fused loss: {e}"
+                            )
+                else:
+                    try:
+                        eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
+                        raw_compiled_loss_fn = torch.compile(
+                            eager_loss_fn,
+                            dynamic=False,
+                            options={"triton.cudagraphs": False},
+                        )
+                        compiled_loss_fn = _CompiledLossFallback(
+                            raw_compiled_loss_fn,
+                            eager_loss_fn,
+                            label=f"Train {train_years}",
+                        )
+                        print(
+                            f"[Train {train_years}] torch.compile loss enabled "
+                            "(DataParallel model, mode=default, dynamic=False, cudagraphs=False)"
+                        )
+                        loss_compile_status = "enabled"
+                    except Exception as e:
+                        if bool(config.training.strict_no_fallback):
+                            raise RuntimeError(
+                                f"[Train {train_years}] torch.compile loss failed; "
+                                "strict_no_fallback=true so eager loss fallback is disabled."
+                            ) from e
+                        compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
+                        loss_compile_status = "fallback:eager"
+                        print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
+            else:
+                if bool(config.training.strict_no_fallback):
+                    raise RuntimeError(
+                        f"[Train {train_years}] torch.compile loss requested but unavailable: {reason}. "
+                        "strict_no_fallback=true so eager loss fallback is disabled."
+                    )
+                loss_compile_status = f"skipped:{reason}"
+                print(f"[Train {train_years}] torch.compile loss skipped: {reason}")
         elif compile_loss:
             loss_compile_status = "off:model_compile_disabled"
         else:
             loss_compile_status = "off:fused_eager" if fused_log_utility_loss_fn is not None else "off:eager"
+
+        if ddp_enabled:
+            if not isinstance(compiled_train_model, DistributedDataParallel):
+                compiled_train_model = _wrap_distributed_data_parallel_model(
+                    compiled_train_model,
+                    config=config,
+                    device=device,
+                )
+            setattr(compiled_train_model, "_stockagent_disable_panel_forward", True)
+            eval_model = compiled_train_model
+            panel_slab_compile_status = "disabled:distributed_data_parallel"
+
+        eval_model_status = (
+            "persistent_compiled_data_parallel"
+            if isinstance(eval_model, _PersistentCompiledDataParallel)
+            else "data_parallel"
+            if data_parallel_enabled
+            else "distributed_data_parallel"
+            if ddp_enabled
+            else ("compiled" if eval_model is compiled_train_model and compiled_train_model is not model else "eager")
+        )
         print(
             f"[Train {train_years}] optimization status: "
             f"model_compile={model_compile_status}; "
-            f"eval_model={'compiled' if eval_model is compiled_train_model and compiled_train_model is not model else 'eager'}; "
+            f"eval_model={eval_model_status}; "
+            f"multi_gpu={'data_parallel' if data_parallel_enabled else 'distributed_data_parallel' if ddp_enabled else 'none'}; "
             f"panel_slab_forward={panel_slab_compile_status}; "
             f"loss_compile={loss_compile_status}; "
             f"fused_log_utility_loss={bool(fused_log_utility_loss_fn is not None)}; "
+            f"fused_loss_manual_backward={bool(getattr(config.training, 'fused_log_utility_manual_backward', False))}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
@@ -9573,6 +11451,7 @@ def run_training(
                     train_sell_masks,
                     train_benchmark,
                     train_sample_mask,
+                    train_volume_notional,
                 ) = _maybe_cache_tensors_on_device(
                     name=f"train tensors {train_years}",
                     tensors=(
@@ -9583,6 +11462,7 @@ def run_training(
                         train_sell_masks,
                         train_benchmark,
                         train_sample_mask,
+                        train_volume_notional,
                     ),
                     device=device,
                     enabled=bool(config.training.cache_train_tensors_on_gpu),
@@ -9618,6 +11498,7 @@ def run_training(
                 combined_val_buy_masks,
                 combined_val_sell_masks,
                 combined_val_bench,
+                combined_val_volume_notional,
             ) = _maybe_cache_tensors_on_device(
                 name=f"validation tensors {train_years}",
                 tensors=(
@@ -9627,6 +11508,7 @@ def run_training(
                     combined_val_buy_masks,
                     combined_val_sell_masks,
                     combined_val_bench,
+                    combined_val_volume_notional,
                 ),
                 device=device,
                 enabled=bool(config.training.cache_eval_tensors_on_gpu),
@@ -9661,6 +11543,7 @@ def run_training(
                 combined_test_buy_masks,
                 combined_test_sell_masks,
                 combined_test_bench,
+                combined_test_volume_notional,
             ) = _maybe_cache_tensors_on_device(
                 name=f"test tensors {train_years}",
                 tensors=(
@@ -9670,6 +11553,7 @@ def run_training(
                     combined_test_buy_masks,
                     combined_test_sell_masks,
                     combined_test_bench,
+                    combined_test_volume_notional,
                 ),
                 device=device,
                 enabled=bool(config.training.cache_eval_tensors_on_gpu),
@@ -9679,6 +11563,7 @@ def run_training(
 
         if _should_profile_train_step():
             profile_batch: dict[str, torch.Tensor] | None = None
+            profile_model: nn.Module = compiled_train_model
             try:
                 if train_loader is not None:
                     raw_batch = next(iter(train_loader))
@@ -9686,12 +11571,22 @@ def run_training(
                 elif train_windowed is not None:
                     slice_end = min(train_batch_size, len(train_windowed))
                     if slice_end > 0:
-                        profile_batch = train_windowed.batch_by_rows(
-                            0,
-                            slice_end,
-                            device=device,
-                            non_blocking=non_blocking,
-                        )
+                        if panel_slab_model is not None:
+                            profile_batch = train_windowed.panel_slab_batch_by_rows(
+                                0,
+                                slice_end,
+                                device=device,
+                                non_blocking=non_blocking,
+                            )
+                            if profile_batch is not None:
+                                profile_model = panel_slab_model
+                        if profile_batch is None:
+                            profile_batch = train_windowed.batch_by_rows(
+                                0,
+                                slice_end,
+                                device=device,
+                                non_blocking=non_blocking,
+                            )
                 else:
                     slice_end = min(train_batch_size, int(train_x.size(0)))
                     if slice_end > 0:
@@ -9706,9 +11601,14 @@ def run_training(
                             profile_batch["benchmark"] = train_benchmark[:slice_end].to(device=device, non_blocking=non_blocking)
                         if train_sample_mask is not None:
                             profile_batch["sample_mask"] = train_sample_mask[:slice_end].to(device=device, non_blocking=non_blocking)
+                        if train_volume_notional is not None:
+                            profile_batch["volume_notional"] = train_volume_notional[:slice_end].to(
+                                device=device,
+                                non_blocking=non_blocking,
+                            )
                 if profile_batch is not None:
                     _profile_single_train_step(
-                        model=compiled_train_model,
+                        model=profile_model,
                         loss_fn=compiled_loss_fn,
                         fused_loss_fn=fused_log_utility_loss_fn,
                         batch=profile_batch,
@@ -9742,6 +11642,8 @@ def run_training(
                         regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
                         regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                         fold_id=fold.fold_id,
+                        max_volume_participation=config.trading.max_volume_participation,
+                        volume_participation_equity=config.trading.volume_participation_equity,
                     )
             except Exception as e:
                 print(f"[torch.profiler] single-step profiling failed: {e}")
@@ -9771,6 +11673,7 @@ def run_training(
             desc=" Epochs",
             leave=True,
             dynamic_ncols=True,
+            disable=not _distributed_is_rank0(),
         )
         val_backtest: BacktestResultTensor | None = None
         test_mean_best_by_val: float | None = None
@@ -9824,8 +11727,34 @@ def run_training(
                     lr_scheduler=scheduler,
                     lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
+                    debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
             if train_windowed is not None:
+                if ddp_enabled:
+                    if fused_log_utility_loss_fn is None:
+                        raise RuntimeError("DDP train hotpath requires training.fused_log_utility_loss=true")
+                    return _train_epoch_windowed_tensor_ddp(
+                        train_model,
+                        fused_log_utility_loss_fn,
+                        train_windowed,
+                        optimizer,
+                        scaler,
+                        batch_size=train_batch_size,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        non_blocking=non_blocking,
+                        objective=loss_objective,
+                        grad_clip_norm=config.training.grad_clip_norm,
+                        finite_check_interval_steps=config.training.finite_check_interval_steps,
+                        lr_scheduler=scheduler,
+                        lr_scheduler_interval=scheduler_step_interval,
+                        profile_timing=profile_timing,
+                        debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
+                        max_volume_participation=config.trading.max_volume_participation,
+                        volume_participation_equity=config.trading.volume_participation_equity,
+                    )
                 return _train_epoch_windowed_tensor(
                     train_model,
                     panel_slab_model,
@@ -9871,6 +11800,9 @@ def run_training(
                     lr_scheduler=scheduler,
                     lr_scheduler_interval=scheduler_step_interval,
                     profile_timing=profile_timing,
+                    debug_timing_sync=bool(getattr(config.training, "debug_timing_sync", False)),
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
             return _train_epoch_tensor(
                 train_model,
@@ -9922,6 +11854,9 @@ def run_training(
                 lr_scheduler=scheduler,
                 lr_scheduler_interval=scheduler_step_interval,
                 profile_timing=profile_timing,
+                volume_notional=train_volume_notional,
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
             )
 
         def _save_best_val_complete_fold_artifacts(
@@ -9959,7 +11894,7 @@ def run_training(
                     name=f"fold {fold.fold_id} best-val test windowed tensors",
                 )
                 test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
-                    eval_model,
+                    final_eval_model,
                     panel_slab_model,
                     test_windowed,
                     device,
@@ -9975,6 +11910,9 @@ def run_training(
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
+                    progress_label=f"[Train {train_years} fold {fold.fold_id} final-test]",
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
                 test_date_idx = test_windowed.valid_indices.to(
                     device=test_windowed.future_log_returns.device,
@@ -10000,7 +11938,7 @@ def run_training(
                     non_blocking,
                 )
                 test_bt_t, test_ic, _ = _evaluate_tensor_batch(
-                    eval_model,
+                    final_eval_model,
                     test_x,
                     test_returns,
                     test_masks,
@@ -10020,6 +11958,7 @@ def run_training(
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
+                    progress_label=f"[Train {train_years} fold {fold.fold_id} final-test]",
                 )
 
             previous_fold_model = _load_previous_fold_neural_model(
@@ -10064,6 +12003,8 @@ def run_training(
                 portfolio_activation=config.trading.portfolio_activation,
                 chunk_rows=eval_chunk_rows,
                 backtest_chunk_rows=eval_backtest_chunk_rows,
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
             )
             if warmup_days > 0:
                 print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
@@ -10116,6 +12057,7 @@ def run_training(
 
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
+            test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
@@ -10130,10 +12072,12 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                max_volume_participation=config.trading.max_volume_participation,
                 gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
+                daily_volumes=test_daily_volumes,
                 symbols=panel.symbols,
                 dates=test_dates,
                 collect_holdings=write_integer_holdings_table,
@@ -10262,7 +12206,11 @@ def run_training(
                             cuda_sync_s=cuda_sync_total,
                             scalar_sync_s=scalar_sync_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
-                            timing_synchronized=(device.type != "cuda" or profile_timing),
+                            timing_synchronized=(
+                                device.type != "cuda"
+                                or profile_timing
+                                or bool(getattr(config.training, "debug_timing_sync", False))
+                            ),
                             backtest_compile_stats=bt_stats_after,
                             backtest_prep_compile_stats=bt_prep_stats_after,
                             backtest_runtime_stats=bt_runtime_after,
@@ -10361,6 +12309,7 @@ def run_training(
                                 model=model,
                                 optimizer=optimizer,
                                 scaler=scaler,
+                                check_finite=config.training.checkpoint_finite_check,
                             )
                             fold_ckpt_total += time.perf_counter() - fold_ckpt_start
                 val_eval_total = max(0.0, time.perf_counter() - val_eval_start - fold_ckpt_total)
@@ -10390,6 +12339,8 @@ def run_training(
                         profile_timing=profile_timing,
                         timing_out=val_timing,
                         reset_at_rows=val_offsets,
+                        max_volume_participation=config.trading.max_volume_participation,
+                        volume_participation_equity=config.trading.volume_participation_equity,
                     )
                 else:
                     val_backtest_epoch, _, _ = _evaluate_tensor_batch(
@@ -10418,6 +12369,9 @@ def run_training(
                         profile_timing=profile_timing,
                         timing_out=val_timing,
                         reset_at_rows=val_offsets,
+                        volume_notional=combined_val_volume_notional,
+                        max_volume_participation=config.trading.max_volume_participation,
+                        volume_participation_equity=config.trading.volume_participation_equity,
                     )
                 val_eval_total = time.perf_counter() - val_eval_start
 
@@ -10537,6 +12491,8 @@ def run_training(
                             profile_timing=False,
                             timing_out=test_curve_timing,
                             reset_at_rows=curve_test_offsets,
+                            max_volume_participation=config.trading.max_volume_participation,
+                            volume_participation_equity=config.trading.volume_participation_equity,
                         )
                     else:
                         test_backtest_epoch, _, _ = _evaluate_tensor_batch(
@@ -10565,6 +12521,13 @@ def run_training(
                             profile_timing=False,
                             timing_out=test_curve_timing,
                             reset_at_rows=curve_test_offsets,
+                            volume_notional=(
+                                None
+                                if combined_test_volume_notional is None
+                                else combined_test_volume_notional[curve_test_start_row:curve_test_end_row]
+                            ),
+                            max_volume_participation=config.trading.max_volume_participation,
+                            volume_participation_equity=config.trading.volume_participation_equity,
                         )
                     test_loss_start = time.perf_counter()
                     deferred_test_loss_tensors = _batched_loss_from_backtest_segments(
@@ -10629,6 +12592,7 @@ def run_training(
                             model=model,
                             optimizer=optimizer,
                             scaler=scaler,
+                            check_finite=config.training.checkpoint_finite_check,
                         )
                         if bool(getattr(config.training, "save_best_val_artifacts", False)):
                             _save_best_val_backtest_snapshot(
@@ -10690,6 +12654,7 @@ def run_training(
                     early_stop_patience=early_stop_patience,
                     early_stopping_no_improve_ratio=early_stop_ratio,
                     early_stop_val_interval_epochs=val_interval,
+                    check_finite=config.training.checkpoint_finite_check,
                 )
                 group_ckpt_total = time.perf_counter() - group_ckpt_start
 
@@ -10789,7 +12754,11 @@ def run_training(
                             scalar_sync_s=scalar_sync_total,
                             gc_s=gc_total,
                             epoch_wall_s=time.perf_counter() - epoch_start,
-                            timing_synchronized=(device.type != "cuda" or profile_timing),
+                            timing_synchronized=(
+                                device.type != "cuda"
+                                or profile_timing
+                                or bool(getattr(config.training, "debug_timing_sync", False))
+                            ),
                             backtest_compile_stats=bt_stats_after,
                             backtest_prep_compile_stats=bt_prep_stats_after,
                             backtest_runtime_stats=bt_runtime_after,
@@ -10813,6 +12782,7 @@ def run_training(
                     )
                     break
 
+        _distributed_barrier()
         curve_flush_start = time.perf_counter()
         curve_plot_timing: dict[str, float | int | str] = {}
         if curve_plotter is not None:
@@ -10828,13 +12798,54 @@ def run_training(
             )
             _log_curve_plot_timing(f"Train {train_years} epoch_curve_plot", curve_plot_timing)
 
+        if ddp_enabled and not _distributed_should_write():
+            # Final fold metrics, plots, and parquet artifacts are rank0-only.
+            # Drop rank-local model/data references before waiting so rank0 has
+            # maximum PCIe/CPU/VRAM headroom for the artifact pass.
+            train_windowed = None
+            combined_val_windowed = None
+            combined_test_windowed = None
+            train_x = None
+            train_returns = None
+            train_masks = None
+            train_buy_masks = None
+            train_sell_masks = None
+            train_benchmark = None
+            train_sample_mask = None
+            combined_val_x = None
+            combined_val_returns = None
+            combined_val_masks = None
+            combined_val_buy_masks = None
+            combined_val_sell_masks = None
+            combined_val_bench = None
+            combined_test_x = None
+            combined_test_returns = None
+            combined_test_masks = None
+            combined_test_buy_masks = None
+            combined_test_sell_masks = None
+            combined_test_bench = None
+            model = None
+            compiled_train_model = None
+            eval_model = None
+            panel_slab_model = None
+            optimizer = None
+            scaler = None
+            scheduler = None
+            if device.type == "cuda":
+                _release_cuda_memory(device)
+            _distributed_barrier()
+            _distributed_barrier()
+            continue
+
+        final_eval_model: nn.Module = _unwrap_distributed_data_parallel(eval_model) if ddp_enabled else eval_model
+
         # In eval-only mode (e.g., resumed checkpoint already beyond max epochs),
         # the epoch loop does not run; compute validation backtest once for reporting.
         if val_backtest is None:
             eval_only_start = time.perf_counter()
             if combined_val_windowed is not None:
                 val_backtest, _, _ = _evaluate_windowed_tensor_batch(
-                    eval_model,
+                    final_eval_model,
                     panel_slab_model,
                     combined_val_windowed,
                     device,
@@ -10852,10 +12863,12 @@ def run_training(
                     profile_timing=profile_timing,
                     progress_label=f"[Train {train_years} final-val]",
                     reset_at_rows=val_offsets,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
             else:
                 val_backtest, _, _ = _evaluate_tensor_batch(
-                    eval_model,
+                    final_eval_model,
                     combined_val_x,
                     combined_val_returns,
                     combined_val_masks,
@@ -10877,6 +12890,9 @@ def run_training(
                     profile_timing=profile_timing,
                     progress_label=f"[Train {train_years} final-val]",
                     reset_at_rows=val_offsets,
+                    volume_notional=combined_val_volume_notional,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
             if profile_timing:
                 _log_timing(
@@ -10949,6 +12965,8 @@ def run_training(
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
                 test_date_idx = test_windowed.valid_indices.to(
                     device=test_windowed.future_log_returns.device,
@@ -10961,6 +12979,7 @@ def run_training(
                 test_bench = test_windowed.benchmark[test_date_idx]
             else:
                 test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(context.test_ds)
+                test_volume_notional = _dataset_volume_notional_to_tensor(context.test_ds)
                 test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _prepare_split_tensors(
                     test_x,
                     test_returns,
@@ -10992,6 +13011,9 @@ def run_training(
                     chunk_rows=eval_chunk_rows,
                     backtest_chunk_rows=eval_backtest_chunk_rows,
                     profile_timing=profile_timing,
+                    volume_notional=test_volume_notional,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
                 )
 
             previous_fold_model = _load_previous_fold_neural_model(
@@ -11062,6 +13084,7 @@ def run_training(
 
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
+            test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
@@ -11076,10 +13099,12 @@ def run_training(
                 sell_fee_rate=config.trading.sell_fee_rate,
                 long_only=config.trading.long_only,
                 max_turnover_ratio=config.trading.max_turnover_ratio,
+                max_volume_participation=config.trading.max_volume_participation,
                 gross_leverage=1.0,
                 min_trade_weight=config.trading.min_trade_weight,
                 portfolio_activation=config.trading.portfolio_activation,
                 close_prices=test_close_prices,
+                daily_volumes=test_daily_volumes,
                 symbols=panel.symbols,
                 dates=test_dates,
                 collect_holdings=write_integer_holdings_table,
@@ -11149,10 +13174,11 @@ def run_training(
             )
             plot_timing["explainability_total_s"] = float(time.perf_counter() - explain_start)
             plot_timing["post_plot_total_s"] = float(time.perf_counter() - save_start)
-            (fold_dir / "plot_timing.json").write_text(
-                json.dumps(plot_timing, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            if _distributed_should_write():
+                (fold_dir / "plot_timing.json").write_text(
+                    json.dumps(plot_timing, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
             if explain_path is not None:
                 print(f"[Fold {fold.fold_id}] explainability output: {explain_path}")
             if profile_timing:
@@ -11178,7 +13204,9 @@ def run_training(
             early_stop_patience=early_stop_patience,
             early_stopping_no_improve_ratio=early_stop_ratio,
             early_stop_val_interval_epochs=val_interval,
+            check_finite=config.training.checkpoint_finite_check,
         )
+        _distributed_barrier()
 
         if config.training.warm_start_from_previous_fold:
             warm_start_checkpoint_path = group_checkpoint_path
@@ -11224,5 +13252,6 @@ def run_training(
                     fold_id=fold.fold_id,
                     enabled=bool(getattr(config.training, "postprocess_benchmark_after_fold", False)),
                 )
+        _distributed_barrier()
 
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

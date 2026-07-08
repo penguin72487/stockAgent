@@ -26,7 +26,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if len(self.valid_indices) == 0:
             raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback} dates.")
 
-        returns = np.nan_to_num(panel.returns_1d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        returns = np.nan_to_num(
+            panel.returns_1d,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+            copy=True,
+        ).astype(np.float32, copy=False)
         if panel.can_buy_mask is None or panel.can_sell_mask is None:
             raise ValueError(
                 "PanelData must provide can_buy_mask and can_sell_mask; no-fallback dataset path "
@@ -45,14 +51,21 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             else np.zeros_like(tradable, dtype=bool)
         )
 
-        # Cache tensors once to avoid per-item numpy copies.
-        self.features_t = torch.nan_to_num(
-            torch.from_numpy(panel.features),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
+        # build_panel sanitizes feature NaN/inf values before caching.  Re-running
+        # torch.nan_to_num here would duplicate the full panel for every split.
+        features = panel.features.astype(np.float32, copy=False)
+        if not features.flags.c_contiguous:
+            features = np.ascontiguousarray(features)
+        self.features_t = torch.from_numpy(features)
         self.future_log_returns_t = torch.from_numpy(returns)
+        daily_volumes = getattr(panel, "daily_volumes", None)
+        if daily_volumes is None:
+            volume_notional = np.full_like(panel.close_prices, np.inf, dtype=np.float32)
+        else:
+            daily_volumes_arr = np.asarray(daily_volumes, dtype=np.float32)
+            close_prices_arr = np.asarray(panel.close_prices, dtype=np.float32)
+            volume_notional = (daily_volumes_arr * close_prices_arr).astype(np.float32, copy=False)
+        self.volume_notional_t = torch.from_numpy(volume_notional)
         self.tradable_mask_t = torch.from_numpy(tradable)
         self.can_buy_mask_t = torch.from_numpy(can_buy)
         self.can_sell_mask_t = torch.from_numpy(can_sell)
@@ -69,6 +82,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         return {
             "x": self.features_t[start_idx : date_idx + 1],
             "future_log_returns": self.future_log_returns_t[date_idx],
+            "volume_notional": self.volume_notional_t[date_idx],
             "tradable_mask": self.tradable_mask_t[date_idx],
             "can_buy_mask": self.can_buy_mask_t[date_idx],
             "can_sell_mask": self.can_sell_mask_t[date_idx],
@@ -86,6 +100,7 @@ def collate_batch(
         return {
             "x": torch.stack([s["x"] for s in samples]),
             "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
+            "volume_notional": torch.stack([s["volume_notional"] for s in samples]),
             "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
             "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
             "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
@@ -106,6 +121,7 @@ def collate_batch(
     return {
         "x": _pad_tensor_list("x"),
         "future_log_returns": _pad_tensor_list("future_log_returns"),
+        "volume_notional": _pad_tensor_list("volume_notional"),
         "tradable_mask": _pad_tensor_list("tradable_mask"),
         "can_buy_mask": _pad_tensor_list("can_buy_mask"),
         "can_sell_mask": _pad_tensor_list("can_sell_mask"),

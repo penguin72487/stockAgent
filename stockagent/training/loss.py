@@ -265,6 +265,7 @@ def factor_generalization_loss(
     buy_fee_rate: float = 0.0,
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
+    volume_limit_weights: Tensor | None = None,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -337,6 +338,7 @@ def factor_generalization_loss(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        volume_limit_weights=volume_limit_weights,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -408,6 +410,7 @@ def portfolio_autoencoder_loss(
     buy_fee_rate: float = 0.0,
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
+    volume_limit_weights: Tensor | None = None,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -493,6 +496,7 @@ def sharpe_aware_loss(
     buy_fee_rate: float = 0.0,
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
+    volume_limit_weights: Tensor | None = None,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -519,6 +523,7 @@ def sharpe_aware_loss(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        volume_limit_weights=volume_limit_weights,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -621,6 +626,7 @@ def risk_aware_loss(
     buy_fee_rate: float = 0.0,
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
+    volume_limit_weights: Tensor | None = None,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
@@ -691,6 +697,7 @@ def risk_aware_loss(
             buy_fee_rate=buy_fee_rate,
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=max_turnover_ratio,
+            volume_limit_weights=volume_limit_weights,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -714,6 +721,7 @@ def risk_aware_loss(
             buy_fee_rate=buy_fee_rate,
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=max_turnover_ratio,
+            volume_limit_weights=volume_limit_weights,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
@@ -815,6 +823,7 @@ def risk_aware_loss(
     if (
         objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}
         and _reduced_log_utility_enabled()
+        and volume_limit_weights is None
     ):
         backtest_start = _loss_timer_start()
         reduced = run_backtest_torch_reduced(
@@ -876,6 +885,7 @@ def risk_aware_loss(
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
+        volume_limit_weights=volume_limit_weights,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,

@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 5
 environment:
   conda_env: fintech
   device: cuda
@@ -223,11 +223,15 @@ training:
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: 8
+  eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
+  # Keep train model/loss compile on. Eval backtest scan compile stalls in
+  # TorchInductor front-end analysis for the current fold18 full-universe shape.
+  eval_backtest_compile: false
   eval_auto_chunk_rows_cap: 16
   train_symbol_subsample_ratio: 1.0
+  train_symbol_compaction: train_union
   detach_prev_state: true
   prefer_fp16: false
   backtest_autotune: true
@@ -243,9 +247,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 16
-  batch_size_train: 16
-  batch_size_eval: 8
+  batch_size: 256
+  batch_size_train: 256
+  batch_size_eval: 256
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -310,7 +314,7 @@ training:
   save_integer_share_holdings_csv: false
   save_daily_weights_csv: false
   backtest_artifact_compression: none
-  save_best_val_artifacts: true
+  save_best_val_artifacts: false
   postprocess_benchmark_after_fold: true
   postprocess_benchmark_after_best_val: true
   postprocess_benchmark_split: test
@@ -340,6 +344,7 @@ training:
   weight_decay: 0.01
   grad_clip_norm: 1.0
   finite_check_interval_steps: 100
+  checkpoint_finite_check: false
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
@@ -455,12 +460,25 @@ training:
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
-    sdpa_batch_limit: 16384
+    # Fold18 full-TW benchmark: 65535 is the largest stable SDPA chunk in the
+    # current CUDA/PyTorch environment. 65536 and 131071 both failed in SDPA
+    # forward with CUDA invalid argument, so this is a kernel shape boundary,
+    # not a VRAM limit.
+    sdpa_batch_limit: 65535
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: true
+    qk_norm: false
     rope_temporal: true
     rope_base: 10000.0
+    # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
+    # two-epoch benchmark, using epoch 2 only: temporal_layers=1,
+    # temporal_heads=1, temporal_ffn_mult=1, d_model=16, cross_heads=2, and
+    # eval_model_chunk_rows=auto reduced epoch wall from 20.16s to 4.93s while
+    # preserving attention pooling semantics. Adding train_symbol_compaction:
+    # train_union then reduced epoch-2 wall to 3.72s and train time to
+    # 175.1ms/batch on fold18 by training only the fold's active symbol union.
+    # d_model=8 was faster at 3.35s but collapsed the 2-epoch fold18
+    # validation/test loss, so it is only a lower bound probe, not active.
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
