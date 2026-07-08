@@ -1420,6 +1420,67 @@ def test_fused_log_utility_loss_matches_canonical_backtest_and_gradients() -> No
     assert torch.allclose(fused_weights.grad, ref_weights.grad, atol=1e-7, rtol=1e-5)
 
 
+def test_fused_log_utility_manual_backward_matches_autograd() -> None:
+    torch.manual_seed(2031)
+    rows, symbols = 13, 7
+    base_weights = torch.randn(rows, symbols, dtype=torch.float32)
+    returns = torch.randn(rows, symbols, dtype=torch.float32) * 0.012
+    tradable = torch.rand(rows, symbols) > 0.20
+    can_buy = torch.rand(rows, symbols) > 0.15
+    can_sell = torch.rand(rows, symbols) > 0.15
+    tradable[0] = True
+    can_buy[0] = True
+    can_sell[0] = True
+    sample_mask = torch.tensor([True, True, False, True, True, False, True, True, False, True, True, True, False])
+    initial_weights = torch.randn(symbols).mul(0.04)
+
+    ref_weights = base_weights.clone().requires_grad_(True)
+    ref_loss, ref_final = fused_log_utility_loss_tensor(
+        ref_weights,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        sample_mask,
+        initial_weights,
+        buy_fee_rate=0.000855,
+        sell_fee_rate=0.003855,
+        long_only=False,
+        max_turnover_ratio=50.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.15,
+        manual_backward=False,
+    )
+    ref_loss.backward()
+
+    fast_weights = base_weights.clone().requires_grad_(True)
+    fast_loss, fast_final = fused_log_utility_loss_tensor(
+        fast_weights,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        sample_mask,
+        initial_weights,
+        buy_fee_rate=0.000855,
+        sell_fee_rate=0.003855,
+        long_only=False,
+        max_turnover_ratio=50.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.15,
+        manual_backward=True,
+    )
+    fast_loss.backward()
+
+    assert torch.allclose(fast_loss, ref_loss, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(fast_final, ref_final, atol=1e-7, rtol=1e-6)
+    assert ref_weights.grad is not None
+    assert fast_weights.grad is not None
+    assert torch.allclose(fast_weights.grad, ref_weights.grad, atol=1e-7, rtol=1e-5)
+
+
 def test_segmented_log_utility_eval_loss_matches_fused_backtest_rules() -> None:
     torch.manual_seed(2028)
     rows, symbols = 13, 8
@@ -1693,3 +1754,79 @@ def test_sortino_loss_accepts_initial_weights_for_stateful_batches() -> None:
     assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
     assert bt.final_weights is not None
     assert torch.allclose(aux_second["_final_weights"], bt.final_weights, atol=1e-7, rtol=1e-6)
+
+
+def test_torch_backtest_applies_volume_participation_weight_cap() -> None:
+    weights = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    returns = torch.zeros_like(weights)
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    volume_limit = torch.tensor(
+        [
+            [0.25, float("inf")],
+            [0.10, 0.30],
+        ],
+        dtype=torch.float32,
+    )
+
+    bt = run_backtest_torch(
+        weights,
+        returns,
+        mask,
+        torch.zeros(2, dtype=torch.float32),
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        volume_limit_weights=volume_limit,
+    )
+
+    expected = torch.tensor(
+        [
+            [0.25, 0.0],
+            [0.15, 0.30],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(bt.weights_history.cpu(), expected, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(bt.turnovers.cpu(), torch.tensor([0.25, 0.40]), atol=1e-7, rtol=1e-6)
+
+
+def test_fused_log_utility_applies_volume_participation_weight_cap() -> None:
+    weights = torch.tensor([[1.0, -1.0]], dtype=torch.float32, requires_grad=True)
+    returns = torch.zeros_like(weights)
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    volume_limit = torch.tensor([[0.20, 0.10]], dtype=torch.float32)
+
+    loss, final_weights = fused_log_utility_loss_tensor(
+        weights,
+        returns,
+        mask,
+        mask,
+        mask,
+        torch.ones(1, dtype=torch.bool),
+        torch.zeros(2, dtype=torch.float32),
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="identity",
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+        manual_backward=True,
+        volume_limit_weights=volume_limit,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.allclose(final_weights.cpu(), torch.tensor([0.20, -0.10]), atol=1e-7, rtol=1e-6)

@@ -1287,6 +1287,7 @@ def _vectorized_backtest(
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    volume_limit_weights: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     target_weights = np.asarray(weights, dtype=np.float32).copy()
     gross_budget = _resolve_exposure_budget(gross_leverage)
@@ -1312,6 +1313,14 @@ def _vectorized_backtest(
         portfolio_activation=portfolio_activation,
     )
     target_weights = _apply_min_trade_weight_numpy(target_weights, min_trade_weight)
+    volume_limits = None
+    if volume_limit_weights is not None:
+        volume_limits = np.asarray(volume_limit_weights, dtype=np.float32)
+        if volume_limits.shape != target_weights.shape:
+            raise ValueError(
+                "volume_limit_weights shape must match weights: "
+                f"{volume_limits.shape} != {target_weights.shape}"
+            )
 
     t_len, n_symbols = target_weights.shape
     weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
@@ -1359,6 +1368,12 @@ def _vectorized_backtest(
             delta = constrained_target - prev
 
         next_weights = prev + delta
+        if volume_limits is not None:
+            volume_cap = volume_limits[t]
+            abs_delta = np.abs(delta)
+            cap_safe = np.where(np.isfinite(volume_cap) & (volume_cap >= 0.0), np.maximum(volume_cap, 0.0), abs_delta)
+            delta = np.sign(delta) * np.minimum(abs_delta, cap_safe)
+            next_weights = prev + delta
         if max_turnover_ratio > 0.0:
             next_weights = _apply_turnover_cap_numpy(prev[None, :], next_weights[None, :], max_turnover_ratio)[0]
             delta = next_weights - prev
@@ -1390,6 +1405,7 @@ def _vectorized_backtest_torch_scan_long_only(
     can_sell_mask: torch.Tensor | None,
     prev_init: torch.Tensor | None = None,
     max_turnover_ratio: float = 0.0,
+    volume_limit_weights: torch.Tensor | None = None,
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1422,6 +1438,7 @@ def _vectorized_backtest_torch_scan_long_only(
         tradable_chunk = tradable[start:end]
         buy_chunk = buy_mask[start:end]
         sell_chunk = sell_mask[start:end]
+        volume_chunk = None if volume_limit_weights is None else volume_limit_weights[start:end]
 
         for offset in range(end - start):
             idx = start + offset
@@ -1440,6 +1457,16 @@ def _vectorized_backtest_torch_scan_long_only(
             delta = sell_delta + buy_delta * buy_scale
 
             next_weights = prev + delta
+            if volume_chunk is not None:
+                volume_cap = volume_chunk[offset].to(device=device, dtype=dtype)
+                abs_delta = delta.abs()
+                cap_safe = torch.where(
+                    torch.isfinite(volume_cap) & (volume_cap >= 0.0),
+                    volume_cap.clamp_min(0.0),
+                    abs_delta,
+                )
+                delta = torch.sign(delta) * torch.minimum(abs_delta, cap_safe)
+                next_weights = prev + delta
             if max_turnover_ratio > 0.0:
                 turnover = delta.abs().sum()
                 turnover_scale = torch.minimum(
@@ -1470,6 +1497,7 @@ def _vectorized_backtest_torch_scan_long_short(
     force_short_cover_mask: torch.Tensor | None = None,
     prev_init: torch.Tensor | None = None,
     max_turnover_ratio: float = 0.0,
+    volume_limit_weights: torch.Tensor | None = None,
     gross_budget: float = 1.0,
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
@@ -1516,6 +1544,7 @@ def _vectorized_backtest_torch_scan_long_short(
         sell_chunk = sell_mask[start:end]
         short_chunk = short_open_mask[start:end]
         force_chunk = force_cover_mask[start:end]
+        volume_chunk = None if volume_limit_weights is None else volume_limit_weights[start:end]
 
         for offset in range(end - start):
             idx = start + offset
@@ -1545,6 +1574,16 @@ def _vectorized_backtest_torch_scan_long_short(
             delta = constrained_target - prev
 
             next_weights = prev + delta
+            if volume_chunk is not None:
+                volume_cap = volume_chunk[offset].to(device=device, dtype=dtype)
+                abs_delta = delta.abs()
+                cap_safe = torch.where(
+                    torch.isfinite(volume_cap) & (volume_cap >= 0.0),
+                    volume_cap.clamp_min(0.0),
+                    abs_delta,
+                )
+                delta = torch.sign(delta) * torch.minimum(abs_delta, cap_safe)
+                next_weights = prev + delta
             if max_turnover_ratio > 0.0:
                 turnover = delta.abs().sum()
                 turnover_scale = torch.minimum(
@@ -1948,6 +1987,7 @@ def _vectorized_backtest_torch(
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
     initial_weights: torch.Tensor | None = None,
+    volume_limit_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_start = _runtime_stat_start()
     _add_backtest_runtime_stat("calls")
@@ -1985,6 +2025,17 @@ def _vectorized_backtest_torch(
                 else force_short_cover_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_tradable
             )
             has_short_constraints = (can_short_open_mask is not None) or (force_short_cover_mask is not None)
+            prepped_volume_limit_weights = None
+            if volume_limit_weights is not None:
+                prepped_volume_limit_weights = volume_limit_weights.to(
+                    device=prepped_weights.device,
+                    dtype=prepped_weights.dtype,
+                )
+                if tuple(prepped_volume_limit_weights.shape) != tuple(prepped_weights.shape):
+                    raise ValueError(
+                        "volume_limit_weights shape must match weights: "
+                        f"{tuple(prepped_volume_limit_weights.shape)} != {tuple(prepped_weights.shape)}"
+                    )
         _add_backtest_elapsed_stat("prep_s", prep_start)
         prev_init_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
@@ -2008,7 +2059,7 @@ def _vectorized_backtest_torch(
         prepped_buy,
         prepped_sell,
         effective_max_turnover_ratio,
-    ) and not has_short_constraints
+    ) and not has_short_constraints and prepped_volume_limit_weights is None
     if use_dense_fast_path:
         _add_backtest_runtime_stat("dense_fast_path_calls")
         dense_start = _runtime_stat_start()
@@ -2070,6 +2121,7 @@ def _vectorized_backtest_torch(
         and cpp_long_short_enabled()
         and not long_only
         and not has_short_constraints
+        and prepped_volume_limit_weights is None
         and prepped_weights.device.type == "cuda"
         and initial_weights is None
     )
@@ -2105,6 +2157,63 @@ def _vectorized_backtest_torch(
                 ) from e
             if _compile_verbose():
                 print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
+
+    if prepped_volume_limit_weights is not None:
+        _add_backtest_runtime_stat("volume_cap_eager_scan_calls")
+        runner_call_start = _runtime_stat_start()
+        with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
+            if long_only:
+                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = (
+                    _vectorized_backtest_torch_scan_long_only(
+                        prepped_weights,
+                        future_returns,
+                        prepped_tradable,
+                        prepped_buy,
+                        prepped_sell,
+                        prev_init=prev_init,
+                        max_turnover_ratio=effective_max_turnover_ratio,
+                        volume_limit_weights=prepped_volume_limit_weights,
+                        scan_chunk_size=resolved_chunk,
+                        record_weights_history=return_weights_history,
+                    )
+                )
+            else:
+                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = (
+                    _vectorized_backtest_torch_scan_long_short(
+                        prepped_weights,
+                        future_returns,
+                        prepped_tradable,
+                        prepped_buy,
+                        prepped_sell,
+                        can_short_open_mask=prepped_short_open,
+                        force_short_cover_mask=prepped_force_cover,
+                        prev_init=prev_init,
+                        max_turnover_ratio=effective_max_turnover_ratio,
+                        volume_limit_weights=prepped_volume_limit_weights,
+                        gross_budget=gross_budget,
+                        scan_chunk_size=resolved_chunk,
+                        record_weights_history=return_weights_history,
+                    )
+                )
+        _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
+        finalize_start = _runtime_stat_start()
+        with _CudaRuntimeTimer("finalize_cuda_s", prepped_weights):
+            returns_dtype = prepped_weights.dtype
+            net_simple_returns = (
+                gross_returns
+                - float(buy_fee_rate) * buy_turnovers
+                - float(sell_fee_rate) * sell_turnovers
+            )
+            strategy_returns = _portfolio_simple_returns_to_log_torch(net_simple_returns)
+            result = (
+                strategy_returns.to(returns_dtype),
+                turnovers.to(returns_dtype),
+                weights_history.to(returns_dtype),
+                final_weights.to(returns_dtype),
+            )
+        _add_backtest_elapsed_stat("finalize_s", finalize_start)
+        _add_backtest_elapsed_stat("total_s", total_start)
+        return result
 
     checkpoint_rows = _checkpoint_chunk_rows()
     use_checkpoint = (
@@ -2318,6 +2427,7 @@ def run_backtest(
     can_sell_mask: np.ndarray | None = None,
     can_short_open_mask: np.ndarray | None = None,
     force_short_cover_mask: np.ndarray | None = None,
+    volume_limit_weights: np.ndarray | None = None,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
@@ -2335,6 +2445,7 @@ def run_backtest(
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
+        volume_limit_weights=volume_limit_weights,
     )
 
     return BacktestResult(
@@ -2557,6 +2668,7 @@ def run_backtest_torch(
     return_weights_history: bool = True,
     dense_mask_constraints: bool = False,
     initial_weights: torch.Tensor | None = None,
+    volume_limit_weights: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     strategy_returns, turnovers, weights_history, final_weights = _vectorized_backtest_torch(
@@ -2578,6 +2690,7 @@ def run_backtest_torch(
         return_weights_history=return_weights_history,
         dense_mask_constraints=dense_mask_constraints,
         initial_weights=initial_weights,
+        volume_limit_weights=volume_limit_weights,
     )
 
     return BacktestResultTensor(
@@ -2604,10 +2717,12 @@ def run_backtest_integer_shares(
     sell_fee_rate: float = 0.004425,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    max_volume_participation: float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     close_prices: np.ndarray | None = None,
+    daily_volumes: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
     collect_holdings: bool = True,
@@ -2667,6 +2782,15 @@ def run_backtest_integer_shares(
     else:
         price_matrix = None
         current_prices = np.ones(n_symbols, dtype=np.float64)
+    if daily_volumes is not None:
+        volume_matrix = np.asarray(daily_volumes, dtype=np.float64)
+        if volume_matrix.shape != (t_len, n_symbols):
+            raise ValueError(
+                "daily_volumes shape must match (num_days, num_symbols): "
+                f"expected {(t_len, n_symbols)}, got {volume_matrix.shape}"
+            )
+    else:
+        volume_matrix = None
     shares = np.zeros(n_symbols, dtype=np.int64)
     cash = float(initial_capital)
     cash_hold_mode = False
@@ -2754,6 +2878,19 @@ def run_backtest_integer_shares(
                 scaled_delta = np.sign(delta.astype(np.float64)) * np.floor(np.abs(delta.astype(np.float64)) * scale)
                 desired_shares = shares + scaled_delta.astype(np.int64)
                 delta = desired_shares - shares
+
+        if max_volume_participation > 0.0 and volume_matrix is not None:
+            volume_day = volume_matrix[t]
+            valid_volume = np.isfinite(volume_day) & (volume_day >= 0.0)
+            max_qty = np.full(delta.shape, np.iinfo(np.int64).max, dtype=np.int64)
+            if np.any(valid_volume):
+                capped = np.floor(volume_day[valid_volume] * float(max_volume_participation))
+                capped = np.clip(capped, 0.0, float(np.iinfo(np.int64).max))
+                max_qty[valid_volume] = capped.astype(np.int64, copy=False)
+            abs_delta = np.abs(delta.astype(np.int64, copy=False))
+            clipped_abs = np.minimum(abs_delta, max_qty)
+            desired_shares = shares + (np.sign(delta.astype(np.float64)) * clipped_abs.astype(np.float64)).astype(np.int64)
+            delta = desired_shares - shares
 
         # Risk-budget guardrail: enforce |long| + |short| <= gross_leverage using
         # current-day prices before fees and next-day return realization.

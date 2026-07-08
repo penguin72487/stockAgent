@@ -150,7 +150,19 @@ Multi-asset Taiwan stock trading research workspace.
 - Recommended activation command: `mamba activate fintech`
 - Shell runners auto-detect the active `fintech` conda/mamba environment across common WSL install paths; override with `PYTHON_BIN=/path/to/python` if needed.
 mamba env export -n fintech --no-builds > fintech_environment.yml
+mamba create fintech python=3.12
 mamba env update -n fintech -f fintech_environment.yml
 
 mkdir -p "$CONDA_PREFIX/conda-meta"
 nano "$CONDA_PREFIX/conda-meta/pinned"
+
+
+rapids>0.0.1
+cuda-version >=13,<14
+python=3.12
+pydantic >=2.13.4
+transformers >= 5.12.1
+
+git config --global user.email "agar.io6100@gmail.com"
+git config --global user.name "penguin72487"
+
