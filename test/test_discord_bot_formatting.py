@@ -47,6 +47,7 @@ from services.discord_bot.bot import (
     _clear_scheduled_retry,
     _set_user_subscription,
     _signal_now_should_refresh_data,
+    _summary_age_seconds,
     _signal_kwargs,
     _signal_sanity_issues,
     _signal_sanity_level,
@@ -265,6 +266,53 @@ def test_can_reuse_latest_signal_now_rejects_stale_closed_panel() -> None:
     reusable, _ = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
 
     assert not reusable
+
+
+def test_can_reuse_latest_signal_now_for_recent_open_panel_market(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="crypto",
+        market_type="crypto",
+        history_frequency="bar",
+        display_timezone="Asia/Taipei",
+        timezone="UTC",
+    )
+    status = SimpleNamespace(
+        market_open=True,
+        data=SimpleNamespace(fresh=True, last_data_date="2026-07-08 14:00:00", panel_date="2026-07-08 14:00:00"),
+    )
+    summary = {
+        "asof_date": "2026-07-08 22:00:30",
+        "panel_date": "2026-07-08 14:00:00",
+        "price_source": "panel_close",
+    }
+
+    monkeypatch.setattr("services.discord_bot.bot._signal_now_open_cache_seconds", lambda: 120.0)
+    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0)
+
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+
+    assert reusable
+    assert reason == "cached_open_panel_age=30s"
+
+
+def test_summary_age_seconds_handles_timezone_aware_generated_at(monkeypatch) -> None:
+    cfg = SimpleNamespace(display_timezone="Asia/Taipei", timezone="UTC")
+    summary = {"generated_at": "2026-07-08T22:29:00+08:00"}
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return cls(2026, 7, 8, 22, 29, 30, tzinfo=tz)
+            return cls(2026, 7, 8, 22, 29, 30)
+
+        @classmethod
+        def fromisoformat(cls, date_string):
+            return datetime.fromisoformat(date_string)
+
+    monkeypatch.setattr("services.discord_bot.bot.datetime", FixedDateTime)
+
+    assert _summary_age_seconds(summary, cfg) == 30.0
 
 
 def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:

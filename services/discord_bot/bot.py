@@ -2084,6 +2084,15 @@ def _signal_now_open_cache_seconds() -> float:
 
 def _summary_age_seconds(summary: dict[str, Any], cfg: LiveMarketConfig) -> float | None:
     raw = summary.get("generated_at") or summary.get("asof_date")
+    text = str(raw or "").strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        parsed = None
+    if parsed is not None and parsed.tzinfo is not None:
+        return max(0.0, (datetime.now(parsed.tzinfo) - parsed).total_seconds())
     dt = _history_datetime(raw)
     if dt is None:
         return None
@@ -2105,6 +2114,21 @@ def _can_reuse_latest_signal_now(
     summary_price = str(summary.get("price_source") or "").strip().lower()
     summary_date = _summary_data_date_key(summary)
     if status.market_open:
+        market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
+        frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
+        if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "15m"}:
+            if requested not in {"", "auto", "panel"}:
+                return False, None
+            latest_data_date = getattr(status.data, "last_data_date", None) or getattr(status.data, "panel_date", None)
+            if not _summary_date_matches(summary_date, latest_data_date):
+                return False, None
+            if summary_price and not (summary_price.startswith("panel") or summary_price in {"close", "panel_close"}):
+                return False, None
+            ttl = _signal_now_open_cache_seconds()
+            age = _summary_age_seconds(summary, cfg)
+            if ttl <= 0 or age is None or age > ttl:
+                return False, None
+            return True, f"cached_open_panel_age={age:.0f}s"
         if requested not in {"", "auto", "yahoo"}:
             return False, None
         if not summary_price.startswith("yahoo"):
