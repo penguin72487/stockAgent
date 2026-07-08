@@ -606,6 +606,12 @@ def parse_args() -> argparse.Namespace:
         help="Compile eval/test backtest scans. Model and loss compile are controlled separately.",
     )
     parser.add_argument(
+        "--eval-backtest-engine",
+        choices=("torch", "auto", "triton"),
+        default=None,
+        help="Override training.eval_backtest_engine for eval/test curve backtests.",
+    )
+    parser.add_argument(
         "--backtest-compile",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -780,6 +786,8 @@ def main() -> None:
     if args.eval_backtest_compile is not None:
         config.training.eval_backtest_compile = bool(args.eval_backtest_compile)
         os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(args.eval_backtest_compile) else "0"
+    if args.eval_backtest_engine is not None:
+        config.training.eval_backtest_engine = str(args.eval_backtest_engine)
     if args.backtest_compile is not None:
         config.training.backtest_compile = bool(args.backtest_compile)
     if args.backtest_compile_stateful is not None:

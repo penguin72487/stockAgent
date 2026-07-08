@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 5
+  start_fold: 1
 environment:
   conda_env: fintech
   device: cuda
@@ -195,11 +195,14 @@ walk_forward:
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
 
+
 trading:
   frequency: daily
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
-  max_turnover_ratio: 50.0
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.5
+  volume_participation_equity: 1000000.0
   leverage: 2.5
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
@@ -229,7 +232,8 @@ training:
   # Keep train model/loss compile on. Eval backtest scan compile stalls in
   # TorchInductor front-end analysis for the current fold18 full-universe shape.
   eval_backtest_compile: false
-  eval_auto_chunk_rows_cap: 16
+  eval_backtest_engine: triton
+  eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
   train_symbol_compaction: train_union
   detach_prev_state: true
@@ -247,9 +251,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 256
-  batch_size_train: 256
-  batch_size_eval: 256
+  batch_size: 32
+  batch_size_train: 32
+  batch_size_eval: 16
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1

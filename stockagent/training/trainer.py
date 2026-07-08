@@ -2127,6 +2127,8 @@ def _timing_curve_payload(
         "bt_dense_fast_path_cuda_ms_per_call": _bt_avg_ms("dense_fast_path_cuda_s"),
         "bt_cpp_ext_ms_per_call": _bt_avg_ms("cpp_ext_s"),
         "bt_cpp_ext_cuda_ms_per_call": _bt_avg_ms("cpp_ext_cuda_s"),
+        "bt_triton_eval_ms_per_call": _bt_avg_ms("triton_eval_s"),
+        "bt_triton_eval_cuda_ms_per_call": _bt_avg_ms("triton_eval_cuda_s"),
         "bt_compiled_runner_calls": int(backtest_runtime_stats.get("compiled_runner_calls", 0.0)),
         "bt_eager_runner_calls": int(backtest_runtime_stats.get("eager_runner_calls", 0.0)),
         "bt_stateful_calls": int(backtest_runtime_stats.get("stateful_calls", 0.0)),
@@ -2138,6 +2140,9 @@ def _timing_curve_payload(
         "bt_dense_fast_path_calls": int(backtest_runtime_stats.get("dense_fast_path_calls", 0.0)),
         "bt_cpp_ext_calls": int(backtest_runtime_stats.get("cpp_ext_calls", 0.0)),
         "bt_cpp_ext_failures": int(backtest_runtime_stats.get("cpp_ext_failures", 0.0)),
+        "bt_triton_eval_calls": int(backtest_runtime_stats.get("triton_eval_calls", 0.0)),
+        "bt_triton_eval_failures": int(backtest_runtime_stats.get("triton_eval_failures", 0.0)),
+        "bt_triton_eval_fallback_calls": int(backtest_runtime_stats.get("triton_eval_fallback_calls", 0.0)),
         "bt_checkpoint_calls": int(backtest_runtime_stats.get("checkpoint_calls", 0.0)),
         "bt_compiled_prep_calls": int(backtest_runtime_stats.get("compiled_prep_calls", 0.0)),
         "bt_eager_prep_calls": int(backtest_runtime_stats.get("eager_prep_calls", 0.0)),
@@ -7223,6 +7228,9 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     eval_backtest_compile = getattr(training, "eval_backtest_compile", None)
     if eval_backtest_compile is not None:
         os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(eval_backtest_compile) else "0"
+    eval_backtest_engine = str(getattr(training, "eval_backtest_engine", "torch")).strip().lower().replace("-", "_")
+    os.environ["STOCKAGENT_BACKTEST_TRITON_EVAL"] = "1" if eval_backtest_engine in {"auto", "triton"} else "0"
+    os.environ["STOCKAGENT_BACKTEST_TRITON_EVAL_REQUIRED"] = "1" if eval_backtest_engine == "triton" else "0"
     os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if bool(training.strict_no_fallback) else "0"
@@ -11342,6 +11350,7 @@ def run_training(
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
             f"backtest_prep_compile={_env_truthy('STOCKAGENT_BACKTEST_COMPILE_PREP', '1')}; "
+            f"eval_backtest_engine={getattr(config.training, 'eval_backtest_engine', 'torch')}; "
             f"backtest_cpp_ext={bool(config.training.backtest_cpp_ext)}; "
             f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
             f"cache_eval_gpu={bool(config.training.cache_eval_tensors_on_gpu)}; "
@@ -12243,6 +12252,7 @@ def run_training(
             deferred_val_loss_contexts: list[FoldRuntimeContext] = []
             deferred_val_loss_tensors: torch.Tensor | None = None
             deferred_test_loss_tensors: torch.Tensor | None = None
+            val_return_weights_history = bool(getattr(config.training, "save_best_val_artifacts", False))
             if loss_objective in {"rank_ic", "pure_rank", "factor_generalization", "portfolio_autoencoder"}:
                 val_eval_start = time.perf_counter()
                 eval_model.eval()
@@ -12335,7 +12345,7 @@ def run_training(
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
-                        return_weights_history=True,
+                        return_weights_history=val_return_weights_history,
                         profile_timing=profile_timing,
                         timing_out=val_timing,
                         reset_at_rows=val_offsets,
@@ -12365,7 +12375,7 @@ def run_training(
                         backtest_chunk_rows=eval_backtest_chunk_rows,
                         compute_ic=False,
                         compute_metrics_summary=False,
-                        return_weights_history=True,
+                        return_weights_history=val_return_weights_history,
                         profile_timing=profile_timing,
                         timing_out=val_timing,
                         reset_at_rows=val_offsets,
