@@ -489,6 +489,77 @@ def test_evaluate_tensor_batch_ragged_chunk_padding_matches_full_long_short_back
     assert torch.allclose(actual.weights_history.cpu(), expected.weights_history, atol=1e-7, rtol=1e-6)
 
 
+def test_triton_eval_backtest_matches_torch_long_short_with_volume_cap(monkeypatch) -> None:
+    if not torch.cuda.is_available() or not simulator.triton_eval_available():
+        pytest.skip("CUDA Triton eval backtest is unavailable")
+
+    torch.manual_seed(765)
+    rows, symbols = 11, 13
+    raw_weights = torch.randn(rows, symbols, device="cuda")
+    weights = raw_weights / raw_weights.abs().sum(dim=1, keepdim=True).clamp_min(1e-12) * 2.5
+    returns = torch.randn(rows, symbols, device="cuda") * 0.02
+    tradable = torch.rand(rows, symbols, device="cuda") > 0.10
+    can_buy = torch.rand(rows, symbols, device="cuda") > 0.20
+    can_sell = torch.rand(rows, symbols, device="cuda") > 0.15
+    tradable[0] = True
+    can_buy[0] = True
+    can_sell[0] = True
+    benchmark = returns.mean(dim=1)
+    initial = torch.randn(symbols, device="cuda")
+    initial = initial / initial.abs().sum().clamp_min(1e-12) * 1.2
+    volume_limit = torch.rand(rows, symbols, device="cuda") * 0.03
+    volume_limit[torch.rand(rows, symbols, device="cuda") < 0.10] = float("nan")
+
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_COMPILE", "0")
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_TRITON_EVAL", "0")
+    expected = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.000855,
+        sell_fee_rate=0.003855,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=2.5,
+        min_trade_weight=0.0,
+        portfolio_activation="pre_normalized",
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        initial_weights=initial,
+        volume_limit_weights=volume_limit,
+    )
+
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_TRITON_EVAL", "1")
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_TRITON_EVAL_REQUIRED", "1")
+    with torch.no_grad():
+        actual = run_backtest_torch(
+            weights,
+            returns,
+            tradable,
+            benchmark,
+            buy_fee_rate=0.000855,
+            sell_fee_rate=0.003855,
+            long_only=False,
+            max_turnover_ratio=0.0,
+            gross_leverage=2.5,
+            min_trade_weight=0.0,
+            portfolio_activation="pre_normalized",
+            can_buy_mask=can_buy,
+            can_sell_mask=can_sell,
+            initial_weights=initial,
+            volume_limit_weights=volume_limit,
+        )
+    torch.cuda.synchronize()
+
+    assert torch.allclose(actual.strategy_returns, expected.strategy_returns, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual.turnovers, expected.turnovers, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual.weights_history, expected.weights_history, atol=1e-6, rtol=1e-5)
+    assert expected.final_weights is not None
+    assert actual.final_weights is not None
+    assert torch.allclose(actual.final_weights, expected.final_weights, atol=1e-6, rtol=1e-5)
+
+
 def test_evaluate_tensor_batch_decoupled_backtest_chunk_matches_old_chunking() -> None:
     torch.manual_seed(777)
     rows, symbols = 19, 8
