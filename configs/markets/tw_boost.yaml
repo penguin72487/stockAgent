@@ -244,9 +244,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 96
-  batch_size_train: 96
-  batch_size_eval: 64
+  batch_size: 4
+  batch_size_train: 4
+  batch_size_eval: 4
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -465,8 +465,8 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: attention
-    temporal_query_mode: full_then_last
+    temporal_pooling: last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
