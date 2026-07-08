@@ -92,14 +92,15 @@ Multi-asset Taiwan stock trading research workspace.
 ### Daily All-Market Update
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
-- The script runs Yahoo all-asset update (`tw_stocks`, `us_stocks`, `crypto`, `forex`; crypto uses 15-minute bars), Taiwan public data daily-update plus public-data feature rebuild, Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
+- The script runs only the source-of-truth feed for each configured market by default: Yahoo `us_stocks`, Taiwan TWSE/TPEx public data plus feature rebuild and official OHLCV sync, Frankfurter forex incremental update to `data_yahoo/forex`, and OKX/Bybit perpetual 15-minute crypto updates. Yahoo Taiwan/crypto/forex and Pepperstone grouped downloads are opt-in fallback or research paths, not the fast daily default.
 - Independent provider groups run concurrently by default; set `DAILY_PARALLEL_GROUPS=0` to force the old serial order.
 - Set `RUN_TW_PUBLIC_DATA=0` to skip the Taiwan public data downloader. The first enabled run may backfill many historical official-data dates.
 - Set `RUN_TW_PUBLIC_FEATURES=0` to skip rebuilding `data_tw_public/features/tw_public_stock_daily.parquet`.
-- Set `RUN_PEPPERSTONE_GROUPS=0` to skip Pepperstone groups when you only want Yahoo+Frankfurter.
+- Set `RUN_PEPPERSTONE_GROUPS=1` to also run Pepperstone grouped fallback/research downloads.
 - Set `RUN_FRANKFURTER=0` to skip Frankfurter cross-rate updates.
 - Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
 - Full data-quality audit is opt-in because it scans parquet roots; set `RUN_DATA_QUALITY_AUDIT=1` when you want that check after downloads.
+- Yahoo updates are capped per asset by `YAHOO_STEP_TIMEOUT_SECONDS` (default `900`) so rate-limited US updates do not stall the whole all-market cycle.
 - Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
 
 ## Live Signal And Discord Bot
@@ -165,4 +166,3 @@ transformers >= 5.12.1
 
 git config --global user.email "agar.io6100@gmail.com"
 git config --global user.name "penguin72487"
-

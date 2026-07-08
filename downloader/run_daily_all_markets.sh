@@ -44,11 +44,11 @@ YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS="${YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS
 YAHOO_INCLUDE_TW_DELISTED="${YAHOO_INCLUDE_TW_DELISTED:-1}"
 YAHOO_INCLUDE_US_DELISTED="${YAHOO_INCLUDE_US_DELISTED:-1}"
 FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
-FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_forex_frankfurter}"
+FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_yahoo/forex}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
 FRANKFURTER_SKIP_MANIFEST="${FRANKFURTER_SKIP_MANIFEST:-0}"
 RUN_FRANKFURTER="${RUN_FRANKFURTER:-1}"
-RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-1}"
+RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-0}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
@@ -59,8 +59,8 @@ BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
 RUN_YAHOO="${RUN_YAHOO:-1}"
-YAHOO_ASSETS="${YAHOO_ASSETS:-us_stocks crypto forex}"
-YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-0}"  # 0 disables timeout
+YAHOO_ASSETS="${YAHOO_ASSETS:-us_stocks}"
+YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-900}"  # 0 disables timeout
 RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
 TW_PUBLIC_DATASETS="${TW_PUBLIC_DATASETS:-all}"
 TW_PUBLIC_OUTPUT_DIR="${TW_PUBLIC_OUTPUT_DIR:-data_tw_public}"
@@ -566,10 +566,7 @@ run_market_close_cycle() {
     tw_date="$(TZ="$TW_CLOSE_TZ" date +%F)"
     log "market=tw due date=${tw_date} close=${TW_CLOSE_TIME} tz=${TW_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_market_tw_yahoo() { run_yahoo_incremental_assets "tw_stocks"; }
-    run_parallel_groups \
-      tw_yahoo run_market_tw_yahoo \
-      tw_public run_tw_public_data_update
+    run_tw_public_data_update
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_TW="$tw_date"
@@ -591,9 +588,7 @@ run_market_close_cycle() {
     fx_date="$(TZ="$FOREX_CLOSE_TZ" date +%F)"
     log "market=forex due date=${fx_date} close=${FOREX_CLOSE_TIME} tz=${FOREX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_market_forex_yahoo() { run_yahoo_incremental_assets "forex"; }
     run_parallel_groups \
-      forex_yahoo run_market_forex_yahoo \
       frankfurter run_frankfurter_incremental \
       pepperstone run_pepperstone_incremental
     did_run=1
@@ -606,10 +601,7 @@ run_market_close_cycle() {
     cex_date="$(TZ="$CEX_CLOSE_TZ" date +%F)"
     log "market=cex due date=${cex_date} close=${CEX_CLOSE_TIME} tz=${CEX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_market_cex_yahoo_crypto() { run_yahoo_incremental_assets "crypto"; }
-    run_parallel_groups \
-      yahoo_crypto run_market_cex_yahoo_crypto \
-      cex_perp run_cex_incremental
+    run_cex_incremental
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_CEX="$cex_date"
@@ -646,14 +638,14 @@ run_once_cycle() {
   cycle_start="$(date +%s)"
   log "cycle=${cycle_id} start mode=${RUN_MODE} root=${ROOT_DIR}"
 
-  run_once_audit() { run_data_quality_audit "$cycle_id"; }
   run_parallel_groups \
     yahoo run_yahoo_incremental \
     tw_public run_tw_public_data_update \
     frankfurter run_frankfurter_incremental \
     pepperstone run_pepperstone_incremental \
-    cex run_cex_incremental \
-    audit run_once_audit
+    cex run_cex_incremental
+
+  run_data_quality_audit "$cycle_id" || true
 
   cycle_end="$(date +%s)"
   cycle_elapsed="$((cycle_end - cycle_start))"
