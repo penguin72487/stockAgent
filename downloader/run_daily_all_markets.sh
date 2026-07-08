@@ -37,6 +37,7 @@ REPAIR_OVERLAP_DAYS="${REPAIR_OVERLAP_DAYS:-7}"
 DAILY_STALE_MAX_LAG_DAYS="${DAILY_STALE_MAX_LAG_DAYS:-14}"
 PRECHECK_FILE_TIMEOUT_SECONDS="${PRECHECK_FILE_TIMEOUT_SECONDS:-20}"
 REPAIR_SYMBOL_TIMEOUT_SECONDS="${REPAIR_SYMBOL_TIMEOUT_SECONDS:-90}"
+YAHOO_RATE_LIMIT_ABORT_AFTER="${YAHOO_RATE_LIMIT_ABORT_AFTER:-20}"
 YAHOO_DAILY_DISCOVER_SYMBOLS="${YAHOO_DAILY_DISCOVER_SYMBOLS:-1}"
 YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS="${YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS:-0}"
 YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS="${YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS:-0}"
@@ -58,7 +59,7 @@ BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
 RUN_YAHOO="${RUN_YAHOO:-1}"
-YAHOO_ASSETS="${YAHOO_ASSETS:-tw_stocks us_stocks crypto forex}"
+YAHOO_ASSETS="${YAHOO_ASSETS:-us_stocks crypto forex}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-0}"  # 0 disables timeout
 RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
 TW_PUBLIC_DATASETS="${TW_PUBLIC_DATASETS:-all}"
@@ -76,6 +77,8 @@ RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
 TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
 TW_PUBLIC_FEATURE_SYMBOLS_ROOT="${TW_PUBLIC_FEATURE_SYMBOLS_ROOT:-data_yahoo/tw_stocks}"
 TW_PUBLIC_MARKET_SYMBOL="${TW_PUBLIC_MARKET_SYMBOL:-__MARKET__}"
+RUN_TW_OFFICIAL_OHLCV_BACKFILL="${RUN_TW_OFFICIAL_OHLCV_BACKFILL:-1}"
+TW_OFFICIAL_BACKFILL_WORKERS="${TW_OFFICIAL_BACKFILL_WORKERS:-8}"
 RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-0}"
 AUDIT_ROOTS="${AUDIT_ROOTS:-data_yahoo/tw_stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
 AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
@@ -332,33 +335,6 @@ run_yahoo_incremental() {
     yahoo_flags+=(--no-include-us-delisted)
   fi
 
-  if [[ "${assets[*]}" == "tw_stocks us_stocks crypto forex" ]]; then
-    base_cmd=(
-      "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py
-      --mode daily-update
-      --asset all
-      --end-date "$today"
-      --workers "$WORKERS"
-      --asset-workers "$ASSET_WORKERS"
-      --retries "$RETRIES"
-      --repair-overlap-days "$REPAIR_OVERLAP_DAYS"
-      --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
-      --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
-      --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
-      "${yahoo_flags[@]}"
-    )
-    run_cmd=("${base_cmd[@]}")
-    if [[ "$YAHOO_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$YAHOO_STEP_TIMEOUT_SECONDS" -gt 0 ]]; then
-      if command -v timeout >/dev/null 2>&1; then
-        run_cmd=(timeout --signal=TERM --kill-after=30s "${YAHOO_STEP_TIMEOUT_SECONDS}" "${base_cmd[@]}")
-      else
-        log "timeout command not found; continue without yahoo timeout"
-      fi
-    fi
-    run_step "yahoo_all_daily_update" "${run_cmd[@]}" || rc=1
-    return "$rc"
-  fi
-
   for asset in "${assets[@]}"; do
     local yahoo_mode="daily-update"
     local step_suffix="daily_update"
@@ -378,6 +354,7 @@ run_yahoo_incremental() {
       --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
       --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
       --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
+      --rate-limit-abort-after "$YAHOO_RATE_LIMIT_ABORT_AFTER"
       "${yahoo_flags[@]}"
     )
 
@@ -511,6 +488,18 @@ run_tw_public_data_update() {
   fi
 
   run_step tw_public_data_daily_update "${cmd[@]}" || rc=1
+
+  if [[ "$RUN_TW_OFFICIAL_OHLCV_BACKFILL" == "1" ]]; then
+    backfill_cmd=(
+      "$PYTHON_BIN" downloader/backfill_tw_public_to_yahoo.py
+      --input-dir "$TW_PUBLIC_OUTPUT_DIR"
+      --symbols-root "$TW_PUBLIC_FEATURE_SYMBOLS_ROOT"
+      --workers "$TW_OFFICIAL_BACKFILL_WORKERS"
+    )
+    run_step tw_official_ohlcv_to_yahoo_backfill "${backfill_cmd[@]}" || rc=1
+  else
+    log "skip=tw_official_ohlcv_to_yahoo_backfill reason=RUN_TW_OFFICIAL_OHLCV_BACKFILL=${RUN_TW_OFFICIAL_OHLCV_BACKFILL}"
+  fi
 
   if [[ "$RUN_TW_PUBLIC_FEATURES" == "1" ]]; then
     feature_cmd=(

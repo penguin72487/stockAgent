@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-abs-delta", type=float, default=None)
     parser.add_argument("--signal-id", default=None)
     parser.add_argument("--write", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--previous-signal-backfill-limit",
+        type=int,
+        default=None,
+        help="Maximum recursive prior daily signals to generate when live weights are behind.",
+    )
     parser.add_argument("--json", action="store_true", help="Print summary JSON instead of Discord message.")
     return parser.parse_args()
 
@@ -62,6 +68,7 @@ def main() -> None:
         "min_abs_delta": args.min_abs_delta,
         "signal_id": args.signal_id,
         "write": args.write,
+        "previous_signal_backfill_limit": args.previous_signal_backfill_limit,
     }
     if args.market_config:
         market_cfg = load_market_config(args.market_config)

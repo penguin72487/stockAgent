@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import math
 import os
+import re
 import signal as signal_module
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -42,6 +47,7 @@ try:
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit("discord.py is required. Install with: pip install discord.py>=2.4") from exc
 
+from downloader.status import command_asset, command_option, first_download_failure
 from stockagent.live.market_config import LiveMarketConfig, load_market_configs
 from stockagent.live.market_status import MarketRuntimeStatus, runtime_status
 from stockagent.config import load_config
@@ -136,7 +142,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raw = _env(name)
     if raw is None:
         return bool(default)
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _public_broadcasts_enabled() -> bool:
+    return _env_bool("STOCKAGENT_PUBLIC_BROADCASTS", False)
 
 
 def _state() -> dict[str, Any]:
@@ -174,6 +184,7 @@ def _set_market_state(market: str, **values: Any) -> None:
         markets[str(market)] = entry
     entry.update(values)
     _write_state(state)
+    _clear_runtime_status_cache()
 
 
 def _normalize_watch_symbol(symbol: Any) -> str:
@@ -247,6 +258,26 @@ def _remove_user_watch_symbol(user_id: Any, market: str, symbol: Any) -> list[st
     normalized = _normalize_watch_symbol(symbol)
     items = [item for item in _user_watchlist(user_id, market) if item != normalized]
     return _set_user_watchlist(user_id, market, items)
+
+
+def _replace_user_watch_symbol(user_id: Any, market: str, old_symbol: Any, new_symbol: Any) -> list[str]:
+    old_normalized = _normalize_watch_symbol(old_symbol)
+    new_normalized = _normalize_watch_symbol(new_symbol)
+    if not old_normalized or not new_normalized:
+        raise BotUserError("update 需要提供 symbol 舊代號與 new_symbol 新代號。")
+    items = _user_watchlist(user_id, market)
+    replaced = False
+    out: list[str] = []
+    for item in items:
+        if item == old_normalized:
+            if new_normalized not in out:
+                out.append(new_normalized)
+            replaced = True
+        elif item not in out:
+            out.append(item)
+    if not replaced and new_normalized not in out:
+        out.append(new_normalized)
+    return _set_user_watchlist(user_id, market, out)
 
 
 def _clear_user_watchlist(user_id: Any, market: str) -> list[str]:
@@ -377,6 +408,19 @@ def _market_summary_time(cfg: LiveMarketConfig) -> str | None:
     return str(value) if value else None
 
 
+def _market_artifact_backfill_time(cfg: LiveMarketConfig) -> str | None:
+    entry = _market_state(cfg.market)
+    value = (
+        entry.get("artifact_backfill_time")
+        or entry.get("backfill_time")
+        or cfg.data_ready_time
+        or cfg.close_time
+        or cfg.summary_time
+        or cfg.schedule_time
+    )
+    return str(value) if value else None
+
+
 def _market_initial_capital(cfg: LiveMarketConfig) -> float | None:
     entry = _market_state(cfg.market)
     return positive_float_or_none(entry.get("initial_capital")) or positive_float_or_none(getattr(cfg, "initial_capital", None))
@@ -431,7 +475,7 @@ def _markets_dir() -> Path:
 
 
 def _market_configs() -> dict[str, LiveMarketConfig]:
-    configs = load_market_configs(_markets_dir())
+    configs = _market_configs_cached(str(_markets_dir()))
     if configs:
         return configs
 
@@ -453,6 +497,11 @@ def _market_configs() -> dict[str, LiveMarketConfig]:
         min_abs_delta=_env_float("STOCKAGENT_MIN_ABS_DELTA", 0.001),
     )
     return {fallback.market: fallback}
+
+
+@lru_cache(maxsize=8)
+def _market_configs_cached(markets_dir: str) -> dict[str, LiveMarketConfig]:
+    return load_market_configs(Path(markets_dir))
 
 
 def _default_market() -> str:
@@ -497,16 +546,18 @@ def _latest_checkpoint(output_dir: str | None) -> Path | None:
 
 
 def _market_model_checkpoint(cfg: LiveMarketConfig) -> Path | None:
-    explicit = _resolve_repo_path(cfg.checkpoint_path)
+    explicit = _resolve_repo_path(getattr(cfg, "checkpoint_path", None))
     if explicit is not None:
         return explicit if explicit.exists() else None
-    if cfg.fold_id is not None and cfg.output_dir:
-        path = _resolve_repo_path(cfg.output_dir)
+    fold_id = getattr(cfg, "fold_id", None)
+    output_dir = getattr(cfg, "output_dir", None)
+    if fold_id is not None and output_dir:
+        path = _resolve_repo_path(output_dir)
         if path is None:
             return None
-        checkpoint = path / f"fold_{int(cfg.fold_id):02d}" / "checkpoint_best.pt"
+        checkpoint = path / f"fold_{int(fold_id):02d}" / "checkpoint_best.pt"
         return checkpoint if checkpoint.exists() else None
-    return _latest_checkpoint(cfg.output_dir)
+    return _latest_checkpoint(output_dir)
 
 
 def _market_fold_dir(cfg: LiveMarketConfig) -> Path:
@@ -521,18 +572,50 @@ def _market_has_model(cfg: LiveMarketConfig) -> bool:
 
 
 def _unsupported_message(cfg: LiveMarketConfig) -> str:
-    if cfg.unsupported_message:
-        return cfg.unsupported_message
-    return f"**{cfg.label}** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
+    message = getattr(cfg, "unsupported_message", None)
+    if message:
+        return str(message)
+    label = getattr(cfg, "label", None) or getattr(cfg, "market", "market")
+    return f"**{label}** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
 
 
 def _runtime_status(cfg: LiveMarketConfig) -> MarketRuntimeStatus:
     return runtime_status(cfg, root=ROOT, enabled_override=_market_enabled(cfg))
 
 
+_RUNTIME_STATUS_CACHE: dict[str, tuple[float, MarketRuntimeStatus]] = {}
+
+
+def _clear_runtime_status_cache() -> None:
+    _RUNTIME_STATUS_CACHE.clear()
+
+
+def _runtime_status_for_display(cfg: LiveMarketConfig) -> MarketRuntimeStatus:
+    ttl = _env_float("STOCKAGENT_STATUS_CACHE_SECONDS", 15.0)
+    if ttl <= 0:
+        return _runtime_status(cfg)
+    key = str(cfg.market)
+    now = time.monotonic()
+    cached = _RUNTIME_STATUS_CACHE.get(key)
+    if cached is not None and now - cached[0] <= ttl:
+        return cached[1]
+    status = _runtime_status(cfg)
+    _RUNTIME_STATUS_CACHE[key] = (now, status)
+    return status
+
+
 def _ensure_signal_ready(cfg: LiveMarketConfig, *, scheduled: bool = False) -> MarketRuntimeStatus:
     del scheduled
     status = _runtime_status(cfg)
+    if not status.enabled:
+        raise MarketDisabledError(cfg)
+    if status.checkpoint is None:
+        raise MarketUnsupportedError(cfg)
+    return status
+
+
+def _ensure_signal_ready_cached(cfg: LiveMarketConfig) -> MarketRuntimeStatus:
+    status = _runtime_status_for_display(cfg)
     if not status.enabled:
         raise MarketDisabledError(cfg)
     if status.checkpoint is None:
@@ -549,6 +632,18 @@ def _data_freshness_notice(status: MarketRuntimeStatus) -> str | None:
     return (
         f"資料提醒：latest=`{latest}` expected=`{expected}` reason=`{reason}`；"
         "仍會產生訊號，請確認資料來源後再交易。"
+    )
+
+
+def _require_fresh_data_for_artifact_generation(cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> None:
+    if status.data.fresh:
+        return
+    latest = _display_cfg_time(status.cfg, status.data.last_data_date or status.data.panel_date or "n/a")
+    expected = _display_cfg_time(status.cfg, status.data.expected_latest_date or "n/a")
+    reason = status.data.reason or "data freshness check failed"
+    raise BotUserError(
+        f"`{cfg.market}` data is stale after update; latest=`{latest}` expected=`{expected}` "
+        f"reason=`{reason}`. 已停止生成訊號，避免用舊 panel。"
     )
 
 
@@ -608,7 +703,7 @@ def _scheduled_markets() -> list[str]:
         if any(item.lower() in {"all", "*"} for item in items):
             return sorted(_market_configs())
         return items
-    return [_default_market()]
+    return sorted(_market_configs())
 
 
 def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
@@ -629,23 +724,80 @@ def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
     return f"{now.strftime('%Y-%m-%d')}:{cfg.market}"
 
 
+def _artifact_backfill_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
+    if _market_schedule_interval_minutes(cfg) is not None:
+        return None
+    backfill_time = _market_artifact_backfill_time(cfg)
+    if not backfill_time or now.strftime("%H:%M") != backfill_time:
+        return None
+    return f"{now.strftime('%Y-%m-%d')}:{cfg.market}:artifact_backfill"
+
+
+def _scheduled_retry_delay_seconds() -> int:
+    return max(1, _env_int("STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS", 60) or 60)
+
+
+def _scheduled_retry_allowed(retry_after: dict[str, float], key: str) -> bool:
+    return time.monotonic() >= float(retry_after.get(key, 0.0) or 0.0)
+
+
+def _mark_scheduled_retry(retry_after: dict[str, float], key: str) -> None:
+    retry_after[key] = time.monotonic() + float(_scheduled_retry_delay_seconds())
+
+
+def _clear_scheduled_retry(retry_after: dict[str, float], key: str) -> None:
+    retry_after.pop(key, None)
+
+
 def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
     if not cfg.pre_signal_command:
         return
     command = [str(item) for item in cfg.pre_signal_command]
     started = datetime.now().astimezone().isoformat(timespec="seconds")
+    timeout_seconds = max(1, int(cfg.pre_signal_timeout_seconds))
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    stdout_tail_chunks: list[bytes] = []
+
+    def remember_tail(chunk: bytes) -> None:
+        stdout_tail_chunks.append(chunk)
+        while sum(len(item) for item in stdout_tail_chunks) > 4000:
+            stdout_tail_chunks.pop(0)
+
+    print(f"[pre-signal:{cfg.market}] start command={' '.join(command)} timeout={timeout_seconds}s", flush=True)
+    proc = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+
+    def stream_output() -> None:
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                remember_tail(chunk)
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+        except Exception as exc:
+            _log_exception(f"pre_signal_stream:{cfg.market}", exc)
+
+    stream_thread = threading.Thread(target=stream_output, name=f"pre-signal-{cfg.market}", daemon=True)
+    stream_thread.start()
     try:
-        result = subprocess.run(
-            command,
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            timeout=max(1, int(cfg.pre_signal_timeout_seconds)),
-            check=False,
-        )
+        returncode = proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        stream_thread.join(timeout=5)
         _log_exception(f"pre_signal_command:{cfg.market}", exc)
         raise BotUserError(f"`{cfg.market}` pre-signal data update timed out after {cfg.pre_signal_timeout_seconds}s")
+    stream_thread.join(timeout=5)
+    stdout_tail = b"".join(stdout_tail_chunks)[-4000:].decode("utf-8", errors="replace")
     log_path = ROOT / "artifacts" / "discord_bot" / "pre_signal_commands.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
@@ -655,18 +807,69 @@ def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
                     "timestamp": started,
                     "market": cfg.market,
                     "command": command,
-                    "returncode": result.returncode,
-                    "stdout_tail": result.stdout[-4000:],
-                    "stderr_tail": result.stderr[-4000:],
+                    "returncode": returncode,
+                    "stdout_tail": stdout_tail,
+                    "stderr_tail": "",
                 },
                 ensure_ascii=False,
             )
             + "\n"
         )
-    if result.returncode != 0:
+    print(f"[pre-signal:{cfg.market}] done returncode={returncode} log={_display_path(log_path)}", flush=True)
+    if returncode != 0:
+        detail = _pre_signal_failure_detail(cfg, command, stdout_tail)
         raise BotUserError(
-            f"`{cfg.market}` pre-signal data update failed rc={result.returncode}; log=`{_display_path(log_path)}`"
+            f"`{cfg.market}` pre-signal data update failed rc={returncode}; "
+            f"{detail} log=`{_display_path(log_path)}`"
         )
+    _validate_pre_signal_download_artifacts(cfg, command, log_path)
+
+
+def _pre_signal_failure_detail(cfg: LiveMarketConfig, command: list[str], stdout_tail: str) -> str:
+    asset = command_asset(command)
+    output_root = command_option(command, "--output-root")
+    if asset and output_root:
+        root = _resolve_repo_path(output_root) or Path(output_root)
+        for name in ("download_report.csv", "repair_report.csv"):
+            path = root / asset / name
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        status = str(row.get("status") or "").strip().lower()
+                        message = str(row.get("message") or "").strip()
+                        if status == "failed" and message:
+                            return f"report=`{_display_path(path)}` reason=`{message[:220]}`;"
+            except Exception:
+                continue
+    failure = first_download_failure(
+        command=command,
+        market=cfg.market,
+        market_type=getattr(cfg, "market_type", None),
+        resolve_path=_resolve_repo_path,
+    )
+    if failure is not None:
+        path, reason = failure
+        return f"summary=`{_display_path(path)}` reason=`{reason}`;"
+    tail = " ".join(str(stdout_tail or "").split())[-220:]
+    return f"tail=`{tail}`;" if tail else ""
+
+
+def _validate_pre_signal_download_artifacts(cfg: LiveMarketConfig, command: list[str], log_path: Path) -> None:
+    failure = first_download_failure(
+        command=command,
+        market=cfg.market,
+        market_type=getattr(cfg, "market_type", None),
+        resolve_path=_resolve_repo_path,
+    )
+    if failure is None:
+        return
+    path, reason = failure
+    raise BotUserError(
+        f"`{cfg.market}` data update did not produce usable data ({reason}); "
+        f"summary=`{_display_path(path)}` log=`{_display_path(log_path)}`"
+    )
 
 
 def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus, requested: str | None) -> str | None:
@@ -688,11 +891,14 @@ def _prepare_realtime_signal_sync(
     requested_price_source: str | None = "auto",
     force_refresh: bool = False,
 ) -> tuple[str | None, MarketRuntimeStatus, bool]:
-    status = _runtime_status(cfg)
-    should_refresh = bool(force_refresh or status.market_open)
+    status = _ensure_signal_ready(cfg)
+    should_refresh = bool(force_refresh or _market_schedule_interval_minutes(cfg) is not None)
     if should_refresh:
         _run_pre_signal_command(cfg)
+        _clear_runtime_status_cache()
         status = _runtime_status(cfg)
+        if not status.data.fresh:
+            _require_fresh_data_for_artifact_generation(cfg, status)
     return _auto_signal_price_source(cfg, status, requested_price_source), status, should_refresh
 
 
@@ -724,12 +930,14 @@ def _signal_kwargs(
 ) -> dict:
     cfg = _resolve_market(market)
     status = _ensure_signal_ready(cfg, scheduled=scheduled)
+    backfill_limit = max(0, _env_int("STOCKAGENT_SIGNAL_BACKFILL_LIMIT", 32) or 32)
     overrides = {
         "price_source": price_source if price_source and price_source != "auto" else None,
         "top_n": top_n,
         "min_abs_delta": min_abs_delta,
         "signal_id": signal_id,
         "market_notice": _market_notice(status),
+        "previous_signal_backfill_limit": backfill_limit,
         "progress_callback": progress_callback,
         "progress_label": progress_label,
     }
@@ -739,12 +947,18 @@ def _signal_kwargs(
 async def _send_command_error(interaction: discord.Interaction, prefix: str, exc: Exception) -> None:
     if isinstance(exc, BotUserError):
         _log_exception(prefix, exc)
-        await interaction.followup.send(str(exc))
+        try:
+            await interaction.followup.send(str(exc))
+        except discord.HTTPException as send_exc:
+            _log_exception(f"{prefix}:error_response", send_exc)
         return
     _log_exception(prefix, exc)
-    await interaction.followup.send(
-        f"{prefix} failed: `{type(exc).__name__}`。詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
-    )
+    try:
+        await interaction.followup.send(
+            f"{prefix} failed: `{type(exc).__name__}`。詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
+        )
+    except discord.HTTPException as send_exc:
+        _log_exception(f"{prefix}:error_response", send_exc)
 
 
 class StockAgentBot(discord.Client):
@@ -757,12 +971,19 @@ class StockAgentBot(discord.Client):
         self.channel_id = _env_int("DISCORD_CHANNEL_ID")
         self._last_scheduled_keys: set[str] = set()
         self._last_daily_summary_keys: set[str] = set()
+        self._last_artifact_backfill_keys: set[str] = set()
+        self._scheduled_retry_after: dict[str, float] = {}
+        self._daily_summary_retry_after: dict[str, float] = {}
+        self._artifact_backfill_retry_after: dict[str, float] = {}
+        self._signal_now_background_tasks: dict[str, asyncio.Task[None]] = {}
+        self._signal_now_background_waiters: dict[str, set[int]] = {}
         self._synced_guild_id: int | None = None
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
         scheduled_signal.start()
         daily_summary.start()
+        artifact_backfill.start()
 
     async def on_ready(self) -> None:
         print(f"logged in as {self.user} signal_time={self.signal_time} channel_id={self.channel_id}", flush=True)
@@ -1046,7 +1267,7 @@ def _performance_window_label(cfg: LiveMarketConfig, recent: dict[str, Any]) -> 
     frequency = str(getattr(cfg, "history_frequency", "daily") or "").strip().lower()
     if frequency in {"bar", "bars", "intraday", "15m", "15min", "15minute", "15minutes"}:
         try:
-            market_cfg = load_config(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path))
+            market_cfg = _load_experiment_config_cached(str(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path)))
             trading_frequency = str(getattr(market_cfg.trading, "frequency", "") or "").strip()
         except Exception:
             trading_frequency = ""
@@ -1133,20 +1354,28 @@ def _refresh_summary_recent_performance_from_history(
     if days <= 0:
         return
     try:
-        history = _load_portfolio_history_for_market(
-            cfg,
-            days,
-            0,
-            0.0,
-            None,
-            capital,
-        )
+        recent_fast = _recent_performance_from_returns(cfg, days, capital=capital)
+    except MarketUnsupportedError:
+        recent_fast = None
     except Exception as exc:
         _log_exception(f"recent_performance_history:{cfg.market}", exc)
-        return
-    recent: dict[str, Any] = dict(raw_recent) if isinstance(raw_recent, dict) else {}
-    recent.update(
-        {
+        recent_fast = None
+    if recent_fast is None:
+        try:
+            history = _load_portfolio_history_for_market(
+                cfg,
+                days,
+                0,
+                0.0,
+                None,
+                capital,
+            )
+        except MarketUnsupportedError:
+            return
+        except Exception as exc:
+            _log_exception(f"recent_performance_history_fallback:{cfg.market}", exc)
+            return
+        recent_fast = {
             "window_days": int(history.days),
             "strategy_return": history.period_return,
             "benchmark_return": history.benchmark_return,
@@ -1159,17 +1388,142 @@ def _refresh_summary_recent_performance_from_history(
             "start_date": history.start_date,
             "end_date": history.end_date,
         }
-    )
+        if capital is not None:
+            for source_key, target_key in (
+                ("strategy_return", "strategy_pnl_value"),
+                ("benchmark_return", "benchmark_pnl_value"),
+                ("excess_return", "excess_pnl_value"),
+            ):
+                value = _float_or_none(recent_fast.get(source_key))
+                if value is not None:
+                    recent_fast[target_key] = value * float(capital)
+    recent: dict[str, Any] = dict(raw_recent) if isinstance(raw_recent, dict) else {}
+    recent.update(recent_fast)
+    summary["recent_performance"] = recent
+
+
+def _returns_artifact_path(fold_dir: Path) -> Path | None:
+    for name in ("daily_portfolio_returns.parquet", "daily_portfolio_returns.csv"):
+        path = fold_dir / name
+        if path.exists():
+            return path
+    return None
+
+
+def _history_sort_dt(value: Any) -> datetime:
+    return _history_datetime(value) or datetime.min
+
+
+def _compound_return_values(values: list[float | None]) -> float | None:
+    total = 1.0
+    seen = False
+    for value in values:
+        number = _float_or_none(value)
+        if number is None:
+            continue
+        total *= 1.0 + number
+        seen = True
+    return total - 1.0 if seen else None
+
+
+def _recent_performance_from_returns(
+    cfg: LiveMarketConfig,
+    periods: int,
+    *,
+    capital: float | None = None,
+) -> dict[str, Any] | None:
+    import polars as pl
+
+    try:
+        limit = max(1, int(periods))
+    except Exception:
+        limit = 32
+    fold_dir = _market_fold_dir(cfg)
+    path = _returns_artifact_path(fold_dir)
+    rows: list[dict[str, Any]] = []
+    source_paths: list[Path] = []
+    if path is not None:
+        source_paths.append(path)
+        columns = ["date", "portfolio_return", "benchmark_return"]
+        if path.suffix == ".parquet":
+            frame = pl.scan_parquet(path).select([pl.col(name) for name in columns if name]).tail(limit * 2).collect()
+        else:
+            frame = pl.read_csv(path, columns=columns, infer_schema_length=10000).tail(limit * 2)
+        for row in frame.select(columns).to_dicts():
+            rows.append(
+                {
+                    "date": str(row.get("date")),
+                    "portfolio_return": _float_or_none(row.get("portfolio_return")),
+                    "benchmark_return": _float_or_none(row.get("benchmark_return")),
+                    "source": "returns_artifact",
+                }
+            )
+
+    live_by_date: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for summary_path, summary in _recent_market_signal_metrics(cfg, max_summaries=max(limit * 4, 64)):
+        date_key = str(
+            summary.get("panel_data_date")
+            or summary.get("weights_date")
+            or summary.get("panel_date")
+            or summary.get("asof_date")
+            or ""
+        ).strip()
+        if not date_key:
+            continue
+        current = live_by_date.get(date_key)
+        if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:
+            live_by_date[date_key] = (summary_path, summary)
+    for summary_path, summary in live_by_date.values():
+        source_paths.append(summary_path)
+        rows.append(
+            {
+                "date": str(
+                    summary.get("panel_data_date")
+                    or summary.get("weights_date")
+                    or summary.get("panel_date")
+                    or summary.get("asof_date")
+                ),
+                "portfolio_return": _float_or_none(summary.get("portfolio_simple_return")),
+                "benchmark_return": _float_or_none(summary.get("benchmark_simple_return")),
+                "source": "live_signal_summary",
+            }
+        )
+
+    latest_by_date: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("date") or "").strip()
+        if not key:
+            continue
+        current = latest_by_date.get(key)
+        if current is None or str(row.get("source")) == "live_signal_summary":
+            latest_by_date[key] = row
+    selected = sorted(latest_by_date.values(), key=lambda row: _history_sort_dt(row.get("date")))[-limit:]
+    if not selected:
+        return None
+    strategy = _compound_return_values([_float_or_none(row.get("portfolio_return")) for row in selected])
+    benchmark = _compound_return_values([_float_or_none(row.get("benchmark_return")) for row in selected])
+    excess = None if strategy is None or benchmark is None else strategy - benchmark
+    out: dict[str, Any] = {
+        "window_days": len(selected),
+        "strategy_return": strategy,
+        "benchmark_return": benchmark,
+        "excess_return": excess,
+        "source": "returns_artifact_with_live_signals",
+        "start_date": str(selected[0].get("date")),
+        "end_date": str(selected[-1].get("date")),
+    }
+    if source_paths:
+        out["source_path"] = str(source_paths[0])
     if capital is not None:
         for source_key, target_key in (
             ("strategy_return", "strategy_pnl_value"),
             ("benchmark_return", "benchmark_pnl_value"),
             ("excess_return", "excess_pnl_value"),
         ):
-            value = _float_or_none(recent.get(source_key))
+            value = _float_or_none(out.get(source_key))
             if value is not None:
-                recent[target_key] = value * float(capital)
-    summary["recent_performance"] = recent
+                out[target_key] = value * float(capital)
+    return out
 
 
 def _annotate_weight_rows_with_capital(rows: list[dict[str, Any]], capital: float | None) -> list[dict[str, Any]]:
@@ -1243,7 +1597,7 @@ def _summary_with_capital_context(
 
 def _config_trading_limits(cfg: LiveMarketConfig) -> tuple[float | None, float | None]:
     try:
-        market_cfg = load_config(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path))
+        market_cfg = _load_experiment_config_cached(str(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path)))
     except Exception:
         return None, None
     gross = _float_or_none(getattr(market_cfg.trading, "gross_leverage", None))
@@ -1630,7 +1984,7 @@ def _health_lines(market: str = "") -> list[str]:
     configs = _market_configs()
     if market:
         cfg = _resolve_market(market)
-        status = _runtime_status(cfg)
+        status = _runtime_status_for_display(cfg)
         return [
             "**stockAgent bot health**",
             f"markets=`{', '.join(sorted(configs))}` default=`{_default_market()}`",
@@ -1648,7 +2002,7 @@ def _health_lines(market: str = "") -> list[str]:
         f"markets=`{', '.join(sorted(configs))}` default=`{_default_market()}`",
     ]
     for key, cfg in sorted(configs.items()):
-        lines.append(_status_line(key, cfg, _runtime_status(cfg)))
+        lines.append(_status_line(key, cfg, _runtime_status_for_display(cfg)))
     return lines
 
 
@@ -1656,7 +2010,7 @@ def _markets_lines() -> list[str]:
     lines = ["**stockAgent markets**"]
     for key, cfg in sorted(_market_configs().items()):
         fold = cfg.fold_id if cfg.fold_id is not None else "latest"
-        runtime = _runtime_status(cfg)
+        runtime = _runtime_status_for_display(cfg)
         lines.append(
             f"`{key}` {cfg.label} status=`{runtime.status}` enabled=`{runtime.enabled}` "
             f"data=`{_display_cfg_time(cfg, runtime.data.last_data_date or 'n/a')}` schedule=`{_market_schedule_time(cfg)}` "
@@ -1682,15 +2036,26 @@ def _find_signal_summary(signal_id: str) -> tuple[Path, dict[str, Any]] | None:
             continue
         seen.add(root)
         for path in sorted(root.glob("**/summary.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            quick_signal_id = path.parent.name if path.parent.name == target else _summary_signal_id_fast(path)
+            if quick_signal_id != target:
+                continue
             try:
                 summary = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if not isinstance(summary, dict):
-                continue
-            if str(summary.get("signal_id") or "") == target or path.parent.name == target:
+            if isinstance(summary, dict):
                 return path, summary
     return None
+
+
+def _summary_signal_id_fast(path: Path) -> str | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            text = handle.read(64 * 1024)
+    except Exception:
+        return None
+    value = _summary_scalar_from_text(text, "signal_id")
+    return str(value) if value is not None else None
 
 
 def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] | None:
@@ -1705,6 +2070,111 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
         if isinstance(summary, dict):
                 return path, summary
     return None
+
+
+def _summary_date_matches(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return str(left).replace("T", " ").strip()[:10] == str(right).replace("T", " ").strip()[:10]
+
+
+def _signal_now_open_cache_seconds() -> float:
+    return max(0.0, _env_float("STOCKAGENT_SIGNAL_NOW_OPEN_CACHE_SECONDS", 60.0))
+
+
+def _summary_age_seconds(summary: dict[str, Any], cfg: LiveMarketConfig) -> float | None:
+    raw = summary.get("generated_at") or summary.get("asof_date")
+    dt = _history_datetime(raw)
+    if dt is None:
+        return None
+    try:
+        now = datetime.now(ZoneInfo(cfg.display_timezone or cfg.timezone or "Asia/Taipei")).replace(tzinfo=None)
+    except Exception:
+        now = datetime.now()
+    return max(0.0, (now - dt).total_seconds())
+
+
+def _can_reuse_latest_signal_now(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    summary: dict[str, Any],
+    *,
+    requested_price_source: str,
+) -> tuple[bool, str | None]:
+    requested = str(requested_price_source or "auto").strip().lower()
+    summary_price = str(summary.get("price_source") or "").strip().lower()
+    summary_date = _summary_data_date_key(summary)
+    if status.market_open:
+        if requested not in {"", "auto", "yahoo"}:
+            return False, None
+        if not summary_price.startswith("yahoo"):
+            return False, None
+        ttl = _signal_now_open_cache_seconds()
+        age = _summary_age_seconds(summary, cfg)
+        if ttl <= 0 or age is None or age > ttl:
+            return False, None
+        return True, f"cached_open_yahoo_age={age:.0f}s"
+
+    if requested not in {"", "auto", "panel"}:
+        return False, None
+    if not status.data.fresh:
+        return False, None
+    latest_data_date = getattr(status.data, "last_data_date", None) or getattr(status.data, "panel_date", None)
+    if not _summary_date_matches(summary_date, latest_data_date):
+        return False, None
+    if summary_price and not (summary_price.startswith("panel") or summary_price in {"close", "panel_close"}):
+        return False, None
+    return True, "cached_latest_close"
+
+
+def _latest_signal_result_from_artifacts(
+    cfg: LiveMarketConfig,
+    summary_path: Path,
+    summary: dict[str, Any],
+    *,
+    top_n: int,
+    current_capital: float | None = None,
+    debug: bool = False,
+):
+    enriched = _summary_with_capital_context(cfg, dict(summary), current_capital=current_capital)
+    message = _latest_signal_message(cfg, summary_path, enriched, top_n=top_n, current_capital=current_capital, debug=debug)
+    return SimpleNamespace(
+        summary=enriched,
+        weights_rows=_latest_artifact_rows(enriched, summary_path, "weights_path", "top_positions"),
+        rebalance_rows=_latest_artifact_rows(enriched, summary_path, "rebalance_path", "rebalance"),
+        decision_rows=_latest_artifact_rows(enriched, summary_path, "decision_explanation_path", "decision_explanations"),
+        message=message,
+        output_dir=str(summary_path.parent),
+    )
+
+
+def _signal_now_cached_result(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    *,
+    requested_price_source: str,
+    top_n: int,
+    debug: bool = False,
+):
+    latest = _latest_market_signal(cfg)
+    if latest is None:
+        return None
+    summary_path, summary = latest
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg,
+        status,
+        summary,
+        requested_price_source=requested_price_source,
+    )
+    if not reusable:
+        return None
+    result = _latest_signal_result_from_artifacts(cfg, summary_path, summary, top_n=top_n, debug=debug)
+    result.summary["signal_now_cache"] = reason
+    return summary_path, result, reason
+
+
+def _signal_now_should_refresh_data(status: MarketRuntimeStatus, *, refresh_data: bool) -> bool:
+    return bool(refresh_data or not bool(getattr(status.data, "fresh", False)))
 
 
 def _market_signals(cfg: LiveMarketConfig) -> list[tuple[Path, dict[str, Any]]]:
@@ -1722,6 +2192,72 @@ def _market_signals(cfg: LiveMarketConfig) -> list[tuple[Path, dict[str, Any]]]:
     return signals
 
 
+def _recent_market_signals(cfg: LiveMarketConfig, *, max_summaries: int) -> list[tuple[Path, dict[str, Any]]]:
+    root = _resolve_repo_path(cfg.live_output_dir)
+    if root is None or not root.exists():
+        return []
+    try:
+        limit = max(1, int(max_summaries))
+    except Exception:
+        limit = 128
+    paths = sorted(root.glob("**/summary.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]
+    signals: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        try:
+            summary = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(summary, dict):
+            signals.append((path, summary))
+    return list(reversed(signals))
+
+
+_SUMMARY_SCALAR_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _summary_scalar_from_text(text: str, key: str) -> Any:
+    pattern = _SUMMARY_SCALAR_PATTERN_CACHE.get(key)
+    if pattern is None:
+        pattern = re.compile(rf'"{re.escape(key)}"\s*:\s*(".*?"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|null)')
+        _SUMMARY_SCALAR_PATTERN_CACHE[key] = pattern
+    match = pattern.search(text)
+    if match is None:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except Exception:
+        return None
+
+
+def _read_summary_metric_fields(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            text = handle.read(256 * 1024)
+    except Exception:
+        return {}
+    keys = (
+        "panel_data_date",
+        "weights_date",
+        "panel_date",
+        "asof_date",
+        "portfolio_simple_return",
+        "benchmark_simple_return",
+    )
+    return {key: _summary_scalar_from_text(text, key) for key in keys}
+
+
+def _recent_market_signal_metrics(cfg: LiveMarketConfig, *, max_summaries: int) -> list[tuple[Path, dict[str, Any]]]:
+    root = _resolve_repo_path(cfg.live_output_dir)
+    if root is None or not root.exists():
+        return []
+    try:
+        limit = max(1, int(max_summaries))
+    except Exception:
+        limit = 128
+    paths = sorted(root.glob("**/summary.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]
+    return [(path, _read_summary_metric_fields(path)) for path in reversed(paths)]
+
+
 def _sync_latest_live_weights_to_market_artifact(cfg: LiveMarketConfig) -> str | None:
     latest = _latest_market_signal(cfg)
     if latest is None:
@@ -1736,6 +2272,50 @@ def _sync_latest_live_weights_to_market_artifact(cfg: LiveMarketConfig) -> str |
     except Exception as exc:
         _log_exception(f"sync_live_weights:{cfg.market}", exc)
         return None
+
+
+def _summary_data_date_key(summary: dict[str, Any]) -> str | None:
+    for key in ("weights_date", "panel_data_date", "panel_date", "asof_date"):
+        raw = summary.get(key)
+        if raw:
+            text = str(raw).replace("T", " ").strip()
+            return text[:10] if len(text) >= 10 else text
+    return None
+
+
+def _market_has_live_signal_for_date(cfg: LiveMarketConfig, date_text: str | None) -> bool:
+    if not date_text:
+        return False
+    target = str(date_text).replace("T", " ").strip()[:10]
+    if not target:
+        return False
+    for _, summary in _recent_market_signal_metrics(cfg, max_summaries=128):
+        if _summary_data_date_key(summary) == target:
+            return True
+    return False
+
+
+def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | None:
+    status = _ensure_signal_ready(cfg)
+    _run_pre_signal_command(cfg)
+    status = _runtime_status(cfg)
+    _require_fresh_data_for_artifact_generation(cfg, status)
+    target_date = status.data.expected_latest_date or status.data.last_data_date or status.data.panel_date
+    if _market_has_live_signal_for_date(cfg, target_date):
+        _sync_latest_live_weights_to_market_artifact(cfg)
+        return None
+    progress_label = f"backfill:{cfg.market}"
+    progress_callback = _ConsoleProgress(prefix=progress_label) if _env_bool("STOCKAGENT_BOT_PROGRESS", True) else None
+    result = generate_live_signal(
+        **cfg.signal_kwargs(
+            price_source="panel",
+            market_notice=_market_notice(status),
+            progress_callback=progress_callback,
+            progress_label=progress_label,
+        )
+    )
+    _sync_latest_live_weights_to_market_artifact(cfg)
+    return result
 
 
 def _summary_artifact_path(summary: dict[str, Any], key: str, summary_path: Path | None = None) -> Path | None:
@@ -1954,7 +2534,11 @@ def _performance_message(
                 )
             )
     try:
-        window = _load_portfolio_history_for_market(cfg, days, 0, 0.0, None, current_capital) if int(days or 0) > 0 else None
+        window = _recent_performance_from_returns(
+            cfg,
+            int(days or 0),
+            capital=_resolve_current_capital(cfg, current_capital=current_capital),
+        ) if int(days or 0) > 0 else None
     except Exception as exc:
         window = None
         if debug:
@@ -1963,12 +2547,12 @@ def _performance_message(
         lines.extend(
             [
                 "",
-                f"**artifact history {window.days} periods**",
+                f"**artifact history {window.get('window_days', 'n')} periods**",
                 _kv_line(
-                    ("period", f"{window.start_date}..{window.end_date}"),
-                    ("strategy", _signed_pct(window.period_return)),
-                    ("baseline", _signed_pct(window.benchmark_return)),
-                    ("profit", _signed_money(window.profit_value)),
+                    ("period", f"{window.get('start_date')}..{window.get('end_date')}"),
+                    ("strategy", _signed_pct(window.get("strategy_return"))),
+                    ("baseline", _signed_pct(window.get("benchmark_return"))),
+                    ("profit", _signed_money(window.get("strategy_pnl_value"))),
                 ),
             ]
         )
@@ -2140,6 +2724,130 @@ async def _send_subscription_notifications(cfg: LiveMarketConfig, result: Any) -
             _log_exception(f"subscription_notify:{cfg.market}:{user_id}", exc)
 
 
+def _signal_now_background_key(
+    cfg: LiveMarketConfig,
+    *,
+    requested_price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    debug: bool,
+) -> str:
+    source = str(requested_price_source or "auto").strip().lower() or "auto"
+    return f"{cfg.market}:{source}:{int(top_n)}:{float(min_abs_delta):.8g}:{int(bool(debug))}"
+
+
+async def _send_signal_now_background_failure(user_ids: set[int], cfg: LiveMarketConfig, exc: Exception) -> None:
+    _log_exception(f"signal_now_background:{cfg.market}", exc)
+    text = (
+        f"`{cfg.market}` 背景資料更新/推論失敗: `{type(exc).__name__}`。\n"
+        f"詳細 traceback 已寫入 `{ERROR_LOG_PATH}`。"
+    )
+    for user_id in sorted(user_ids):
+        try:
+            user = await bot.fetch_user(int(user_id))
+            await user.send(text)
+        except Exception as send_exc:
+            _log_exception(f"signal_now_background_failure_dm:{cfg.market}:{user_id}", send_exc)
+
+
+async def _run_signal_now_background_refresh(
+    key: str,
+    *,
+    market: str,
+    requested_price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    debug: bool,
+) -> None:
+    cfg = _resolve_market(market)
+    try:
+        resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
+            _prepare_realtime_signal_sync,
+            cfg,
+            requested_price_source=requested_price_source,
+            force_refresh=True,
+        )
+        await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
+        result = await _run_market_signal(
+            market=cfg.market,
+            price_source=resolved_price_source,
+            top_n=top_n,
+            min_abs_delta=min_abs_delta,
+            progress_label=f"signal_now:bg:{cfg.market}",
+        )
+        result = _enrich_signal_performance_for_discord(cfg, result, max_rows=0, debug=debug)
+        sanity_issues = _signal_sanity_issues(cfg, result.summary)
+        if sanity_issues:
+            result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
+        waiters = set(bot._signal_now_background_waiters.get(key, set()))
+        if not waiters:
+            return
+        header = (
+            f"`{cfg.market}` 背景更新完成，以下是最新 signal_now。\n"
+            f"auto_refreshed=`{bool(auto_refreshed)}` price_source=`{resolved_price_source or 'config'}`"
+        )
+        for user_id in sorted(waiters):
+            try:
+                user = await bot.fetch_user(int(user_id))
+                content = f"{header}\n\n{result.message}"
+                await user.send(
+                    content if len(content) <= 1900 else content[:1900],
+                    view=SignalReviewView(
+                        signal_id=str(result.summary.get("signal_id")),
+                        market=str(result.summary.get("market") or cfg.market),
+                    ),
+                )
+                for pages in _scheduled_detail_page_groups(
+                    cfg,
+                    result,
+                    title_prefix="signal_now",
+                    include_decisions=True,
+                    debug=debug,
+                ):
+                    await _send_channel_pages(user, pages, timeout=24 * 60 * 60)
+            except Exception as send_exc:
+                _log_exception(f"signal_now_background_dm:{cfg.market}:{user_id}", send_exc)
+    except Exception as exc:
+        waiters = set(bot._signal_now_background_waiters.get(key, set()))
+        await _send_signal_now_background_failure(waiters, cfg, exc)
+    finally:
+        bot._signal_now_background_tasks.pop(key, None)
+        bot._signal_now_background_waiters.pop(key, None)
+
+
+def _enqueue_signal_now_background_refresh(
+    *,
+    user_id: int,
+    cfg: LiveMarketConfig,
+    requested_price_source: str,
+    top_n: int,
+    min_abs_delta: float,
+    debug: bool,
+) -> tuple[str, bool]:
+    key = _signal_now_background_key(
+        cfg,
+        requested_price_source=requested_price_source,
+        top_n=top_n,
+        min_abs_delta=min_abs_delta,
+        debug=debug,
+    )
+    bot._signal_now_background_waiters.setdefault(key, set()).add(int(user_id))
+    task = bot._signal_now_background_tasks.get(key)
+    if task is not None and not task.done():
+        return key, False
+    bot._signal_now_background_tasks[key] = asyncio.create_task(
+        _run_signal_now_background_refresh(
+            key,
+            market=cfg.market,
+            requested_price_source=requested_price_source,
+            top_n=top_n,
+            min_abs_delta=min_abs_delta,
+            debug=debug,
+        )
+    )
+    return key, True
+
+
 def _display_path(path: Path) -> str:
     try:
         return str(path.relative_to(ROOT))
@@ -2152,7 +2860,7 @@ def _market_symbol_names(cfg: LiveMarketConfig) -> dict[str, str]:
         parquet_root = _market_price_root(cfg)
         if parquet_root is None:
             return {}
-        return load_symbol_name_map(parquet_root)
+        return _symbol_name_map_cached(str(parquet_root))
     except Exception:
         return {}
 
@@ -2160,13 +2868,23 @@ def _market_symbol_names(cfg: LiveMarketConfig) -> dict[str, str]:
 def _market_price_root(cfg: LiveMarketConfig) -> Path | None:
     try:
         config_path = _resolve_repo_path(cfg.config_path) or Path(cfg.config_path)
-        config = load_config(config_path)
+        config = _load_experiment_config_cached(str(config_path))
         parquet_root = Path(config.data.parquet_root)
         if not parquet_root.is_absolute():
             parquet_root = ROOT / parquet_root
         return parquet_root
     except Exception:
         return None
+
+
+@lru_cache(maxsize=16)
+def _load_experiment_config_cached(config_path: str):
+    return load_config(Path(config_path))
+
+
+@lru_cache(maxsize=16)
+def _symbol_name_map_cached(parquet_root: str) -> dict[str, str]:
+    return load_symbol_name_map(Path(parquet_root))
 
 
 def _annotate_history_rows_with_display_time(cfg: LiveMarketConfig, rows: list[dict[str, Any]]) -> None:
@@ -2427,13 +3145,22 @@ def _include_live_signals_in_portfolio_history(
         return dt or datetime.min, str(path)
 
     latest_by_date: dict[str, tuple[Path, dict[str, Any]]] = {}
-    for summary_path, summary in _market_signals(cfg):
-        key = signal_date_key(summary)
-        if not key:
-            continue
-        current = latest_by_date.get(key)
-        if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:
-            latest_by_date[key] = (summary_path, summary)
+    scan_limit = max(max_rows * 4, max_rows + 16, 64)
+    recent_signals = _recent_market_signals(cfg, max_summaries=scan_limit)
+    if not recent_signals:
+        recent_signals = _market_signals(cfg)
+    def collect(signals: list[tuple[Path, dict[str, Any]]]) -> None:
+        for summary_path, summary in signals:
+            key = signal_date_key(summary)
+            if not key:
+                continue
+            current = latest_by_date.get(key)
+            if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:
+                latest_by_date[key] = (summary_path, summary)
+
+    collect(recent_signals)
+    if not latest_by_date:
+        collect(_market_signals(cfg))
 
     for summary_path, summary in sorted(latest_by_date.values(), key=signal_sort_key):
         _prepend_latest_signal_row_to_portfolio_history(
@@ -2962,7 +3689,7 @@ def _decision_overview_page(
 
 
 def _daily_summary_message(cfg: LiveMarketConfig, *, debug: bool = False) -> str:
-    status = _runtime_status(cfg)
+    status = _runtime_status_for_display(cfg)
     latest = _latest_market_signal(cfg)
     lines = [
         f"**daily summary** {cfg.label}",
@@ -3354,15 +4081,21 @@ async def risk(
 @bot.tree.command(name="watch", description="Manage your per-market symbol watchlist.")
 @app_commands.describe(
     market="Market id",
-    action="add/remove/list/clear",
-    symbol="Symbol to add or remove.",
+    action="add/update/remove/delete/list/clear/enable/disable",
+    symbol="Symbol to add, update, or remove. For update, this is the old symbol.",
+    new_symbol="New symbol for action:update.",
+    alerts="Enable personal watchlist DM alerts for this market.",
 )
 @app_commands.choices(
     action=[
         app_commands.Choice(name="add", value="add"),
+        app_commands.Choice(name="update", value="update"),
         app_commands.Choice(name="remove", value="remove"),
+        app_commands.Choice(name="delete", value="delete"),
         app_commands.Choice(name="list", value="list"),
         app_commands.Choice(name="clear", value="clear"),
+        app_commands.Choice(name="enable alerts", value="enable"),
+        app_commands.Choice(name="disable alerts", value="disable"),
     ]
 )
 @app_commands.autocomplete(market=market_autocomplete)
@@ -3371,6 +4104,8 @@ async def watchlist_command(
     action: str,
     market: str = "",
     symbol: str = "",
+    new_symbol: str = "",
+    alerts: bool = True,
 ) -> None:
     cfg = _resolve_market(market)
     user_id = getattr(interaction.user, "id", None)
@@ -3381,7 +4116,14 @@ async def watchlist_command(
             if not normalized:
                 raise BotUserError("請提供要加入 watchlist 的 symbol。")
             items = _add_user_watch_symbol(user_id, cfg.market, normalized)
+            if alerts:
+                _set_user_subscription(user_id, cfg.market, watchlist_only=True)
             verb = "加入"
+        elif action_value in {"update", "replace", "modify", "set"}:
+            items = _replace_user_watch_symbol(user_id, cfg.market, symbol, new_symbol)
+            if alerts:
+                _set_user_subscription(user_id, cfg.market, watchlist_only=True)
+            verb = "更新"
         elif action_value in {"remove", "delete", "del"}:
             normalized = _normalize_watch_symbol(symbol)
             if not normalized:
@@ -3394,8 +4136,16 @@ async def watchlist_command(
         elif action_value == "list":
             items = _user_watchlist(user_id, cfg.market)
             verb = "目前"
+        elif action_value in {"enable", "on", "subscribe"}:
+            items = _user_watchlist(user_id, cfg.market)
+            _set_user_subscription(user_id, cfg.market, watchlist_only=True)
+            verb = "啟用提醒"
+        elif action_value in {"disable", "off", "unsubscribe"}:
+            items = _user_watchlist(user_id, cfg.market)
+            _remove_user_subscription(user_id, cfg.market)
+            verb = "停用提醒"
         else:
-            raise BotUserError("action 必須是 add/remove/list/clear。")
+            raise BotUserError("action 必須是 add/update/remove/delete/list/clear/enable/disable。")
     except Exception as exc:
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
@@ -3405,10 +4155,16 @@ async def watchlist_command(
         interaction,
         market=cfg.market,
         symbol=_normalize_watch_symbol(symbol),
+        new_symbol=_normalize_watch_symbol(new_symbol),
         watchlist=items,
+        alerts=cfg.market in _user_subscriptions(user_id),
     )
     content = ", ".join(f"`{item}`" for item in items) if items else "(empty)"
-    await interaction.response.send_message(f"`{cfg.market}` watchlist 已{verb}: {content}", ephemeral=True)
+    alert_text = "on" if cfg.market in _user_subscriptions(user_id) else "off"
+    await interaction.response.send_message(
+        f"`{cfg.market}` watchlist 已{verb}: {content}\nalerts=`{alert_text}` mode=`watchlist_only`",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
@@ -3417,7 +4173,7 @@ async def watchlist_command(
     price_source="auto/panel/csv/yahoo",
     top_n="Rows to show, minimum 10",
     min_abs_delta="Minimum absolute weight delta",
-    refresh_data="Run the market pre-signal data updater before generating.",
+    refresh_data="Run the market pre-signal data updater before generating. Default false for fast query.",
     debug="Show signal ids, fingerprints, output folders, and artifact paths.",
 )
 @app_commands.autocomplete(market=market_autocomplete)
@@ -3427,23 +4183,84 @@ async def signal_now(
     price_source: str = "auto",
     top_n: int = 20,
     min_abs_delta: float = 0.001,
-    refresh_data: bool = True,
+    refresh_data: bool = False,
     debug: bool = False,
 ) -> None:
     await interaction.response.defer(thinking=True)
     try:
+        shown_rows = _top_n(top_n)
         cfg = _resolve_market(market)
+        status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
+        cached = None
+        if not refresh_data:
+            cached = await asyncio.to_thread(
+                _signal_now_cached_result,
+                cfg,
+                status,
+                requested_price_source=price_source,
+                top_n=shown_rows,
+                debug=debug,
+            )
+        if cached is not None:
+            summary_path, result, cache_reason = cached
+            _record_audit_event(
+                str(result.summary.get("signal_id")),
+                "cached",
+                interaction,
+                market=str(result.summary.get("market") or market or _default_market()),
+                output_dir=result.output_dir,
+                market_open=bool(status.market_open),
+                auto_refreshed=False,
+                requested_price_source=price_source,
+                resolved_price_source=str(result.summary.get("price_source") or "artifact"),
+                cache=cache_reason,
+                summary=str(summary_path),
+                sanity=_signal_sanity_level(_signal_sanity_issues(cfg, result.summary)),
+            )
+            await _send_signal_response(
+                interaction,
+                result.message,
+                str(result.summary.get("signal_id")),
+                str(result.summary.get("market") or market or _default_market()),
+            )
+            for pages in _scheduled_detail_page_groups(
+                cfg,
+                result,
+                title_prefix="signal_now",
+                include_decisions=True,
+                debug=debug,
+            ):
+                await _send_paginated_response(interaction, pages)
+            return
+        should_refresh_data = _signal_now_should_refresh_data(status, refresh_data=refresh_data)
+        if should_refresh_data:
+            user_id = int(getattr(interaction.user, "id", 0) or 0)
+            key, started = _enqueue_signal_now_background_refresh(
+                user_id=user_id,
+                cfg=cfg,
+                requested_price_source=price_source,
+                top_n=shown_rows,
+                min_abs_delta=min_abs_delta,
+                debug=debug,
+            )
+            verb = "已開始" if started else "已加入既有"
+            reason = "refresh_data=true" if refresh_data else "資料落後"
+            await interaction.followup.send(
+                f"`{cfg.market}` {reason}，{verb}背景更新與推論；完成後會 DM 結果。\n"
+                f"job=`{key}`"
+            )
+            return
         resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
             _prepare_realtime_signal_sync,
             cfg,
             requested_price_source=price_source,
-            force_refresh=refresh_data,
+            force_refresh=should_refresh_data,
         )
         await asyncio.to_thread(_sync_latest_live_weights_to_market_artifact, cfg)
         result = await _run_market_signal(
             market=market,
             price_source=resolved_price_source,
-            top_n=_top_n(top_n),
+            top_n=shown_rows,
             min_abs_delta=min_abs_delta,
             progress_label=f"signal_now:{cfg.market}",
         )
@@ -3504,12 +4321,19 @@ async def positions(
     await interaction.response.defer(thinking=True)
     try:
         cfg = _resolve_market(market)
-        result = await _run_market_signal(market=market, top_n=_page_size(page_size))
+        summary_path, summary = _latest_signal_or_raise(cfg)
+        rows = await asyncio.to_thread(
+            _latest_artifact_rows,
+            summary,
+            summary_path,
+            "weights_path",
+            "top_positions",
+        )
     except Exception as exc:
         await _send_command_error(interaction, "positions", exc)
         return
     rows = sorted(
-        result.weights_rows,
+        rows,
         key=lambda row: (_row_abs(row, "target_weight"), _row_abs(row, "delta_weight"), _row_abs(row, "score")),
         reverse=True,
     )
@@ -3526,9 +4350,9 @@ async def positions(
     rows = _annotate_weight_rows_with_capital(rows, capital)
     header = [
         _kv_line(
-            ("market", result.summary.get("market", "n/a")),
-            ("asof", _display_summary_time(result.summary, result.summary.get("asof_date", "n/a"))),
-            ("panel", _display_summary_time(result.summary, result.summary.get("panel_date", "n/a"))),
+            ("market", summary.get("market", cfg.market)),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
             ("rows", len(rows)),
         ),
         f"capital: `{_capital_context_text(capital=capital)}`",
@@ -3538,10 +4362,10 @@ async def positions(
         header.extend(
             [
                 _kv_line(
-                    ("signal", result.summary.get("signal_id", "n/a")),
-                    ("display_tz", result.summary.get("display_timezone_label") or _display_tz_text(cfg)),
+                    ("signal", summary.get("signal_id", summary_path.parent.name)),
+                    ("display_tz", summary.get("display_timezone_label") or _display_tz_text(cfg)),
                 ),
-                f"full: `{result.summary.get('positions_markdown_path', result.summary.get('weights_path', 'n/a'))}`",
+                f"full: `{summary.get('positions_markdown_path', summary.get('weights_path', 'n/a'))}`",
             ]
         )
     await _send_paginated_response(
@@ -3579,18 +4403,27 @@ async def rebalance(
     try:
         cfg = _resolve_market(market)
         _require_trader_permission(interaction, cfg)
-        result = await _run_market_signal(market=market, top_n=_page_size(page_size), min_abs_delta=threshold)
+        summary_path, summary = _latest_signal_or_raise(cfg)
+        rows = await asyncio.to_thread(
+            _latest_artifact_rows,
+            summary,
+            summary_path,
+            "rebalance_path",
+            "rebalance",
+        )
     except Exception as exc:
         await _send_command_error(interaction, "rebalance", exc)
         return
-    rows = _limit_rows(result.rebalance_rows, limit)
+    rows = [row for row in rows if _row_abs(row, "delta_weight") >= max(0.0, float(threshold or 0.0))]
+    rows = _sort_decision_rows(rows, "delta")
+    rows = _limit_rows(rows, limit)
     capital = _resolve_current_capital(cfg, current_capital=current_capital)
     rows = _annotate_weight_rows_with_capital(rows, capital)
     header = [
         _kv_line(
-            ("market", result.summary.get("market", "n/a")),
-            ("asof", _display_summary_time(result.summary, result.summary.get("asof_date", "n/a"))),
-            ("panel", _display_summary_time(result.summary, result.summary.get("panel_date", "n/a"))),
+            ("market", summary.get("market", cfg.market)),
+            ("asof", _display_summary_time(summary, summary.get("asof_date", "n/a"))),
+            ("panel", _display_summary_time(summary, summary.get("panel_date", "n/a"))),
             ("threshold", threshold),
             ("rows", len(rows)),
         ),
@@ -3601,10 +4434,10 @@ async def rebalance(
         header.extend(
             [
                 _kv_line(
-                    ("signal", result.summary.get("signal_id", "n/a")),
-                    ("display_tz", result.summary.get("display_timezone_label") or _display_tz_text(cfg)),
+                    ("signal", summary.get("signal_id", summary_path.parent.name)),
+                    ("display_tz", summary.get("display_timezone_label") or _display_tz_text(cfg)),
                 ),
-                f"full: `{result.summary.get('rebalance_markdown_path', result.summary.get('rebalance_path', 'n/a'))}`",
+                f"full: `{summary.get('rebalance_markdown_path', summary.get('rebalance_path', 'n/a'))}`",
             ]
         )
     await _send_paginated_response(
@@ -3962,9 +4795,9 @@ async def daily_summary_command(interaction: discord.Interaction, market: str = 
 
 @tasks.loop(seconds=10)
 async def scheduled_signal() -> None:
-    if bot.channel_id is None:
-        return
-    channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
+    channel = None
+    if bot.channel_id is not None and _public_broadcasts_enabled():
+        channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
@@ -3973,7 +4806,8 @@ async def scheduled_signal() -> None:
             continue
         if key in bot._last_scheduled_keys:
             continue
-        bot._last_scheduled_keys.add(key)
+        if not _scheduled_retry_allowed(bot._scheduled_retry_after, key):
+            continue
         try:
             resolved_price_source, _, _ = await asyncio.to_thread(
                 _prepare_realtime_signal_sync,
@@ -3993,25 +4827,33 @@ async def scheduled_signal() -> None:
             if sanity_issues:
                 result.message = _prepend_sanity_notice(result.message, cfg, result.summary)
         except BotUserError as exc:
-            if not isinstance(exc, MarketClosedError):
+            if channel is not None and not isinstance(exc, MarketClosedError):
                 await channel.send(str(exc))
+            if not isinstance(exc, MarketClosedError):
+                _mark_scheduled_retry(bot._scheduled_retry_after, key)
             continue
         except Exception as exc:
             _log_exception(f"scheduled_signal:{market}", exc)
-            await channel.send(f"`{market}` scheduled signal failed: `{type(exc).__name__}`")
+            if channel is not None:
+                await channel.send(f"`{market}` scheduled signal failed: `{type(exc).__name__}`")
+            _mark_scheduled_retry(bot._scheduled_retry_after, key)
             continue
-        await channel.send(result.message, view=SignalReviewView(
-            signal_id=str(result.summary.get("signal_id")),
-            market=str(result.summary.get("market") or market),
-        ))
+        if channel is not None:
+            await channel.send(result.message, view=SignalReviewView(
+                signal_id=str(result.summary.get("signal_id")),
+                market=str(result.summary.get("market") or market),
+            ))
+        bot._last_scheduled_keys.add(key)
+        _clear_scheduled_retry(bot._scheduled_retry_after, key)
         await _send_subscription_notifications(cfg, result)
-        for pages in _scheduled_detail_page_groups(cfg, result):
-            await _send_channel_pages(channel, pages)
+        if channel is not None:
+            for pages in _scheduled_detail_page_groups(cfg, result):
+                await _send_channel_pages(channel, pages)
 
 
 @tasks.loop(minutes=1)
 async def daily_summary() -> None:
-    if bot.channel_id is None:
+    if not _public_broadcasts_enabled() or bot.channel_id is None:
         return
     channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
     for market in _scheduled_markets():
@@ -4026,16 +4868,61 @@ async def daily_summary() -> None:
         key = f"{today}:{market}"
         if key in bot._last_daily_summary_keys:
             continue
-        bot._last_daily_summary_keys.add(key)
+        if not _scheduled_retry_allowed(bot._daily_summary_retry_after, key):
+            continue
         try:
             message = await asyncio.to_thread(_daily_summary_message, cfg)
             await channel.send(message[:1900])
+            bot._last_daily_summary_keys.add(key)
+            _clear_scheduled_retry(bot._daily_summary_retry_after, key)
         except MarketUnsupportedError as exc:
             await channel.send(str(exc))
+            _mark_scheduled_retry(bot._daily_summary_retry_after, key)
             continue
         except Exception as exc:
             _log_exception(f"daily_summary:{market}", exc)
             await channel.send(f"`{market}` daily summary failed: `{type(exc).__name__}`")
+            _mark_scheduled_retry(bot._daily_summary_retry_after, key)
+
+
+@tasks.loop(minutes=1)
+async def artifact_backfill() -> None:
+    channel = None
+    if bot.channel_id is not None and _public_broadcasts_enabled():
+        try:
+            channel = bot.get_channel(bot.channel_id) or await bot.fetch_channel(bot.channel_id)
+        except Exception:
+            channel = None
+    for market in _scheduled_markets():
+        cfg = _resolve_market(market)
+        now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
+        key = _artifact_backfill_key(cfg, now)
+        if key is None:
+            continue
+        if key in bot._last_artifact_backfill_keys:
+            continue
+        if not _scheduled_retry_allowed(bot._artifact_backfill_retry_after, key):
+            continue
+        try:
+            result = await asyncio.to_thread(_run_artifact_backfill_sync, cfg)
+            bot._last_artifact_backfill_keys.add(key)
+            _clear_scheduled_retry(bot._artifact_backfill_retry_after, key)
+            if result is not None:
+                print(
+                    f"[artifact-backfill] {market} signal={result.summary.get('signal_id')} "
+                    f"panel={result.summary.get('panel_date')} output={result.output_dir}",
+                    flush=True,
+                )
+        except BotUserError as exc:
+            _log_exception(f"artifact_backfill:{market}", exc)
+            if channel is not None and not isinstance(exc, MarketClosedError):
+                await channel.send(f"`{market}` artifact backfill failed: {exc}")
+            _mark_scheduled_retry(bot._artifact_backfill_retry_after, key)
+        except Exception as exc:
+            _log_exception(f"artifact_backfill:{market}", exc)
+            if channel is not None:
+                await channel.send(f"`{market}` artifact backfill failed: `{type(exc).__name__}`")
+            _mark_scheduled_retry(bot._artifact_backfill_retry_after, key)
 
 
 @scheduled_signal.before_loop
@@ -4045,6 +4932,11 @@ async def before_scheduled_signal() -> None:
 
 @daily_summary.before_loop
 async def before_daily_summary() -> None:
+    await bot.wait_until_ready()
+
+
+@artifact_backfill.before_loop
+async def before_artifact_backfill() -> None:
     await bot.wait_until_ready()
 
 
@@ -4058,13 +4950,6 @@ WATCH_ROOTS_DEFAULT = (
 WATCH_EXTENSIONS = {".py", ".yaml", ".yml"}
 WATCH_FILENAMES = {".env"}
 WATCH_SKIP_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules"}
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = _env(name)
-    if raw is None:
-        return bool(default)
-    return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 
 def _watch_delay_seconds() -> float:

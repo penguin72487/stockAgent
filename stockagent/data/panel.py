@@ -916,6 +916,60 @@ def _load_symbol_arrays_pyarrow(
         raise RuntimeError("PyArrow is not available")
 
     table = pq.read_table(path)
+    return _symbol_arrays_from_arrow_table(
+        table,
+        path,
+        tradable_mode=tradable_mode,
+        trading_volume_policy=trading_volume_policy,
+    )
+
+
+def _read_parquet_tail_table(path: Path, rows: int):
+    if pq is None:
+        raise RuntimeError("PyArrow is not available")
+    tail_rows = max(1, int(rows))
+    parquet_file = pq.ParquetFile(path)
+    metadata = parquet_file.metadata
+    if metadata is None or int(metadata.num_row_groups) <= 0:
+        return pq.read_table(path)
+
+    row_groups: list[int] = []
+    row_count = 0
+    for group_idx in range(int(metadata.num_row_groups) - 1, -1, -1):
+        row_groups.append(group_idx)
+        row_count += int(metadata.row_group(group_idx).num_rows)
+        if row_count >= tail_rows:
+            break
+    table = parquet_file.read_row_groups(sorted(row_groups))
+    if int(table.num_rows) <= tail_rows:
+        return table
+    offset = int(table.num_rows) - tail_rows
+    return table.slice(offset, tail_rows)
+
+
+def _load_symbol_arrays_pyarrow_tail(
+    path: Path,
+    *,
+    tail_rows: int,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+) -> _SymbolPanelArrays:
+    table = _read_parquet_tail_table(path, tail_rows)
+    return _symbol_arrays_from_arrow_table(
+        table,
+        path,
+        tradable_mode=tradable_mode,
+        trading_volume_policy=trading_volume_policy,
+    )
+
+
+def _symbol_arrays_from_arrow_table(
+    table: Any,
+    path: Path,
+    *,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+) -> _SymbolPanelArrays:
     _require_trading_volume_column(path, set(table.column_names), trading_volume_policy)
     rows = int(table.num_rows)
     if rows == 0:
@@ -1285,6 +1339,176 @@ def _build_panel_from_symbol_arrays(
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
     )
+
+
+def build_tail_panel(
+    parquet_root: str | Path,
+    *,
+    tail_rows: int,
+    benchmark_name: str = "universe_average_return",
+    usd_only_trading_pairs: bool = False,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+    security_filter: str | None = "none",
+    strict_no_fallback: bool | None = None,
+    panel_load_workers: int = 4,
+    feature_include: Any = None,
+    feature_exclude: Any = None,
+) -> PanelData:
+    """Build a panel from only the last rows of each symbol file for live inference."""
+    parquet_root = Path(parquet_root)
+    feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
+    feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    if not parquet_paths:
+        raise FileNotFoundError(f"No parquet files found under {parquet_root}")
+
+    if usd_only_trading_pairs:
+        parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
+        if not parquet_paths:
+            raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
+
+    security_filter = _normalize_security_filter(security_filter)
+    security_metadata_paths = _security_filter_metadata_paths(parquet_root, security_filter)
+    if security_filter == BROKER_TRADABLE_SECURITY_FILTER:
+        parquet_paths = _filter_us_broker_tradable_paths(parquet_root, parquet_paths, security_metadata_paths)
+        if not parquet_paths:
+            raise FileNotFoundError(f"No broker-tradable US symbols found under {parquet_root}")
+
+    if strict_no_fallback is None:
+        strict_no_fallback = str(os.getenv("STOCKAGENT_STRICT_NO_FALLBACK", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        strict_no_fallback = bool(strict_no_fallback)
+
+    tradable_mode = str(tradable_mode).strip().lower()
+    trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
+    read_rows = max(2, int(tail_rows))
+    panel_load_workers = max(0, int(panel_load_workers))
+    print(
+        f"[panel] building live tail from {len(parquet_paths)} parquet files "
+        f"(tail_rows={read_rows}, workers={panel_load_workers})..."
+    )
+
+    def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
+        try:
+            arrays = _load_symbol_arrays_pyarrow_tail(
+                path,
+                tail_rows=read_rows,
+                tradable_mode=tradable_mode,
+                trading_volume_policy=trading_volume_policy,
+            )
+            if int(arrays.dates.size) == 0:
+                raise ValueError(f"Symbol file is empty: {path.name}")
+            return path, arrays, None
+        except Exception as exc:
+            return path, None, exc
+
+    if panel_load_workers > 1 and len(parquet_paths) > 1:
+        with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
+            loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
+    else:
+        loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
+
+    valid_arrays: list[_SymbolPanelArrays] = []
+    for path, arrays, exc in loaded_arrays:
+        if exc is not None:
+            if strict_no_fallback or isinstance(exc, _MissingTradingVolumeError):
+                raise type(exc)(f"{path.name}: {exc}") from exc
+            print(f"[panel] SKIP {path.name}: {exc}")
+            continue
+        if arrays is not None:
+            valid_arrays.append(arrays)
+
+    panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
+    panel = _filter_panel_features(
+        panel,
+        feature_include=feature_include_patterns,
+        feature_exclude=feature_exclude_patterns,
+    )
+    _print_feature_overview(panel)
+    return panel
+
+
+def load_cached_panel(
+    parquet_root: str | Path,
+    use_rapids: bool = True,
+    benchmark_name: str = "universe_average_return",
+    usd_only_trading_pairs: bool = False,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+    security_filter: str | None = "none",
+    strict_no_fallback: bool | None = None,
+    buy_tradable_mode: str | None = None,
+    sell_tradable_mode: str | None = None,
+    panel_backend: str = "auto",
+    panel_load_workers: int = 4,
+    external_feature_path: str | Path | None = None,
+    external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    feature_include: Any = None,
+    feature_exclude: Any = None,
+) -> PanelData | None:
+    del use_rapids, panel_load_workers
+    parquet_root = Path(parquet_root)
+    external_feature_path = _normalize_external_feature_path(external_feature_path)
+    feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
+    feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    if not parquet_paths:
+        return None
+    if usd_only_trading_pairs:
+        parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
+        if not parquet_paths:
+            return None
+
+    security_filter = _normalize_security_filter(security_filter)
+    security_metadata_paths = _security_filter_metadata_paths(parquet_root, security_filter)
+    if security_filter == BROKER_TRADABLE_SECURITY_FILTER:
+        parquet_paths = _filter_us_broker_tradable_paths(parquet_root, parquet_paths, security_metadata_paths)
+        if not parquet_paths:
+            return None
+
+    panel_backend = str(panel_backend).strip().lower()
+    if panel_backend == "pyarrow":
+        selected_backend = "pyarrow"
+    elif panel_backend in {"polars", "polars_lazy", "polars_streaming"}:
+        selected_backend = "polars_streaming" if panel_backend == "polars_streaming" else "polars_lazy"
+    elif panel_backend == "auto" and pl is not None and pq is not None:
+        selected_backend = "polars_lazy"
+    elif panel_backend == "auto" and pq is not None:
+        selected_backend = "pyarrow"
+    else:
+        return None
+
+    if buy_tradable_mode is not None or sell_tradable_mode is not None:
+        buy_mode = str(buy_tradable_mode if buy_tradable_mode is not None else tradable_mode).strip().lower()
+        sell_mode = str(sell_tradable_mode if sell_tradable_mode is not None else tradable_mode).strip().lower()
+        if buy_mode != sell_mode:
+            return None
+        tradable_mode = buy_mode
+    tradable_mode = str(tradable_mode).strip().lower()
+    trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
+    external_key = str(external_feature_path) if external_feature_path is not None else "none"
+    backend_key = (
+        f"{selected_backend}|benchmark={benchmark_name}|"
+        f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
+        f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
+        f"external={external_key}|external_market_symbol={external_market_symbol}|"
+        f"feature_include={list(feature_include_patterns)!r}|"
+        f"feature_exclude={list(feature_exclude_patterns)!r}"
+    )
+    source_paths = [*parquet_paths, *security_metadata_paths]
+    if external_feature_path is not None:
+        source_paths.append(external_feature_path)
+    source_hash = _compute_source_hash(source_paths)
+    panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
+    if panel is not None:
+        _print_feature_overview(panel)
+    return panel
 
 
 def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFeatureArrays | None) -> PanelData:

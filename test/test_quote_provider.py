@@ -34,6 +34,37 @@ class _FakeResponse:
         }
 
 
+class _FakeChartResponse:
+    def __init__(self, ticker: str) -> None:
+        self.ticker = ticker
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        index = int(self.ticker.replace("SYM", ""))
+        return {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {
+                            "regularMarketPrice": 200.0 + index,
+                            "regularMarketTime": 1_900_000_000 + index,
+                        },
+                        "timestamp": [1_900_000_000 + index],
+                        "indicators": {
+                            "quote": [
+                                {
+                                    "close": [200.0 + index],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+
+
 def test_fetch_yahoo_last_prices_runs_requests_in_parallel(monkeypatch, tmp_path) -> None:
     active = 0
     max_active = 0
@@ -73,3 +104,47 @@ def test_fetch_yahoo_last_prices_runs_requests_in_parallel(monkeypatch, tmp_path
     assert request_count == 2
     assert result.source == "yahoo:quote"
     assert result.timestamp is not None
+
+
+def test_fetch_yahoo_last_prices_falls_back_to_parallel_chart(monkeypatch, tmp_path) -> None:
+    active = 0
+    max_active = 0
+    request_count = 0
+    lock = threading.Lock()
+
+    def fake_get(url: str, timeout: int, **kwargs):
+        nonlocal active, max_active, request_count
+        if "/v7/finance/quote" in url:
+            return _FakeResponse([])
+        with lock:
+            active += 1
+            request_count += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        try:
+            ticker = url.split("/chart/", 1)[1].split("?", 1)[0]
+            return _FakeChartResponse(ticker)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setenv("STOCKAGENT_YAHOO_PARALLEL_REQUESTS", "4")
+    monkeypatch.setenv("STOCKAGENT_YAHOO_CHART_FALLBACK_MAX_SYMBOLS", "20")
+    monkeypatch.setattr("stockagent.live.quote_provider._yahoo_session_and_crumb", lambda: (None, None))
+    monkeypatch.setattr("stockagent.live.quote_provider.requests.get", fake_get)
+
+    symbols = [f"SYM{i}" for i in range(8)]
+    fallback = np.ones((len(symbols),), dtype=np.float64)
+    result = fetch_yahoo_last_prices(
+        symbols,
+        fallback,
+        parquet_root=tmp_path,
+        chunk_size=4,
+    )
+
+    assert result.available_count == len(symbols)
+    assert np.allclose(result.prices, [200.0 + i for i in range(len(symbols))])
+    assert max_active > 1
+    assert max_active <= 4
+    assert request_count == len(symbols)
+    assert result.source == "yahoo:quote+chart"

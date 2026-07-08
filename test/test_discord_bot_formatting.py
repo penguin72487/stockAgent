@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import polars as pl
@@ -8,6 +10,8 @@ import polars as pl
 from services.discord_bot.bot import (
     _add_user_watch_symbol,
     _auto_signal_price_source,
+    _artifact_backfill_key,
+    _can_reuse_latest_signal_now,
     _ConsoleProgress,
     _decision_overview_page,
     _daily_summary_message,
@@ -17,20 +21,32 @@ from services.discord_bot.bot import (
     _latest_changes_pages,
     _latest_signal_message,
     _market_notice,
+    _market_artifact_backfill_time,
+    _market_has_live_signal_for_date,
+    _validate_pre_signal_download_artifacts,
+    BotUserError,
     _performance_message,
     _enrich_signal_performance_for_discord,
     _position_line,
     _portfolio_change_line,
     _portfolio_history_header_lines,
     _portfolio_history_block,
+    _prepare_realtime_signal_sync,
     _include_live_signals_in_portfolio_history,
     _prepend_latest_signal_row_to_portfolio_history,
+    _public_broadcasts_enabled,
     _rebalance_line,
     _remove_user_watch_symbol,
     _remove_user_subscription,
+    _replace_user_watch_symbol,
     _risk_message,
     _scheduled_detail_page_groups,
+    _scheduled_markets,
+    _scheduled_retry_allowed,
+    _mark_scheduled_retry,
+    _clear_scheduled_retry,
     _set_user_subscription,
+    _signal_now_should_refresh_data,
     _signal_kwargs,
     _signal_sanity_issues,
     _signal_sanity_level,
@@ -45,6 +61,238 @@ from services.discord_bot.bot import (
     _watch_delay_seconds,
     _watch_poll_seconds,
 )
+
+
+def test_scheduled_markets_defaults_to_all_configured_markets(monkeypatch) -> None:
+    monkeypatch.delenv("STOCKAGENT_SCHEDULED_MARKETS", raising=False)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_configs",
+        lambda: {"tw": object(), "crypto": object(), "us": object()},
+    )
+
+    assert _scheduled_markets() == ["crypto", "tw", "us"]
+
+
+def test_scheduled_markets_respects_explicit_env(monkeypatch) -> None:
+    monkeypatch.setenv("STOCKAGENT_SCHEDULED_MARKETS", "tw,crypto")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_configs",
+        lambda: {"tw": object(), "crypto": object(), "us": object()},
+    )
+
+    assert _scheduled_markets() == ["tw", "crypto"]
+
+
+def test_public_broadcasts_default_to_disabled(monkeypatch) -> None:
+    monkeypatch.delenv("STOCKAGENT_PUBLIC_BROADCASTS", raising=False)
+
+    assert not _public_broadcasts_enabled()
+
+
+def test_public_broadcasts_can_be_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("STOCKAGENT_PUBLIC_BROADCASTS", "1")
+
+    assert _public_broadcasts_enabled()
+
+
+def test_replace_user_watch_symbol_updates_or_adds(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("services.discord_bot.bot.STATE_PATH", tmp_path / "state.json")
+    items = _add_user_watch_symbol(123, "tw", "2330")
+
+    assert items == ["2330"]
+
+    items = _replace_user_watch_symbol(123, "tw", "2330", "2317")
+
+    assert items == ["2317"]
+
+    items = _replace_user_watch_symbol(123, "tw", "9999", "0050")
+
+    assert items == ["2317", "0050"]
+
+
+def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(monkeypatch) -> None:
+    monkeypatch.setattr("services.discord_bot.bot._market_state", lambda market: {})
+    daily_cfg = SimpleNamespace(
+        market="tw",
+        data_ready_time="18:00",
+        close_time="13:30",
+        summary_time="14:00",
+        schedule_time="13:15",
+        schedule_interval_minutes=None,
+    )
+    interval_cfg = SimpleNamespace(
+        market="crypto",
+        data_ready_time="00:00",
+        close_time=None,
+        summary_time=None,
+        schedule_time=None,
+        schedule_interval_minutes=15,
+        schedule_delay_seconds=45,
+    )
+    now = datetime(2026, 7, 6, 18, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+
+    assert _market_artifact_backfill_time(daily_cfg) == "18:00"
+    assert _artifact_backfill_key(daily_cfg, now) == "2026-07-06:tw:artifact_backfill"
+    assert _artifact_backfill_key(daily_cfg, now.replace(hour=17, minute=59)) is None
+    assert _artifact_backfill_key(interval_cfg, now) is None
+
+
+def test_market_has_live_signal_for_date_uses_summary_data_fields(monkeypatch) -> None:
+    cfg = SimpleNamespace(market="tw")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._recent_market_signal_metrics",
+        lambda cfg, max_summaries: [
+            (None, {"panel_data_date": "2026-07-05 13:30:00"}),
+            (None, {"weights_date": "2026-07-06 13:30:00"}),
+        ],
+    )
+
+    assert _market_has_live_signal_for_date(cfg, "2026-07-06")
+    assert not _market_has_live_signal_for_date(cfg, "2026-07-07")
+
+
+def test_validate_pre_signal_download_artifacts_rejects_all_failed_download(tmp_path) -> None:
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    (output_dir / "download_summary.json").write_text(
+        '{"asset_class":"tw_stocks","symbol_count":2307,"row_count":0,"status_counts":{"failed":2307}}',
+        encoding="utf-8",
+    )
+    cfg = SimpleNamespace(market="tw", market_type="tw")
+    command = ["python", "downloader/download_yahoo_ohlcv.py", "--output-dir", str(output_dir), "--mode", "daily-update"]
+
+    try:
+        _validate_pre_signal_download_artifacts(cfg, command, tmp_path / "pre_signal.log")
+    except BotUserError as exc:
+        assert "did not produce usable data" in str(exc)
+    else:
+        raise AssertionError("expected BotUserError")
+
+
+def test_scheduled_retry_helpers_apply_and_clear_cooldown(monkeypatch) -> None:
+    clock = {"now": 100.0}
+    retry_after = {}
+
+    monkeypatch.setattr("services.discord_bot.bot.time.monotonic", lambda: clock["now"])
+    monkeypatch.setenv("STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS", "30")
+
+    assert _scheduled_retry_allowed(retry_after, "2026-07-06:tw")
+
+    _mark_scheduled_retry(retry_after, "2026-07-06:tw")
+
+    assert not _scheduled_retry_allowed(retry_after, "2026-07-06:tw")
+    clock["now"] = 130.0
+    assert _scheduled_retry_allowed(retry_after, "2026-07-06:tw")
+
+    _clear_scheduled_retry(retry_after, "2026-07-06:tw")
+    assert retry_after == {}
+
+
+def test_prepare_realtime_signal_does_not_refresh_disabled_market(monkeypatch) -> None:
+    cfg = SimpleNamespace()
+    calls = []
+
+    def fake_ensure_signal_ready(cfg):
+        raise RuntimeError("disabled")
+
+    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", fake_ensure_signal_ready)
+    monkeypatch.setattr("services.discord_bot.bot._run_pre_signal_command", lambda cfg: calls.append(cfg))
+
+    try:
+        _prepare_realtime_signal_sync(cfg, force_refresh=True)
+    except RuntimeError:
+        pass
+
+    assert calls == []
+
+
+def test_prepare_realtime_signal_does_not_run_daily_updater_just_because_market_is_open(monkeypatch) -> None:
+    cfg = SimpleNamespace(market="tw", market_type="tw", history_frequency="daily", schedule_interval_minutes=None)
+    status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
+    calls = []
+
+    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda cfg: status)
+    monkeypatch.setattr("services.discord_bot.bot._run_pre_signal_command", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda cfg: status)
+
+    source, resolved_status, refreshed = _prepare_realtime_signal_sync(cfg, requested_price_source="auto", force_refresh=False)
+
+    assert source == "yahoo"
+    assert resolved_status is status
+    assert not refreshed
+    assert calls == []
+
+
+def test_prepare_realtime_signal_refreshes_interval_market(monkeypatch) -> None:
+    cfg = SimpleNamespace(market="crypto", market_type="crypto", history_frequency="bar", schedule_interval_minutes=15)
+    status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
+    calls = []
+
+    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda cfg: status)
+    monkeypatch.setattr("services.discord_bot.bot._run_pre_signal_command", lambda cfg: calls.append(cfg))
+    monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda cfg: status)
+
+    source, resolved_status, refreshed = _prepare_realtime_signal_sync(cfg, requested_price_source="auto", force_refresh=False)
+
+    assert source == "panel"
+    assert resolved_status is status
+    assert refreshed
+    assert calls == [cfg]
+
+
+def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
+    cfg = SimpleNamespace(market="tw")
+    status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(fresh=True, last_data_date="2026-07-06", panel_date="2026-07-06"),
+    )
+    summary = {"panel_date": "2026-07-06 13:30:00", "price_source": "panel_close"}
+
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+
+    assert reusable
+    assert reason == "cached_latest_close"
+
+
+def test_can_reuse_latest_signal_now_rejects_stale_closed_panel() -> None:
+    cfg = SimpleNamespace(market="tw")
+    status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(fresh=False, last_data_date="2026-07-02", panel_date="2026-07-02"),
+    )
+    summary = {"panel_date": "2026-07-02 13:30:00", "price_source": "panel_close"}
+
+    reusable, _ = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+
+    assert not reusable
+
+
+def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:
+    cfg = SimpleNamespace(market="tw", display_timezone="Asia/Taipei", timezone="Asia/Taipei")
+    status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
+    summary = {"asof_date": "2026-07-07 09:30:00", "price_source": "yahoo:quote"}
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 7, 9, 30, 30, tzinfo=tz)
+
+    monkeypatch.setattr("services.discord_bot.bot.datetime", FixedDateTime)
+    monkeypatch.setenv("STOCKAGENT_SIGNAL_NOW_OPEN_CACHE_SECONDS", "60")
+
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+
+    assert reusable
+    assert reason == "cached_open_yahoo_age=30s"
+
+
+def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:
+    fresh = SimpleNamespace(data=SimpleNamespace(fresh=True))
+    stale = SimpleNamespace(data=SimpleNamespace(fresh=False))
+
+    assert not _signal_now_should_refresh_data(fresh, refresh_data=False)
+    assert _signal_now_should_refresh_data(fresh, refresh_data=True)
+    assert _signal_now_should_refresh_data(stale, refresh_data=False)
 
 
 def test_auto_signal_price_source_uses_intraday_quotes_for_open_stock_markets() -> None:
