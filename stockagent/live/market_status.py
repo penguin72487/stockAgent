@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -408,7 +410,7 @@ def data_freshness(
 
     market_type = infer_market_type(cfg, parquet_root)
     crypto_intraday = market_type.lower() == "crypto"
-    feature_files = sorted(parquet_root.glob(f"*{FEATURE_SUFFIX}"))
+    feature_files = list(parquet_root.glob(f"*{FEATURE_SUFFIX}"))
     total_files = len(feature_files)
     benchmark_path = _feature_path(parquet_root, benchmark_name)
     selected = list(feature_files)
@@ -423,13 +425,23 @@ def data_freshness(
     elif benchmark_path is not None and benchmark_path not in selected:
         selected.append(benchmark_path)
 
+    date_only = not crypto_intraday
+    if len(selected) > 1:
+        try:
+            workers = max(1, int(os.getenv("STOCKAGENT_FRESHNESS_WORKERS", "16") or "16"))
+        except Exception:
+            workers = 16
+        with ThreadPoolExecutor(max_workers=min(workers, len(selected))) as executor:
+            max_dates = list(executor.map(lambda path: _max_date_from_parquet(path, date_only=date_only), selected))
+    else:
+        max_dates = [_max_date_from_parquet(path, date_only=date_only) for path in selected]
+
     last_data_date: str | None = None
-    for path in selected:
-        max_date = _max_date_from_parquet(path, date_only=not crypto_intraday)
+    for max_date in max_dates:
         if max_date and (last_data_date is None or max_date > last_data_date):
             last_data_date = max_date
     benchmark_date = (
-        _max_date_from_parquet(benchmark_path, date_only=not crypto_intraday)
+        _max_date_from_parquet(benchmark_path, date_only=date_only)
         if benchmark_path is not None
         else None
     )

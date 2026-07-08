@@ -176,6 +176,7 @@ def _change_row(
     previous_date: str | None,
     price_lookup: _PriceLookup | None,
     symbol_names: dict[str, str] | None,
+    resolve_missing_prices: bool = True,
 ) -> dict[str, Any]:
     shares = int((current or {}).get("shares") or 0)
     prev_shares = int((previous or {}).get("shares") or 0)
@@ -184,12 +185,12 @@ def _change_row(
     market_value = float((current or {}).get("market_value") or 0.0)
     prev_market_value = float((previous or {}).get("market_value") or 0.0)
     price = _float_or_none((current or {}).get("price"))
-    if price is None and price_lookup is not None:
+    if resolve_missing_prices and price is None and price_lookup is not None:
         price = price_lookup.get(symbol, date)
-    if price is None:
+    if resolve_missing_prices and price is None:
         price = _float_or_none((previous or {}).get("price"))
     prev_price = _float_or_none((previous or {}).get("price"))
-    if prev_price is None and price_lookup is not None:
+    if resolve_missing_prices and prev_price is None and price_lookup is not None:
         prev_price = price_lookup.get(symbol, previous_date)
     price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
     stock_return = position_adjusted_stock_return(prev_holding_ratio, price_return)
@@ -219,6 +220,38 @@ def _change_row(
         "prev_holding_ratio": prev_holding_ratio,
         "holding_ratio_delta": holding_ratio - prev_holding_ratio,
     }
+
+
+def _enrich_change_row_prices(
+    row: dict[str, Any],
+    *,
+    date: str,
+    previous_date: str | None,
+    price_lookup: _PriceLookup | None,
+) -> dict[str, Any]:
+    if price_lookup is None:
+        return row
+    symbol = str(row.get("symbol") or "")
+    price = _float_or_none(row.get("price"))
+    prev_price = _float_or_none(row.get("prev_price"))
+    action_text = str(row.get("action") or "").upper()
+    if action_text.startswith("EXIT"):
+        price = price_lookup.get(symbol, date) or price
+    if price is None:
+        price = price_lookup.get(symbol, date)
+    if prev_price is None:
+        prev_price = price_lookup.get(symbol, previous_date)
+    if price is None:
+        price = prev_price
+    price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
+    prev_holding_ratio = float(row.get("prev_holding_ratio") or 0.0)
+    enriched = dict(row)
+    enriched["price"] = price
+    enriched["prev_price"] = prev_price
+    enriched["price_return"] = price_return
+    enriched["stock_return"] = position_adjusted_stock_return(prev_holding_ratio, price_return)
+    enriched["portfolio_contribution"] = position_portfolio_contribution(prev_holding_ratio, price_return)
+    return enriched
 
 
 def _records_by_date(holdings) -> dict[str, dict[str, dict[str, Any]]]:
@@ -260,6 +293,7 @@ def _daily_changes(
             previous_date=previous_date,
             price_lookup=price_lookup,
             symbol_names=symbol_names,
+            resolve_missing_prices=False,
         )
         action = str(row["action"])
         if action == "HOLD":
@@ -278,7 +312,18 @@ def _daily_changes(
         ),
         reverse=True,
     )
-    return changes[: max(0, int(top_changes))], counts
+    selected = changes[: max(0, int(top_changes))]
+    if price_lookup is not None and selected:
+        selected = [
+            _enrich_change_row_prices(
+                row,
+                date=date,
+                previous_date=previous_date,
+                price_lookup=price_lookup,
+            )
+            for row in selected
+        ]
+    return selected, counts
 
 
 def _period_total_return(rows: list[dict[str, Any]], key: str) -> float | None:

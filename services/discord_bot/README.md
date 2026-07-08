@@ -39,6 +39,11 @@ Market configs:
 - 24/7 intraday markets such as crypto can set `schedule_interval_minutes: 15`
   instead of `schedule_time`; the bot deduplicates one alert per completed bar.
   `schedule_delay_seconds` waits briefly after bar close before running.
+- Daily markets also run a private artifact backfill once per day. The default
+  time is `data_ready_time`, then `close_time`, then `summary_time`, then
+  `schedule_time`. This refreshes data, writes live signal artifacts, and syncs
+  `live_signal_weights.parquet` even if nobody runs a command. Runtime state can
+  override it with `artifact_backfill_time` or `backfill_time`.
 - `history_frequency: bar` makes `/portfolio_history` and `/stock_history`
   show recent bars instead of collapsing artifacts to daily rows.
 - `pre_signal_command` can run a data updater before scheduled signals. Crypto
@@ -53,11 +58,22 @@ Market configs:
 
 Useful commands:
 
-- `/signal_now market:tw` generates immediately. With `price_source:auto`, if
-  the market is open it first runs the market data updater when configured and
-  uses current prices; when the market is closed it uses the latest panel close.
+- `/signal_now market:tw` answers from a reusable live artifact when it already
+  matches the current market context. With `price_source:auto`, open stock
+  markets use current Yahoo quotes when a new inference is needed; closed
+  markets use the latest panel close. The command is fast by default and does
+  not run the full market data updater when data is already current. If data is
+  stale, it automatically runs the configured updater first. If the updater
+  fails or the panel remains older than the expected latest trading day after
+  refresh, the bot stops instead of emitting a stale signal.
 - `/signal_now market:crypto refresh_data:true` runs the configured data updater
   first, then generates the signal.
+- `/watch action:add market:tw symbol:2330` adds a symbol to your personal
+  watchlist and enables watchlist-only DM alerts for that market.
+- `/watch action:update market:tw symbol:2330 new_symbol:2317` replaces a
+  watched symbol; `/watch action:remove ...` or `action:delete` removes one.
+- `/watch action:enable market:tw` enables personal watchlist alerts, and
+  `/watch action:disable market:tw` disables them without deleting the list.
 - `/signal signal_id:...`
 - `/positions market:tw limit:0 page_size:20 current_capital:1000000` shows
   paged current/target weights and estimated position amounts.
@@ -111,9 +127,18 @@ Operational files:
   - `decision_report.md`
   - `model_explanation.json`
 
-Scheduled markets are controlled by `STOCKAGENT_SCHEDULED_MARKETS`; use `all`
-to schedule every YAML under `services/discord_bot/markets/`, or set an explicit
-list such as `tw,us,crypto`. Each market uses its own configured timezone. Daily
-markets use `schedule_time`; interval markets use `schedule_interval_minutes`.
-Each scheduled signal posts the summary plus paged current/target positions and
-all rebalance rows that pass the market's configured `min_abs_delta`.
+Scheduled markets default to every YAML under `services/discord_bot/markets/`.
+Use `STOCKAGENT_SCHEDULED_MARKETS` only when you want to restrict the set; set
+`all` for every market, or an explicit list such as `tw,us,crypto`.
+Each market uses its own configured timezone. Daily markets use
+`schedule_time`; interval markets use `schedule_interval_minutes`.
+Public scheduled broadcasts are disabled by default
+(`STOCKAGENT_PUBLIC_BROADCASTS=0`). Scheduled signals still run for artifacts
+and personal `/watch` DM alerts. Set `STOCKAGENT_PUBLIC_BROADCASTS=1` only when
+you want the bot to post automatic summaries/details to the shared channel.
+For daily markets, the private artifact backfill loop runs independently from
+public broadcasts and retries failed runs after
+`STOCKAGENT_SCHEDULED_RETRY_DELAY_SECONDS` seconds, default `60`.
+If the updater is rate-limited or otherwise produces mostly failed rows, the
+backfill is treated as failed and no live signal artifact is written from stale
+data.

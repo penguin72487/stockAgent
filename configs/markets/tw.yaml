@@ -23,6 +23,7 @@ data:
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
+  live_tail_panel_rows: 64
   trading_volume_policy: auto
   tradable_mode: tw_limit_guard
   use_tw_public_features: false

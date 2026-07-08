@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -29,6 +30,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tqdm import tqdm
 
+from downloader.status import download_counts_failure_reason
 from stockagent.data.us_universe import is_us_broker_tradable_security
 
 try:
@@ -307,6 +309,10 @@ class DownloadResult:
     checked_through_date: str | None = None
 
 
+class YahooRateLimitedError(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class ExistingFileInfo:
     first_date: str | None
@@ -557,6 +563,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=90,
         help="Max seconds to wait for one symbol's repair download; 0 disables per-symbol timeout.",
+    )
+    parser.add_argument(
+        "--rate-limit-abort-after",
+        type=int,
+        default=20,
+        help=(
+            "Abort a symbol batch after this many completed requests when all completed failures "
+            "look like Yahoo HTTP 429 rate limiting. Set 0 to disable."
+        ),
     )
     parser.add_argument(
         "--daily-stale-max-lag-days",
@@ -2960,6 +2975,9 @@ def _run_parallel_symbol_downloads(
         return []
 
     results: list[DownloadResult] = []
+    completed = 0
+    rate_limited_failures = 0
+    abort_after = max(0, int(getattr(args, "rate_limit_abort_after", 20) or 0))
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
             executor.submit(
@@ -2988,6 +3006,8 @@ def _run_parallel_symbol_downloads(
                 record, meta = futures[future]
                 try:
                     result = future.result(timeout=symbol_timeout_seconds)
+                except CancelledError:
+                    continue
                 except TimeoutError:
                     if timeout_handler is None:
                         raise
@@ -2996,7 +3016,21 @@ def _run_parallel_symbol_downloads(
                 if result_transformer is not None:
                     result = result_transformer(result, meta)
                 results.append(result)
+                completed += 1
+                message = str(result.message or "").lower()
+                if result.status == "failed" and ("429" in message or "too many requests" in message):
+                    rate_limited_failures += 1
                 progress.update(1)
+                if abort_after and completed >= abort_after and rate_limited_failures == completed:
+                    message = (
+                        f"{asset_class}: Yahoo HTTP 429 rate limited all first {completed} completed requests; "
+                        "abort remaining symbols to avoid a long doomed update"
+                    )
+                    print(f"[{progress_desc}] aborted: {message}", file=sys.stderr, flush=True)
+                    for pending in futures:
+                        if not pending.done():
+                            pending.cancel()
+                    raise YahooRateLimitedError(message)
         finally:
             progress.close()
 
@@ -3286,6 +3320,9 @@ def main() -> None:
                     key, counts = future.result()
                     summaries[key] = counts
                     asset_progress.update(1)
+    except YahooRateLimitedError as exc:
+        print(f"[{args.mode}] aborted: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(str(exc)) from exc
     finally:
         asset_progress.close()
 
@@ -3300,6 +3337,13 @@ def main() -> None:
     summary_path = Path(args.output_root) / summary_name
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
+    failures = []
+    for asset_class, counts in summaries.items():
+        reason = download_counts_failure_reason(counts)
+        if reason:
+            failures.append(f"{asset_class}: {reason}")
+    if failures:
+        raise SystemExit("; ".join(failures))
 
 
 if __name__ == "__main__":

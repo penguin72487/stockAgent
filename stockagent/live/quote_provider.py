@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,6 +10,17 @@ from urllib.parse import quote
 
 import numpy as np
 import requests
+
+
+_YAHOO_SESSION_LOCK = threading.Lock()
+_YAHOO_SESSION: requests.Session | None = None
+_YAHOO_CRUMB: str | None = None
+_YAHOO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    )
+}
 
 
 @dataclass(slots=True)
@@ -81,6 +93,28 @@ def load_prices_csv(path: str | Path, symbols: list[str], fallback_prices: np.nd
     return PriceSnapshot(prices=prices, source=f"csv:{Path(path)}", available_count=count)
 
 
+def _yahoo_session_and_crumb() -> tuple[requests.Session, str | None]:
+    global _YAHOO_SESSION, _YAHOO_CRUMB
+    with _YAHOO_SESSION_LOCK:
+        if _YAHOO_SESSION is None:
+            _YAHOO_SESSION = requests.Session()
+        if not _YAHOO_CRUMB:
+            try:
+                _YAHOO_SESSION.get("https://fc.yahoo.com", timeout=8, headers=_YAHOO_HEADERS)
+                response = _YAHOO_SESSION.get(
+                    "https://query1.finance.yahoo.com/v1/test/getcrumb",
+                    timeout=8,
+                    headers=_YAHOO_HEADERS,
+                )
+                response.raise_for_status()
+                crumb = response.text.strip()
+                if crumb and "Too Many Requests" not in crumb:
+                    _YAHOO_CRUMB = crumb
+            except Exception:
+                _YAHOO_CRUMB = None
+        return _YAHOO_SESSION, _YAHOO_CRUMB
+
+
 def fetch_yahoo_last_prices(
     symbols: list[str],
     fallback_prices: np.ndarray,
@@ -94,26 +128,30 @@ def fetch_yahoo_last_prices(
     yahoo_map = load_symbol_yahoo_map(parquet_root)
     tickers = [yahoo_map.get(symbol, symbol) for symbol in symbols]
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
-    count = 0
+    filled = np.zeros((len(symbols),), dtype=bool)
     last_timestamp_s: int | None = None
     chunk_len = max(1, int(chunk_size))
     chunks = [(start, tickers[start : start + chunk_len]) for start in range(0, len(tickers), chunk_len)]
     max_parallel = int(os.getenv("STOCKAGENT_YAHOO_PARALLEL_REQUESTS", "32") or "32")
     workers = max(1, min(len(chunks) or 1, max_parallel))
 
-    def fetch_chunk(start: int, ticker_chunk: list[str]) -> list[tuple[int, float, int | None]]:
+    def fetch_chunk(
+        start: int,
+        ticker_chunk: list[str],
+        *,
+        session: requests.Session | None = None,
+        crumb: str | None = None,
+    ) -> list[tuple[int, float, int | None]]:
         encoded = quote(",".join(str(ticker) for ticker in ticker_chunk), safe=",")
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={encoded}"
+        params = {"crumb": crumb} if crumb else None
+        request_get = session.get if session is not None else requests.get
         try:
-            response = requests.get(
+            response = request_get(
                 url,
+                params=params,
                 timeout=8,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-                    )
-                },
+                headers=_YAHOO_HEADERS,
             )
             response.raise_for_status()
             payload = response.json()
@@ -152,16 +190,113 @@ def fetch_yahoo_last_prices(
                 rows.append((index, value, timestamp_s))
         return rows
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yahoo-quote") as executor:
-        futures = [executor.submit(fetch_chunk, start, ticker_chunk) for start, ticker_chunk in chunks]
-        for future in as_completed(futures):
-            for idx, value, timestamp_s in future.result():
+    def run_quote_pass(*, session: requests.Session | None = None, crumb: str | None = None) -> None:
+        nonlocal last_timestamp_s
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yahoo-quote") as executor:
+            futures = [
+                executor.submit(fetch_chunk, start, ticker_chunk, session=session, crumb=crumb)
+                for start, ticker_chunk in chunks
+            ]
+            for future in as_completed(futures):
+                for idx, value, timestamp_s in future.result():
+                    prices[idx] = value
+                    filled[idx] = True
+                    if timestamp_s is not None and (last_timestamp_s is None or timestamp_s > last_timestamp_s):
+                        last_timestamp_s = timestamp_s
+
+    run_quote_pass()
+    quote_count = int(filled.sum())
+    min_quote_retry_count = min(len(symbols), max(1, int(len(symbols) * 0.8)))
+    used_crumb = False
+    if quote_count < min_quote_retry_count:
+        session, crumb = _yahoo_session_and_crumb()
+        if crumb:
+            run_quote_pass(session=session, crumb=crumb)
+            used_crumb = True
+
+    used_chart = False
+    if (
+        not str(os.getenv("STOCKAGENT_YAHOO_CHART_FALLBACK", "1") or "1").strip().lower()
+        in {"0", "false", "no", "off"}
+        and not bool(filled.all())
+    ):
+        missing = [idx for idx, ok in enumerate(filled) if not ok]
+        fallback_cap = int(os.getenv("STOCKAGENT_YAHOO_CHART_FALLBACK_MAX_SYMBOLS", "200") or "200")
+        if fallback_cap >= 0:
+            missing = missing[:fallback_cap]
+
+        def fetch_chart(idx: int) -> tuple[int, float, int | None] | None:
+            ticker = str(tickers[idx]).strip()
+            if not ticker:
+                return None
+            encoded = quote(ticker, safe="")
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range={period}&interval={interval}"
+            try:
+                response = requests.get(
+                    url,
+                    timeout=8,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+                        )
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                result_rows = payload.get("chart", {}).get("result") or []
+                if not result_rows:
+                    return None
+                row = result_rows[0]
+                meta = row.get("meta") or {}
+                raw_value = meta.get("regularMarketPrice") or meta.get("chartPreviousClose")
+                raw_time = meta.get("regularMarketTime")
+                indicators = row.get("indicators", {}).get("quote") or []
+                timestamps = row.get("timestamp") or []
+                if indicators:
+                    closes = indicators[0].get("close") or []
+                    for pos in range(len(closes) - 1, -1, -1):
+                        try:
+                            close_value = float(closes[pos])
+                        except Exception:
+                            continue
+                        if np.isfinite(close_value) and close_value > 0.0:
+                            raw_value = close_value
+                            if pos < len(timestamps):
+                                raw_time = timestamps[pos]
+                            break
+                value = float(raw_value)
+                if not (np.isfinite(value) and value > 0.0):
+                    return None
+                try:
+                    timestamp_s = int(raw_time)
+                except Exception:
+                    timestamp_s = None
+                return idx, value, timestamp_s
+            except Exception:
+                return None
+
+        chart_workers = max(1, min(len(missing) or 1, max_parallel))
+        with ThreadPoolExecutor(max_workers=chart_workers, thread_name_prefix="yahoo-chart") as executor:
+            futures = [executor.submit(fetch_chart, idx) for idx in missing]
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    continue
+                idx, value, timestamp_s = result
                 prices[idx] = value
-                count += 1
+                filled[idx] = True
+                used_chart = True
                 if timestamp_s is not None and (last_timestamp_s is None or timestamp_s > last_timestamp_s):
                     last_timestamp_s = timestamp_s
 
     last_timestamp = (
         datetime.fromtimestamp(last_timestamp_s, tz=timezone.utc).isoformat() if last_timestamp_s is not None else None
     )
-    return PriceSnapshot(prices=prices, source=f"yahoo:quote", timestamp=last_timestamp, available_count=count)
+    source_parts = ["yahoo:quote"]
+    if used_crumb:
+        source_parts.append("crumb")
+    if used_chart:
+        source_parts.append("chart")
+    source = "+".join(source_parts)
+    return PriceSnapshot(prices=prices, source=source, timestamp=last_timestamp, available_count=int(filled.sum()))

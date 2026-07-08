@@ -14,7 +14,7 @@ import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.config import ExperimentConfig, load_config
-from stockagent.data.panel import PanelData, build_panel
+from stockagent.data.panel import PanelData, build_panel, build_tail_panel, load_cached_panel
 from stockagent.live.portfolio_state import (
     build_rebalance_rows,
     classify_rebalance_action,
@@ -110,24 +110,50 @@ def _datetime64_second(value: object) -> np.datetime64 | None:
             return None
 
 
-def _build_panel(config: ExperimentConfig) -> PanelData:
-    return build_panel(
-        config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
-        benchmark_name=config.data.benchmark_name,
-        usd_only_trading_pairs=config.data.usd_only_trading_pairs,
-        tradable_mode=config.data.tradable_mode,
-        trading_volume_policy=config.data.trading_volume_policy,
-        security_filter=config.data.security_filter,
-        strict_no_fallback=config.training.strict_no_fallback,
-        panel_backend=config.data.panel_backend,
-        panel_load_workers=config.data.panel_load_workers,
-        external_feature_path=(
+def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelData:
+    live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
+    panel_kwargs = {
+        "use_rapids": config.data.use_rapids,
+        "benchmark_name": config.data.benchmark_name,
+        "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
+        "tradable_mode": config.data.tradable_mode,
+        "trading_volume_policy": config.data.trading_volume_policy,
+        "security_filter": config.data.security_filter,
+        "strict_no_fallback": config.training.strict_no_fallback,
+        "panel_backend": config.data.panel_backend,
+        "panel_load_workers": config.data.panel_load_workers,
+        "external_feature_path": (
             config.data.tw_public_feature_path if config.data.use_tw_public_features else None
         ),
-        external_market_symbol=config.data.tw_public_market_symbol,
-        feature_include=config.data.feature_include,
-        feature_exclude=config.data.feature_exclude,
+        "external_market_symbol": config.data.tw_public_market_symbol,
+        "feature_include": config.data.feature_include,
+        "feature_exclude": config.data.feature_exclude,
+    }
+    if live_tail and not _is_intraday_frequency(getattr(config.trading, "frequency", "")):
+        cached_panel = load_cached_panel(config.data.parquet_root, **panel_kwargs)
+        if cached_panel is not None:
+            if live_tail_rows <= 0:
+                live_tail_rows = max(int(config.training.lookback) + 8, 48)
+            return _tail_panel_dates(cached_panel, live_tail_rows)
+    if live_tail and not bool(getattr(config.data, "use_tw_public_features", False)):
+        if live_tail_rows <= 0:
+            live_tail_rows = max(int(config.training.lookback) + 8, 48)
+        return build_tail_panel(
+            config.data.parquet_root,
+            tail_rows=live_tail_rows,
+            benchmark_name=config.data.benchmark_name,
+            usd_only_trading_pairs=config.data.usd_only_trading_pairs,
+            tradable_mode=config.data.tradable_mode,
+            trading_volume_policy=config.data.trading_volume_policy,
+            security_filter=config.data.security_filter,
+            strict_no_fallback=config.training.strict_no_fallback,
+            panel_load_workers=config.data.panel_load_workers,
+            feature_include=config.data.feature_include,
+            feature_exclude=config.data.feature_exclude,
+        )
+    return build_panel(
+        config.data.parquet_root,
+        **panel_kwargs,
     )
 
 
@@ -168,7 +194,7 @@ def _read_table(path: Path):
     if path.suffix == ".parquet":
         return pl.read_parquet(path)
     if path.suffix == ".csv":
-        return pl.read_csv(path)
+        return pl.read_csv(path, infer_schema_length=None)
     raise ValueError(f"Unsupported table format: {path}")
 
 
@@ -179,6 +205,28 @@ def _is_intraday_frequency(frequency: object) -> bool:
     if text in {"bar", "intraday", "minute", "minutes", "15m", "15min", "15-min", "15-minute"}:
         return True
     return text.endswith("m") and text[:-1].isdigit()
+
+
+def _tail_panel_dates(panel: PanelData, rows: int) -> PanelData:
+    count = max(1, int(rows))
+    if int(panel.num_dates) <= count:
+        return panel
+    slc = slice(int(panel.num_dates) - count, int(panel.num_dates))
+    return PanelData(
+        dates=panel.dates[slc],
+        symbols=list(panel.symbols),
+        feature_names=list(panel.feature_names),
+        features=panel.features[slc],
+        returns_1d=panel.returns_1d[slc],
+        tradable_mask=panel.tradable_mask[slc],
+        alive_mask=panel.alive_mask[slc],
+        benchmark_returns=panel.benchmark_returns[slc],
+        close_prices=panel.close_prices[slc],
+        can_buy_mask=panel.can_buy_mask[slc] if panel.can_buy_mask is not None else None,
+        can_sell_mask=panel.can_sell_mask[slc] if panel.can_sell_mask is not None else None,
+        can_short_open_mask=panel.can_short_open_mask[slc] if panel.can_short_open_mask is not None else None,
+        force_short_cover_mask=panel.force_short_cover_mask[slc] if panel.force_short_cover_mask is not None else None,
+    )
 
 
 def _candidate_weights_paths(output_dir: str | Path, fold_id: int, *, prefer_live_weights: bool = True) -> list[Path]:
@@ -563,6 +611,11 @@ def _fmt_md_value(value: Any, *, pct: bool = False, digits: int = 4) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
+def _fmt_md_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
 def _aux_scalar_by_symbol(
     aux: dict[str, torch.Tensor] | None,
     key: str,
@@ -738,7 +791,7 @@ def _markdown_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[
             elif kind == "float":
                 cells.append(_fmt_md_value(row.get(key), digits=6))
             else:
-                cells.append(_fmt_md_value(row.get(key)))
+                cells.append(_fmt_md_text(row.get(key)))
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
@@ -1052,6 +1105,7 @@ def generate_live_signal(
     daily_bar_time: str | None = None,
     write: bool = True,
     ensure_previous_signal: bool = True,
+    previous_signal_backfill_limit: int = 8,
     progress_callback: ProgressCallback | None = None,
     progress_label: str | None = None,
 ) -> LiveSignalResult:
@@ -1094,7 +1148,7 @@ def generate_live_signal(
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
 
-    panel = _build_panel(config)
+    panel = _build_panel(config, live_tail=True)
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
     panel = _align_panel_to_state_dict_universe(
         panel,
@@ -1145,6 +1199,7 @@ def generate_live_signal(
     _emit_progress(progress_callback, label=progress_name, step=8, total=progress_total, message="check previous signal")
     if (
         ensure_previous_signal
+        and int(previous_signal_backfill_limit) > 0
         and write
         and not intraday_frequency
         and weights_path is None
@@ -1182,7 +1237,8 @@ def generate_live_signal(
             display_timezone=display_timezone,
             daily_bar_time=daily_bar_time,
             write=True,
-            ensure_previous_signal=False,
+            ensure_previous_signal=True,
+            previous_signal_backfill_limit=max(0, int(previous_signal_backfill_limit) - 1),
             progress_callback=progress_callback,
             progress_label=f"{progress_name}:previous",
         )

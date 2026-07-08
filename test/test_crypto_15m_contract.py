@@ -26,8 +26,18 @@ def test_discord_crypto_market_uses_15m_incremental_updater() -> None:
     assert "incremental" in cfg.pre_signal_command
 
 
-def test_discord_daily_markets_use_downloader_without_audit() -> None:
-    for market, asset in (("tw", "tw_stocks"), ("us", "us_stocks"), ("forex", "forex")):
+def test_discord_tw_market_uses_official_ohlcv_without_audit() -> None:
+    cfg = load_market_config("services/discord_bot/markets/tw.yaml")
+    command = " ".join(cfg.pre_signal_command)
+
+    assert "downloader/update_tw_official_ohlcv.py" in command
+    assert "--public-output-dir data_tw_public" in command
+    assert "--symbols-root data_yahoo/tw_stocks" in command
+    assert "audit_ohlcv_data.py" not in command
+
+
+def test_discord_daily_yahoo_markets_use_downloader_without_audit() -> None:
+    for market, asset in (("us", "us_stocks"), ("forex", "forex")):
         cfg = load_market_config(f"services/discord_bot/markets/{market}.yaml")
         command = " ".join(cfg.pre_signal_command)
         assert "downloader/download_yahoo_ohlcv.py" in command
