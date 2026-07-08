@@ -279,9 +279,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 128
-  batch_size_train: 128
-  batch_size_eval: 128
+  batch_size: 256
+  batch_size_train: 256
+  batch_size_eval: 256
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1

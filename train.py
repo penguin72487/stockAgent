@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import random
-import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -94,8 +94,12 @@ def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
     env.setdefault("MKL_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
     env.setdefault("OPENBLAS_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
     env.setdefault("NUMEXPR_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
-    env.setdefault("POLARS_MAX_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
-    env.setdefault("RAYON_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    # Panel loading parallelizes across symbol files via panel_load_workers.
+    # Keep Polars/Rayon inner pools small unless explicitly overridden, otherwise
+    # DDP can multiply into workers * inner_threads * ranks.
+    polars_threads = env.get("STOCKAGENT_POLARS_THREADS", "1")
+    env["POLARS_MAX_THREADS"] = polars_threads
+    env["RAYON_NUM_THREADS"] = polars_threads
     env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", env.get("STOCKAGENT_TORCH_COMPILE_THREADS", "16"))
 
     cmd = [
@@ -113,7 +117,7 @@ def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
         f"cmd={' '.join(cmd)}",
         flush=True,
     )
-    raise SystemExit(subprocess.call(cmd, env=env))
+    os.execvpe(sys.executable, cmd, env)
 
 
 def _resolve_cpu_thread_count(raw: object | None) -> int | None:
@@ -145,8 +149,8 @@ def _configure_cpu_parallelism(*, cpu_threads: int | None, compile_threads: int 
     # Panel loading already parallelizes across symbol parquet files. Keep
     # Polars/Rayon single-threaded per file to avoid 128 outer workers each
     # spawning a full inner CPU pool.
-    os.environ.setdefault("POLARS_MAX_THREADS", str(resolved_polars_threads))
-    os.environ.setdefault("RAYON_NUM_THREADS", str(resolved_polars_threads))
+    os.environ["POLARS_MAX_THREADS"] = str(resolved_polars_threads)
+    os.environ["RAYON_NUM_THREADS"] = str(resolved_polars_threads)
 
     torch.set_num_threads(resolved_cpu_threads)
     try:
@@ -202,6 +206,107 @@ def _configure_cuda_runtime() -> None:
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "enable_math_sdp"):
         torch.backends.cuda.enable_math_sdp(True)
+
+
+def _distributed_ready() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _distributed_rank() -> int:
+    if _distributed_ready():
+        return int(torch.distributed.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def _distributed_world_size() -> int:
+    if _distributed_ready():
+        return int(torch.distributed.get_world_size())
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _destroy_distributed_at_exit() -> None:
+    if _distributed_ready():
+        torch.distributed.destroy_process_group()
+
+
+def _maybe_init_distributed_for_panel(active_strategy: str, config) -> None:
+    if active_strategy != "distributed_data_parallel":
+        return
+    if int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        return
+    if _distributed_ready():
+        return
+    device_name = str(getattr(config.environment, "device", "cpu")).strip().lower()
+    backend = "nccl" if device_name == "cuda" and torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if local_rank < 0 or local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is unavailable; "
+                f"visible CUDA device_count={torch.cuda.device_count()}"
+            )
+        torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(backend=backend)
+    atexit.register(_destroy_distributed_at_exit)
+
+
+def _distributed_barrier() -> None:
+    if not _distributed_ready() or _distributed_world_size() <= 1:
+        return
+    if torch.cuda.is_available():
+        try:
+            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            return
+        except TypeError:
+            pass
+    torch.distributed.barrier()
+
+
+def _build_panel_kwargs(config) -> dict:
+    return {
+        "use_rapids": config.data.use_rapids,
+        "benchmark_name": config.data.benchmark_name,
+        "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
+        "tradable_mode": config.data.tradable_mode,
+        "trading_volume_policy": config.data.trading_volume_policy,
+        "security_filter": config.data.security_filter,
+        "strict_no_fallback": config.training.strict_no_fallback,
+        "panel_backend": config.data.panel_backend,
+        "panel_load_workers": config.data.panel_load_workers,
+        "external_feature_path": (
+            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+        ),
+        "external_market_symbol": config.data.tw_public_market_symbol,
+        "feature_include": config.data.feature_include,
+        "feature_exclude": config.data.feature_exclude,
+    }
+
+
+def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
+    kwargs = _build_panel_kwargs(config)
+    if active_strategy != "distributed_data_parallel" or _distributed_world_size() <= 1:
+        return build_panel(config.data.parquet_root, **kwargs)
+
+    rank = _distributed_rank()
+    world_size = _distributed_world_size()
+    if rank == 0:
+        print(
+            f"[panel-ddp] rank0 builds or loads panel cache first; "
+            f"{world_size - 1} rank(s) wait to avoid duplicate materialization",
+            flush=True,
+        )
+        panel = build_panel(config.data.parquet_root, **kwargs)
+    else:
+        panel = None
+
+    _distributed_barrier()
+    if rank != 0:
+        print(f"[panel-ddp] rank{rank} loading panel after rank0 cache barrier", flush=True)
+        panel = build_panel(config.data.parquet_root, **kwargs)
+    _distributed_barrier()
+    if panel is None:
+        raise RuntimeError("DDP panel build coordination failed to produce a panel")
+    return panel
 
 
 def _set_global_seed(seed: int) -> None:
@@ -682,6 +787,7 @@ def main() -> None:
     if args.backtest_compile_dynamic is not None:
         config.training.backtest_compile_dynamic = bool(args.backtest_compile_dynamic)
     _configure_cuda_runtime()
+    _maybe_init_distributed_for_panel(active_strategy, config)
 
     # Keep runtime switches consistent with YAML config.
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if config.training.backtest_autotune else "0"
@@ -716,24 +822,7 @@ def main() -> None:
         config.environment.device = "cpu"
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
-    panel = build_panel(
-        config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
-        benchmark_name=config.data.benchmark_name,
-        usd_only_trading_pairs=config.data.usd_only_trading_pairs,
-        tradable_mode=config.data.tradable_mode,
-        trading_volume_policy=config.data.trading_volume_policy,
-        security_filter=config.data.security_filter,
-        strict_no_fallback=config.training.strict_no_fallback,
-        panel_backend=config.data.panel_backend,
-        panel_load_workers=config.data.panel_load_workers,
-        external_feature_path=(
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
-        ),
-        external_market_symbol=config.data.tw_public_market_symbol,
-        feature_include=config.data.feature_include,
-        feature_exclude=config.data.feature_exclude,
-    )
+    panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
     folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,
