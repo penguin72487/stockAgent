@@ -96,7 +96,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 22
+PANEL_CACHE_VERSION = 23
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -204,6 +204,7 @@ class PanelData:
     alive_mask: np.ndarray
     benchmark_returns: np.ndarray
     close_prices: np.ndarray
+    daily_volumes: np.ndarray | None = None
     can_buy_mask: np.ndarray | None = None
     can_sell_mask: np.ndarray | None = None
     can_short_open_mask: np.ndarray | None = None
@@ -225,6 +226,7 @@ class _SymbolPanelArrays:
     features: np.ndarray
     returns_1d: np.ndarray
     close_prices: np.ndarray
+    daily_volumes: np.ndarray
     tradable_mask: np.ndarray
     can_buy_mask: np.ndarray
     can_sell_mask: np.ndarray
@@ -383,6 +385,45 @@ def _align_external_values(
     if bool(valid.any()):
         out[row_idx[valid]] = source_values[valid]
     return out
+
+
+def _overlay_external_values(
+    target: np.ndarray,
+    panel_dates: np.ndarray,
+    source_dates: np.ndarray,
+    source_values: np.ndarray,
+) -> None:
+    if target.size == 0 or panel_dates.size == 0 or source_dates.size == 0 or source_values.size == 0:
+        return
+    row_idx = np.searchsorted(panel_dates, source_dates)
+    in_bounds = (row_idx >= 0) & (row_idx < int(panel_dates.size))
+    if not bool(in_bounds.any()):
+        return
+    candidate_rows = row_idx[in_bounds]
+    source_pos = np.nonzero(in_bounds)[0]
+    exact = panel_dates[candidate_rows] == source_dates[source_pos]
+    if not bool(exact.any()):
+        return
+    target_rows = candidate_rows[exact]
+    values = source_values[source_pos[exact]]
+    finite = np.isfinite(values)
+    if bool(finite.all()):
+        target[target_rows, :] = values
+        return
+    if not bool(finite.any()):
+        return
+    value_rows, value_cols = np.nonzero(finite)
+    target[target_rows[value_rows], value_cols] = values[value_rows, value_cols]
+
+
+def _contiguous_indexer(indices: list[int]) -> Any:
+    if not indices:
+        return slice(0, 0)
+    start = int(indices[0])
+    stop = start + len(indices)
+    if indices == list(range(start, stop)):
+        return slice(start, stop)
+    return indices
 
 
 def _normalize_security_filter(value: str | None) -> str:
@@ -927,6 +968,7 @@ def _load_symbol_arrays_pyarrow(
             features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
+            daily_volumes=empty_1d,
             tradable_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
@@ -946,7 +988,7 @@ def _load_symbol_arrays_pyarrow(
     low_px = _round_half_up(col("min"), decimals=price_decimals)
     close_px = _round_half_up(col("close"), decimals=price_decimals)
     adjclose = _round_half_up(col("adjclose"), decimals=price_decimals)
-    volume = col("Trading_Volume")
+    volume = col("Trading_Volume") if "Trading_Volume" in table.column_names else np.full((rows,), np.nan, dtype=np.float64)
 
     spread = np.clip(high_px - low_px, 0.0, None)
     denom = spread + EPSILON
@@ -1012,6 +1054,7 @@ def _load_symbol_arrays_pyarrow(
         features = features[valid_dates]
         return_1d = return_1d[valid_dates]
         close_px = close_px[valid_dates]
+        volume = volume[valid_dates]
         tradable = tradable[valid_dates]
         close_notna = close_notna[valid_dates]
 
@@ -1034,6 +1077,7 @@ def _load_symbol_arrays_pyarrow(
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
+        daily_volumes=volume.astype(np.float32, copy=False),
         tradable_mask=tradable,
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
@@ -1121,6 +1165,7 @@ def _load_symbol_arrays_polars_lazy(
     selected_columns = [
         _polars_datetime_ns_expr(frame.schema, "date"),
         pl.col("_close").alias("close_px"),
+        pl.col("_volume").alias("daily_volume"),
         pl.col("return_1d"),
         pl.col("tradable"),
         *[pl.col(name) for name in LOG_RETURN_FEATURE_COLUMNS],
@@ -1142,6 +1187,7 @@ def _load_symbol_arrays_polars_lazy(
             features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
+            daily_volumes=empty_1d,
             tradable_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
@@ -1150,6 +1196,7 @@ def _load_symbol_arrays_polars_lazy(
 
     dates = out["date"].to_numpy().astype("datetime64[ns]", copy=False)
     close_px = out["close_px"].to_numpy().astype(np.float64, copy=False)
+    daily_volume = out["daily_volume"].to_numpy().astype(np.float64, copy=False)
     return_1d = out["return_1d"].to_numpy().astype(np.float64, copy=False)
     tradable = out["tradable"].to_numpy().astype(bool, copy=False)
     features = np.column_stack(
@@ -1163,6 +1210,7 @@ def _load_symbol_arrays_polars_lazy(
         features = features[valid_dates]
         return_1d = return_1d[valid_dates]
         close_px = close_px[valid_dates]
+        daily_volume = daily_volume[valid_dates]
         tradable = tradable[valid_dates]
         close_notna = close_notna[valid_dates]
 
@@ -1185,6 +1233,7 @@ def _load_symbol_arrays_polars_lazy(
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
+        daily_volumes=daily_volume.astype(np.float32, copy=False),
         tradable_mask=np.asarray(tradable, dtype=bool),
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
@@ -1196,6 +1245,8 @@ def _build_panel_from_symbol_arrays(
     symbol_arrays: list[_SymbolPanelArrays],
     benchmark_name: str = "universe_average_return",
     external_features: _ExternalFeatureArrays | None = None,
+    feature_include: tuple[str, ...] = (),
+    feature_exclude: tuple[str, ...] = (),
 ) -> PanelData:
     if not symbol_arrays:
         raise RuntimeError("No valid parquet files could be loaded.")
@@ -1208,15 +1259,43 @@ def _build_panel_from_symbol_arrays(
     all_dates.sort()
     num_dates = int(all_dates.size)
     num_symbols = len(symbol_arrays)
-    base_feature_names = list(LOG_RETURN_FEATURE_COLUMNS)
-    external_feature_names = list(external_features.feature_names) if external_features is not None else []
-    num_base_features = len(base_feature_names)
-    num_external_features = len(external_feature_names)
-    num_features = num_base_features + num_external_features
+    all_base_feature_names = list(LOG_RETURN_FEATURE_COLUMNS)
+    all_external_feature_names = list(external_features.feature_names) if external_features is not None else []
+    (
+        base_feature_indices,
+        base_dest_indices,
+        external_feature_indices,
+        external_dest_indices,
+        feature_names,
+    ) = _resolve_panel_feature_indices(
+        all_base_feature_names,
+        all_external_feature_names,
+        feature_include=feature_include,
+        feature_exclude=feature_exclude,
+    )
+    num_base_features = len(base_feature_indices)
+    num_external_features = len(external_feature_indices)
+    num_features = len(feature_names)
+    base_source_indexer = _contiguous_indexer(base_feature_indices)
+    base_dest_indexer = _contiguous_indexer(base_dest_indices)
+    external_source_indexer = _contiguous_indexer(external_feature_indices)
+    external_dest_indexer = _contiguous_indexer(external_dest_indices)
+    external_dest_is_slice = isinstance(external_dest_indexer, slice)
+    total_available_features = len(all_base_feature_names) + len(all_external_feature_names)
+    if num_features != total_available_features:
+        print(
+            f"[panel] feature filter kept {num_features}/{total_available_features} "
+            f"(include={list(feature_include) or ['*']}, exclude={list(feature_exclude) or []})"
+        )
+    print(
+        f"[panel] materializing panel dates={num_dates} symbols={num_symbols} "
+        f"features={num_features} base_features={num_base_features} external_features={num_external_features}"
+    )
 
     features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    daily_volumes = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     can_buy_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
@@ -1224,10 +1303,11 @@ def _build_panel_from_symbol_arrays(
 
     market_external = None
     if external_features is not None and num_external_features:
+        market_values = external_features.market_values[:, external_source_indexer]
         market_external = _align_external_values(
             all_dates,
             external_features.market_dates,
-            external_features.market_values,
+            market_values,
         )
 
     for sym_idx, item in enumerate(symbol_arrays):
@@ -1235,24 +1315,35 @@ def _build_panel_from_symbol_arrays(
             continue
         row_idx = np.searchsorted(all_dates, item.dates)
         valid = (row_idx >= 0) & (row_idx < num_dates) & (all_dates[row_idx] == item.dates)
-        if not bool(valid.all()):
+        all_valid = bool(valid.all())
+        if not all_valid:
             row_idx = row_idx[valid]
-        features[row_idx, sym_idx, :num_base_features] = item.features[valid]
+        item_features = item.features if all_valid else item.features[valid]
+        symbol_features = features[:, sym_idx, :]
+        if num_base_features:
+            if isinstance(base_dest_indexer, slice):
+                symbol_features[row_idx, base_dest_indexer] = item_features[:, base_source_indexer]
+            else:
+                symbol_features[np.ix_(row_idx, base_dest_indices)] = item_features[:, base_source_indexer]
         if market_external is not None:
-            features[:, sym_idx, num_base_features:] = market_external
+            symbol_features[:, external_dest_indexer] = market_external
         if external_features is not None and num_external_features:
             symbol_external = external_features.by_symbol.get(str(item.symbol).upper())
             if symbol_external is not None:
-                aligned_external = _align_external_values(all_dates, symbol_external[0], symbol_external[1])
-                target = features[:, sym_idx, num_base_features:]
-                value_mask = np.isfinite(aligned_external)
-                target[value_mask] = aligned_external[value_mask]
-        returns_1d[row_idx, sym_idx] = item.returns_1d[valid]
-        close_prices[row_idx, sym_idx] = item.close_prices[valid]
-        tradable_mask[row_idx, sym_idx] = item.tradable_mask[valid]
-        can_buy_mask[row_idx, sym_idx] = item.can_buy_mask[valid]
-        can_sell_mask[row_idx, sym_idx] = item.can_sell_mask[valid]
-        alive_mask[row_idx, sym_idx] = item.alive_mask[valid]
+                symbol_values = symbol_external[1][:, external_source_indexer]
+                target = symbol_features[:, external_dest_indexer]
+                _overlay_external_values(target, all_dates, symbol_external[0], symbol_values)
+                if not external_dest_is_slice:
+                    symbol_features[:, external_dest_indexer] = target
+        returns_1d[row_idx, sym_idx] = item.returns_1d if all_valid else item.returns_1d[valid]
+        close_prices[row_idx, sym_idx] = item.close_prices if all_valid else item.close_prices[valid]
+        daily_volumes[row_idx, sym_idx] = item.daily_volumes if all_valid else item.daily_volumes[valid]
+        tradable_mask[row_idx, sym_idx] = item.tradable_mask if all_valid else item.tradable_mask[valid]
+        can_buy_mask[row_idx, sym_idx] = item.can_buy_mask if all_valid else item.can_buy_mask[valid]
+        can_sell_mask[row_idx, sym_idx] = item.can_sell_mask if all_valid else item.can_sell_mask[valid]
+        alive_mask[row_idx, sym_idx] = item.alive_mask if all_valid else item.alive_mask[valid]
+        if (sym_idx + 1) % 500 == 0 or (sym_idx + 1) == num_symbols:
+            print(f"[panel] materialized symbols {sym_idx + 1}/{num_symbols}")
 
     benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
     if benchmark_symbol_index is None:
@@ -1269,11 +1360,12 @@ def _build_panel_from_symbol_arrays(
             neginf=0.0,
         ).astype(np.float32, copy=False)
 
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    print("[panel] sanitizing feature NaN/inf values")
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     return PanelData(
         dates=np.asarray(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
-        feature_names=[*base_feature_names, *external_feature_names],
+        feature_names=feature_names,
         features=features,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
@@ -1284,6 +1376,7 @@ def _build_panel_from_symbol_arrays(
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
+        daily_volumes=daily_volumes,
     )
 
 
@@ -1350,6 +1443,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
+        daily_volumes=panel.daily_volumes,
     )
 
 
@@ -1423,6 +1517,12 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         if "force_short_cover_mask" in cached_keys
         else np.zeros_like(tradable_mask, dtype=bool)
     )
+    close_prices = cached["close_prices"]
+    daily_volumes = (
+        cached["daily_volumes"]
+        if "daily_volumes" in cached_keys
+        else np.full_like(close_prices, np.nan, dtype=np.float32)
+    )
     return PanelData(
         dates=cached["dates"],
         symbols=cached["symbols"].tolist(),
@@ -1436,7 +1536,8 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         force_short_cover_mask=force_short_cover_mask,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
-        close_prices=cached["close_prices"],
+        close_prices=close_prices,
+        daily_volumes=daily_volumes,
     )
 
 
@@ -1446,6 +1547,8 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
     can_sell_mask = payload.get("can_sell_mask", tradable_mask)
     can_short_open_mask = payload.get("can_short_open_mask", can_sell_mask)
     force_short_cover_mask = payload.get("force_short_cover_mask", np.zeros_like(tradable_mask, dtype=bool))
+    close_prices = payload["close_prices"]
+    daily_volumes = payload.get("daily_volumes", np.full_like(close_prices, np.nan, dtype=np.float32))
     return PanelData(
         dates=payload["dates"],
         symbols=list(payload["symbols"]),
@@ -1459,7 +1562,8 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         force_short_cover_mask=force_short_cover_mask,
         alive_mask=payload["alive_mask"],
         benchmark_returns=payload["benchmark_returns"],
-        close_prices=payload["close_prices"],
+        close_prices=close_prices,
+        daily_volumes=daily_volumes,
     )
 
 
@@ -1523,6 +1627,42 @@ def _feature_pattern_indices(feature_names: list[str], patterns: tuple[str, ...]
     return selected
 
 
+def _resolve_panel_feature_indices(
+    base_feature_names: list[str],
+    external_feature_names: list[str],
+    *,
+    feature_include: tuple[str, ...] = (),
+    feature_exclude: tuple[str, ...] = (),
+) -> tuple[list[int], list[int], list[int], list[int], list[str]]:
+    all_feature_names = [*base_feature_names, *external_feature_names]
+    if feature_include:
+        selected = _feature_pattern_indices(all_feature_names, feature_include, label="feature_include")
+    else:
+        selected = list(range(len(all_feature_names)))
+
+    if feature_exclude:
+        excluded = set(_feature_pattern_indices(all_feature_names, feature_exclude, label="feature_exclude"))
+        selected = [idx for idx in selected if idx not in excluded]
+
+    if not selected:
+        raise ValueError("feature_include/feature_exclude removed all panel features")
+
+    num_base = len(base_feature_names)
+    base_indices: list[int] = []
+    base_dest_indices: list[int] = []
+    external_indices: list[int] = []
+    external_dest_indices: list[int] = []
+    for dest_idx, source_idx in enumerate(selected):
+        if source_idx < num_base:
+            base_indices.append(source_idx)
+            base_dest_indices.append(dest_idx)
+        else:
+            external_indices.append(source_idx - num_base)
+            external_dest_indices.append(dest_idx)
+    selected_names = [all_feature_names[idx] for idx in selected]
+    return base_indices, base_dest_indices, external_indices, external_dest_indices, selected_names
+
+
 def _filter_panel_features(
     panel: PanelData,
     *,
@@ -1566,6 +1706,7 @@ def _filter_panel_features(
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
+        daily_volumes=panel.daily_volumes,
     )
 
 
@@ -1782,13 +1923,10 @@ def build_panel(
         valid_arrays,
         benchmark_name=benchmark_name,
         external_features=external_features,
-    )
-    panel = _apply_external_rule_masks(panel, external_features)
-    panel = _filter_panel_features(
-        panel,
         feature_include=feature_include_patterns,
         feature_exclude=feature_exclude_patterns,
     )
+    panel = _apply_external_rule_masks(panel, external_features)
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)
