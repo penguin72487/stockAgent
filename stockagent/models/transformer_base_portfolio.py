@@ -380,7 +380,19 @@ class FlashSDPAAttention(nn.Module):
                 self.captured_attention = capture_attn.mean(dim=1).detach().float().cpu()
                 self.captured_attention_shape = tuple(int(dim) for dim in capture_attn.shape)
 
-        if self.use_flash_attention:
+        use_sdpa_attention = bool(self.use_flash_attention)
+        if (
+            use_sdpa_attention
+            and context is not None
+            and _torch_is_compiling()
+            and q.dtype in {torch.float16, torch.bfloat16}
+        ):
+            # Inductor + BF16 SDPA cross-attention can emit unstable Blackwell
+            # kernels in the current CUDA/PyTorch stack. Keep temporal SDPA, but
+            # use the explicit attention path for compiled cross-attention.
+            use_sdpa_attention = False
+
+        if use_sdpa_attention:
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
                 chunks: list[torch.Tensor] = []
                 for start in range(0, int(q.size(0)), self.sdpa_batch_limit):
@@ -1000,6 +1012,18 @@ class TransformerBasePortfolioModel(nn.Module):
     def _symbol_position(self, n_symbols: int, symbol_indices: torch.Tensor | None = None) -> torch.Tensor:
         if symbol_indices is not None:
             indices = symbol_indices.to(device=self.symbol_position.device, dtype=torch.long)
+            indices = indices.clamp(0, int(self.symbol_position.size(2)) - 1)
+            if _torch_is_compiling():
+                position_matrix = self.symbol_position.reshape(
+                    int(self.symbol_position.size(2)),
+                    int(self.symbol_position.size(3)),
+                )
+                selector = F.one_hot(indices, num_classes=int(self.symbol_position.size(2))).to(
+                    device=position_matrix.device,
+                    dtype=position_matrix.dtype,
+                )
+                selected = selector.matmul(position_matrix)
+                return selected.reshape(1, 1, int(indices.numel()), int(self.symbol_position.size(3)))
             return self.symbol_position.index_select(2, indices)
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]

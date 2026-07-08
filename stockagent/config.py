@@ -62,6 +62,37 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
     return items
 
 
+def _normalize_int_list(value: Any, *, field_name: str) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raise ValueError(f"{field_name} must be a list or comma-separated string, got {type(value).__name__}")
+
+    items: list[int] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.startswith("#"):
+            continue
+        items.append(int(text))
+    return items
+
+
+def _normalize_optional_positive_int(value: Any, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"", "0", "auto", "none", "off", "false"}:
+        return None
+    resolved = int(value)
+    if resolved < 1:
+        raise ValueError(f"{field_name} must be >= 1, got {resolved}")
+    return resolved
+
+
 def _normalize_portfolio_output_mode(mode: str | None) -> str:
     normalized = str(mode or "activation_l1").strip().lower().replace("-", "_")
     if normalized in {
@@ -127,6 +158,8 @@ class EnvironmentConfig:
     use_tensor_cores: bool
     amp_dtype: str
     target_vram_fraction: float = 1
+    cpu_threads: int | None = None
+    torch_compile_threads: int | None = None
 
 
 @dataclass(slots=True)
@@ -165,6 +198,8 @@ class TradingConfig:
     long_only: bool
     cash_allowed: bool
     max_turnover_ratio: float = 0.0
+    max_volume_participation: float = 0.0
+    volume_participation_equity: float = 1_000_000.0
     leverage: float = 1.0
     min_trade_weight: float = 0.0
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
@@ -507,6 +542,12 @@ class TrainingConfig:
     non_blocking_transfer: bool
     model_name: str
     seed: int = 42
+    multi_gpu_strategy: str = "none"
+    data_parallel_device_ids: list[int] = field(default_factory=list)
+    data_parallel_output_device: int | None = None
+    data_parallel_disable_panel_forward: bool = True
+    data_parallel_compile_model: bool = False
+    ddp_bucket_cap_mb: int = 4
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
     torch_compile_mode: str = "reduce-overhead"
@@ -514,7 +555,9 @@ class TrainingConfig:
     triton_cache_dir: str = "~/.cache/triton"
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
+    compile_fused_log_utility_loss: bool | None = None
     fused_log_utility_loss: bool = True
+    fused_log_utility_manual_backward: bool = False
     loss_portfolio_activation: str = "auto"
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
@@ -525,6 +568,7 @@ class TrainingConfig:
     eval_auto_chunk_rows_cap: int = 16
     train_symbol_subsample_ratio: float = 1.0
     train_symbol_compaction: str = "none"
+    train_symbol_compaction_bucket_size: int = 0
     detach_prev_state: bool = True
     prefer_fp16: bool = False
     backtest_autotune: bool = True
@@ -726,8 +770,56 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     walk_forward.setdefault("val_years", 1)
     walk_forward.setdefault("require_future_test_year", True)
 
+    environment = raw.setdefault("environment", {})
+    environment.setdefault("cpu_threads", None)
+    environment.setdefault("torch_compile_threads", None)
+    environment["cpu_threads"] = _normalize_optional_positive_int(
+        environment.get("cpu_threads"),
+        field_name="environment.cpu_threads",
+    )
+    environment["torch_compile_threads"] = _normalize_optional_positive_int(
+        environment.get("torch_compile_threads"),
+        field_name="environment.torch_compile_threads",
+    )
+
     training = raw.setdefault("training", {})
     training.setdefault("seed", 42)
+    training.setdefault("multi_gpu_strategy", "none")
+    multi_gpu_strategy = str(training.get("multi_gpu_strategy", "none")).strip().lower().replace("-", "_")
+    multi_gpu_aliases = {
+        "": "none",
+        "0": "none",
+        "false": "none",
+        "off": "none",
+        "no": "none",
+        "single": "none",
+        "single_gpu": "none",
+        "dp": "data_parallel",
+        "dataparallel": "data_parallel",
+        "torch_data_parallel": "data_parallel",
+        "ddp": "distributed_data_parallel",
+        "distributed": "distributed_data_parallel",
+        "distributed_data_parallel": "distributed_data_parallel",
+        "torch_ddp": "distributed_data_parallel",
+    }
+    multi_gpu_strategy = multi_gpu_aliases.get(multi_gpu_strategy, multi_gpu_strategy)
+    if multi_gpu_strategy not in {"none", "data_parallel", "distributed_data_parallel"}:
+        raise ValueError("training.multi_gpu_strategy must be one of: none, data_parallel, distributed_data_parallel")
+    training["multi_gpu_strategy"] = multi_gpu_strategy
+    training.setdefault(
+        "data_parallel_device_ids",
+        [0, 1] if multi_gpu_strategy in {"data_parallel", "distributed_data_parallel"} else [],
+    )
+    training["data_parallel_device_ids"] = _normalize_int_list(
+        training.get("data_parallel_device_ids"),
+        field_name="training.data_parallel_device_ids",
+    )
+    raw_output_device = training.get("data_parallel_output_device", None)
+    training["data_parallel_output_device"] = None if raw_output_device is None else int(raw_output_device)
+    training.setdefault("data_parallel_disable_panel_forward", True)
+    training.setdefault("data_parallel_compile_model", False)
+    training.setdefault("ddp_bucket_cap_mb", 4)
+    training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
     training.setdefault("lookback", 1)
     training.setdefault("batch_size", 32)
     training.setdefault("batch_size_train", training.get("batch_size", 32))
@@ -741,7 +833,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("triton_cache_dir", "~/.cache/triton")
     training.setdefault("cuda_cache_path", "~/.cache/nv_cuda")
     training.setdefault("compile_loss", None)
+    training.setdefault("compile_fused_log_utility_loss", None)
     training.setdefault("fused_log_utility_loss", True)
+    training.setdefault("fused_log_utility_manual_backward", False)
     training.setdefault("loss_portfolio_activation", "auto")
     training.setdefault("warm_start_from_previous_fold", False)
     training.setdefault("chunk_rows", 0)
@@ -752,6 +846,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("eval_auto_chunk_rows_cap", 16)
     training.setdefault("train_symbol_subsample_ratio", 1.0)
     training.setdefault("train_symbol_compaction", "none")
+    training.setdefault("train_symbol_compaction_bucket_size", 0)
     training.setdefault("detach_prev_state", True)
     training.setdefault("prefer_fp16", False)
     training.setdefault("backtest_autotune", True)
@@ -1460,11 +1555,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("training.backtest_artifact_compression must be one of: none, compressed")
     training["backtest_artifact_compression"] = backtest_artifact_compression
     trading.setdefault("max_turnover_ratio", 0.0)
+    trading.setdefault("max_volume_participation", 0.0)
+    trading.setdefault("volume_participation_equity", 1_000_000.0)
     legacy_gross_leverage = trading.pop("gross_leverage", None)
     trading.setdefault("leverage", legacy_gross_leverage if legacy_gross_leverage is not None else 1.0)
     trading.setdefault("min_trade_weight", 0.0)
     trading.setdefault("portfolio_activation", DEFAULT_PORTFOLIO_ACTIVATION)
     # Report/post-processing leverage only. Canonical model/loss/backtest exposure stays unlevered.
+    trading["max_turnover_ratio"] = max(0.0, float(trading.get("max_turnover_ratio", 0.0)))
+    trading["max_volume_participation"] = max(0.0, float(trading.get("max_volume_participation", 0.0)))
+    trading["volume_participation_equity"] = max(1e-12, float(trading.get("volume_participation_equity", 1_000_000.0)))
     trading["leverage"] = max(0.0, float(trading.get("leverage", 1.0)))
     trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.0)))
     trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
@@ -1513,6 +1613,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
             non_blocking_transfer=training_raw["non_blocking_transfer"],
             model_name=training_raw["model_name"],
             seed=training_raw["seed"],
+            multi_gpu_strategy=training_raw["multi_gpu_strategy"],
+            data_parallel_device_ids=training_raw["data_parallel_device_ids"],
+            data_parallel_output_device=training_raw["data_parallel_output_device"],
+            data_parallel_disable_panel_forward=training_raw["data_parallel_disable_panel_forward"],
+            data_parallel_compile_model=training_raw["data_parallel_compile_model"],
+            ddp_bucket_cap_mb=training_raw["ddp_bucket_cap_mb"],
             enable_torch_compile=training_raw["enable_torch_compile"],
             auto_torch_compile_sharpe=training_raw["auto_torch_compile_sharpe"],
             torch_compile_mode=training_raw["torch_compile_mode"],
@@ -1520,7 +1626,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             triton_cache_dir=training_raw["triton_cache_dir"],
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
+            compile_fused_log_utility_loss=training_raw["compile_fused_log_utility_loss"],
             fused_log_utility_loss=training_raw["fused_log_utility_loss"],
+            fused_log_utility_manual_backward=training_raw["fused_log_utility_manual_backward"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
@@ -1531,6 +1639,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             eval_auto_chunk_rows_cap=training_raw["eval_auto_chunk_rows_cap"],
             train_symbol_subsample_ratio=training_raw["train_symbol_subsample_ratio"],
             train_symbol_compaction=training_raw["train_symbol_compaction"],
+            train_symbol_compaction_bucket_size=int(training_raw["train_symbol_compaction_bucket_size"]),
             detach_prev_state=training_raw["detach_prev_state"],
             prefer_fp16=training_raw["prefer_fp16"],
             backtest_autotune=training_raw["backtest_autotune"],
