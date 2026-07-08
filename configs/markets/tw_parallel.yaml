@@ -1,17 +1,20 @@
-experiment_name: tw-stock-transformer-market-public-data-all
+experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090
 
 runner:
-  output_dir: artifacts/markets/tw_boost
+  output_dir: artifacts/markets/tw_parallel_epyc7662_dual5090
   mode: train
-  resume: false
+  resume: true
   post_train_infer: false
-  start_fold: 11
+  start_fold: 20
 environment:
   conda_env: fintech
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
   target_vram_fraction: 0.9
+  # AMD EPYC 7662: 64 physical cores / usually 128 logical threads with SMT.
+  cpu_threads: 128
+  torch_compile_threads: 32
 
 data:
   parquet_root: data_yahoo/tw_stocks
@@ -22,7 +25,7 @@ data:
   use_rapids: false
   usd_only_trading_pairs: false
   panel_backend: auto
-  panel_load_workers: 16
+  panel_load_workers: 128
   trading_volume_policy: auto
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
@@ -199,10 +202,12 @@ trading:
   frequency: daily
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
-  max_turnover_ratio: 50.0
+  max_turnover_ratio: 0.0
+  max_volume_participation: 0.5
+  volume_participation_equity: 1000000.0
   leverage: 2.5
   min_trade_weight: 0.0
-  portfolio_activation: pre_normalized
+  portfolio_activation: identity
   long_only: false
   cash_allowed: true
 training:
@@ -210,30 +215,60 @@ training:
   target: next_1d_rank
   batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
-  seed: 1
-  model_name: gradient_boosted_portfolio_transformer
+  model_name: transformer_base_portfolio
+  # Dual RTX 5090 DDP training path. train.py auto-relaunches itself under
+  # torchrun when this strategy is selected, so the normal command remains:
+  #   python train.py --config configs/markets/tw_parallel.yaml
+  #
+  # Measured DDP hotpath profile on EPYC 7662 + dual RTX 5090:
+  # - world_size=2, global_batch_size=128, local_batch_size=64
+  # - torch.compile model=true, compile_mode=default, order=model_before_ddp
+  # - compile_fused_log_utility_loss=false
+  # - eager fused log-utility loss; compiling the recurrent scan stalls cold compile
+  # - fold21 hotpath recheck: batch128 and batch256 are both about 620 rows/s,
+  #   so the recurrent full-batch log-utility scan is the throughput limiter.
+  #   Increasing batch size alone does not materially improve GPU occupancy.
+  multi_gpu_strategy: distributed_data_parallel
+  data_parallel_device_ids: [0, 1]
+  data_parallel_output_device: 0
+  data_parallel_disable_panel_forward: true
+  ddp_bucket_cap_mb: 4
+  # DDP compiles the bare model before wrapping it in DistributedDataParallel,
+  # so Dynamo does not trace DDP broadcast/reducer internals. The recurrent
+  # fused loss stays eager because fullgraph-compiling the row scan causes
+  # excessive cold compile time.
+  # Runtime also disables Inductor Triton mix-order reduction by default
+  # (STOCKAGENT_INDUCTOR_MIX_ORDER_REDUCTION=0) because PyTorch CUDA 13 hit
+  # a compiled-backward scheduler assertion in that fusion pass on RTX 5090.
+  # Only used when overriding multi_gpu_strategy back to data_parallel.
+  data_parallel_compile_model: true
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
-  torch_compile_mode: reduce-overhead
+  torch_compile_mode: default
   torchinductor_cache_dir: ~/.cache/torchinductor
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
+  compile_fused_log_utility_loss: false
   fused_log_utility_loss: true
-  loss_portfolio_activation: pre_normalized
+  fused_log_utility_manual_backward: true
+  loss_portfolio_activation: identity
   materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
+  eval_backtest_compile: false
   eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
+  train_symbol_compaction: train_union
+  train_symbol_compaction_bucket_size: 0
   detach_prev_state: true
   prefer_fp16: false
-  backtest_autotune: true
-  backtest_compile: false
-  backtest_compile_stateful: false
+  backtest_autotune: false
+  backtest_compile: true
+  backtest_compile_stateful: true
   backtest_compile_dynamic: false
   inference_backtest_autotune: false
   inference_backtest_compile: false
@@ -244,9 +279,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 4
-  batch_size_train: 4
-  batch_size_eval: 4
+  batch_size: 256
+  batch_size_train: 256
+  batch_size_eval: 256
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -312,8 +347,8 @@ training:
   save_daily_weights_csv: false
   backtest_artifact_compression: none
   save_best_val_artifacts: false
-  postprocess_benchmark_after_fold: true
-  postprocess_benchmark_after_best_val: true
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
   postprocess_benchmark_split: test
   postprocess_benchmark_activations: identity,softsign,tanh,isru,erf,atan,gd
   postprocess_benchmark_thresholds: 0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02
@@ -340,12 +375,13 @@ training:
   num_workers: 0
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  finite_check_interval_steps: 1
+  finite_check_interval_steps: 100
+  checkpoint_finite_check: false
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  vram_budget_gb: 90
-  vram_safety_margin_gb: 4.0
+  vram_budget_gb: 32
+  vram_safety_margin_gb: 2.0
   target_vram_fraction: 0.9
   # Model branches. Only the block named by training.model_name is active.
   # Current active branch: transformer_base_portfolio.
@@ -456,12 +492,25 @@ training:
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
-    sdpa_batch_limit: 16384
+    # Fold18 full-TW benchmark: 65535 is the largest stable SDPA chunk in the
+    # current CUDA/PyTorch environment. 65536 and 131071 both failed in SDPA
+    # forward with CUDA invalid argument, so this is a kernel shape boundary,
+    # not a VRAM limit.
+    sdpa_batch_limit: 65535
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: true
+    qk_norm: false
     rope_temporal: true
     rope_base: 10000.0
+    # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
+    # two-epoch benchmark, using epoch 2 only: temporal_layers=1,
+    # temporal_heads=1, temporal_ffn_mult=1, d_model=16, cross_heads=2, and
+    # eval_model_chunk_rows=auto reduced epoch wall from 20.16s to 4.93s while
+    # preserving attention pooling semantics. Adding train_symbol_compaction:
+    # train_union then reduced epoch-2 wall to 3.72s and train time to
+    # 175.1ms/batch on fold18 by training only the fold's active symbol union.
+    # d_model=8 was faster at 3.35s but collapsed the 2-epoch fold18
+    # validation/test loss, so it is only a lower bound probe, not active.
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
@@ -496,7 +545,7 @@ training:
     # - signed_sparsemax: hardest sparse long/short/cash simplex; largest local gradients, more support-jump risk.
     # - projection_l1: raw holdings projected to L1 ball; legal cash, sparse only when raw gross exceeds 1.
     # For signed_* and projection_l1, keep portfolio_activation/loss_portfolio_activation=pre_normalized.
-    portfolio_output_mode: projection_l1
+    portfolio_output_mode: logits
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false
@@ -536,7 +585,7 @@ training:
     detach_stage_condition: true
     default_temperature: 1.0
     portfolio_mode: long_short
-    portfolio_output_mode: projection_l1
+    portfolio_output_mode: logits
     center_final_logits: true
     return_aux: false
     return_aux_details: false
@@ -663,3 +712,6 @@ evaluation:
   gamma_cvar_budget: 2.0
   gamma_drawdown_budget: 2.5
   gamma_turnover_budget: 0.5
+  eval_log_utility_pre_log_power: 0.0
+  eval_log_utility_periods_per_year: 252.0
+  eval_log_utility_log_shift: 0.0

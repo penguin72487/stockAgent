@@ -16,6 +16,7 @@ detect_fintech_env_path() {
     "$HOME/mambaforge/envs/fintech" \
     "$HOME/miniconda3/envs/fintech" \
     "$HOME/anaconda3/envs/fintech" \
+    "/venv/fintech" \
     "/root/miniforge3/envs/fintech" \
     "/home/user/miniforge3/envs/fintech"; do
     if [[ -x "$candidate/bin/python" ]]; then
@@ -62,6 +63,7 @@ resolve_fintech_python() {
 
 prepend_fintech_path() {
   if [[ -n "${FINTECH_ENV_PATH:-}" && -d "$FINTECH_ENV_PATH/bin" ]]; then
+    export CONDA_PREFIX="${CONDA_PREFIX:-$FINTECH_ENV_PATH}"
     export PATH="$FINTECH_ENV_PATH/bin:$PATH"
   fi
 }

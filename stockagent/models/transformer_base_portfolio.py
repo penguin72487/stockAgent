@@ -18,6 +18,7 @@ from stockagent.models.normalization import (
     masked_softmax,
     normalize_portfolio_activation,
 )
+from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, profile_range
 
 
 class PortfolioRMSNorm(nn.Module):
@@ -379,7 +380,19 @@ class FlashSDPAAttention(nn.Module):
                 self.captured_attention = capture_attn.mean(dim=1).detach().float().cpu()
                 self.captured_attention_shape = tuple(int(dim) for dim in capture_attn.shape)
 
-        if self.use_flash_attention:
+        use_sdpa_attention = bool(self.use_flash_attention)
+        if (
+            use_sdpa_attention
+            and context is not None
+            and _torch_is_compiling()
+            and q.dtype in {torch.float16, torch.bfloat16}
+        ):
+            # Inductor + BF16 SDPA cross-attention can emit unstable Blackwell
+            # kernels in the current CUDA/PyTorch stack. Keep temporal SDPA, but
+            # use the explicit attention path for compiled cross-attention.
+            use_sdpa_attention = False
+
+        if use_sdpa_attention:
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
                 chunks: list[torch.Tensor] = []
                 for start in range(0, int(q.size(0)), self.sdpa_batch_limit):
@@ -856,13 +869,40 @@ class TransformerBasePortfolioModel(nn.Module):
             "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
         )
 
-    def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:
+    def _check_symbol_indices(self, symbol_indices: torch.Tensor | None, n_symbols: int) -> None:
+        if symbol_indices is None:
+            return
+        if symbol_indices.dim() != 1:
+            raise ValueError(f"Expected symbol_indices shape [S], got ndim={symbol_indices.dim()}")
+        if int(symbol_indices.numel()) != int(n_symbols):
+            raise ValueError(
+                f"Expected symbol_indices length {int(n_symbols)}, got {int(symbol_indices.numel())}"
+            )
+        if int(symbol_indices.numel()) == 0:
+            return
+        if _torch_is_compiling():
+            return
+        idx_cpu = symbol_indices.detach().to(device="cpu", dtype=torch.long)
+        min_idx = int(idx_cpu.min().item())
+        max_idx = int(idx_cpu.max().item())
+        if min_idx < 0 or max_idx >= self.num_symbols:
+            raise ValueError(
+                f"symbol_indices must be in [0, {self.num_symbols}), got min={min_idx}, max={max_idx}"
+            )
+
+    def _check_shapes(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> None:
         if x.dim() != 4:
             raise ValueError(f"Expected x shape [B,L,S,F], got ndim={x.dim()}")
         if int(x.size(1)) != self.lookback:
             raise ValueError(f"Expected lookback={self.lookback}, got {int(x.size(1))}")
-        if (not self.allow_dynamic_symbols) and int(x.size(2)) != self.num_symbols:
+        if (not self.allow_dynamic_symbols) and symbol_indices is None and int(x.size(2)) != self.num_symbols:
             raise ValueError(f"Expected num_symbols={self.num_symbols}, got {int(x.size(2))}")
+        self._check_symbol_indices(symbol_indices, int(x.size(2)))
         if int(x.size(3)) != self.num_features:
             raise ValueError(f"Expected num_features={self.num_features}, got {int(x.size(3))}")
         if mask is not None and tuple(mask.shape) != (int(x.size(0)), int(x.size(2))):
@@ -873,13 +913,15 @@ class TransformerBasePortfolioModel(nn.Module):
         features: torch.Tensor,
         date_indices: torch.Tensor,
         mask: torch.Tensor | None,
+        symbol_indices: torch.Tensor | None = None,
     ) -> None:
         if features.dim() != 3:
             raise ValueError(f"Expected features shape [T,S,F], got ndim={features.dim()}")
         if date_indices.dim() != 1:
             raise ValueError(f"Expected date_indices shape [B], got ndim={date_indices.dim()}")
-        if (not self.allow_dynamic_symbols) and int(features.size(1)) != self.num_symbols:
+        if (not self.allow_dynamic_symbols) and symbol_indices is None and int(features.size(1)) != self.num_symbols:
             raise ValueError(f"Expected num_symbols={self.num_symbols}, got {int(features.size(1))}")
+        self._check_symbol_indices(symbol_indices, int(features.size(1)))
         if int(features.size(2)) != self.num_features:
             raise ValueError(f"Expected num_features={self.num_features}, got {int(features.size(2))}")
         if mask is not None and tuple(mask.shape) != (int(date_indices.numel()), int(features.size(1))):
@@ -898,15 +940,21 @@ class TransformerBasePortfolioModel(nn.Module):
         if max_idx >= int(features.size(0)):
             raise ValueError(f"date_indices must be < T ({int(features.size(0))}), got max={max_idx}")
 
-    def _check_panel_slab_shapes(self, feature_slab: torch.Tensor, mask: torch.Tensor | None) -> None:
+    def _check_panel_slab_shapes(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor | None,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> None:
         if feature_slab.dim() != 3:
             raise ValueError(f"Expected feature_slab shape [U,S,F], got ndim={feature_slab.dim()}")
         if int(feature_slab.size(0)) < self.lookback:
             raise ValueError(
                 f"Expected feature_slab rows >= lookback={self.lookback}, got {int(feature_slab.size(0))}"
             )
-        if (not self.allow_dynamic_symbols) and int(feature_slab.size(1)) != self.num_symbols:
+        if (not self.allow_dynamic_symbols) and symbol_indices is None and int(feature_slab.size(1)) != self.num_symbols:
             raise ValueError(f"Expected num_symbols={self.num_symbols}, got {int(feature_slab.size(1))}")
+        self._check_symbol_indices(symbol_indices, int(feature_slab.size(1)))
         if int(feature_slab.size(2)) != self.num_features:
             raise ValueError(f"Expected num_features={self.num_features}, got {int(feature_slab.size(2))}")
         batch_rows = int(feature_slab.size(0)) - self.lookback + 1
@@ -961,7 +1009,22 @@ class TransformerBasePortfolioModel(nn.Module):
     def _prefixed_aux(prefix: str, values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {f"{prefix}_{name}": value for name, value in values.items()}
 
-    def _symbol_position(self, n_symbols: int) -> torch.Tensor:
+    def _symbol_position(self, n_symbols: int, symbol_indices: torch.Tensor | None = None) -> torch.Tensor:
+        if symbol_indices is not None:
+            indices = symbol_indices.to(device=self.symbol_position.device, dtype=torch.long)
+            indices = indices.clamp(0, int(self.symbol_position.size(2)) - 1)
+            if _torch_is_compiling():
+                position_matrix = self.symbol_position.reshape(
+                    int(self.symbol_position.size(2)),
+                    int(self.symbol_position.size(3)),
+                )
+                selector = F.one_hot(indices, num_classes=int(self.symbol_position.size(2))).to(
+                    device=position_matrix.device,
+                    dtype=position_matrix.dtype,
+                )
+                selected = selector.matmul(position_matrix)
+                return selected.reshape(1, 1, int(indices.numel()), int(self.symbol_position.size(3)))
+            return self.symbol_position.index_select(2, indices)
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]
         extra = self.symbol_position.new_zeros(
@@ -1000,19 +1063,24 @@ class TransformerBasePortfolioModel(nn.Module):
             return projected
         return projected + self.categorical_proj(cat_embedding).to(dtype=projected.dtype)
 
-    def _embed_inputs(self, x: torch.Tensor) -> torch.Tensor:
+    def _embed_inputs(self, x: torch.Tensor, symbol_indices: torch.Tensor | None = None) -> torch.Tensor:
         h = self._project_features(x)
         if self.use_time_pos:
             h = h + self.time_position[:, : int(x.size(1)), :, :]
         if self.use_symbol_pos:
-            h = h + self._symbol_position(int(x.size(2)))
+            h = h + self._symbol_position(int(x.size(2)), symbol_indices)
         return self.input_dropout(h)
 
-    def _add_window_positions(self, h: torch.Tensor, n_symbols: int) -> torch.Tensor:
+    def _add_window_positions(
+        self,
+        h: torch.Tensor,
+        n_symbols: int,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.use_time_pos:
             h = h + self.time_position[:, : self.lookback, :, :]
         if self.use_symbol_pos:
-            h = h + self._symbol_position(int(n_symbols))
+            h = h + self._symbol_position(int(n_symbols), symbol_indices)
         return self.input_dropout(h)
 
     def _project_panel_rows(self, features: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
@@ -1020,15 +1088,20 @@ class TransformerBasePortfolioModel(nn.Module):
         selected = features.index_select(0, row_indices)
         return self._project_features(selected)
 
-    def _embed_windowed_from_panel_slab(self, feature_slab: torch.Tensor) -> torch.Tensor:
+    def _embed_windowed_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         projected = self._project_features(feature_slab)
         h = projected.unfold(0, self.lookback, 1).permute(0, 3, 1, 2).contiguous()
-        return self._add_window_positions(h, int(feature_slab.size(1)))
+        return self._add_window_positions(h, int(feature_slab.size(1)), symbol_indices)
 
     def _embed_windowed_from_panel(
         self,
         features: torch.Tensor,
         date_indices: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         date_indices_source = date_indices.to(device=features.device, dtype=torch.long)
         batch_rows = int(date_indices_source.numel())
@@ -1045,7 +1118,10 @@ class TransformerBasePortfolioModel(nn.Module):
             if is_contiguous:
                 start = int(date_indices_source[0].detach().cpu().item()) - self.lookback + 1
                 end = int(date_indices_source[-1].detach().cpu().item()) + 1
-                return self._embed_windowed_from_panel_slab(features.narrow(0, start, end - start))
+                return self._embed_windowed_from_panel_slab(
+                    features.narrow(0, start, end - start),
+                    symbol_indices,
+                )
             else:
                 offsets = torch.arange(
                     self.lookback - 1,
@@ -1060,7 +1136,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 h = projected.index_select(0, inverse.to(device=projected.device, dtype=torch.long))
                 h = h.reshape(batch_rows, self.lookback, int(features.size(1)), self.d_model).contiguous()
 
-        return self._add_window_positions(h, int(features.size(1)))
+        return self._add_window_positions(h, int(features.size(1)), symbol_indices)
 
     def _apply_temporal_blocks(self, h: torch.Tensor, *, keep_all_steps: bool = False) -> torch.Tensor:
         bsz, steps, n_symbols, dim = h.shape
@@ -1338,10 +1414,20 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
 
-        z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
-        scores = self.score_head(z_stock).squeeze(-1)
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-        masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
+        if PROFILE_RANGES_ENABLED:
+            with profile_range("model.portfolio.mask_z_stock"):
+                z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
+            with profile_range("model.portfolio.score_head"):
+                scores = self.score_head(z_stock).squeeze(-1)
+            with profile_range("model.portfolio.score_nan_clamp"):
+                scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+            with profile_range("model.portfolio.score_mask_fill"):
+                masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
+        else:
+            z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
+            scores = self.score_head(z_stock).squeeze(-1)
+            scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+            masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if temperature is None:
             temp = masked_scores.new_tensor(self.default_temperature)
@@ -1356,7 +1442,11 @@ class TransformerBasePortfolioModel(nn.Module):
 
         if self.portfolio_mode == "long_only":
             centered_scores = scores
-            target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
+            if PROFILE_RANGES_ENABLED:
+                with profile_range("model.portfolio.target_logits"):
+                    target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
+            else:
+                target_logits = (scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
             elif self.portfolio_output_mode == "signed_softmax":
@@ -1406,8 +1496,14 @@ class TransformerBasePortfolioModel(nn.Module):
                 weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
                 weights = masked_softmax(masked_scores / temp, mask_bool, activation=weight_activation)
         else:
-            centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
+            if PROFILE_RANGES_ENABLED:
+                with profile_range("model.portfolio.center_scores"):
+                    centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
+                with profile_range("model.portfolio.target_logits"):
+                    target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
+            else:
+                centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
+                target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits
             elif self.portfolio_output_mode == "signed_softmax":
@@ -1456,7 +1552,11 @@ class TransformerBasePortfolioModel(nn.Module):
             else:
                 weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
                 weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation=weight_activation)
-        weights = weights.masked_fill(~mask_bool, 0.0)
+        if PROFILE_RANGES_ENABLED:
+            with profile_range("model.portfolio.weights_final_mask"):
+                weights = weights.masked_fill(~mask_bool, 0.0)
+        else:
+            weights = weights.masked_fill(~mask_bool, 0.0)
 
         if return_aux is True:
             aux = dict(aux)
@@ -1500,13 +1600,14 @@ class TransformerBasePortfolioModel(nn.Module):
         mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
+        symbol_indices: torch.Tensor | None = None,
     ):
-        self._check_shapes(x, mask)
+        self._check_shapes(x, mask, symbol_indices)
         if mask is None:
             mask_bool = torch.ones(x.size(0), x.size(2), dtype=torch.bool, device=x.device)
         else:
             mask_bool = mask.to(device=x.device, dtype=torch.bool)
-        h = self._embed_inputs(x)
+        h = self._embed_inputs(x, symbol_indices)
         return self._forward_embedded(
             h,
             mask_bool,
@@ -1521,9 +1622,10 @@ class TransformerBasePortfolioModel(nn.Module):
         mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
+        symbol_indices: torch.Tensor | None = None,
     ):
-        self._check_panel_shapes(features, date_indices, mask)
-        h = self._embed_windowed_from_panel(features, date_indices)
+        self._check_panel_shapes(features, date_indices, mask, symbol_indices)
+        h = self._embed_windowed_from_panel(features, date_indices, symbol_indices)
         if mask is None:
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
@@ -1541,9 +1643,10 @@ class TransformerBasePortfolioModel(nn.Module):
         mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
+        symbol_indices: torch.Tensor | None = None,
     ):
-        self._check_panel_slab_shapes(feature_slab, mask)
-        h = self._embed_windowed_from_panel_slab(feature_slab)
+        self._check_panel_slab_shapes(feature_slab, mask, symbol_indices)
+        h = self._embed_windowed_from_panel_slab(feature_slab, symbol_indices)
         if mask is None:
             mask_bool = torch.ones(h.size(0), h.size(2), dtype=torch.bool, device=h.device)
         else:
