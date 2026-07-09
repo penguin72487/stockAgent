@@ -8,23 +8,34 @@ from stockagent.data.panel import PanelData
 
 
 class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
-    def __init__(self, panel: PanelData, date_indices: np.ndarray, lookback: int) -> None:
-        self.lookback = lookback
-        self.date_indices = np.array(sorted(date_indices.tolist()), dtype=np.int64)
-        if self.date_indices.size == 0:
-            raise ValueError("Fold has no dates after split filtering.")
-
-        # Keep only indices that have a full lookback window inside this fold.
-        fold_start_idx = int(self.date_indices[0])
-        min_valid_idx = fold_start_idx + lookback - 1
+    def __init__(
+        self,
+        panel: PanelData,
+        date_indices: np.ndarray,
+        lookback: int,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        self.lookback = int(lookback)
+        self.date_indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
         tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
-        valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
-        if valid_indices.size > 0:
-            valid_indices = valid_indices[tradable[valid_indices].any(axis=1)]
+        if self.date_indices.size == 0:
+            valid_indices = self.date_indices
+            if not allow_empty:
+                raise ValueError("Fold has no dates after split filtering.")
+        else:
+            # Keep only indices that have a full lookback window inside this fold.
+            fold_start_idx = int(self.date_indices[0])
+            min_valid_idx = fold_start_idx + self.lookback - 1
+            valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
+            if valid_indices.size > 0:
+                valid_indices = valid_indices[tradable[valid_indices].any(axis=1)]
         self.valid_indices = valid_indices
 
-        if len(self.valid_indices) == 0:
-            raise ValueError(f"Fold has insufficient data for lookback={lookback}. Need at least {lookback} dates.")
+        if len(self.valid_indices) == 0 and not allow_empty:
+            raise ValueError(
+                f"Fold has insufficient data for lookback={self.lookback}. Need at least {self.lookback} dates."
+            )
 
         returns = np.nan_to_num(
             panel.returns_1d,
