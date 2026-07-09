@@ -47,6 +47,7 @@ from services.discord_bot.bot import (
     _clear_scheduled_retry,
     _set_user_subscription,
     _signal_now_should_refresh_data,
+    _summary_age_seconds,
     _signal_kwargs,
     _signal_sanity_issues,
     _signal_sanity_level,
@@ -129,11 +130,11 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
         schedule_interval_minutes=15,
         schedule_delay_seconds=45,
     )
-    now = datetime(2026, 7, 6, 18, 0, tzinfo=ZoneInfo("Asia/Taipei"))
+    now = datetime(2026, 7, 6, 13, 30, tzinfo=ZoneInfo("Asia/Taipei"))
 
-    assert _market_artifact_backfill_time(daily_cfg) == "18:00"
+    assert _market_artifact_backfill_time(daily_cfg) == "13:30"
     assert _artifact_backfill_key(daily_cfg, now) == "2026-07-06:tw:artifact_backfill"
-    assert _artifact_backfill_key(daily_cfg, now.replace(hour=17, minute=59)) is None
+    assert _artifact_backfill_key(daily_cfg, now.replace(hour=13, minute=29)) is None
     assert _artifact_backfill_key(interval_cfg, now) is None
 
 
@@ -217,7 +218,7 @@ def test_prepare_realtime_signal_does_not_run_daily_updater_just_because_market_
 
     source, resolved_status, refreshed = _prepare_realtime_signal_sync(cfg, requested_price_source="auto", force_refresh=False)
 
-    assert source == "yahoo"
+    assert source == "tw"
     assert resolved_status is status
     assert not refreshed
     assert calls == []
@@ -267,6 +268,86 @@ def test_can_reuse_latest_signal_now_rejects_stale_closed_panel() -> None:
     assert not reusable
 
 
+def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_missing(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw",
+        market_type="tw",
+        history_frequency="daily",
+        display_timezone="Asia/Taipei",
+        timezone="Asia/Taipei",
+        open_time="00:00",
+    )
+    status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(fresh=True, last_data_date="2000-01-01", panel_date="2000-01-01"),
+    )
+
+    panel_summary = {"asof_date": "2026-07-09 14:35:00", "panel_date": "2000-01-01", "price_source": "panel_close"}
+    reusable, _ = _can_reuse_latest_signal_now(cfg, status, panel_summary, requested_price_source="auto")
+    assert not reusable
+
+    mis_summary = {
+        "asof_date": "2026-07-09 14:35:00",
+        "panel_date": "2000-01-01",
+        "price_source": "twse_tpex:mis",
+        "price_available_count": 2000,
+    }
+    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0)
+    monkeypatch.setenv("STOCKAGENT_SIGNAL_NOW_OPEN_CACHE_SECONDS", "60")
+
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, mis_summary, requested_price_source="auto")
+
+    assert reusable
+    assert reason == "cached_tw_after_close_age=30s"
+
+
+def test_can_reuse_latest_signal_now_for_recent_open_panel_market(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="crypto",
+        market_type="crypto",
+        history_frequency="bar",
+        display_timezone="Asia/Taipei",
+        timezone="UTC",
+    )
+    status = SimpleNamespace(
+        market_open=True,
+        data=SimpleNamespace(fresh=True, last_data_date="2026-07-08 14:00:00", panel_date="2026-07-08 14:00:00"),
+    )
+    summary = {
+        "asof_date": "2026-07-08 22:00:30",
+        "panel_date": "2026-07-08 14:00:00",
+        "price_source": "panel_close",
+    }
+
+    monkeypatch.setattr("services.discord_bot.bot._signal_now_open_cache_seconds", lambda: 120.0)
+    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 30.0)
+
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+
+    assert reusable
+    assert reason == "cached_open_panel_age=30s"
+
+
+def test_summary_age_seconds_handles_timezone_aware_generated_at(monkeypatch) -> None:
+    cfg = SimpleNamespace(display_timezone="Asia/Taipei", timezone="UTC")
+    summary = {"generated_at": "2026-07-08T22:29:00+08:00"}
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None:
+                return cls(2026, 7, 8, 22, 29, 30, tzinfo=tz)
+            return cls(2026, 7, 8, 22, 29, 30)
+
+        @classmethod
+        def fromisoformat(cls, date_string):
+            return datetime.fromisoformat(date_string)
+
+    monkeypatch.setattr("services.discord_bot.bot.datetime", FixedDateTime)
+
+    assert _summary_age_seconds(summary, cfg) == 30.0
+
+
 def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:
     cfg = SimpleNamespace(market="tw", display_timezone="Asia/Taipei", timezone="Asia/Taipei")
     status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
@@ -295,12 +376,19 @@ def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:
     assert _signal_now_should_refresh_data(stale, refresh_data=False)
 
 
-def test_auto_signal_price_source_uses_intraday_quotes_for_open_stock_markets() -> None:
+def test_auto_signal_price_source_uses_tw_mis_for_open_taiwan_market() -> None:
     status = SimpleNamespace(market_open=True)
     cfg = SimpleNamespace(market_type="tw", history_frequency="daily", pre_signal_command=["download"])
 
+    assert _auto_signal_price_source(cfg, status, "auto") == "tw"
+    assert _auto_signal_price_source(cfg, status, None) == "tw"
+
+
+def test_auto_signal_price_source_uses_yahoo_for_other_open_stock_markets() -> None:
+    status = SimpleNamespace(market_open=True)
+    cfg = SimpleNamespace(market_type="us", history_frequency="daily", pre_signal_command=["download"])
+
     assert _auto_signal_price_source(cfg, status, "auto") == "yahoo"
-    assert _auto_signal_price_source(cfg, status, None) == "yahoo"
 
 
 def test_auto_signal_price_source_keeps_bar_markets_on_latest_panel_bar() -> None:
@@ -312,12 +400,27 @@ def test_auto_signal_price_source_keeps_bar_markets_on_latest_panel_bar() -> Non
 
 def test_auto_signal_price_source_respects_explicit_and_closed_market_defaults() -> None:
     open_status = SimpleNamespace(market_open=True)
-    closed_status = SimpleNamespace(market_open=False)
-    cfg = SimpleNamespace(market_type="tw", history_frequency="daily", pre_signal_command=["download"])
+    today = datetime.now().date().isoformat()
+    closed_fresh_status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(last_data_date=today, panel_date=today),
+    )
+    closed_lagging_after_open_status = SimpleNamespace(
+        market_open=False,
+        data=SimpleNamespace(last_data_date="2000-01-01", panel_date="2000-01-01"),
+    )
+    cfg = SimpleNamespace(
+        market_type="tw",
+        history_frequency="daily",
+        pre_signal_command=["download"],
+        timezone="Asia/Taipei",
+        open_time="00:00",
+    )
 
     assert _auto_signal_price_source(cfg, open_status, "panel") == "panel"
     assert _auto_signal_price_source(cfg, open_status, "yahoo") == "yahoo"
-    assert _auto_signal_price_source(cfg, closed_status, "auto") is None
+    assert _auto_signal_price_source(cfg, closed_fresh_status, "auto") is None
+    assert _auto_signal_price_source(cfg, closed_lagging_after_open_status, "auto") == "tw"
 
 
 def test_console_progress_prints_backend_progress_bar(capsys) -> None:

@@ -413,8 +413,8 @@ def _market_artifact_backfill_time(cfg: LiveMarketConfig) -> str | None:
     value = (
         entry.get("artifact_backfill_time")
         or entry.get("backfill_time")
-        or cfg.data_ready_time
         or cfg.close_time
+        or cfg.data_ready_time
         or cfg.summary_time
         or cfg.schedule_time
     )
@@ -872,16 +872,61 @@ def _validate_pre_signal_download_artifacts(cfg: LiveMarketConfig, command: list
     )
 
 
+def _date_key(value: Any) -> str | None:
+    text = str(value or "").replace("T", " ").strip()
+    if not text or text.lower() in {"none", "null", "nat", "n/a"}:
+        return None
+    return text[:10] if len(text) >= 10 else text
+
+
+def _hhmm_minutes(value: Any) -> int | None:
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{1,2}):(\d{2})", text)
+    if not match:
+        return None
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _should_use_realtime_quote_after_open(cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> bool:
+    try:
+        now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+    except Exception:
+        now = datetime.now()
+    open_minutes = _hhmm_minutes(getattr(cfg, "open_time", None)) or (9 * 60)
+    if now.hour * 60 + now.minute < open_minutes:
+        return False
+    data = getattr(status, "data", None)
+    latest = _date_key(getattr(data, "last_data_date", None) or getattr(data, "panel_date", None))
+    today = now.date().isoformat()
+    return bool(latest and latest < today)
+
+
+def _realtime_price_source_for_market(cfg: LiveMarketConfig) -> str | None:
+    market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
+    if market_type in {"tw", "taiwan"}:
+        return "tw"
+    if market_type in {"us", "usa", "stock", "stocks", "equity", "equities"}:
+        return "yahoo"
+    return None
+
+
 def _auto_signal_price_source(cfg: LiveMarketConfig, status: MarketRuntimeStatus, requested: str | None) -> str | None:
     text = str(requested or "").strip().lower()
     if text and text != "auto":
         return text
-    if not status.market_open:
-        return None
     market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
     frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
     if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "15m"}:
+        if not status.market_open:
+            return None
         return "panel"
+    if market_type in {"tw", "taiwan"}:
+        return "tw" if (bool(getattr(status, "market_open", False)) or _should_use_realtime_quote_after_open(cfg, status)) else None
+    realtime_source = _realtime_price_source_for_market(cfg)
+    if realtime_source and _should_use_realtime_quote_after_open(cfg, status):
+        return realtime_source
+    if not status.market_open:
+        return None
     return "yahoo"
 
 
@@ -1081,6 +1126,24 @@ def _symbol_label(row: dict) -> str:
     if name:
         return f"`{symbol}` {name}"
     return f"`{symbol}`"
+
+
+def _position_status_label(row: dict[str, Any]) -> str:
+    status = str(row.get("position_status") or "").strip().lower()
+    if status == "locked_untradable":
+        return "不可交易，已視為前一可交易日清算"
+    if status == "untradable":
+        return "不可交易"
+    if status == "model_flattened_by_constraints":
+        return "模型權重被交易限制歸零"
+    constraint = str(row.get("constraint") or "").strip().lower()
+    if constraint == "not_tradable":
+        return "不可交易"
+    if constraint == "buy_blocked":
+        return "買進受限"
+    if constraint == "sell_blocked":
+        return "賣出受限"
+    return ""
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -2084,6 +2147,15 @@ def _signal_now_open_cache_seconds() -> float:
 
 def _summary_age_seconds(summary: dict[str, Any], cfg: LiveMarketConfig) -> float | None:
     raw = summary.get("generated_at") or summary.get("asof_date")
+    text = str(raw or "").strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        parsed = None
+    if parsed is not None and parsed.tzinfo is not None:
+        return max(0.0, (datetime.now(parsed.tzinfo) - parsed).total_seconds())
     dt = _history_datetime(raw)
     if dt is None:
         return None
@@ -2105,6 +2177,33 @@ def _can_reuse_latest_signal_now(
     summary_price = str(summary.get("price_source") or "").strip().lower()
     summary_date = _summary_data_date_key(summary)
     if status.market_open:
+        market_type = str(getattr(cfg, "market_type", "") or "").strip().lower()
+        frequency = str(getattr(cfg, "history_frequency", "daily") or "daily").strip().lower()
+        if market_type in {"crypto", "forex", "fx"} or frequency in {"bar", "intraday", "15m"}:
+            if requested not in {"", "auto", "panel"}:
+                return False, None
+            latest_data_date = getattr(status.data, "last_data_date", None) or getattr(status.data, "panel_date", None)
+            if not _summary_date_matches(summary_date, latest_data_date):
+                return False, None
+            if summary_price and not (summary_price.startswith("panel") or summary_price in {"close", "panel_close"}):
+                return False, None
+            ttl = _signal_now_open_cache_seconds()
+            age = _summary_age_seconds(summary, cfg)
+            if ttl <= 0 or age is None or age > ttl:
+                return False, None
+            return True, f"cached_open_panel_age={age:.0f}s"
+        if market_type in {"tw", "taiwan"}:
+            if requested not in {"", "auto", "tw", "twse", "tpex", "mis", "tw_mis"}:
+                return False, None
+            if not (summary_price.startswith("twse_tpex") or summary_price in {"tw", "tw_mis", "mis"}):
+                return False, None
+            if int(summary.get("price_available_count") or 0) <= 0:
+                return False, None
+            ttl = _signal_now_open_cache_seconds()
+            age = _summary_age_seconds(summary, cfg)
+            if ttl <= 0 or age is None or age > ttl:
+                return False, None
+            return True, f"cached_open_tw_mis_age={age:.0f}s"
         if requested not in {"", "auto", "yahoo"}:
             return False, None
         if not summary_price.startswith("yahoo"):
@@ -2114,6 +2213,27 @@ def _can_reuse_latest_signal_now(
         if ttl <= 0 or age is None or age > ttl:
             return False, None
         return True, f"cached_open_yahoo_age={age:.0f}s"
+
+    realtime_source = _realtime_price_source_for_market(cfg)
+    if realtime_source and _should_use_realtime_quote_after_open(cfg, status):
+        allowed = {"", "auto", realtime_source}
+        if realtime_source == "tw":
+            allowed |= {"twse", "tpex", "mis", "tw_mis"}
+        if requested not in allowed:
+            return False, None
+        if realtime_source == "tw":
+            source_ok = summary_price.startswith("twse_tpex") or summary_price in {"tw", "tw_mis", "mis"}
+        else:
+            source_ok = summary_price.startswith(realtime_source)
+        if not source_ok:
+            return False, None
+        if int(summary.get("price_available_count") or 0) <= 0:
+            return False, None
+        ttl = _signal_now_open_cache_seconds()
+        age = _summary_age_seconds(summary, cfg)
+        if ttl <= 0 or age is None or age > ttl:
+            return False, None
+        return True, f"cached_{realtime_source}_after_close_age={age:.0f}s"
 
     if requested not in {"", "auto", "panel"}:
         return False, None
@@ -2297,6 +2417,25 @@ def _market_has_live_signal_for_date(cfg: LiveMarketConfig, date_text: str | Non
 
 def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | None:
     status = _ensure_signal_ready(cfg)
+    resolved_price_source = _auto_signal_price_source(cfg, status, "auto")
+    if resolved_price_source:
+        target_date = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei")).date().isoformat()
+        if _market_has_live_signal_for_date(cfg, target_date):
+            _sync_latest_live_weights_to_market_artifact(cfg)
+            return None
+        progress_label = f"backfill:{cfg.market}:close"
+        progress_callback = _ConsoleProgress(prefix=progress_label) if _env_bool("STOCKAGENT_BOT_PROGRESS", True) else None
+        result = generate_live_signal(
+            **cfg.signal_kwargs(
+                price_source=resolved_price_source,
+                market_notice=_market_notice(status),
+                progress_callback=progress_callback,
+                progress_label=progress_label,
+            )
+        )
+        _sync_latest_live_weights_to_market_artifact(cfg)
+        return result
+
     _run_pre_signal_command(cfg)
     status = _runtime_status(cfg)
     _require_fresh_data_for_artifact_generation(cfg, status)
@@ -3326,6 +3465,9 @@ def _position_line(row: dict[str, Any]) -> str:
             ("score", _num(row.get("score"), 3)),
         )
     )
+    status = _position_status_label(row)
+    if status:
+        lines.append(f"狀態: `{status}`")
     lines.append(_return_pnl_line(row, ("current_weight", "holding_ratio", "target_weight")))
     return "\n".join(lines)
 
@@ -3345,6 +3487,9 @@ def _rebalance_line(row: dict[str, Any]) -> str:
         ),
         _return_pnl_line(row, ("current_weight", "holding_ratio", "target_weight")),
     ]
+    status = _position_status_label(row)
+    if status:
+        lines.append(f"狀態: `{status}`")
     if _float_or_none(row.get("delta_value")) is not None:
         lines.append(
             _kv_line(
@@ -3494,6 +3639,8 @@ def _portfolio_history_block(row: dict[str, Any]) -> str:
 def _decision_line(row: dict[str, Any]) -> str:
     constraint = str(row.get("constraint") or "")
     constraint_text = f" constraint=`{constraint}`" if constraint else ""
+    status = _position_status_label(row)
+    status_text = f" status=`{status}`" if status else ""
     return (
         f"{_symbol_label(row)} **{row.get('action', 'HOLD')}** "
         f"delta=`{_signed_pct(row.get('delta_weight'))}` "
@@ -3504,6 +3651,7 @@ def _decision_line(row: dict[str, Any]) -> str:
         f"stock_ret=`{_signed_pct_zero_plain(_position_adjusted_return(row, ('current_weight', 'holding_ratio', 'target_weight')))}` "
         f"pnl_contrib=`{_signed_pct_zero_plain(_portfolio_return_contribution(row, ('current_weight', 'holding_ratio', 'target_weight')))}` "
         f"{constraint_text} "
+        f"{status_text} "
         f"reason=`{_shorten(row.get('decision_reason', ''), 100)}`"
     )
 
@@ -3537,6 +3685,7 @@ def _decision_block(row: dict[str, Any]) -> str:
                 ("can_sell", row.get("can_sell")),
                 ("constraint", constraint_text),
             ),
+            f"  status: `{_position_status_label(row) or '一般'}`",
             f"  reason: `{_shorten(row.get('decision_reason', ''), 220)}`",
         ]
     )
@@ -4170,7 +4319,7 @@ async def watchlist_command(
 @bot.tree.command(name="signal_now", description="Run stockAgent live signal now.")
 @app_commands.describe(
     market="Market id",
-    price_source="auto/panel/csv/yahoo",
+    price_source="auto/panel/csv/yahoo/tw",
     top_n="Rows to show, minimum 10",
     min_abs_delta="Minimum absolute weight delta",
     refresh_data="Run the market pre-signal data updater before generating. Default false for fast query.",
