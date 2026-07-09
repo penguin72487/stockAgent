@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 20
+  start_fold: 23
 environment:
   conda_env: fintech
   device: cuda
@@ -14,7 +14,7 @@ environment:
   target_vram_fraction: 0.9
   # AMD EPYC 7662: 64 physical cores / usually 128 logical threads with SMT.
   cpu_threads: 128
-  torch_compile_threads: 32
+  torch_compile_threads: 128
 
 data:
   parquet_root: data_yahoo/tw_stocks
@@ -279,9 +279,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 256
-  batch_size_train: 256
-  batch_size_eval: 256
+  batch_size: 64
+  batch_size_train: 64
+  batch_size_eval: 64
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -481,7 +481,7 @@ training:
     return_aux_details: false
   # Active model branch for this experiment.
   transformer_base_portfolio:
-    d_model: 32
+    d_model: 64
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
@@ -499,7 +499,7 @@ training:
     sdpa_batch_limit: 65535
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: false
+    qk_norm: true
     rope_temporal: true
     rope_base: 10000.0
     # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
@@ -515,7 +515,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: last_only
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -524,14 +524,14 @@ training:
     joint_ffn_mult: 2
     latent_layers: 1
     num_latent_factors: 16
-    num_market_tokens: 4
-    market_layers: 1
-    dynamic_latent_tokens: true
-    dynamic_market_tokens: true
+    num_market_tokens: 16
+    market_layers: 2
+    dynamic_latent_tokens: false
+    dynamic_market_tokens: false
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
     dynamic_token_dropout: 0.0
-    head_hidden_dim: 32
+    head_hidden_dim: 64
     head_layers: 1
     dropout: 0.0
     default_temperature: 1
@@ -545,7 +545,7 @@ training:
     # - signed_sparsemax: hardest sparse long/short/cash simplex; largest local gradients, more support-jump risk.
     # - projection_l1: raw holdings projected to L1 ball; legal cash, sparse only when raw gross exceeds 1.
     # For signed_* and projection_l1, keep portfolio_activation/loss_portfolio_activation=pre_normalized.
-    portfolio_output_mode: logits
+    portfolio_output_mode: activation_l1
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false

@@ -8,6 +8,56 @@ import yaml
 
 
 DEFAULT_PORTFOLIO_ACTIVATION = "identity"
+_CONFIG_INHERITANCE_KEYS = ("base_config", "base_configs", "extends", "inherits")
+
+
+def _deep_merge_config(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = _deep_merge_config(merged[key], value) if key in merged else value
+        return merged
+    return override
+
+
+def _normalize_base_config_refs(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [str(value)]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item).strip()]
+    raise ValueError(
+        "config inheritance keys must be a path string or a list of path strings"
+    )
+
+
+def _load_raw_config(path: str | Path, stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+    config_path = Path(path).expanduser()
+    if not config_path.is_absolute():
+        config_path = config_path.resolve()
+    if config_path in stack:
+        cycle = " -> ".join(str(item) for item in (*stack, config_path))
+        raise ValueError(f"Config inheritance cycle detected: {cycle}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config file must contain a YAML mapping: {config_path}")
+
+    base_refs: list[str] = []
+    for key in _CONFIG_INHERITANCE_KEYS:
+        base_refs.extend(_normalize_base_config_refs(raw.pop(key, None)))
+    if not base_refs:
+        return raw
+
+    merged: dict[str, Any] = {}
+    next_stack = (*stack, config_path)
+    for ref in base_refs:
+        base_path = Path(ref).expanduser()
+        if not base_path.is_absolute():
+            base_path = config_path.parent / base_path
+        merged = _deep_merge_config(merged, _load_raw_config(base_path, next_stack))
+    return _deep_merge_config(merged, raw)
 
 
 def _normalize_portfolio_activation(activation: str | None) -> str:
@@ -108,6 +158,25 @@ def _normalize_portfolio_output_mode(mode: str | None) -> str:
         return "l1"
     if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
         return "logits"
+    if normalized in {
+        "gated_l1",
+        "gross_gated_l1",
+        "cash_gated_l1",
+        "gated_activation_l1",
+        "adaptive_gross_l1",
+        "adaptive_cash_l1",
+    }:
+        return "gated_l1"
+    if normalized in {
+        "gated_net_l1",
+        "net_gated_l1",
+        "gross_net_gated_l1",
+        "adaptive_net_l1",
+        "adaptive_gross_net_l1",
+        "directional_gated_l1",
+        "beta_gated_l1",
+    }:
+        return "gated_net_l1"
     if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
         return "signed_softmax"
     if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
@@ -136,7 +205,7 @@ def _normalize_portfolio_output_mode(mode: str | None) -> str:
         return "projection_l1"
     raise ValueError(
         "training.transformer_base_portfolio.portfolio_output_mode must be one of "
-        "'activation_l1', 'l1', 'logits', 'signed_softmax', "
+        "'activation_l1', 'l1', 'logits', 'gated_l1', 'gated_net_l1', 'signed_softmax', "
         "'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
     )
 
@@ -382,6 +451,11 @@ class TransformerBasePortfolioModelConfig:
     default_temperature: float = 1.0
     portfolio_mode: str = "auto"
     portfolio_output_mode: str = "activation_l1"
+    portfolio_gross_gate_min: float = 0.0
+    portfolio_gross_gate_max: float = 1.0
+    portfolio_gross_gate_init: float = 0.5
+    portfolio_net_gate_max: float = 1.0
+    portfolio_net_gate_init: float = 0.0
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
     return_aux: bool = True
@@ -596,6 +670,8 @@ class TrainingConfig:
     target_vram_fraction: float = 1
     epochs: int = 1000
     early_stopping_no_improve_ratio: float = 0.2
+    early_stopping_min_delta: float = 0.0
+    best_checkpoint_max_epoch: int = 0
     val_interval_epochs: int = 1
     curve_test_interval: int = 100
     record_epoch_curve: bool = True
@@ -869,6 +945,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("target_vram_fraction", 0.85)
     training.setdefault("epochs", 10)
     training.setdefault("early_stopping_no_improve_ratio", 0.2)
+    training.setdefault("early_stopping_min_delta", 0.0)
+    training.setdefault("best_checkpoint_max_epoch", 0)
+    training["best_checkpoint_max_epoch"] = max(0, int(training["best_checkpoint_max_epoch"]))
     training.setdefault("val_interval_epochs", 1)
     training.setdefault("curve_test_interval", 100)
     training.setdefault("record_epoch_curve", True)
@@ -1186,6 +1265,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio["portfolio_output_mode"] = _normalize_portfolio_output_mode(
         transformer_base_portfolio.get("portfolio_output_mode")
     )
+    transformer_base_portfolio.setdefault("portfolio_gross_gate_min", 0.0)
+    transformer_base_portfolio.setdefault("portfolio_gross_gate_max", 1.0)
+    transformer_base_portfolio.setdefault("portfolio_gross_gate_init", 0.5)
+    transformer_base_portfolio.setdefault("portfolio_net_gate_max", 1.0)
+    transformer_base_portfolio.setdefault("portfolio_net_gate_init", 0.0)
     transformer_base_portfolio.setdefault("max_full_tokens", 4096)
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
@@ -1605,9 +1689,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_config(path: str | Path) -> ExperimentConfig:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
-
+    raw = _load_raw_config(path)
     raw = _merge_defaults(raw)
     training_raw = raw["training"]
     return ExperimentConfig(
@@ -1677,6 +1759,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             target_vram_fraction=training_raw["target_vram_fraction"],
             epochs=training_raw["epochs"],
             early_stopping_no_improve_ratio=training_raw["early_stopping_no_improve_ratio"],
+            early_stopping_min_delta=training_raw["early_stopping_min_delta"],
+            best_checkpoint_max_epoch=training_raw["best_checkpoint_max_epoch"],
             val_interval_epochs=training_raw["val_interval_epochs"],
             curve_test_interval=training_raw["curve_test_interval"],
             record_epoch_curve=training_raw["record_epoch_curve"],

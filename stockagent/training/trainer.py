@@ -909,6 +909,9 @@ def _annual_log_utility_eval_value(
 def _is_return_series_objective(objective: str) -> bool:
     return objective.strip().lower() in {
         "sharpe",
+        "sharp",
+        "sharpck",
+        "sharpe_ratio",
         "sortino",
         "log_utility",
         "log_util",
@@ -1198,6 +1201,9 @@ def _normalize_risk_objective(loss_type: str) -> str:
     objective = str(loss_type).strip().lower()
     if objective in {
         "sharpe",
+        "sharp",
+        "sharpck",
+        "sharpe_ratio",
         "sortino",
         "log_utility",
         "log_util",
@@ -1234,6 +1240,8 @@ def _normalize_risk_objective(loss_type: str) -> str:
             return "rank_ic"
         if objective in {"rank_only", "score_rank"}:
             return "pure_rank"
+        if objective in {"sharp", "sharpck", "sharpe_ratio"}:
+            return "sharpe"
         if objective in {"log_util", "kelly", "growth", "mean_log_return"}:
             return "log_utility"
         if objective in {"cvar", "cvar_drawdown", "excess_cvar"}:
@@ -7025,6 +7033,12 @@ def _wrap_distributed_data_parallel_model(
         "find_unused_parameters": False,
     }
     try:
+        ddp_params = inspect.signature(DistributedDataParallel).parameters
+        if "gradient_as_bucket_view" in ddp_params:
+            ddp_kwargs["gradient_as_bucket_view"] = True
+    except (TypeError, ValueError):
+        pass
+    try:
         return DistributedDataParallel(module, static_graph=True, **ddp_kwargs)
     except TypeError:
         return DistributedDataParallel(module, **ddp_kwargs)
@@ -8281,6 +8295,7 @@ def _train_epoch_tensor(
     grad_clip_norm: float,
     finite_check_interval_steps: int = 0,
     rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
@@ -8401,6 +8416,13 @@ def _train_epoch_tensor(
                         portfolio_prev_weights,
                         batch_volume_limit_weights,
                     )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        batch_ret,
+                        batch_mask,
+                        return_rank_ic_weight,
+                    )
                 else:
                     loss = loss_fn(
                         weights,
@@ -8434,6 +8456,7 @@ def _train_epoch_tensor(
                         objective=objective,
                         aux_outputs=aux_outputs,
                         rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
                         direction_weight=direction_weight,
                         volatility_regime_weight=volatility_regime_weight,
                         concentration_weight=concentration_weight,
@@ -8622,6 +8645,7 @@ def _train_epoch_windowed_tensor(
     grad_clip_norm: float,
     finite_check_interval_steps: int = 0,
     rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
@@ -8851,6 +8875,13 @@ def _train_epoch_windowed_tensor(
                                 portfolio_prev_weights,
                                 batch_volume_limit_weights,
                             )
+                            loss = _add_return_rank_ic_aux_loss(
+                                loss,
+                                weights,
+                                batch_ret,
+                                batch_mask,
+                                return_rank_ic_weight,
+                            )
                         else:
                             loss = loss_fn(
                                 weights,
@@ -8884,6 +8915,7 @@ def _train_epoch_windowed_tensor(
                                 objective=objective,
                                 aux_outputs=aux_outputs,
                                 rank_ic_weight=rank_ic_weight,
+                                return_rank_ic_weight=return_rank_ic_weight,
                                 direction_weight=direction_weight,
                                 volatility_regime_weight=volatility_regime_weight,
                                 concentration_weight=concentration_weight,
@@ -8901,6 +8933,13 @@ def _train_epoch_windowed_tensor(
                         batch_sample_mask,
                         portfolio_prev_weights,
                         batch_volume_limit_weights,
+                    )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        batch_ret,
+                        batch_mask,
+                        return_rank_ic_weight,
                     )
                 else:
                     loss = loss_fn(
@@ -8935,6 +8974,7 @@ def _train_epoch_windowed_tensor(
                         objective=objective,
                         aux_outputs=aux_outputs,
                         rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
                         direction_weight=direction_weight,
                         volatility_regime_weight=volatility_regime_weight,
                         concentration_weight=concentration_weight,
@@ -9072,7 +9112,8 @@ def _train_epoch_windowed_tensor(
 
 def _train_epoch_windowed_tensor_ddp(
     model: nn.Module,
-    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    loss_fn: Callable[..., torch.Tensor],
+    fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
     split: WindowedSplitTensors,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -9082,7 +9123,34 @@ def _train_epoch_windowed_tensor_ddp(
     non_blocking: bool,
     objective: str,
     grad_clip_norm: float,
+    long_only: bool,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
+    max_turnover_ratio: float,
+    gross_leverage: float,
+    gamma_sharpe: float,
+    gamma_excess: float,
+    gamma_cvar: float,
+    cvar_alpha: float,
+    gamma_drawdown: float,
+    drawdown_target: float,
+    gamma_turnover: float,
+    gamma_underperformance: float,
+    excess_target: float,
+    cvar_budget: float,
+    drawdown_budget: float,
+    turnover_budget: float,
+    gamma_cvar_budget: float,
+    gamma_drawdown_budget: float,
+    gamma_turnover_budget: float,
     finite_check_interval_steps: int = 0,
+    rank_ic_weight: float = 0.20,
+    return_rank_ic_weight: float = 0.0,
+    direction_weight: float = 0.05,
+    volatility_regime_weight: float = 0.05,
+    concentration_weight: float = 0.005,
+    regime_up_threshold: float = 0.002,
+    regime_down_threshold: float = -0.002,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     lr_scheduler_interval: str = "epoch",
     profile_timing: bool = False,
@@ -9091,8 +9159,9 @@ def _train_epoch_windowed_tensor_ddp(
     max_volume_participation: float = 0.0,
     volume_participation_equity: float = 1_000_000.0,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
-    if not _is_log_utility_objective(objective):
-        raise RuntimeError("DDP windowed hotpath currently requires log_utility objective")
+    use_fused_log_utility = fused_loss_fn is not None and _is_log_utility_objective(objective)
+    if not (use_fused_log_utility or _is_return_series_objective(objective)):
+        raise RuntimeError("DDP windowed hotpath requires log_utility, sharpe, sortino, or another return-series objective")
     world_size = _distributed_world_size()
     rank = _distributed_rank()
     if world_size <= 1 or not _distributed_is_initialized():
@@ -9193,6 +9262,7 @@ def _train_epoch_windowed_tensor_ddp(
             can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
             can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
             sample_mask = _all_gather_no_grad(batch["sample_mask"].contiguous())
+            benchmark = _all_gather_no_grad(batch["benchmark"].contiguous())
             volume_notional = (
                 _all_gather_no_grad(batch["volume_notional"].contiguous())
                 if _volume_participation_enabled(max_volume_participation, volume_participation_equity)
@@ -9212,17 +9282,68 @@ def _train_epoch_windowed_tensor_ddp(
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
             with _cuda_timing(timing, "loss_cuda_s", device):
-                loss, fused_next_prev = _run_fused_log_utility_loss(
-                    fused_loss_fn,
-                    weights,
-                    future_returns,
-                    tradable_mask,
-                    can_buy_mask,
-                    can_sell_mask,
-                    sample_mask,
-                    portfolio_prev_weights,
-                    volume_limit_weights,
-                )
+                fused_next_prev: torch.Tensor | None = None
+                aux_outputs: dict[str, torch.Tensor] | None = None
+                if use_fused_log_utility and fused_loss_fn is not None:
+                    loss, fused_next_prev = _run_fused_log_utility_loss(
+                        fused_loss_fn,
+                        weights,
+                        future_returns,
+                        tradable_mask,
+                        can_buy_mask,
+                        can_sell_mask,
+                        sample_mask,
+                        portfolio_prev_weights,
+                        volume_limit_weights,
+                    )
+                    loss = _add_return_rank_ic_aux_loss(
+                        loss,
+                        weights,
+                        future_returns,
+                        tradable_mask,
+                        return_rank_ic_weight,
+                    )
+                else:
+                    aux_outputs = {"initial_weights": portfolio_prev_weights}
+                    loss = loss_fn(
+                        weights,
+                        future_returns,
+                        tradable_mask,
+                        benchmark_returns=benchmark,
+                        can_buy_mask=can_buy_mask,
+                        can_sell_mask=can_sell_mask,
+                        sample_mask=sample_mask,
+                        long_only=long_only,
+                        buy_fee_rate=buy_fee_rate,
+                        sell_fee_rate=sell_fee_rate,
+                        max_turnover_ratio=max_turnover_ratio,
+                        volume_limit_weights=volume_limit_weights,
+                        gross_leverage=gross_leverage,
+                        gamma_sharpe=gamma_sharpe,
+                        gamma_excess=gamma_excess,
+                        gamma_cvar=gamma_cvar,
+                        cvar_alpha=cvar_alpha,
+                        gamma_drawdown=gamma_drawdown,
+                        drawdown_target=drawdown_target,
+                        gamma_turnover=gamma_turnover,
+                        gamma_underperformance=gamma_underperformance,
+                        excess_target=excess_target,
+                        cvar_budget=cvar_budget,
+                        drawdown_budget=drawdown_budget,
+                        turnover_budget=turnover_budget,
+                        gamma_cvar_budget=gamma_cvar_budget,
+                        gamma_drawdown_budget=gamma_drawdown_budget,
+                        gamma_turnover_budget=gamma_turnover_budget,
+                        objective=objective,
+                        aux_outputs=aux_outputs,
+                        rank_ic_weight=rank_ic_weight,
+                        return_rank_ic_weight=return_rank_ic_weight,
+                        direction_weight=direction_weight,
+                        volatility_regime_weight=volatility_regime_weight,
+                        concentration_weight=concentration_weight,
+                        regime_up_threshold=regime_up_threshold,
+                        regime_down_threshold=regime_down_threshold,
+                    )
             _maybe_sync_cuda(device, profile_timing)
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
@@ -9240,10 +9361,12 @@ def _train_epoch_windowed_tensor_ddp(
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-        state_start = time.perf_counter()
-        portfolio_prev_weights = _detach_portfolio_state(fused_next_prev)
-        _maybe_sync_cuda(device, profile_timing)
-        timing.portfolio_state_s += time.perf_counter() - state_start
+        next_prev = fused_next_prev if use_fused_log_utility else (aux_outputs or {}).get("_final_weights")
+        if next_prev is not None:
+            state_start = time.perf_counter()
+            portfolio_prev_weights = _detach_portfolio_state(next_prev)
+            _maybe_sync_cuda(device, profile_timing)
+            timing.portfolio_state_s += time.perf_counter() - state_start
         timing.forward_s += time.perf_counter() - forward_start
 
         backward_start = time.perf_counter()
@@ -11645,6 +11768,7 @@ def run_training(
                         gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                         objective=loss_objective,
                         rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                        return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
                         direction_weight=config.training.multitask_loss.direction_weight,
                         volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
                         concentration_weight=config.training.multitask_loss.concentration_weight,
@@ -11659,15 +11783,25 @@ def run_training(
 
         early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
         early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
+        early_stop_min_delta = max(0.0, float(getattr(config.training, "early_stopping_min_delta", 0.0)))
+        best_checkpoint_max_epoch = max(0, int(getattr(config.training, "best_checkpoint_max_epoch", 0)))
         val_interval = max(1, int(config.training.val_interval_epochs))
         print(f"[Train {train_years}] validation interval={val_interval} epoch(s)")
         no_improve_epochs = resume_no_improve_epochs
         last_epoch = start_epoch - 1
+        early_stop_improvement_label = (
+            "checkpoint-eligible improvement" if best_checkpoint_max_epoch > 0 else "improvement"
+        )
         if early_stop_patience > 0:
             print(
                 f"[Train {train_years}] early stopping enabled: "
                 f"patience={early_stop_patience} validation check(s) "
-                f"(ratio={early_stop_ratio:.2f})"
+                f"(ratio={early_stop_ratio:.2f}, min_delta={early_stop_min_delta:g})"
+            )
+        if best_checkpoint_max_epoch > 0:
+            print(
+                f"[Train {train_years}] best checkpoint updates limited to "
+                f"epoch <= {best_checkpoint_max_epoch}"
             )
         if resume_no_improve_source is not None:
             print(
@@ -11691,7 +11825,10 @@ def run_training(
         get_backtest_runtime_stats(reset=True)
         get_loss_runtime_stats(reset=True)
 
+        ddp_generic_return_loss_notice_printed = False
+
         def _run_one_train_epoch(train_model: nn.Module) -> tuple[torch.Tensor, TimingBreakdown]:
+            nonlocal ddp_generic_return_loss_notice_printed
             if train_loader is not None:
                 return _train_epoch(
                     train_model,
@@ -11727,6 +11864,7 @@ def run_training(
                     config.training.grad_clip_norm,
                     finite_check_interval_steps=config.training.finite_check_interval_steps,
                     rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                    return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
                     direction_weight=config.training.multitask_loss.direction_weight,
                     volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
                     concentration_weight=config.training.multitask_loss.concentration_weight,
@@ -11742,10 +11880,19 @@ def run_training(
                 )
             if train_windowed is not None:
                 if ddp_enabled:
-                    if fused_log_utility_loss_fn is None:
-                        raise RuntimeError("DDP train hotpath requires training.fused_log_utility_loss=true")
+                    if (
+                        fused_log_utility_loss_fn is None
+                        and not ddp_generic_return_loss_notice_printed
+                        and _distributed_is_rank0()
+                    ):
+                        print(
+                            f"[Train {train_years}] DDP generic return-series loss path enabled "
+                            f"for objective={loss_objective}; fused log-utility loss is unavailable"
+                        )
+                        ddp_generic_return_loss_notice_printed = True
                     return _train_epoch_windowed_tensor_ddp(
                         train_model,
+                        compiled_loss_fn,
                         fused_log_utility_loss_fn,
                         train_windowed,
                         optimizer,
@@ -11756,7 +11903,34 @@ def run_training(
                         non_blocking=non_blocking,
                         objective=loss_objective,
                         grad_clip_norm=config.training.grad_clip_norm,
+                        long_only=config.trading.long_only,
+                        buy_fee_rate=config.trading.buy_fee_rate,
+                        sell_fee_rate=config.trading.sell_fee_rate,
+                        max_turnover_ratio=config.trading.max_turnover_ratio,
+                        gross_leverage=1.0,
+                        gamma_sharpe=config.evaluation.gamma_sharpe,
+                        gamma_excess=config.evaluation.gamma_excess,
+                        gamma_cvar=config.evaluation.gamma_cvar,
+                        cvar_alpha=config.evaluation.cvar_alpha,
+                        gamma_drawdown=config.evaluation.gamma_drawdown,
+                        drawdown_target=config.evaluation.drawdown_target,
+                        gamma_turnover=config.evaluation.gamma_turnover,
+                        gamma_underperformance=config.evaluation.gamma_underperformance,
+                        excess_target=config.evaluation.excess_target,
+                        cvar_budget=config.evaluation.cvar_budget,
+                        drawdown_budget=config.evaluation.drawdown_budget,
+                        turnover_budget=config.evaluation.turnover_budget,
+                        gamma_cvar_budget=config.evaluation.gamma_cvar_budget,
+                        gamma_drawdown_budget=config.evaluation.gamma_drawdown_budget,
+                        gamma_turnover_budget=config.evaluation.gamma_turnover_budget,
                         finite_check_interval_steps=config.training.finite_check_interval_steps,
+                        rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                        return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
+                        direction_weight=config.training.multitask_loss.direction_weight,
+                        volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                        concentration_weight=config.training.multitask_loss.concentration_weight,
+                        regime_up_threshold=config.training.multitask_loss.regime_up_threshold,
+                        regime_down_threshold=config.training.multitask_loss.regime_down_threshold,
                         lr_scheduler=scheduler,
                         lr_scheduler_interval=scheduler_step_interval,
                         profile_timing=profile_timing,
@@ -11800,6 +11974,7 @@ def run_training(
                     grad_clip_norm=config.training.grad_clip_norm,
                     finite_check_interval_steps=config.training.finite_check_interval_steps,
                     rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                    return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
                     direction_weight=config.training.multitask_loss.direction_weight,
                     volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
                     concentration_weight=config.training.multitask_loss.concentration_weight,
@@ -11854,6 +12029,7 @@ def run_training(
                 grad_clip_norm=config.training.grad_clip_norm,
                 finite_check_interval_steps=config.training.finite_check_interval_steps,
                 rank_ic_weight=config.training.multitask_loss.rank_ic_weight,
+                return_rank_ic_weight=config.training.multitask_loss.return_rank_ic_weight,
                 direction_weight=config.training.multitask_loss.direction_weight,
                 volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
                 concentration_weight=config.training.multitask_loss.concentration_weight,
@@ -12590,7 +12766,10 @@ def run_training(
                 ):
                     val_loss = float(val_loss_raw)
                     val_losses.append(val_loss)
-                    if val_loss < context.best_val_loss:
+                    checkpoint_epoch_allowed = (
+                        best_checkpoint_max_epoch <= 0 or int(epoch) <= best_checkpoint_max_epoch
+                    )
+                    if checkpoint_epoch_allowed and val_loss < (context.best_val_loss - early_stop_min_delta):
                         any_fold_improved = True
                         context.best_val_loss = val_loss
                         fold_ckpt_start = time.perf_counter()
@@ -12787,7 +12966,8 @@ def run_training(
                 if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
                     print(
                         f"[Train {train_years}] early stop at epoch {epoch}: "
-                        f"no improvement for {no_improve_epochs} validation check(s) "
+                        f"no {early_stop_improvement_label} for "
+                        f"{no_improve_epochs} validation check(s) "
                         f"(patience={early_stop_patience})"
                     )
                     break
