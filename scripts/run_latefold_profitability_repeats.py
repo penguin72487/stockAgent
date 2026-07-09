@@ -13,7 +13,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs/markets/tw_parallel_latefold_gated_net_short12.yaml"
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts/markets/tw_parallel_latefold_gated_net_short12_repeats"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts/markets/tw_parallel_latefold_projection_short12_repeats"
 DEFAULT_RUNNER = REPO_ROOT / "coda_runner.sh"
 
 

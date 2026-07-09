@@ -158,25 +158,6 @@ def _normalize_portfolio_output_mode(mode: str | None) -> str:
         return "l1"
     if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
         return "logits"
-    if normalized in {
-        "gated_l1",
-        "gross_gated_l1",
-        "cash_gated_l1",
-        "gated_activation_l1",
-        "adaptive_gross_l1",
-        "adaptive_cash_l1",
-    }:
-        return "gated_l1"
-    if normalized in {
-        "gated_net_l1",
-        "net_gated_l1",
-        "gross_net_gated_l1",
-        "adaptive_net_l1",
-        "adaptive_gross_net_l1",
-        "directional_gated_l1",
-        "beta_gated_l1",
-    }:
-        return "gated_net_l1"
     if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
         return "signed_softmax"
     if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
@@ -205,7 +186,7 @@ def _normalize_portfolio_output_mode(mode: str | None) -> str:
         return "projection_l1"
     raise ValueError(
         "training.transformer_base_portfolio.portfolio_output_mode must be one of "
-        "'activation_l1', 'l1', 'logits', 'gated_l1', 'gated_net_l1', 'signed_softmax', "
+        "'activation_l1', 'l1', 'logits', 'signed_softmax', "
         "'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
     )
 
@@ -451,11 +432,6 @@ class TransformerBasePortfolioModelConfig:
     default_temperature: float = 1.0
     portfolio_mode: str = "auto"
     portfolio_output_mode: str = "activation_l1"
-    portfolio_gross_gate_min: float = 0.0
-    portfolio_gross_gate_max: float = 1.0
-    portfolio_gross_gate_init: float = 0.5
-    portfolio_net_gate_max: float = 1.0
-    portfolio_net_gate_init: float = 0.0
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
     return_aux: bool = True
@@ -1267,11 +1243,6 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio["portfolio_output_mode"] = _normalize_portfolio_output_mode(
         transformer_base_portfolio.get("portfolio_output_mode")
     )
-    transformer_base_portfolio.setdefault("portfolio_gross_gate_min", 0.0)
-    transformer_base_portfolio.setdefault("portfolio_gross_gate_max", 1.0)
-    transformer_base_portfolio.setdefault("portfolio_gross_gate_init", 0.5)
-    transformer_base_portfolio.setdefault("portfolio_net_gate_max", 1.0)
-    transformer_base_portfolio.setdefault("portfolio_net_gate_init", 0.0)
     transformer_base_portfolio.setdefault("max_full_tokens", 4096)
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)

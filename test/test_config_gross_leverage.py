@@ -267,8 +267,6 @@ def test_load_config_preserves_best_checkpoint_max_epoch(tmp_path: Path) -> None
         ("activation-l1", "activation_l1"),
         ("raw_l1", "l1"),
         ("raw-scores", "logits"),
-        ("adaptive-gross-l1", "gated_l1"),
-        ("adaptive-gross-net-l1", "gated_net_l1"),
         ("signed-action-softmax", "signed_softmax"),
         ("signed-action-sparsemax", "signed_sparsemax"),
         ("signed-action-entmax", "signed_entmax15"),
@@ -294,30 +292,19 @@ def test_load_config_normalizes_portfolio_output_mode_aliases(
     assert config.training.transformer_base_portfolio.portfolio_output_mode == expected_mode
 
 
-def test_load_config_preserves_gated_net_l1_parameters(tmp_path: Path) -> None:
+@pytest.mark.parametrize("raw_mode", ["adaptive-gross-l1", "adaptive-gross-net-l1", "gated-net-l1"])
+def test_load_config_rejects_removed_gated_portfolio_modes(tmp_path: Path, raw_mode: str) -> None:
     config_path = _write_minimal_config(
         tmp_path,
         training_overrides={
             "transformer_base_portfolio": {
-                "portfolio_output_mode": "directional-gated-l1",
-                "portfolio_gross_gate_min": 0.05,
-                "portfolio_gross_gate_max": 0.95,
-                "portfolio_gross_gate_init": 0.40,
-                "portfolio_net_gate_max": 0.80,
-                "portfolio_net_gate_init": 0.20,
+                "portfolio_output_mode": raw_mode,
             }
         },
     )
 
-    config = load_config(config_path)
-    tbp = config.training.transformer_base_portfolio
-
-    assert tbp.portfolio_output_mode == "gated_net_l1"
-    assert tbp.portfolio_gross_gate_min == 0.05
-    assert tbp.portfolio_gross_gate_max == 0.95
-    assert tbp.portfolio_gross_gate_init == 0.40
-    assert tbp.portfolio_net_gate_max == 0.80
-    assert tbp.portfolio_net_gate_init == 0.20
+    with pytest.raises(ValueError, match="portfolio_output_mode"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_unknown_portfolio_output_mode(tmp_path: Path) -> None:

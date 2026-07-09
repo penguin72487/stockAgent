@@ -526,8 +526,8 @@ training:
     num_latent_factors: 16
     num_market_tokens: 16
     market_layers: 2
-    dynamic_latent_tokens: false
-    dynamic_market_tokens: false
+    dynamic_latent_tokens: true
+    dynamic_market_tokens: true
     dynamic_token_hidden_mult: 2
     dynamic_token_gate_init: 0.1
     dynamic_token_dropout: 0.0
