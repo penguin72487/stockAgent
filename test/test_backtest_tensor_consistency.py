@@ -26,6 +26,7 @@ from stockagent.training.trainer import (
     _pad_eval_metadata_first_dim,
     _pad_training_tensors,
     _pad_windowed_training_split,
+    _prepend_compile_toolchain_paths,
     _prepare_windowed_split,
     _loss_from_backtest_series,
     TimingBreakdown,
@@ -1692,6 +1693,7 @@ def test_segmented_log_utility_eval_loss_applies_geometric_utility_transform() -
 def test_fused_log_utility_loss_compile_fullgraph_smoke() -> None:
     if not torch.cuda.is_available() or not hasattr(torch, "compile"):
         return
+    _prepend_compile_toolchain_paths()
     torch.manual_seed(2027)
     rows, symbols = 8, 6
     device = torch.device("cuda")

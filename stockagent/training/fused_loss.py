@@ -8,8 +8,22 @@ from stockagent.backtest.simulator import (
     _asset_log_returns_to_simple_torch,
     _normalize_target_weights_torch,
     _portfolio_simple_returns_to_log_torch,
-    _resolve_exposure_budget,
 )
+
+
+def _resolve_fused_loss_static_scalars(
+    gross_leverage: float,
+    max_turnover_ratio: float,
+) -> tuple[float, float]:
+    gross_budget = min(1.0, max(0.0, float(gross_leverage)))
+    max_possible_turnover = 2.0 * float(gross_budget)
+    raw_turnover_cap = max(0.0, float(max_turnover_ratio))
+    effective_turnover_cap = (
+        raw_turnover_cap
+        if 0.0 < raw_turnover_cap < max_possible_turnover
+        else 0.0
+    )
+    return float(gross_budget), float(effective_turnover_cap)
 
 
 def _torch_dynamo_is_compiling() -> bool:
@@ -372,16 +386,12 @@ def fused_log_utility_loss_tensor(
     """
     compute_dtype = weights.dtype
     device = weights.device
-    gross_budget = _resolve_exposure_budget(gross_leverage)
-    # A turnover cap above the maximum possible L1 distance between two
-    # normalized portfolios cannot bind.  Treat it as disabled so the recurrent
-    # train loss avoids a dead branch in the hottest scan.
-    max_possible_turnover = 2.0 * float(gross_budget)
-    raw_turnover_cap = float(max_turnover_ratio)
-    effective_turnover_cap = (
-        raw_turnover_cap
-        if 0.0 < raw_turnover_cap < max_possible_turnover
-        else 0.0
+    (
+        gross_budget,
+        effective_turnover_cap,
+    ) = _resolve_fused_loss_static_scalars(
+        gross_leverage,
+        max_turnover_ratio,
     )
     returns = _asset_log_returns_to_simple_torch(future_returns, device=device, dtype=compute_dtype)
     tradable = tradable_mask.to(device=device, dtype=torch.bool)
