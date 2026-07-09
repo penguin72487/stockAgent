@@ -166,11 +166,6 @@ training:
     num_latent_factors: 16
     num_market_tokens: 4
     market_layers: 1
-    dynamic_latent_tokens: false
-    dynamic_market_tokens: false
-    dynamic_token_hidden_mult: 2
-    dynamic_token_gate_init: 0.1
-    dynamic_token_dropout: 0.0
     head_hidden_dim: 32
     head_layers: 1
     dropout: 0.1
@@ -194,20 +189,18 @@ Notes:
 - `batch_size_train: 32` improves steady-state epoch throughput versus 16 on the current benchmark, but first-epoch compile/warmup time is higher; use it for long training runs, and re-benchmark before reducing it.
 - `temporal_pooling: attention` is the active user preference when trying to improve convergence; pair it with `temporal_query_mode: full_then_last` because attention pooling needs all temporal steps.
 - `temporal_pooling: last` remains the faster speed ablation. Pair it with `temporal_query_mode: last_only` to shrink the temporal autograd graph when speed is the priority.
-- The active speed ablation sets `qk_norm: false`, `dropout: 0.1`, and `dynamic_token_dropout: 0.0` to trim attention/FFN dropout and Q/K RMS-normalization autograd nodes. Treat this as a speed baseline, not proof that the regularized model is worse; re-check validation/test metrics before making investment-quality conclusions.
+- The active speed ablation sets `qk_norm: false` and `dropout: 0.1` to trim attention/FFN dropout and Q/K RMS-normalization autograd nodes. Treat this as a speed baseline, not proof that the regularized model is worse; re-check validation/test metrics before making investment-quality conclusions.
 - `TransformerBasePortfolioModel.forward_from_panel(features, date_indices, mask, ...)` is the preferred lazy-window path for `WindowedSplitTensors`: it projects each unique panel date once and gathers projected `[B,L,S,D]` windows before running the same downstream temporal/market-token/score path. Preserve old `forward(x, mask, ...)` API compatibility.
 - `TransformerBasePortfolioModel.forward_from_panel_slab(feature_slab, mask, ...)` is the compile-friendly fast path for contiguous lazy-window batches: pass `[B+lookback-1,S,F]` panel slabs and keep `date_indices` / gather metadata outside the compiled model graph. It must remain numerically equivalent to materialized windows and generic `forward_from_panel` for contiguous rows.
 - Keep training `return_aux: false` and `return_aux_details: false` unless the objective explicitly needs aux tensors; enable aux for explainability/inference runs rather than the tight VRAM training path.
 - The active `market_token` architecture should follow this low-complexity flow:
   - input `[B,L,S,F]` -> feature projection -> shared temporal encoder per stock -> `z_base [B,S,D]`
-  - masked market summary is `mean + std + mean absolute dispersion`, shape `[B,3,D]`
-  - when dynamic market tokens are enabled, they are `static_anchor + sigmoid(gate) * delta(summary)`, with `num_market_tokens` usually `4` or `6`; the current speed ablation sets `dynamic_market_tokens: false` and uses learned static market-token anchors
-  - market tokens read stocks through cross-attention with stock masks
+  - learned static market-token anchors read stocks through cross-attention with stock masks
   - stocks read updated market tokens through cross-attention
   - stock-level market gate applies `z = RMSNorm(z_base_or_factor + sigmoid(g_i) * market_delta)`
   - portfolio head uses three scalar heads: `mu`, `sigma`, `confidence`
   - score is `mu / softplus(sigma) * sigmoid(confidence)`, then masked de-mean for long/short, then configured bounded activation + L1 portfolio normalization
-- Keep `alpha_mu`, `risk_sigma`, `confidence`, `stock_market_gate`, `z_market_delta`, dynamic token queries/deltas/gates, and market summary parts available in aux outputs when detailed explainability is requested.
+- Keep `stock_market_gate`, `z_market_delta`, market tokens, latent factors, and stock embeddings available in aux outputs when detailed explainability is requested.
 
 Modern Transformer module contract:
 
@@ -215,11 +208,7 @@ Modern Transformer module contract:
 - Default modern block settings are `norm_type: rmsnorm`, `ffn_type: swiglu`, `qk_norm: true`, `rope_temporal: true`; the current speed ablation deliberately overrides `qk_norm: false`.
 - Apply RoPE only to temporal attention by default. Do not apply RoPE over the stock axis unless stock order is deliberately made meaningful.
 - Keep PyTorch SDPA/Flash path enabled and keep `sdpa_batch_limit` for large `batch * symbols` temporal attention.
-- When dynamic latent/market tokens are enabled, they should be gated deltas around static token anchors:
-  - `dynamic_token = static_query + sigmoid(gate) * input_conditioned_delta`
-  - use market-summary inputs from masked stock embedding mean/std/dispersion
-  - keep dynamic gates small at initialization, e.g. `dynamic_token_gate_init: 0.1`
-- When `return_aux_details` is true, expose dynamic token query/delta/gate/summary tensors so explainability can detect token collapse, over-concentration, or strange liquidity/price-level rules.
+- Transformer-base no longer has dynamic latent/market token delta knobs; use learned static query anchors plus cross-attention. Do not reintroduce no-op config fields for token dynamics.
 
 ## Scalable Transformer Base Portfolio
 

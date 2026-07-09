@@ -660,6 +660,19 @@ def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> 
     assert np.intersect1d(first_ds.valid_indices, second_ds.valid_indices).size == 0
 
 
+def test_cross_sectional_dataset_allows_empty_split_when_requested() -> None:
+    panel = _make_panel(rows=3)
+    date_indices = np.arange(panel.num_dates)
+
+    with pytest.raises(ValueError, match="insufficient data"):
+        CrossSectionalDataset(panel, date_indices, lookback=4)
+
+    dataset = CrossSectionalDataset(panel, date_indices, lookback=4, allow_empty=True)
+
+    assert len(dataset) == 0
+    assert dataset.valid_indices.size == 0
+
+
 def test_windowed_split_matches_materialized_dataset_tensors() -> None:
     panel = _make_panel()
     dataset = CrossSectionalDataset(panel, torch.arange(panel.num_dates).numpy(), lookback=3)

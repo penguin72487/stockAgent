@@ -86,6 +86,7 @@ parquet per symbol
 ```
 
 目前 `panel_backend=auto` 會優先使用 Polars Lazy，必要時回到 PyArrow。
+需要和 PyArrow build 做嚴格 feature parity 比較時，明確設定 `panel_backend=pyarrow`。
 `PanelData` 建構仍會轉成訓練用 tensor；build-time backend 不代表訓練 tensor 永遠留在 GPU。
 
 ### Walk-forward

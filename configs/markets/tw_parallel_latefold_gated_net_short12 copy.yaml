@@ -76,9 +76,6 @@ training:
     temporal_query_mode: last_only
     qk_norm: true
     input_dropout: 0.05
-    dynamic_latent_tokens: true
-    dynamic_market_tokens: true
-    dynamic_token_dropout: 0.0
     dropout: 0.0
     portfolio_mode: long_short
     portfolio_output_mode: projection_l1
