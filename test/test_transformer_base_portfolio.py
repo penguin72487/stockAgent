@@ -61,11 +61,6 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
         "num_latent_factors": 4,
         "num_market_tokens": 2,
         "market_layers": 1,
-        "dynamic_latent_tokens": True,
-        "dynamic_market_tokens": True,
-        "dynamic_token_hidden_mult": 2,
-        "dynamic_token_gate_init": 0.1,
-        "dynamic_token_dropout": 0.0,
         "head_hidden_dim": 24,
         "head_layers": 1,
         "dropout": 0.0,
@@ -165,8 +160,6 @@ def test_modern_components_and_learned_token_aux() -> None:
     assert tuple(model.latent_queries.shape) == (1, 4, 24)
     assert model.market_queries is not None
     assert tuple(model.market_queries.shape) == (1, 2, 24)
-    assert model.dynamic_latent_generator is None
-    assert model.dynamic_market_generator is None
     assert hasattr(model, "score_head")
     assert not hasattr(model, "mu_head")
     assert not hasattr(model, "sigma_head")
@@ -222,38 +215,19 @@ def test_learned_token_attention_aux_contract(mode: str) -> None:
     assert "dynamic_market_delta" not in aux
 
 
-@pytest.mark.parametrize("mode", ["latent", "market_token"])
 @pytest.mark.parametrize(
-    ("dynamic_latent_tokens", "dynamic_market_tokens"),
-    [(False, False), (False, True), (True, False), (True, True)],
+    "deprecated_kwarg",
+    [
+        "dynamic_latent_tokens",
+        "dynamic_market_tokens",
+        "dynamic_token_hidden_mult",
+        "dynamic_token_gate_init",
+        "dynamic_token_dropout",
+    ],
 )
-def test_deprecated_dynamic_token_flags_keep_forward_compatible(
-    mode: str,
-    dynamic_latent_tokens: bool,
-    dynamic_market_tokens: bool,
-) -> None:
-    device = _device()
-    model = _make_model(
-        attention_mode=mode,
-        dynamic_latent_tokens=dynamic_latent_tokens,
-        dynamic_market_tokens=dynamic_market_tokens,
-    ).eval()
-    x = torch.randn(2, 6, 13, 11, device=device)
-    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
-    mask[0, 11:] = False
-
-    with torch.no_grad():
-        weights, _, aux = model(x, mask, return_aux=True)
-
-    assert model.dynamic_latent_tokens is dynamic_latent_tokens
-    assert model.dynamic_market_tokens is dynamic_market_tokens
-    assert model.dynamic_latent_generator is None
-    assert model.dynamic_market_generator is None
-    assert weights.shape == (2, 13)
-    assert torch.isfinite(weights).all()
-    assert weights[0, 11:].abs().max().item() < 1e-6
-    assert "dynamic_latent_delta" not in aux
-    assert "dynamic_market_delta" not in aux
+def test_dynamic_token_kwargs_are_not_accepted(deprecated_kwarg: str) -> None:
+    with pytest.raises(TypeError):
+        _make_model(**{deprecated_kwarg: True})
 
 
 def test_aux_details_false_keeps_training_output_light() -> None:
@@ -513,21 +487,17 @@ def test_windowed_metadata_batch_has_no_x() -> None:
     assert compact_batch["tradable_mask"].shape == (2, 2)
 
 
-def test_legacy_norm_ffn_and_static_tokens_can_be_configured() -> None:
+def test_legacy_norm_and_ffn_can_be_configured() -> None:
     device = _device()
     model = _make_model(
         norm_type="layernorm",
         ffn_type="gelu",
         qk_norm=False,
         rope_temporal=False,
-        dynamic_latent_tokens=False,
-        dynamic_market_tokens=False,
     ).eval()
     assert isinstance(model.temporal_blocks[0].norm_query, torch.nn.LayerNorm)
     assert not isinstance(model.temporal_blocks[0].ffn, SwiGLUFeedForward)
     assert model.temporal_blocks[0].attn.qk_norm is False
-    assert model.dynamic_latent_generator is None
-    assert model.dynamic_market_generator is None
 
     x = torch.randn(1, 6, 13, 11, device=device)
     mask = torch.ones(1, 13, dtype=torch.bool, device=device)
@@ -780,9 +750,5 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.rope_temporal == cfg.training.transformer_base_portfolio.rope_temporal
     assert model.temporal_query_mode == cfg.training.transformer_base_portfolio.temporal_query_mode
     assert model.portfolio_output_mode == cfg.training.transformer_base_portfolio.portfolio_output_mode
-    assert model.dynamic_latent_tokens == cfg.training.transformer_base_portfolio.dynamic_latent_tokens
-    assert model.dynamic_market_tokens == cfg.training.transformer_base_portfolio.dynamic_market_tokens
-    assert model.dynamic_latent_generator is None
-    assert model.dynamic_market_generator is None
     if model.attention_mode == "market_token":
         assert len(model.latent_blocks) == 0
