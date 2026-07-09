@@ -2955,8 +2955,6 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
         "joint_blocks.",
         "latent_queries",
         "market_queries",
-        "dynamic_latent_generator.",
-        "dynamic_market_generator.",
         "temporal_pool_score.",
         "latent_blocks.",
         "market_blocks.",
