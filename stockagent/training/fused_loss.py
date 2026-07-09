@@ -8,8 +8,22 @@ from stockagent.backtest.simulator import (
     _asset_log_returns_to_simple_torch,
     _normalize_target_weights_torch,
     _portfolio_simple_returns_to_log_torch,
-    _resolve_exposure_budget,
 )
+
+
+def _resolve_fused_loss_static_scalars(
+    gross_leverage: float,
+    max_turnover_ratio: float,
+) -> tuple[float, float]:
+    gross_budget = min(1.0, max(0.0, float(gross_leverage)))
+    max_possible_turnover = 2.0 * float(gross_budget)
+    raw_turnover_cap = max(0.0, float(max_turnover_ratio))
+    effective_turnover_cap = (
+        raw_turnover_cap
+        if 0.0 < raw_turnover_cap < max_possible_turnover
+        else 0.0
+    )
+    return float(gross_budget), float(effective_turnover_cap)
 
 
 def _torch_dynamo_is_compiling() -> bool:
@@ -62,7 +76,8 @@ class _LongShortLogUtilityNoTurnoverCap(torch.autograd.Function):
         one = torch.ones((), device=device, dtype=dtype)
 
         for idx in range(t_len):
-            target_t = torch.where(tradable_b[idx], target_weights[idx], prev)
+            prev = torch.where(tradable_b[idx], prev, torch.zeros_like(prev))
+            target_t = torch.where(tradable_b[idx], target_weights[idx], torch.zeros_like(prev))
             delta_raw = target_t - prev
             allowed = ((delta_raw > 0.0) & can_buy_b[idx]) | ((delta_raw < 0.0) & can_sell_b[idx])
             pre = prev + torch.where(allowed, delta_raw, torch.zeros_like(delta_raw))
@@ -225,7 +240,8 @@ def _fused_log_utility_long_only_scan(
     valid_count = torch.zeros((), device=device, dtype=torch.float32)
 
     for idx in range(t_len):
-        target_t = torch.where(tradable[idx], target_weights[idx], prev)
+        prev = torch.where(tradable[idx], prev, torch.zeros_like(prev))
+        target_t = torch.where(tradable[idx], target_weights[idx], torch.zeros_like(prev))
         delta = target_t - prev
         buy_delta = delta.clamp_min(0.0) * can_buy[idx].to(dtype=dtype)
         sell_delta = delta.clamp_max(0.0) * can_sell[idx].to(dtype=dtype)
@@ -299,7 +315,8 @@ def _fused_log_utility_long_short_scan(
     valid_count = torch.zeros((), device=device, dtype=torch.float32)
 
     for idx in range(t_len):
-        target_t = torch.where(tradable[idx], target_weights[idx], prev)
+        prev = torch.where(tradable[idx], prev, torch.zeros_like(prev))
+        target_t = torch.where(tradable[idx], target_weights[idx], torch.zeros_like(prev))
         delta = target_t - prev
         buy_delta = delta.clamp_min(0.0) * can_buy[idx].to(dtype=dtype)
         sell_delta = delta.clamp_max(0.0) * can_sell[idx].to(dtype=dtype)
@@ -372,16 +389,12 @@ def fused_log_utility_loss_tensor(
     """
     compute_dtype = weights.dtype
     device = weights.device
-    gross_budget = _resolve_exposure_budget(gross_leverage)
-    # A turnover cap above the maximum possible L1 distance between two
-    # normalized portfolios cannot bind.  Treat it as disabled so the recurrent
-    # train loss avoids a dead branch in the hottest scan.
-    max_possible_turnover = 2.0 * float(gross_budget)
-    raw_turnover_cap = float(max_turnover_ratio)
-    effective_turnover_cap = (
-        raw_turnover_cap
-        if 0.0 < raw_turnover_cap < max_possible_turnover
-        else 0.0
+    (
+        gross_budget,
+        effective_turnover_cap,
+    ) = _resolve_fused_loss_static_scalars(
+        gross_leverage,
+        max_turnover_ratio,
     )
     returns = _asset_log_returns_to_simple_torch(future_returns, device=device, dtype=compute_dtype)
     tradable = tradable_mask.to(device=device, dtype=torch.bool)
@@ -408,6 +421,7 @@ def fused_log_utility_loss_tensor(
         and float(effective_turnover_cap) == 0.0
         and volume_limits is None
         and target_weights.requires_grad
+        and bool(torch.all(tradable).detach().cpu().item())
         and not _torch_dynamo_is_compiling()
     )
 

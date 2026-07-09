@@ -609,6 +609,10 @@ class TransformerBasePortfolioModel(nn.Module):
         self.qk_norm = bool(qk_norm)
         self.rope_temporal = bool(rope_temporal)
         self.rope_base = float(rope_base)
+        # Deprecated config compatibility knobs. Dynamic token deltas based on
+        # hand-built mean/std/dispersion summaries are intentionally disabled in
+        # the Transformer-base forward path; learned query tokens now read the
+        # stock/factor pool directly through cross-attention.
         self.dynamic_latent_tokens = bool(dynamic_latent_tokens)
         self.dynamic_market_tokens = bool(dynamic_market_tokens)
 
@@ -709,32 +713,11 @@ class TransformerBasePortfolioModel(nn.Module):
             if self.attention_mode in {"latent", "market_token"}
             else None
         )
-        self.dynamic_latent_generator = (
-            DynamicTokenGenerator(
-                dim=self.d_model,
-                num_tokens=latent_count,
-                hidden_mult=int(dynamic_token_hidden_mult),
-                dropout=float(dynamic_token_dropout),
-                gate_init=float(dynamic_token_gate_init),
-                norm_type=self.norm_type,
-                ffn_type=self.ffn_type,
-            )
-            if self.attention_mode == "latent" and self.dynamic_latent_tokens
-            else None
-        )
-        self.dynamic_market_generator = (
-            DynamicTokenGenerator(
-                dim=self.d_model,
-                num_tokens=market_count,
-                hidden_mult=int(dynamic_token_hidden_mult),
-                dropout=float(dynamic_token_dropout),
-                gate_init=float(dynamic_token_gate_init),
-                norm_type=self.norm_type,
-                ffn_type=self.ffn_type,
-            )
-            if self.attention_mode in {"latent", "market_token"} and self.dynamic_market_tokens
-            else None
-        )
+        # Kept as attributes so old checkpoints/tests/config-driven code can
+        # probe them, but the deprecated DynamicTokenGenerator is no longer used
+        # by TransformerBasePortfolioModel.
+        self.dynamic_latent_generator = None
+        self.dynamic_market_generator = None
         self.latent_blocks = nn.ModuleList(
             [
                 make_block(int(cross_heads), int(cross_ffn_mult))
@@ -1412,43 +1395,27 @@ class TransformerBasePortfolioModel(nn.Module):
         aux: dict[str, torch.Tensor] = {}
 
         if use_latent:
-            if self.dynamic_latent_generator is not None:
-                latent, dynamic_aux = self.dynamic_latent_generator(
-                    self.latent_queries,
-                    z_base,
-                    safe_mask,
-                    collect_aux=collect_aux,
-                )
-                if collect_aux:
-                    aux.update(self._prefixed_aux("dynamic_latent", dynamic_aux))
-            else:
-                latent = self.latent_queries.expand(bsz, -1, -1)
+            if self.latent_queries is None:
+                raise RuntimeError("latent_queries are required for attention_mode=latent")
+            factor_tokens = self.latent_queries.expand(bsz, -1, -1)
             for block in self.latent_blocks:
-                latent = self._run_block(block, latent, z_base, safe_mask)
-            market_context = latent
+                factor_tokens = self._run_block(block, factor_tokens, z_base, safe_mask)
+            market_context = factor_tokens
             market_key_mask = None
             z_factor_context = z_base
             for block in self.stock_read_latent_blocks:
-                z_factor_context = self._run_block(block, z_factor_context, latent, None)
+                z_factor_context = self._run_block(block, z_factor_context, factor_tokens, None)
             z_gate_base = z_factor_context
         else:
-            latent = z_base.new_empty(bsz, 0, self.d_model)
+            factor_tokens = z_base.new_empty(bsz, 0, self.d_model)
             market_context = z_base
             market_key_mask = safe_mask
             z_factor_context = z_base
             z_gate_base = z_base
 
-        if self.dynamic_market_generator is not None:
-            market_tokens, dynamic_aux = self.dynamic_market_generator(
-                self.market_queries,
-                z_base,
-                safe_mask,
-                collect_aux=collect_aux,
-            )
-            if collect_aux:
-                aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
-        else:
-            market_tokens = self.market_queries.expand(bsz, -1, -1)
+        if self.market_queries is None:
+            raise RuntimeError("market_queries are required for latent/market_token attention")
+        market_tokens = self.market_queries.expand(bsz, -1, -1)
         for block in self.market_blocks:
             market_tokens = self._run_block(block, market_tokens, market_context, market_key_mask)
 
@@ -1465,7 +1432,8 @@ class TransformerBasePortfolioModel(nn.Module):
             aux.update({
                 "token_embedding": h,
                 "stock_embedding": z_base,
-                "latent_factors": latent,
+                "factor_tokens": factor_tokens,
+                "latent_factors": factor_tokens,
                 "market_tokens": market_tokens,
                 "z_factor_context": z_factor_context,
                 "z_market_context": z_market_context,
@@ -1488,17 +1456,7 @@ class TransformerBasePortfolioModel(nn.Module):
 
         if self.market_queries is None:
             raise RuntimeError("market_queries are required for attention_mode=market_token")
-        if self.dynamic_market_generator is not None:
-            market_tokens, dynamic_aux = self.dynamic_market_generator(
-                self.market_queries,
-                z_base,
-                safe_mask,
-                collect_aux=collect_aux,
-            )
-            if collect_aux:
-                aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
-        else:
-            market_tokens = self.market_queries.expand(bsz, -1, -1)
+        market_tokens = self.market_queries.expand(bsz, -1, -1)
 
         for block in self.market_blocks:
             market_tokens = self._run_block(block, market_tokens, z_base, safe_mask)

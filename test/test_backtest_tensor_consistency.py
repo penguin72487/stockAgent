@@ -26,6 +26,7 @@ from stockagent.training.trainer import (
     _pad_eval_metadata_first_dim,
     _pad_training_tensors,
     _pad_windowed_training_split,
+    _prepend_compile_toolchain_paths,
     _prepare_windowed_split,
     _loss_from_backtest_series,
     TimingBreakdown,
@@ -180,6 +181,31 @@ def test_long_short_backtest_force_cover_clamps_negative_target_to_zero() -> Non
     )
 
     assert torch.allclose(result.weights_history[:, 0], torch.tensor([-0.4, 0.0]))
+
+
+def test_backtest_liquidates_before_symbol_becomes_untradable() -> None:
+    weights = torch.tensor([[0.4], [0.4]], dtype=torch.float32)
+    returns = torch.zeros_like(weights)
+    tradable = torch.tensor([[True], [False]], dtype=torch.bool)
+    benchmark = torch.zeros((2,), dtype=torch.float32)
+    can_buy = tradable.clone()
+    can_sell = tradable.clone()
+
+    result = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+    )
+
+    assert torch.allclose(result.weights_history[:, 0], torch.tensor([0.4, 0.0]))
+    assert torch.allclose(result.turnovers, torch.tensor([0.4, 0.0]))
 
 
 def test_reduced_and_fused_log_utility_convert_asset_log_returns_for_short_pnl() -> None:
@@ -498,7 +524,7 @@ def test_triton_eval_backtest_matches_torch_long_short_with_volume_cap(monkeypat
     raw_weights = torch.randn(rows, symbols, device="cuda")
     weights = raw_weights / raw_weights.abs().sum(dim=1, keepdim=True).clamp_min(1e-12) * 2.5
     returns = torch.randn(rows, symbols, device="cuda") * 0.02
-    tradable = torch.rand(rows, symbols, device="cuda") > 0.10
+    tradable = torch.ones(rows, symbols, device="cuda", dtype=torch.bool)
     can_buy = torch.rand(rows, symbols, device="cuda") > 0.20
     can_sell = torch.rand(rows, symbols, device="cuda") > 0.15
     tradable[0] = True
@@ -1692,6 +1718,7 @@ def test_segmented_log_utility_eval_loss_applies_geometric_utility_transform() -
 def test_fused_log_utility_loss_compile_fullgraph_smoke() -> None:
     if not torch.cuda.is_available() or not hasattr(torch, "compile"):
         return
+    _prepend_compile_toolchain_paths()
     torch.manual_seed(2027)
     rows, symbols = 8, 6
     device = torch.device("cuda")

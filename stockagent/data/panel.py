@@ -597,7 +597,13 @@ def _frame_column_bool_array(frame: Any, name: str, *, default: bool = False) ->
 
 
 def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
-    """Compute TW daily limit price with floor-to-tick rule from theoretical price."""
+    """Compute TW daily limit price from theoretical price.
+
+    TW limit-up prices are rounded down to the nearest tick, while limit-down
+    prices are rounded up to the nearest tick. The asymmetry matters around
+    half-tick boundaries, e.g. prev_close=524 -> theoretical down=471.6 ->
+    limit-down=472.0.
+    """
     if _panel_numba is not None:
         return _panel_numba.tw_limit_price(prev_close, ratio)
     prev = _to_float_array(prev_close)
@@ -606,8 +612,12 @@ def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
 
     out = np.full(theoretical.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(theoretical) & np.isfinite(tick) & (tick > 0.0)
+    scaled = theoretical[valid] / tick[valid]
     # Small epsilon avoids floating-point edge cases around exact tick boundaries.
-    out[valid] = np.floor((theoretical[valid] / tick[valid]) + 1e-12) * tick[valid]
+    if float(ratio) < 1.0:
+        out[valid] = np.ceil(scaled - 1e-12) * tick[valid]
+    else:
+        out[valid] = np.floor(scaled + 1e-12) * tick[valid]
     return _round_half_up(out, decimals=2)
 
 
@@ -1589,6 +1599,7 @@ def load_cached_panel(
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
+        f"tw_limit_rounding=v2|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"feature_include={list(feature_include_patterns)!r}|"
@@ -2081,6 +2092,7 @@ def build_panel(
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
+        f"tw_limit_rounding=v2|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"feature_include={list(feature_include_patterns)!r}|"

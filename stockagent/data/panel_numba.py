@@ -63,13 +63,16 @@ def _tw_limit_price_flat(prev_close: np.ndarray, ratio: float) -> np.ndarray:
             tick = 1.0
         else:
             tick = 5.0
-        floored = math.floor((theoretical / tick) + 1e-12) * tick
-        if not math.isfinite(floored):
-            out[idx] = np.nan
-        elif floored >= 0.0:
-            out[idx] = math.floor(floored * 100.0 + 0.5) / 100.0
+        if ratio < 1.0:
+            rounded = math.ceil((theoretical / tick) - 1e-12) * tick
         else:
-            out[idx] = math.ceil(floored * 100.0 - 0.5) / 100.0
+            rounded = math.floor((theoretical / tick) + 1e-12) * tick
+        if not math.isfinite(rounded):
+            out[idx] = np.nan
+        elif rounded >= 0.0:
+            out[idx] = math.floor(rounded * 100.0 + 0.5) / 100.0
+        else:
+            out[idx] = math.ceil(rounded * 100.0 - 0.5) / 100.0
     return out
 
 
@@ -194,7 +197,7 @@ def _tw_limit_masks_kernel(
                 tick_down = 5.0
 
             limit_up = math.floor((theoretical_up / tick_up) + 1e-12) * tick_up
-            limit_down = math.floor((theoretical_down / tick_down) + 1e-12) * tick_down
+            limit_down = math.ceil((theoretical_down / tick_down) - 1e-12) * tick_down
             limit_up = math.floor(limit_up * 100.0 + 0.5) / 100.0
             limit_down = math.floor(limit_down * 100.0 + 0.5) / 100.0
             is_limit_up = close >= (limit_up - 1e-9)

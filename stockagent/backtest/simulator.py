@@ -1346,10 +1346,12 @@ def _vectorized_backtest(
 
     prev = np.zeros((n_symbols,), dtype=np.float32)
     for t in range(t_len):
-        target_t = target_weights[t].copy()
         tradable_t = tradable[t]
-        # If symbol is not tradable today, keep previous holdings instead of forcing liquidation.
-        target_t[~tradable_t] = prev[~tradable_t]
+        # If a symbol is no longer tradable, assume the position was liquidated
+        # on its previous tradable day. Do not carry suspended/delisted exposure.
+        prev = np.where(tradable_t, prev, 0.0).astype(np.float32, copy=False)
+        target_t = target_weights[t].copy()
+        target_t[~tradable_t] = 0.0
         if not long_only:
             target_t = np.where(force_cover_mask[t] & (target_t < 0.0), 0.0, target_t)
 
@@ -1459,7 +1461,9 @@ def _vectorized_backtest_torch_scan_long_only(
 
         for offset in range(end - start):
             idx = start + offset
-            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            tradable_t = tradable_chunk[offset]
+            prev = torch.where(tradable_t, prev, torch.zeros_like(prev))
+            target_t = torch.where(tradable_t, target_chunk[offset], torch.zeros_like(prev))
 
             delta = target_t - prev
             buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
@@ -1565,7 +1569,9 @@ def _vectorized_backtest_torch_scan_long_short(
 
         for offset in range(end - start):
             idx = start + offset
-            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            tradable_t = tradable_chunk[offset]
+            prev = torch.where(tradable_t, prev, torch.zeros_like(prev))
+            target_t = torch.where(tradable_t, target_chunk[offset], torch.zeros_like(prev))
             target_t = torch.where(
                 force_chunk[offset] & (target_t < 0.0),
                 torch.zeros_like(target_t),
@@ -1692,7 +1698,9 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
 
         for offset in range(end - start):
             idx = start + offset
-            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            tradable_t = tradable_chunk[offset]
+            prev = torch.where(tradable_t, prev, torch.zeros_like(prev))
+            target_t = torch.where(tradable_t, target_chunk[offset], torch.zeros_like(prev))
             if not long_only:
                 target_t = torch.where(
                     force_chunk[offset] & (target_t < 0.0),
@@ -2118,6 +2126,12 @@ def _vectorized_backtest_torch(
         )
 
     triton_requested = _triton_eval_enabled()
+    triton_tradable_supported = True
+    if triton_requested:
+        try:
+            triton_tradable_supported = bool(torch.all(prepped_tradable.to(dtype=torch.bool)).detach().cpu().item())
+        except Exception:
+            triton_tradable_supported = False
     triton_supported = (
         triton_requested
         and not _torch_dynamo_is_compiling()
@@ -2127,6 +2141,7 @@ def _vectorized_backtest_torch(
         and triton_eval_available()
         and not long_only
         and not has_short_constraints
+        and triton_tradable_supported
         and prepped_weights.device.type == "cuda"
         and prepped_weights.dim() == 2
         and (prepped_volume_limit_weights is None or not prepped_volume_limit_weights.requires_grad)
@@ -2135,7 +2150,7 @@ def _vectorized_backtest_torch(
         raise RuntimeError(
             "eval_backtest_engine=triton was requested, but this backtest shape is not supported. "
             "Required: CUDA+Triton, no autograd, long_only=false, no explicit short-open/force-cover masks, "
-            "and 2D [T, S] weights."
+            "all tradable_mask values true, and 2D [T, S] weights."
         )
     if triton_supported:
         _add_backtest_runtime_stat("triton_eval_calls")
