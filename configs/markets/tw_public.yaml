@@ -235,6 +235,8 @@ training:
   eval_backtest_compile: false
   eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
+  # Explicit comparison knob: train_union changes the training symbol universe
+  # to the fold's active-symbol union; set none for full-symbol parity runs.
   train_symbol_compaction: train_union
   detach_prev_state: true
   prefer_fp16: false
@@ -471,7 +473,7 @@ training:
     sdpa_batch_limit: 65535
     norm_type: rmsnorm
     ffn_type: swiglu
-    qk_norm: false
+    qk_norm: true
     rope_temporal: true
     rope_base: 10000.0
     # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
@@ -498,11 +500,6 @@ training:
     num_latent_factors: 16
     num_market_tokens: 16
     market_layers: 1
-    dynamic_latent_tokens: true
-    dynamic_market_tokens: true
-    dynamic_token_hidden_mult: 2
-    dynamic_token_gate_init: 0.1
-    dynamic_token_dropout: 0.0
     head_hidden_dim: 32
     head_layers: 1
     dropout: 0.0

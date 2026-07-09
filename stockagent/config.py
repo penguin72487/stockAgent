@@ -421,11 +421,6 @@ class TransformerBasePortfolioModelConfig:
     num_latent_factors: int = 16
     num_market_tokens: int = 4
     market_layers: int = 1
-    dynamic_latent_tokens: bool = True
-    dynamic_market_tokens: bool = True
-    dynamic_token_hidden_mult: int = 2
-    dynamic_token_gate_init: float = 0.1
-    dynamic_token_dropout: float = 0.1
     head_hidden_dim: int = 64
     head_layers: int = 1
     dropout: float = 0.1
@@ -1232,11 +1227,6 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio.setdefault("num_latent_factors", 16)
     transformer_base_portfolio.setdefault("num_market_tokens", 4)
     transformer_base_portfolio.setdefault("market_layers", 1)
-    transformer_base_portfolio.setdefault("dynamic_latent_tokens", True)
-    transformer_base_portfolio.setdefault("dynamic_market_tokens", True)
-    transformer_base_portfolio.setdefault("dynamic_token_hidden_mult", 2)
-    transformer_base_portfolio.setdefault("dynamic_token_gate_init", 0.1)
-    transformer_base_portfolio.setdefault("dynamic_token_dropout", 0.1)
     transformer_base_portfolio.setdefault("head_hidden_dim", 64)
     transformer_base_portfolio.setdefault("head_layers", 1)
     transformer_base_portfolio.setdefault("dropout", legacy_dropout)

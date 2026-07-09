@@ -163,75 +163,6 @@ def _rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(variance + eps).to(dtype=x.dtype)
 
 
-def _masked_market_summary_parts(z_stock: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    mask_bool = mask.to(device=z_stock.device, dtype=torch.bool)
-    weights = mask_bool.to(dtype=z_stock.dtype).unsqueeze(-1)
-    denom = weights.sum(dim=1).clamp_min(1.0)
-    mean = (z_stock * weights).sum(dim=1) / denom
-    centered = (z_stock - mean.unsqueeze(1)) * weights
-    variance = centered.float().pow(2).sum(dim=1) / denom.float()
-    std = torch.sqrt(variance.clamp_min(0.0) + 1e-6).to(dtype=z_stock.dtype)
-    dispersion = centered.abs().sum(dim=1) / denom
-    return torch.stack([mean, std, dispersion], dim=1)
-
-
-def _gate_logit(init_value: float) -> float:
-    value = min(max(float(init_value), 1e-4), 1.0 - 1e-4)
-    return math.log(value / (1.0 - value))
-
-
-class DynamicTokenGenerator(nn.Module):
-    """Generate input-conditioned latent or market query deltas from market summary."""
-
-    def __init__(
-        self,
-        *,
-        dim: int,
-        num_tokens: int,
-        hidden_mult: int,
-        dropout: float,
-        gate_init: float,
-        norm_type: str,
-        ffn_type: str,
-    ) -> None:
-        super().__init__()
-        self.dim = int(dim)
-        self.num_tokens = max(1, int(num_tokens))
-        summary_dim = self.dim * 3
-        hidden_dim = max(self.dim, _round_up_to_multiple(self.dim * max(1, int(hidden_mult)), 8))
-        self.summary_norm = _make_norm(summary_dim, norm_type)
-        self.summary_proj = GatedProjection(summary_dim, hidden_dim, dropout, ffn_type)
-        self.out_proj = nn.Linear(hidden_dim, self.num_tokens * self.dim)
-        self.delta_dropout = nn.Dropout(float(dropout))
-        self.gate_logit = nn.Parameter(torch.tensor(_gate_logit(gate_init), dtype=torch.float32))
-
-    def forward(
-        self,
-        base_queries: torch.Tensor,
-        z_stock: torch.Tensor,
-        mask: torch.Tensor,
-        *,
-        collect_aux: bool = True,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        bsz = int(z_stock.size(0))
-        summary_parts = _masked_market_summary_parts(z_stock, mask)
-        summary = summary_parts.flatten(start_dim=1)
-        hidden = self.summary_proj(self.summary_norm(summary))
-        delta = self.out_proj(hidden).reshape(bsz, self.num_tokens, self.dim)
-        delta = self.delta_dropout(delta)
-        gate = torch.sigmoid(self.gate_logit).to(device=delta.device, dtype=delta.dtype)
-        base = base_queries.expand(bsz, -1, -1)
-        dynamic = base + gate * delta
-        if not collect_aux:
-            return dynamic, {}
-        return dynamic, {
-            "delta": delta,
-            "gate": gate.reshape(1),
-            "summary_parts": summary_parts,
-            "queries": dynamic,
-        }
-
-
 class FlashSDPAAttention(nn.Module):
     """Multi-head attention backed by PyTorch SDPA.
 
@@ -548,11 +479,6 @@ class TransformerBasePortfolioModel(nn.Module):
         num_latent_factors: int = 16,
         num_market_tokens: int = 4,
         market_layers: int = 1,
-        dynamic_latent_tokens: bool = True,
-        dynamic_market_tokens: bool = True,
-        dynamic_token_hidden_mult: int = 2,
-        dynamic_token_gate_init: float = 0.1,
-        dynamic_token_dropout: float = 0.1,
         head_hidden_dim: int = 64,
         head_layers: int = 1,
         dropout: float = 0.1,
@@ -596,12 +522,6 @@ class TransformerBasePortfolioModel(nn.Module):
         self.qk_norm = bool(qk_norm)
         self.rope_temporal = bool(rope_temporal)
         self.rope_base = float(rope_base)
-        # Deprecated config compatibility knobs. Dynamic token deltas based on
-        # hand-built mean/std/dispersion summaries are intentionally disabled in
-        # the Transformer-base forward path; learned query tokens now read the
-        # stock/factor pool directly through cross-attention.
-        self.dynamic_latent_tokens = bool(dynamic_latent_tokens)
-        self.dynamic_market_tokens = bool(dynamic_market_tokens)
 
         raw_categorical_indices = tuple(int(idx) for idx in (categorical_feature_indices or ()))
         categorical_indices: list[int] = []
@@ -700,11 +620,6 @@ class TransformerBasePortfolioModel(nn.Module):
             if self.attention_mode in {"latent", "market_token"}
             else None
         )
-        # Kept as attributes so old checkpoints/tests/config-driven code can
-        # probe them, but the deprecated DynamicTokenGenerator is no longer used
-        # by TransformerBasePortfolioModel.
-        self.dynamic_latent_generator = None
-        self.dynamic_market_generator = None
         self.latent_blocks = nn.ModuleList(
             [
                 make_block(int(cross_heads), int(cross_ffn_mult))
