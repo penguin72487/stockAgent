@@ -1,0 +1,12 @@
+base_config: tw_parallel_latefold_stable.yaml
+
+experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090-latefold-sharpck
+
+runner:
+  output_dir: artifacts/markets/tw_parallel_latefold_sharpck
+
+training:
+  loss_type: sharpck
+  early_stopping_min_delta: 0.005
+  fused_log_utility_loss: false
+  compile_loss: false
