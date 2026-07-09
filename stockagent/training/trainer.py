@@ -9382,7 +9382,7 @@ def _run_training_tree_models(
                 next_fold_by_id.get(int(fold.fold_id)),
                 config.training.lookback,
             )
-            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback)
+            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback, allow_empty=True)
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
                 continue
@@ -9608,7 +9608,7 @@ def _run_inference_tree_models(
             next_fold_by_id.get(int(fold.fold_id)),
             config.training.lookback,
         )
-        test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback)
+        test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback, allow_empty=True)
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
             continue
@@ -9872,7 +9872,7 @@ def _run_inference_neural_models(
             next_fold_by_id.get(int(fold.fold_id)),
             config.training.lookback,
         )
-        test_ds = CrossSectionalDataset(fold_panel, test_indices, config.training.lookback)
+        test_ds = CrossSectionalDataset(fold_panel, test_indices, config.training.lookback, allow_empty=True)
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
             continue
@@ -10404,7 +10404,7 @@ def run_training(
                 next_fold_by_id.get(int(fold.fold_id)),
                 config.training.lookback,
             )
-            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback)
+            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback, allow_empty=True)
 
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
@@ -10508,7 +10508,7 @@ def run_training(
         if curve_test_indices.size == 0:
             curve_test_indices = curve_test_fold_context.fold.test_indices
             curve_test_years = curve_test_fold_context.fold.test_years
-        curve_test_ds = CrossSectionalDataset(panel, curve_test_indices, config.training.lookback)
+        curve_test_ds = CrossSectionalDataset(panel, curve_test_indices, config.training.lookback, allow_empty=True)
         if len(curve_test_ds) == 0 and curve_test_indices.size != curve_test_fold_context.fold.test_indices.size:
             curve_test_indices = curve_test_fold_context.fold.test_indices
             curve_test_years = curve_test_fold_context.fold.test_years
