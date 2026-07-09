@@ -233,7 +233,6 @@ training:
   # Keep train model/loss compile on. Eval backtest scan compile stalls in
   # TorchInductor front-end analysis for the current fold18 full-universe shape.
   eval_backtest_compile: false
-  eval_backtest_engine: triton
   eval_auto_chunk_rows_cap: 64
   train_symbol_subsample_ratio: 1.0
   train_symbol_compaction: train_union

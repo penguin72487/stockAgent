@@ -2141,8 +2141,6 @@ def _timing_curve_payload(
         "bt_dense_fast_path_cuda_ms_per_call": _bt_avg_ms("dense_fast_path_cuda_s"),
         "bt_cpp_ext_ms_per_call": _bt_avg_ms("cpp_ext_s"),
         "bt_cpp_ext_cuda_ms_per_call": _bt_avg_ms("cpp_ext_cuda_s"),
-        "bt_triton_eval_ms_per_call": _bt_avg_ms("triton_eval_s"),
-        "bt_triton_eval_cuda_ms_per_call": _bt_avg_ms("triton_eval_cuda_s"),
         "bt_compiled_runner_calls": int(backtest_runtime_stats.get("compiled_runner_calls", 0.0)),
         "bt_eager_runner_calls": int(backtest_runtime_stats.get("eager_runner_calls", 0.0)),
         "bt_stateful_calls": int(backtest_runtime_stats.get("stateful_calls", 0.0)),
@@ -2154,9 +2152,6 @@ def _timing_curve_payload(
         "bt_dense_fast_path_calls": int(backtest_runtime_stats.get("dense_fast_path_calls", 0.0)),
         "bt_cpp_ext_calls": int(backtest_runtime_stats.get("cpp_ext_calls", 0.0)),
         "bt_cpp_ext_failures": int(backtest_runtime_stats.get("cpp_ext_failures", 0.0)),
-        "bt_triton_eval_calls": int(backtest_runtime_stats.get("triton_eval_calls", 0.0)),
-        "bt_triton_eval_failures": int(backtest_runtime_stats.get("triton_eval_failures", 0.0)),
-        "bt_triton_eval_fallback_calls": int(backtest_runtime_stats.get("triton_eval_fallback_calls", 0.0)),
         "bt_checkpoint_calls": int(backtest_runtime_stats.get("checkpoint_calls", 0.0)),
         "bt_compiled_prep_calls": int(backtest_runtime_stats.get("compiled_prep_calls", 0.0)),
         "bt_eager_prep_calls": int(backtest_runtime_stats.get("eager_prep_calls", 0.0)),
@@ -4073,278 +4068,51 @@ def _panel_indices_to_tensors(
     return valid_indices, x, returns, masks, can_buy_masks, can_sell_masks, bench
 
 
-def _concat_backtest_tensors(
-    first: BacktestResultTensor,
-    second: BacktestResultTensor,
-) -> BacktestResultTensor:
-    if first.weights_history.numel() == 0:
-        weights = second.weights_history
-    elif second.weights_history.numel() == 0:
-        weights = first.weights_history
-    else:
-        weights = torch.cat([first.weights_history, second.weights_history], dim=0)
-    return BacktestResultTensor(
-        strategy_returns=torch.cat([first.strategy_returns, second.strategy_returns], dim=0),
-        benchmark_returns=torch.cat([first.benchmark_returns, second.benchmark_returns], dim=0),
-        turnovers=torch.cat([first.turnovers, second.turnovers], dim=0),
-        weights_history=weights,
-        final_weights=second.final_weights,
-    )
-
-
-def _load_previous_fold_tree_model(output_path: Path, fold_id: int) -> Any | None:
-    if fold_id <= 1:
-        return None
-    previous_model_path = _model_path(_fold_dir(output_path, fold_id - 1))
-    if not previous_model_path.exists():
-        return None
-    with previous_model_path.open("rb") as model_file:
-        return pickle.load(model_file)
-
-
-def _load_previous_fold_neural_model(
-    *,
+def _split_valid_indices(
     panel: PanelData,
-    config: ExperimentConfig,
-    output_path: Path,
-    fold_id: int,
-    device: torch.device,
-) -> nn.Module | None:
-    if fold_id <= 1:
-        return None
-
-    previous_fold_dir = _fold_dir(output_path, fold_id - 1)
-    previous_model_file = _model_path(previous_fold_dir)
-    previous_best_checkpoint = _best_checkpoint_path(previous_fold_dir)
-
-    previous_state_dict: dict | None = None
-    if previous_model_file.exists():
-        previous_state_dict = torch.load(previous_model_file, map_location="cpu")
-    elif previous_best_checkpoint.exists():
-        previous_checkpoint = _load_checkpoint(previous_best_checkpoint)
-        previous_state_dict = previous_checkpoint.get("model_state_dict")
-
-    if not isinstance(previous_state_dict, dict):
-        return None
-
-    previous_model = build_model(
-        config=config,
-        lookback=config.training.lookback,
-        num_features=len(panel.feature_names),
-        num_symbols=panel.num_symbols,
-        feature_names=panel.feature_names,
-    ).to(device)
-    try:
-        _load_state_dict(previous_model, previous_state_dict)
-    except RuntimeError as exc:
-        print(
-            f"[warmup] fold {fold_id - 1} model incompatible with current panel "
-            f"(num_symbols={panel.num_symbols}), skipping warmup: {exc}"
-        )
-        del previous_model
-        return None
-    previous_model.eval()
-    return previous_model
+    date_indices: np.ndarray,
+    lookback: int,
+) -> np.ndarray:
+    indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
+    if indices.size == 0:
+        return indices
+    fold_start_idx = int(indices[0])
+    min_valid_idx = fold_start_idx + int(lookback) - 1
+    valid_indices = indices[indices >= min_valid_idx]
+    if valid_indices.size > 0:
+        target_mask = panel.tradable_mask & np.isfinite(panel.returns_1d)
+        valid_indices = valid_indices[target_mask[valid_indices].any(axis=1)]
+    return valid_indices
 
 
-def _merge_test_backtest_with_previous_fold_warmup(
-    *,
+def _next_fold_by_id(folds: Iterable[WalkForwardFold]) -> dict[int, WalkForwardFold | None]:
+    ordered = sorted(list(folds), key=lambda item: int(item.fold_id))
+    result: dict[int, WalkForwardFold | None] = {}
+    for idx, fold in enumerate(ordered):
+        result[int(fold.fold_id)] = ordered[idx + 1] if idx + 1 < len(ordered) else None
+    return result
+
+
+def _deployment_test_indices(
     panel: PanelData,
     fold: WalkForwardFold,
+    next_fold: WalkForwardFold | None,
     lookback: int,
-    previous_model: Any | None,
-    current_backtest: BacktestResultTensor,
-    current_returns: torch.Tensor,
-    current_masks: torch.Tensor,
-    current_buy_masks: torch.Tensor,
-    current_sell_masks: torch.Tensor,
-    current_benchmark: torch.Tensor,
-    current_valid_indices: np.ndarray,
-    device: torch.device,
-    amp_dtype: torch.dtype | None,
-    non_blocking: bool,
-    long_only: bool,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
-    max_turnover_ratio: float,
-    gross_leverage: float,
-    min_trade_weight: float = 0.0,
-    chunk_rows: int = 1,
-    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
-    backtest_chunk_rows: int | None = None,
-    max_volume_participation: float = 0.0,
-    volume_participation_equity: float = 1_000_000.0,
-) -> tuple[
-    BacktestResultTensor,
-    dict[str, float],
-    dict[str, float],
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    np.ndarray,
-    int,
-]:
-    valid_indices = np.asarray(current_valid_indices, dtype=np.int64)
-    if previous_model is None or valid_indices.size == 0:
-        test_ic = ic_summary(
-            compute_ic_series_torch(
-                current_backtest.weights_history,
-                current_returns.to(device=current_backtest.weights_history.device),
-                current_masks.to(device=current_backtest.weights_history.device),
-            ).detach().cpu().numpy()
-        )
-        test_met = _compute_metrics_from_tensors(
-            current_backtest.strategy_returns,
-            current_backtest.benchmark_returns,
-            current_backtest.turnovers,
-        )
-        return (
-            current_backtest,
-            test_ic,
-            test_met,
-            current_returns,
-            current_masks,
-            current_buy_masks,
-            current_sell_masks,
-            current_benchmark,
-            valid_indices,
-            0,
-        )
+) -> np.ndarray:
+    """Raw test date indices owned by this fold's model.
 
-    all_test_indices = np.array(sorted(np.asarray(fold.test_indices, dtype=np.int64).tolist()), dtype=np.int64)
-    first_current_idx = int(valid_indices[0])
-    warmup_candidate_indices = all_test_indices[all_test_indices < first_current_idx]
-    warmup_indices, warmup_x, warmup_returns, warmup_masks, warmup_buy_masks, warmup_sell_masks, warmup_bench = _panel_indices_to_tensors(
-        panel,
-        warmup_candidate_indices,
-        lookback,
-    )
-    warmup_days = int(warmup_indices.size)
-    if warmup_days == 0:
-        test_ic = ic_summary(
-            compute_ic_series_torch(
-                current_backtest.weights_history,
-                current_returns.to(device=current_backtest.weights_history.device),
-                current_masks.to(device=current_backtest.weights_history.device),
-            ).detach().cpu().numpy()
-        )
-        test_met = _compute_metrics_from_tensors(
-            current_backtest.strategy_returns,
-            current_backtest.benchmark_returns,
-            current_backtest.turnovers,
-        )
-        return (
-            current_backtest,
-            test_ic,
-            test_met,
-            current_returns,
-            current_masks,
-            current_buy_masks,
-            current_sell_masks,
-            current_benchmark,
-            valid_indices,
-            0,
-        )
-
-    if panel.daily_volumes is None:
-        warmup_volume_notional = torch.full_like(warmup_returns, float("inf"))
-    else:
-        warmup_volume_notional_np = (
-            np.asarray(panel.daily_volumes[warmup_indices], dtype=np.float32)
-            * np.asarray(panel.close_prices[warmup_indices], dtype=np.float32)
-        ).astype(np.float32, copy=False)
-        warmup_volume_notional = torch.from_numpy(warmup_volume_notional_np)
-
-    warmup_x, warmup_returns, warmup_masks, warmup_buy_masks, warmup_sell_masks, warmup_bench = _prepare_split_tensors(
-        warmup_x,
-        warmup_returns,
-        warmup_masks,
-        warmup_buy_masks,
-        warmup_sell_masks,
-        warmup_bench,
-        device,
-        non_blocking,
-    )
-    warmup_volume_notional = _prepare_host_tensor(
-        warmup_volume_notional,
-        pin_memory=(device.type == "cuda" and non_blocking),
-    )
-
-    warmup_bt_t, _, _ = _evaluate_tensor_batch(
-        previous_model,
-        warmup_x,
-        warmup_returns,
-        warmup_masks,
-        warmup_buy_masks,
-        warmup_sell_masks,
-        warmup_bench,
-        device,
-        amp_dtype,
-        non_blocking,
-        long_only,
-        buy_fee_rate,
-        sell_fee_rate,
-        max_turnover_ratio,
-        gross_leverage,
-        min_trade_weight,
-        chunk_rows=max(1, min(int(chunk_rows), int(warmup_x.size(0)))),
-        backtest_chunk_rows=backtest_chunk_rows,
-        compute_metrics_summary=False,
-        volume_notional=warmup_volume_notional,
-        max_volume_participation=max_volume_participation,
-        volume_participation_equity=volume_participation_equity,
-    )
-
-    merged_backtest = _concat_backtest_tensors(warmup_bt_t, current_backtest)
-
-    merged_returns = torch.cat(
-        [warmup_returns.to(device=merged_backtest.strategy_returns.device), current_returns.to(device=merged_backtest.strategy_returns.device)],
-        dim=0,
-    )
-    merged_masks = torch.cat(
-        [warmup_masks.to(device=merged_backtest.strategy_returns.device), current_masks.to(device=merged_backtest.strategy_returns.device)],
-        dim=0,
-    )
-    merged_buy_masks = torch.cat(
-        [warmup_buy_masks.to(device=merged_backtest.strategy_returns.device), current_buy_masks.to(device=merged_backtest.strategy_returns.device)],
-        dim=0,
-    )
-    merged_sell_masks = torch.cat(
-        [warmup_sell_masks.to(device=merged_backtest.strategy_returns.device), current_sell_masks.to(device=merged_backtest.strategy_returns.device)],
-        dim=0,
-    )
-    merged_bench = torch.cat(
-        [warmup_bench.to(device=merged_backtest.strategy_returns.device), current_benchmark.to(device=merged_backtest.strategy_returns.device)],
-        dim=0,
-    )
-    merged_indices = np.concatenate([warmup_indices, valid_indices])
-
-    test_ic = ic_summary(
-        compute_ic_series_torch(
-            merged_backtest.weights_history,
-            merged_returns,
-            merged_masks,
-        ).detach().cpu().numpy()
-    )
-    test_met = _compute_metrics_from_tensors(
-        merged_backtest.strategy_returns,
-        merged_backtest.benchmark_returns,
-        merged_backtest.turnovers,
-    )
-    return (
-        merged_backtest,
-        test_ic,
-        test_met,
-        merged_returns,
-        merged_masks,
-        merged_buy_masks,
-        merged_sell_masks,
-        merged_bench,
-        merged_indices,
-        warmup_days,
-    )
+    CrossSectionalDataset later drops the first ``lookback - 1`` rows of this
+    raw interval. The interval ends just before the next fold's first valid row,
+    so the new year's lookback warmup days remain assigned to the previous
+    model instead of being prepended to the next model's backtest.
+    """
+    indices = np.array(sorted(np.asarray(fold.test_indices, dtype=np.int64).tolist()), dtype=np.int64)
+    if indices.size == 0 or next_fold is None:
+        return indices
+    next_valid = _split_valid_indices(panel, next_fold.test_indices, lookback)
+    if next_valid.size == 0:
+        return indices
+    return indices[indices < int(next_valid[0])]
 
 
 def _prepare_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
@@ -7242,9 +7010,6 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     eval_backtest_compile = getattr(training, "eval_backtest_compile", None)
     if eval_backtest_compile is not None:
         os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(eval_backtest_compile) else "0"
-    eval_backtest_engine = str(getattr(training, "eval_backtest_engine", "torch")).strip().lower().replace("-", "_")
-    os.environ["STOCKAGENT_BACKTEST_TRITON_EVAL"] = "1" if eval_backtest_engine in {"auto", "triton"} else "0"
-    os.environ["STOCKAGENT_BACKTEST_TRITON_EVAL_REQUIRED"] = "1" if eval_backtest_engine == "triton" else "0"
     os.environ["STOCKAGENT_USE_CPP_BACKTEST_EXT"] = "1" if bool(training.backtest_cpp_ext) else "0"
     os.environ["STOCKAGENT_BACKTEST_VERBOSE"] = "1" if bool(training.backtest_verbose) else "0"
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if bool(training.strict_no_fallback) else "0"
@@ -9432,6 +9197,7 @@ def _run_training_tree_models(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
+    next_fold_by_id = _next_fold_by_id(fold_list)
 
     if resume:
         for fold in fold_list:
@@ -9487,7 +9253,13 @@ def _run_training_tree_models(
         for fold in pending_folds:
             print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
             val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-            test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+            test_indices = _deployment_test_indices(
+                panel,
+                fold,
+                next_fold_by_id.get(int(fold.fold_id)),
+                config.training.lookback,
+            )
+            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback)
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
                 continue
@@ -9540,7 +9312,7 @@ def _run_training_tree_models(
 
             test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
             test_volume_notional = _dataset_volume_notional_to_tensor(test_ds)
-            test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+            test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
                 model,
                 test_x,
                 test_returns,
@@ -9563,47 +9335,7 @@ def _run_training_tree_models(
                 max_volume_participation=config.trading.max_volume_participation,
                 volume_participation_equity=config.trading.volume_participation_equity,
             )
-
-            previous_fold_model = _load_previous_fold_tree_model(output_path, fold.fold_id)
-            (
-                test_bt_t,
-                test_ic,
-                test_met,
-                test_returns,
-                test_masks,
-                test_buy_masks,
-                test_sell_masks,
-                test_bench,
-                test_eval_indices,
-                warmup_days,
-            ) = _merge_test_backtest_with_previous_fold_warmup(
-                panel=panel,
-                fold=fold,
-                lookback=config.training.lookback,
-                previous_model=previous_fold_model,
-                current_backtest=test_bt_t,
-                current_returns=test_returns,
-                current_masks=test_masks,
-                current_buy_masks=test_buy_masks,
-                current_sell_masks=test_sell_masks,
-                current_benchmark=test_bench,
-                current_valid_indices=np.asarray(test_ds.valid_indices, dtype=np.int64),
-                device=device,
-                amp_dtype=amp_dtype,
-                non_blocking=non_blocking,
-                long_only=config.trading.long_only,
-                buy_fee_rate=config.trading.buy_fee_rate,
-                sell_fee_rate=config.trading.sell_fee_rate,
-                max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=1.0,
-                min_trade_weight=config.trading.min_trade_weight,
-                portfolio_activation=config.trading.portfolio_activation,
-                chunk_rows=min(eval_chunk_rows, max(1, int(test_x.size(0)))),
-                max_volume_participation=config.trading.max_volume_participation,
-                volume_participation_equity=config.trading.volume_participation_equity,
-            )
-            if warmup_days > 0:
-                print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
+            test_eval_indices = np.asarray(test_ds.valid_indices, dtype=np.int64)
 
             test_dates = panel.dates[test_eval_indices]
             test_close_prices = panel.close_prices[test_eval_indices]
@@ -9728,6 +9460,7 @@ def _run_inference_tree_models(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = sorted(list(folds), key=lambda item: item.fold_id)
+    next_fold_by_id = _next_fold_by_id(fold_list)
 
     device = torch.device("cpu")
     amp_dtype: torch.dtype | None = None
@@ -9746,7 +9479,13 @@ def _run_inference_tree_models(
             model = pickle.load(model_file)
 
         val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-        test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+        test_indices = _deployment_test_indices(
+            panel,
+            fold,
+            next_fold_by_id.get(int(fold.fold_id)),
+            config.training.lookback,
+        )
+        test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback)
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
             continue
@@ -9798,7 +9537,7 @@ def _run_inference_tree_models(
         test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
         test_volume_notional = _dataset_volume_notional_to_tensor(test_ds)
         test_chunk_rows = max(1, min(2048, int(test_x.size(0))))
-        test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+        test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
             model,
             test_x,
             test_returns,
@@ -9821,47 +9560,7 @@ def _run_inference_tree_models(
             max_volume_participation=config.trading.max_volume_participation,
             volume_participation_equity=config.trading.volume_participation_equity,
         )
-
-        previous_fold_model = _load_previous_fold_tree_model(output_path, fold.fold_id)
-        (
-            test_bt_t,
-            test_ic,
-            test_met,
-            test_returns,
-            test_masks,
-            test_buy_masks,
-            test_sell_masks,
-            test_bench,
-            test_eval_indices,
-            warmup_days,
-        ) = _merge_test_backtest_with_previous_fold_warmup(
-            panel=panel,
-            fold=fold,
-            lookback=config.training.lookback,
-            previous_model=previous_fold_model,
-            current_backtest=test_bt_t,
-            current_returns=test_returns,
-            current_masks=test_masks,
-            current_buy_masks=test_buy_masks,
-            current_sell_masks=test_sell_masks,
-            current_benchmark=test_bench,
-            current_valid_indices=np.asarray(test_ds.valid_indices, dtype=np.int64),
-            device=device,
-            amp_dtype=amp_dtype,
-            non_blocking=non_blocking,
-            long_only=config.trading.long_only,
-            buy_fee_rate=config.trading.buy_fee_rate,
-            sell_fee_rate=config.trading.sell_fee_rate,
-            max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=1.0,
-            min_trade_weight=config.trading.min_trade_weight,
-            portfolio_activation=config.trading.portfolio_activation,
-            chunk_rows=test_chunk_rows,
-            max_volume_participation=config.trading.max_volume_participation,
-            volume_participation_equity=config.trading.volume_participation_equity,
-        )
-        if warmup_days > 0:
-            print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
+        test_eval_indices = np.asarray(test_ds.valid_indices, dtype=np.int64)
 
         test_dates = panel.dates[test_eval_indices]
         test_close_prices = panel.close_prices[test_eval_indices]
@@ -10044,7 +9743,13 @@ def _run_inference_neural_models(
             print(f"[Fold {fold.fold_id}] inference mode=windowed panel_forward=fallback")
 
         val_ds = CrossSectionalDataset(fold_panel, fold.val_indices, config.training.lookback)
-        test_ds = CrossSectionalDataset(fold_panel, fold.test_indices, config.training.lookback)
+        test_indices = _deployment_test_indices(
+            fold_panel,
+            fold,
+            next_fold_by_id.get(int(fold.fold_id)),
+            config.training.lookback,
+        )
+        test_ds = CrossSectionalDataset(fold_panel, test_indices, config.training.lookback)
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
             continue
@@ -10123,7 +9828,7 @@ def _run_inference_neural_models(
             f"backtest_chunk_rows={test_backtest_chunk_rows}"
         )
 
-        test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
+        test_bt_t, test_ic, test_met = _evaluate_windowed_tensor_batch(
             model,
             panel_slab_model,
             test_windowed,
@@ -10148,54 +9853,7 @@ def _run_inference_neural_models(
             non_blocking=non_blocking,
         )
         test_valid_indices = _windowed_valid_indices_numpy(test_windowed)
-
-        previous_fold_model = _load_previous_fold_neural_model(
-            panel=fold_panel,
-            config=config,
-            output_path=output_path,
-            fold_id=fold.fold_id,
-            device=device,
-        )
-        (
-            test_bt_t,
-            test_ic,
-            test_met,
-            test_returns,
-            test_masks,
-            test_buy_masks,
-            test_sell_masks,
-            test_bench,
-            test_eval_indices,
-            warmup_days,
-        ) = _merge_test_backtest_with_previous_fold_warmup(
-            panel=fold_panel,
-            fold=fold,
-            lookback=config.training.lookback,
-            previous_model=previous_fold_model,
-            current_backtest=test_bt_t,
-            current_returns=test_returns,
-            current_masks=test_masks,
-            current_buy_masks=test_buy_masks,
-            current_sell_masks=test_sell_masks,
-            current_benchmark=test_bench,
-            current_valid_indices=test_valid_indices,
-            device=device,
-            amp_dtype=amp_dtype,
-            non_blocking=non_blocking,
-            long_only=config.trading.long_only,
-            buy_fee_rate=config.trading.buy_fee_rate,
-            sell_fee_rate=config.trading.sell_fee_rate,
-            max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=1.0,
-            min_trade_weight=config.trading.min_trade_weight,
-            portfolio_activation=config.trading.portfolio_activation,
-            chunk_rows=test_chunk_rows,
-            backtest_chunk_rows=test_backtest_chunk_rows,
-        )
-        if warmup_days > 0:
-            print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
-        if previous_fold_model is not None:
-            del previous_fold_model
+        test_eval_indices = test_valid_indices
 
         test_dates = fold_panel.dates[test_eval_indices]
         test_close_prices = fold_panel.close_prices[test_eval_indices]
@@ -10418,6 +10076,7 @@ def run_training(
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
+    next_fold_by_id = _next_fold_by_id(fold_list)
 
     retrain_completed_folds = _env_truthy("STOCKAGENT_RETRAIN_COMPLETED_FOLDS", "0")
     if resume and not retrain_completed_folds:
@@ -10616,7 +10275,13 @@ def run_training(
         for fold in pending_folds:
             print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
             val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-            test_ds = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+            test_indices = _deployment_test_indices(
+                panel,
+                fold,
+                next_fold_by_id.get(int(fold.fold_id)),
+                config.training.lookback,
+            )
+            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback)
 
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
@@ -10767,10 +10432,13 @@ def run_training(
         curve_test_start_row = 0
         curve_test_end_row = int(test_lengths[0])
         curve_test_offsets = [0, curve_test_end_row - curve_test_start_row]
+        curve_test_scope = "sampled_first_fold_first_test_year"
+        curve_test_fold_id = int(curve_test_fold_context.fold.fold_id)
+        curve_test_rows = int(curve_test_offsets[-1])
         print(
             f"[Train {train_years}] epoch-level test loss uses fold "
-            f"{curve_test_fold_context.fold.fold_id} only "
-            f"(years={curve_test_years}, rows={curve_test_offsets[-1]})"
+            f"{curve_test_fold_id} only "
+            f"(scope={curve_test_scope}, years={curve_test_years}, rows={curve_test_rows})"
         )
         if profile_timing:
             _log_timing(
@@ -11368,7 +11036,6 @@ def run_training(
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
             f"backtest_prep_compile={_env_truthy('STOCKAGENT_BACKTEST_COMPILE_PREP', '1')}; "
-            f"eval_backtest_engine={getattr(config.training, 'eval_backtest_engine', 'torch')}; "
             f"backtest_cpp_ext={bool(config.training.backtest_cpp_ext)}; "
             f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
             f"cache_eval_gpu={bool(config.training.cache_eval_tensors_on_gpu)}; "
@@ -11920,7 +11587,7 @@ def run_training(
                     shared_base=shared_test_base,
                     name=f"fold {fold.fold_id} best-val test windowed tensors",
                 )
-                test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
+                test_bt_t, test_ic, test_met = _evaluate_windowed_tensor_batch(
                     final_eval_model,
                     panel_slab_model,
                     test_windowed,
@@ -11950,6 +11617,7 @@ def run_training(
                 test_buy_masks = test_windowed.can_buy_mask[test_date_idx]
                 test_sell_masks = test_windowed.can_sell_mask[test_date_idx]
                 test_bench = test_windowed.benchmark[test_date_idx]
+                test_eval_indices = _windowed_valid_indices_numpy(test_windowed)
             else:
                 test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(
                     context.test_ds
@@ -11964,7 +11632,7 @@ def run_training(
                     device,
                     non_blocking,
                 )
-                test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+                test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
                     final_eval_model,
                     test_x,
                     test_returns,
@@ -11987,56 +11655,7 @@ def run_training(
                     profile_timing=profile_timing,
                     progress_label=f"[Train {train_years} fold {fold.fold_id} final-test]",
                 )
-
-            previous_fold_model = _load_previous_fold_neural_model(
-                panel=panel,
-                config=config,
-                output_path=output_path,
-                fold_id=fold.fold_id,
-                device=device,
-            )
-            (
-                test_bt_t,
-                test_ic,
-                test_met,
-                test_returns,
-                test_masks,
-                test_buy_masks,
-                test_sell_masks,
-                test_bench,
-                test_eval_indices,
-                warmup_days,
-            ) = _merge_test_backtest_with_previous_fold_warmup(
-                panel=panel,
-                fold=fold,
-                lookback=config.training.lookback,
-                previous_model=previous_fold_model,
-                current_backtest=test_bt_t,
-                current_returns=test_returns,
-                current_masks=test_masks,
-                current_buy_masks=test_buy_masks,
-                current_sell_masks=test_sell_masks,
-                current_benchmark=test_bench,
-                current_valid_indices=np.asarray(context.test_ds.valid_indices, dtype=np.int64),
-                device=device,
-                amp_dtype=amp_dtype,
-                non_blocking=non_blocking,
-                long_only=config.trading.long_only,
-                buy_fee_rate=config.trading.buy_fee_rate,
-                sell_fee_rate=config.trading.sell_fee_rate,
-                max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=1.0,
-                min_trade_weight=config.trading.min_trade_weight,
-                portfolio_activation=config.trading.portfolio_activation,
-                chunk_rows=eval_chunk_rows,
-                backtest_chunk_rows=eval_backtest_chunk_rows,
-                max_volume_participation=config.trading.max_volume_participation,
-                volume_participation_equity=config.trading.volume_participation_equity,
-            )
-            if warmup_days > 0:
-                print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
-            if previous_fold_model is not None:
-                del previous_fold_model
+                test_eval_indices = np.asarray(context.test_ds.valid_indices, dtype=np.int64)
             test_eval_total = time.perf_counter() - test_eval_start
 
             val_row_start = max(0, int(val_row_start))
@@ -12224,6 +11843,10 @@ def run_training(
                         "train_loss": float(train_loss),
                         "val_mean": None,
                         "test_mean": test_mean_best_by_val,
+                        "test_mean_scope": curve_test_scope,
+                        "test_mean_sampled": True,
+                        "test_sample_fold_id": curve_test_fold_id,
+                        "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
                         **_timing_curve_payload(
@@ -12432,7 +12055,7 @@ def run_training(
                 )
                 val_loss_total = time.perf_counter() - val_loss_start
 
-            curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 100)))
+            curve_test_interval = max(1, int(getattr(config.training, "curve_test_interval", 1)))
             should_compute_test_mean = (
                 run_epoch_test_curve
                 and (
@@ -12764,6 +12387,10 @@ def run_training(
                         "train_loss": float(train_loss),
                         "val_mean": val_mean_loss,
                         "test_mean": test_mean_best_by_val,
+                        "test_mean_scope": curve_test_scope,
+                        "test_mean_sampled": True,
+                        "test_sample_fold_id": curve_test_fold_id,
+                        "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
                         **_timing_curve_payload(
@@ -12976,7 +12603,7 @@ def run_training(
                     shared_base=shared_test_base,
                     name=f"fold {fold.fold_id} final-test windowed tensors",
                 )
-                test_bt_t, test_ic, _ = _evaluate_windowed_tensor_batch(
+                test_bt_t, test_ic, test_met = _evaluate_windowed_tensor_batch(
                     eval_model,
                     panel_slab_model,
                     test_windowed,
@@ -13005,6 +12632,7 @@ def run_training(
                 test_buy_masks = test_windowed.can_buy_mask[test_date_idx]
                 test_sell_masks = test_windowed.can_sell_mask[test_date_idx]
                 test_bench = test_windowed.benchmark[test_date_idx]
+                test_eval_indices = _windowed_valid_indices_numpy(test_windowed)
             else:
                 test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(context.test_ds)
                 test_volume_notional = _dataset_volume_notional_to_tensor(context.test_ds)
@@ -13018,7 +12646,7 @@ def run_training(
                     device,
                     non_blocking,
                 )
-                test_bt_t, test_ic, _ = _evaluate_tensor_batch(
+                test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
                     eval_model,
                     test_x,
                     test_returns,
@@ -13043,54 +12671,7 @@ def run_training(
                     max_volume_participation=config.trading.max_volume_participation,
                     volume_participation_equity=config.trading.volume_participation_equity,
                 )
-
-            previous_fold_model = _load_previous_fold_neural_model(
-                panel=panel,
-                config=config,
-                output_path=output_path,
-                fold_id=fold.fold_id,
-                device=device,
-            )
-            (
-                test_bt_t,
-                test_ic,
-                test_met,
-                test_returns,
-                test_masks,
-                test_buy_masks,
-                test_sell_masks,
-                test_bench,
-                test_eval_indices,
-                warmup_days,
-            ) = _merge_test_backtest_with_previous_fold_warmup(
-                panel=panel,
-                fold=fold,
-                lookback=config.training.lookback,
-                previous_model=previous_fold_model,
-                current_backtest=test_bt_t,
-                current_returns=test_returns,
-                current_masks=test_masks,
-                current_buy_masks=test_buy_masks,
-                current_sell_masks=test_sell_masks,
-                current_benchmark=test_bench,
-                current_valid_indices=np.asarray(context.test_ds.valid_indices, dtype=np.int64),
-                device=device,
-                amp_dtype=amp_dtype,
-                non_blocking=non_blocking,
-                long_only=config.trading.long_only,
-                buy_fee_rate=config.trading.buy_fee_rate,
-                sell_fee_rate=config.trading.sell_fee_rate,
-                max_turnover_ratio=config.trading.max_turnover_ratio,
-                gross_leverage=1.0,
-                min_trade_weight=config.trading.min_trade_weight,
-                portfolio_activation=config.trading.portfolio_activation,
-                chunk_rows=eval_chunk_rows,
-                backtest_chunk_rows=eval_backtest_chunk_rows,
-            )
-            if warmup_days > 0:
-                print(f"[Fold {fold.fold_id}] prepended {warmup_days} warmup test days from fold {fold.fold_id - 1} model")
-            if previous_fold_model is not None:
-                del previous_fold_model
+                test_eval_indices = np.asarray(context.test_ds.valid_indices, dtype=np.int64)
             test_eval_total = time.perf_counter() - test_eval_start
 
             start = val_offsets[index]
