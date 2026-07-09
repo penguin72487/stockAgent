@@ -58,8 +58,14 @@ BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
 BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
-RUN_YAHOO="${RUN_YAHOO:-1}"
-YAHOO_ASSETS="${YAHOO_ASSETS:-us_stocks}"
+RUN_CBOE_US="${RUN_CBOE_US:-1}"
+CBOE_US_WORKERS="${CBOE_US_WORKERS:-4}"
+CBOE_US_RETRIES="${CBOE_US_RETRIES:-3}"
+CBOE_US_TIMEOUT="${CBOE_US_TIMEOUT:-20}"
+CBOE_US_REQUEST_INTERVAL="${CBOE_US_REQUEST_INTERVAL:-0.25}"
+CBOE_US_STEP_TIMEOUT_SECONDS="${CBOE_US_STEP_TIMEOUT_SECONDS:-7200}"  # 0 disables timeout
+RUN_YAHOO="${RUN_YAHOO:-0}"
+YAHOO_ASSETS="${YAHOO_ASSETS:-}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-900}"  # 0 disables timeout
 RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
 TW_PUBLIC_DATASETS="${TW_PUBLIC_DATASETS:-all}"
@@ -372,6 +378,42 @@ run_yahoo_incremental() {
   return "$rc"
 }
 
+run_cboe_us_incremental() {
+  local today
+  local -a base_cmd=()
+  local -a run_cmd=()
+
+  today="$(date +%F)"
+  if [[ "$RUN_CBOE_US" != "1" ]]; then
+    log "skip=cboe_us_incremental reason=RUN_CBOE_US=${RUN_CBOE_US}"
+    return 0
+  fi
+
+  base_cmd=(
+    "$PYTHON_BIN" downloader/download_cboe_us_ohlcv.py
+    --mode daily-update
+    --end-date "$today"
+    --output-root data_yahoo
+    --workers "$CBOE_US_WORKERS"
+    --retries "$CBOE_US_RETRIES"
+    --timeout "$CBOE_US_TIMEOUT"
+    --request-interval "$CBOE_US_REQUEST_INTERVAL"
+    --repair-overlap-days "$REPAIR_OVERLAP_DAYS"
+    --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
+  )
+
+  run_cmd=("${base_cmd[@]}")
+  if [[ "$CBOE_US_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$CBOE_US_STEP_TIMEOUT_SECONDS" -gt 0 ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      run_cmd=(timeout --signal=TERM --kill-after=30s "${CBOE_US_STEP_TIMEOUT_SECONDS}" "${base_cmd[@]}")
+    else
+      log "timeout command not found; continue without per-asset timeout"
+    fi
+  fi
+
+  run_step "cboe_us_daily_update" "${run_cmd[@]}"
+}
+
 run_frankfurter_incremental() {
   local today
   local -a cmd=()
@@ -577,7 +619,7 @@ run_market_close_cycle() {
     us_date="$(TZ="$US_CLOSE_TZ" date +%F)"
     log "market=us due date=${us_date} close=${US_CLOSE_TIME} tz=${US_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "us_stocks" || true
+    run_cboe_us_incremental || true
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_US="$us_date"
@@ -639,6 +681,7 @@ run_once_cycle() {
   log "cycle=${cycle_id} start mode=${RUN_MODE} root=${ROOT_DIR}"
 
   run_parallel_groups \
+    cboe_us run_cboe_us_incremental \
     yahoo run_yahoo_incremental \
     tw_public run_tw_public_data_update \
     frankfurter run_frankfurter_incremental \

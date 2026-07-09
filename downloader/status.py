@@ -11,6 +11,7 @@ PRODUCTIVE_STATUSES = {
     "new_symbol_repaired",
     "schema_repaired",
     "current",
+    "unchanged",
     "not_found",
     "not_found_skip",
     "delisted_skip",
@@ -56,7 +57,12 @@ def command_option(command: list[str], option: str) -> str | None:
 
 
 def command_asset(command: list[str]) -> str | None:
-    return command_option(command, "--asset")
+    asset = command_option(command, "--asset")
+    if asset:
+        return asset
+    if any(str(item).endswith("download_cboe_us_ohlcv.py") for item in command):
+        return "us_stocks"
+    return None
 
 
 def command_summary_paths(command: list[str], *, resolve_path=None) -> list[Path]:

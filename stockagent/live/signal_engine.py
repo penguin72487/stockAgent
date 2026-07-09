@@ -21,9 +21,14 @@ from stockagent.live.portfolio_state import (
     estimate_benchmark_return,
     estimate_drifted_weights,
     portfolio_risk_summary,
-    top_weight_rows,
 )
-from stockagent.live.quote_provider import PriceSnapshot, fetch_yahoo_last_prices, load_prices_csv, load_symbol_name_map
+from stockagent.live.quote_provider import (
+    PriceSnapshot,
+    fetch_tw_mis_last_prices,
+    fetch_yahoo_last_prices,
+    load_prices_csv,
+    load_symbol_name_map,
+)
 from stockagent.live.report_formatter import format_signal_message
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
@@ -476,7 +481,14 @@ def _price_snapshot(
             parquet_root=parquet_root,
             chunk_size=yahoo_chunk_size,
         )
-    raise ValueError(f"price_source must be one of panel/csv/yahoo, got {source!r}")
+    if source_norm in {"tw", "twse", "tpex", "mis", "tw_mis"}:
+        return fetch_tw_mis_last_prices(
+            symbols,
+            fallback_prices,
+            parquet_root=parquet_root,
+            chunk_size=yahoo_chunk_size,
+        )
+    raise ValueError(f"price_source must be one of panel/csv/yahoo/tw, got {source!r}")
 
 
 def _write_outputs(result: LiveSignalResult, output_root: str | Path, asof_date: str) -> str:
@@ -568,6 +580,44 @@ def _daily_bar_timestamp(value: str | None, daily_bar_time: str | None) -> str |
     if has_non_midnight_time:
         return normalized
     return f"{text[:10]} {bar_time}"
+
+
+def _parse_local_datetime(value: str | None, timezone_name: str | None) -> datetime | None:
+    text = str(value or "").strip().replace("T", " ")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text[:19])
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_display_zone(timezone_name))
+    return parsed
+
+
+def _daily_price_timestamp(
+    *,
+    price_snapshot: PriceSnapshot,
+    resolved_asof: str,
+    panel_display_date: str | None,
+    daily_bar_time: str | None,
+    source_timezone: str | None,
+    intraday_frequency: bool,
+) -> str | None:
+    source = str(price_snapshot.source or "").strip().lower()
+    if intraday_frequency:
+        return price_snapshot.timestamp or panel_display_date
+    if source.startswith("panel") or source in {"panel", "close", "panel_close"}:
+        return panel_display_date
+
+    close_time = _normalize_daily_bar_time(daily_bar_time)
+    asof_dt = _parse_local_datetime(resolved_asof, source_timezone)
+    if close_time is not None and asof_dt is not None:
+        hour, minute, second = (int(part) for part in close_time.split(":"))
+        close_dt = asof_dt.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        if asof_dt >= close_dt:
+            return close_dt.strftime("%Y-%m-%d %H:%M:%S")
+    return price_snapshot.timestamp or resolved_asof
 
 
 def _finite_float_or_none(value: Any) -> float | None:
@@ -672,6 +722,28 @@ def _constraint_note(
     return ""
 
 
+def _position_status(
+    *,
+    tradable: bool,
+    current_weight: float,
+    target_weight: float,
+    model_weight: float,
+    eps: float = 1e-9,
+) -> str:
+    current_active = abs(float(current_weight)) > float(eps)
+    target_active = abs(float(target_weight)) > float(eps)
+    model_active = abs(float(model_weight)) > float(eps)
+    if not tradable:
+        if current_active or target_active:
+            return "locked_untradable"
+        return "untradable"
+    if target_active:
+        return "active"
+    if model_active:
+        return "model_flattened_by_constraints"
+    return "flat"
+
+
 def _decision_reason(action: str, score: float | None, model_weight: float, constraint: str) -> str:
     pieces: list[str] = []
     if score is None:
@@ -762,6 +834,12 @@ def _build_decision_rows(
                 "tradable": bool(tradable_mask[idx]),
                 "can_buy": bool(can_buy_mask[idx]),
                 "can_sell": bool(can_sell_mask[idx]),
+                "position_status": _position_status(
+                    tradable=bool(tradable_mask[idx]),
+                    current_weight=current_weight,
+                    target_weight=target_weight,
+                    model_weight=float(model_weights[idx]),
+                ),
                 "stock_market_gate": _finite_float_or_none(gate[idx]) if gate is not None else None,
                 "market_delta_norm": _finite_float_or_none(market_delta_norm[idx]) if market_delta_norm is not None else None,
             }
@@ -775,6 +853,39 @@ def _build_decision_rows(
         reverse=True,
     )
     return rows
+
+
+def _top_position_rows_from_weights(rows: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: (
+            abs(float(row.get("target_weight") or 0.0)),
+            abs(float(row.get("current_weight") or 0.0)),
+            abs(float(row.get("delta_weight") or 0.0)),
+        ),
+        reverse=True,
+    )
+    out: list[dict[str, Any]] = []
+    for row in sorted_rows[: max(0, int(top_n))]:
+        weight = float(row.get("target_weight") or 0.0)
+        out.append(
+            {
+                "symbol": str(row.get("symbol") or ""),
+                "name": str(row.get("name") or ""),
+                "weight": weight,
+                "abs_weight": abs(weight),
+                "current_weight": float(row.get("current_weight") or 0.0),
+                "target_weight": weight,
+                "delta_weight": float(row.get("delta_weight") or 0.0),
+                "current_price": row.get("current_price"),
+                "model_weight": float(row.get("model_weight") or 0.0),
+                "tradable": bool(row.get("tradable", True)),
+                "can_buy": bool(row.get("can_buy", True)),
+                "can_sell": bool(row.get("can_sell", True)),
+                "position_status": str(row.get("position_status") or ""),
+            }
+        )
+    return out
 
 
 def _markdown_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str, str, str]]) -> str:
@@ -909,6 +1020,7 @@ def _decision_report_markdown(summary: dict[str, Any], decision_rows: list[dict[
             "- stock_market_gate: Transformer market-token gate when available. Higher means this stock's representation used more market-token context.",
             "- market_delta_norm: magnitude of market-token adjustment when available. Higher means market context changed the stock embedding more.",
             "- constraint: buy_blocked, sell_blocked, or not_tradable when the market mask affected the action.",
+            "- position_status: active, flat, untradable, locked_untradable, or model_flattened_by_constraints. locked_untradable means the model assigned zero weight but the simulator preserved an existing position because the symbol cannot trade.",
             "- decision_reason: compact rule trace derived from score sign, model direction, action, and constraint.",
             "",
             "## Artifact Paths",
@@ -942,6 +1054,7 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("pnl_contrib", "portfolio_contribution", "pct"),
                 ("score", "score", "float"),
                 ("action", "action", "text"),
+                ("status", "position_status", "text"),
             ],
         ),
         encoding="utf-8",
@@ -960,6 +1073,7 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("px", "trade_price", "price"),
                 ("stock_ret", "stock_return", "pct"),
                 ("pnl_contrib", "portfolio_contribution", "pct"),
+                ("status", "position_status", "text"),
             ],
         ),
         encoding="utf-8",
@@ -981,6 +1095,8 @@ def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
                 ("px", "trade_price", "price"),
                 ("stock_ret", "stock_return", "pct"),
                 ("pnl_contrib", "portfolio_contribution", "pct"),
+                ("constraint", "constraint", "text"),
+                ("status", "position_status", "text"),
                 ("gate", "stock_market_gate", "float"),
                 ("market_delta", "market_delta_norm", "float"),
             ],
@@ -1194,7 +1310,16 @@ def generate_live_signal(
         message=f"prices source={price_snapshot.source} available={price_snapshot.available_count}/{panel.num_symbols}",
     )
 
-    expected_previous_data_date = _previous_usable_panel_date(panel, panel_idx, config.training.lookback)
+    previous_price_source = str(price_snapshot.source or "").strip().lower()
+    uses_realtime_daily_prices = (
+        not intraday_frequency
+        and previous_price_source
+        and previous_price_source not in {"panel", "panel_close", "close"}
+        and not previous_price_source.startswith("panel")
+    )
+    expected_previous_data_date = (
+        panel_date_str if uses_realtime_daily_prices else _previous_usable_panel_date(panel, panel_idx, config.training.lookback)
+    )
     fold_dir = checkpoint.parent
     _emit_progress(progress_callback, label=progress_name, step=8, total=progress_total, message="check previous signal")
     if (
@@ -1248,9 +1373,9 @@ def generate_live_signal(
         output_dir=resolved_output_dir,
         fold_id=resolved_fold_id,
         weights_path=weights_path,
-        asof_date=panel_date_str,
+        asof_date=expected_previous_data_date or panel_date_str,
         prefer_live_weights=True,
-        strictly_before_asof=True,
+        strictly_before_asof=not uses_realtime_daily_prices,
     )
     previous_weights_data_date = previous_weights_date
     previous_weights_display_date = (
@@ -1302,6 +1427,8 @@ def generate_live_signal(
     mask_np = np.asarray(panel.tradable_mask[panel_idx], dtype=bool)
     can_buy_np = np.asarray(panel.can_buy_mask[panel_idx] if panel.can_buy_mask is not None else mask_np, dtype=bool)
     can_sell_np = np.asarray(panel.can_sell_mask[panel_idx] if panel.can_sell_mask is not None else mask_np, dtype=bool)
+    current_weights = np.asarray(drift.weights, dtype=np.float64).copy()
+    current_weights[~mask_np] = 0.0
 
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
@@ -1311,7 +1438,7 @@ def generate_live_signal(
             model_weights_t, aux = _extract_weights_and_aux(model_output)
         _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
         zero_returns = torch.zeros_like(model_weights_t, dtype=torch.float32)
-        initial = torch.from_numpy(drift.weights.astype(np.float32)).to(device=runtime_device, non_blocking=non_blocking)
+        initial = torch.from_numpy(current_weights.astype(np.float32)).to(device=runtime_device, non_blocking=non_blocking)
         backtest = run_backtest_torch(
             model_weights_t.float(),
             zero_returns,
@@ -1354,15 +1481,14 @@ def generate_live_signal(
     )
     rebalance_rows = build_rebalance_rows(
         panel.symbols,
-        drift.weights,
+        current_weights,
         target_weights,
         current_prices,
         drift_base_prices,
         symbol_names=symbol_names,
         min_abs_delta=min_abs_delta,
     )
-    top_positions = top_weight_rows(panel.symbols, target_weights, current_prices, symbol_names=symbol_names, top_n=top_n)
-    current_risk = portfolio_risk_summary(drift.weights)
+    current_risk = portfolio_risk_summary(current_weights)
     target_risk = portfolio_risk_summary(target_weights)
     recent_performance = cumulative_recent_returns(checkpoint, window_days=benchmark_window_days)
     risk_warnings = _risk_warnings(
@@ -1402,9 +1528,9 @@ def generate_live_signal(
         where=np.isfinite(current_prices) & np.isfinite(drift_base_prices) & (drift_base_prices > 0.0),
     ) - 1.0
     for idx, symbol in enumerate(panel.symbols):
-        delta_weight = float(target_weights[idx] - drift.weights[idx])
-        action = classify_rebalance_action(float(drift.weights[idx]), float(target_weights[idx]), delta_weight=delta_weight)
-        current_weight = float(drift.weights[idx])
+        delta_weight = float(target_weights[idx] - current_weights[idx])
+        action = classify_rebalance_action(float(current_weights[idx]), float(target_weights[idx]), delta_weight=delta_weight)
+        current_weight = float(current_weights[idx])
         raw_price_return = float(price_return[idx]) if np.isfinite(price_return[idx]) else None
         weights_rows.append(
             {
@@ -1428,8 +1554,26 @@ def generate_live_signal(
                 "tradable": bool(mask_np[idx]),
                 "can_buy": bool(can_buy_np[idx]),
                 "can_sell": bool(can_sell_np[idx]),
+                "position_status": _position_status(
+                    tradable=bool(mask_np[idx]),
+                    current_weight=current_weight,
+                    target_weight=float(target_weights[idx]),
+                    model_weight=float(model_weights[idx]),
+                ),
             }
         )
+    top_positions = _top_position_rows_from_weights(weights_rows, top_n)
+    weight_meta_by_symbol = {str(row.get("symbol") or ""): row for row in weights_rows}
+    for row in rebalance_rows:
+        meta = weight_meta_by_symbol.get(str(row.get("symbol") or ""))
+        if not meta:
+            continue
+        row["score"] = meta.get("score")
+        row["model_weight"] = meta.get("model_weight")
+        row["tradable"] = meta.get("tradable")
+        row["can_buy"] = meta.get("can_buy")
+        row["can_sell"] = meta.get("can_sell")
+        row["position_status"] = meta.get("position_status")
 
     decision_rows = _build_decision_rows(
         symbols=panel.symbols,
@@ -1437,7 +1581,7 @@ def generate_live_signal(
         asof_date=resolved_asof,
         panel_date=panel_date_str,
         model_weights=model_weights,
-        current_weights=drift.weights,
+        current_weights=current_weights,
         target_weights=target_weights,
         scores=score_values,
         current_prices=current_prices,
@@ -1453,6 +1597,14 @@ def generate_live_signal(
     _emit_progress(progress_callback, label=progress_name, step=15, total=progress_total, message="rows formatted")
 
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
+    price_timestamp = _daily_price_timestamp(
+        price_snapshot=price_snapshot,
+        resolved_asof=resolved_asof,
+        panel_display_date=panel_display_date,
+        daily_bar_time=daily_bar_time,
+        source_timezone=source_timezone,
+        intraday_frequency=intraday_frequency,
+    )
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
         "generated_at": generated_at_text,
@@ -1484,7 +1636,8 @@ def generate_live_signal(
         "drift_base_date": drift_base_display_date,
         "drift_base_data_date": drift_base_date,
         "price_source": price_snapshot.source,
-        "price_timestamp": price_snapshot.timestamp,
+        "price_timestamp": price_timestamp,
+        "price_data_date": price_timestamp,
         "price_available_count": int(price_snapshot.available_count),
         "symbol_count": int(panel.num_symbols),
         "valid_price_count": int(drift.valid_price_count),
