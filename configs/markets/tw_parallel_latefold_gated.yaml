@@ -1,9 +1,9 @@
 base_config: tw_parallel.yaml
 
-experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090-latefold-gated
+experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090-latefold-projection
 
 runner:
-  output_dir: artifacts/markets/tw_parallel_latefold_gated
+  output_dir: artifacts/markets/tw_parallel_latefold_projection
   mode: train
   resume: true
   post_train_infer: false
@@ -76,10 +76,7 @@ training:
     dynamic_token_dropout: 0.05
     dropout: 0.10
     portfolio_mode: long_short
-    portfolio_output_mode: gated_l1
-    portfolio_gross_gate_min: 0.05
-    portfolio_gross_gate_max: 0.95
-    portfolio_gross_gate_init: 0.35
+    portfolio_output_mode: projection_l1
     return_aux: false
     return_aux_details: false
 

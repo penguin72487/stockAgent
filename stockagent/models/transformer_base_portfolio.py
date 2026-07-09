@@ -560,11 +560,6 @@ class TransformerBasePortfolioModel(nn.Module):
         portfolio_mode: str = "long_short",
         portfolio_activation: str = "identity",
         portfolio_output_mode: str = "activation_l1",
-        portfolio_gross_gate_min: float = 0.0,
-        portfolio_gross_gate_max: float = 1.0,
-        portfolio_gross_gate_init: float = 0.5,
-        portfolio_net_gate_max: float = 1.0,
-        portfolio_net_gate_init: float = 0.0,
         max_full_tokens: int = 4096,
         checkpoint_blocks: bool = False,
         return_aux: bool = True,
@@ -587,14 +582,6 @@ class TransformerBasePortfolioModel(nn.Module):
         self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.portfolio_output_mode = self._normalize_portfolio_output_mode(portfolio_output_mode)
-        gate_min = max(0.0, float(portfolio_gross_gate_min))
-        gate_max = max(gate_min, float(portfolio_gross_gate_max))
-        self.portfolio_gross_gate_min = gate_min
-        self.portfolio_gross_gate_max = gate_max
-        self.portfolio_gross_gate_init = min(max(float(portfolio_gross_gate_init), gate_min), gate_max)
-        net_gate_max = min(max(0.0, float(portfolio_net_gate_max)), 1.0)
-        self.portfolio_net_gate_max = net_gate_max
-        self.portfolio_net_gate_init = min(max(float(portfolio_net_gate_init), -net_gate_max), net_gate_max)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.return_aux = bool(return_aux)
@@ -769,49 +756,6 @@ class TransformerBasePortfolioModel(nn.Module):
             return nn.Sequential(*head)
 
         self.score_head = make_scalar_head()
-        gross_summary_dim = self.d_model * 3
-        self.portfolio_gross_norm = (
-            _make_norm(gross_summary_dim, self.norm_type)
-            if self.portfolio_output_mode in {"gated_l1", "gated_net_l1"}
-            else None
-        )
-        self.portfolio_gross_head = (
-            nn.Sequential(
-                GatedProjection(gross_summary_dim, max(self.d_model, int(head_hidden_dim)), float(dropout), self.ffn_type),
-                nn.Linear(max(self.d_model, int(head_hidden_dim)), 1),
-            )
-            if self.portfolio_output_mode in {"gated_l1", "gated_net_l1"}
-            else None
-        )
-        if self.portfolio_gross_head is not None:
-            out_proj = self.portfolio_gross_head[-1]
-            if isinstance(out_proj, nn.Linear):
-                nn.init.zeros_(out_proj.weight)
-                gate_range = max(1e-6, self.portfolio_gross_gate_max - self.portfolio_gross_gate_min)
-                init_fraction = (self.portfolio_gross_gate_init - self.portfolio_gross_gate_min) / gate_range
-                out_proj.bias.data.fill_(_gate_logit(init_fraction))
-        self.portfolio_net_norm = (
-            _make_norm(gross_summary_dim, self.norm_type)
-            if self.portfolio_output_mode == "gated_net_l1"
-            else None
-        )
-        self.portfolio_net_head = (
-            nn.Sequential(
-                GatedProjection(gross_summary_dim, max(self.d_model, int(head_hidden_dim)), float(dropout), self.ffn_type),
-                nn.Linear(max(self.d_model, int(head_hidden_dim)), 1),
-            )
-            if self.portfolio_output_mode == "gated_net_l1"
-            else None
-        )
-        if self.portfolio_net_head is not None:
-            out_proj = self.portfolio_net_head[-1]
-            if isinstance(out_proj, nn.Linear):
-                nn.init.zeros_(out_proj.weight)
-                if self.portfolio_net_gate_max > 0.0:
-                    init_fraction = 0.5 * (self.portfolio_net_gate_init / self.portfolio_net_gate_max + 1.0)
-                else:
-                    init_fraction = 0.5
-                out_proj.bias.data.fill_(_gate_logit(init_fraction))
 
     @staticmethod
     def _normalize_attention_mode(attention_mode: str) -> str:
@@ -877,25 +821,6 @@ class TransformerBasePortfolioModel(nn.Module):
             return "l1"
         if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
             return "logits"
-        if normalized in {
-            "gated_l1",
-            "gross_gated_l1",
-            "cash_gated_l1",
-            "gated_activation_l1",
-            "adaptive_gross_l1",
-            "adaptive_cash_l1",
-        }:
-            return "gated_l1"
-        if normalized in {
-            "gated_net_l1",
-            "net_gated_l1",
-            "gross_net_gated_l1",
-            "adaptive_net_l1",
-            "adaptive_gross_net_l1",
-            "directional_gated_l1",
-            "beta_gated_l1",
-        }:
-            return "gated_net_l1"
         if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
             return "signed_softmax"
         if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
@@ -924,7 +849,7 @@ class TransformerBasePortfolioModel(nn.Module):
             return "projection_l1"
         raise ValueError(
             "portfolio_output_mode must be 'activation_l1', 'l1', 'logits', "
-            "'gated_l1', 'gated_net_l1', 'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
+            "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
         )
 
     def _check_symbol_indices(self, symbol_indices: torch.Tensor | None, n_symbols: int) -> None:
@@ -1279,63 +1204,6 @@ class TransformerBasePortfolioModel(nn.Module):
         z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
         return z_stock, gate.masked_fill(~safe_mask.unsqueeze(-1), 0.0), market_delta
 
-    def _portfolio_gross_gate(self, z_stock: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
-        if self.portfolio_output_mode not in {"gated_l1", "gated_net_l1"}:
-            return z_stock.new_ones((int(z_stock.size(0)),))
-        gate_min = float(self.portfolio_gross_gate_min)
-        gate_max = float(self.portfolio_gross_gate_max)
-        if gate_max <= gate_min:
-            return z_stock.new_full((int(z_stock.size(0)),), gate_max)
-        if self.portfolio_gross_head is None or self.portfolio_gross_norm is None:
-            gate01 = z_stock.new_full((int(z_stock.size(0)),), 0.5)
-        else:
-            summary = _masked_market_summary_parts(z_stock, mask_bool).flatten(start_dim=1)
-            logits = self.portfolio_gross_head(self.portfolio_gross_norm(summary)).squeeze(-1)
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-            gate01 = torch.sigmoid(logits)
-        return gate_min + (gate_max - gate_min) * gate01
-
-    def _portfolio_net_gate(self, z_stock: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
-        if self.portfolio_output_mode != "gated_net_l1":
-            return z_stock.new_zeros((int(z_stock.size(0)),))
-        gate_max = float(self.portfolio_net_gate_max)
-        if gate_max <= 0.0:
-            return z_stock.new_zeros((int(z_stock.size(0)),))
-        if self.portfolio_net_head is None or self.portfolio_net_norm is None:
-            gate01 = z_stock.new_full((int(z_stock.size(0)),), 0.5)
-        else:
-            summary = _masked_market_summary_parts(z_stock, mask_bool).flatten(start_dim=1)
-            logits = self.portfolio_net_head(self.portfolio_net_norm(summary)).squeeze(-1)
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-            gate01 = torch.sigmoid(logits)
-        return gate_max * (gate01.mul(2.0) - 1.0)
-
-    @staticmethod
-    def _masked_probability(logits: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
-        mask_fill = finite_mask_fill_value(logits)
-        safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-        safe_logits = safe_logits.masked_fill(~mask_bool, mask_fill)
-        probs = torch.softmax(safe_logits.float(), dim=1).to(dtype=logits.dtype)
-        probs = probs.masked_fill(~mask_bool, 0.0)
-        denom = probs.sum(dim=1, keepdim=True)
-        return torch.where(denom > 0.0, probs / denom.clamp_min(1e-12), torch.zeros_like(probs))
-
-    def _gated_net_l1_weights(
-        self,
-        target_logits: torch.Tensor,
-        mask_bool: torch.Tensor,
-        z_stock: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        gross_gate = self._portfolio_gross_gate(z_stock, mask_bool).to(device=target_logits.device, dtype=target_logits.dtype)
-        net_gate = self._portfolio_net_gate(z_stock, mask_bool).to(device=target_logits.device, dtype=target_logits.dtype)
-        long_probs = self._masked_probability(target_logits, mask_bool)
-        short_probs = self._masked_probability(-target_logits, mask_bool)
-        long_fraction = (0.5 * (1.0 + net_gate)).clamp(min=0.0, max=1.0)
-        short_fraction = (0.5 * (1.0 - net_gate)).clamp(min=0.0, max=1.0)
-        weights = long_fraction.unsqueeze(1) * long_probs - short_fraction.unsqueeze(1) * short_probs
-        weights = weights.masked_fill(~mask_bool, 0.0) * gross_gate.unsqueeze(1)
-        return weights, gross_gate, net_gate, long_fraction, short_fraction
-
     def _forward_full(
         self,
         h: torch.Tensor,
@@ -1582,8 +1450,6 @@ class TransformerBasePortfolioModel(nn.Module):
                         "projection_gross_exposure": weights.abs().sum(dim=1),
                         "implicit_cash_weight": (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0),
                     }
-            elif self.portfolio_output_mode in {"gated_l1", "gated_net_l1"}:
-                weights = masked_softmax(target_logits, mask_bool, activation="identity")
             else:
                 weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
                 weights = masked_softmax(masked_scores / temp, mask_bool, activation=weight_activation)
@@ -1641,23 +1507,6 @@ class TransformerBasePortfolioModel(nn.Module):
                         "projection_gross_exposure": weights.abs().sum(dim=1),
                         "implicit_cash_weight": (1.0 - weights.abs().sum(dim=1)).clamp_min(0.0),
                     }
-            elif self.portfolio_output_mode == "gated_l1":
-                weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation="identity")
-            elif self.portfolio_output_mode == "gated_net_l1":
-                weights, gross_gate, net_gate, long_fraction, short_fraction = self._gated_net_l1_weights(
-                    target_logits,
-                    mask_bool,
-                    z_stock,
-                )
-                if include_action_aux or return_aux is True:
-                    output_aux.update(
-                        {
-                            "portfolio_gross_gate": gross_gate,
-                            "portfolio_net_gate": net_gate,
-                            "portfolio_long_gross_fraction": long_fraction,
-                            "portfolio_short_gross_fraction": short_fraction,
-                        }
-                    )
             else:
                 weight_activation = "identity" if self.portfolio_output_mode == "l1" else self.portfolio_activation
                 weights = dual_branch_softmax(centered_scores / temp, mask_bool, activation=weight_activation)
@@ -1666,26 +1515,6 @@ class TransformerBasePortfolioModel(nn.Module):
                 weights = weights.masked_fill(~mask_bool, 0.0)
         else:
             weights = weights.masked_fill(~mask_bool, 0.0)
-
-        if self.portfolio_output_mode in {"gated_l1", "gated_net_l1"}:
-            gross_gate = self._portfolio_gross_gate(z_stock, mask_bool).to(device=weights.device, dtype=weights.dtype)
-            if self.portfolio_output_mode == "gated_l1" or self.portfolio_mode == "long_only":
-                weights = weights * gross_gate.unsqueeze(1)
-            if include_action_aux or return_aux is True:
-                gross_exposure = weights.abs().sum(dim=1)
-                net_exposure = weights.sum(dim=1)
-                gate_aux = {
-                    "portfolio_gross_gate": gross_gate,
-                    "portfolio_gross_exposure": gross_exposure,
-                    "portfolio_net_exposure": net_exposure,
-                    "implicit_cash_weight": (1.0 - gross_exposure).clamp_min(0.0),
-                }
-                if self.portfolio_output_mode == "gated_net_l1":
-                    gate_aux.setdefault(
-                        "portfolio_net_gate",
-                        self._portfolio_net_gate(z_stock, mask_bool).to(device=weights.device, dtype=weights.dtype),
-                    )
-                output_aux.update(gate_aux)
 
         if return_aux is True:
             aux = dict(aux)

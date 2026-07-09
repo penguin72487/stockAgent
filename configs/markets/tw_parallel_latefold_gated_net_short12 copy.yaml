@@ -1,14 +1,14 @@
 # Best validated late-fold TW setting for folds 24-26.
-# Rationale from artifacts/markets/tw_parallel_latefold_gated_net_short12:
+# Rationale from artifacts/markets/tw_parallel_latefold_projection_short12:
 # - fold24 overfits after epoch 12: validation keeps improving while test turns worse.
-# - gated_net_l1 lets the model learn both gross exposure and net direction.
+# - Use projection_l1 for implicit cash rather than learned gross/net gates.
 # - log_utility beat sharpck/sortino on the late-fold comparison gates.
 base_config: tw_parallel.yaml
 
-experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090-latefold-gated-net-short12
+experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090-latefold-projection-short12-copy
 
 runner:
-  output_dir: artifacts/markets/tw_parallel_latefold_gated_net_short12
+  output_dir: artifacts/markets/tw_parallel_latefold_projection_short12_copy
   mode: train
   resume: true
   post_train_infer: false
@@ -81,12 +81,7 @@ training:
     dynamic_token_dropout: 0.0
     dropout: 0.0
     portfolio_mode: long_short
-    portfolio_output_mode: gated_net_l1
-    portfolio_gross_gate_min: 0.005
-    portfolio_gross_gate_max: 1.00
-    portfolio_gross_gate_init: 0.60
-    portfolio_net_gate_max: 0.90
-    portfolio_net_gate_init: 0.35
+    portfolio_output_mode: projection_l1
     return_aux: false
     return_aux_details: false
 
