@@ -62,7 +62,8 @@ class _LongShortLogUtilityNoTurnoverCap(torch.autograd.Function):
         one = torch.ones((), device=device, dtype=dtype)
 
         for idx in range(t_len):
-            target_t = torch.where(tradable_b[idx], target_weights[idx], prev)
+            prev = torch.where(tradable_b[idx], prev, torch.zeros_like(prev))
+            target_t = torch.where(tradable_b[idx], target_weights[idx], torch.zeros_like(prev))
             delta_raw = target_t - prev
             allowed = ((delta_raw > 0.0) & can_buy_b[idx]) | ((delta_raw < 0.0) & can_sell_b[idx])
             pre = prev + torch.where(allowed, delta_raw, torch.zeros_like(delta_raw))
@@ -225,7 +226,8 @@ def _fused_log_utility_long_only_scan(
     valid_count = torch.zeros((), device=device, dtype=torch.float32)
 
     for idx in range(t_len):
-        target_t = torch.where(tradable[idx], target_weights[idx], prev)
+        prev = torch.where(tradable[idx], prev, torch.zeros_like(prev))
+        target_t = torch.where(tradable[idx], target_weights[idx], torch.zeros_like(prev))
         delta = target_t - prev
         buy_delta = delta.clamp_min(0.0) * can_buy[idx].to(dtype=dtype)
         sell_delta = delta.clamp_max(0.0) * can_sell[idx].to(dtype=dtype)
@@ -299,7 +301,8 @@ def _fused_log_utility_long_short_scan(
     valid_count = torch.zeros((), device=device, dtype=torch.float32)
 
     for idx in range(t_len):
-        target_t = torch.where(tradable[idx], target_weights[idx], prev)
+        prev = torch.where(tradable[idx], prev, torch.zeros_like(prev))
+        target_t = torch.where(tradable[idx], target_weights[idx], torch.zeros_like(prev))
         delta = target_t - prev
         buy_delta = delta.clamp_min(0.0) * can_buy[idx].to(dtype=dtype)
         sell_delta = delta.clamp_max(0.0) * can_sell[idx].to(dtype=dtype)
@@ -408,6 +411,7 @@ def fused_log_utility_loss_tensor(
         and float(effective_turnover_cap) == 0.0
         and volume_limits is None
         and target_weights.requires_grad
+        and bool(torch.all(tradable).detach().cpu().item())
         and not _torch_dynamo_is_compiling()
     )
 

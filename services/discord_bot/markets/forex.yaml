@@ -4,7 +4,7 @@ enabled: true
 market_type: forex
 timezone: America/New_York
 open_time:
-close_time:
+close_time: "17:00"
 schedule_time: "16:55"
 summary_time: "17:10"
 data_ready_time: "18:00"

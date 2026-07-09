@@ -6,11 +6,13 @@ import polars as pl
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
 from stockagent.live.market_config import LiveMarketConfig
 from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
+from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
 from stockagent.live.signal_engine import (
     LIVE_SIGNAL_WEIGHTS_NAME,
     _build_decision_rows,
     _daily_bar_timestamp,
+    _daily_price_timestamp,
     _date_string,
     _live_weights_has_date,
     _load_previous_weights,
@@ -105,6 +107,27 @@ def test_daily_bar_timestamp_uses_market_close_time_for_midnight_dates() -> None
     assert _daily_bar_timestamp("2026-06-23", "13:30") == "2026-06-23 13:30:00"
     assert _daily_bar_timestamp("2026-06-23 00:00:00", "13:30") == "2026-06-23 13:30:00"
     assert _daily_bar_timestamp("2026-06-23 10:15:00", "13:30") == "2026-06-23 10:15:00"
+
+
+def test_daily_price_timestamp_clamps_realtime_after_close_to_market_close() -> None:
+    snapshot = PriceSnapshot(
+        prices=np.array([1.0]),
+        source="twse_tpex:mis",
+        timestamp="2026-07-09T06:30:00+00:00",
+        available_count=1,
+    )
+
+    assert (
+        _daily_price_timestamp(
+            price_snapshot=snapshot,
+            resolved_asof="2026-07-09 14:35:21",
+            panel_display_date="2026-07-08 13:30:00",
+            daily_bar_time="13:30",
+            source_timezone="Asia/Taipei",
+            intraday_frequency=False,
+        )
+        == "2026-07-09 13:30:00"
+    )
 
 
 def test_live_market_config_passes_close_time_as_daily_bar_time() -> None:
@@ -224,6 +247,36 @@ def test_daily_previous_weights_use_previous_live_trading_day_not_same_day_signa
 
     assert weights_path == str(fold_dir / LIVE_SIGNAL_WEIGHTS_NAME)
     assert date_text == "2026-06-22"
+    assert np.isclose(weights[0], 0.90)
+
+
+def test_daily_realtime_previous_weights_can_use_panel_date_signal(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-07-07", "2026-07-08"],
+            "AAA": [0.15, 0.40],
+        }
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+    write_live_weights_history(
+        fold_dir,
+        {"weights_date": "2026-07-08"},
+        [{"symbol": "AAA", "target_weight": 0.90}],
+    )
+
+    weights, date_text, weights_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=25,
+        weights_path=None,
+        asof_date="2026-07-08",
+        prefer_live_weights=True,
+        strictly_before_asof=False,
+    )
+
+    assert weights_path == str(fold_dir / LIVE_SIGNAL_WEIGHTS_NAME)
+    assert date_text == "2026-07-08"
     assert np.isclose(weights[0], 0.90)
 
 

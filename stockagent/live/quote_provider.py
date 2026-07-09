@@ -93,6 +93,143 @@ def load_prices_csv(path: str | Path, symbols: list[str], fallback_prices: np.nd
     return PriceSnapshot(prices=prices, source=f"csv:{Path(path)}", available_count=count)
 
 
+def _float_or_none(value: object) -> float | None:
+    try:
+        text = str(value).strip()
+        if not text or text in {"-", "--", "null", "None"}:
+            return None
+        parsed = float(text.replace(",", ""))
+    except Exception:
+        return None
+    if not (np.isfinite(parsed) and parsed > 0.0):
+        return None
+    return parsed
+
+
+def _first_book_price(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for part in text.split("_"):
+        parsed = _float_or_none(part)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _tw_mis_candidates(symbol: str, yahoo_symbol: str | None) -> list[str]:
+    code = str(symbol).strip()
+    if not code:
+        return []
+    raw_yahoo = str(yahoo_symbol or "").strip()
+    markets: list[str] = []
+    for item in raw_yahoo.split(","):
+        ticker = item.strip().upper()
+        if ticker.endswith(".TW") and "tse" not in markets:
+            markets.append("tse")
+        elif ticker.endswith(".TWO") and "otc" not in markets:
+            markets.append("otc")
+    if not markets:
+        markets = ["tse", "otc"]
+    return [f"{market}_{code}.tw" for market in markets]
+
+
+def _tw_mis_price(row: dict) -> float | None:
+    for key in ("z", "pz"):
+        value = _float_or_none(row.get(key))
+        if value is not None:
+            return value
+    bid = _first_book_price(row.get("b"))
+    ask = _first_book_price(row.get("a"))
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    return bid or ask or _float_or_none(row.get("y"))
+
+
+def fetch_tw_mis_last_prices(
+    symbols: list[str],
+    fallback_prices: np.ndarray,
+    *,
+    parquet_root: str | Path,
+    chunk_size: int = 80,
+) -> PriceSnapshot:
+    """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
+    yahoo_map = load_symbol_yahoo_map(parquet_root)
+    prices = np.asarray(fallback_prices, dtype=np.float64).copy()
+    filled = np.zeros((len(symbols),), dtype=bool)
+    last_timestamp_ms: int | None = None
+
+    ex_channels: list[tuple[int, str]] = []
+    for idx, symbol in enumerate(symbols):
+        for ex_ch in _tw_mis_candidates(str(symbol), yahoo_map.get(str(symbol))):
+            ex_channels.append((idx, ex_ch))
+    chunk_len = max(1, int(chunk_size))
+    chunks = [ex_channels[start : start + chunk_len] for start in range(0, len(ex_channels), chunk_len)]
+    max_parallel = int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "8") or "8")
+    workers = max(1, min(len(chunks) or 1, max_parallel))
+    session_local = threading.local()
+
+    def session() -> requests.Session:
+        sess = getattr(session_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            sess.headers.update(_YAHOO_HEADERS)
+            try:
+                sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
+            except Exception:
+                pass
+            session_local.session = sess
+        return sess
+
+    def fetch_chunk(items: list[tuple[int, str]]) -> list[tuple[int, float, int | None]]:
+        if not items:
+            return []
+        ex_ch = "|".join(ex for _, ex in items)
+        code_to_indices: dict[str, list[int]] = {}
+        for idx, _ex in items:
+            code_to_indices.setdefault(str(symbols[idx]), []).append(idx)
+        try:
+            response = session().get(
+                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                params={"ex_ch": ex_ch, "json": "1", "delay": "0", "_": str(int(datetime.now().timestamp() * 1000))},
+                headers={"Referer": "https://mis.twse.com.tw/stock/index.jsp", **_YAHOO_HEADERS},
+                timeout=8,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return []
+        rows: list[tuple[int, float, int | None]] = []
+        for item in payload.get("msgArray") or []:
+            code = str(item.get("c") or "").strip()
+            if not code:
+                continue
+            value = _tw_mis_price(item)
+            if value is None:
+                continue
+            try:
+                timestamp_ms = int(item.get("tlong") or 0) or None
+            except Exception:
+                timestamp_ms = None
+            for idx in code_to_indices.get(code, []):
+                rows.append((idx, value, timestamp_ms))
+        return rows
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tw-mis-quote") as executor:
+        futures = [executor.submit(fetch_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            for idx, value, timestamp_ms in future.result():
+                prices[idx] = value
+                filled[idx] = True
+                if timestamp_ms is not None and (last_timestamp_ms is None or timestamp_ms > last_timestamp_ms):
+                    last_timestamp_ms = timestamp_ms
+
+    timestamp = None
+    if last_timestamp_ms is not None:
+        timestamp = datetime.fromtimestamp(last_timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
+    return PriceSnapshot(prices=prices, source="twse_tpex:mis", timestamp=timestamp, available_count=int(filled.sum()))
+
+
 def _yahoo_session_and_crumb() -> tuple[requests.Session, str | None]:
     global _YAHOO_SESSION, _YAHOO_CRUMB
     with _YAHOO_SESSION_LOCK:
