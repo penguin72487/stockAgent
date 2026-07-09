@@ -92,6 +92,67 @@ def test_load_config_preserves_lr_scheduler_warmup_fields(tmp_path: Path) -> Non
     assert config.training.lr_scheduler_interval == "step"
 
 
+def test_load_config_supports_relative_base_config_deep_merge(tmp_path: Path) -> None:
+    base_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={
+            "batch_size_train": 64,
+            "multitask_loss": {"concentration_weight": 0.01},
+            "transformer_base_portfolio": {
+                "dropout": 0.1,
+                "portfolio_output_mode": "logits",
+            },
+        },
+    )
+    child_path = tmp_path / "child.yaml"
+    child_path.write_text(
+        yaml.safe_dump(
+            {
+                "base_config": base_path.name,
+                "experiment_name": "child-config",
+                "runner": {"output_dir": "artifacts/child"},
+                "training": {
+                    "learning_rate": 0.0002,
+                    "multitask_loss": {"return_rank_ic_weight": 0.07},
+                    "transformer_base_portfolio": {"dropout": 0.2},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(child_path)
+
+    assert config.experiment_name == "child-config"
+    assert config.runner.output_dir == "artifacts/child"
+    assert config.training.batch_size_train == 64
+    assert math.isclose(config.training.learning_rate, 0.0002)
+    assert math.isclose(config.training.multitask_loss.concentration_weight, 0.01)
+    assert math.isclose(config.training.multitask_loss.return_rank_ic_weight, 0.07)
+    assert config.training.transformer_base_portfolio.portfolio_output_mode == "logits"
+    assert math.isclose(config.training.transformer_base_portfolio.dropout, 0.2)
+
+
+def test_latefold_objective_configs_load_and_keep_ddp_transformer() -> None:
+    from stockagent.training.trainer import _normalize_risk_objective
+
+    expected = {
+        "configs/markets/tw_parallel_latefold_stable.yaml": "log_utility",
+        "configs/markets/tw_parallel_latefold_sharpck.yaml": "sharpe",
+        "configs/markets/tw_parallel_latefold_sortino.yaml": "sortino",
+    }
+    output_dirs: set[str] = set()
+    for path, objective in expected.items():
+        config = load_config(path)
+        output_dirs.add(config.runner.output_dir)
+        assert config.runner.start_fold == 24
+        assert config.training.model_name == "transformer_base_portfolio"
+        assert config.training.multi_gpu_strategy == "distributed_data_parallel"
+        assert config.training.transformer_base_portfolio.portfolio_output_mode == "logits"
+        assert _normalize_risk_objective(config.training.loss_type) == objective
+    assert len(output_dirs) == len(expected)
+
+
 def test_backtest_exposure_budget_caps_multiplier_at_one() -> None:
     assert _resolve_exposure_budget(2.5) == 1.0
 
@@ -200,6 +261,17 @@ def test_load_config_best_val_artifacts_master_switch_enables_fold_artifacts(tmp
     assert config.training.save_best_val_fold_plots is True
 
 
+def test_load_config_preserves_best_checkpoint_max_epoch(tmp_path: Path) -> None:
+    default_config_path = _write_minimal_config(tmp_path)
+    default_config = load_config(default_config_path)
+
+    capped_config_path = _write_minimal_config(tmp_path, training_overrides={"best_checkpoint_max_epoch": 12})
+    capped_config = load_config(capped_config_path)
+
+    assert default_config.training.best_checkpoint_max_epoch == 0
+    assert capped_config.training.best_checkpoint_max_epoch == 12
+
+
 @pytest.mark.parametrize(
     ("raw_mode", "expected_mode"),
     [
@@ -229,6 +301,21 @@ def test_load_config_normalizes_portfolio_output_mode_aliases(
     config = load_config(config_path)
 
     assert config.training.transformer_base_portfolio.portfolio_output_mode == expected_mode
+
+
+@pytest.mark.parametrize("raw_mode", ["adaptive-gross-l1", "adaptive-gross-net-l1", "gated-net-l1"])
+def test_load_config_rejects_removed_gated_portfolio_modes(tmp_path: Path, raw_mode: str) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={
+            "transformer_base_portfolio": {
+                "portfolio_output_mode": raw_mode,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="portfolio_output_mode"):
+        load_config(config_path)
 
 
 def test_load_config_rejects_unknown_portfolio_output_mode(tmp_path: Path) -> None:
