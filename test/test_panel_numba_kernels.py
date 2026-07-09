@@ -45,6 +45,20 @@ def test_tw_limit_mask_kernel_matches_limit_rule_examples() -> None:
     assert can_sell.tolist() == [True, True, False]
 
 
+def test_tw_limit_mask_kernel_rounds_limit_down_up_to_tick() -> None:
+    close_raw = np.array([524.0, 472.0], dtype=np.float64)
+    tradable = np.array([True, True])
+    dividends = np.full(close_raw.shape, np.nan)
+    stock_splits = np.full(close_raw.shape, np.nan)
+
+    limit_down = panel_numba.tw_limit_price(np.array([524.0], dtype=np.float64), 0.90)
+    can_buy, can_sell = panel_numba.tw_limit_masks_from_arrays(close_raw, tradable, dividends, stock_splits)
+
+    assert float(limit_down[0]) == 472.0
+    assert can_buy.tolist() == [True, True]
+    assert can_sell.tolist() == [True, False]
+
+
 def test_tw_limit_mask_kernel_handles_dividends_and_splits() -> None:
     can_buy_div, can_sell_div = panel_numba.tw_limit_masks_from_arrays(
         np.array([35.1, 37.5]),
