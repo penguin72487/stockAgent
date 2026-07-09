@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 23
 environment:
   conda_env: fintech
   device: cuda
@@ -221,6 +221,7 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
+  compile_fused_log_utility_loss_dynamic: true
   fused_log_utility_loss: true
   loss_portfolio_activation: pre_normalized
   materialize_window_tensors: false
@@ -251,9 +252,9 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 32
-  batch_size_train: 32
-  batch_size_eval: 16
+  batch_size: 8
+  batch_size_train: 8
+  batch_size_eval: 8
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -487,7 +488,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: last_only
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
@@ -496,7 +497,7 @@ training:
     joint_ffn_mult: 2
     latent_layers: 1
     num_latent_factors: 16
-    num_market_tokens: 4
+    num_market_tokens: 16
     market_layers: 1
     dynamic_latent_tokens: true
     dynamic_market_tokens: true

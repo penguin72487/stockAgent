@@ -557,6 +557,7 @@ class TrainingConfig:
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
     compile_fused_log_utility_loss: bool | None = None
+    compile_fused_log_utility_loss_dynamic: bool | None = None
     fused_log_utility_loss: bool = True
     fused_log_utility_manual_backward: bool = False
     loss_portfolio_activation: str = "auto"
@@ -836,6 +837,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("cuda_cache_path", "~/.cache/nv_cuda")
     training.setdefault("compile_loss", None)
     training.setdefault("compile_fused_log_utility_loss", None)
+    training.setdefault("compile_fused_log_utility_loss_dynamic", None)
     training.setdefault("fused_log_utility_loss", True)
     training.setdefault("fused_log_utility_manual_backward", False)
     training.setdefault("loss_portfolio_activation", "auto")
@@ -1638,6 +1640,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
             compile_fused_log_utility_loss=training_raw["compile_fused_log_utility_loss"],
+            compile_fused_log_utility_loss_dynamic=training_raw["compile_fused_log_utility_loss_dynamic"],
             fused_log_utility_loss=training_raw["fused_log_utility_loss"],
             fused_log_utility_manual_backward=training_raw["fused_log_utility_manual_backward"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],

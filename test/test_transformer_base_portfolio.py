@@ -154,15 +154,19 @@ def test_sdpa_batch_chunking_matches_unchunked_eval() -> None:
     assert torch.allclose(out_a["score_logits"], out_b["score_logits"], atol=1e-5, rtol=1e-5)
 
 
-def test_modern_components_and_dynamic_token_aux() -> None:
+def test_modern_components_and_learned_token_aux() -> None:
     device = _device()
     model = _make_model(attention_mode="latent").eval()
     assert isinstance(model.temporal_blocks[0].norm_query, PortfolioRMSNorm)
     assert isinstance(model.temporal_blocks[0].ffn, SwiGLUFeedForward)
     assert model.temporal_blocks[0].attn.qk_norm is True
     assert model.rope_temporal is True
-    assert model.dynamic_latent_generator is not None
-    assert model.dynamic_market_generator is not None
+    assert model.latent_queries is not None
+    assert tuple(model.latent_queries.shape) == (1, 4, 24)
+    assert model.market_queries is not None
+    assert tuple(model.market_queries.shape) == (1, 2, 24)
+    assert model.dynamic_latent_generator is None
+    assert model.dynamic_market_generator is None
     assert hasattr(model, "score_head")
     assert not hasattr(model, "mu_head")
     assert not hasattr(model, "sigma_head")
@@ -174,18 +178,82 @@ def test_modern_components_and_dynamic_token_aux() -> None:
         out = model(x, mask)
 
     aux = out["aux"]
-    assert aux["dynamic_latent_delta"].shape == (2, 4, 24)
-    assert aux["dynamic_latent_queries"].shape == (2, 4, 24)
-    assert aux["dynamic_market_delta"].shape == (2, 2, 24)
-    assert aux["dynamic_market_queries"].shape == (2, 2, 24)
-    assert aux["dynamic_latent_summary_parts"].shape == (2, 3, 24)
-    assert aux["dynamic_market_summary_parts"].shape == (2, 3, 24)
-    assert 0.0 < float(aux["dynamic_latent_gate"].item()) < 1.0
-    assert 0.0 < float(aux["dynamic_market_gate"].item()) < 1.0
+    assert aux["stock_embedding"].shape == (2, 13, 24)
+    assert aux["factor_tokens"].shape == (2, 4, 24)
+    assert aux["latent_factors"].shape == (2, 4, 24)
+    assert torch.allclose(aux["factor_tokens"], aux["latent_factors"], atol=0.0, rtol=0.0)
+    assert aux["market_tokens"].shape == (2, 2, 24)
+    assert aux["z_factor_context"].shape == (2, 13, 24)
+    assert aux["z_market_context"].shape == (2, 13, 24)
     assert aux["stock_market_gate"].shape == (2, 13, 1)
     assert aux["z_market_delta"].shape == (2, 13, 24)
     assert aux["score_logits"].shape == (2, 13)
     assert aux["rank_logits"].shape == (2, 13)
+    assert "dynamic_latent_delta" not in aux
+    assert "dynamic_market_delta" not in aux
+
+
+@pytest.mark.parametrize("mode", ["latent", "market_token"])
+def test_learned_token_attention_aux_contract(mode: str) -> None:
+    device = _device()
+    model = _make_model(attention_mode=mode).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    assert weights.shape == (2, 13)
+    assert weights[1, 9:].abs().max().item() < 1e-6
+    assert aux["stock_embedding"].shape == (2, 13, 24)
+    assert aux["market_tokens"].shape == (2, 2, 24)
+    assert aux["z_market_context"].shape == (2, 13, 24)
+    assert aux["stock_market_gate"].shape == (2, 13, 1)
+    if mode == "latent":
+        assert aux["factor_tokens"].shape == (2, 4, 24)
+        assert aux["latent_factors"].shape == (2, 4, 24)
+        assert aux["z_factor_context"].shape == (2, 13, 24)
+    else:
+        assert "factor_tokens" not in aux
+        assert "latent_factors" not in aux
+        assert "z_factor_context" not in aux
+    assert "dynamic_latent_delta" not in aux
+    assert "dynamic_market_delta" not in aux
+
+
+@pytest.mark.parametrize("mode", ["latent", "market_token"])
+@pytest.mark.parametrize(
+    ("dynamic_latent_tokens", "dynamic_market_tokens"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_deprecated_dynamic_token_flags_keep_forward_compatible(
+    mode: str,
+    dynamic_latent_tokens: bool,
+    dynamic_market_tokens: bool,
+) -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode=mode,
+        dynamic_latent_tokens=dynamic_latent_tokens,
+        dynamic_market_tokens=dynamic_market_tokens,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[0, 11:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    assert model.dynamic_latent_tokens is dynamic_latent_tokens
+    assert model.dynamic_market_tokens is dynamic_market_tokens
+    assert model.dynamic_latent_generator is None
+    assert model.dynamic_market_generator is None
+    assert weights.shape == (2, 13)
+    assert torch.isfinite(weights).all()
+    assert weights[0, 11:].abs().max().item() < 1e-6
+    assert "dynamic_latent_delta" not in aux
+    assert "dynamic_market_delta" not in aux
 
 
 def test_aux_details_false_keeps_training_output_light() -> None:
@@ -209,8 +277,9 @@ def test_aux_details_false_keeps_training_output_light() -> None:
     assert torch.allclose(light_out["weights"], weights, atol=1e-6, rtol=1e-6)
     assert torch.allclose(light_out["scores"], scores, atol=1e-6, rtol=1e-6)
     assert aux["token_embedding"].shape == (2, 6, 13, 24)
-    assert aux["dynamic_latent_delta"].shape == (2, 4, 24)
-    assert aux["dynamic_market_delta"].shape == (2, 2, 24)
+    assert aux["factor_tokens"].shape == (2, 4, 24)
+    assert aux["latent_factors"].shape == (2, 4, 24)
+    assert aux["market_tokens"].shape == (2, 2, 24)
     assert aux["stock_market_gate"].shape == (2, 13, 1)
 
 
@@ -713,10 +782,7 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.portfolio_output_mode == cfg.training.transformer_base_portfolio.portfolio_output_mode
     assert model.dynamic_latent_tokens == cfg.training.transformer_base_portfolio.dynamic_latent_tokens
     assert model.dynamic_market_tokens == cfg.training.transformer_base_portfolio.dynamic_market_tokens
+    assert model.dynamic_latent_generator is None
+    assert model.dynamic_market_generator is None
     if model.attention_mode == "market_token":
-        if cfg.training.transformer_base_portfolio.dynamic_market_tokens:
-            assert model.dynamic_market_generator is not None
-        else:
-            assert model.dynamic_market_generator is None
-        assert model.dynamic_latent_generator is None
         assert len(model.latent_blocks) == 0

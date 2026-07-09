@@ -954,6 +954,20 @@ def _volume_limit_weights_from_notional(
     )
 
 
+def _compile_fused_log_utility_loss_dynamic(config: ExperimentConfig) -> bool:
+    configured = getattr(config.training, "compile_fused_log_utility_loss_dynamic", None)
+    if configured is None:
+        default_dynamic = (
+            _normalize_train_symbol_compaction(getattr(config.training, "train_symbol_compaction", "none")) != "none"
+        )
+    else:
+        default_dynamic = bool(configured)
+    return _env_truthy(
+        "STOCKAGENT_COMPILE_FUSED_LOG_UTILITY_LOSS_DYNAMIC",
+        "1" if default_dynamic else "0",
+    )
+
+
 def _run_fused_log_utility_loss(
     fused_loss_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     weights: torch.Tensor,
@@ -11059,6 +11073,7 @@ def run_training(
             "STOCKAGENT_COMPILE_FUSED_LOG_UTILITY_LOSS",
             default_compile_fused_loss,
         )
+        compile_fused_log_utility_loss_dynamic = _compile_fused_log_utility_loss_dynamic(config)
         data_parallel_compile_model = (
             data_parallel_enabled and bool(getattr(config.training, "data_parallel_compile_model", False))
         )
@@ -11159,7 +11174,7 @@ def run_training(
                             try:
                                 raw_compiled_fused_loss_fn = torch.compile(
                                     fused_log_utility_loss_fn,
-                                    dynamic=False,
+                                    dynamic=compile_fused_log_utility_loss_dynamic,
                                     fullgraph=True,
                                     options={"triton.cudagraphs": False},
                                 )
@@ -11170,7 +11185,8 @@ def run_training(
                                 )
                                 print(
                                     f"[Train {train_years}] torch.compile fused log-utility loss enabled "
-                                    "(fullgraph=True, dynamic=False, cudagraphs=False)"
+                                    f"(fullgraph=True, dynamic={compile_fused_log_utility_loss_dynamic}, "
+                                    "cudagraphs=False)"
                                 )
                                 loss_compile_status = "enabled:fused_log_utility"
                             except Exception as e:
@@ -11252,7 +11268,7 @@ def run_training(
                         try:
                             raw_compiled_fused_loss_fn = torch.compile(
                                 fused_log_utility_loss_fn,
-                                dynamic=False,
+                                dynamic=compile_fused_log_utility_loss_dynamic,
                                 fullgraph=True,
                                 options={"triton.cudagraphs": False},
                             )
@@ -11263,7 +11279,8 @@ def run_training(
                             )
                             print(
                                 f"[Train {train_years}] torch.compile fused log-utility loss enabled "
-                                "(DataParallel model, fullgraph=True, dynamic=False, cudagraphs=False)"
+                                f"(DataParallel model, fullgraph=True, dynamic={compile_fused_log_utility_loss_dynamic}, "
+                                "cudagraphs=False)"
                             )
                             loss_compile_status = "enabled:fused_log_utility"
                         except Exception as e:
@@ -11345,6 +11362,7 @@ def run_training(
             f"panel_slab_forward={panel_slab_compile_status}; "
             f"loss_compile={loss_compile_status}; "
             f"fused_log_utility_loss={bool(fused_log_utility_loss_fn is not None)}; "
+            f"fused_loss_compile_dynamic={bool(compile_fused_log_utility_loss_dynamic)}; "
             f"fused_loss_manual_backward={bool(getattr(config.training, 'fused_log_utility_manual_backward', False))}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
