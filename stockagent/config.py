@@ -567,7 +567,6 @@ class TrainingConfig:
     eval_backtest_chunk_rows: int = 512
     eval_backtest_chunk_rows_auto: bool = True
     eval_backtest_compile: bool | None = None
-    eval_backtest_engine: str = "torch"
     eval_auto_chunk_rows_cap: int = 16
     train_symbol_subsample_ratio: float = 1.0
     train_symbol_compaction: str = "none"
@@ -598,7 +597,7 @@ class TrainingConfig:
     epochs: int = 1000
     early_stopping_no_improve_ratio: float = 0.2
     val_interval_epochs: int = 1
-    curve_test_interval: int = 100
+    curve_test_interval: int = 1
     record_epoch_curve: bool = True
     curve_plot_interval: int = 1
     curve_plot_async: bool = True
@@ -786,6 +785,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
 
     training = raw.setdefault("training", {})
+    if "eval_backtest_engine" in training:
+        raise ValueError(
+            "training.eval_backtest_engine has been removed; "
+            "eval/test backtests use the canonical Torch engine plus optional torch.compile."
+        )
     training.setdefault("seed", 42)
     training.setdefault("multi_gpu_strategy", "none")
     multi_gpu_strategy = str(training.get("multi_gpu_strategy", "none")).strip().lower().replace("-", "_")
@@ -847,7 +851,6 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("eval_backtest_chunk_rows", 512)
     training.setdefault("eval_backtest_chunk_rows_auto", True)
     training.setdefault("eval_backtest_compile", None)
-    training.setdefault("eval_backtest_engine", "torch")
     training.setdefault("eval_auto_chunk_rows_cap", 16)
     training.setdefault("train_symbol_subsample_ratio", 1.0)
     training.setdefault("train_symbol_compaction", "none")
@@ -872,7 +875,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training.setdefault("epochs", 10)
     training.setdefault("early_stopping_no_improve_ratio", 0.2)
     training.setdefault("val_interval_epochs", 1)
-    training.setdefault("curve_test_interval", 100)
+    training.setdefault("curve_test_interval", 1)
     training.setdefault("record_epoch_curve", True)
     training.setdefault("curve_plot_interval", 1)
     training.setdefault("curve_plot_async", True)
@@ -1583,12 +1586,6 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         training["loss_portfolio_activation"] = "auto"
     else:
         training["loss_portfolio_activation"] = _normalize_portfolio_activation(loss_activation)
-    eval_backtest_engine = str(training.get("eval_backtest_engine", "torch")).strip().lower().replace("-", "_")
-    if eval_backtest_engine in {"", "off", "none", "default"}:
-        eval_backtest_engine = "torch"
-    if eval_backtest_engine not in {"torch", "auto", "triton"}:
-        raise ValueError("training.eval_backtest_engine must be one of: torch, auto, triton")
-    training["eval_backtest_engine"] = eval_backtest_engine
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
@@ -1650,7 +1647,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
             eval_backtest_chunk_rows=training_raw["eval_backtest_chunk_rows"],
             eval_backtest_chunk_rows_auto=training_raw["eval_backtest_chunk_rows_auto"],
             eval_backtest_compile=training_raw["eval_backtest_compile"],
-            eval_backtest_engine=training_raw["eval_backtest_engine"],
             eval_auto_chunk_rows_cap=training_raw["eval_auto_chunk_rows_cap"],
             train_symbol_subsample_ratio=training_raw["train_symbol_subsample_ratio"],
             train_symbol_compaction=training_raw["train_symbol_compaction"],

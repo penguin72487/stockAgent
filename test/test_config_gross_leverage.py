@@ -177,6 +177,17 @@ def test_load_config_defaults_best_val_artifact_switches_off(tmp_path: Path) -> 
     assert config.training.save_best_val_artifacts is False
     assert config.training.save_best_val_fold_artifacts is False
     assert config.training.save_best_val_fold_plots is False
+    assert config.training.curve_test_interval == 1
+
+
+def test_load_config_rejects_removed_eval_backtest_engine(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={"eval_backtest_engine": "triton"},
+    )
+
+    with pytest.raises(ValueError, match="eval_backtest_engine"):
+        load_config(config_path)
 
 
 def test_load_config_best_val_artifacts_master_switch_enables_fold_artifacts(tmp_path: Path) -> None:

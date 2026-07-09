@@ -8,14 +8,21 @@ from torch import nn
 from stockagent.backtest.simulator import run_backtest_torch, run_backtest_torch_reduced
 import stockagent.backtest.simulator as simulator
 from stockagent.data.panel import PanelData
+from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.training.dataset import CrossSectionalDataset
-from stockagent.training.loss import _dense_masked_clean_mean, get_loss_runtime_stats, risk_aware_loss
+from stockagent.training.loss import (
+    _dense_masked_clean_mean,
+    _reduced_log_utility_enabled,
+    get_loss_runtime_stats,
+    risk_aware_loss,
+)
 from stockagent.training.fused_loss import fused_log_utility_loss_tensor
 from stockagent.training.trainer import (
     _batched_loss_from_backtest_segments,
     _CompiledLossFallback,
     _dataset_to_tensors,
     _detach_portfolio_state,
+    _deployment_test_indices,
     _estimate_eval_chunk_rows,
     _evaluate_tensor_batch,
     _evaluate_windowed_tensor_batch,
@@ -515,77 +522,6 @@ def test_evaluate_tensor_batch_ragged_chunk_padding_matches_full_long_short_back
     assert torch.allclose(actual.weights_history.cpu(), expected.weights_history, atol=1e-7, rtol=1e-6)
 
 
-def test_triton_eval_backtest_matches_torch_long_short_with_volume_cap(monkeypatch) -> None:
-    if not torch.cuda.is_available() or not simulator.triton_eval_available():
-        pytest.skip("CUDA Triton eval backtest is unavailable")
-
-    torch.manual_seed(765)
-    rows, symbols = 11, 13
-    raw_weights = torch.randn(rows, symbols, device="cuda")
-    weights = raw_weights / raw_weights.abs().sum(dim=1, keepdim=True).clamp_min(1e-12) * 2.5
-    returns = torch.randn(rows, symbols, device="cuda") * 0.02
-    tradable = torch.ones(rows, symbols, device="cuda", dtype=torch.bool)
-    can_buy = torch.rand(rows, symbols, device="cuda") > 0.20
-    can_sell = torch.rand(rows, symbols, device="cuda") > 0.15
-    tradable[0] = True
-    can_buy[0] = True
-    can_sell[0] = True
-    benchmark = returns.mean(dim=1)
-    initial = torch.randn(symbols, device="cuda")
-    initial = initial / initial.abs().sum().clamp_min(1e-12) * 1.2
-    volume_limit = torch.rand(rows, symbols, device="cuda") * 0.03
-    volume_limit[torch.rand(rows, symbols, device="cuda") < 0.10] = float("nan")
-
-    monkeypatch.setenv("STOCKAGENT_BACKTEST_COMPILE", "0")
-    monkeypatch.setenv("STOCKAGENT_BACKTEST_TRITON_EVAL", "0")
-    expected = run_backtest_torch(
-        weights,
-        returns,
-        tradable,
-        benchmark,
-        buy_fee_rate=0.000855,
-        sell_fee_rate=0.003855,
-        long_only=False,
-        max_turnover_ratio=0.0,
-        gross_leverage=2.5,
-        min_trade_weight=0.0,
-        portfolio_activation="pre_normalized",
-        can_buy_mask=can_buy,
-        can_sell_mask=can_sell,
-        initial_weights=initial,
-        volume_limit_weights=volume_limit,
-    )
-
-    monkeypatch.setenv("STOCKAGENT_BACKTEST_TRITON_EVAL", "1")
-    monkeypatch.setenv("STOCKAGENT_BACKTEST_TRITON_EVAL_REQUIRED", "1")
-    with torch.no_grad():
-        actual = run_backtest_torch(
-            weights,
-            returns,
-            tradable,
-            benchmark,
-            buy_fee_rate=0.000855,
-            sell_fee_rate=0.003855,
-            long_only=False,
-            max_turnover_ratio=0.0,
-            gross_leverage=2.5,
-            min_trade_weight=0.0,
-            portfolio_activation="pre_normalized",
-            can_buy_mask=can_buy,
-            can_sell_mask=can_sell,
-            initial_weights=initial,
-            volume_limit_weights=volume_limit,
-        )
-    torch.cuda.synchronize()
-
-    assert torch.allclose(actual.strategy_returns, expected.strategy_returns, atol=1e-6, rtol=1e-5)
-    assert torch.allclose(actual.turnovers, expected.turnovers, atol=1e-6, rtol=1e-5)
-    assert torch.allclose(actual.weights_history, expected.weights_history, atol=1e-6, rtol=1e-5)
-    assert expected.final_weights is not None
-    assert actual.final_weights is not None
-    assert torch.allclose(actual.final_weights, expected.final_weights, atol=1e-6, rtol=1e-5)
-
-
 def test_evaluate_tensor_batch_decoupled_backtest_chunk_matches_old_chunking() -> None:
     torch.manual_seed(777)
     rows, symbols = 19, 8
@@ -676,6 +612,52 @@ def _make_panel(rows: int = 8, symbols: int = 4, features: int = 3) -> PanelData
         benchmark_returns=returns.mean(dim=1).numpy(),
         close_prices=torch.ones(rows, symbols).numpy(),
     )
+
+
+def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> None:
+    lookback = 4
+    dates = np.concatenate(
+        [
+            np.arange("2020-01-01", "2020-01-11", dtype="datetime64[D]"),
+            np.arange("2021-01-01", "2021-01-11", dtype="datetime64[D]"),
+            np.arange("2022-01-01", "2022-01-11", dtype="datetime64[D]"),
+            np.arange("2023-01-01", "2023-01-11", dtype="datetime64[D]"),
+        ]
+    )
+    rows = int(dates.size)
+    symbols = 2
+    features = 3
+    mask = np.ones((rows, symbols), dtype=bool)
+    panel = PanelData(
+        dates=dates,
+        symbols=["A", "B"],
+        feature_names=[f"f{i}" for i in range(features)],
+        features=np.ones((rows, symbols, features), dtype=np.float32),
+        returns_1d=np.ones((rows, symbols), dtype=np.float32) * 0.001,
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=mask.copy(),
+        alive_mask=mask.copy(),
+        benchmark_returns=np.zeros((rows,), dtype=np.float32),
+        close_prices=np.ones((rows, symbols), dtype=np.float32),
+    )
+    folds = build_expanding_year_folds(
+        dates,
+        min_train_years=1,
+        val_years=1,
+        require_future_test_year=True,
+    )
+    assert [fold.test_years[0] for fold in folds] == [2022, 2023]
+
+    first_indices = _deployment_test_indices(panel, folds[0], folds[1], lookback)
+    second_indices = _deployment_test_indices(panel, folds[1], None, lookback)
+    first_ds = CrossSectionalDataset(panel, first_indices, lookback)
+    second_ds = CrossSectionalDataset(panel, second_indices, lookback)
+
+    assert panel.dates[first_ds.valid_indices[0]] == np.datetime64("2022-01-04")
+    assert panel.dates[first_ds.valid_indices[-1]] == np.datetime64("2023-01-03")
+    assert panel.dates[second_ds.valid_indices[0]] == np.datetime64("2023-01-04")
+    assert np.intersect1d(first_ds.valid_indices, second_ds.valid_indices).size == 0
 
 
 def test_windowed_split_matches_materialized_dataset_tensors() -> None:
@@ -1352,6 +1334,14 @@ def test_log_utility_loss_sample_mask_dense_path_matches_canonical_backtest_retu
     assert stats["prepare_inputs_calls"] >= 1
     assert stats["backtest_calls"] >= 1
     assert stats["log_utility_calls"] >= 1
+
+
+def test_reduced_log_utility_is_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("STOCKAGENT_LOSS_REDUCED_LOG_UTILITY", raising=False)
+    assert _reduced_log_utility_enabled() is False
+
+    monkeypatch.setenv("STOCKAGENT_LOSS_REDUCED_LOG_UTILITY", "1")
+    assert _reduced_log_utility_enabled() is True
 
 
 def test_reduced_and_fused_log_utility_match_canonical_curve_loss_and_gradients() -> None:

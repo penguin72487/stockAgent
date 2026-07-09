@@ -30,10 +30,6 @@ from stockagent.backtest.cpp_long_short import (
     cpp_long_short_enabled,
     run_long_short_cpp_autograd,
 )
-from stockagent.backtest.triton_eval import (
-    run_long_short_eval_triton,
-    triton_eval_available,
-)
 
 
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
@@ -90,8 +86,6 @@ _BACKTEST_RUNTIME_STATS: dict[str, float] = {
     "dense_fast_path_cuda_s": 0.0,
     "cpp_ext_s": 0.0,
     "cpp_ext_cuda_s": 0.0,
-    "triton_eval_s": 0.0,
-    "triton_eval_cuda_s": 0.0,
     "runner_resolve_s": 0.0,
     "runner_call_s": 0.0,
     "runner_call_cuda_s": 0.0,
@@ -103,9 +97,6 @@ _BACKTEST_RUNTIME_STATS: dict[str, float] = {
     "dense_fast_path_calls": 0.0,
     "cpp_ext_calls": 0.0,
     "cpp_ext_failures": 0.0,
-    "triton_eval_calls": 0.0,
-    "triton_eval_failures": 0.0,
-    "triton_eval_fallback_calls": 0.0,
     "checkpoint_calls": 0.0,
     "compiled_prep_calls": 0.0,
     "eager_prep_calls": 0.0,
@@ -576,14 +567,6 @@ def _compile_prep_enabled() -> bool:
 
 def _compile_reduced_enabled() -> bool:
     return _env_flag("STOCKAGENT_BACKTEST_COMPILE_REDUCED", "0")
-
-
-def _triton_eval_enabled() -> bool:
-    return _env_flag("STOCKAGENT_BACKTEST_TRITON_EVAL", "0")
-
-
-def _triton_eval_required() -> bool:
-    return _env_flag("STOCKAGENT_BACKTEST_TRITON_EVAL_REQUIRED", "0")
 
 
 def _compile_verbose() -> bool:
@@ -2124,64 +2107,6 @@ def _vectorized_backtest_torch(
             weights_history.to(returns_dtype),
             prepped_weights[-1].to(returns_dtype),
         )
-
-    triton_requested = _triton_eval_enabled()
-    triton_tradable_supported = True
-    if triton_requested:
-        try:
-            triton_tradable_supported = bool(torch.all(prepped_tradable.to(dtype=torch.bool)).detach().cpu().item())
-        except Exception:
-            triton_tradable_supported = False
-    triton_supported = (
-        triton_requested
-        and not _torch_dynamo_is_compiling()
-        and not torch.is_grad_enabled()
-        and not prepped_weights.requires_grad
-        and not future_returns.requires_grad
-        and triton_eval_available()
-        and not long_only
-        and not has_short_constraints
-        and triton_tradable_supported
-        and prepped_weights.device.type == "cuda"
-        and prepped_weights.dim() == 2
-        and (prepped_volume_limit_weights is None or not prepped_volume_limit_weights.requires_grad)
-    )
-    if triton_requested and not triton_supported and _triton_eval_required():
-        raise RuntimeError(
-            "eval_backtest_engine=triton was requested, but this backtest shape is not supported. "
-            "Required: CUDA+Triton, no autograd, long_only=false, no explicit short-open/force-cover masks, "
-            "all tradable_mask values true, and 2D [T, S] weights."
-        )
-    if triton_supported:
-        _add_backtest_runtime_stat("triton_eval_calls")
-        triton_start = _runtime_stat_start()
-        try:
-            with _CudaRuntimeTimer("triton_eval_cuda_s", prepped_weights):
-                strategy_returns, turnovers, weights_history, final_weights = run_long_short_eval_triton(
-                    prepped_weights,
-                    future_returns,
-                    prepped_tradable,
-                    prepped_buy,
-                    prepped_sell,
-                    buy_fee_rate=buy_fee_rate,
-                    sell_fee_rate=sell_fee_rate,
-                    max_turnover_ratio=effective_max_turnover_ratio,
-                    gross_budget=gross_budget,
-                    return_weights_history=return_weights_history,
-                    initial_weights=prev_init,
-                    volume_limit_weights=prepped_volume_limit_weights,
-                )
-            _add_backtest_elapsed_stat("triton_eval_s", triton_start)
-            _add_backtest_elapsed_stat("total_s", total_start)
-            return strategy_returns, turnovers, weights_history, final_weights
-        except Exception as e:
-            _add_backtest_runtime_stat("triton_eval_failures")
-            _add_backtest_elapsed_stat("triton_eval_s", triton_start)
-            if _triton_eval_required():
-                raise RuntimeError("eval_backtest_engine=triton failed; required engine fallback is disabled.") from e
-            _add_backtest_runtime_stat("triton_eval_fallback_calls")
-            if _compile_verbose():
-                print(f"[backtest triton eval] failed, falling back to torch scan: {type(e).__name__}: {e}")
 
     resolved_chunk = (
         int(scan_chunk_size)

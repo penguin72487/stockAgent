@@ -364,7 +364,8 @@ def _plot_loss_curve(rows: list[dict], curve_path: Path, output_path: Path, inte
     fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
     ax.plot(epochs, train_loss, marker="o", linewidth=1.8, markersize=4, label="train_loss")
     ax.plot(epochs, val_mean, marker="s", linewidth=1.8, markersize=4, label="val_mean")
-    ax.plot(epochs, test_mean, marker="^", linewidth=1.8, markersize=4, label="test_mean")
+    test_label = "sampled_test_mean" if any(bool(row.get("test_mean_sampled")) for row in rows) else "test_mean"
+    ax.plot(epochs, test_mean, marker="^", linewidth=1.8, markersize=4, label=test_label)
     ax.set_title(f"Loss Curves (sample every {max(1, int(interval))} epochs)")
     ax.set_xlabel("Epoch")
     if finite_loss_values.size == 0:
