@@ -1,0 +1,91 @@
+# Best validated late-fold TW setting for folds 24-26.
+# Rationale from artifacts/markets/tw_parallel_latefold_projection_short12:
+# - fold24 overfits after epoch 12: validation keeps improving while test turns worse.
+# - Use projection_l1 for implicit cash rather than learned gross/net gates.
+# - log_utility beat sharpck/sortino on the late-fold comparison gates.
+base_config: tw_parallel.yaml
+
+experiment_name: tw-stock-transformer-market-public-data-epyc7662-dual5090-latefold-projection-short12-copy
+
+runner:
+  output_dir: artifacts/markets/tw_parallel_latefold_projection_short12_copy
+  mode: train
+  resume: true
+  post_train_infer: false
+  start_fold: 24
+
+environment:
+  amp_dtype: bf16
+  torch_compile_threads: 64
+
+trading:
+  long_only: false
+  min_trade_weight: 0.0
+  portfolio_activation: pre_normalized
+  max_turnover_ratio: 0.0
+
+training:
+  model_name: transformer_base_portfolio
+  multi_gpu_strategy: distributed_data_parallel
+  data_parallel_device_ids: [0, 1]
+  ddp_bucket_cap_mb: 16
+
+  enable_torch_compile: true
+  auto_torch_compile_sharpe: false
+  torch_compile_mode: default
+  compile_loss: true
+  compile_fused_log_utility_loss: false
+  fused_log_utility_loss: true
+  fused_log_utility_manual_backward: true
+
+  loss_type: log_utility
+  loss_portfolio_activation: pre_normalized
+
+  batch_size: 128
+  batch_size_train: 128
+  batch_size_eval: 256
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0
+
+  learning_rate: 0.0001
+  enable_lr_scheduler: false
+  lr_scheduler: plateau
+  lr_scheduler_interval: epoch
+  lr_scheduler_gamma: 0.5
+  lr_scheduler_patience: 3
+  lr_scheduler_threshold: 0.0005
+  lr_scheduler_eta_min: 0.000005
+
+  weight_decay: 0.03
+  grad_clip_norm: 0.75
+  finite_check_interval_steps: 50
+
+  multitask_loss:
+    rank_ic_weight: 0.35
+    return_rank_ic_weight: 0.06
+    direction_weight: 0.00
+    volatility_regime_weight: 0.00
+    concentration_weight: 0.02
+    regime_up_threshold: 0.002
+    regime_down_threshold: -0.002
+
+  transformer_base_portfolio:
+    attention_mode: market_token
+    temporal_pooling: last
+    temporal_query_mode: last_only
+    qk_norm: true
+    input_dropout: 0.05
+    dynamic_latent_tokens: true
+    dynamic_market_tokens: true
+    dynamic_token_dropout: 0.0
+    dropout: 0.0
+    portfolio_mode: long_short
+    portfolio_output_mode: projection_l1
+    return_aux: false
+    return_aux_details: false
+
+evaluation:
+  gamma_turnover: 0.05
+  turnover_budget: 0.25
+  gamma_turnover_budget: 0.5
