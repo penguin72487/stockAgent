@@ -15,6 +15,10 @@ def test_download_counts_failure_reason_accepts_productive_download() -> None:
     assert download_counts_failure_reason({"repaired": 2000, "failed": 10}) is None
 
 
+def test_download_counts_failure_reason_accepts_unchanged_download() -> None:
+    assert download_counts_failure_reason({"unchanged": 2000, "failed": 10}) is None
+
+
 def test_command_summary_paths_prefers_asset_output_summary(tmp_path) -> None:
     output_root = tmp_path / "data_yahoo"
     command = [
@@ -30,6 +34,23 @@ def test_command_summary_paths_prefers_asset_output_summary(tmp_path) -> None:
 
     assert command_summary_paths(command) == [
         output_root / "tw_stocks" / "download_summary.json",
+        output_root / "daily_update_summary.json",
+    ]
+
+
+def test_command_summary_paths_maps_cboe_us_command(tmp_path) -> None:
+    output_root = tmp_path / "data_yahoo"
+    command = [
+        "python",
+        "downloader/download_cboe_us_ohlcv.py",
+        "--mode",
+        "daily-update",
+        "--output-root",
+        str(output_root),
+    ]
+
+    assert command_summary_paths(command) == [
+        output_root / "us_stocks" / "download_summary.json",
         output_root / "daily_update_summary.json",
     ]
 

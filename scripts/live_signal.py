@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--panel-date", default=None, help="Panel date to use for model features, or latest.")
     parser.add_argument("--asof-date", default=None, help="Signal timestamp label. Defaults to the current source-market time.")
     parser.add_argument("--daily-bar-time", default=None, help="Display time for daily bars, e.g. 13:30 for TW close.")
-    parser.add_argument("--price-source", choices=("panel", "csv", "yahoo"), default=None)
+    parser.add_argument("--price-source", choices=("panel", "csv", "yahoo", "tw"), default=None)
     parser.add_argument("--prices-csv", default=None, help="CSV with symbol/code/ticker and price/close/last columns.")
     parser.add_argument("--yahoo-chunk-size", type=int, default=None)
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")

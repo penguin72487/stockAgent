@@ -27,7 +27,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Runner defaults are centralized in `configs/runner.env`.
 - Outputs include one folder per walk-forward fold and a top-level `summary.json`.
 
-## Yahoo Finance Multi-Asset Download
+## Market Data Downloads
 
 - Run `python download_yahoo_ohlcv.py` to download four separate folders under `data_yahoo/`: `tw_stocks/`, `us_stocks/`, `crypto/`, and `forex/`.
 - The downloader defaults to `2000-01-01` through today.
@@ -40,7 +40,8 @@ Multi-asset Taiwan stock trading research workspace.
 - Forex symbols are loaded from Yahoo Finance currencies page tickers (with static fallback when rate-limited).
 - Pepperstone-style FX universe is available via `configs/forex_pepperstone_pairs.txt` and can be downloaded to `data_yahoo/forex_pepperstone/`.
 - Use `python downloader/download_yahoo_ohlcv.py --asset tw_stocks` to download only Taiwan stocks.
-- Use `python downloader/download_yahoo_ohlcv.py --asset us_stocks` to download only the expanded U.S. stock universe.
+- Use `python downloader/download_cboe_us_ohlcv.py --mode daily-update` to refresh the expanded U.S. stock universe from Cboe delayed historical OHLCV into `data_yahoo/us_stocks`.
+- The old Yahoo U.S. path is still available with `python downloader/download_yahoo_ohlcv.py --asset us_stocks`, but daily automation defaults to Cboe because Yahoo often rate-limits large U.S. refreshes.
 - Use `python downloader/download_yahoo_ohlcv.py --asset crypto` to download only the expanded crypto universe.
 - Use `python downloader/download_yahoo_ohlcv.py --asset crypto --mode incremental` to refresh only missing/stale Yahoo crypto 15-minute bars.
 - Yahoo crypto uses 15-minute bars; existing crypto parquet files that look like old daily data are rebuilt from the 15-minute source instead of being merged.
@@ -92,15 +93,16 @@ Multi-asset Taiwan stock trading research workspace.
 ### Daily All-Market Update
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
-- The script runs Yahoo all-asset update (`tw_stocks`, `us_stocks`, `crypto`, `forex`; crypto uses 15-minute bars), Taiwan public data daily-update plus public-data feature rebuild, Frankfurter forex incremental update to `data_yahoo/forex`, Pepperstone grouped daily-update, and OKX/Bybit perpetual 15-minute incremental updates.
+- The script runs only the source-of-truth feed for each configured market by default: Cboe `us_stocks`, Taiwan TWSE/TPEx public data plus feature rebuild and official OHLCV sync, Frankfurter forex incremental update to `data_yahoo/forex`, and OKX/Bybit perpetual 15-minute crypto updates. Yahoo and Pepperstone grouped downloads are opt-in fallback or research paths, not the fast daily default.
 - Independent provider groups run concurrently by default; set `DAILY_PARALLEL_GROUPS=0` to force the old serial order.
 - Set `RUN_TW_PUBLIC_DATA=0` to skip the Taiwan public data downloader. The first enabled run may backfill many historical official-data dates.
 - Set `RUN_TW_PUBLIC_FEATURES=0` to skip rebuilding `data_tw_public/features/tw_public_stock_daily.parquet`.
-- Set `RUN_PEPPERSTONE_GROUPS=0` to skip Pepperstone groups when you only want Yahoo+Frankfurter.
+- Set `RUN_PEPPERSTONE_GROUPS=1` to also run Pepperstone grouped fallback/research downloads.
 - Set `RUN_FRANKFURTER=0` to skip Frankfurter cross-rate updates.
 - Set `RUN_CEX_PERP=0` to skip OKX/Bybit updates.
 - Full data-quality audit is opt-in because it scans parquet roots; set `RUN_DATA_QUALITY_AUDIT=1` when you want that check after downloads.
-- Set `WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
+- Cboe U.S. updates are capped by `CBOE_US_STEP_TIMEOUT_SECONDS` (default `7200`) and throttled by `CBOE_US_REQUEST_INTERVAL` (default `0.25`) to avoid CDN 429s.
+- Set `WORKERS`, `CBOE_US_WORKERS`, `ASSET_WORKERS`, `PEPPERSTONE_WORKERS`, `OKX_WORKERS`, `BYBIT_WORKERS`, and `REPAIR_OVERLAP_DAYS` via environment variables to tune speed.
 
 ## Live Signal And Discord Bot
 
@@ -165,4 +167,3 @@ transformers >= 5.12.1
 
 git config --global user.email "agar.io6100@gmail.com"
 git config --global user.name "penguin72487"
-

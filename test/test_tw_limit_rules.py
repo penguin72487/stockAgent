@@ -35,12 +35,23 @@ def test_limit_price_examples() -> None:
     down = _tw_limit_price(prev, 0.90)
 
     expected_up = [10.9, 11.0, 54.7, 55.0, 109.5, 110.0, 548.0, 550.0, 1095.0, 1100.0]
-    expected_down = [8.95, 9.0, 44.8, 45.0, 89.9, 90.0, 449.0, 450.0, 899.0, 900.0]
+    expected_down = [8.96, 9.0, 44.85, 45.0, 90.0, 90.0, 449.5, 450.0, 900.0, 900.0]
 
     for actual, expected in zip(up.tolist(), expected_up):
         _assert_close(float(actual), float(expected))
     for actual, expected in zip(down.tolist(), expected_down):
         _assert_close(float(actual), float(expected))
+
+
+def test_limit_down_rounds_up_to_tick_for_ching_yun_case() -> None:
+    prev = np.asarray([524.0])
+    down = _tw_limit_price(prev, 0.90)
+    _assert_close(float(down[0]), 472.0)
+
+    frame = pl.DataFrame({"tradable": [True, True], "close_raw": [524.0, 472.0]})
+    can_buy, can_sell = _compute_tw_limit_masks(frame)
+    assert bool(can_buy[1]) is True
+    assert bool(can_sell[1]) is False
 
 
 def test_limit_masks() -> None:
