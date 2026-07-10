@@ -7,7 +7,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from stockagent.backtest.simulator import _resolve_exposure_budget, run_backtest_torch, run_backtest_torch_reduced
+from stockagent.backtest.simulator import (
+    _apply_min_trade_weight_torch,
+    _normalize_target_weights_torch,
+    _resolve_exposure_budget,
+    run_backtest_torch,
+    run_backtest_torch_reduced,
+)
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION, dual_branch_softmax
 
 
@@ -329,6 +335,11 @@ def factor_generalization_loss(
         activation=portfolio_activation,
     )
     can_buy = can_buy_mask.to(dtype=torch.bool, device=weights.device) if can_buy_mask is not None else tradable
+    needs_penalty_weights = (
+        float(net_exposure_weight) > 0.0
+        or float(gross_exposure_weight) > 0.0
+        or float(concentration_weight) > 0.0
+    )
     factor_backtest = run_backtest_torch(
         factor_weights,
         returns,
@@ -344,7 +355,7 @@ def factor_generalization_loss(
         portfolio_activation=portfolio_activation,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
-        return_weights_history=False,
+        return_weights_history=needs_penalty_weights,
     )
     factor_returns = torch.nan_to_num(factor_backtest.strategy_returns, nan=0.0, posinf=0.0, neginf=0.0)
     factor_returns_valid = factor_returns[valid_rows]
@@ -371,25 +382,33 @@ def factor_generalization_loss(
             consistency = 1.0 - _masked_corr_per_row(scores_z, aug_scores_z, tradable)
             total = total + float(consistency_weight) * (consistency * valid_f).sum() / valid_count
 
-    weights_safe = weights.to(dtype=returns.dtype)
-    if float(net_exposure_weight) > 0.0:
-        net_exposure = weights_safe.sum(dim=1).pow(2)
-        total = total + float(net_exposure_weight) * (net_exposure * valid_f).sum() / valid_count
-    if float(gross_exposure_weight) > 0.0:
-        gross = weights_safe.abs().sum(dim=1)
-        gross_target = float(_resolve_exposure_budget(gross_leverage))
-        gross_error = (gross - gross_target).pow(2)
-        total = total + float(gross_exposure_weight) * (gross_error * valid_f).sum() / valid_count
-    if float(concentration_weight) > 0.0:
-        tradable_f = tradable.to(dtype=weights_safe.dtype)
-        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-        concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count)
-        total = total + float(concentration_weight) * (concentration * valid_f).sum() / valid_count
-    if float(turnover_weight) > 0.0 and weights_safe.size(0) > 1:
-        turnover_proxy = (weights_safe[1:] - weights_safe[:-1]).abs().sum(dim=1)
-        row_mask = valid_rows[1:] & valid_rows[:-1]
-        row_mask_f = row_mask.to(dtype=turnover_proxy.dtype)
-        total = total + float(turnover_weight) * (turnover_proxy * row_mask_f).sum() / row_mask_f.sum().clamp_min(1.0)
+    if needs_penalty_weights:
+        weights_safe = _resolved_penalty_weights(
+            factor_backtest.weights_history,
+            factor_weights,
+            long_only=long_only,
+            gross_leverage=gross_leverage,
+            min_trade_weight=min_trade_weight,
+            portfolio_activation=portfolio_activation,
+        ).to(dtype=returns.dtype)
+        if float(net_exposure_weight) > 0.0:
+            net_exposure = weights_safe.sum(dim=1).pow(2)
+            total = total + float(net_exposure_weight) * (net_exposure * valid_f).sum() / valid_count
+        if float(gross_exposure_weight) > 0.0:
+            total = total + float(gross_exposure_weight) * _portfolio_gross_exposure_error(
+                weights_safe,
+                valid_rows,
+                gross_leverage=gross_leverage,
+            )
+        if float(concentration_weight) > 0.0:
+            total = total + float(concentration_weight) * _portfolio_concentration_penalty(
+                weights_safe,
+                tradable,
+                valid_rows,
+            )
+    if float(turnover_weight) > 0.0:
+        turnover_mean, _ = _dense_masked_clean_mean(factor_backtest.turnovers, valid_rows)
+        total = total + float(turnover_weight) * turnover_mean
     if float(score_l2_weight) > 0.0:
         score_l2 = (scores_z.pow(2) * tradable.to(dtype=scores_z.dtype)).sum(dim=1)
         denom = tradable.to(dtype=scores_z.dtype).sum(dim=1).clamp_min(1.0)
@@ -580,6 +599,80 @@ def _compute_log_utility(valid_returns: Tensor) -> Tensor:
     return valid_returns.mean() * annualizer
 
 
+def _valid_row_mask_like(weights: Tensor, sample_mask: Tensor | None) -> Tensor:
+    if sample_mask is None:
+        return torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
+    return sample_mask.to(device=weights.device, dtype=torch.bool)
+
+
+def _canonical_target_weights_for_loss(
+    weights: Tensor,
+    *,
+    long_only: bool,
+    gross_leverage: float,
+    min_trade_weight: float,
+    portfolio_activation: str,
+) -> Tensor:
+    """Apply the same target-weight transform used by the canonical backtest."""
+    gross_budget = float(_resolve_exposure_budget(gross_leverage))
+    target = _normalize_target_weights_torch(
+        torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0),
+        long_only=long_only,
+        gross_budget=gross_budget,
+        portfolio_activation=portfolio_activation,
+    )
+    return _apply_min_trade_weight_torch(target, min_trade_weight)
+
+
+def _resolved_penalty_weights(
+    backtest_weights_history: Tensor | None,
+    raw_weights: Tensor,
+    *,
+    long_only: bool,
+    gross_leverage: float,
+    min_trade_weight: float,
+    portfolio_activation: str,
+) -> Tensor:
+    if isinstance(backtest_weights_history, torch.Tensor) and backtest_weights_history.numel() > 0:
+        return torch.nan_to_num(backtest_weights_history, nan=0.0, posinf=0.0, neginf=0.0)
+    return _canonical_target_weights_for_loss(
+        raw_weights,
+        long_only=long_only,
+        gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
+    )
+
+
+def _portfolio_concentration_penalty(weights: Tensor, tradable: Tensor, valid_mask: Tensor) -> Tensor:
+    weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    tradable_f = tradable.to(device=weights_safe.device, dtype=weights_safe.dtype)
+    valid_f = valid_mask.to(device=weights_safe.device, dtype=weights_safe.dtype)
+    active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+    concentration = (weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count
+    return (concentration * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+
+
+def _portfolio_net_exposure_penalty(weights: Tensor, valid_mask: Tensor) -> Tensor:
+    weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_f = valid_mask.to(device=weights_safe.device, dtype=weights_safe.dtype)
+    net_exposure = weights_safe.sum(dim=1).pow(2)
+    return (net_exposure * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+
+
+def _portfolio_gross_exposure_error(
+    weights: Tensor,
+    valid_mask: Tensor,
+    *,
+    gross_leverage: float,
+) -> Tensor:
+    weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_f = valid_mask.to(device=weights_safe.device, dtype=weights_safe.dtype)
+    gross_target = float(_resolve_exposure_budget(gross_leverage))
+    gross_error = (weights_safe.abs().sum(dim=1) - gross_target).pow(2)
+    return (gross_error * valid_f).sum() / valid_f.sum().clamp_min(1.0)
+
+
 def _dense_masked_clean_mean(values: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
     """Mean of values[valid_mask] after nan_to_num, without dynamic-shape indexing."""
     mask_bool = valid_mask.to(device=values.device, dtype=torch.bool)
@@ -652,6 +745,7 @@ def risk_aware_loss(
     direction_weight: float = 0.05,
     volatility_regime_weight: float = 0.05,
     concentration_weight: float = 0.005,
+    net_exposure_weight: float = 0.0,
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
     factor_slope_tstat_weight: float = 1.0,
@@ -824,6 +918,7 @@ def risk_aware_loss(
         objective_norm in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}
         and _reduced_log_utility_enabled()
         and volume_limit_weights is None
+        and float(net_exposure_weight) <= 0.0
     ):
         backtest_start = _loss_timer_start()
         reduced = run_backtest_torch_reduced(
@@ -863,11 +958,19 @@ def risk_aware_loss(
         total_loss = total_loss + weights.new_zeros(())
         _loss_timer_stop("log_utility", log_utility_start)
         if concentration_weight > 0.0:
-            weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-            tradable_f = tradable.to(dtype=weights_safe.dtype)
-            active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-            concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
-            total_loss = total_loss + float(concentration_weight) * concentration
+            valid_mask = _valid_row_mask_like(weights, sample_mask)
+            penalty_weights = _canonical_target_weights_for_loss(
+                weights,
+                long_only=long_only,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+            )
+            total_loss = total_loss + float(concentration_weight) * _portfolio_concentration_penalty(
+                penalty_weights,
+                tradable,
+                valid_mask,
+            )
         if float(return_rank_ic_weight) > 0.0:
             rank_logits = aux_outputs.get("rank_logits") if aux_outputs else None
             if rank_logits is None:
@@ -876,6 +979,7 @@ def risk_aware_loss(
         return total_loss
 
     backtest_start = _loss_timer_start()
+    needs_penalty_weights = float(concentration_weight) > 0.0 or float(net_exposure_weight) > 0.0
     backtest = run_backtest_torch(
         weights,
         returns,
@@ -891,7 +995,7 @@ def risk_aware_loss(
         portfolio_activation=portfolio_activation,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell_mask.to(dtype=torch.bool, device=weights.device) if can_sell_mask is not None else None,
-        return_weights_history=False,
+        return_weights_history=needs_penalty_weights,
         initial_weights=initial_weights,
     )
     _loss_timer_stop("backtest", backtest_start)
@@ -947,11 +1051,32 @@ def risk_aware_loss(
 
         total_loss = objective_value + turnover_term
         if concentration_weight > 0.0:
-            weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-            tradable_f = tradable.to(dtype=weights_safe.dtype)
-            active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-            concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
-            total_loss = total_loss + float(concentration_weight) * concentration
+            penalty_weights = _resolved_penalty_weights(
+                backtest.weights_history,
+                weights,
+                long_only=long_only,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+            )
+            total_loss = total_loss + float(concentration_weight) * _portfolio_concentration_penalty(
+                penalty_weights,
+                tradable,
+                valid_mask,
+            )
+        if net_exposure_weight > 0.0:
+            penalty_weights = _resolved_penalty_weights(
+                backtest.weights_history,
+                weights,
+                long_only=long_only,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+            )
+            total_loss = total_loss + float(net_exposure_weight) * _portfolio_net_exposure_penalty(
+                penalty_weights,
+                valid_mask,
+            )
         if float(return_rank_ic_weight) > 0.0:
             rank_logits = aux_outputs.get("rank_logits") if aux_outputs else None
             if rank_logits is None:
@@ -1023,11 +1148,32 @@ def risk_aware_loss(
         total_loss = objective_value + turnover_term
 
         if concentration_weight > 0.0:
-            weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-            tradable_f = tradable.to(dtype=weights_safe.dtype)
-            active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-            concentration = ((weights_safe.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
-            total_loss = total_loss + float(concentration_weight) * concentration
+            penalty_weights = _resolved_penalty_weights(
+                backtest.weights_history,
+                weights,
+                long_only=long_only,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+            )
+            total_loss = total_loss + float(concentration_weight) * _portfolio_concentration_penalty(
+                penalty_weights,
+                tradable,
+                valid_mask,
+            )
+        if net_exposure_weight > 0.0:
+            penalty_weights = _resolved_penalty_weights(
+                backtest.weights_history,
+                weights,
+                long_only=long_only,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+            )
+            total_loss = total_loss + float(net_exposure_weight) * _portfolio_net_exposure_penalty(
+                penalty_weights,
+                valid_mask,
+            )
         if float(return_rank_ic_weight) > 0.0:
             rank_logits = aux_outputs.get("rank_logits") if aux_outputs else None
             if rank_logits is None:

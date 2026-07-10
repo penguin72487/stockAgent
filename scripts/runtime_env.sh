@@ -11,6 +11,12 @@ detect_fintech_env_path() {
   fi
 
   local candidate
+  local env_root
+  local -a dynamic_candidates=()
+  IFS=':' read -r -a env_roots <<< "${CONDA_ENVS_PATH:-}"
+  for env_root in "${env_roots[@]}"; do
+    [[ -n "$env_root" ]] && dynamic_candidates+=("$env_root/fintech")
+  done
   for candidate in \
     "$HOME/miniforge3/envs/fintech" \
     "$HOME/mambaforge/envs/fintech" \
@@ -18,12 +24,24 @@ detect_fintech_env_path() {
     "$HOME/anaconda3/envs/fintech" \
     "/venv/fintech" \
     "/root/miniforge3/envs/fintech" \
-    "/home/user/miniforge3/envs/fintech"; do
+    "/home/user/miniforge3/envs/fintech" \
+    "/opt/conda/envs/fintech" \
+    "${dynamic_candidates[@]}"; do
     if [[ -x "$candidate/bin/python" ]]; then
       printf "%s\n" "$candidate"
       return 0
     fi
   done
+
+  local manager
+  manager="$(detect_mamba_or_conda_bin 2>/dev/null || true)"
+  if [[ -n "$manager" ]]; then
+    candidate="$($manager env list --json 2>/dev/null | sed -n 's/.*"\([^" ]*\/fintech\)".*/\1/p' | head -n 1)"
+    if [[ -n "$candidate" && -x "$candidate/bin/python" ]]; then
+      printf "%s\n" "$candidate"
+      return 0
+    fi
+  fi
 
   return 1
 }

@@ -223,8 +223,10 @@ def _fused_log_utility_long_only_scan(
     buy_fee_rate: float,
     sell_fee_rate: float,
     max_turnover_ratio: float,
+    track_net_exposure: bool = False,
+    track_concentration: bool = False,
     volume_limit_weights: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     t_len = int(target_weights.size(0))
     dtype = target_weights.dtype
     device = target_weights.device
@@ -237,9 +239,14 @@ def _fused_log_utility_long_only_scan(
     one = torch.ones((), device=device, dtype=dtype)
     return_sum = torch.zeros((), device=device, dtype=torch.float32)
     turnover_sum = torch.zeros((), device=device, dtype=torch.float32)
+    net_exposure_sum = torch.zeros((), device=device, dtype=torch.float32)
+    concentration_sum = torch.zeros((), device=device, dtype=torch.float32)
     valid_count = torch.zeros((), device=device, dtype=torch.float32)
 
     for idx in range(t_len):
+        forced_exit = torch.where(~tradable[idx], prev, torch.zeros_like(prev))
+        forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+        forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
         prev = torch.where(tradable[idx], prev, torch.zeros_like(prev))
         target_t = torch.where(tradable[idx], target_weights[idx], torch.zeros_like(prev))
         delta = target_t - prev
@@ -269,8 +276,8 @@ def _fused_log_utility_long_only_scan(
             next_weights = prev + delta * turnover_scale
             delta = next_weights - prev
 
-        buy_turnover = delta.clamp_min(0.0).sum()
-        sell_turnover = (-delta).clamp_min(0.0).sum()
+        buy_turnover = delta.clamp_min(0.0).sum() + forced_buy_turnover
+        sell_turnover = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
         turnover = buy_turnover + sell_turnover
         gross_return = (next_weights * returns[idx]).sum()
         net_simple_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
@@ -279,10 +286,15 @@ def _fused_log_utility_long_only_scan(
         valid_f = valid_mask[idx].to(dtype=torch.float32)
         return_sum = return_sum + torch.nan_to_num(strategy_return.float(), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
         turnover_sum = turnover_sum + torch.nan_to_num(turnover.float(), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
+        if track_net_exposure:
+            net_exposure_sum = net_exposure_sum + next_weights.float().sum().pow(2) * valid_f
+        if track_concentration:
+            active_count = tradable[idx].float().sum().clamp_min(1.0)
+            concentration_sum = concentration_sum + next_weights.float().pow(2).sum() * active_count * valid_f
         valid_count = valid_count + valid_f
         prev = next_weights
 
-    return return_sum, turnover_sum, valid_count, prev
+    return return_sum, turnover_sum, net_exposure_sum, concentration_sum, valid_count, prev
 
 
 def _fused_log_utility_long_short_scan(
@@ -298,8 +310,10 @@ def _fused_log_utility_long_short_scan(
     sell_fee_rate: float,
     max_turnover_ratio: float,
     gross_budget: float,
+    track_net_exposure: bool = False,
+    track_concentration: bool = False,
     volume_limit_weights: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     t_len = int(target_weights.size(0))
     dtype = target_weights.dtype
     device = target_weights.device
@@ -312,9 +326,14 @@ def _fused_log_utility_long_short_scan(
     gross_cap = torch.as_tensor(gross_budget, device=device, dtype=dtype)
     return_sum = torch.zeros((), device=device, dtype=torch.float32)
     turnover_sum = torch.zeros((), device=device, dtype=torch.float32)
+    net_exposure_sum = torch.zeros((), device=device, dtype=torch.float32)
+    concentration_sum = torch.zeros((), device=device, dtype=torch.float32)
     valid_count = torch.zeros((), device=device, dtype=torch.float32)
 
     for idx in range(t_len):
+        forced_exit = torch.where(~tradable[idx], prev, torch.zeros_like(prev))
+        forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+        forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
         prev = torch.where(tradable[idx], prev, torch.zeros_like(prev))
         target_t = torch.where(tradable[idx], target_weights[idx], torch.zeros_like(prev))
         delta = target_t - prev
@@ -344,8 +363,8 @@ def _fused_log_utility_long_short_scan(
         next_weights = next_weights * gross_scale
         delta = next_weights - prev
 
-        buy_turnover = delta.clamp_min(0.0).sum()
-        sell_turnover = (-delta).clamp_min(0.0).sum()
+        buy_turnover = delta.clamp_min(0.0).sum() + forced_buy_turnover
+        sell_turnover = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
         turnover = buy_turnover + sell_turnover
         gross_return = (next_weights * returns[idx]).sum()
         net_simple_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
@@ -354,10 +373,15 @@ def _fused_log_utility_long_short_scan(
         valid_f = valid_mask[idx].to(dtype=torch.float32)
         return_sum = return_sum + torch.nan_to_num(strategy_return.float(), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
         turnover_sum = turnover_sum + torch.nan_to_num(turnover.float(), nan=0.0, posinf=0.0, neginf=0.0) * valid_f
+        if track_net_exposure:
+            net_exposure_sum = net_exposure_sum + next_weights.float().sum().pow(2) * valid_f
+        if track_concentration:
+            active_count = tradable[idx].float().sum().clamp_min(1.0)
+            concentration_sum = concentration_sum + next_weights.float().pow(2).sum() * active_count * valid_f
         valid_count = valid_count + valid_f
         prev = next_weights
 
-    return return_sum, turnover_sum, valid_count, prev
+    return return_sum, turnover_sum, net_exposure_sum, concentration_sum, valid_count, prev
 
 
 def fused_log_utility_loss_tensor(
@@ -379,6 +403,7 @@ def fused_log_utility_loss_tensor(
     gamma_sharpe: float = 1.0,
     gamma_turnover: float = 0.0,
     concentration_weight: float = 0.0,
+    net_exposure_weight: float = 0.0,
     manual_backward: bool = False,
     volume_limit_weights: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
@@ -414,9 +439,13 @@ def fused_log_utility_loss_tensor(
         portfolio_activation=portfolio_activation,
     )
     target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
+    track_net_exposure = float(net_exposure_weight) > 0.0
+    track_concentration = float(concentration_weight) > 0.0
 
     use_manual_backward = (
         bool(manual_backward)
+        and not track_net_exposure
+        and not track_concentration
         and not bool(long_only)
         and float(effective_turnover_cap) == 0.0
         and volume_limits is None
@@ -442,7 +471,7 @@ def fused_log_utility_loss_tensor(
         )
         loss = return_sum_loss
     elif long_only:
-        return_sum, turnover_sum, valid_count, final_weights = _fused_log_utility_long_only_scan(
+        return_sum, turnover_sum, net_exposure_sum, concentration_sum, valid_count, final_weights = _fused_log_utility_long_only_scan(
             target_weights,
             returns,
             tradable,
@@ -453,10 +482,12 @@ def fused_log_utility_loss_tensor(
             buy_fee_rate=buy_fee_rate,
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=effective_turnover_cap,
+            track_net_exposure=track_net_exposure,
+            track_concentration=track_concentration,
             volume_limit_weights=volume_limits,
         )
     else:
-        return_sum, turnover_sum, valid_count, final_weights = _fused_log_utility_long_short_scan(
+        return_sum, turnover_sum, net_exposure_sum, concentration_sum, valid_count, final_weights = _fused_log_utility_long_short_scan(
             target_weights,
             returns,
             tradable,
@@ -468,6 +499,8 @@ def fused_log_utility_loss_tensor(
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=effective_turnover_cap,
             gross_budget=gross_budget,
+            track_net_exposure=track_net_exposure,
+            track_concentration=track_concentration,
             volume_limit_weights=volume_limits,
         )
 
@@ -477,9 +510,8 @@ def fused_log_utility_loss_tensor(
         loss = -float(gamma_sharpe) * (mean_return * torch.as_tensor(252.0, device=device, dtype=torch.float32))
         if float(gamma_turnover) != 0.0:
             loss = loss + float(gamma_turnover) * (turnover_sum / denom)
-    if float(concentration_weight) > 0.0:
-        tradable_f = tradable.to(dtype=target_weights.dtype)
-        active_count = tradable_f.sum(dim=1).clamp_min(1.0)
-        concentration = ((target_weights.pow(2) * tradable_f).sum(dim=1) * active_count).mean()
-        loss = loss + float(concentration_weight) * concentration.float()
+        if track_net_exposure:
+            loss = loss + float(net_exposure_weight) * (net_exposure_sum / denom)
+        if track_concentration:
+            loss = loss + float(concentration_weight) * (concentration_sum / denom)
     return loss, final_weights.detach().clone(memory_format=torch.contiguous_format)

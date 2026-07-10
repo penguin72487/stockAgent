@@ -198,3 +198,77 @@ def test_external_tpex_limit_rule_columns_update_masks_without_becoming_features
     assert bool(panel.can_sell_mask[date_0103, symbol_idx]) is True
     assert bool(panel.can_buy_mask[date_0104, symbol_idx]) is True
     assert bool(panel.can_sell_mask[date_0104, symbol_idx]) is False
+
+
+def test_official_missing_day_inside_listing_lifetime_is_frozen_suspension(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 100.0, 101.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04"],
+            "symbol": ["2330", "2330"],
+            "_twpub_official_traded": [1.0, 1.0],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    suspended_idx = int(np.where(panel.dates == np.datetime64("2024-01-03T00:00:00.000000000"))[0][0])
+    assert bool(panel.tradable_mask[suspended_idx, symbol_idx]) is True
+    assert bool(panel.can_buy_mask[suspended_idx, symbol_idx]) is False
+    assert bool(panel.can_sell_mask[suspended_idx, symbol_idx]) is False
+    assert panel.returns_1d[suspended_idx, symbol_idx] == np.float32(0.0)
+
+
+def test_official_delisting_event_extends_suspension_then_marks_untradable(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 100.0, 100.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04"],
+            "symbol": ["2330", "2330"],
+            "_twpub_official_traded": [1.0, None],
+            "_twpub_delisted": [None, 1.0],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    suspended_idx = int(np.where(panel.dates == np.datetime64("2024-01-03T00:00:00.000000000"))[0][0])
+    delisted_idx = int(np.where(panel.dates == np.datetime64("2024-01-04T00:00:00.000000000"))[0][0])
+    assert bool(panel.tradable_mask[suspended_idx, symbol_idx]) is True
+    assert bool(panel.can_sell_mask[suspended_idx, symbol_idx]) is False
+    assert bool(panel.tradable_mask[delisted_idx, symbol_idx]) is False
+
+
+def test_feature_builder_emits_official_delisting_rule(tmp_path: Path) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "date": ["2024-01-03"],
+            "market": ["twse"],
+            "symbol": ["2330"],
+            "company_name": ["測試"],
+            "delisting_reason": ["測試原因"],
+        }
+    ).write_parquet(tmp_path / "twse_delisted_company.parquet")
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "2330")
+    assert out.filter(pl.col("_twpub_delisted") == 1.0).height == 1

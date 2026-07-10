@@ -12,6 +12,7 @@ from stockagent.models.transformer_base_portfolio import (
     PortfolioRMSNorm,
     SwiGLUFeedForward,
     TransformerBasePortfolioModel,
+    _sanitize_scores_to_dtype,
 )
 from stockagent.models.normalization import (
     masked_activation_l1_weights,
@@ -588,6 +589,48 @@ def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:
     assert model.portfolio_output_mode == "logits"
     assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
     assert weights[1, 10:].abs().max().item() < 1e-6
+
+
+def test_score_sanitization_preserves_finite_values_outside_legacy_clip() -> None:
+    scores = torch.tensor([[-100.0, 100.0, float("nan"), float("inf"), -float("inf")]], dtype=torch.float32)
+
+    sanitized = _sanitize_scores_to_dtype(scores)
+
+    assert sanitized[0, 0].item() == -100.0
+    assert sanitized[0, 1].item() == 100.0
+    assert sanitized[0, 2].item() == 0.0
+    assert sanitized[0, 3].item() == torch.finfo(torch.float32).max
+    assert sanitized[0, 4].item() == torch.finfo(torch.float32).min
+
+
+def test_l1_projection_preserves_large_finite_values_inside_radius() -> None:
+    logits = torch.tensor([[100.0, -100.0]], dtype=torch.float32)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    projected = masked_l1_projection_weights(logits, mask, radius=250.0)
+
+    assert torch.equal(projected, logits)
+
+
+def test_long_short_logit_centering_can_be_disabled() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="logits",
+        center_long_short_logits=False,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    expected = aux["score_logits"].masked_fill(~mask, 0.0)
+    assert not model.center_long_short_logits
+    assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(aux["centered_score_logits"], aux["score_logits"], atol=1e-6, rtol=1e-6)
 
 
 def test_portfolio_output_mode_signed_softmax_matches_action_helper() -> None:

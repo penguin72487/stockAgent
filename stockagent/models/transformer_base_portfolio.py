@@ -21,6 +21,11 @@ from stockagent.models.normalization import (
 from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, profile_range
 
 
+def _sanitize_scores_to_dtype(scores: torch.Tensor) -> torch.Tensor:
+    """Keep finite scores unchanged and replace non-finite values within dtype bounds."""
+    return torch.nan_to_num(scores, nan=0.0)
+
+
 class PortfolioRMSNorm(nn.Module):
     """RMSNorm for transformer blocks without forcing a PyTorch version dependency."""
 
@@ -486,6 +491,7 @@ class TransformerBasePortfolioModel(nn.Module):
         portfolio_mode: str = "long_short",
         portfolio_activation: str = "identity",
         portfolio_output_mode: str = "activation_l1",
+        center_long_short_logits: bool = True,
         max_full_tokens: int = 4096,
         checkpoint_blocks: bool = False,
         return_aux: bool = True,
@@ -508,6 +514,7 @@ class TransformerBasePortfolioModel(nn.Module):
         self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.portfolio_output_mode = self._normalize_portfolio_output_mode(portfolio_output_mode)
+        self.center_long_short_logits = bool(center_long_short_logits)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
         self.return_aux = bool(return_aux)
@@ -1292,14 +1299,14 @@ class TransformerBasePortfolioModel(nn.Module):
                 z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
             with profile_range("model.portfolio.score_head"):
                 scores = self.score_head(z_stock).squeeze(-1)
-            with profile_range("model.portfolio.score_nan_clamp"):
-                scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+            with profile_range("model.portfolio.score_sanitize"):
+                scores = _sanitize_scores_to_dtype(scores)
             with profile_range("model.portfolio.score_mask_fill"):
                 masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
         else:
             z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
             scores = self.score_head(z_stock).squeeze(-1)
-            scores = torch.nan_to_num(scores, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+            scores = _sanitize_scores_to_dtype(scores)
             masked_scores = scores.masked_fill(~mask_bool, finite_mask_fill_value(scores))
 
         if temperature is None:
@@ -1371,11 +1378,19 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             if PROFILE_RANGES_ENABLED:
                 with profile_range("model.portfolio.center_scores"):
-                    centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
+                    centered_scores = (
+                        scores - masked_cross_sectional_mean(scores, mask_bool)
+                        if self.center_long_short_logits
+                        else scores
+                    )
                 with profile_range("model.portfolio.target_logits"):
                     target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             else:
-                centered_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
+                centered_scores = (
+                    scores - masked_cross_sectional_mean(scores, mask_bool)
+                    if self.center_long_short_logits
+                    else scores
+                )
                 target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             if self.portfolio_output_mode == "logits":
                 weights = target_logits

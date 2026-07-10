@@ -113,6 +113,8 @@ MARKET_FEATURE_COLUMNS = (
 
 FEATURE_COLUMNS = (*STOCK_FEATURE_COLUMNS, *MARKET_FEATURE_COLUMNS)
 RULE_COLUMNS = (
+    "_twpub_official_traded",
+    "_twpub_delisted",
     "_twpub_tpex_next_limit_up_ret",
     "_twpub_tpex_next_limit_down_ret",
     "_twpub_dividend_year",
@@ -155,6 +157,7 @@ def build_tw_public_training_features(
     symbols = _load_symbol_filter(symbols_root)
     stock_frames = [
         _build_official_ohlcv_features(input_dir),
+        _build_delisted_company_rules(input_dir),
         _build_valuation_features(input_dir),
         _build_margin_features(input_dir),
         _build_institutional_features(input_dir),
@@ -518,6 +521,7 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                 [
                     _date_column_expr("date").alias("date"),
                     _symbol_expr("證券代號").alias("symbol"),
+                    pl.lit(1.0).alias("_twpub_official_traded"),
                     close.alias("_close"),
                     _positive_log1p(volume).alias("twpub_official_trading_volume_log"),
                     _positive_log1p(value).alias("twpub_official_trading_value_log"),
@@ -542,6 +546,7 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                 [
                     _date_column_expr("date").alias("date"),
                     _symbol_expr("代號").alias("symbol"),
+                    pl.lit(1.0).alias("_twpub_official_traded"),
                     close.alias("_close"),
                     _positive_log1p(volume).alias("twpub_official_trading_volume_log"),
                     _positive_log1p(value).alias("twpub_official_trading_value_log"),
@@ -565,6 +570,26 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
         .with_columns(_safe_log(pl.col("_close") / pl.col("_close").shift(1).over("symbol")).alias("twpub_official_close_logret_1d"))
         .drop("_close")
     )
+
+
+def _build_delisted_company_rules(input_dir: Path) -> pl.DataFrame:
+    frames: list[pl.DataFrame] = []
+    for dataset in ("twse_delisted_company", "tpex_delisted_company"):
+        frame = _read_optional(input_dir, dataset)
+        if frame.is_empty() or not {"date", "symbol"}.issubset(frame.columns):
+            continue
+        frames.append(
+            frame.select(
+                [
+                    _date_column_expr("date").alias("date"),
+                    _symbol_expr("symbol").alias("symbol"),
+                    pl.lit(1.0).alias("_twpub_delisted"),
+                ]
+            ).drop_nulls(["date", "symbol"])
+        )
+    if not frames:
+        return pl.DataFrame()
+    return pl.concat(frames, how="diagonal_relaxed").unique(["date", "symbol"], keep="last")
 
 
 def _build_twse_market_index_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
