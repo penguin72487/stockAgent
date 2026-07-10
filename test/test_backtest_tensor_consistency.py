@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-from stockagent.backtest.simulator import run_backtest_torch, run_backtest_torch_reduced
+from stockagent.backtest.simulator import BacktestResultTensor, run_backtest_torch, run_backtest_torch_reduced
 import stockagent.backtest.simulator as simulator
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -45,6 +45,53 @@ class _EchoWeightModel(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         del mask
         return x[:, -1, :, 0]
+
+
+def test_backtest_result_tensor_to_numpy_casts_bfloat16_before_numpy_boundary() -> None:
+    result = BacktestResultTensor(
+        strategy_returns=torch.tensor([0.01, -0.02], dtype=torch.bfloat16),
+        benchmark_returns=torch.tensor([0.0, 0.01], dtype=torch.bfloat16),
+        turnovers=torch.tensor([0.1, 0.2], dtype=torch.bfloat16),
+        weights_history=torch.tensor([[0.5, -0.5], [0.4, -0.4]], dtype=torch.bfloat16),
+    ).to_numpy()
+
+    assert result.strategy_returns.dtype == np.float32
+    assert result.benchmark_returns.dtype == np.float32
+    assert result.turnovers.dtype == np.float32
+    assert result.weights_history.dtype == np.float32
+
+
+def test_bfloat16_model_weights_use_float32_finance_backtest_with_gradients() -> None:
+    raw_weights = torch.tensor(
+        [[0.6, -0.4], [0.5, -0.5]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    future_returns = torch.tensor(
+        [[0.01, -0.02], [0.03, 0.01]],
+        dtype=torch.float32,
+    )
+    tradable = torch.ones_like(raw_weights, dtype=torch.bool)
+
+    result = run_backtest_torch(
+        raw_weights,
+        future_returns,
+        tradable,
+        torch.zeros(2, dtype=torch.float32),
+        buy_fee_rate=0.001,
+        sell_fee_rate=0.002,
+        long_only=False,
+        can_buy_mask=tradable,
+        can_sell_mask=tradable,
+    )
+
+    assert result.strategy_returns.dtype == torch.float32
+    assert result.benchmark_returns.dtype == torch.float32
+    assert result.turnovers.dtype == torch.float32
+    assert result.weights_history.dtype == torch.float32
+    result.strategy_returns.sum().backward()
+    assert raw_weights.grad is not None
+    assert torch.isfinite(raw_weights.grad.float()).all()
 
 
 class _EchoPanelWeightModel(_EchoWeightModel):

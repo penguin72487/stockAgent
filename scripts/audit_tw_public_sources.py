@@ -16,7 +16,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from downloader.download_tw_public_data import DEFAULT_DATASETS
+from downloader.download_tw_public_data import (
+    DEFAULT_DATASETS,
+    TPEX_MODEL_USEFUL_PATHS,
+    TWSE_MODEL_USEFUL_PATHS,
+    _api_dataset_name,
+)
 
 
 CATALOGS = {
@@ -36,6 +41,14 @@ EXACT_COVERAGE = {
     ("TPEx", "/mopsfin_t187ap03_O"): "tpex_basic_company",
     ("TPEx", "/tpex_disposal_information"): "tpex_disposal_stock",
     ("TPEx", "/tpex_trading_warning_information"): "tpex_attention_stock",
+    **{
+        ("TWSE", f"/{path}"): _api_dataset_name("twse", path)
+        for path, _group in TWSE_MODEL_USEFUL_PATHS
+    },
+    **{
+        ("TPEx", f"/{path}"): _api_dataset_name("tpex", path)
+        for path, _group in TPEX_MODEL_USEFUL_PATHS
+    },
 }
 
 # The project uses date-query endpoints rather than these current/snapshot OpenAPI

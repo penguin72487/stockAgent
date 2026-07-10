@@ -1153,11 +1153,16 @@ class BacktestResultTensor:
     final_weights: torch.Tensor | None = None  # [S], realised weights after the final simulated day.
 
     def to_numpy(self) -> BacktestResult:
+        # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
+        # than after .numpy(), because the latter raises before astype can run.
+        def as_float32(tensor: torch.Tensor) -> np.ndarray:
+            return tensor.detach().to(device="cpu", dtype=torch.float32).numpy()
+
         return BacktestResult(
-            strategy_returns=self.strategy_returns.detach().cpu().numpy().astype(np.float32),
-            benchmark_returns=self.benchmark_returns.detach().cpu().numpy().astype(np.float32),
-            turnovers=self.turnovers.detach().cpu().numpy().astype(np.float32),
-            weights_history=self.weights_history.detach().cpu().numpy().astype(np.float32),
+            strategy_returns=as_float32(self.strategy_returns),
+            benchmark_returns=as_float32(self.benchmark_returns),
+            turnovers=as_float32(self.turnovers),
+            weights_history=as_float32(self.weights_history),
         )
 
 
@@ -1930,6 +1935,11 @@ def _prepare_scan_inputs(
     min_trade_weight: float,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Model forward stays under BF16/FP16 AMP, but portfolio state, fee-adjusted
+    # returns, turnover, and finance reductions are numerically sensitive. Keep
+    # the canonical backtest in FP32; .to() preserves the gradient path back to
+    # lower-precision model outputs.
+    weights = weights.to(dtype=torch.float32)
     gross_budget = _resolve_exposure_budget(gross_leverage)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="backtest input preparation")
     buy_input = tradable_mask if can_buy_mask is None else can_buy_mask

@@ -91,6 +91,31 @@ data:
     - twpub_dealer_net_buy_flow
     - twpub_institutional_net_buy_flow
 
+    # Point-in-time monthly revenue / financial statements
+    - twpub_monthly_revenue_log
+    - twpub_monthly_revenue_mom
+    - twpub_monthly_revenue_yoy
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_eps
+    - twpub_financial_revenue_log
+    - twpub_financial_net_income_asinh
+    - twpub_financial_gross_margin
+    - twpub_financial_operating_margin
+    - twpub_financial_net_margin
+    - twpub_financial_assets_log
+    - twpub_financial_debt_ratio
+    - twpub_financial_current_ratio
+    - twpub_financial_equity_ratio
+    - twpub_financial_book_value_per_share_log
+
+    # Point-in-time ownership / securities lending
+    - twpub_insider_holdings_log
+    - twpub_insider_pledge_ratio
+    - twpub_insider_transfer_shares_log
+    - twpub_borrow_available_log
+    - twpub_sbl_balance_log
+    - twpub_short_sale_available_log
+
     # TW public TDCC holders
     - twpub_tdcc_retail_holder_ratio
     - twpub_tdcc_large_holder_ratio

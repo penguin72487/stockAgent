@@ -416,6 +416,31 @@ def _overlay_external_values(
     target[target_rows[value_rows], value_cols] = values[value_rows, value_cols]
 
 
+_POINT_IN_TIME_STATE_FEATURE_PREFIXES = (
+    "twpub_monthly_revenue_",
+    "twpub_financial_",
+)
+_POINT_IN_TIME_STATE_FEATURES = {
+    "twpub_insider_holdings_log",
+    "twpub_insider_pledge_ratio",
+}
+
+
+def _forward_fill_point_in_time_features(values: np.ndarray, feature_names: list[str]) -> None:
+    if values.ndim != 2 or values.shape[0] == 0:
+        return
+    for col_idx, name in enumerate(feature_names):
+        if name not in _POINT_IN_TIME_STATE_FEATURES and not name.startswith(_POINT_IN_TIME_STATE_FEATURE_PREFIXES):
+            continue
+        column = values[:, col_idx]
+        valid = np.flatnonzero(np.isfinite(column))
+        if valid.size == 0:
+            continue
+        last_seen = np.maximum.accumulate(np.where(np.isfinite(column), np.arange(column.size), -1))
+        fill_rows = (last_seen >= 0) & ~np.isfinite(column)
+        column[fill_rows] = column[last_seen[fill_rows]]
+
+
 def _contiguous_indexer(indices: list[int]) -> Any:
     if not indices:
         return slice(0, 0)
@@ -1345,6 +1370,7 @@ def _build_panel_from_symbol_arrays(
     external_source_indexer = _contiguous_indexer(external_feature_indices)
     external_dest_indexer = _contiguous_indexer(external_dest_indices)
     external_dest_is_slice = isinstance(external_dest_indexer, slice)
+    selected_external_feature_names = [all_external_feature_names[idx] for idx in external_feature_indices]
     total_available_features = len(all_base_feature_names) + len(all_external_feature_names)
     if num_features != total_available_features:
         print(
@@ -1397,6 +1423,7 @@ def _build_panel_from_symbol_arrays(
                 symbol_values = symbol_external[1][:, external_source_indexer]
                 target = symbol_features[:, external_dest_indexer]
                 _overlay_external_values(target, all_dates, symbol_external[0], symbol_values)
+                _forward_fill_point_in_time_features(target, selected_external_feature_names)
                 if not external_dest_is_slice:
                     symbol_features[:, external_dest_indexer] = target
         returns_1d[row_idx, sym_idx] = item.returns_1d if all_valid else item.returns_1d[valid]
@@ -1624,7 +1651,9 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
     down_idx = rule_to_idx.get("_twpub_tpex_next_limit_down_ret")
     traded_idx = rule_to_idx.get("_twpub_official_traded")
     delisted_idx = rule_to_idx.get("_twpub_delisted")
-    if up_idx is None and down_idx is None and traded_idx is None and delisted_idx is None:
+    short_ban_idx = rule_to_idx.get("_twpub_short_open_ban")
+    trading_halt_idx = rule_to_idx.get("_twpub_trading_halt")
+    if all(idx is None for idx in (up_idx, down_idx, traded_idx, delisted_idx, short_ban_idx, trading_halt_idx)):
         return panel
 
     can_buy = np.asarray(panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask, dtype=bool).copy()
@@ -1641,6 +1670,17 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         if rule_values.size == 0:
             continue
         aligned_rules = _align_external_values(panel.dates, rule_dates, rule_values)
+        if trading_halt_idx is not None:
+            halted = np.isfinite(aligned_rules[:, trading_halt_idx]) & (aligned_rules[:, trading_halt_idx] > 0.0)
+            if bool(halted.any()):
+                can_buy[halted, sym_idx] = False
+                can_sell[halted, sym_idx] = False
+                if panel.can_short_open_mask is not None:
+                    panel.can_short_open_mask[halted, sym_idx] = False
+                panel.returns_1d[halted, sym_idx] = 0.0
+        if short_ban_idx is not None and panel.can_short_open_mask is not None:
+            short_banned = np.isfinite(aligned_rules[:, short_ban_idx]) & (aligned_rules[:, short_ban_idx] > 0.0)
+            panel.can_short_open_mask[short_banned, sym_idx] = False
         delisted_rows = np.empty((0,), dtype=np.int64)
         if delisted_idx is not None:
             event_mask = np.isfinite(rule_values[:, delisted_idx]) & (rule_values[:, delisted_idx] > 0.0)

@@ -65,6 +65,27 @@ STOCK_FEATURE_COLUMNS = (
     "twpub_attention_close_log",
     "twpub_attention_pe_log",
     "twpub_disposal_count_log",
+    "twpub_monthly_revenue_log",
+    "twpub_monthly_revenue_mom",
+    "twpub_monthly_revenue_yoy",
+    "twpub_cumulative_revenue_yoy",
+    "twpub_financial_eps",
+    "twpub_financial_revenue_log",
+    "twpub_financial_net_income_asinh",
+    "twpub_financial_gross_margin",
+    "twpub_financial_operating_margin",
+    "twpub_financial_net_margin",
+    "twpub_financial_assets_log",
+    "twpub_financial_debt_ratio",
+    "twpub_financial_current_ratio",
+    "twpub_financial_equity_ratio",
+    "twpub_financial_book_value_per_share_log",
+    "twpub_insider_holdings_log",
+    "twpub_insider_pledge_ratio",
+    "twpub_insider_transfer_shares_log",
+    "twpub_borrow_available_log",
+    "twpub_sbl_balance_log",
+    "twpub_short_sale_available_log",
 )
 
 MARKET_FEATURE_COLUMNS = (
@@ -120,6 +141,8 @@ RULE_COLUMNS = (
     "_twpub_dividend_year",
     "_twpub_attention_flag",
     "_twpub_disposal_flag",
+    "_twpub_short_open_ban",
+    "_twpub_trading_halt",
 )
 OUTPUT_COLUMNS = (*FEATURE_COLUMNS, *RULE_COLUMNS)
 KEY_COLUMNS = ("date", "symbol")
@@ -167,6 +190,10 @@ def build_tw_public_training_features(
         _build_ex_dividend_preview_features(input_dir),
         _build_material_info_features(input_dir),
         _build_attention_disposal_features(input_dir),
+        _build_model_useful_financial_features(input_dir),
+        _build_model_useful_ownership_features(input_dir),
+        _build_model_useful_shorting_features(input_dir),
+        _build_model_useful_rule_features(input_dir),
     ]
     stock_features = _merge_feature_frames(stock_frames)
     if symbols is not None and not stock_features.is_empty():
@@ -590,6 +617,206 @@ def _build_delisted_company_rules(input_dir: Path) -> pl.DataFrame:
     if not frames:
         return pl.DataFrame()
     return pl.concat(frames, how="diagonal_relaxed").unique(["date", "symbol"], keep="last")
+
+
+def _snapshot_date_expr(columns: set[str]):
+    explicit = _first_existing(columns, ("出表日期", "Date", "日期"))
+    return _date_column_expr(explicit) if explicit else _date_column_expr("date")
+
+
+def _snapshot_symbol_expr(columns: set[str]):
+    name = _first_existing(columns, ("公司代號", "SecuritiesCompanyCode", "Code", "TWSECode"))
+    return _symbol_expr(name) if name else pl.lit("")
+
+
+def _read_glob(input_dir: Path, pattern: str) -> list[pl.DataFrame]:
+    return [pl.read_parquet(path) for path in sorted(input_dir.glob(pattern))]
+
+
+def _build_model_useful_financial_features(input_dir: Path) -> pl.DataFrame:
+    monthly_frames: list[pl.DataFrame] = []
+    income_frames: list[pl.DataFrame] = []
+    balance_frames: list[pl.DataFrame] = []
+    for frame in _read_glob(input_dir, "*_api_*t187ap05_[lo].parquet"):
+        columns = set(frame.columns)
+        revenue = _first_num_expr(columns, ("營業收入-當月營收",))
+        monthly_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _positive_log1p(revenue).alias("twpub_monthly_revenue_log"),
+                (_first_num_expr(columns, ("營業收入-上月比較增減(%)",)) / 100.0).alias("twpub_monthly_revenue_mom"),
+                (_first_num_expr(columns, ("營業收入-去年同月增減(%)",)) / 100.0).alias("twpub_monthly_revenue_yoy"),
+                (_first_num_expr(columns, ("累計營業收入-前期比較增減(%)",)) / 100.0).alias("twpub_cumulative_revenue_yoy"),
+            )
+        )
+
+    for frame in _read_glob(input_dir, "*_api_*t187ap06_*parquet"):
+        columns = set(frame.columns)
+        revenue = _first_num_expr(columns, ("營業收入", "收益", "利息淨收益"))
+        gross = _first_num_expr(columns, ("營業毛利（毛損）淨額", "營業毛利（毛損）"))
+        operating = _first_num_expr(columns, ("營業利益（損失）", "繼續營業單位稅前淨利（淨損）"))
+        net_income = _first_num_expr(columns, ("本期淨利（淨損）", "本期稅後淨利（淨損）"))
+        income_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _first_num_expr(columns, ("基本每股盈餘（元）", "基本每股盈餘")).alias("twpub_financial_eps"),
+                _positive_log1p(revenue).alias("twpub_financial_revenue_log"),
+                _signed_asinh(net_income, scale=100000.0).alias("twpub_financial_net_income_asinh"),
+                _safe_ratio(gross, revenue).alias("twpub_financial_gross_margin"),
+                _safe_ratio(operating, revenue).alias("twpub_financial_operating_margin"),
+                _safe_ratio(net_income, revenue).alias("twpub_financial_net_margin"),
+            )
+        )
+
+    for frame in _read_glob(input_dir, "*_api_*t187ap07_*parquet"):
+        columns = set(frame.columns)
+        assets = _first_num_expr(columns, ("資產總額", "資產總計"))
+        liabilities = _first_num_expr(columns, ("負債總額", "負債總計"))
+        current_assets = _first_num_expr(columns, ("流動資產",))
+        current_liabilities = _first_num_expr(columns, ("流動負債",))
+        equity = _first_num_expr(columns, ("權益總額", "權益總計"))
+        balance_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _positive_log1p(assets).alias("twpub_financial_assets_log"),
+                _safe_ratio(liabilities, assets).alias("twpub_financial_debt_ratio"),
+                _safe_ratio(current_assets, current_liabilities).alias("twpub_financial_current_ratio"),
+                _safe_ratio(equity, assets).alias("twpub_financial_equity_ratio"),
+                _positive_log(_first_num_expr(columns, ("每股參考淨值",))).alias("twpub_financial_book_value_per_share_log"),
+            )
+        )
+    groups = [
+        pl.concat(group, how="diagonal_relaxed")
+        for group in (monthly_frames, income_frames, balance_frames)
+        if group
+    ]
+    return _merge_feature_frames(groups)
+
+
+def _build_model_useful_ownership_features(input_dir: Path) -> pl.DataFrame:
+    holding_frames: list[pl.DataFrame] = []
+    transfer_frames: list[pl.DataFrame] = []
+    for frame in _read_glob(input_dir, "*_api_*t187ap11_[lo].parquet"):
+        columns = set(frame.columns)
+        holding_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _num_expr("目前持股").alias("holdings"),
+                _num_expr("設質股數").alias("pledged"),
+            ).group_by(["date", "symbol"]).agg(
+                _positive_log1p(pl.col("holdings").sum()).alias("twpub_insider_holdings_log"),
+                _safe_ratio(pl.col("pledged").sum(), pl.col("holdings").sum()).alias("twpub_insider_pledge_ratio"),
+            )
+        )
+    for frame in _read_glob(input_dir, "*_api_*t187ap12_[lo].parquet"):
+        columns = set(frame.columns)
+        transfer_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _num_expr("預定轉讓方式及股數-轉讓股數").alias("shares"),
+            ).group_by(["date", "symbol"]).agg(
+                _positive_log1p(pl.col("shares").sum()).alias("twpub_insider_transfer_shares_log")
+            )
+        )
+    groups = [
+        pl.concat(group, how="diagonal_relaxed")
+        for group in (holding_frames, transfer_frames)
+        if group
+    ]
+    return _merge_feature_frames(groups)
+
+
+def _build_model_useful_shorting_features(input_dir: Path) -> pl.DataFrame:
+    frames: list[pl.DataFrame] = []
+    tpex = _read_optional(input_dir, "tpex_api_tpex_margin_sbl")
+    if not tpex.is_empty():
+        columns = set(tpex.columns)
+        frames.append(
+            tpex.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _positive_log1p(_num_expr("SaleAvailableVolumes")).alias("twpub_short_sale_available_log"),
+                _positive_log1p(_num_expr("SecuritiesBorrowingBalanceOfTheMarketDay")).alias("twpub_sbl_balance_log"),
+                _positive_log1p(_num_expr("AvailableVolumesForSBLShortSale")).alias("twpub_borrow_available_log"),
+            )
+        )
+    twse = _read_optional(input_dir, "twse_api_sbl_twt96u")
+    if not twse.is_empty():
+        for code, volume in (("TWSECode", "TWSEAvailableVolume"), ("GRETAICode", "GRETAIAvailableVolume")):
+            frames.append(
+                twse.select(
+                    _date_column_expr("date").alias("date"),
+                    _symbol_expr(code).alias("symbol"),
+                    _positive_log1p(_num_expr(volume)).alias("twpub_borrow_available_log"),
+                )
+            )
+    return _finalize_feature_frame(pl.concat(frames, how="diagonal_relaxed")) if frames else pl.DataFrame()
+
+
+def _expand_rule_range(
+    frame: pl.DataFrame,
+    *,
+    symbol: str,
+    start: str,
+    end: str | None,
+    rule: str,
+    end_exclusive: bool = False,
+) -> pl.DataFrame:
+    columns = set(frame.columns)
+    start_expr = _date_column_expr(start)
+    if end and end in columns:
+        parsed_end = _date_column_expr(end)
+        end_expr = pl.coalesce([parsed_end.dt.offset_by("-1d") if end_exclusive else parsed_end, start_expr])
+    else:
+        end_expr = start_expr
+    return (
+        frame.select(
+            _symbol_expr(symbol).alias("symbol"),
+            pl.date_ranges(start_expr, end_expr, interval="1d", closed="both").alias("date"),
+        )
+        .explode("date", empty_as_null=True)
+        .drop_nulls(["date", "symbol"])
+        .with_columns(pl.lit(1.0).alias(rule))
+    )
+
+
+def _build_model_useful_rule_features(input_dir: Path) -> pl.DataFrame:
+    frames: list[pl.DataFrame] = []
+    specs = (
+        ("twse_api_exchangereport_bfi84u", "Code", "StartDate", "EndDate", "_twpub_short_open_ban", False),
+        ("tpex_api_tpex_margin_trading_term", "SecuritiesCompanyCode", "ShortSaleSuspensionStartDate", "ShortSaleSuspensionEndDate", "_twpub_short_open_ban", False),
+        ("twse_api_exchangereport_twtawu", "Code", "TradingHaltDate", "TradingResumptionDate", "_twpub_trading_halt", True),
+        ("tpex_api_tpex_spendi_history", "SecuritiesCompanyCode", "DateOfSuspendedTrading", "DateOfResumedTrading", "_twpub_trading_halt", True),
+    )
+    for dataset, symbol, start, end, rule, end_exclusive in specs:
+        frame = _read_optional(input_dir, dataset)
+        if not frame.is_empty() and {symbol, start}.issubset(frame.columns):
+            frames.append(
+                _expand_rule_range(
+                    frame,
+                    symbol=symbol,
+                    start=start,
+                    end=end,
+                    rule=rule,
+                    end_exclusive=end_exclusive,
+                )
+            )
+    cmode = _read_optional(input_dir, "tpex_api_tpex_cmode")
+    if not cmode.is_empty():
+        frames.append(
+            cmode.filter(_text_expr("SuspensionOfTrading").is_in(["Y", "Ｙ", "是"]))
+            .select(
+                _date_column_expr("Date").alias("date"),
+                _symbol_expr("SecuritiesCompanyCode").alias("symbol"),
+                pl.lit(1.0).alias("_twpub_trading_halt"),
+            )
+        )
+    return _finalize_feature_frame(pl.concat(frames, how="diagonal_relaxed")) if frames else pl.DataFrame()
 
 
 def _build_twse_market_index_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
