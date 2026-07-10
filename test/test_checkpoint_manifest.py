@@ -1202,8 +1202,17 @@ def test_tree_sidecar_makes_completed_fold_manifest_verifiable(tmp_path: Path) -
     (fold_dir / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     (fold_dir / "model.pt").write_bytes(b"tree pickle placeholder")
     (fold_dir / "test_backtest.npz").write_bytes(b"backtest placeholder")
+    (fold_dir / "deployment_test_backtest.npz").write_bytes(b"deployment placeholder")
     (fold_dir / "fold_complete.json").write_text(
-        json.dumps({"status": "complete"}), encoding="utf-8"
+        json.dumps(
+            {
+                "status": "complete",
+                "artifact_scope_version": 2,
+                "test_scope": "full_horizon",
+                "deployment_scope": "stitched_deployment",
+            }
+        ),
+        encoding="utf-8",
     )
     checkpoint_path = fold_dir / "checkpoint_best.pt"
     _save_tree_checkpoint_metadata(

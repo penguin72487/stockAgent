@@ -2,6 +2,7 @@ import json
 import inspect
 import math
 import os
+import random
 
 import numpy as np
 import pytest
@@ -33,6 +34,7 @@ from stockagent.training.trainer import (
     _distributed_min_int,
     _distributed_probe_succeeded,
     _deployment_test_indices,
+    _deployment_test_prefix_rows,
     _estimate_eval_chunk_rows,
     _evaluate_tensor_batch,
     _evaluate_windowed_aux_objective_loss,
@@ -2341,11 +2343,122 @@ def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> 
     second_indices = _deployment_test_indices(panel, folds[1], None, lookback)
     first_ds = CrossSectionalDataset(panel, first_indices, lookback)
     second_ds = CrossSectionalDataset(panel, second_indices, lookback)
+    first_full_ds = CrossSectionalDataset(panel, folds[0].test_indices, lookback)
 
     assert panel.dates[first_ds.valid_indices[0]] == np.datetime64("2022-01-04")
     assert panel.dates[first_ds.valid_indices[-1]] == np.datetime64("2023-01-03")
     assert panel.dates[second_ds.valid_indices[0]] == np.datetime64("2023-01-04")
     assert np.intersect1d(first_ds.valid_indices, second_ds.valid_indices).size == 0
+    assert _deployment_test_prefix_rows(
+        panel,
+        folds[0],
+        folds[1],
+        lookback,
+        first_full_ds.valid_indices,
+    ) == len(first_ds)
+    assert np.array_equal(
+        first_ds.valid_indices,
+        first_full_ds.valid_indices[: len(first_ds)],
+    )
+
+
+def test_full_test_survives_zero_row_experimental_deployment_handoff() -> None:
+    lookback = 4
+    dates = np.concatenate(
+        [
+            np.arange(f"{year}-01-01", f"{year}-01-11", dtype="datetime64[D]")
+            for year in range(2020, 2024)
+        ]
+    )
+    rows = int(dates.size)
+    mask = np.ones((rows, 2), dtype=bool)
+    panel = PanelData(
+        dates=dates,
+        symbols=["A", "B"],
+        feature_names=["f0"],
+        features=np.ones((rows, 2, 1), dtype=np.float32),
+        returns_1d=np.ones((rows, 2), dtype=np.float32) * 0.001,
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=mask.copy(),
+        alive_mask=mask.copy(),
+        benchmark_returns=np.zeros((rows,), dtype=np.float32),
+        close_prices=np.ones((rows, 2), dtype=np.float32),
+    )
+    folds = build_expanding_year_folds(
+        dates,
+        min_train_years=1,
+        val_years=1,
+        require_future_test_year=False,
+    )
+    penultimate = folds[-2]
+    experimental = folds[-1]
+    assert penultimate.test_years == experimental.test_years == [2023]
+
+    full_ds = CrossSectionalDataset(panel, penultimate.test_indices, lookback)
+    assert len(full_ds) > 0
+    assert _deployment_test_prefix_rows(
+        panel,
+        penultimate,
+        experimental,
+        lookback,
+        full_ds.valid_indices,
+    ) == 0
+
+
+def test_tensor_metrics_max_drawdown_includes_initial_nav() -> None:
+    log_returns = torch.log1p(torch.tensor([-0.10, 0.01, 0.01], dtype=torch.float64))
+    metrics = trainer_module._compute_metrics_from_tensors(
+        log_returns,
+        torch.zeros_like(log_returns),
+        torch.zeros_like(log_returns),
+    )
+
+    assert metrics["max_drawdown"] == pytest.approx(-0.10)
+
+
+def test_artifact_migration_rng_guard_restores_process_streams() -> None:
+    original_python_state = random.getstate()
+    original_numpy_state = np.random.get_state()
+    original_torch_state = torch.get_rng_state().clone()
+    try:
+        random.seed(71)
+        np.random.seed(72)
+        torch.manual_seed(73)
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.get_rng_state().clone()
+
+        with trainer_module._preserve_process_rng_state():
+            random.random()
+            np.random.random()
+            torch.rand(4)
+
+        restored_numpy_state = np.random.get_state()
+        assert random.getstate() == python_state
+        assert restored_numpy_state[0] == numpy_state[0]
+        np.testing.assert_array_equal(restored_numpy_state[1], numpy_state[1])
+        assert restored_numpy_state[2:] == numpy_state[2:]
+        assert torch.equal(torch.get_rng_state(), torch_state)
+    finally:
+        random.setstate(original_python_state)
+        np.random.set_state(original_numpy_state)
+        torch.set_rng_state(original_torch_state)
+
+
+def test_rank0_store_phase_rejects_uninitialized_multi_rank(monkeypatch) -> None:
+    called = False
+
+    def _operation() -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(trainer_module, "_distributed_is_initialized", lambda: False)
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 2)
+
+    with pytest.raises(RuntimeError, match="requires an initialized process group"):
+        trainer_module._run_rank0_store_synchronized_phase("probe", _operation)
+    assert not called
 
 
 def test_cross_sectional_dataset_allows_empty_split_when_requested() -> None:
