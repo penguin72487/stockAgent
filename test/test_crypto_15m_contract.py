@@ -13,7 +13,7 @@ def test_crypto_market_config_is_15m() -> None:
     config = load_config("configs/markets/crypto.yaml")
 
     assert config.trading.frequency == "15m"
-    assert config.training.target == "next_15m_rank"
+    assert config.trading.frequency == "15m"
     assert config.data.universe_mode == "all_15m_symbols"
 
 

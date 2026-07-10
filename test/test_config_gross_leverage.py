@@ -33,8 +33,6 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
                 "data": {
                     "parquet_root": "data_yahoo/tw_stocks",
                     "benchmark_name": "2330",
-                    "benchmark_required": False,
-                    "benchmark_source": "derived_from_panel",
                     "universe_mode": "all_daily_symbols",
                 },
                 "walk_forward": {
@@ -47,7 +45,6 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
                     "buy_fee_rate": 0.000855,
                     "sell_fee_rate": 0.003855,
                     "long_only": False,
-                    "cash_allowed": True,
                     "gross_leverage": 2.5,
                 },
                 "training": training,

@@ -6,8 +6,11 @@ from typing import Any
 
 import yaml
 
+from stockagent.portfolio_contract import (
+    DEFAULT_PORTFOLIO_ACTIVATION,
+    normalize_portfolio_activation,
+)
 
-DEFAULT_PORTFOLIO_ACTIVATION = "identity"
 _CONFIG_INHERITANCE_KEYS = ("base_config", "base_configs", "extends", "inherits")
 
 
@@ -58,39 +61,6 @@ def _load_raw_config(path: str | Path, stack: tuple[Path, ...] = ()) -> dict[str
             base_path = config_path.parent / base_path
         merged = _deep_merge_config(merged, _load_raw_config(base_path, next_stack))
     return _deep_merge_config(merged, raw)
-
-
-def _normalize_portfolio_activation(activation: str | None) -> str:
-    normalized = str(activation or DEFAULT_PORTFOLIO_ACTIVATION).strip().lower().replace("-", "_")
-    aliases = {
-        "arc_tan": "atan",
-        "arctan": "atan",
-        "erf_scaled": "erf",
-        "gd": "gudermannian",
-        "already_normalized": "pre_normalized",
-        "inverse_square_root_unit": "isru",
-        "inverse_sqrt": "isru",
-        "inverse_sqrt_unit": "isru",
-        "isr": "isru",
-        "isru1": "isru",
-        "pre_normalized_weights": "pre_normalized",
-        "preserve": "pre_normalized",
-        "preserve_weights": "pre_normalized",
-        "soft_sign": "softsign",
-        "weights": "pre_normalized",
-        "x_over_1_abs_x": "softsign",
-        "x_over_sqrt_1_x2": "isru",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized in {"identity", "linear", "none", "raw"}:
-        return "identity"
-    valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian", "pre_normalized"}
-    if normalized not in valid:
-        raise ValueError(
-            "trading.portfolio_activation must be one of "
-            "'identity', 'tanh', 'softsign', 'isru', 'erf', 'atan', 'gd', or 'pre_normalized'"
-        )
-    return normalized
 
 
 def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
@@ -216,8 +186,6 @@ class EnvironmentConfig:
 class DataConfig:
     parquet_root: str
     benchmark_name: str
-    benchmark_required: bool
-    benchmark_source: str
     universe_mode: str
     security_filter: str = "none"
     use_rapids: bool = False
@@ -247,7 +215,6 @@ class TradingConfig:
     buy_fee_rate: float
     sell_fee_rate: float
     long_only: bool
-    cash_allowed: bool
     max_turnover_ratio: float = 0.0
     max_volume_participation: float = 0.0
     volume_participation_equity: float = 1_000_000.0
@@ -427,6 +394,7 @@ class TransformerBasePortfolioModelConfig:
     default_temperature: float = 1.0
     portfolio_mode: str = "auto"
     portfolio_output_mode: str = "activation_l1"
+    center_long_short_logits: bool = True
     max_full_tokens: int = 4096
     checkpoint_blocks: bool = False
     return_aux: bool = True
@@ -517,6 +485,7 @@ class MultitaskLossConfig:
     direction_weight: float = 0.05
     volatility_regime_weight: float = 0.05
     concentration_weight: float = 0.005
+    net_exposure_weight: float = 0.0
     regime_up_threshold: float = 0.002
     regime_down_threshold: float = -0.002
 
@@ -582,9 +551,6 @@ class XGBoostModelConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
-    backend: str
-    target: str
-    batch_mode: str
     non_blocking_transfer: bool
     model_name: str
     seed: int = 42
@@ -832,6 +798,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
 
     training = raw.setdefault("training", {})
+    for removed_key in ("backend", "target", "batch_mode"):
+        training.pop(removed_key, None)
     if "eval_backtest_engine" in training:
         raise ValueError(
             "training.eval_backtest_engine has been removed; "
@@ -1236,6 +1204,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     transformer_base_portfolio["portfolio_output_mode"] = _normalize_portfolio_output_mode(
         transformer_base_portfolio.get("portfolio_output_mode")
     )
+    transformer_base_portfolio.setdefault("center_long_short_logits", True)
     transformer_base_portfolio.setdefault("max_full_tokens", 4096)
     transformer_base_portfolio.setdefault("checkpoint_blocks", False)
     transformer_base_portfolio.setdefault("return_aux", True)
@@ -1358,6 +1327,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     multitask_loss.setdefault("direction_weight", 0.05)
     multitask_loss.setdefault("volatility_regime_weight", 0.05)
     multitask_loss.setdefault("concentration_weight", 0.005)
+    multitask_loss.setdefault("net_exposure_weight", 0.0)
     multitask_loss.setdefault("regime_up_threshold", 0.002)
     multitask_loss.setdefault("regime_down_threshold", -0.002)
 
@@ -1444,6 +1414,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     data = raw.setdefault("data", {})
     data.setdefault("use_rapids", False)
+    data.pop("benchmark_required", None)
+    data.pop("benchmark_source", None)
     data.setdefault("usd_only_trading_pairs", False)
     data.setdefault("trading_volume_policy", "auto")
     data.setdefault("security_filter", "none")
@@ -1457,6 +1429,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data.setdefault("feature_exclude", [])
 
     trading = raw.setdefault("trading", {})
+    trading.pop("cash_allowed", None)
 
     # Legacy migration:
     # - data.tw_limit_up_down_guard=true  -> buy/sell use TW limit guard
@@ -1622,7 +1595,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     trading["volume_participation_equity"] = max(1e-12, float(trading.get("volume_participation_equity", 1_000_000.0)))
     trading["leverage"] = max(0.0, float(trading.get("leverage", 1.0)))
     trading["min_trade_weight"] = max(0.0, float(trading.get("min_trade_weight", 0.0)))
-    trading["portfolio_activation"] = _normalize_portfolio_activation(trading.get("portfolio_activation"))
+    trading["portfolio_activation"] = normalize_portfolio_activation(trading.get("portfolio_activation"))
     evaluation = raw.setdefault("evaluation", {})
     evaluation.pop("primary_baseline", None)
     evaluation.pop("metrics", None)
@@ -1630,7 +1603,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if loss_activation in {"", "auto", "trading", "same", "same_as_trading"}:
         training["loss_portfolio_activation"] = "auto"
     else:
-        training["loss_portfolio_activation"] = _normalize_portfolio_activation(loss_activation)
+        training["loss_portfolio_activation"] = normalize_portfolio_activation(loss_activation)
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
@@ -1660,9 +1633,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
         walk_forward=WalkForwardConfig(**raw["walk_forward"]),
         trading=TradingConfig(**raw["trading"]),
         training=TrainingConfig(
-            backend=training_raw["backend"],
-            target=training_raw["target"],
-            batch_mode=training_raw["batch_mode"],
             non_blocking_transfer=training_raw["non_blocking_transfer"],
             model_name=training_raw["model_name"],
             seed=training_raw["seed"],

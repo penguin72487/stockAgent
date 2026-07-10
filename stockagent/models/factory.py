@@ -363,6 +363,7 @@ def build_model(
             portfolio_mode=portfolio_mode,
             portfolio_activation=config.trading.portfolio_activation,
             portfolio_output_mode=tbp_cfg.portfolio_output_mode,
+            center_long_short_logits=tbp_cfg.center_long_short_logits,
             max_full_tokens=tbp_cfg.max_full_tokens,
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,

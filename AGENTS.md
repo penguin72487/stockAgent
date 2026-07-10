@@ -14,9 +14,11 @@ architecture, or explainability artifacts.
 ## Workspace And Environment
 
 - Repo root: `/home/user/stockAgent`.
-- Preferred Python runtime:
-  - `/home/user/miniforge3/envs/fintech/bin/python`
-- Do not assume `python` exists on PATH. Use the explicit fintech Python path for checks and tests.
+- Preferred Python runtime is the `fintech` Conda/Mamba environment, whose absolute
+  path differs across machines. Source `scripts/runtime_env.sh` and use
+  `resolve_fintech_python`; `FINTECH_ENV_PATH` or `PYTHON_BIN` may override discovery.
+- Do not assume `python` exists on PATH or hard-code one user's home directory.
+  Run `$(resolve_fintech_python) scripts/check_environment.py` before expensive jobs.
 - CUDA is expected for training. If CUDA is unavailable and `runner.require_cuda` is true, do not silently fall back to CPU.
 - Use `rg` / `rg --files` for search.
 - Use `apply_patch` for manual file edits.

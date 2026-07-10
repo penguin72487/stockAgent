@@ -68,6 +68,7 @@ Multi-asset Taiwan stock trading research workspace.
 ## Taiwan Public Data Download
 
 - Run `python downloader/download_tw_public_data.py --mode daily-update --datasets all --output-dir data_tw_public` to collect Taiwan free public datasets from TWSE, TPEx, MOPS-backed OpenAPI feeds, TDCC, TAIFEX, CBC, DGBAS, and MOF.
+- The same daily update also maintains official delisted-company histories in `twse_delisted_company.parquet` and `tpex_delisted_company.parquet`. Use `--datasets delisted` to update only these two datasets.
 - The first `daily-update` run backfills historical daily datasets where the official endpoint supports dates, including TWSE/TPEx OHLCV, margin balance, institutional trades, and valuation tables. Later runs append only missing dates.
 - Snapshot-style OpenAPI feeds that only publish the latest table are stored with a `date` batch column, so daily runs accumulate same-day-replaced snapshots instead of discarding prior days.
 - Government Data Platform datasets are resolved through `data.gov.tw` metadata at runtime, then written to parquet with raw metadata under `data_tw_public/metadata/`.

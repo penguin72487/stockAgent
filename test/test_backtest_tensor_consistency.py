@@ -212,7 +212,27 @@ def test_backtest_liquidates_before_symbol_becomes_untradable() -> None:
     )
 
     assert torch.allclose(result.weights_history[:, 0], torch.tensor([0.4, 0.0]))
-    assert torch.allclose(result.turnovers, torch.tensor([0.4, 0.0]))
+    assert torch.allclose(result.turnovers, torch.tensor([0.4, 0.4]))
+
+
+def test_forced_liquidation_charges_sell_fee() -> None:
+    weights = torch.tensor([[0.4], [0.4]], dtype=torch.float32)
+    returns = torch.zeros_like(weights)
+    tradable = torch.tensor([[True], [False]], dtype=torch.bool)
+    result = run_backtest_torch(
+        weights,
+        returns,
+        tradable,
+        torch.zeros(2),
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.01,
+        long_only=False,
+        portfolio_activation="pre_normalized",
+        can_buy_mask=tradable,
+        can_sell_mask=tradable,
+    )
+    assert torch.allclose(result.turnovers, torch.tensor([0.4, 0.4]))
+    assert torch.allclose(result.strategy_returns[1], torch.log1p(torch.tensor(-0.004)))
 
 
 def test_reduced_and_fused_log_utility_convert_asset_log_returns_for_short_pnl() -> None:
@@ -1178,6 +1198,174 @@ def test_log_utility_loss_uses_fee_adjusted_canonical_tensor_backtest_returns() 
     expected = -bt.strategy_returns.mean() * 252.0
 
     assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+
+
+def test_log_utility_concentration_penalty_uses_canonical_backtest_weights() -> None:
+    weights = torch.tensor(
+        [
+            [100.0, -100.0, 0.5],
+            [50.0, -25.0, -25.0],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    returns = torch.zeros_like(weights)
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros((2,), dtype=torch.float32)
+    sample_mask = torch.tensor([True, False], dtype=torch.bool)
+    concentration_weight = 0.7
+
+    loss = risk_aware_loss(
+        weights,
+        returns,
+        mask,
+        benchmark_returns=benchmark,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        sample_mask=sample_mask,
+        long_only=False,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=concentration_weight,
+        objective="log_utility",
+    )
+
+    bt = run_backtest_torch(
+        weights,
+        returns,
+        mask,
+        benchmark,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        return_weights_history=True,
+    )
+    tradable_f = mask.to(dtype=bt.weights_history.dtype)
+    active_count = tradable_f.sum(dim=1).clamp_min(1.0)
+    concentration = (bt.weights_history.pow(2) * tradable_f).sum(dim=1) * active_count
+    expected = concentration_weight * concentration[sample_mask].mean()
+
+    raw_concentration = (weights.detach().pow(2) * tradable_f).sum(dim=1) * active_count
+    assert torch.allclose(loss, expected, atol=1e-7, rtol=1e-6)
+    assert loss.detach() < concentration_weight * raw_concentration[sample_mask].mean() * 0.01
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+
+
+def test_log_utility_net_exposure_penalty_uses_realised_backtest_weights() -> None:
+    base_weights = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
+    returns = torch.zeros_like(base_weights)
+    tradable = torch.ones_like(base_weights, dtype=torch.bool)
+    can_buy = tradable.clone()
+    can_sell = torch.tensor([[True, False]], dtype=torch.bool)
+    sample_mask = torch.ones((1,), dtype=torch.bool)
+    initial_weights = torch.zeros((2,), dtype=torch.float32)
+    net_exposure_weight = 2.0
+
+    general_weights = base_weights.clone().requires_grad_(True)
+    general_loss = risk_aware_loss(
+        general_weights,
+        returns,
+        tradable,
+        benchmark_returns=torch.zeros((1,), dtype=torch.float32),
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        sample_mask=sample_mask,
+        long_only=False,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+        net_exposure_weight=net_exposure_weight,
+        objective="log_utility",
+    )
+
+    fused_weights = base_weights.clone().requires_grad_(True)
+    fused_loss, fused_final = fused_log_utility_loss_tensor(
+        fused_weights,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        sample_mask,
+        initial_weights,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="identity",
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=0.0,
+        net_exposure_weight=net_exposure_weight,
+        manual_backward=True,
+    )
+
+    expected_final = torch.tensor([0.5, 0.0], dtype=torch.float32)
+    expected_penalty = torch.tensor(0.5, dtype=torch.float32)
+    assert torch.allclose(fused_final, expected_final, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(general_loss, expected_penalty, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(fused_loss, expected_penalty, atol=1e-7, rtol=1e-6)
+
+    general_loss.backward()
+    fused_loss.backward()
+    assert general_weights.grad is not None
+    assert fused_weights.grad is not None
+    assert torch.isfinite(general_weights.grad).all()
+    assert torch.isfinite(fused_weights.grad).all()
+
+
+def test_fused_log_utility_concentration_uses_realised_backtest_weights() -> None:
+    weights = torch.tensor([[1.0, -1.0]], dtype=torch.float32, requires_grad=True)
+    returns = torch.zeros_like(weights)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    can_buy = tradable.clone()
+    can_sell = torch.tensor([[True, False]], dtype=torch.bool)
+    concentration_weight = 0.7
+
+    loss, final_weights = fused_log_utility_loss_tensor(
+        weights,
+        returns,
+        tradable,
+        can_buy,
+        can_sell,
+        torch.ones((1,), dtype=torch.bool),
+        torch.zeros((2,), dtype=torch.float32),
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=False,
+        max_turnover_ratio=0.0,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="identity",
+        gamma_sharpe=1.0,
+        gamma_turnover=0.0,
+        concentration_weight=concentration_weight,
+        net_exposure_weight=0.0,
+        manual_backward=True,
+    )
+
+    expected_final = torch.tensor([0.5, 0.0], dtype=torch.float32)
+    expected_concentration = concentration_weight * 2.0 * expected_final.pow(2).sum()
+    assert torch.allclose(final_weights, expected_final, atol=1e-7, rtol=1e-6)
+    assert torch.allclose(loss, expected_concentration, atol=1e-7, rtol=1e-6)
     loss.backward()
     assert weights.grad is not None
     assert torch.isfinite(weights.grad).all()

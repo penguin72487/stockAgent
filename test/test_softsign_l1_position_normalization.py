@@ -208,12 +208,13 @@ def test_portfolio_activation_formulas_match_supported_switches() -> None:
             assert bool((actual.abs() <= 1.0).all().item())
 
 
-def test_identity_activation_keeps_large_finite_scores_unclipped() -> None:
+def test_identity_activation_keeps_finite_scores_and_uses_dtype_bounds_for_infinities() -> None:
     x = torch.tensor([[200.0, -50.0, float("nan"), float("inf"), float("-inf")]], dtype=torch.float32)
 
     actual = apply_portfolio_activation(x, "identity")
 
-    expected = torch.tensor([[200.0, -50.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    finfo = torch.finfo(torch.float32)
+    expected = torch.tensor([[200.0, -50.0, 0.0, finfo.max, finfo.min]], dtype=torch.float32)
     assert torch.allclose(actual, expected)
 
 

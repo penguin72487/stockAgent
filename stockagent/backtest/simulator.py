@@ -1332,6 +1332,9 @@ def _vectorized_backtest(
         tradable_t = tradable[t]
         # If a symbol is no longer tradable, assume the position was liquidated
         # on its previous tradable day. Do not carry suspended/delisted exposure.
+        forced_exit = np.where(~tradable_t, prev, 0.0).astype(np.float32, copy=False)
+        forced_buy_turnover = np.clip(-forced_exit, 0.0, None).sum(dtype=np.float32)
+        forced_sell_turnover = np.clip(forced_exit, 0.0, None).sum(dtype=np.float32)
         prev = np.where(tradable_t, prev, 0.0).astype(np.float32, copy=False)
         target_t = target_weights[t].copy()
         target_t[~tradable_t] = 0.0
@@ -1387,8 +1390,8 @@ def _vectorized_backtest(
                 delta = next_weights - prev
 
         weights_history[t] = next_weights.astype(np.float32, copy=False)
-        buy_turnovers[t] = np.clip(delta, 0.0, None).sum(dtype=np.float32)
-        sell_turnovers[t] = np.clip(-delta, 0.0, None).sum(dtype=np.float32)
+        buy_turnovers[t] = np.clip(delta, 0.0, None).sum(dtype=np.float32) + forced_buy_turnover
+        sell_turnovers[t] = np.clip(-delta, 0.0, None).sum(dtype=np.float32) + forced_sell_turnover
         prev = next_weights.astype(np.float32, copy=False)
 
     turnovers = (buy_turnovers + sell_turnovers).astype(np.float32)
@@ -1445,6 +1448,9 @@ def _vectorized_backtest_torch_scan_long_only(
         for offset in range(end - start):
             idx = start + offset
             tradable_t = tradable_chunk[offset]
+            forced_exit = torch.where(~tradable_t, prev, torch.zeros_like(prev))
+            forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+            forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
             prev = torch.where(tradable_t, prev, torch.zeros_like(prev))
             target_t = torch.where(tradable_t, target_chunk[offset], torch.zeros_like(prev))
 
@@ -1482,8 +1488,8 @@ def _vectorized_backtest_torch_scan_long_only(
 
             if record_weights_history:
                 weights_history[idx] = next_weights
-            buy_turnovers[idx] = delta.clamp_min(0.0).sum()
-            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum()
+            buy_turnovers[idx] = delta.clamp_min(0.0).sum() + forced_buy_turnover
+            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
             gross_returns[idx] = (next_weights * future_returns_t[idx]).sum()
             prev = next_weights
 
@@ -1553,6 +1559,9 @@ def _vectorized_backtest_torch_scan_long_short(
         for offset in range(end - start):
             idx = start + offset
             tradable_t = tradable_chunk[offset]
+            forced_exit = torch.where(~tradable_t, prev, torch.zeros_like(prev))
+            forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+            forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
             prev = torch.where(tradable_t, prev, torch.zeros_like(prev))
             target_t = torch.where(tradable_t, target_chunk[offset], torch.zeros_like(prev))
             target_t = torch.where(
@@ -1609,8 +1618,8 @@ def _vectorized_backtest_torch_scan_long_short(
 
             if record_weights_history:
                 weights_history[idx] = next_weights
-            buy_turnovers[idx] = delta.clamp_min(0.0).sum()
-            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum()
+            buy_turnovers[idx] = delta.clamp_min(0.0).sum() + forced_buy_turnover
+            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
             gross_returns[idx] = (next_weights * future_returns_t[idx]).sum()
             prev = next_weights
 
@@ -1682,6 +1691,9 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
         for offset in range(end - start):
             idx = start + offset
             tradable_t = tradable_chunk[offset]
+            forced_exit = torch.where(~tradable_t, prev, torch.zeros_like(prev))
+            forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+            forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
             prev = torch.where(tradable_t, prev, torch.zeros_like(prev))
             target_t = torch.where(tradable_t, target_chunk[offset], torch.zeros_like(prev))
             if not long_only:
@@ -1740,8 +1752,8 @@ def _vectorized_backtest_torch_scan_log_utility_reduced(
                 next_weights = next_weights * gross_scale
                 delta = next_weights - prev
 
-            buy_turnover = delta.clamp_min(0.0).sum()
-            sell_turnover = (-delta).clamp_min(0.0).sum()
+            buy_turnover = delta.clamp_min(0.0).sum() + forced_buy_turnover
+            sell_turnover = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
             turnover = buy_turnover + sell_turnover
             gross_return = (next_weights * future_returns_t[idx]).sum()
             net_simple_return = (
@@ -2132,6 +2144,7 @@ def _vectorized_backtest_torch(
         and prepped_volume_limit_weights is None
         and prepped_weights.device.type == "cuda"
         and initial_weights is None
+        and bool(torch.all(prepped_tradable).detach().cpu().item())
     )
     if use_cpp_long_short:
         _add_backtest_runtime_stat("cpp_ext_calls")

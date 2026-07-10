@@ -16,8 +16,6 @@ environment:
 data:
   parquet_root: data_yahoo/tw_stocks
   benchmark_name: "2330"
-  benchmark_required: false
-  benchmark_source: derived_from_panel
   universe_mode: all_daily_symbols
   use_rapids: false
   usd_only_trading_pairs: false
@@ -45,11 +43,7 @@ trading:
   min_trade_weight: 0.0
   portfolio_activation: identity
   long_only: false
-  cash_allowed: true
 training:
-  backend: pytorch
-  target: next_1d_rank
-  batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
   enable_torch_compile: true

@@ -13,6 +13,7 @@ import gc
 import inspect
 import csv
 import copy
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
@@ -2981,6 +2982,69 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
         )
 
 
+def _stable_fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_manifest(panel: PanelData, config: ExperimentConfig) -> dict[str, Any]:
+    """Build a portable semantic manifest; machine/runtime-only settings are excluded."""
+    model_config = asdict(getattr(config.training, config.training.model_name))
+    data_contract = {
+        "symbols": list(panel.symbols),
+        "feature_names": list(panel.feature_names),
+        "lookback": int(config.training.lookback),
+        "tradable_mode": str(config.data.tradable_mode),
+        "feature_include": list(config.data.feature_include),
+        "feature_exclude": list(config.data.feature_exclude),
+        "use_tw_public_features": bool(config.data.use_tw_public_features),
+    }
+    setting_contract = {
+        "model_name": str(config.training.model_name),
+        "model": model_config,
+        "loss_type": str(config.training.loss_type),
+        "loss_portfolio_activation": str(config.training.loss_portfolio_activation),
+        "long_only": bool(config.trading.long_only),
+        "portfolio_activation": str(config.trading.portfolio_activation),
+        "min_trade_weight": float(config.trading.min_trade_weight),
+        "buy_fee_rate": float(config.trading.buy_fee_rate),
+        "sell_fee_rate": float(config.trading.sell_fee_rate),
+        "max_turnover_ratio": float(config.trading.max_turnover_ratio),
+    }
+    return {
+        "schema_version": 1,
+        "data": data_contract,
+        "settings": setting_contract,
+        "data_fingerprint": _stable_fingerprint(data_contract),
+        "settings_fingerprint": _stable_fingerprint(setting_contract),
+    }
+
+
+def _validate_checkpoint_manifest(
+    checkpoint: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    checkpoint_path: Path,
+) -> None:
+    actual = checkpoint.get("experiment_manifest")
+    if actual is None:
+        print(f"[checkpoint] legacy checkpoint has no fingerprint; loading compatibly: {checkpoint_path}")
+        return
+    mismatches = [
+        name
+        for name in ("data_fingerprint", "settings_fingerprint")
+        if actual.get(name) != expected.get(name)
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{name}: saved={actual.get(name)} current={expected.get(name)}" for name in mismatches
+        )
+        raise RuntimeError(
+            f"Checkpoint semantic fingerprint mismatch ({details}): {checkpoint_path}. "
+            "Use a matching config/data schema or start a fresh output directory."
+        )
+
+
 def _save_fold_checkpoint(
     checkpoint_path: Path,
     *,
@@ -2990,6 +3054,7 @@ def _save_fold_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
+    experiment_manifest: Mapping[str, Any],
     include_optimizer: bool = False,
     check_finite: bool = True,
 ) -> None:
@@ -3006,6 +3071,7 @@ def _save_fold_checkpoint(
         "test_years": fold.test_years,
         "best_val_loss": best_val_loss,
         "model_state_dict": _state_dict_for_save(model),
+        "experiment_manifest": dict(experiment_manifest),
     }
     if include_optimizer:
         payload["optimizer_state_dict"] = optimizer.state_dict()
@@ -3025,6 +3091,7 @@ def _save_group_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
+    experiment_manifest: Mapping[str, Any],
     scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
     no_improve_epochs: int = 0,
     early_stop_patience: int = 0,
@@ -3045,6 +3112,7 @@ def _save_group_checkpoint(
             "model_state_dict": _state_dict_for_save(model),
             "optimizer_state_dict": optimizer.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
+            "experiment_manifest": dict(experiment_manifest),
             "scheduler_state_dict": scheduler_state,
             "no_improve_epochs": int(max(0, no_improve_epochs)),
             "early_stop_patience": int(max(0, early_stop_patience)),
@@ -9315,6 +9383,7 @@ def _run_training_tree_models(
 ) -> list[FoldResult]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    experiment_manifest = _checkpoint_manifest(panel, config)
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
@@ -9578,6 +9647,7 @@ def _run_inference_tree_models(
 ) -> list[FoldResult]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    experiment_manifest = _checkpoint_manifest(panel, config)
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = sorted(list(folds), key=lambda item: item.fold_id)
@@ -9800,6 +9870,7 @@ def _run_inference_neural_models(
     output_dir: str | Path,
 ) -> list[FoldResult]:
     _configure_backtest_runtime_from_config(config)
+    experiment_manifest = _checkpoint_manifest(panel, config)
     if getattr(config.training, "inference_backtest_autotune", None) is not None:
         os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = (
             "1" if bool(config.training.inference_backtest_autotune) else "0"
@@ -9832,6 +9903,11 @@ def _run_inference_neural_models(
             model_state_dict = torch.load(model_file, map_location="cpu")
         elif best_checkpoint_file.exists():
             checkpoint = _load_checkpoint(best_checkpoint_file)
+            _validate_checkpoint_manifest(
+                checkpoint,
+                experiment_manifest,
+                checkpoint_path=best_checkpoint_file,
+            )
             model_state_dict = checkpoint.get("model_state_dict")
             best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
         else:
@@ -10186,6 +10262,7 @@ def run_training(
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    experiment_manifest = _checkpoint_manifest(panel, config)
 
     results_by_fold: dict[int, FoldResult] = {}
     loss_objective = _normalize_risk_objective(config.training.loss_type)
@@ -10195,6 +10272,7 @@ def run_training(
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
     risk_loss_kwargs["min_trade_weight"] = config.trading.min_trade_weight
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
+    risk_loss_kwargs["net_exposure_weight"] = config.training.multitask_loss.net_exposure_weight
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
     fold_list = list(folds)
     next_fold_by_id = _next_fold_by_id(fold_list)
@@ -10428,6 +10506,11 @@ def run_training(
 
             if resume and checkpoint_best_path.exists():
                 checkpoint = _load_checkpoint(checkpoint_best_path)
+                _validate_checkpoint_manifest(
+                    checkpoint,
+                    experiment_manifest,
+                    checkpoint_path=checkpoint_best_path,
+                )
                 fold_contexts[fold.fold_id].best_val_loss = float(
                     checkpoint.get("best_val_loss", float("inf"))
                 )
@@ -10584,6 +10667,11 @@ def run_training(
 
         if config.training.warm_start_from_previous_fold and warm_start_checkpoint_path is not None and warm_start_checkpoint_path.exists():
             warm_start_checkpoint = _load_checkpoint(warm_start_checkpoint_path)
+            _validate_checkpoint_manifest(
+                warm_start_checkpoint,
+                experiment_manifest,
+                checkpoint_path=warm_start_checkpoint_path,
+            )
             if "model_state_dict" in warm_start_checkpoint:
                 _load_state_dict(model, warm_start_checkpoint["model_state_dict"])
                 print(f"[Train {train_years}] warm-started from {warm_start_checkpoint_path.name}")
@@ -10648,6 +10736,7 @@ def run_training(
                 gamma_sharpe=config.evaluation.gamma_sharpe,
                 gamma_turnover=config.evaluation.gamma_turnover,
                 concentration_weight=config.training.multitask_loss.concentration_weight,
+                net_exposure_weight=config.training.multitask_loss.net_exposure_weight,
                 manual_backward=bool(getattr(config.training, "fused_log_utility_manual_backward", False)),
             )
 
@@ -10707,6 +10796,11 @@ def run_training(
 
         if resume and resume_checkpoint_path.exists():
             checkpoint = _load_checkpoint(resume_checkpoint_path)
+            _validate_checkpoint_manifest(
+                checkpoint,
+                experiment_manifest,
+                checkpoint_path=resume_checkpoint_path,
+            )
             if list(checkpoint.get("train_years", [])) == train_years:
                 _load_state_dict(model, checkpoint["model_state_dict"])
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -12134,6 +12228,7 @@ def run_training(
                                 model=model,
                                 optimizer=optimizer,
                                 scaler=scaler,
+                                experiment_manifest=experiment_manifest,
                                 check_finite=config.training.checkpoint_finite_check,
                             )
                             fold_ckpt_total += time.perf_counter() - fold_ckpt_start
@@ -12420,6 +12515,7 @@ def run_training(
                             model=model,
                             optimizer=optimizer,
                             scaler=scaler,
+                            experiment_manifest=experiment_manifest,
                             check_finite=config.training.checkpoint_finite_check,
                         )
                         if bool(getattr(config.training, "save_best_val_artifacts", False)):
@@ -12477,6 +12573,7 @@ def run_training(
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
+                    experiment_manifest=experiment_manifest,
                     scheduler=scheduler,
                     no_improve_epochs=no_improve_epochs,
                     early_stop_patience=early_stop_patience,
@@ -12764,6 +12861,11 @@ def run_training(
             best_checkpoint_path = context.checkpoint_best_path
             if best_checkpoint_path.exists():
                 checkpoint = _load_checkpoint(best_checkpoint_path)
+                _validate_checkpoint_manifest(
+                    checkpoint,
+                    experiment_manifest,
+                    checkpoint_path=best_checkpoint_path,
+                )
                 _load_state_dict(model, checkpoint["model_state_dict"])
                 best_val_loss = float(checkpoint.get("best_val_loss", context.best_val_loss))
             else:
@@ -12986,6 +13088,7 @@ def run_training(
             model=model,
             optimizer=optimizer,
             scaler=scaler,
+            experiment_manifest=experiment_manifest,
             scheduler=scheduler,
             no_improve_epochs=no_improve_epochs,
             early_stop_patience=early_stop_patience,

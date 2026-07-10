@@ -1622,7 +1622,9 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
     rule_to_idx = {name: idx for idx, name in enumerate(external_features.rule_names)}
     up_idx = rule_to_idx.get("_twpub_tpex_next_limit_up_ret")
     down_idx = rule_to_idx.get("_twpub_tpex_next_limit_down_ret")
-    if up_idx is None and down_idx is None:
+    traded_idx = rule_to_idx.get("_twpub_official_traded")
+    delisted_idx = rule_to_idx.get("_twpub_delisted")
+    if up_idx is None and down_idx is None and traded_idx is None and delisted_idx is None:
         return panel
 
     can_buy = np.asarray(panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask, dtype=bool).copy()
@@ -1639,6 +1641,38 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         if rule_values.size == 0:
             continue
         aligned_rules = _align_external_values(panel.dates, rule_dates, rule_values)
+        delisted_rows = np.empty((0,), dtype=np.int64)
+        if delisted_idx is not None:
+            event_mask = np.isfinite(rule_values[:, delisted_idx]) & (rule_values[:, delisted_idx] > 0.0)
+            if bool(event_mask.any()):
+                # Official termination dates can fall on weekends. Apply the event
+                # on the first panel session at or after the official date.
+                candidate_rows = np.searchsorted(panel.dates, rule_dates[event_mask])
+                delisted_rows = np.unique(candidate_rows[candidate_rows < panel.num_dates]).astype(np.int64)
+        if traded_idx is not None:
+            official_traded = np.isfinite(aligned_rules[:, traded_idx]) & (aligned_rules[:, traded_idx] > 0.0)
+            observed_rows = np.flatnonzero(official_traded)
+            if observed_rows.size:
+                lifetime_end = int(delisted_rows[0]) - 1 if delisted_rows.size else int(observed_rows[-1])
+                in_official_lifetime = np.zeros_like(official_traded)
+                if lifetime_end >= int(observed_rows[0]):
+                    in_official_lifetime[int(observed_rows[0]) : lifetime_end + 1] = True
+                suspended = in_official_lifetime & ~official_traded
+                if bool(suspended.any()):
+                    panel.tradable_mask[suspended, sym_idx] = True
+                    can_buy[suspended, sym_idx] = False
+                    can_sell[suspended, sym_idx] = False
+                    if panel.can_short_open_mask is not None:
+                        panel.can_short_open_mask[suspended, sym_idx] = False
+                    panel.returns_1d[suspended, sym_idx] = 0.0
+        if delisted_rows.size:
+            first_delisted = int(delisted_rows[0])
+            delisted_and_after = np.arange(panel.num_dates) >= first_delisted
+            panel.tradable_mask[delisted_and_after, sym_idx] = False
+            can_buy[delisted_and_after, sym_idx] = False
+            can_sell[delisted_and_after, sym_idx] = False
+            if panel.can_short_open_mask is not None:
+                panel.can_short_open_mask[delisted_and_after, sym_idx] = False
         close_ret = _safe_log_ratio_array(close_prices[:, sym_idx], _shift_array(close_prices[:, sym_idx], 1))
 
         if up_idx is not None:
