@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -272,3 +273,107 @@ def test_feature_builder_emits_official_delisting_rule(tmp_path: Path) -> None:
     build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
     out = pl.read_parquet(output_path).filter(pl.col("symbol") == "2330")
     assert out.filter(pl.col("_twpub_delisted") == 1.0).height == 1
+
+
+def test_model_useful_features_use_official_report_date_and_emit_rules(tmp_path: Path) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "出表日期": ["1130215"],
+            "公司代號": ["2330"],
+            "營業收入-當月營收": ["1000000"],
+            "營業收入-上月比較增減(%)": ["10"],
+            "營業收入-去年同月增減(%)": ["20"],
+            "累計營業收入-前期比較增減(%)": ["30"],
+            "date": ["2024-03-01"],
+        }
+    ).write_parquet(tmp_path / "twse_api_opendata_t187ap05_l.parquet")
+    pl.DataFrame(
+        {
+            "Date": ["1130216"],
+            "SecuritiesCompanyCode": ["2330"],
+            "ShortSaleSuspensionStartDate": ["1130219"],
+            "ShortSaleSuspensionEndDate": ["1130220"],
+            "date": ["2024-03-01"],
+        }
+    ).write_parquet(tmp_path / "tpex_api_tpex_margin_trading_term.parquet")
+    pl.DataFrame(
+        {
+            "Code": ["2330"],
+            "TradingHaltDate": ["1130221"],
+            "TradingResumptionDate": ["1130223"],
+            "date": ["2024-03-01"],
+        }
+    ).write_parquet(tmp_path / "twse_api_exchangereport_twtawu.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "2330").sort("date")
+
+    revenue = out.filter(pl.col("twpub_monthly_revenue_log").is_not_null())
+    assert revenue["date"].to_list() == [date(2024, 2, 15)]
+    assert revenue["twpub_monthly_revenue_yoy"].to_list() == [0.2]
+    assert out.filter(pl.col("_twpub_short_open_ban") == 1.0)["date"].to_list() == [
+        date(2024, 2, 19),
+        date(2024, 2, 20),
+    ]
+    assert out.filter(pl.col("_twpub_trading_halt") == 1.0)["date"].to_list() == [
+        date(2024, 2, 21),
+        date(2024, 2, 22),
+    ]
+
+
+def test_external_short_ban_and_halt_rules_update_directional_masks(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 100.0, 100.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "symbol": ["2330", "2330"],
+            "_twpub_short_open_ban": [1.0, None],
+            "_twpub_trading_halt": [None, 1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    assert bool(panel.can_short_open_mask[0, symbol_idx]) is False
+    assert bool(panel.can_buy_mask[0, symbol_idx]) is True
+    assert bool(panel.can_buy_mask[1, symbol_idx]) is False
+    assert bool(panel.can_sell_mask[1, symbol_idx]) is False
+
+
+def test_point_in_time_financial_features_forward_fill_only_after_publication(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-03"],
+            "symbol": ["2330"],
+            "twpub_monthly_revenue_yoy": [0.25],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    feature_idx = panel.feature_names.index("twpub_monthly_revenue_yoy")
+    symbol_idx = panel.symbols.index("2330")
+    assert panel.features[0, symbol_idx, feature_idx] == np.float32(0.0)
+    assert panel.features[1, symbol_idx, feature_idx] == np.float32(0.25)
+    assert panel.features[2, symbol_idx, feature_idx] == np.float32(0.25)

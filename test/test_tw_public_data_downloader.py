@@ -88,6 +88,16 @@ def test_select_specs_accepts_tags_and_names():
     assert "dgbas_unemployment_rate" in names
 
 
+def test_model_useful_group_is_curated_and_has_unique_dataset_names():
+    specs = twpub._select_specs(["model_useful"])
+    names = [spec.name for spec in specs]
+
+    assert len(specs) == 117
+    assert len(names) == len(set(names))
+    assert all("model_useful" in spec.tags for spec in specs)
+    assert not any("warrant" in spec.name or "bond" in spec.name or "gold" in spec.name for spec in specs)
+
+
 def test_merge_frames_replaces_existing_dates():
     existing = pl.DataFrame(
         {

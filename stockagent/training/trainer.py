@@ -3427,11 +3427,11 @@ def _save_best_val_backtest_snapshot(
         return
     row_start = max(0, int(row_start))
     row_end = max(row_start, int(row_end))
-    strategy_returns = val_backtest.strategy_returns[row_start:row_end].detach().cpu().numpy().astype(np.float32)
-    benchmark_returns = val_backtest.benchmark_returns[row_start:row_end].detach().cpu().numpy().astype(np.float32)
-    turnovers = val_backtest.turnovers[row_start:row_end].detach().cpu().numpy().astype(np.float32)
+    strategy_returns = val_backtest.strategy_returns[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
+    benchmark_returns = val_backtest.benchmark_returns[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
+    turnovers = val_backtest.turnovers[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
     if val_backtest.weights_history.numel() and int(val_backtest.weights_history.size(0)) >= row_end:
-        weights_history = val_backtest.weights_history[row_start:row_end].detach().cpu().numpy().astype(np.float32)
+        weights_history = val_backtest.weights_history[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
     else:
         num_symbols = int(val_backtest.weights_history.size(1)) if val_backtest.weights_history.dim() == 2 else 0
         weights_history = np.empty((0, num_symbols), dtype=np.float32)
@@ -11959,7 +11959,7 @@ def run_training(
                         val_backtest_epoch.weights_history[val_row_start:val_row_end],
                         val_returns_device[val_row_start:val_row_end],
                         val_masks_device[val_row_start:val_row_end],
-                    ).cpu().numpy()
+                    ).to(device="cpu", dtype=torch.float32).numpy()
                 )
             else:
                 val_ic = ic_summary(np.asarray([], dtype=np.float32))
@@ -12963,7 +12963,7 @@ def run_training(
                     val_backtest.weights_history[start:end],
                     val_returns_device[start:end],
                     val_masks_device[start:end],
-                ).cpu().numpy()
+                ).to(device="cpu", dtype=torch.float32).numpy()
             )
             val_met = _compute_metrics_from_tensors(
                 val_backtest.strategy_returns[start:end],
