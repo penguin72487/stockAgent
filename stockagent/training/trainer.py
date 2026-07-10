@@ -283,7 +283,9 @@ class TimingBreakdown:
     after_step_sync_s: float = 0.0
     gc_s: float = 0.0
     batches: int = 0
-    cuda_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = field(default_factory=list)
+    cuda_events: list[tuple[str, torch.device, torch.cuda.Event, torch.cuda.Event]] = field(
+        default_factory=list
+    )
 
 
 def _log_timing(label: str, timing: TimingBreakdown) -> None:
@@ -416,28 +418,44 @@ def _add_timing(dst: TimingBreakdown, src: TimingBreakdown) -> None:
 
 
 class _CudaTimingRecorder:
-    def __init__(self, timing: TimingBreakdown, attr: str, device: torch.device):
+    def __init__(
+        self,
+        timing: TimingBreakdown,
+        attr: str,
+        device: torch.device,
+        *,
+        enabled: bool = True,
+    ):
         self.timing = timing
         self.attr = attr
-        self.enabled = device.type == "cuda" and torch.cuda.is_available()
+        self.device = device
+        self.enabled = bool(enabled) and device.type == "cuda" and torch.cuda.is_available()
         self.start: torch.cuda.Event | None = None
         self.end: torch.cuda.Event | None = None
 
     def __enter__(self) -> "_CudaTimingRecorder":
         if self.enabled:
-            self.start = torch.cuda.Event(enable_timing=True)
-            self.end = torch.cuda.Event(enable_timing=True)
-            self.start.record()
+            with torch.cuda.device(self.device):
+                self.start = torch.cuda.Event(enable_timing=True)
+                self.end = torch.cuda.Event(enable_timing=True)
+                self.start.record()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.enabled and self.start is not None and self.end is not None:
-            self.end.record()
-            self.timing.cuda_events.append((self.attr, self.start, self.end))
+            with torch.cuda.device(self.device):
+                self.end.record()
+            self.timing.cuda_events.append((self.attr, self.device, self.start, self.end))
 
 
-def _cuda_timing(timing: TimingBreakdown, attr: str, device: torch.device) -> _CudaTimingRecorder:
-    return _CudaTimingRecorder(timing, attr, device)
+def _cuda_timing(
+    timing: TimingBreakdown,
+    attr: str,
+    device: torch.device,
+    *,
+    enabled: bool = True,
+) -> _CudaTimingRecorder:
+    return _CudaTimingRecorder(timing, attr, device, enabled=enabled)
 
 
 def _flush_cuda_timing_events(timing: TimingBreakdown) -> None:
@@ -445,9 +463,17 @@ def _flush_cuda_timing_events(timing: TimingBreakdown) -> None:
         return
     pending = list(timing.cuda_events)
     timing.cuda_events.clear()
-    for attr, start, end in pending:
+    # One synchronization per participating device completes every recorded
+    # event. Synchronizing each end event separately adds thousands of redundant
+    # CUDA API calls per full-US epoch.
+    devices = {device for _attr, device, _start, _end in pending}
+    for device in devices:
         try:
-            end.synchronize()
+            torch.cuda.synchronize(device)
+        except Exception:
+            pass
+    for attr, _device, start, end in pending:
+        try:
             setattr(timing, attr, getattr(timing, attr) + float(start.elapsed_time(end)) / 1000.0)
         except Exception:
             continue
@@ -2252,29 +2278,27 @@ def _unwrap_distributed_data_parallel(model: nn.Module) -> nn.Module:
     return model
 
 
-def _clip_model_gradients_(model: nn.Module, max_norm: float) -> bool:
+def _clip_model_gradients_(model: nn.Module, max_norm: float) -> torch.Tensor | None:
     params = [param for param in _unwrap_model(model).parameters() if param.grad is not None]
     if not params:
-        return True
+        return None
     try:
-        torch.nn.utils.clip_grad_norm_(
+        return torch.nn.utils.clip_grad_norm_(
             params,
             max_norm=float(max_norm),
             error_if_nonfinite=False,
             foreach=True,
         )
-        return True
     except RuntimeError as exc:
         message = str(exc).lower()
         if "foreach" not in message and "not implemented" not in message and "not support" not in message:
             raise
-    torch.nn.utils.clip_grad_norm_(
+    return torch.nn.utils.clip_grad_norm_(
         params,
         max_norm=float(max_norm),
         error_if_nonfinite=False,
         foreach=False,
     )
-    return True
 
 
 def _run_gradient_clip_(
@@ -2286,17 +2310,17 @@ def _run_gradient_clip_(
     timing: TimingBreakdown,
     device: torch.device,
     profile_timing: bool,
-) -> bool:
+) -> torch.Tensor | None:
     if float(grad_clip_norm) <= 0.0:
-        return True
+        return None
     clip_start = time.perf_counter()
-    with _cuda_timing(timing, "clip_cuda_s", device):
+    with _cuda_timing(timing, "clip_cuda_s", device, enabled=profile_timing):
         if scaler.is_enabled():
             scaler.unscale_(optimizer)
-        gradients_are_finite = _clip_model_gradients_(model, float(grad_clip_norm))
+        gradient_total_norm = _clip_model_gradients_(model, float(grad_clip_norm))
     _maybe_sync_cuda(device, profile_timing)
     timing.clip_s += time.perf_counter() - clip_start
-    return gradients_are_finite
+    return gradient_total_norm
 
 
 def _panel_forward_module(model: nn.Module) -> nn.Module | None:
@@ -2565,25 +2589,40 @@ def _first_nonfinite_model_parameter(model: nn.Module) -> str | None:
 
 
 def _model_parameters_are_finite(model: nn.Module) -> bool:
-    finite_flag: torch.Tensor | None = None
-    for param in _unwrap_model(model).parameters():
-        current = torch.isfinite(param.detach()).all()
-        finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
-    if finite_flag is None:
+    parameters = [param.detach() for param in _unwrap_model(model).parameters()]
+    if not parameters:
         return True
-    return bool(finite_flag.item())
+    try:
+        # Infinity-norm is finite exactly when every tensor element is finite,
+        # and foreach reduces all parameter tensors without launching a separate
+        # isfinite/all/logical-and chain for each one.
+        norms = torch._foreach_norm(parameters, float("inf"))
+        return bool(torch.isfinite(torch.stack(norms)).all().item())
+    except (RuntimeError, TypeError):
+        finite_flag: torch.Tensor | None = None
+        for param in parameters:
+            current = torch.isfinite(param).all()
+            finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
+        return bool(finite_flag.item()) if finite_flag is not None else True
 
 
 def _model_gradients_are_finite(model: nn.Module) -> bool:
-    finite_flag: torch.Tensor | None = None
-    for param in _unwrap_model(model).parameters():
-        if param.grad is None:
-            continue
-        current = torch.isfinite(param.grad.detach()).all()
-        finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
-    if finite_flag is None:
+    gradients = [
+        param.grad.detach()
+        for param in _unwrap_model(model).parameters()
+        if param.grad is not None
+    ]
+    if not gradients:
         return True
-    return bool(finite_flag.item())
+    try:
+        norms = torch._foreach_norm(gradients, float("inf"))
+        return bool(torch.isfinite(torch.stack(norms)).all().item())
+    except (RuntimeError, TypeError):
+        finite_flag: torch.Tensor | None = None
+        for gradient in gradients:
+            current = torch.isfinite(gradient).all()
+            finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
+        return bool(finite_flag.item()) if finite_flag is not None else True
 
 
 def _stabilize_model_parameters_after_step(model: nn.Module) -> None:
@@ -2616,9 +2655,9 @@ def _checkpoint_parameters_are_saveable(
     _stabilize_model_parameters_after_step(model)
     if not bool(check_finite):
         return True
-    bad_name = _first_nonfinite_model_parameter(model)
-    if bad_name is None:
+    if _model_parameters_are_finite(model):
         return True
+    bad_name = _first_nonfinite_model_parameter(model) or "<unknown>"
     message = (
         f"non-finite model checkpoint not saved: {checkpoint_path}: "
         f"first non-finite parameter={bad_name}"
@@ -2961,10 +3000,11 @@ def _active_autoencoder_loss_checkpoint_contract(config: ExperimentConfig) -> di
 def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
     """Return the explicit schema-4 controls that can change a resumed trajectory.
 
-    Machine-local execution, compilation, cache, DDP, eval chunking, VRAM,
-    plotting, explainability, table, and post-processing settings deliberately
-    remain in ``configuration`` only.  Active model architecture is fingerprinted
-    independently by the model contract.
+    Machine-local execution, compilation, ordinary cache placement, DDP, eval
+    chunking, VRAM, plotting, explainability, table, and post-processing settings
+    deliberately remain in ``configuration`` only.  A cache option that changes
+    immutable tensor storage precision is a semantic exception recorded below.
+    Active model architecture is fingerprinted independently by the model contract.
     """
     training = config.training
     objective = _normalize_risk_objective(training.loss_type)
@@ -3025,6 +3065,11 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "use_tensor_cores": bool(config.environment.use_tensor_cores),
         },
     }
+    if bool(getattr(training, "cache_train_features_in_amp_dtype", False)):
+        # This opt-in changes the immutable feature storage seen by the train
+        # executor. Keep default=false schema-4 checkpoints backward compatible,
+        # but never resume an opted-in trajectory under a different precision path.
+        contract["precision"]["cache_train_features_in_amp_dtype"] = True
     # These rank objectives return before portfolio post-processing/backtest in
     # risk_aware_loss, so changing the loss activation cannot change gradients.
     if objective not in {"pure_rank", "rank_ic"}:
@@ -3052,6 +3097,10 @@ def _training_checkpoint_contract_schema_3(
 ) -> dict[str, Any]:
     """Exact training contract written by schema 3 before semantic layering."""
     contract = asdict(config.training)
+    # This storage-precision option was introduced by schema 4.  It must not be
+    # synthesized into a historical schema-3 fingerprint; the compatibility
+    # constraint below separately prevents unsafe optimizer resume when enabled.
+    contract.pop("cache_train_features_in_amp_dtype", None)
     # Schema 3 recorded this field even though no executor ever consumed it.
     # Reconstruct the only honest/effective historical value after removing the
     # no-op from TrainingConfig so old fingerprints remain verifiable.
@@ -3249,6 +3298,12 @@ def _transformer_base_checkpoint_model_values(
         "portfolio_mode": portfolio_mode,
         "portfolio_output_mode": output_mode,
     }
+    if not bool(values.get("sanitize_inputs", True)):
+        contract["sanitize_inputs"] = False
+    if bool(values.get("amp_native_position_add", False)):
+        contract["amp_native_position_add"] = True
+    if bool(values.get("temporal_self_attention_fast_path", False)):
+        contract["temporal_self_attention_fast_path"] = True
     if head_layers > 0:
         contract["head_hidden_dim"] = int(values["head_hidden_dim"])
     if portfolio_mode == "long_short":
@@ -3616,14 +3671,28 @@ def _checkpoint_manifest(
         "compatibility_constraints": {
             "schema_1": {
                 "force_exit_mask_is_empty": schema_2_force_exit_compatible,
+                "amp_feature_cache_disabled": not bool(
+                    config.training.cache_train_features_in_amp_dtype
+                ),
             },
             "schema_2": {
                 # Schema 2 predates terminal-exit events. It is safe to resume
                 # only when the current panel would not exercise that new rule.
                 "force_exit_mask_is_empty": schema_2_force_exit_compatible,
+                "amp_feature_cache_disabled": not bool(
+                    config.training.cache_train_features_in_amp_dtype
+                ),
+            },
+            "schema_3": {
+                "amp_feature_cache_disabled": not bool(
+                    config.training.cache_train_features_in_amp_dtype
+                ),
             },
             "schema_3_without_force_exit": {
                 "force_exit_mask_is_empty": schema_2_force_exit_compatible,
+                "amp_feature_cache_disabled": not bool(
+                    config.training.cache_train_features_in_amp_dtype
+                ),
             },
         },
         # Stable aliases keep old tooling readable while layered validation
@@ -3690,16 +3759,6 @@ def _validate_checkpoint_manifest(
         expected_fold=expected_fold,
         expected_train_years=expected_train_years,
     )
-    actual = checkpoint.get("experiment_manifest")
-    if actual is None:
-        print(f"[checkpoint] legacy checkpoint has no fingerprint; loading compatibly: {checkpoint_path}")
-        return
-    if not isinstance(actual, Mapping):
-        raise RuntimeError(
-            f"Checkpoint experiment_manifest must be a mapping, got {type(actual).__name__}: "
-            f"{checkpoint_path}."
-        )
-
     normalized_scope = str(scope).strip().lower().replace("-", "_")
     scopes = {
         "resume": ("data", "model", "training", "evaluation", "trading", "walk_forward"),
@@ -3711,6 +3770,28 @@ def _validate_checkpoint_manifest(
     }
     if normalized_scope not in scopes:
         raise ValueError(f"Unknown checkpoint validation scope: {scope!r}")
+
+    actual = checkpoint.get("experiment_manifest")
+    if actual is None:
+        amp_feature_cache_enabled = bool(
+            expected.get("contracts", {})
+            .get("training", {})
+            .get("precision", {})
+            .get("cache_train_features_in_amp_dtype", False)
+        )
+        if normalized_scope in {"resume", "artifact"} and amp_feature_cache_enabled:
+            raise RuntimeError(
+                "Legacy checkpoint without a semantic manifest cannot safely resume "
+                "with cache_train_features_in_amp_dtype=true because its feature-storage "
+                f"precision was not fingerprinted: {checkpoint_path}. Start a fresh training run."
+            )
+        print(f"[checkpoint] legacy checkpoint has no fingerprint; loading compatibly: {checkpoint_path}")
+        return
+    if not isinstance(actual, Mapping):
+        raise RuntimeError(
+            f"Checkpoint experiment_manifest must be a mapping, got {type(actual).__name__}: "
+            f"{checkpoint_path}."
+        )
 
     try:
         actual_schema = int(actual.get("schema_version", 1))
@@ -3724,6 +3805,18 @@ def _validate_checkpoint_manifest(
             f"{actual_schema}: {checkpoint_path}. This runtime supports schemas 1 through 4; "
             "use a runtime that understands the saved schema instead of guessing compatibility."
         )
+    if actual_schema < 4 and normalized_scope in {"resume", "artifact"}:
+        schema_constraints = expected.get("compatibility_constraints", {}).get(
+            f"schema_{actual_schema}",
+            {},
+        )
+        if not bool(schema_constraints.get("amp_feature_cache_disabled", True)):
+            raise RuntimeError(
+                f"Schema {actual_schema} checkpoint cannot safely resume with "
+                "cache_train_features_in_amp_dtype=true because that immutable "
+                f"feature-storage precision was not fingerprinted: {checkpoint_path}. "
+                "Start a fresh training run."
+            )
     expected_for_validation: Mapping[str, Any] = expected
     legacy_expected: Mapping[str, Any] = {}
     if actual_schema < 2:
@@ -5034,6 +5127,8 @@ def _dataset_to_tensors(
 
 def _dataset_volume_notional_to_tensor(dataset: CrossSectionalDataset) -> torch.Tensor:
     valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
+    if dataset.volume_notional_t is None:
+        raise ValueError("dataset was created without volume_notional tensors")
     return dataset.volume_notional_t[valid_indices]
 
 
@@ -5103,11 +5198,31 @@ def _resolve_inference_model_chunk_rows(
 def _resolve_inference_backtest_chunk_rows(
     config: ExperimentConfig,
     model_chunk_rows: int,
+    total_rows: int,
 ) -> int:
     configured = max(1, int(getattr(config.training, "eval_backtest_chunk_rows", model_chunk_rows)))
     if bool(getattr(config.training, "eval_backtest_chunk_rows_auto", True)):
-        return max(int(model_chunk_rows), configured)
+        return _auto_backtest_chunk_rows(
+            total_rows=total_rows,
+            model_chunk_rows=model_chunk_rows,
+            configured_cap=configured,
+        )
     return configured
+
+
+def _auto_backtest_chunk_rows(
+    *,
+    total_rows: int,
+    model_chunk_rows: int,
+    configured_cap: int,
+) -> int:
+    """Choose the smallest stable power-of-two compile bucket that fits rows."""
+    total_rows = max(1, int(total_rows))
+    model_chunk_rows = max(1, int(model_chunk_rows))
+    configured_cap = max(model_chunk_rows, int(configured_cap))
+    logical_rows = min(total_rows, configured_cap)
+    bucket = 1 << max(0, int(logical_rows - 1).bit_length())
+    return min(configured_cap, max(model_chunk_rows, bucket))
 
 
 def _split_valid_indices(
@@ -5191,21 +5306,77 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
 
 
+def _resolve_train_feature_cache_dtype(
+    config: ExperimentConfig,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    *,
+    train_uses_panel_slab: bool,
+    has_categorical_features: bool,
+) -> torch.dtype | None:
+    """Resolve the only pre-quantized feature-cache path proven AMP-equivalent."""
+    if not bool(getattr(config.training, "cache_train_features_in_amp_dtype", False)):
+        return None
+    active_model_name = str(_active_model_config(config)["config_name"])
+    tbp_cfg = config.training.transformer_base_portfolio
+    if (
+        device.type != "cuda"
+        or amp_dtype not in {torch.float16, torch.bfloat16}
+        or active_model_name != "transformer_base_portfolio"
+        or bool(getattr(tbp_cfg, "sanitize_inputs", True))
+        or bool(has_categorical_features)
+        or not train_uses_panel_slab
+    ):
+        raise ValueError(
+            "cache_train_features_in_amp_dtype requires CUDA BF16/FP16, "
+            "transformer_base_portfolio panel-slab training, sanitize_inputs=false, "
+            "and no categorical feature embeddings"
+        )
+    return amp_dtype
+
+
 def _maybe_cache_tensors_on_device(
     *,
     name: str,
-    tensors: tuple[torch.Tensor, ...],
+    tensors: tuple[torch.Tensor | None, ...],
     device: torch.device,
     enabled: bool,
     target_fraction: float,
     safety_margin_gb: float,
-) -> tuple[torch.Tensor, ...]:
+    target_dtypes: tuple[torch.dtype | None, ...] | None = None,
+) -> tuple[torch.Tensor | None, ...]:
     if not enabled or device.type != "cuda":
         return tensors
-    if all(tensor.device.type == "cuda" for tensor in tensors):
+    if target_dtypes is None:
+        target_dtypes = tuple(None for _ in tensors)
+    if len(target_dtypes) != len(tensors):
+        raise ValueError("target_dtypes must align with tensors")
+
+    def _target_dtype(tensor: torch.Tensor, requested: torch.dtype | None) -> torch.dtype:
+        if requested is None or not tensor.dtype.is_floating_point:
+            return tensor.dtype
+        return requested
+
+    if all(
+        tensor is None
+        or (
+            _tensor_on_requested_device(tensor, device)
+            and tensor.dtype == _target_dtype(tensor, requested_dtype)
+        )
+        for tensor, requested_dtype in zip(tensors, target_dtypes, strict=True)
+    ):
         return tensors
 
-    required_bytes = sum(_tensor_nbytes(tensor) for tensor in tensors if tensor.device.type != "cuda")
+    required_bytes = sum(
+        int(tensor.numel())
+        * torch.empty((), dtype=_target_dtype(tensor, requested_dtype)).element_size()
+        for tensor, requested_dtype in zip(tensors, target_dtypes, strict=True)
+        if tensor is not None
+        and (
+            not _tensor_on_requested_device(tensor, device)
+            or tensor.dtype != _target_dtype(tensor, requested_dtype)
+        )
+    )
     free_mem, total_mem = torch.cuda.mem_get_info(device)
     margin_bytes = int(max(0.0, float(safety_margin_gb)) * 1024**3)
     min_post_cache_free_bytes = 0
@@ -5231,14 +5402,38 @@ def _maybe_cache_tensors_on_device(
         )
         return tensors
 
-    moved: list[torch.Tensor] = []
+    moved: list[torch.Tensor | None] = []
+    converted_dtype = any(
+        tensor is not None and tensor.dtype != _target_dtype(tensor, requested_dtype)
+        for tensor, requested_dtype in zip(tensors, target_dtypes, strict=True)
+    )
     try:
-        for tensor in tensors:
-            moved.append(tensor if tensor.device.type == "cuda" else tensor.to(device=device, non_blocking=True))
+        for tensor, requested_dtype in zip(tensors, target_dtypes, strict=True):
+            if tensor is None:
+                moved.append(tensor)
+            else:
+                target_dtype = _target_dtype(tensor, requested_dtype)
+                if _tensor_on_requested_device(tensor, device) and tensor.dtype == target_dtype:
+                    moved.append(tensor)
+                else:
+                    moved.append(
+                        tensor.to(
+                            device=device,
+                            dtype=target_dtype,
+                            non_blocking=True,
+                        )
+                    )
         torch.cuda.synchronize(device)
+        if converted_dtype:
+            # A cross-device dtype conversion can leave the temporary source-
+            # dtype staging allocation in the CUDA caching allocator. Release
+            # it now so the advertised AMP-cache saving is available to the
+            # compiled forward/backward workspace.
+            torch.cuda.empty_cache()
+        free_after, _ = torch.cuda.mem_get_info(device)
         print(
             f"[gpu cache] cached {name} on {device}: size={required_bytes/1024**3:.2f}GB "
-            f"(free_before={free_mem/1024**3:.2f}GB)"
+            f"(free_before={free_mem/1024**3:.2f}GB free_after={free_after/1024**3:.2f}GB)"
         )
         return tuple(moved)
     except RuntimeError as exc:
@@ -5633,7 +5828,7 @@ def _prepare_windowed_split(
     return prepared
 
 
-def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor, ...]:
+def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor | None, ...]:
     return (
         split.features,
         split.future_log_returns,
@@ -5656,8 +5851,10 @@ def _windowed_metadata_tensors(split: WindowedSplitTensors) -> tuple[torch.Tenso
 
 def _with_windowed_base(
     split: WindowedSplitTensors,
-    base_tensors: tuple[torch.Tensor, ...],
+    base_tensors: tuple[torch.Tensor | None, ...],
 ) -> WindowedSplitTensors:
+    if any(tensor is None for tensor in base_tensors[:9]):
+        raise ValueError("required windowed base tensor is missing")
     return WindowedSplitTensors(
         features=base_tensors[0],
         valid_indices=split.valid_indices,
@@ -5706,14 +5903,17 @@ def _maybe_cache_windowed_base_on_device(
     enabled: bool,
     target_fraction: float,
     safety_margin_gb: float,
+    feature_dtype: torch.dtype | None = None,
 ) -> WindowedSplitTensors:
+    base_tensors = _windowed_base_tensors(split)
     moved = _maybe_cache_tensors_on_device(
         name=f"{name} shared base",
-        tensors=_windowed_base_tensors(split),
+        tensors=base_tensors,
         device=device,
         enabled=enabled,
         target_fraction=target_fraction,
         safety_margin_gb=safety_margin_gb,
+        target_dtypes=(feature_dtype, *(None for _ in base_tensors[1:])),
     )
     return _with_windowed_base(split, moved)
 
@@ -5749,6 +5949,7 @@ def _maybe_cache_windowed_split_on_device(
     enabled: bool,
     target_fraction: float,
     safety_margin_gb: float,
+    feature_dtype: torch.dtype | None = None,
 ) -> WindowedSplitTensors:
     split = _maybe_cache_windowed_base_on_device(
         name=name,
@@ -5757,6 +5958,7 @@ def _maybe_cache_windowed_split_on_device(
         enabled=enabled,
         target_fraction=target_fraction,
         safety_margin_gb=safety_margin_gb,
+        feature_dtype=feature_dtype,
     )
     return _maybe_cache_windowed_metadata_on_device(
         name=name,
@@ -5784,6 +5986,10 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
     for attr in attrs:
         lhs = getattr(a, attr)
         rhs = getattr(b, attr)
+        if lhs is None or rhs is None:
+            if lhs is not rhs:
+                return False
+            continue
         if tuple(lhs.shape) != tuple(rhs.shape) or lhs.dtype != rhs.dtype:
             return False
     if (a.symbol_indices is None) != (b.symbol_indices is None):
@@ -6190,9 +6396,13 @@ def _run_eval_backtest_from_weight_buffers(
         timing.backtest_prepare_s += time.perf_counter() - backtest_prepare_start
 
         backtest_runner_start = time.perf_counter()
+        # Artifact passes request the full weights history only once. Compiling
+        # that distinct recurrent output graph costs minutes on short folds and
+        # cannot amortize; repeated epoch metrics keep the compiled fast path.
+        compile_default = "0" if return_weights_history else "1"
         compile_context = (
             nullcontext()
-            if _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", "1")
+            if _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", compile_default)
             else _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0")
         )
         with compile_context:
@@ -7536,7 +7746,7 @@ def _probe_compiled_loss_forward_backward(
     local_error: str | None = None
     try:
         prepare_device = _windowed_prepare_device(split, device)
-        batch = split.batch_by_rows(
+        batch = split.batch_metadata_by_rows(
             0,
             int(batch_size),
             device=prepare_device,
@@ -7566,7 +7776,8 @@ def _probe_compiled_loss_forward_backward(
                 (split.num_symbols,),
                 device=device,
                 dtype=torch.float32,
-            )
+            ),
+            "initial_alive": torch.ones((), device=device, dtype=torch.bool),
         }
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = loss_fn(
@@ -8340,7 +8551,12 @@ def _train_epoch_windowed_tensor(
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
-            with _cuda_timing(timing, "model_forward_cuda_s", device):
+            with _cuda_timing(
+                timing,
+                "model_forward_cuda_s",
+                device,
+                enabled=profile_timing,
+            ):
                 if PROFILE_RANGES_ENABLED:
                     with profile_range("train.forward.model"):
                         if use_panel_forward:
@@ -8419,7 +8635,12 @@ def _train_epoch_windowed_tensor(
             timing.model_forward_s += time.perf_counter() - model_forward_start
 
             factor_aug_start = time.perf_counter()
-            with _cuda_timing(timing, "factor_aug_cuda_s", device):
+            with _cuda_timing(
+                timing,
+                "factor_aug_cuda_s",
+                device,
+                enabled=profile_timing,
+            ):
                 aux_outputs = _attach_factor_augmented_scores(
                     model=model,
                     aux_outputs=aux_outputs,
@@ -8445,7 +8666,7 @@ def _train_epoch_windowed_tensor(
 
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
-            with _cuda_timing(timing, "loss_cuda_s", device):
+            with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
                 loss_context = profile_range("train.forward.loss") if PROFILE_RANGES_ENABLED else nullcontext()
                 with loss_context:
                     loss = loss_fn(
@@ -8525,13 +8746,14 @@ def _train_epoch_windowed_tensor(
         backward_start = time.perf_counter()
         if scaler.is_enabled():
             grad_start = time.perf_counter()
-            with _cuda_timing(timing, "grad_cuda_s", device):
+            with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
+            gradient_total_norm: torch.Tensor | None = None
             if grad_clip_norm > 0.0:
-                gradients_are_finite = _run_gradient_clip_(
+                gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -8540,15 +8762,19 @@ def _train_epoch_windowed_tensor(
                     device=device,
                     profile_timing=profile_timing,
                 )
-            if gradients_are_finite and should_check_finite:
+            if should_check_finite:
                 finite_start = time.perf_counter()
-                gradients_are_finite = _model_gradients_are_finite(model)
+                gradients_are_finite = (
+                    _tensor_is_finite(gradient_total_norm)
+                    if gradient_total_norm is not None
+                    else _model_gradients_are_finite(model)
+                )
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
                 continue
             step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device):
+            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                 scaler.step(optimizer)
                 scaler.update()
             _stabilize_model_parameters_after_step(model)
@@ -8559,14 +8785,15 @@ def _train_epoch_windowed_tensor(
                 timing.scheduler_s += _step_batch_lr_scheduler(lr_scheduler)
         else:
             grad_start = time.perf_counter()
-            with _cuda_timing(timing, "grad_cuda_s", device):
+            with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 loss.backward()
             _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
+            gradient_total_norm = None
             if grad_clip_norm > 0.0:
-                gradients_are_finite = _run_gradient_clip_(
+                gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -8575,15 +8802,19 @@ def _train_epoch_windowed_tensor(
                     device=device,
                     profile_timing=profile_timing,
                 )
-            if gradients_are_finite and should_check_finite:
+            if should_check_finite:
                 finite_start = time.perf_counter()
-                gradients_are_finite = _model_gradients_are_finite(model)
+                gradients_are_finite = (
+                    _tensor_is_finite(gradient_total_norm)
+                    if gradient_total_norm is not None
+                    else _model_gradients_are_finite(model)
+                )
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
                 continue
             step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device):
+            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                 optimizer.step()
             _stabilize_model_parameters_after_step(model)
             _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
@@ -8602,7 +8833,7 @@ def _train_epoch_windowed_tensor(
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
 
-        total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
+        total_loss_t.add_(loss.detach().to(dtype=torch.float32))
         steps += 1
         if progress_label:
             _progress(
@@ -8778,7 +9009,12 @@ def _train_epoch_windowed_tensor_ddp(
         forward_start = time.perf_counter()
         with _autocast_context(device, amp_dtype):
             model_forward_start = time.perf_counter()
-            with _cuda_timing(timing, "model_forward_cuda_s", device):
+            with _cuda_timing(
+                timing,
+                "model_forward_cuda_s",
+                device,
+                enabled=profile_timing,
+            ):
                 if use_panel_slab:
                     model_output = model(
                         batch["feature_slab"],
@@ -8828,7 +9064,7 @@ def _train_epoch_windowed_tensor_ddp(
 
             _record_debug_cuda_sync(timing, "after_forward_sync_s", device, debug_timing_sync)
             loss_start = time.perf_counter()
-            with _cuda_timing(timing, "loss_cuda_s", device):
+            with _cuda_timing(timing, "loss_cuda_s", device, enabled=profile_timing):
                 aux_outputs: dict[str, torch.Tensor] | None = None
                 aux_outputs = {
                     "initial_weights": portfolio_prev_weights,
@@ -8907,13 +9143,14 @@ def _train_epoch_windowed_tensor_ddp(
         backward_start = time.perf_counter()
         if scaler.is_enabled():
             grad_start = time.perf_counter()
-            with _cuda_timing(timing, "grad_cuda_s", device):
+            with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 scaler.scale(loss).backward()
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
+            gradient_total_norm: torch.Tensor | None = None
             if float(grad_clip_norm) > 0.0:
-                gradients_are_finite = _run_gradient_clip_(
+                gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -8922,15 +9159,19 @@ def _train_epoch_windowed_tensor_ddp(
                     device=device,
                     profile_timing=profile_timing,
                 )
-            if gradients_are_finite and should_check_finite:
+            if should_check_finite:
                 finite_start = time.perf_counter()
-                gradients_are_finite = _model_gradients_are_finite(model)
+                gradients_are_finite = (
+                    _tensor_is_finite(gradient_total_norm)
+                    if gradient_total_norm is not None
+                    else _model_gradients_are_finite(model)
+                )
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
                 continue
             step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device):
+            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                 scaler.step(optimizer)
                 scaler.update()
             _stabilize_model_parameters_after_step(model)
@@ -8938,14 +9179,15 @@ def _train_epoch_windowed_tensor_ddp(
             timing.step_s += time.perf_counter() - step_start
         else:
             grad_start = time.perf_counter()
-            with _cuda_timing(timing, "grad_cuda_s", device):
+            with _cuda_timing(timing, "grad_cuda_s", device, enabled=profile_timing):
                 loss.backward()
             _record_debug_cuda_sync(timing, "after_backward_sync_s", device, debug_timing_sync)
             _maybe_sync_cuda(device, profile_timing)
             timing.grad_s += time.perf_counter() - grad_start
             gradients_are_finite = True
+            gradient_total_norm = None
             if float(grad_clip_norm) > 0.0:
-                gradients_are_finite = _run_gradient_clip_(
+                gradient_total_norm = _run_gradient_clip_(
                     model,
                     optimizer,
                     scaler,
@@ -8954,15 +9196,19 @@ def _train_epoch_windowed_tensor_ddp(
                     device=device,
                     profile_timing=profile_timing,
                 )
-            if gradients_are_finite and should_check_finite:
+            if should_check_finite:
                 finite_start = time.perf_counter()
-                gradients_are_finite = _model_gradients_are_finite(model)
+                gradients_are_finite = (
+                    _tensor_is_finite(gradient_total_norm)
+                    if gradient_total_norm is not None
+                    else _model_gradients_are_finite(model)
+                )
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
                 continue
             step_start = time.perf_counter()
-            with _cuda_timing(timing, "step_cuda_s", device):
+            with _cuda_timing(timing, "step_cuda_s", device, enabled=profile_timing):
                 optimizer.step()
             _stabilize_model_parameters_after_step(model)
             _record_debug_cuda_sync(timing, "after_step_sync_s", device, debug_timing_sync)
@@ -8980,7 +9226,7 @@ def _train_epoch_windowed_tensor_ddp(
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
-        total_loss_t = total_loss_t + loss.detach().to(dtype=torch.float32)
+        total_loss_t.add_(loss.detach().to(dtype=torch.float32))
         steps += 1
         if progress_label and _distributed_is_rank0():
             _progress(
@@ -9600,6 +9846,10 @@ def _run_inference_neural_models(
     non_blocking = config.training.non_blocking_transfer and device.type == "cuda"
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     loss_objective = _normalize_risk_objective(config.training.loss_type)
+    include_volume_notional = _volume_participation_enabled(
+        config.trading.max_volume_participation,
+        config.trading.volume_participation_equity,
+    )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -9662,14 +9912,25 @@ def _run_inference_neural_models(
         else:
             print(f"[Fold {fold.fold_id}] inference mode=windowed panel_forward=fallback")
 
-        val_ds = CrossSectionalDataset(fold_panel, fold.val_indices, config.training.lookback)
+        val_ds = CrossSectionalDataset(
+            fold_panel,
+            fold.val_indices,
+            config.training.lookback,
+            include_volume_notional=include_volume_notional,
+        )
         test_indices = _deployment_test_indices(
             fold_panel,
             fold,
             next_fold_by_id.get(int(fold.fold_id)),
             config.training.lookback,
         )
-        test_ds = CrossSectionalDataset(fold_panel, test_indices, config.training.lookback, allow_empty=True)
+        test_ds = CrossSectionalDataset(
+            fold_panel,
+            test_indices,
+            config.training.lookback,
+            allow_empty=True,
+            include_volume_notional=include_volume_notional,
+        )
         if len(test_ds) == 0:
             print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
             continue
@@ -9681,7 +9942,11 @@ def _run_inference_neural_models(
             name=f"inference fold {fold.fold_id} validation windowed tensors",
         )
         val_chunk_rows = _resolve_inference_model_chunk_rows(config, len(val_windowed))
-        val_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(config, val_chunk_rows)
+        val_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(
+            config,
+            val_chunk_rows,
+            len(val_windowed),
+        )
         print(
             f"[Fold {fold.fold_id}] inference val chunks: "
             f"rows={len(val_windowed)} model_chunk_rows={val_chunk_rows} "
@@ -9766,7 +10031,11 @@ def _run_inference_neural_models(
             name=f"inference fold {fold.fold_id} test windowed tensors",
         )
         test_chunk_rows = _resolve_inference_model_chunk_rows(config, len(test_windowed))
-        test_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(config, test_chunk_rows)
+        test_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(
+            config,
+            test_chunk_rows,
+            len(test_windowed),
+        )
         print(
             f"[Fold {fold.fold_id}] inference test chunks: "
             f"rows={len(test_windowed)} model_chunk_rows={test_chunk_rows} "
@@ -10131,7 +10400,16 @@ def run_training(
         print(f"{'='*80}")
 
         train_reference = group_folds[0]
-        train_ds = CrossSectionalDataset(panel, train_reference.train_indices, config.training.lookback)
+        include_volume_notional = _volume_participation_enabled(
+            config.trading.max_volume_participation,
+            config.trading.volume_participation_equity,
+        )
+        train_ds = CrossSectionalDataset(
+            panel,
+            train_reference.train_indices,
+            config.training.lookback,
+            include_volume_notional=include_volume_notional,
+        )
         min_batch_size = max(1, config.training.min_batch_size)
         train_batch_used_bytes = 0
 
@@ -10241,14 +10519,25 @@ def run_training(
         fold_contexts: dict[int, FoldRuntimeContext] = {}
         for fold in pending_folds:
             print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
-            val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
+            val_ds = CrossSectionalDataset(
+                panel,
+                fold.val_indices,
+                config.training.lookback,
+                include_volume_notional=include_volume_notional,
+            )
             test_indices = _deployment_test_indices(
                 panel,
                 fold,
                 next_fold_by_id.get(int(fold.fold_id)),
                 config.training.lookback,
             )
-            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback, allow_empty=True)
+            test_ds = CrossSectionalDataset(
+                panel,
+                test_indices,
+                config.training.lookback,
+                allow_empty=True,
+                include_volume_notional=include_volume_notional,
+            )
 
             if len(test_ds) == 0:
                 print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
@@ -10323,7 +10612,13 @@ def run_training(
         if curve_test_indices.size == 0:
             curve_test_indices = curve_test_fold_context.fold.test_indices
             curve_test_years = curve_test_fold_context.fold.test_years
-        curve_test_ds = CrossSectionalDataset(panel, curve_test_indices, config.training.lookback, allow_empty=True)
+        curve_test_ds = CrossSectionalDataset(
+            panel,
+            curve_test_indices,
+            config.training.lookback,
+            allow_empty=True,
+            include_volume_notional=include_volume_notional,
+        )
         if len(curve_test_ds) == 0 and curve_test_indices.size != curve_test_fold_context.fold.test_indices.size:
             curve_test_indices = curve_test_fold_context.fold.test_indices
             curve_test_years = curve_test_fold_context.fold.test_years
@@ -10637,7 +10932,11 @@ def run_training(
 
         eval_backtest_chunk_rows_config = int(getattr(config.training, "eval_backtest_chunk_rows", 512))
         if bool(getattr(config.training, "eval_backtest_chunk_rows_auto", True)):
-            eval_backtest_chunk_rows = max(eval_chunk_rows, eval_backtest_chunk_rows_config)
+            eval_backtest_chunk_rows = _auto_backtest_chunk_rows(
+                total_rows=combined_val_rows,
+                model_chunk_rows=eval_chunk_rows,
+                configured_cap=eval_backtest_chunk_rows_config,
+            )
         else:
             eval_backtest_chunk_rows = max(1, eval_backtest_chunk_rows_config)
         eval_backtest_chunk_rows = max(1, eval_backtest_chunk_rows)
@@ -10854,6 +11153,69 @@ def run_training(
                     f"all ranks use eager before probe/DDP wrap: {compile_setup_error}"
                 )
 
+        requested_train_feature_cache_dtype = _resolve_train_feature_cache_dtype(
+            config,
+            device,
+            amp_dtype,
+            train_uses_panel_slab=train_uses_panel_slab,
+            has_categorical_features=bool(
+                getattr(_unwrap_model(model), "categorical_feature_indices", ())
+            ),
+        )
+
+        # Cache before probing so torch.compile validates the exact dtype/device
+        # representation that the epoch executor will receive. An opted-in AMP
+        # feature cache is a strict semantic contract: never silently fall back
+        # to FP32 or let DDP ranks specialize different graphs.
+        _release_cuda_memory(device)
+        train_cache_error: BaseException | None = None
+        try:
+            train_windowed = _maybe_cache_windowed_split_on_device(
+                name=f"train windowed tensors {train_years}",
+                split=train_windowed,
+                device=device,
+                enabled=bool(config.training.cache_train_tensors_on_gpu),
+                target_fraction=float(config.training.target_vram_fraction),
+                safety_margin_gb=float(config.training.vram_safety_margin_gb),
+                feature_dtype=requested_train_feature_cache_dtype,
+            )
+        except Exception as exc:
+            # Every DDP rank must reach the phase decision below. Raising here
+            # would strand successful peers in their next collective.
+            train_cache_error = exc
+        effective_train_feature_dtype = train_windowed.features.dtype
+        effective_train_feature_on_device = _tensor_on_requested_device(
+            train_windowed.features,
+            device,
+        )
+        if requested_train_feature_cache_dtype is not None and (
+            not effective_train_feature_on_device
+            or effective_train_feature_dtype != requested_train_feature_cache_dtype
+        ):
+            train_cache_error = RuntimeError(
+                "cache_train_features_in_amp_dtype could not be honored; "
+                f"requested={requested_train_feature_cache_dtype} on {device}, "
+                f"effective={effective_train_feature_dtype} on {train_windowed.features.device}. "
+                "Reduce the panel/universe or disable the option explicitly."
+            )
+        _raise_if_distributed_phase_failed(
+            f"train_feature_cache_{_group_id(train_years)}",
+            train_cache_error,
+        )
+        dtype_code = {
+            torch.float32: 0,
+            torch.float16: 1,
+            torch.bfloat16: 2,
+        }.get(effective_train_feature_dtype, 99)
+        representation_code = int(dtype_code) + (10 if effective_train_feature_on_device else 0)
+        min_representation_code = _distributed_min_int(representation_code, device)
+        max_representation_code = -_distributed_min_int(-representation_code, device)
+        if min_representation_code != max_representation_code:
+            raise RuntimeError(
+                "DDP ranks selected inconsistent train feature cache representations: "
+                f"local={effective_train_feature_dtype}@{train_windowed.features.device}"
+            )
+
         if model_compile_status.startswith("enabled"):
             probe_uses_panel_slab = bool(train_uses_panel_slab and panel_slab_model is not None)
             probe_model = panel_slab_model if probe_uses_panel_slab else compiled_train_model
@@ -10991,6 +11353,9 @@ def run_training(
             if eval_model is not model
             else "eager"
         )
+        effective_train_feature_label = (
+            f"{effective_train_feature_dtype}@{train_windowed.features.device}"
+        )
         print(
             f"[Train {train_years}] optimization status: "
             f"model_compile={model_compile_status}; "
@@ -11004,6 +11369,7 @@ def run_training(
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
             f"backtest_prep_compile={_env_truthy('STOCKAGENT_BACKTEST_COMPILE_PREP', '1')}; "
             f"cache_train_gpu={bool(config.training.cache_train_tensors_on_gpu)}; "
+            f"cache_train_features={effective_train_feature_label}; "
             f"cache_eval_gpu={bool(config.training.cache_eval_tensors_on_gpu)}; "
             f"record_epoch_curve={record_epoch_curve}; "
             f"epoch_test_curve={run_epoch_test_curve}; "
@@ -11016,14 +11382,10 @@ def run_training(
                 "Use 100+ for throughput runs unless debugging NaNs/Infs."
             )
         print(f"[Train {train_years}] training mode=windowed tensor")
-        train_windowed = _maybe_cache_windowed_split_on_device(
-            name=f"train windowed tensors {train_years}",
-            split=train_windowed,
-            device=device,
-            enabled=bool(config.training.cache_train_tensors_on_gpu),
-            target_fraction=float(config.training.target_vram_fraction),
-            safety_margin_gb=float(config.training.vram_safety_margin_gb),
-        )
+        # Compile probes intentionally allocate real train/eval workspaces. The
+        # immutable train base is already cached and remains live; release only
+        # temporary allocator blocks before considering eval caches.
+        _release_cuda_memory(device)
 
         combined_val_windowed_shared = _maybe_share_windowed_base_from_cached(
             name=f"validation windowed tensors {train_years}",

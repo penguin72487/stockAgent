@@ -37,14 +37,22 @@ def finite_mask_fill_value(values: torch.Tensor) -> float:
     return float(torch.finfo(values.dtype).min)
 
 
-def masked_cross_sectional_mean(values: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-    values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+def masked_cross_sectional_mean_finite(
+    values: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Masked cross-sectional mean for callers that already guarantee finite values."""
     if mask is None:
         return values.mean(dim=1, keepdim=True)
 
     mask_f = mask.to(dtype=values.dtype)
     denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (values * mask_f).sum(dim=1, keepdim=True) / denom
+
+
+def masked_cross_sectional_mean(values: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    return masked_cross_sectional_mean_finite(values, mask)
 
 
 def masked_softmax(

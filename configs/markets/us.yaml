@@ -42,7 +42,9 @@ training:
   model_name: transformer_base_portfolio
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
-  torch_compile_mode: reduce-overhead
+  # Fold26 steady-state winner for long runs; cold compilation is slower than
+  # reduce-overhead, but the break-even is about 29 epochs on the measured GPU.
+  torch_compile_mode: max-autotune-no-cudagraphs
   torchinductor_cache_dir: ~/.cache/torchinductor
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
@@ -54,6 +56,8 @@ training:
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 16
+  train_symbol_compaction: train_union
+  train_symbol_compaction_bucket_size: 128
   backtest_autotune: true
   backtest_compile: true
   backtest_compile_stateful: true
@@ -128,6 +132,9 @@ training:
   save_best_val_artifacts: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
+  # AMP already quantizes the feature-projection input to BF16. Store the GPU
+  # cache in that compute dtype to cut the shared base from 6.40GB to 3.66GB.
+  cache_train_features_in_amp_dtype: true
   learning_rate: 0.000075
   enable_lr_scheduler: false
   lr_scheduler: plateau
@@ -255,6 +262,13 @@ training:
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
+    # build_panel guarantees finite features; retain BF16 after projection and
+    # prevent FP32 position parameters from upcasting the full residual stream.
+    sanitize_inputs: false
+    amp_native_position_add: true
+    temporal_self_attention_fast_path: true
+    # Compiled-only kernel choice; eager inference retains SDPA.
+    compiled_cross_attention_backend: manual
     sdpa_batch_limit: 65535
     norm_type: rmsnorm
     ffn_type: swiglu
@@ -265,7 +279,10 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: full_then_last
+    # Speed architecture: update only the final temporal query at each layer.
+    # Parameter shapes/count stay identical, but this is intentionally not
+    # function-equivalent to full_then_last.
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2

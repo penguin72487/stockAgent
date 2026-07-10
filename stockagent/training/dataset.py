@@ -15,6 +15,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         lookback: int,
         *,
         allow_empty: bool = False,
+        include_volume_notional: bool = True,
     ) -> None:
         self.lookback = int(lookback)
         self.date_indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
@@ -77,14 +78,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             features = np.ascontiguousarray(features)
         self.features_t = torch.from_numpy(features)
         self.future_log_returns_t = torch.from_numpy(returns)
-        daily_volumes = getattr(panel, "daily_volumes", None)
-        if daily_volumes is None:
-            volume_notional = np.full_like(panel.close_prices, np.inf, dtype=np.float32)
-        else:
-            daily_volumes_arr = np.asarray(daily_volumes, dtype=np.float32)
-            close_prices_arr = np.asarray(panel.close_prices, dtype=np.float32)
-            volume_notional = (daily_volumes_arr * close_prices_arr).astype(np.float32, copy=False)
-        self.volume_notional_t = torch.from_numpy(volume_notional)
+        self.volume_notional_t: torch.Tensor | None = None
+        if bool(include_volume_notional):
+            daily_volumes = getattr(panel, "daily_volumes", None)
+            if daily_volumes is None:
+                volume_notional = np.full_like(panel.close_prices, np.inf, dtype=np.float32)
+            else:
+                daily_volumes_arr = np.asarray(daily_volumes, dtype=np.float32)
+                close_prices_arr = np.asarray(panel.close_prices, dtype=np.float32)
+                volume_notional = (daily_volumes_arr * close_prices_arr).astype(np.float32, copy=False)
+            self.volume_notional_t = torch.from_numpy(volume_notional)
         self.tradable_mask_t = torch.from_numpy(tradable)
         self.can_buy_mask_t = torch.from_numpy(can_buy)
         self.can_sell_mask_t = torch.from_numpy(can_sell)
@@ -99,10 +102,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         date_idx = int(self.valid_indices[index])
         start_idx = date_idx - self.lookback + 1
-        return {
+        sample = {
             "x": self.features_t[start_idx : date_idx + 1],
             "future_log_returns": self.future_log_returns_t[date_idx],
-            "volume_notional": self.volume_notional_t[date_idx],
             "tradable_mask": self.tradable_mask_t[date_idx],
             "can_buy_mask": self.can_buy_mask_t[date_idx],
             "can_sell_mask": self.can_sell_mask_t[date_idx],
@@ -111,6 +113,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "force_exit_mask": self.force_exit_mask_t[date_idx],
             "benchmark": self.benchmark_t[date_idx],
         }
+        if self.volume_notional_t is not None:
+            sample["volume_notional"] = self.volume_notional_t[date_idx]
+        return sample
 
 
 def collate_batch(
@@ -118,10 +123,9 @@ def collate_batch(
     batch_size: int | None = None,
 ) -> dict[str, torch.Tensor]:
     if batch_size is None or len(samples) >= batch_size:
-        return {
+        batch = {
             "x": torch.stack([s["x"] for s in samples]),
             "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
-            "volume_notional": torch.stack([s["volume_notional"] for s in samples]),
             "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
             "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
             "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
@@ -131,6 +135,9 @@ def collate_batch(
             "benchmark": torch.stack([s["benchmark"] for s in samples]),
             "sample_mask": torch.ones(len(samples), dtype=torch.bool),
         }
+        if "volume_notional" in samples[0]:
+            batch["volume_notional"] = torch.stack([s["volume_notional"] for s in samples])
+        return batch
 
     pad_count = batch_size - len(samples)
     template = samples[0]
@@ -140,10 +147,9 @@ def collate_batch(
         padding = [torch.zeros_like(template[name]) for _ in range(pad_count)]
         return torch.stack(values + padding)
 
-    return {
+    batch = {
         "x": _pad_tensor_list("x"),
         "future_log_returns": _pad_tensor_list("future_log_returns"),
-        "volume_notional": _pad_tensor_list("volume_notional"),
         "tradable_mask": _pad_tensor_list("tradable_mask"),
         "can_buy_mask": _pad_tensor_list("can_buy_mask"),
         "can_sell_mask": _pad_tensor_list("can_sell_mask"),
@@ -153,3 +159,6 @@ def collate_batch(
         "benchmark": _pad_tensor_list("benchmark"),
         "sample_mask": torch.tensor([True] * len(samples) + [False] * pad_count, dtype=torch.bool),
     }
+    if "volume_notional" in template:
+        batch["volume_notional"] = _pad_tensor_list("volume_notional")
+    return batch

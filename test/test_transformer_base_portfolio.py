@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Smoke tests for the scalable Transformer-base portfolio model."""
 
+import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import stockagent.models.transformer_base_portfolio as transformer_module
 from stockagent.config import load_config
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.transformer_base_portfolio import (
+    FlashSDPAAttention,
     PortfolioRMSNorm,
     SwiGLUFeedForward,
     TransformerBasePortfolioModel,
+    _compiled_cross_attention_requires_blackwell_workaround,
     _sanitize_scores_to_dtype,
 )
 from stockagent.models.normalization import (
@@ -19,7 +24,12 @@ from stockagent.models.normalization import (
     masked_l1_projection_weights,
     masked_signed_action_weights,
 )
-from stockagent.training.trainer import _extract_weights_and_aux, _PanelSlabForwardWrapper
+from stockagent.training.loss import risk_aware_loss
+from stockagent.training.trainer import (
+    _extract_weights_and_aux,
+    _maybe_compact_train_windowed_symbols,
+    _PanelSlabForwardWrapper,
+)
 from stockagent.training.windowed import WindowedSplitTensors
 
 
@@ -422,6 +432,173 @@ def test_symbol_indices_preserve_full_universe_symbol_positions() -> None:
     assert torch.allclose(slab_full, slab_compact, atol=1e-5, rtol=1e-5)
 
 
+def test_train_union_bucket_padding_preserves_output_loss_grad_and_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compaction is only a representation change, including recurrent state."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    torch.manual_seed(101)
+    total_symbols = 13
+    active_indices = torch.tensor([0, 2, 5, 8, 12], dtype=torch.long)
+    valid_indices = torch.tensor([5, 6, 7], dtype=torch.long)
+    features = torch.randn(8, total_symbols, 11)
+    future_returns = torch.randn(8, total_symbols) * 0.01
+    tradable = torch.zeros(8, total_symbols, dtype=torch.bool)
+    tradable[valid_indices[:, None], active_indices[None, :]] = True
+    split = WindowedSplitTensors(
+        features=features,
+        valid_indices=valid_indices,
+        future_log_returns=future_returns,
+        tradable_mask=tradable,
+        can_buy_mask=tradable.clone(),
+        can_sell_mask=tradable.clone(),
+        benchmark=torch.randn(8) * 0.001,
+        lookback=6,
+        volume_notional=None,
+    )
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            train_symbol_compaction="train_union",
+            train_symbol_compaction_bucket_size=4,
+        )
+    )
+
+    compact = _maybe_compact_train_windowed_symbols(split, config, label="test")
+
+    assert compact.num_symbols == 8
+    assert compact.symbol_indices is not None
+    assert compact.symbol_indices[: active_indices.numel()].tolist() == active_indices.tolist()
+    assert compact.symbol_indices[active_indices.numel() :].tolist() == [0, 0, 0]
+    assert not compact.tradable_mask[:, active_indices.numel() :].any()
+    assert compact.volume_notional is None
+
+    full_batch = split.panel_slab_batch_by_rows(0, len(split), torch.device("cpu"), non_blocking=False)
+    compact_batch = compact.panel_slab_batch_by_rows(
+        0,
+        len(compact),
+        torch.device("cpu"),
+        non_blocking=False,
+    )
+    assert full_batch is not None
+    assert compact_batch is not None
+    full_slab = full_batch["feature_slab"].detach().clone().requires_grad_(True)
+    compact_slab = compact_batch["feature_slab"].detach().clone().requires_grad_(True)
+
+    full_model = _make_model(
+        attention_mode="market_token",
+        num_symbols=total_symbols,
+        allow_dynamic_symbols=False,
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        portfolio_output_mode="logits",
+        return_aux=False,
+        return_aux_details=False,
+    ).cpu().train()
+    compact_model = copy.deepcopy(full_model)
+    full_weights = full_model.forward_from_panel_slab(
+        full_slab,
+        full_batch["tradable_mask"],
+        return_aux=False,
+    )
+    compact_weights = compact_model.forward_from_panel_slab(
+        compact_slab,
+        compact_batch["tradable_mask"],
+        return_aux=False,
+        symbol_indices=compact_batch["symbol_indices"],
+    )
+    active_count = int(active_indices.numel())
+
+    assert torch.allclose(
+        full_weights.index_select(1, active_indices),
+        compact_weights[:, :active_count],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch.count_nonzero(full_weights[:, ~tradable[valid_indices].any(dim=0)]) == 0
+    assert torch.count_nonzero(compact_weights[:, active_count:]) == 0
+
+    initial_full = torch.zeros(total_symbols)
+    initial_full[active_indices] = torch.tensor([0.08, -0.06, 0.04, -0.02, 0.01])
+    initial_compact = torch.cat((initial_full[active_indices], torch.zeros(3)))
+    full_state = {"initial_weights": initial_full, "initial_alive": torch.tensor(True)}
+    compact_state = {"initial_weights": initial_compact, "initial_alive": torch.tensor(True)}
+    loss_kwargs = {
+        "long_only": False,
+        "buy_fee_rate": 0.001,
+        "sell_fee_rate": 0.002,
+        "max_turnover_ratio": 0.6,
+        "gross_leverage": 1.0,
+        "min_trade_weight": 0.0,
+        "portfolio_activation": "identity",
+        "gamma_sharpe": 1.0,
+        "gamma_turnover": 0.03,
+        "objective": "log_utility",
+        "concentration_weight": 0.0,
+        "net_exposure_weight": 0.0,
+    }
+    full_loss = risk_aware_loss(
+        full_weights,
+        full_batch["future_log_returns"],
+        full_batch["tradable_mask"],
+        benchmark_returns=full_batch["benchmark"],
+        can_buy_mask=full_batch["can_buy_mask"],
+        can_sell_mask=full_batch["can_sell_mask"],
+        can_short_open_mask=full_batch["can_short_open_mask"],
+        force_short_cover_mask=full_batch["force_short_cover_mask"],
+        force_exit_mask=full_batch["force_exit_mask"],
+        sample_mask=full_batch["sample_mask"],
+        aux_outputs=full_state,
+        **loss_kwargs,
+    )
+    compact_loss = risk_aware_loss(
+        compact_weights,
+        compact_batch["future_log_returns"],
+        compact_batch["tradable_mask"],
+        benchmark_returns=compact_batch["benchmark"],
+        can_buy_mask=compact_batch["can_buy_mask"],
+        can_sell_mask=compact_batch["can_sell_mask"],
+        can_short_open_mask=compact_batch["can_short_open_mask"],
+        force_short_cover_mask=compact_batch["force_short_cover_mask"],
+        force_exit_mask=compact_batch["force_exit_mask"],
+        sample_mask=compact_batch["sample_mask"],
+        aux_outputs=compact_state,
+        **loss_kwargs,
+    )
+
+    assert torch.allclose(compact_loss, full_loss, atol=2e-6, rtol=2e-6)
+    assert torch.allclose(
+        compact_state["_final_weights"][:active_count],
+        full_state["_final_weights"].index_select(0, active_indices),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+    assert torch.count_nonzero(compact_state["_final_weights"][active_count:]) == 0
+    assert torch.count_nonzero(full_state["_final_weights"][~tradable[valid_indices].any(dim=0)]) == 0
+    assert torch.equal(compact_state["_final_alive"], full_state["_final_alive"])
+
+    full_loss.backward()
+    compact_loss.backward()
+    assert full_slab.grad is not None
+    assert compact_slab.grad is not None
+    assert torch.allclose(
+        compact_slab.grad[:, :active_count],
+        full_slab.grad.index_select(1, active_indices),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    assert torch.count_nonzero(compact_slab.grad[:, active_count:]) == 0
+    assert torch.count_nonzero(full_slab.grad[:, ~tradable[valid_indices].any(dim=0)]) == 0
+    for (full_name, full_param), (compact_name, compact_param) in zip(
+        full_model.named_parameters(),
+        compact_model.named_parameters(),
+        strict=True,
+    ):
+        assert compact_name == full_name
+        assert (compact_param.grad is None) == (full_param.grad is None), full_name
+        if full_param.grad is not None:
+            assert torch.allclose(compact_param.grad, full_param.grad, atol=2e-5, rtol=2e-5), full_name
+
+
 @pytest.mark.parametrize("mode", ["axial", "latent", "market_token", "temporal_only"])
 def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
     device = _device()
@@ -429,9 +606,12 @@ def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
         attention_mode=mode,
         temporal_pooling="last",
         temporal_layers=2,
+        temporal_self_attention_fast_path=True,
         return_aux=True,
         return_aux_details=False,
     ).eval()
+    with torch.no_grad():
+        model.temporal_blocks[-1].norm_context.weight.fill_(2.0)
     x = torch.randn(2, 6, 13, 11, device=device)
     mask = torch.ones(2, 13, dtype=torch.bool, device=device)
     mask[1, 11:] = False
@@ -444,6 +624,106 @@ def test_last_pooling_fast_path_matches_full_temporal_path(mode: str) -> None:
     assert full_aux["token_embedding"].shape == (2, 6, 13, 24)
     assert torch.allclose(fast_out["weights"], full_weights, atol=1e-5, rtol=1e-5)
     assert torch.allclose(fast_out["scores"], full_scores, atol=1e-5, rtol=1e-5)
+
+
+def test_amp_native_position_add_keeps_bfloat16_residual() -> None:
+    device = _device()
+    model = _make_model(
+        amp_native_position_add=True,
+        sanitize_inputs=False,
+        return_aux=False,
+    ).to(device).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        embedded = model._embed_inputs(x)
+
+    assert embedded.dtype == torch.bfloat16
+
+
+def test_compiled_cross_attention_workaround_is_blackwell_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 9))
+    assert not _compiled_cross_attention_requires_blackwell_workaround()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+    assert _compiled_cross_attention_requires_blackwell_workaround()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA module migration contract")
+def test_cross_attention_apply_recomputes_blackwell_workaround_for_parameter_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_devices: list[torch.device | str | int | None] = []
+
+    def fake_requires_workaround(device=None) -> bool:
+        seen_devices.append(device)
+        return device is not None and torch.device(device).type == "cuda"
+
+    monkeypatch.setattr(
+        transformer_module,
+        "_compiled_cross_attention_requires_blackwell_workaround",
+        fake_requires_workaround,
+    )
+    attention = FlashSDPAAttention(dim=16, num_heads=4, dropout=0.0)
+    assert attention.compiled_cross_attention_blackwell_workaround is False
+    assert seen_devices == [None]
+
+    attention = attention.cuda()
+    assert torch.device(seen_devices[-1]) == attention.in_proj.weight.device
+    assert attention.compiled_cross_attention_blackwell_workaround is True
+
+    attention = attention.cpu()
+    assert torch.device(seen_devices[-1]) == attention.in_proj.weight.device
+    assert attention.compiled_cross_attention_blackwell_workaround is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA BF16 cross-attention equivalence")
+@pytest.mark.parametrize("query_steps", [1, 3])
+def test_dynamo_manual_cross_attention_matches_eager_sdpa_output_and_grad(query_steps: int) -> None:
+    """The optimized compiled branch must preserve eager SDPA numerics."""
+    torch.manual_seed(103)
+    eager = FlashSDPAAttention(
+        dim=16,
+        num_heads=4,
+        dropout=0.0,
+        use_flash_attention=True,
+        sdpa_batch_limit=4096,
+        qk_norm=True,
+    ).cuda().train()
+    eager.compiled_cross_attention_backend = "manual"
+    compiled_module = copy.deepcopy(eager)
+    compiled = torch.compile(
+        compiled_module,
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    query_eager = torch.randn(2, query_steps, 16, device="cuda", requires_grad=True)
+    context_eager = torch.randn(2, 7, 16, device="cuda", requires_grad=True)
+    query_compiled = query_eager.detach().clone().requires_grad_(True)
+    context_compiled = context_eager.detach().clone().requires_grad_(True)
+    key_mask = torch.tensor(
+        [[True, True, True, True, True, True, True], [True, True, True, True, False, False, False]],
+        device="cuda",
+    )
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        eager_output = eager(query_eager, context_eager, key_mask=key_mask)
+    upstream = torch.randn_like(eager_output, dtype=torch.float32)
+    (eager_output.float() * upstream).sum().backward()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        compiled_output = compiled(query_compiled, context_compiled, key_mask=key_mask)
+    (compiled_output.float() * upstream).sum().backward()
+
+    assert torch.allclose(compiled_output.float(), eager_output.float(), atol=8e-3, rtol=8e-3)
+    assert query_eager.grad is not None and query_compiled.grad is not None
+    assert context_eager.grad is not None and context_compiled.grad is not None
+    assert torch.allclose(query_compiled.grad, query_eager.grad, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(context_compiled.grad, context_eager.grad, atol=1e-2, rtol=1e-2)
+    for eager_param, compiled_param in zip(eager.parameters(), compiled_module.parameters(), strict=True):
+        assert eager_param.grad is not None and compiled_param.grad is not None
+        assert torch.allclose(compiled_param.grad, eager_param.grad, atol=3e-2, rtol=2e-2)
 
 
 def test_last_only_temporal_shapes_and_finite() -> None:

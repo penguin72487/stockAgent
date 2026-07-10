@@ -183,6 +183,40 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         assert changed[expected_layer] != baseline[expected_layer]
 
 
+def test_amp_feature_cache_checkpoint_contract_is_default_compatible_and_opt_in_strict(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    default_config = _config()
+    assert default_config.training.cache_train_features_in_amp_dtype is False
+    default_manifest = _checkpoint_manifest(panel, default_config)
+    default_precision = default_manifest["contracts"]["training"]["precision"]
+    assert "cache_train_features_in_amp_dtype" not in default_precision
+
+    opted_in_config = copy.deepcopy(default_config)
+    opted_in_config.training.cache_train_features_in_amp_dtype = True
+    opted_in_manifest = _checkpoint_manifest(panel, opted_in_config)
+    assert (
+        opted_in_manifest["contracts"]["training"]["precision"][
+            "cache_train_features_in_amp_dtype"
+        ]
+        is True
+    )
+    assert (
+        opted_in_manifest["fingerprints"]["training"]
+        != default_manifest["fingerprints"]["training"]
+    )
+
+    checkpoint = {"experiment_manifest": default_manifest}
+    with pytest.raises(RuntimeError, match="training"):
+        _validate_checkpoint_manifest(
+            checkpoint,
+            opted_in_manifest,
+            checkpoint_path=tmp_path / "pre_amp_feature_cache.pt",
+            scope="resume",
+        )
+
+
 def test_checkpoint_manifest_records_but_does_not_block_execution_and_inactive_settings() -> None:
     panel = _panel()
     baseline_config = _config()
@@ -818,6 +852,97 @@ def test_schema_v1_removed_scheduler_interval_spellings_remain_loadable(tmp_path
             manifest,
             checkpoint_path=tmp_path / "legacy_scheduler_interval.pt",
             scope="resume",
+        )
+
+
+def _historical_schema_manifest(
+    source_manifest: dict,
+    schema_version: int,
+) -> dict:
+    """Build the minimal payload emitted by that historical schema."""
+    if schema_version == 1:
+        return {
+            "schema_version": 1,
+            **copy.deepcopy(source_manifest["legacy_fingerprints"]),
+        }
+    compatibility_key = f"schema_{schema_version}"
+    contracts = copy.deepcopy(
+        source_manifest["compatibility_contracts"][compatibility_key]
+    )
+    fingerprints = copy.deepcopy(
+        source_manifest["compatibility_fingerprints"][compatibility_key]
+    )
+    if schema_version == 3:
+        # This flag was introduced in schema 4. Never synthesize it into a
+        # schema-3 fixture merely because the current TrainingConfig has it.
+        contracts["training"].pop("cache_train_features_in_amp_dtype", None)
+        fingerprints["training"] = trainer_module._stable_fingerprint(
+            contracts["training"]
+        )
+    assert "cache_train_features_in_amp_dtype" not in contracts["training"]
+    return {
+        "schema_version": schema_version,
+        "contracts": contracts,
+        "fingerprints": fingerprints,
+    }
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_historical_schema_cannot_resume_amp_feature_cache_opt_in(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    panel = _panel()
+    historical_config = _config()
+    assert historical_config.training.cache_train_features_in_amp_dtype is False
+    historical = _historical_schema_manifest(
+        _checkpoint_manifest(panel, historical_config),
+        schema_version,
+    )
+    current_config = copy.deepcopy(historical_config)
+    current_config.training.cache_train_features_in_amp_dtype = True
+    current = _checkpoint_manifest(panel, current_config)
+    checkpoint = {"experiment_manifest": historical}
+    checkpoint_path = tmp_path / f"schema_{schema_version}_pre_amp_cache.pt"
+
+    with pytest.raises(RuntimeError, match="cache_train_features_in_amp_dtype|fingerprint mismatch|training"):
+        _validate_checkpoint_manifest(
+            checkpoint,
+            current,
+            checkpoint_path=checkpoint_path,
+            scope="resume",
+        )
+
+    # Weight loading and future inference do not replay the historical
+    # optimizer trajectory or its immutable feature representation.
+    for scope in ("inference", "model"):
+        _validate_checkpoint_manifest(
+            checkpoint,
+            current,
+            checkpoint_path=checkpoint_path,
+            scope=scope,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_historical_schema_remains_compatible_when_amp_feature_cache_is_default_off(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    panel = _panel()
+    config = _config()
+    assert config.training.cache_train_features_in_amp_dtype is False
+    current = _checkpoint_manifest(panel, config)
+    checkpoint = {
+        "experiment_manifest": _historical_schema_manifest(current, schema_version)
+    }
+
+    for scope in ("resume", "inference", "model"):
+        _validate_checkpoint_manifest(
+            checkpoint,
+            current,
+            checkpoint_path=tmp_path / f"schema_{schema_version}_default_amp_cache.pt",
+            scope=scope,
         )
 
 
