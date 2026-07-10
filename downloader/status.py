@@ -60,7 +60,7 @@ def command_asset(command: list[str]) -> str | None:
     asset = command_option(command, "--asset")
     if asset:
         return asset
-    if any(str(item).endswith("download_cboe_us_ohlcv.py") for item in command):
+    if any(str(item).endswith("download_alpaca_us_ohlcv.py") for item in command):
         return "us_stocks"
     return None
 

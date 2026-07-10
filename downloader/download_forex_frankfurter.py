@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,10 +11,12 @@ import polars as pl
 import pyarrow.parquet as pq
 import requests
 
-from common import resolve_end_date, run_parallel_tasks
+from common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
 
 API_BASE = "https://api.frankfurter.app"
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
+_RATE_LIMITER: SharedRateLimiter | None = None
+_HTTP_LOCAL = threading.local()
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
@@ -68,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols-file", default=None, help="Optional text file with one 6-letter pair per line")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent workers")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help="Global minimum seconds between API requests. Default uses Frankfurter public profile.",
+    )
     parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
     parser.add_argument(
         "--incremental",
@@ -83,7 +92,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def _get_json(url: str, timeout: int) -> dict:
-    response = requests.get(url, timeout=timeout)
+    if _RATE_LIMITER is not None:
+        _RATE_LIMITER.wait()
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _HTTP_LOCAL.session = session
+    response = session.get(url, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict):
@@ -322,8 +340,12 @@ def _download_pair(
 
 
 def main() -> None:
+    global _RATE_LIMITER
     args = parse_args()
     incremental_mode = args.incremental or args.mode == "daily-update"
+    request_interval = resolve_request_interval("frankfurter_public", args.request_interval)
+    _RATE_LIMITER = SharedRateLimiter(request_interval, name="frankfurter_public")
+    print(f"[frankfurter] {describe_rate_limit('frankfurter_public', request_interval)}", flush=True)
 
     if args.refresh and incremental_mode:
         raise RuntimeError("--refresh cannot be combined with daily incremental mode (--mode daily-update or --incremental)")

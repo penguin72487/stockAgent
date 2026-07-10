@@ -27,9 +27,9 @@ from tqdm import tqdm
 from urllib3.exceptions import InsecureRequestWarning
 
 try:
-    from downloader.common import resolve_end_date, run_parallel_tasks
+    from downloader.common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
 except ImportError:  # pragma: no cover - direct script execution from downloader/
-    from common import resolve_end_date, run_parallel_tasks
+    from common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
 
 
 DATA_GOV_DATASET_API = "https://data.gov.tw/api/v2/rest/dataset/{dataset_id}"
@@ -42,6 +42,7 @@ ROC_DATE_PATTERN = re.compile(r"^\d{2,3}/\d{1,2}/\d{1,2}$")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _HTTP_LOCAL = threading.local()
+_RATE_LIMITER: SharedRateLimiter | None = None
 
 
 def _http_session() -> requests.Session:
@@ -469,6 +470,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-backoff", type=float, default=1.0, help="Base seconds for exponential retry backoff.")
     parser.add_argument("--sleep", type=float, default=0.15, help="Delay between historical date requests per dataset.")
     parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help="Global minimum seconds between public HTTP requests. Default uses TW public profile.",
+    )
+    parser.add_argument(
         "--flush-every-dates",
         type=int,
         default=250,
@@ -570,6 +577,8 @@ def _http_get(
 
     for attempt in range(retry_count + 1):
         try:
+            if _RATE_LIMITER is not None:
+                _RATE_LIMITER.wait()
             session = _http_session()
             try:
                 response = session.get(url, params=params, headers=headers, timeout=timeout, verify=verify_ssl)
@@ -1352,7 +1361,11 @@ def _print_dataset_list(specs: list[DatasetSpec]) -> None:
 
 
 def main() -> None:
+    global _RATE_LIMITER
     args = parse_args()
+    request_interval = resolve_request_interval("tw_public", args.request_interval)
+    _RATE_LIMITER = SharedRateLimiter(request_interval, name="tw_public")
+    print(f"[tw-public] {describe_rate_limit('tw_public', request_interval)}", flush=True)
     specs = _select_specs(args.datasets)
     if args.mode == "list":
         _print_dataset_list(specs)

@@ -38,11 +38,11 @@ def test_command_summary_paths_prefers_asset_output_summary(tmp_path) -> None:
     ]
 
 
-def test_command_summary_paths_maps_cboe_us_command(tmp_path) -> None:
+def test_command_summary_paths_maps_alpaca_us_command(tmp_path) -> None:
     output_root = tmp_path / "data_yahoo"
     command = [
         "python",
-        "downloader/download_cboe_us_ohlcv.py",
+        "downloader/download_alpaca_us_ohlcv.py",
         "--mode",
         "daily-update",
         "--output-root",

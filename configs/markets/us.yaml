@@ -280,7 +280,7 @@ training:
     use_time_pos: true
     use_symbol_pos: true
     input_dropout: 0.0
-    sdpa_batch_limit: 16384
+    sdpa_batch_limit: 65535
     norm_type: rmsnorm
     ffn_type: swiglu
     qk_norm: true
