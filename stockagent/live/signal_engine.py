@@ -36,6 +36,7 @@ from stockagent.models.factory import build_model
 from stockagent.training.trainer import (
     _autocast_context,
     _call_model,
+    _checkpoint_manifest,
     _extract_weights_and_aux,
     _align_panel_to_state_dict_universe,
     _configure_backtest_runtime_from_config,
@@ -43,6 +44,7 @@ from stockagent.training.trainer import (
     _load_state_dict,
     _resolve_amp_dtype,
     _resolve_device,
+    _validate_checkpoint_manifest,
 )
 
 
@@ -117,8 +119,10 @@ def _datetime64_second(value: object) -> np.datetime64 | None:
 
 def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelData:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
+    use_tw_public_features = bool(config.data.use_tw_public_features)
+    use_tw_public_rules = bool(config.data.use_tw_public_rules)
+    use_tw_public_data = use_tw_public_features or use_tw_public_rules
     panel_kwargs = {
-        "use_rapids": config.data.use_rapids,
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
         "tradable_mode": config.data.tradable_mode,
@@ -128,9 +132,12 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
         "panel_backend": config.data.panel_backend,
         "panel_load_workers": config.data.panel_load_workers,
         "external_feature_path": (
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path if use_tw_public_data else None
         ),
         "external_market_symbol": config.data.tw_public_market_symbol,
+        "external_include_features": use_tw_public_features,
+        "external_include_rules": use_tw_public_rules,
+        "external_data_required": use_tw_public_data,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
     }
@@ -140,7 +147,7 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
             if live_tail_rows <= 0:
                 live_tail_rows = max(int(config.training.lookback) + 8, 48)
             return _tail_panel_dates(cached_panel, live_tail_rows)
-    if live_tail and not bool(getattr(config.data, "use_tw_public_features", False)):
+    if live_tail:
         if live_tail_rows <= 0:
             live_tail_rows = max(int(config.training.lookback) + 8, 48)
         return build_tail_panel(
@@ -153,6 +160,13 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
             security_filter=config.data.security_filter,
             strict_no_fallback=config.training.strict_no_fallback,
             panel_load_workers=config.data.panel_load_workers,
+            external_feature_path=(
+                config.data.tw_public_feature_path if use_tw_public_data else None
+            ),
+            external_market_symbol=config.data.tw_public_market_symbol,
+            external_include_features=use_tw_public_features,
+            external_include_rules=use_tw_public_rules,
+            external_data_required=use_tw_public_data,
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
         )
@@ -231,6 +245,7 @@ def _tail_panel_dates(panel: PanelData, rows: int) -> PanelData:
         can_sell_mask=panel.can_sell_mask[slc] if panel.can_sell_mask is not None else None,
         can_short_open_mask=panel.can_short_open_mask[slc] if panel.can_short_open_mask is not None else None,
         force_short_cover_mask=panel.force_short_cover_mask[slc] if panel.force_short_cover_mask is not None else None,
+        force_exit_mask=panel.force_exit_mask[slc] if panel.force_exit_mask is not None else None,
     )
 
 
@@ -1272,6 +1287,17 @@ def generate_live_signal(
         state_dict,
         context=f"live signal {market_id or resolved_fold_id}",
     )
+    saved_fold_id = checkpoint_payload.get("fold_id")
+    if saved_fold_id is not None and int(saved_fold_id) != int(resolved_fold_id):
+        raise RuntimeError(
+            f"checkpoint fold mismatch: path requests {resolved_fold_id}, payload contains {saved_fold_id}"
+        )
+    _validate_checkpoint_manifest(
+        checkpoint_payload,
+        _checkpoint_manifest(panel, config, include_data_content=False),
+        checkpoint_path=checkpoint,
+        scope="model",
+    )
     _emit_progress(progress_callback, label=progress_name, step=5, total=progress_total, message="universe aligned")
     symbol_names = load_symbol_name_map(config.data.parquet_root)
     panel_idx, panel_fallback_notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
@@ -1427,8 +1453,25 @@ def generate_live_signal(
     mask_np = np.asarray(panel.tradable_mask[panel_idx], dtype=bool)
     can_buy_np = np.asarray(panel.can_buy_mask[panel_idx] if panel.can_buy_mask is not None else mask_np, dtype=bool)
     can_sell_np = np.asarray(panel.can_sell_mask[panel_idx] if panel.can_sell_mask is not None else mask_np, dtype=bool)
+    can_short_open_np = np.asarray(
+        panel.can_short_open_mask[panel_idx]
+        if panel.can_short_open_mask is not None
+        else can_sell_np,
+        dtype=bool,
+    )
+    force_short_cover_np = np.asarray(
+        panel.force_short_cover_mask[panel_idx]
+        if panel.force_short_cover_mask is not None
+        else np.zeros_like(mask_np, dtype=bool),
+        dtype=bool,
+    )
+    force_exit_np = np.asarray(
+        panel.force_exit_mask[panel_idx]
+        if panel.force_exit_mask is not None
+        else np.zeros_like(mask_np, dtype=bool),
+        dtype=bool,
+    )
     current_weights = np.asarray(drift.weights, dtype=np.float64).copy()
-    current_weights[~mask_np] = 0.0
 
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
@@ -1453,6 +1496,18 @@ def generate_live_signal(
             portfolio_activation=config.trading.portfolio_activation,
             can_buy_mask=torch.from_numpy(can_buy_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
             can_sell_mask=torch.from_numpy(can_sell_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
+            can_short_open_mask=torch.from_numpy(can_short_open_np).unsqueeze(0).to(
+                device=runtime_device,
+                non_blocking=non_blocking,
+            ),
+            force_short_cover_mask=torch.from_numpy(force_short_cover_np).unsqueeze(0).to(
+                device=runtime_device,
+                non_blocking=non_blocking,
+            ),
+            force_exit_mask=torch.from_numpy(force_exit_np).unsqueeze(0).to(
+                device=runtime_device,
+                non_blocking=non_blocking,
+            ),
             return_weights_history=True,
             initial_weights=initial,
         )

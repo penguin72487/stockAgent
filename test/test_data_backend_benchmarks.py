@@ -170,7 +170,6 @@ def test_pyarrow_panel_backend_builds_synthetic_parquet(tmp_path: Path) -> None:
 
     pyarrow_panel = build_panel(
         tmp_path,
-        use_rapids=False,
         benchmark_name="universe_average_return",
         panel_backend="pyarrow",
         panel_load_workers=1,
@@ -224,14 +223,12 @@ def test_polars_lazy_panel_backend_matches_pyarrow_on_synthetic_parquet(tmp_path
 
     pyarrow_panel = build_panel(
         tmp_path,
-        use_rapids=False,
         benchmark_name="universe_average_return",
         panel_backend="pyarrow",
         panel_load_workers=1,
     )
     polars_panel = build_panel(
         tmp_path,
-        use_rapids=False,
         benchmark_name="universe_average_return",
         panel_backend="polars_lazy",
         panel_load_workers=1,
@@ -259,14 +256,12 @@ def test_polars_streaming_panel_backend_matches_pyarrow_on_synthetic_parquet(tmp
 
     pyarrow_panel = build_panel(
         tmp_path,
-        use_rapids=False,
         benchmark_name="universe_average_return",
         panel_backend="pyarrow",
         panel_load_workers=1,
     )
     polars_panel = build_panel(
         tmp_path,
-        use_rapids=False,
         benchmark_name="universe_average_return",
         panel_backend="polars_streaming",
         panel_load_workers=1,

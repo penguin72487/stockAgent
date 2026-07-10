@@ -157,6 +157,6 @@ if __name__ == "__main__":
     test_default_output_is_trainer_compatible()
     test_shapes_mask_and_backward()
     test_dynamic_symbols_and_token_counts()
-    test_long_only_and_empty_mask_rows_are_safe()
+    test_long_only_rejects_empty_mask_rows()
     test_factory_builds_latent_factor_market_token_model()
     print("SUCCESS")

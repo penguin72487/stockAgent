@@ -13,14 +13,20 @@ from stockagent.models.normalization import (
     masked_softmax,
     normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode
 
 
 def _safe_attention_mask(mask: torch.Tensor) -> torch.Tensor:
     safe_mask = mask.to(dtype=torch.bool)
-    torch._assert(
-        safe_mask.any(dim=1).all(),
-        "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row",
-    )
+    condition = safe_mask.any(dim=1).all()
+    message = "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row"
+    if torch.compiler.is_compiling():
+        # Avoid a host scalar extraction/graph break while Dynamo is tracing.
+        torch._assert_async(condition, message)
+    else:
+        # Keep eager validation synchronous so a device-side assertion cannot
+        # poison the CUDA context used by the rest of the process.
+        torch._assert(condition, message)
     return safe_mask
 
 
@@ -73,7 +79,7 @@ class LatentFactorMarketTokenPortfolioModel(nn.Module):
         self.num_latent_factors = max(1, int(num_latent_factors))
         self.num_market_tokens = max(1, int(num_market_tokens))
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.return_aux = bool(return_aux)
         self.runtime_shape_check = bool(runtime_shape_check)
@@ -158,18 +164,6 @@ class LatentFactorMarketTokenPortfolioModel(nn.Module):
             in_dim = int(head_hidden_dim)
         head.append(nn.Linear(in_dim, 1))
         self.score_head = nn.Sequential(*head)
-
-    @staticmethod
-    def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-        normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-        if normalized in {"long", "long_only", "longonly"}:
-            return "long_only"
-        if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-            return "long_short"
-        raise ValueError(
-            "LatentFactorMarketTokenPortfolioModel portfolio_mode must be "
-            "'long_only' or 'long_short'"
-        )
 
     def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:
         if x.dim() != 4:

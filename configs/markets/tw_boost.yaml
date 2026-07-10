@@ -7,25 +7,20 @@ runner:
   post_train_infer: false
   start_fold: 11
 environment:
-  conda_env: fintech
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  target_vram_fraction: 0.9
 
 data:
   parquet_root: data_yahoo/tw_stocks
   benchmark_name: "2330"
-  benchmark_required: false
-  benchmark_source: derived_from_panel
-  universe_mode: all_daily_symbols
-  use_rapids: false
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
   trading_volume_policy: auto
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
+  use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
   # Manual feature switch.
@@ -92,6 +87,31 @@ data:
     - twpub_investment_trust_net_buy_flow
     - twpub_dealer_net_buy_flow
     - twpub_institutional_net_buy_flow
+
+    # Point-in-time monthly revenue / financial statements
+    - twpub_monthly_revenue_log
+    - twpub_monthly_revenue_mom
+    - twpub_monthly_revenue_yoy
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_eps
+    - twpub_financial_revenue_log
+    - twpub_financial_net_income_asinh
+    - twpub_financial_gross_margin
+    - twpub_financial_operating_margin
+    - twpub_financial_net_margin
+    - twpub_financial_assets_log
+    - twpub_financial_debt_ratio
+    - twpub_financial_current_ratio
+    - twpub_financial_equity_ratio
+    - twpub_financial_book_value_per_share_log
+
+    # Point-in-time ownership / securities lending
+    - twpub_insider_holdings_log
+    - twpub_insider_pledge_ratio
+    - twpub_insider_transfer_shares_log
+    - twpub_borrow_available_log
+    - twpub_sbl_balance_log
+    - twpub_short_sale_available_log
 
     # TW public TDCC holders
     - twpub_tdcc_retail_holder_ratio
@@ -200,15 +220,11 @@ trading:
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
   max_turnover_ratio: 50.0
-  leverage: 2.5
+  reporting_leverage: 2.5
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
   long_only: false
-  cash_allowed: true
 training:
-  backend: pytorch
-  target: next_1d_rank
-  batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   seed: 1
   model_name: gradient_boosted_portfolio_transformer
@@ -219,32 +235,25 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
-  fused_log_utility_loss: true
   loss_portfolio_activation: pre_normalized
-  materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
   eval_model_chunk_rows: auto
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 64
-  train_symbol_subsample_ratio: 1.0
-  detach_prev_state: true
-  prefer_fp16: false
   backtest_autotune: true
   backtest_compile: false
   backtest_compile_stateful: false
   backtest_compile_dynamic: false
   inference_backtest_autotune: false
   inference_backtest_compile: false
-  backtest_cpp_ext: false
   backtest_verbose: false
   strict_no_fallback: true
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 4
   batch_size_train: 4
   batch_size_eval: 4
   epochs: 1000
@@ -257,8 +266,6 @@ training:
   plot_backend: auto
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
-  input_pipeline_ab_test: false
-  input_pipeline_ab_test_steps: 20
   explain_after_each_fold: false
   explain_first_test_year_only: true
   explain_top_k: 20
@@ -305,11 +312,6 @@ training:
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true
   save_integer_share_holdings_table: true
-  # Legacy CSV-specific switches still feed runtime fallbacks; keep disabled
-  # while table_output_format=parquet is the default training output.
-  save_integer_share_daily_weights_csv: false
-  save_integer_share_holdings_csv: false
-  save_daily_weights_csv: false
   backtest_artifact_compression: none
   save_best_val_artifacts: false
   postprocess_benchmark_after_fold: true
@@ -331,13 +333,10 @@ training:
   lr_scheduler_t_max: 0
   lr_scheduler_eta_min: 0.00001
   lr_scheduler_warmup_steps: 500
-  lr_scheduler_interval: step
   lr_scheduler_step_size: 50
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 4
   lr_scheduler_threshold: 0.0005
-  top_k: 10
-  num_workers: 0
   weight_decay: 0.01
   grad_clip_norm: 1.0
   finite_check_interval_steps: 1
@@ -565,23 +564,10 @@ training:
     n_blocks: 4
     dropout: 0.1
   cross_sectional_temporal_portfolio_model:
-    stock_embedding_dim: 128
-    stock_hidden_dim: 128
-    stock_n_blocks: 2
-    temporal_hidden_dim: 128
-    temporal_blocks: 2
-    temporal_kernel_size: 3
-    cross_hidden_dim: 128
-    cross_heads: 4
-    cross_layers: 2
-    candidate_top_m: 64
-    portfolio_top_k: 10
     candidate_k: 64
     trade_k: 10
-    scorer: tabular_resnet
     scorer_hidden: 128
     scorer_blocks: 2
-    reranker: set_transformer
     d_model: 128
     heads: 4
     layers: 2
@@ -614,7 +600,6 @@ training:
     augmentation_time_dropout: 0.05
     augmentation_noise_std: 0.01
   portfolio_autoencoder_loss:
-    cost_rate: 0.0005
     lambda_turnover: 0.1
     lambda_concentration: 0.01
     lambda_latent: 0.001

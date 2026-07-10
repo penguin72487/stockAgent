@@ -51,7 +51,7 @@ Master's Thesis Proposal
 | 層次 | 目前專案狀態 | 論文中之定位 |
 | --- | --- | --- |
 | 市場 | `data.parquet_root: data_yahoo/tw_stocks` | 以台灣股票日頻資料為主要資料來源 |
-| 股票池 | `universe_mode: all_daily_symbols` | 使用動態股票集合，避免只看期末存活股票 |
+| 股票池 | 載入 parquet 目錄內的完整歷史標的並使用逐日 `alive/tradable` 遮罩 | 使用動態股票集合，避免只看期末存活股票 |
 | 可交易遮罩 | `tradable_mode: tw_limit_guard` | 已考慮台股漲跌停造成的不可買或不可賣 |
 | 模型 | `transformer_base_portfolio` | 作為主要 Transformer 端到端投資組合模型 |
 | 注意力模式 | `attention_mode: market_token` | 以市場權杖壓縮跨股票共同狀態 |

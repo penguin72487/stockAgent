@@ -218,6 +218,157 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
 )
 
 
+DELISTED_DATASETS: tuple[DatasetSpec, ...] = (
+    DatasetSpec(
+        name="twse_delisted_company",
+        kind="delisted_history",
+        source="TWSE OpenAPI",
+        description="TWSE official historical delisted-company records.",
+        tags=("twse", "company", "delisted", "universe", "historical"),
+        url="https://openapi.twse.com.tw/v1/company/suspendListingCsvAndHtml",
+        start_date="2001-01-01",
+    ),
+    DatasetSpec(
+        name="tpex_delisted_company",
+        kind="delisted_history",
+        source="TPEx",
+        description="TPEx official historical delisted-company records.",
+        tags=("tpex", "company", "delisted", "universe", "historical"),
+        url="https://www.tpex.org.tw/www/zh-tw/company/deListed",
+        start_date="1994-01-01",
+    ),
+)
+
+
+# First-principles subset for a daily stock model. These are point-in-time
+# company/fundamental/ownership/lifecycle/shorting/index inputs. Intraday ranks,
+# broker leaderboards, warrants, bonds, gold, funds, and auction-frequency-only
+# feeds are intentionally excluded.
+TWSE_MODEL_USEFUL_PATHS: tuple[tuple[str, str], ...] = (
+    ("company/applylistingForeign", "lifecycle"),
+    ("company/applylistingLocal", "lifecycle"),
+    ("company/newlisting", "lifecycle"),
+    ("opendata/t187ap02_L", "ownership"),
+    ("opendata/t187ap05_L", "fundamental"),
+    ("opendata/t187ap08_L", "ownership"),
+    ("opendata/t187ap09_L", "ownership"),
+    ("opendata/t187ap10_L", "ownership"),
+    ("opendata/t187ap11_L", "ownership"),
+    ("opendata/t187ap12_L", "ownership"),
+    ("opendata/t187ap13_L", "ownership"),
+    ("opendata/t187ap22_L", "event"),
+    ("opendata/t187ap23_L", "event"),
+    ("opendata/t187ap24_L", "event"),
+    ("opendata/t187ap25_L", "event"),
+    ("opendata/t187ap26_L", "lifecycle"),
+    ("opendata/t187ap27_L", "lifecycle"),
+    ("opendata/t187ap15_L", "fundamental"),
+    ("opendata/t187ap16_L", "fundamental"),
+    ("opendata/t187ap17_L", "fundamental"),
+    ("opendata/t187ap31_L", "fundamental"),
+    ("SBL/TWT96U", "shorting"),
+    ("exchangeReport/BFI84U", "shorting"),
+    ("exchangeReport/MI_MARGN", "shorting"),
+    ("exchangeReport/TWT84U", "market_rule"),
+    ("exchangeReport/TWT85U", "lifecycle"),
+    ("exchangeReport/TWT88U", "market_rule"),
+    ("exchangeReport/TWTAWU", "lifecycle"),
+    ("fund/MI_QFIIS_cat", "ownership"),
+    ("fund/MI_QFIIS_sort_20", "ownership"),
+    ("holidaySchedule/holidaySchedule", "calendar"),
+    ("opendata/twtazu_od", "market_state"),
+    ("indicesReport/FRMSA", "index"),
+    ("indicesReport/MFI94U", "index"),
+    ("indicesReport/MI_5MINS_HIST", "index"),
+    ("indicesReport/TAI50I", "index"),
+    *tuple((f"opendata/t187ap06_L_{suffix}", "fundamental") for suffix in ("basi", "bd", "ci", "fh", "ins", "mim")),
+    *tuple((f"opendata/t187ap07_L_{suffix}", "fundamental") for suffix in ("basi", "bd", "ci", "fh", "ins", "mim")),
+)
+
+TPEX_MODEL_USEFUL_PATHS: tuple[tuple[str, str], ...] = (
+    ("mopsfin_t187ap02_O", "ownership"),
+    ("mopsfin_t187ap04_O", "event"),
+    ("mopsfin_t187ap05_O", "fundamental"),
+    ("mopsfin_t187ap05_OA", "fundamental"),
+    ("mopsfin_t187ap05_OB", "fundamental"),
+    ("mopsfin_t187ap08_O", "ownership"),
+    ("mopsfin_t187ap09_O", "ownership"),
+    ("mopsfin_t187ap10_O", "ownership"),
+    ("mopsfin_t187ap11_O", "ownership"),
+    ("mopsfin_t187ap12_O", "ownership"),
+    ("mopsfin_t187ap13_O", "ownership"),
+    ("mopsfin_t187ap22_O", "event"),
+    ("mopsfin_t187ap23_O", "event"),
+    ("mopsfin_t187ap24_O", "event"),
+    ("mopsfin_t187ap25_O", "event"),
+    ("mopsfin_t187ap26_O", "lifecycle"),
+    ("mopsfin_t187ap27_O", "lifecycle"),
+    ("mopsfin_t187ap15_O", "fundamental"),
+    ("mopsfin_t187ap16_O", "fundamental"),
+    ("mopsfin_187ap17_O", "fundamental"),
+    ("mopsfin_t187ap31_O", "fundamental"),
+    ("tpex_3insti_dealer_trading", "flow"),
+    ("tpex_3insti_qfii", "ownership"),
+    ("tpex_3insti_qfii_industry", "ownership"),
+    ("tpex_3insti_qfii_trading", "flow"),
+    ("tpex_3insti_summary", "flow"),
+    ("tpex_3insti_trading", "flow"),
+    ("tpex_ceil_non_trading", "market_rule"),
+    ("tpex_cmode", "lifecycle"),
+    ("tpex_esb_applicant_companies", "lifecycle"),
+    ("tpex_exright_daily", "corporate_action"),
+    ("tpex_exright_prepost", "corporate_action"),
+    ("tpex_ipo_no_limit", "market_rule"),
+    ("tpex_margin_sbl", "shorting"),
+    ("tpex_margin_trading_adjust", "shorting"),
+    ("tpex_margin_trading_margin_mark", "shorting"),
+    ("tpex_margin_trading_margin_used", "shorting"),
+    ("tpex_margin_trading_marginspot", "shorting"),
+    ("tpex_margin_trading_short_sell", "shorting"),
+    ("tpex_margin_trading_term", "shorting"),
+    ("tpex_short_sell", "shorting"),
+    ("tpex_spendi_history", "lifecycle"),
+    ("tpex_spendi_today", "lifecycle"),
+    ("tpex_index", "index"),
+    ("tpex_index_consti", "index"),
+    ("tpex_reward_index", "index"),
+    ("tpex50_index", "index"),
+    ("tpex50_constituents", "index"),
+    ("tpex200_constituents", "index"),
+    ("tphd_index", "index"),
+    ("tphd_constituents", "index"),
+    *tuple((f"mopsfin_t187ap06_O_{suffix}", "fundamental") for suffix in ("basi", "basiA", "bd", "bdA", "ci", "ciA", "fh", "fhA", "ins", "insA", "mim", "mimA")),
+    *tuple((f"mopsfin_t187ap07_O_{suffix}", "fundamental") for suffix in ("basi", "bd", "ci", "fh", "ins", "mim")),
+)
+
+
+def _api_dataset_name(source: str, path: str) -> str:
+    return f"{source}_api_{SAFE_NAME_PATTERN.sub('_', path).strip('_').lower()}"
+
+
+MODEL_USEFUL_SNAPSHOT_DATASETS: tuple[DatasetSpec, ...] = tuple(
+    DatasetSpec(
+        name=_api_dataset_name("twse", path),
+        kind="snapshot_url",
+        source="TWSE OpenAPI",
+        description=f"Daily point-in-time snapshot of TWSE {group} endpoint {path}.",
+        tags=("twse", "model_useful", group, "snapshot"),
+        url=f"https://openapi.twse.com.tw/v1/{path}",
+    )
+    for path, group in TWSE_MODEL_USEFUL_PATHS
+) + tuple(
+    DatasetSpec(
+        name=_api_dataset_name("tpex", path),
+        kind="snapshot_url",
+        source="TPEx OpenAPI",
+        description=f"Daily point-in-time snapshot of TPEx {group} endpoint {path}.",
+        tags=("tpex", "model_useful", group, "snapshot"),
+        url=f"https://www.tpex.org.tw/openapi/v1/{path}",
+    )
+    for path, group in TPEX_MODEL_USEFUL_PATHS
+)
+
+
 SNAPSHOT_OPEN_DATASETS: tuple[DatasetSpec, ...] = (
     DatasetSpec(
         name="twse_listed_company_basic",
@@ -438,6 +589,8 @@ DEFAULT_DATASETS: dict[str, DatasetSpec] = {
     spec.name: spec
     for spec in (
         *HISTORICAL_DAILY_DATASETS,
+        *DELISTED_DATASETS,
+        *MODEL_USEFUL_SNAPSHOT_DATASETS,
         *SNAPSHOT_OPEN_DATASETS,
         *DATA_GOV_DATASETS,
     )
@@ -1216,6 +1369,131 @@ def _download_snapshot_url(spec: DatasetSpec, args: argparse.Namespace, output_d
     return DownloadResult(spec.name, "ok", rows, str(parquet_path), raw_path=str(raw_path) if raw_path else None)
 
 
+def _parse_roc_delisted_date(value: Any) -> str | None:
+    text = _strip_html(value).replace("年", "/").replace("月", "/").replace("日", "").replace("-", "/")
+    return _roc_date_to_iso(text)
+
+
+def _twse_delisted_frame(payload: Any) -> pl.DataFrame:
+    if not isinstance(payload, list):
+        return pl.DataFrame()
+    records: list[dict[str, str]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        delisted_date = _parse_roc_delisted_date(row.get("DelistingDate", ""))
+        if delisted_date:
+            records.append(
+                {
+                    DATE_COLUMN: delisted_date,
+                    "market": "twse",
+                    "symbol": _strip_html(row.get("Code", "")),
+                    "company_name": _strip_html(row.get("Company", "")),
+                    "delisting_reason": "",
+                }
+            )
+    return pl.DataFrame(records, schema={key: pl.Utf8 for key in records[0]}) if records else pl.DataFrame()
+
+
+def _tpex_delisted_frame(payload: Any) -> pl.DataFrame:
+    if not isinstance(payload, dict) or str(payload.get("stat", "")).lower() != "ok":
+        return pl.DataFrame()
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or not tables or not isinstance(tables[0], dict):
+        return pl.DataFrame()
+    table = tables[0]
+    fields, rows = table.get("fields"), table.get("data")
+    if not isinstance(fields, list) or not isinstance(rows, list):
+        return pl.DataFrame()
+    names = _make_unique([str(value) for value in fields])
+    records: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        record = {name: _strip_html(row[idx]) if idx < len(row) else "" for idx, name in enumerate(names)}
+        delisted_date = _parse_roc_delisted_date(record.get("終止上櫃日期", ""))
+        if delisted_date:
+            records.append(
+                {
+                    DATE_COLUMN: delisted_date,
+                    "market": "tpex",
+                    "symbol": record.get("股票代號", ""),
+                    "company_name": record.get("公司名稱", ""),
+                    "delisting_reason": record.get("終止上櫃原因", ""),
+                }
+            )
+    return pl.DataFrame(records, schema={key: pl.Utf8 for key in records[0]}) if records else pl.DataFrame()
+
+
+def _download_delisted_history(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> DownloadResult:
+    assert spec.url is not None
+    parquet_path = output_dir / f"{spec.name}.parquet"
+    configured_start = _parse_date(spec.start_date or "2000-01-01")
+    start = configured_start if args.start_date == "earliest" else max(configured_start, _parse_date(args.start_date))
+    end = _parse_date(resolve_end_date(args.end_date))
+    if args.mode == "daily-update" and not args.refresh:
+        latest = _latest_existing_date(parquet_path)
+        if latest is not None:
+            start = max(configured_start, latest - timedelta(days=31))
+    if start > end:
+        return DownloadResult(spec.name, "up_to_date", _read_existing_row_count(parquet_path), str(parquet_path))
+
+    market = "twse" if spec.name.startswith("twse_") else "tpex"
+    requests_to_make: list[tuple[str, dict[str, str], str]] = []
+    if market == "twse":
+        requests_to_make.append((spec.url, {}, "twse_delisted_companies"))
+    else:
+        for year in range(start.year, end.year + 1):
+            requests_to_make.append(
+                (spec.url, {"response": "json", "date": str(year), "cate": "1"}, str(year))
+            )
+
+    frames: list[pl.DataFrame] = []
+    raw_path: Path | None = None
+    fetched_at = _now_utc()
+    for url, params, raw_stem in requests_to_make:
+        response = _http_get(
+            url,
+            params=params,
+            timeout=args.timeout,
+            verify_ssl=bool(args.verify_ssl),
+            retries=int(args.retries),
+            retry_backoff=float(args.retry_backoff),
+        )
+        if not args.skip_raw:
+            raw_path = _write_raw(response.content, output_dir / "raw" / spec.name, spec.name, ".json", stem=raw_stem)
+        frame = _twse_delisted_frame(response.json()) if market == "twse" else _tpex_delisted_frame(response.json())
+        if not frame.is_empty():
+            frame = frame.filter(pl.col(DATE_COLUMN).str.to_date().is_between(start, end))
+            if not frame.is_empty():
+                frames.append(_append_common_columns(frame, spec, fetched_at=fetched_at, url=response.url))
+        if args.sleep:
+            time.sleep(max(0.0, float(args.sleep)))
+
+    if not frames:
+        return DownloadResult(
+            spec.name,
+            "no_new_rows",
+            _read_existing_row_count(parquet_path),
+            str(parquet_path) if parquet_path.exists() else None,
+            raw_path=str(raw_path) if raw_path else None,
+        )
+    incoming = pl.concat(frames, how="diagonal_relaxed")
+    rows = _write_parquet_merged(parquet_path, incoming, refresh=bool(args.refresh))
+    return DownloadResult(
+        spec.name,
+        "ok",
+        rows,
+        str(parquet_path),
+        raw_path=str(raw_path) if raw_path else None,
+        fetched_dates=len(requests_to_make),
+    )
+
+
 def _suffix_from_url(url: str, content_type: str) -> str:
     suffix = Path(urlparse(url).path).suffix
     if suffix:
@@ -1323,6 +1601,8 @@ def download_dataset(spec: DatasetSpec, args: argparse.Namespace, output_dir: Pa
     try:
         if spec.kind == "historical_json_table":
             return _download_historical(spec, args, output_dir)
+        if spec.kind == "delisted_history":
+            return _download_delisted_history(spec, args, output_dir)
         if spec.kind == "snapshot_url":
             return _download_snapshot_url(spec, args, output_dir)
         if spec.kind == "data_gov":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date
 import fnmatch
 from pathlib import Path
 import csv
@@ -96,7 +97,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 23
+PANEL_CACHE_VERSION = 30
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -209,6 +210,7 @@ class PanelData:
     can_sell_mask: np.ndarray | None = None
     can_short_open_mask: np.ndarray | None = None
     force_short_cover_mask: np.ndarray | None = None
+    force_exit_mask: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -257,30 +259,78 @@ def _normalize_external_feature_path(path: str | Path | None) -> Path | None:
     return Path(text)
 
 
+def _resolve_external_data_path(
+    path: str | Path | None,
+    *,
+    include_features: bool,
+    include_rules: bool,
+    required: bool,
+) -> Path | None:
+    """Validate one external parquet request without coupling rules to inputs."""
+
+    include_any = bool(include_features) or bool(include_rules)
+    normalized = _normalize_external_feature_path(path)
+    if required and not include_any:
+        raise ValueError(
+            "external_data_required=True requires external features or rules to be enabled"
+        )
+    if not include_any:
+        return None
+    if normalized is None:
+        if required:
+            raise FileNotFoundError(
+                "external TW public data is required but external_feature_path is empty"
+            )
+        return None
+    if not normalized.exists():
+        raise FileNotFoundError(f"external_feature_path not found: {normalized}")
+    return normalized
+
+
 def _load_external_feature_arrays(
     path: Path,
     *,
     market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    include_features: bool = True,
+    include_rules: bool = True,
 ) -> _ExternalFeatureArrays:
     if pl is None or pq is None:
         raise RuntimeError("external TW public features require polars and pyarrow")
     if not path.exists():
         raise FileNotFoundError(f"external feature parquet not found: {path}")
 
-    frame = pl.from_arrow(pq.read_table(path, memory_map=True))
     required = {"date", "symbol"}
-    missing = required - set(frame.columns)
+    parquet_columns = list(pq.read_schema(path).names)
+    missing = required - set(parquet_columns)
     if missing:
         raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
 
     candidate_columns = [
         column
-        for column in frame.columns
+        for column in parquet_columns
         if column not in required
     ]
-    feature_names = [column for column in candidate_columns if not str(column).startswith("_")]
-    rule_names = [column for column in candidate_columns if str(column).startswith("_twpub_")]
+    feature_names = (
+        [column for column in candidate_columns if not str(column).startswith("_")]
+        if include_features
+        else []
+    )
+    rule_names = (
+        [column for column in candidate_columns if str(column).startswith("_twpub_")]
+        if include_rules
+        else []
+    )
     value_columns = [*feature_names, *rule_names]
+    # Rules-only TW runs should not materialize millions of rows across every
+    # public model feature. Arrow projection keeps I/O and peak RAM proportional
+    # to the independently enabled column families.
+    frame = pl.from_arrow(
+        pq.read_table(
+            path,
+            columns=["date", "symbol", *value_columns],
+            memory_map=True,
+        )
+    )
     if not feature_names:
         if not rule_names:
             return _ExternalFeatureArrays(
@@ -414,6 +464,31 @@ def _overlay_external_values(
         return
     value_rows, value_cols = np.nonzero(finite)
     target[target_rows[value_rows], value_cols] = values[value_rows, value_cols]
+
+
+_POINT_IN_TIME_STATE_FEATURE_PREFIXES = (
+    "twpub_monthly_revenue_",
+    "twpub_financial_",
+)
+_POINT_IN_TIME_STATE_FEATURES = {
+    "twpub_insider_holdings_log",
+    "twpub_insider_pledge_ratio",
+}
+
+
+def _forward_fill_point_in_time_features(values: np.ndarray, feature_names: list[str]) -> None:
+    if values.ndim != 2 or values.shape[0] == 0:
+        return
+    for col_idx, name in enumerate(feature_names):
+        if name not in _POINT_IN_TIME_STATE_FEATURES and not name.startswith(_POINT_IN_TIME_STATE_FEATURE_PREFIXES):
+            continue
+        column = values[:, col_idx]
+        valid = np.flatnonzero(np.isfinite(column))
+        if valid.size == 0:
+            continue
+        last_seen = np.maximum.accumulate(np.where(np.isfinite(column), np.arange(column.size), -1))
+        fill_rows = (last_seen >= 0) & ~np.isfinite(column)
+        column[fill_rows] = column[last_seen[fill_rows]]
 
 
 def _contiguous_indexer(indices: list[int]) -> Any:
@@ -1345,6 +1420,7 @@ def _build_panel_from_symbol_arrays(
     external_source_indexer = _contiguous_indexer(external_feature_indices)
     external_dest_indexer = _contiguous_indexer(external_dest_indices)
     external_dest_is_slice = isinstance(external_dest_indexer, slice)
+    selected_external_feature_names = [all_external_feature_names[idx] for idx in external_feature_indices]
     total_available_features = len(all_base_feature_names) + len(all_external_feature_names)
     if num_features != total_available_features:
         print(
@@ -1397,6 +1473,7 @@ def _build_panel_from_symbol_arrays(
                 symbol_values = symbol_external[1][:, external_source_indexer]
                 target = symbol_features[:, external_dest_indexer]
                 _overlay_external_values(target, all_dates, symbol_external[0], symbol_values)
+                _forward_fill_point_in_time_features(target, selected_external_feature_names)
                 if not external_dest_is_slice:
                     symbol_features[:, external_dest_indexer] = target
         returns_1d[row_idx, sym_idx] = item.returns_1d if all_valid else item.returns_1d[valid]
@@ -1437,6 +1514,7 @@ def _build_panel_from_symbol_arrays(
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_sell_mask.copy(),
         force_short_cover_mask=np.zeros_like(tradable_mask, dtype=bool),
+        force_exit_mask=np.zeros_like(tradable_mask, dtype=bool),
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
@@ -1455,11 +1533,22 @@ def build_tail_panel(
     security_filter: str | None = "none",
     strict_no_fallback: bool | None = None,
     panel_load_workers: int = 4,
+    external_feature_path: str | Path | None = None,
+    external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    external_include_features: bool = True,
+    external_include_rules: bool = True,
+    external_data_required: bool = False,
     feature_include: Any = None,
     feature_exclude: Any = None,
 ) -> PanelData:
     """Build a panel from only the last rows of each symbol file for live inference."""
     parquet_root = Path(parquet_root)
+    external_feature_path = _resolve_external_data_path(
+        external_feature_path,
+        include_features=external_include_features,
+        include_rules=external_include_rules,
+        required=external_data_required,
+    )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -1527,19 +1616,30 @@ def build_tail_panel(
         if arrays is not None:
             valid_arrays.append(arrays)
 
-    panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
-    panel = _filter_panel_features(
-        panel,
+    external_features = (
+        _load_external_feature_arrays(
+            external_feature_path,
+            market_symbol=external_market_symbol,
+            include_features=external_include_features,
+            include_rules=external_include_rules,
+        )
+        if external_feature_path is not None
+        else None
+    )
+    panel = _build_panel_from_symbol_arrays(
+        valid_arrays,
+        benchmark_name=benchmark_name,
+        external_features=external_features,
         feature_include=feature_include_patterns,
         feature_exclude=feature_exclude_patterns,
     )
+    panel = _apply_external_rule_masks(panel, external_features)
     _print_feature_overview(panel)
     return panel
 
 
 def load_cached_panel(
     parquet_root: str | Path,
-    use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
     tradable_mode: str = "tradable",
@@ -1552,12 +1652,20 @@ def load_cached_panel(
     panel_load_workers: int = 4,
     external_feature_path: str | Path | None = None,
     external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    external_include_features: bool = True,
+    external_include_rules: bool = True,
+    external_data_required: bool = False,
     feature_include: Any = None,
     feature_exclude: Any = None,
 ) -> PanelData | None:
-    del use_rapids, panel_load_workers
+    del panel_load_workers
     parquet_root = Path(parquet_root)
-    external_feature_path = _normalize_external_feature_path(external_feature_path)
+    external_feature_path = _resolve_external_data_path(
+        external_feature_path,
+        include_features=external_include_features,
+        include_rules=external_include_rules,
+        required=external_data_required,
+    )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -1602,6 +1710,8 @@ def load_cached_panel(
         f"tw_limit_rounding=v2|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
+        f"external_features={bool(external_include_features)}|"
+        f"external_rules={bool(external_include_rules)}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}"
     )
@@ -1622,11 +1732,55 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
     rule_to_idx = {name: idx for idx, name in enumerate(external_features.rule_names)}
     up_idx = rule_to_idx.get("_twpub_tpex_next_limit_up_ret")
     down_idx = rule_to_idx.get("_twpub_tpex_next_limit_down_ret")
-    if up_idx is None and down_idx is None:
+    traded_idx = rule_to_idx.get("_twpub_official_traded")
+    delisted_idx = rule_to_idx.get("_twpub_delisted")
+    short_ban_idx = rule_to_idx.get("_twpub_short_open_ban")
+    force_short_cover_idx = rule_to_idx.get("_twpub_force_short_cover")
+    force_cover_lead_idx = rule_to_idx.get("_twpub_force_cover_lead_sessions")
+    force_cover_anchor_idx = rule_to_idx.get("_twpub_force_cover_anchor_ordinal")
+    if force_cover_anchor_idx is None:
+        # Compatibility for public feature parquet generated before the anchor
+        # semantics were named explicitly.
+        force_cover_anchor_idx = rule_to_idx.get(
+            "_twpub_force_cover_delisting_ordinal"
+        )
+    force_cover_cancel_idx = rule_to_idx.get("_twpub_force_cover_cancel_ordinal")
+    trading_halt_idx = rule_to_idx.get("_twpub_trading_halt")
+    if all(
+        idx is None
+        for idx in (
+            up_idx,
+            down_idx,
+            traded_idx,
+            delisted_idx,
+            short_ban_idx,
+            force_short_cover_idx,
+            force_cover_lead_idx,
+            force_cover_anchor_idx,
+            force_cover_cancel_idx,
+            trading_halt_idx,
+        )
+    ):
         return panel
 
     can_buy = np.asarray(panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask, dtype=bool).copy()
     can_sell = np.asarray(panel.can_sell_mask if panel.can_sell_mask is not None else panel.tradable_mask, dtype=bool).copy()
+    can_short_open = np.asarray(
+        panel.can_short_open_mask if panel.can_short_open_mask is not None else can_sell,
+        dtype=bool,
+    ).copy()
+    force_short_cover = np.asarray(
+        panel.force_short_cover_mask
+        if panel.force_short_cover_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool),
+        dtype=bool,
+    ).copy()
+    force_exit = np.asarray(
+        panel.force_exit_mask
+        if panel.force_exit_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool),
+        dtype=bool,
+    ).copy()
     close_prices = np.asarray(panel.close_prices, dtype=np.float64)
     changed_buy = 0
     changed_sell = 0
@@ -1635,10 +1789,100 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         rule_payload = external_features.by_symbol_rules.get(str(symbol).upper())
         if rule_payload is None:
             continue
+        # Preserve the source-market observation before official lifecycle
+        # rules mutate it.  A same-symbol security that trades again on the
+        # immediately following panel session is a venue/corporate transition,
+        # not a terminal asset exit; permanently blocking it would create both
+        # a fabricated sale and years of false untradability (for example 2301).
+        base_tradable = np.asarray(panel.tradable_mask[:, sym_idx], dtype=bool).copy()
         rule_dates, rule_values = rule_payload
         if rule_values.size == 0:
             continue
         aligned_rules = _align_external_values(panel.dates, rule_dates, rule_values)
+        if trading_halt_idx is not None:
+            halted = np.isfinite(aligned_rules[:, trading_halt_idx]) & (aligned_rules[:, trading_halt_idx] > 0.0)
+            if bool(halted.any()):
+                can_buy[halted, sym_idx] = False
+                can_sell[halted, sym_idx] = False
+                can_short_open[halted, sym_idx] = False
+                panel.returns_1d[halted, sym_idx] = 0.0
+        if short_ban_idx is not None:
+            short_banned = np.isfinite(aligned_rules[:, short_ban_idx]) & (aligned_rules[:, short_ban_idx] > 0.0)
+            can_short_open[short_banned, sym_idx] = False
+        delisted_rows = np.empty((0,), dtype=np.int64)
+        delisted_blocked = np.zeros((panel.num_dates,), dtype=bool)
+        if delisted_idx is not None:
+            event_mask = np.isfinite(rule_values[:, delisted_idx]) & (rule_values[:, delisted_idx] > 0.0)
+            if bool(event_mask.any()):
+                # Official termination dates can fall on weekends. Apply the event
+                # on the first panel session at or after the official date.
+                candidate_rows = np.searchsorted(panel.dates, rule_dates[event_mask])
+                candidate_rows = np.unique(
+                    candidate_rows[candidate_rows < panel.num_dates]
+                ).astype(np.int64)
+                effective_rows: list[int] = []
+                for candidate in candidate_rows:
+                    start = int(candidate)
+                    later_traded = np.flatnonzero(base_tradable[start + 1 :])
+                    next_traded = (
+                        start + 1 + int(later_traded[0])
+                        if later_traded.size
+                        else panel.num_dates
+                    )
+                    # Immediate continuation under the same symbol is an
+                    # exchange/corporate migration rather than a terminal
+                    # position.  Longer gaps are real incarnation boundaries:
+                    # exit the old security, then allow a later relisting.
+                    if later_traded.size and next_traded == start + 1:
+                        continue
+                    if not delisted_blocked[start]:
+                        effective_rows.append(start)
+                    delisted_blocked[start:next_traded] = True
+                delisted_rows = np.asarray(effective_rows, dtype=np.int64)
+        if traded_idx is not None:
+            official_traded = np.isfinite(aligned_rules[:, traded_idx]) & (aligned_rules[:, traded_idx] > 0.0)
+            observed_rows = np.flatnonzero(official_traded)
+            if observed_rows.size:
+                # The official OHLC downloads can contain several sparse
+                # archive snapshots rather than one continuous history.  Only
+                # infer a missing-session suspension between nearby positive
+                # observations; a multi-year absence is missing evidence, not
+                # proof that the entire market was halted.  Longer suspensions
+                # come from the explicit halt/resume rule feed above.
+                suspended = np.zeros_like(official_traded)
+                max_contiguous_gap = np.timedelta64(7, "D")
+                for left, right in zip(observed_rows[:-1], observed_rows[1:]):
+                    left_row = int(left)
+                    right_row = int(right)
+                    if right_row <= left_row + 1:
+                        continue
+                    if panel.dates[right_row] - panel.dates[left_row] <= max_contiguous_gap:
+                        suspended[left_row + 1 : right_row] = True
+                for delisted_row in delisted_rows:
+                    prior = observed_rows[observed_rows < int(delisted_row)]
+                    if not prior.size:
+                        continue
+                    left_row = int(prior[-1])
+                    right_row = int(delisted_row)
+                    if (
+                        right_row > left_row + 1
+                        and panel.dates[right_row] - panel.dates[left_row]
+                        <= max_contiguous_gap
+                    ):
+                        suspended[left_row + 1 : right_row] = True
+                suspended &= ~delisted_blocked
+                if bool(suspended.any()):
+                    panel.tradable_mask[suspended, sym_idx] = True
+                    can_buy[suspended, sym_idx] = False
+                    can_sell[suspended, sym_idx] = False
+                    can_short_open[suspended, sym_idx] = False
+                    panel.returns_1d[suspended, sym_idx] = 0.0
+        if delisted_rows.size:
+            force_exit[delisted_rows, sym_idx] = True
+            panel.tradable_mask[delisted_blocked, sym_idx] = False
+            can_buy[delisted_blocked, sym_idx] = False
+            can_sell[delisted_blocked, sym_idx] = False
+            can_short_open[delisted_blocked, sym_idx] = False
         close_ret = _safe_log_ratio_array(close_prices[:, sym_idx], _shift_array(close_prices[:, sym_idx], 1))
 
         if up_idx is not None:
@@ -1655,6 +1899,83 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             can_sell[:, sym_idx] &= ~is_limit_down
             changed_sell += int(np.count_nonzero(before & ~can_sell[:, sym_idx]))
 
+        if force_short_cover_idx is not None:
+            event_mask = np.isfinite(rule_values[:, force_short_cover_idx]) & (rule_values[:, force_short_cover_idx] > 0.0)
+            for candidate in np.searchsorted(panel.dates, rule_dates[event_mask]):
+                if candidate >= panel.num_dates:
+                    continue
+                # Closing a short is a buy.  Align weekend/holiday deadlines
+                # to the first session where that buy can actually execute,
+                # after halt, delisting and limit-up rules have been applied.
+                executable_after = np.flatnonzero(can_buy[int(candidate) :, sym_idx])
+                if executable_after.size:
+                    force_short_cover[int(candidate) + int(executable_after[0]), sym_idx] = True
+        if force_cover_lead_idx is not None and force_cover_anchor_idx is not None:
+            lead_values = rule_values[:, force_cover_lead_idx]
+            anchor_ordinals = rule_values[:, force_cover_anchor_idx]
+            cancel_ordinals = (
+                rule_values[:, force_cover_cancel_idx]
+                if force_cover_cancel_idx is not None
+                else np.full_like(anchor_ordinals, np.nan)
+            )
+            relative_event_rows = np.flatnonzero(
+                np.isfinite(lead_values)
+                & (lead_values > 0.0)
+                & np.isfinite(anchor_ordinals)
+                & (anchor_ordinals > 0.0)
+            )
+            for event_row in relative_event_rows:
+                knowledge_idx = int(np.searchsorted(panel.dates, rule_dates[event_row], side="right"))
+                anchor_date = np.datetime64(
+                    date.fromordinal(int(round(float(anchor_ordinals[event_row]))))
+                )
+                anchor_session_idx = int(
+                    np.searchsorted(panel.dates, anchor_date, side="left")
+                )
+                deadline_idx = anchor_session_idx - int(
+                    round(float(lead_values[event_row]))
+                )
+                if np.isfinite(cancel_ordinals[event_row]):
+                    cancellation_date = np.datetime64(
+                        date.fromordinal(
+                            int(round(float(cancel_ordinals[event_row])))
+                        )
+                    )
+                    cancellation_session_idx = int(
+                        np.searchsorted(panel.dates, cancellation_date, side="left")
+                    )
+                    # Cancellation is prospective: remove only an obligation
+                    # whose actual exchange-session deadline has not passed.
+                    if cancellation_session_idx <= deadline_idx:
+                        continue
+                if knowledge_idx >= panel.num_dates or knowledge_idx >= anchor_session_idx:
+                    continue
+                if deadline_idx >= knowledge_idx:
+                    candidate = min(deadline_idx, panel.num_dates - 1)
+                    executable = np.flatnonzero(can_buy[knowledge_idx : candidate + 1, sym_idx])
+                    if executable.size:
+                        force_short_cover[knowledge_idx + int(executable[-1]), sym_idx] = True
+                    else:
+                        # If every session through the contractual deadline is
+                        # blocked, do not silently lose the cover obligation.
+                        # Execute on the first available session from the
+                        # deadline onward, but never cross the rule anchor.
+                        end = min(anchor_session_idx, panel.num_dates)
+                        executable_after = np.flatnonzero(
+                            can_buy[candidate:end, sym_idx]
+                        )
+                        if executable_after.size:
+                            force_short_cover[
+                                candidate + int(executable_after[0]), sym_idx
+                            ] = True
+                else:
+                    # A late notice cannot retroactively force a cover. Execute
+                    # on the first known tradable session before the anchor.
+                    end = min(anchor_session_idx, panel.num_dates)
+                    executable = np.flatnonzero(can_buy[knowledge_idx:end, sym_idx])
+                    if executable.size:
+                        force_short_cover[knowledge_idx + int(executable[0]), sym_idx] = True
+
     if changed_buy or changed_sell:
         print(
             "[panel] external TW public limit rules updated masks "
@@ -1669,12 +1990,9 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         tradable_mask=panel.tradable_mask,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell,
-        can_short_open_mask=np.asarray(
-            panel.can_short_open_mask if panel.can_short_open_mask is not None else can_sell,
-            dtype=bool,
-        )
-        & can_sell,
-        force_short_cover_mask=panel.force_short_cover_mask,
+        can_short_open_mask=can_short_open & can_sell,
+        force_short_cover_mask=force_short_cover,
+        force_exit_mask=force_exit,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
@@ -1716,12 +2034,52 @@ def _cache_meta_path(parquet_root: str | Path) -> Path:
 
 
 def _compute_source_hash(paths: list[Path]) -> str:
-    """Compute hash of source files' mtime and size."""
-    hasher = hashlib.md5()
-    for path in sorted(paths):
-        mtime = path.stat().st_mtime
-        size = path.stat().st_size
-        hasher.update(f"{path.name}:{mtime}:{size}".encode())
+    """Fingerprint complete source contents, detecting races while hashing.
+
+    Metadata-only keys can reuse stale panels when a sync/copy preserves path,
+    size and mtime (and some filesystems expose coarse ctime).  A stale cache
+    then defeats the stronger checkpoint panel fingerprint because the new
+    source is never materialized.  Hash every byte once per cache validation;
+    independent files are read concurrently to keep many-small-file universes
+    practical.
+    """
+
+    def file_fingerprint(path: Path) -> tuple[str, int, str]:
+        for attempt in range(2):
+            before = path.stat()
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                while chunk := handle.read(1 << 20):
+                    digest.update(chunk)
+            after = path.stat()
+            unchanged = (
+                int(before.st_size) == int(after.st_size)
+                and int(before.st_mtime_ns) == int(after.st_mtime_ns)
+                and int(before.st_ctime_ns) == int(after.st_ctime_ns)
+            )
+            if unchanged:
+                return str(path), int(after.st_size), digest.hexdigest()
+            if attempt == 0:
+                continue
+        raise RuntimeError(f"Panel source changed while fingerprinting: {path}")
+
+    ordered_paths = sorted(paths)
+    workers = min(
+        len(ordered_paths),
+        max(1, min(16, int(os.cpu_count() or 1))),
+    )
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            identities = list(executor.map(file_fingerprint, ordered_paths))
+    else:
+        identities = [file_fingerprint(path) for path in ordered_paths]
+
+    hasher = hashlib.sha256()
+    for identity in identities:
+        for item in identity:
+            encoded = str(item).encode("utf-8")
+            hasher.update(len(encoded).to_bytes(8, byteorder="little", signed=False))
+            hasher.update(encoded)
     return hasher.hexdigest()
 
 
@@ -1752,6 +2110,11 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         if "force_short_cover_mask" in cached_keys
         else np.zeros_like(tradable_mask, dtype=bool)
     )
+    force_exit_mask = (
+        cached["force_exit_mask"]
+        if "force_exit_mask" in cached_keys
+        else np.zeros_like(tradable_mask, dtype=bool)
+    )
     close_prices = cached["close_prices"]
     daily_volumes = (
         cached["daily_volumes"]
@@ -1769,6 +2132,7 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
+        force_exit_mask=force_exit_mask,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
         close_prices=close_prices,
@@ -1782,6 +2146,9 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
     can_sell_mask = payload.get("can_sell_mask", tradable_mask)
     can_short_open_mask = payload.get("can_short_open_mask", can_sell_mask)
     force_short_cover_mask = payload.get("force_short_cover_mask", np.zeros_like(tradable_mask, dtype=bool))
+    force_exit_mask = payload.get(
+        "force_exit_mask", np.zeros_like(tradable_mask, dtype=bool)
+    )
     close_prices = payload["close_prices"]
     daily_volumes = payload.get("daily_volumes", np.full_like(close_prices, np.nan, dtype=np.float32))
     return PanelData(
@@ -1795,6 +2162,7 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
+        force_exit_mask=force_exit_mask,
         alive_mask=payload["alive_mask"],
         benchmark_returns=payload["benchmark_returns"],
         close_prices=close_prices,
@@ -1938,6 +2306,7 @@ def _filter_panel_features(
         can_sell_mask=panel.can_sell_mask,
         can_short_open_mask=panel.can_short_open_mask,
         force_short_cover_mask=panel.force_short_cover_mask,
+        force_exit_mask=panel.force_exit_mask,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
@@ -2003,7 +2372,6 @@ def _load_valid_panel_cache(
 
 def build_panel(
     parquet_root: str | Path,
-    use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
     tradable_mode: str = "tradable",
@@ -2016,11 +2384,19 @@ def build_panel(
     panel_load_workers: int = 4,
     external_feature_path: str | Path | None = None,
     external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    external_include_features: bool = True,
+    external_include_rules: bool = True,
+    external_data_required: bool = False,
     feature_include: Any = None,
     feature_exclude: Any = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
-    external_feature_path = _normalize_external_feature_path(external_feature_path)
+    external_feature_path = _resolve_external_data_path(
+        external_feature_path,
+        include_features=external_include_features,
+        include_rules=external_include_rules,
+        required=external_data_required,
+    )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -2085,9 +2461,6 @@ def build_panel(
     else:
         raise RuntimeError("data.panel_backend='auto' requires pyarrow")
 
-    if external_feature_path is not None and not external_feature_path.exists():
-        raise FileNotFoundError(f"external_feature_path not found: {external_feature_path}")
-
     external_key = str(external_feature_path) if external_feature_path is not None else "none"
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
@@ -2095,6 +2468,8 @@ def build_panel(
         f"tw_limit_rounding=v2|"
         f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
+        f"external_features={bool(external_include_features)}|"
+        f"external_rules={bool(external_include_rules)}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}"
     )
@@ -2151,7 +2526,12 @@ def build_panel(
         if arrays is not None:
             valid_arrays.append(arrays)
     external_features = (
-        _load_external_feature_arrays(external_feature_path, market_symbol=external_market_symbol)
+        _load_external_feature_arrays(
+            external_feature_path,
+            market_symbol=external_market_symbol,
+            include_features=external_include_features,
+            include_rules=external_include_rules,
+        )
         if external_feature_path is not None
         else None
     )

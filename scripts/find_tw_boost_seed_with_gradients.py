@@ -21,7 +21,12 @@ from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.models.factory import build_model
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.loss import risk_aware_loss
-from stockagent.training.trainer import _autocast_context, _extract_weights_and_aux, _resolve_amp_dtype
+from stockagent.training.trainer import (
+    _autocast_context,
+    _extract_weights_and_aux,
+    _resolve_amp_dtype,
+    _volume_limit_weights_from_notional,
+)
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
 
@@ -100,6 +105,16 @@ def _probe_seed(config, panel, fold, seed: int, device: torch.device, batch_size
             benchmark_returns=batch.get("benchmark"),
             can_buy_mask=batch["can_buy_mask"],
             can_sell_mask=batch["can_sell_mask"],
+            can_short_open_mask=batch["can_short_open_mask"],
+            force_short_cover_mask=batch["force_short_cover_mask"],
+            force_exit_mask=batch["force_exit_mask"],
+            volume_limit_weights=_volume_limit_weights_from_notional(
+                batch.get("volume_notional"),
+                max_volume_participation=float(config.trading.max_volume_participation),
+                volume_participation_equity=float(config.trading.volume_participation_equity),
+                device=weights.device,
+                dtype=weights.dtype,
+            ),
             sample_mask=batch.get("sample_mask"),
             aux_outputs=aux_outputs,
             **_loss_kwargs(config),
@@ -158,7 +173,6 @@ def main() -> None:
 
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
@@ -167,8 +181,15 @@ def main() -> None:
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
-        external_feature_path=(config.data.tw_public_feature_path if config.data.use_tw_public_features else None),
+        external_feature_path=(
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
+        ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
     )

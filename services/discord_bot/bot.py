@@ -55,7 +55,7 @@ from stockagent.live.capital import positive_float_or_none
 from stockagent.live.quote_provider import load_symbol_name_map
 from stockagent.live.portfolio_history import PortfolioHistoryResult, load_portfolio_history
 from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
-from stockagent.live.signal_engine import generate_live_signal, write_live_weights_history
+from stockagent.live.signal_engine import LiveSignalResult, generate_live_signal, write_live_weights_history
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
 
@@ -64,6 +64,7 @@ MIN_DISCORD_ROWS = 10
 STATE_PATH = ROOT / "artifacts" / "discord_bot" / "state.json"
 ERROR_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "errors.log"
 AUDIT_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "audit_events.jsonl"
+PYTHON_EXECUTABLE_SENTINEL = "{python}"
 
 
 class BotUserError(RuntimeError):
@@ -749,10 +750,17 @@ def _clear_scheduled_retry(retry_after: dict[str, float], key: str) -> None:
     retry_after.pop(key, None)
 
 
+def _resolve_pre_signal_command(command: tuple[str, ...] | list[str]) -> list[str]:
+    resolved = [str(item) for item in command]
+    if resolved and resolved[0] == PYTHON_EXECUTABLE_SENTINEL:
+        resolved[0] = sys.executable
+    return resolved
+
+
 def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
     if not cfg.pre_signal_command:
         return
-    command = [str(item) for item in cfg.pre_signal_command]
+    command = _resolve_pre_signal_command(cfg.pre_signal_command)
     started = datetime.now().astimezone().isoformat(timespec="seconds")
     timeout_seconds = max(1, int(cfg.pre_signal_timeout_seconds))
     env = os.environ.copy()
@@ -1663,7 +1671,10 @@ def _config_trading_limits(cfg: LiveMarketConfig) -> tuple[float | None, float |
         market_cfg = _load_experiment_config_cached(str(_resolve_repo_path(cfg.config_path) or Path(cfg.config_path)))
     except Exception:
         return None, None
-    gross = _float_or_none(getattr(market_cfg.trading, "gross_leverage", None))
+    # Canonical train/eval/live execution normalizes realised gross exposure to
+    # 1.0. reporting_leverage is a separate plot-only scenario multiplier and
+    # must not weaken live exposure sanity checks.
+    gross = 1.0
     turnover = _float_or_none(getattr(market_cfg.trading, "max_turnover_ratio", None))
     return gross, turnover
 

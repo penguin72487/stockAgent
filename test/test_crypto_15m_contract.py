@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+import pytest
+import yaml
 
 from downloader import download_bybit_perp_daily as bybit
 from downloader import download_okx_perp_daily as okx
@@ -13,13 +17,13 @@ def test_crypto_market_config_is_15m() -> None:
     config = load_config("configs/markets/crypto.yaml")
 
     assert config.trading.frequency == "15m"
-    assert config.training.target == "next_15m_rank"
-    assert config.data.universe_mode == "all_15m_symbols"
+    assert config.data.parquet_root == "data_okx"
 
 
 def test_discord_crypto_market_uses_15m_incremental_updater() -> None:
     cfg = load_market_config("services/discord_bot/markets/crypto.yaml")
 
+    assert cfg.pre_signal_command[0] == "{python}"
     assert cfg.schedule_interval_minutes == 15
     assert cfg.history_frequency == "bar"
     assert "downloader/download_okx_perp_15m.py" in cfg.pre_signal_command
@@ -36,14 +40,52 @@ def test_discord_tw_market_uses_official_ohlcv_without_audit() -> None:
     assert "audit_ohlcv_data.py" not in command
 
 
-def test_discord_daily_yahoo_markets_use_downloader_without_audit() -> None:
-    for market, asset in (("us", "us_stocks"), ("forex", "forex")):
+def test_discord_daily_markets_use_canonical_downloaders_without_audit() -> None:
+    expected_downloaders = {
+        "us": "downloader/download_cboe_us_ohlcv.py",
+        "forex": "downloader/download_forex_frankfurter.py",
+    }
+    for market, downloader in expected_downloaders.items():
         cfg = load_market_config(f"services/discord_bot/markets/{market}.yaml")
+        assert cfg.pre_signal_command[0] == "{python}"
         command = " ".join(cfg.pre_signal_command)
-        assert "downloader/download_yahoo_ohlcv.py" in command
+        assert downloader in command
         assert "--mode daily-update" in command
-        assert f"--asset {asset}" in command
         assert "audit_ohlcv_data.py" not in command
+
+
+def test_live_market_config_rejects_unknown_typo_key(tmp_path: Path) -> None:
+    path = tmp_path / "tw.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "market": "tw",
+                "config_path": "configs/markets/tw.yaml",
+                "freshness_max_lag_day": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"Unknown market config key.*freshness_max_lag_day"):
+        load_market_config(path)
+
+
+def test_live_market_config_rejects_unsupported_nested_keys(tmp_path: Path) -> None:
+    path = tmp_path / "tw.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "market": "tw",
+                "config_path": "configs/markets/tw.yaml",
+                "pre_signal_command": {"command": ["{python}", "downloader/example.py"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"Nested market config key.*pre_signal_command.command"):
+        load_market_config(path)
 
 
 def test_crypto_downloaders_accept_incremental_15m_mode(monkeypatch) -> None:

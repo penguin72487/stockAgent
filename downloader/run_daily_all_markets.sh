@@ -84,6 +84,8 @@ TW_PUBLIC_FLUSH_EVERY_DATES="${TW_PUBLIC_FLUSH_EVERY_DATES:-250}"
 TW_PUBLIC_SKIP_RAW="${TW_PUBLIC_SKIP_RAW:-0}"
 TW_PUBLIC_MAX_DATES="${TW_PUBLIC_MAX_DATES:-}"
 RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
+RUN_TW_SHORT_RESTRICTIONS="${RUN_TW_SHORT_RESTRICTIONS:-1}"
+TW_SHORT_RESTRICTION_WORKERS="${TW_SHORT_RESTRICTION_WORKERS:-2}"
 TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
 TW_PUBLIC_FEATURE_SYMBOLS_ROOT="${TW_PUBLIC_FEATURE_SYMBOLS_ROOT:-data_yahoo/tw_stocks}"
 TW_PUBLIC_MARKET_SYMBOL="${TW_PUBLIC_MARKET_SYMBOL:-__MARKET__}"
@@ -551,6 +553,18 @@ run_tw_public_data_update() {
   fi
 
   run_step tw_public_data_daily_update "${cmd[@]}" || rc=1
+
+  if [[ "$RUN_TW_SHORT_RESTRICTIONS" == "1" ]]; then
+    run_step tw_short_sale_restrictions_update \
+      "$PYTHON_BIN" downloader/download_tw_short_sale_restrictions.py \
+      --output-dir "$TW_PUBLIC_OUTPUT_DIR" \
+      --start-year "$(date +%Y)" \
+      --end-year "$(date +%Y)" \
+      --workers "$TW_SHORT_RESTRICTION_WORKERS" \
+      --timeout "$TW_PUBLIC_TIMEOUT" || rc=1
+  else
+    log "skip=tw_short_sale_restrictions_update reason=RUN_TW_SHORT_RESTRICTIONS=${RUN_TW_SHORT_RESTRICTIONS}"
+  fi
 
   if [[ "$RUN_TW_OFFICIAL_OHLCV_BACKFILL" == "1" ]]; then
     backfill_cmd=(

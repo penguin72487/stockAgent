@@ -7,11 +7,9 @@ runner:
   post_train_infer: false
   start_fold: 23
 environment:
-  conda_env: fintech
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  target_vram_fraction: 0.9
   # AMD EPYC 7662: 64 physical cores / usually 128 logical threads with SMT.
   cpu_threads: 128
   torch_compile_threads: 128
@@ -19,16 +17,13 @@ environment:
 data:
   parquet_root: data_yahoo/tw_stocks
   benchmark_name: "2330"
-  benchmark_required: false
-  benchmark_source: derived_from_panel
-  universe_mode: all_daily_symbols
-  use_rapids: false
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 128
   trading_volume_policy: auto
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
+  use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
   # Manual feature switch.
@@ -95,6 +90,31 @@ data:
     - twpub_investment_trust_net_buy_flow
     - twpub_dealer_net_buy_flow
     - twpub_institutional_net_buy_flow
+
+    # Point-in-time monthly revenue / financial statements
+    - twpub_monthly_revenue_log
+    - twpub_monthly_revenue_mom
+    - twpub_monthly_revenue_yoy
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_eps
+    - twpub_financial_revenue_log
+    - twpub_financial_net_income_asinh
+    - twpub_financial_gross_margin
+    - twpub_financial_operating_margin
+    - twpub_financial_net_margin
+    - twpub_financial_assets_log
+    - twpub_financial_debt_ratio
+    - twpub_financial_current_ratio
+    - twpub_financial_equity_ratio
+    - twpub_financial_book_value_per_share_log
+
+    # Point-in-time ownership / securities lending
+    - twpub_insider_holdings_log
+    - twpub_insider_pledge_ratio
+    - twpub_insider_transfer_shares_log
+    - twpub_borrow_available_log
+    - twpub_sbl_balance_log
+    - twpub_short_sale_available_log
 
     # TW public TDCC holders
     - twpub_tdcc_retail_holder_ratio
@@ -205,43 +225,34 @@ trading:
   max_turnover_ratio: 0.0
   max_volume_participation: 0.5
   volume_participation_equity: 1000000.0
-  leverage: 2.5
+  reporting_leverage: 2.5
   min_trade_weight: 0.0
   portfolio_activation: identity
   long_only: false
-  cash_allowed: true
 training:
-  backend: pytorch
-  target: next_1d_rank
-  batch_mode: time_window_x_all_symbols
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
   # Dual RTX 5090 DDP training path. train.py auto-relaunches itself under
   # torchrun when this strategy is selected, so the normal command remains:
   #   python train.py --config configs/markets/tw_parallel.yaml
   #
-  # Measured DDP hotpath profile on EPYC 7662 + dual RTX 5090:
-  # - world_size=2, global_batch_size=128, local_batch_size=64
+  # Historical DDP hotpath profile on EPYC 7662 + dual RTX 5090 (these are
+  # measurement shapes, not the current defaults below):
+  # - measured world_size=2, global_batch_size=128, local_batch_size=64
   # - torch.compile model=true, compile_mode=default, order=model_before_ddp
-  # - compile_fused_log_utility_loss=false
-  # - eager fused log-utility loss; compiling the recurrent scan stalls cold compile
-  # - fold21 hotpath recheck: batch128 and batch256 are both about 620 rows/s,
+  # - canonical fullgraph log-utility loss; cold compile time is accepted
+  # - fold21 historical recheck: global batch128 and 256 were both about 620 rows/s,
   #   so the recurrent full-batch log-utility scan is the throughput limiter.
   #   Increasing batch size alone does not materially improve GPU occupancy.
   multi_gpu_strategy: distributed_data_parallel
-  data_parallel_device_ids: [0, 1]
-  data_parallel_output_device: 0
-  data_parallel_disable_panel_forward: true
   ddp_bucket_cap_mb: 4
   # DDP compiles the bare model before wrapping it in DistributedDataParallel,
   # so Dynamo does not trace DDP broadcast/reducer internals. The recurrent
-  # fused loss stays eager because fullgraph-compiling the row scan causes
-  # excessive cold compile time.
+  # canonical loss is compiled as one full graph so rule execution and the
+  # objective cannot drift into separate fast/debug formulas.
   # Runtime also disables Inductor Triton mix-order reduction by default
   # (STOCKAGENT_INDUCTOR_MIX_ORDER_REDUCTION=0) because PyTorch CUDA 13 hit
   # a compiled-backward scheduler assertion in that fusion pass on RTX 5090.
-  # Only used when overriding multi_gpu_strategy back to data_parallel.
-  data_parallel_compile_model: true
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: default
@@ -249,11 +260,7 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
-  compile_fused_log_utility_loss: false
-  fused_log_utility_loss: true
-  fused_log_utility_manual_backward: true
   loss_portfolio_activation: identity
-  materialize_window_tensors: false
   warm_start_from_previous_fold: false
   chunk_rows: 0
   eval_model_chunk_rows: auto
@@ -261,29 +268,26 @@ training:
   eval_backtest_chunk_rows_auto: true
   eval_backtest_compile: false
   eval_auto_chunk_rows_cap: 64
-  train_symbol_subsample_ratio: 1.0
   # Explicit comparison knob: train_union changes the training symbol universe
   # to the fold's active-symbol union; set none for full-symbol parity runs.
   train_symbol_compaction: train_union
   train_symbol_compaction_bucket_size: 0
-  detach_prev_state: true
-  prefer_fp16: false
   backtest_autotune: false
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
   inference_backtest_autotune: false
   inference_backtest_compile: false
-  backtest_cpp_ext: false
   backtest_verbose: false
   strict_no_fallback: true
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size: 64
-  batch_size_train: 64
-  batch_size_eval: 64
+  # DDP treats this as the effective global batch and divides it across ranks;
+  # with world_size=2 the current local batch is 16.
+  batch_size_train: 32
+  batch_size_eval: 32
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -294,8 +298,6 @@ training:
   plot_backend: auto
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
-  input_pipeline_ab_test: false
-  input_pipeline_ab_test_steps: 20
   explain_after_each_fold: false
   explain_first_test_year_only: true
   explain_top_k: 20
@@ -342,11 +344,6 @@ training:
   save_daily_weights_table: true
   save_integer_share_daily_weights_table: true
   save_integer_share_holdings_table: true
-  # Legacy CSV-specific switches still feed runtime fallbacks; keep disabled
-  # while table_output_format=parquet is the default training output.
-  save_integer_share_daily_weights_csv: false
-  save_integer_share_holdings_csv: false
-  save_daily_weights_csv: false
   backtest_artifact_compression: none
   save_best_val_artifacts: false
   postprocess_benchmark_after_fold: false
@@ -368,15 +365,13 @@ training:
   lr_scheduler_t_max: 0
   lr_scheduler_eta_min: 0.00001
   lr_scheduler_warmup_steps: 500
-  lr_scheduler_interval: step
   lr_scheduler_step_size: 50
   lr_scheduler_gamma: 0.5
   lr_scheduler_patience: 4
   lr_scheduler_threshold: 0.0005
-  top_k: 10
-  num_workers: 0
   weight_decay: 0.01
-  grad_clip_norm: 1.0
+  # Global gradient-norm clipping for optimizer stability. 0 disables it.
+  grad_clip_norm: 0.0
   finite_check_interval_steps: 100
   checkpoint_finite_check: false
   loss_type: log_utility
@@ -533,6 +528,8 @@ training:
     dropout: 0.0
     default_temperature: 1
     portfolio_mode: long_short
+    # true keeps the legacy near-dollar-neutral logits; false allows directional net exposure.
+    center_long_short_logits: false
     # portfolio_output_mode design:
     # - activation_l1: legacy activated scores -> full-gross L1 weights; good baseline, dense.
     # - l1: raw centered scores -> full-gross L1 weights; strongest dense gradient among normalized modes.
@@ -542,7 +539,7 @@ training:
     # - signed_sparsemax: hardest sparse long/short/cash simplex; largest local gradients, more support-jump risk.
     # - projection_l1: raw holdings projected to L1 ball; legal cash, sparse only when raw gross exceeds 1.
     # For signed_* and projection_l1, keep portfolio_activation/loss_portfolio_activation=pre_normalized.
-    portfolio_output_mode: activation_l1
+    portfolio_output_mode: projection_l1
     max_full_tokens: 16384
     checkpoint_blocks: false
     return_aux: false
@@ -616,23 +613,10 @@ training:
     n_blocks: 4
     dropout: 0.1
   cross_sectional_temporal_portfolio_model:
-    stock_embedding_dim: 128
-    stock_hidden_dim: 128
-    stock_n_blocks: 2
-    temporal_hidden_dim: 128
-    temporal_blocks: 2
-    temporal_kernel_size: 3
-    cross_hidden_dim: 128
-    cross_heads: 4
-    cross_layers: 2
-    candidate_top_m: 64
-    portfolio_top_k: 10
     candidate_k: 64
     trade_k: 10
-    scorer: tabular_resnet
     scorer_hidden: 128
     scorer_blocks: 2
-    reranker: set_transformer
     d_model: 128
     heads: 4
     layers: 2
@@ -642,7 +626,10 @@ training:
     rank_ic_weight: 1.00
     direction_weight: 0.00
     volatility_regime_weight: 0.00
-    concentration_weight: 0.00
+    # Soft portfolio concentration penalty. 0 disables it.
+    concentration_weight: 0.0
+    # Soft penalty on realised (long - short) exposure. 0 disables it.
+    net_exposure_weight: 0.0
     regime_up_threshold: 0.002
     regime_down_threshold: -0.002
   factor_generalization_loss:
@@ -652,11 +639,11 @@ training:
     block_stability_weight: 0.20
     regime_stability_weight: 0.20
     consistency_weight: 0.05
-    net_exposure_weight: 0.05
-    gross_exposure_weight: 0.02
-    concentration_weight: 0.02
-    turnover_weight: 0.02
-    score_l2_weight: 0.001
+    net_exposure_weight: 0.0
+    gross_exposure_weight: 0.0
+    concentration_weight: 0.0
+    turnover_weight: 0.0
+    score_l2_weight: 0.0
     factor_temperature: 1.0
     block_count: 4
     worst_fraction: 0.25
@@ -665,7 +652,6 @@ training:
     augmentation_time_dropout: 0.05
     augmentation_noise_std: 0.01
   portfolio_autoencoder_loss:
-    cost_rate: 0.0005
     lambda_turnover: 0.1
     lambda_concentration: 0.01
     lambda_latent: 0.001
@@ -700,7 +686,8 @@ evaluation:
   cvar_alpha: 0.95
   gamma_drawdown: 0.5
   drawdown_target: 0.2
-  gamma_turnover: 0
+  # Soft realised-turnover penalty. 0 disables it; transaction fees still apply.
+  gamma_turnover: 0.0
   gamma_underperformance: 2.0
   excess_target: 0.0
   cvar_budget: 0.03

@@ -9,14 +9,16 @@ if [[ -f "$PROJECT_DIR/scripts/runtime_env.sh" ]]; then
   source "$PROJECT_DIR/scripts/runtime_env.sh"
 fi
 
-LOCAL_ENV_DIR="${LOCAL_ENV_DIR:-${FINTECH_ENV_PATH:-/home/user/miniforge3/envs/fintech}}"
+if [[ -z "${LOCAL_ENV_DIR:-}" ]]; then
+  LOCAL_ENV_DIR="${FINTECH_ENV_PATH:-$(detect_fintech_env_path 2>/dev/null || true)}"
+fi
 REMOTE_USER="${REMOTE_USER:-root}"
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_PORT="${REMOTE_PORT:-22}"
 REMOTE_WORKSPACE="${REMOTE_WORKSPACE:-/workspace}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-}"
 REMOTE_ENV_ARCHIVE="${REMOTE_ENV_ARCHIVE:-}"
-REMOTE_ENV_DIR="${REMOTE_ENV_DIR:-/home/user/miniforge3/envs/fintech}"
+REMOTE_ENV_DIR="${REMOTE_ENV_DIR:-}"
 ARCHIVE_PATH="${ARCHIVE_PATH:-$PROJECT_DIR/fintech-env.tar.gz}"
 RSYNC_DELETE="${RSYNC_DELETE:-0}"
 RUN_REMOTE_SETUP="${RUN_REMOTE_SETUP:-1}"
@@ -38,7 +40,7 @@ Options:
   --remote-workspace <path>   Vast workspace (default: /workspace)
   --remote-project-dir <path> Vast project dir (default: /workspace/stockAgent)
   --remote-env-archive <path> Vast env archive path (default: /workspace/fintech-env.tar.gz)
-  --remote-env-dir <path>     Vast env dir (default: /home/user/miniforge3/envs/fintech)
+  --remote-env-dir <path>     Vast env dir (default: <remote-workspace>/fintech-env)
   --env-transfer <pack|rsync> Transfer env as conda-pack archive or direct rsync (default: pack)
   --no-remote-setup           Upload only; do not run setup_vast.sh
   --delete                    Mirror deletes to remote project dir during rsync
@@ -121,6 +123,10 @@ if [[ -z "$REMOTE_HOST" ]]; then
   usage >&2
   exit 2
 fi
+if [[ -z "$LOCAL_ENV_DIR" ]]; then
+  echo "Local fintech env was not discovered; set FINTECH_ENV_PATH or --local-env-dir." >&2
+  exit 2
+fi
 if [[ ! -x "$LOCAL_ENV_DIR/bin/python" ]]; then
   echo "Local fintech env not found: $LOCAL_ENV_DIR" >&2
   exit 2
@@ -131,6 +137,7 @@ if [[ "$ENV_TRANSFER_MODE" != "pack" && "$ENV_TRANSFER_MODE" != "rsync" ]]; then
 fi
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-$REMOTE_WORKSPACE/stockAgent}"
 REMOTE_ENV_ARCHIVE="${REMOTE_ENV_ARCHIVE:-$REMOTE_WORKSPACE/fintech-env.tar.gz}"
+REMOTE_ENV_DIR="${REMOTE_ENV_DIR:-$REMOTE_WORKSPACE/fintech-env}"
 
 find_conda_pack() {
   if command -v conda-pack >/dev/null 2>&1; then
@@ -163,7 +170,7 @@ if [[ "$ENV_TRANSFER_MODE" == "pack" ]]; then
 fi
 if [[ "$ENV_TRANSFER_MODE" == "pack" && -z "$CONDA_PACK_BIN" ]]; then
   echo "conda-pack is required. Install it first, for example:" >&2
-  echo "  /home/user/miniforge3/bin/conda install -n base -c conda-forge conda-pack -y" >&2
+  echo "  conda install -n base -c conda-forge conda-pack -y" >&2
   exit 2
 fi
 

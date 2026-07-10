@@ -4,51 +4,18 @@ import math
 
 import torch
 
+from stockagent.portfolio_contract import (
+    DEFAULT_PORTFOLIO_ACTIVATION,
+    normalize_portfolio_activation,
+)
 from stockagent.profiling import profile_range
-
-
-DEFAULT_PORTFOLIO_ACTIVATION = "identity"
-
-
-def normalize_portfolio_activation(activation: str | None) -> str:
-    normalized = str(activation or DEFAULT_PORTFOLIO_ACTIVATION).strip().lower().replace("-", "_")
-    aliases = {
-        "arc_tan": "atan",
-        "arctan": "atan",
-        "erf_scaled": "erf",
-        "gd": "gudermannian",
-        "already_normalized": "pre_normalized",
-        "inverse_square_root_unit": "isru",
-        "inverse_sqrt": "isru",
-        "inverse_sqrt_unit": "isru",
-        "isr": "isru",
-        "isru1": "isru",
-        "pre_normalized_weights": "pre_normalized",
-        "preserve": "pre_normalized",
-        "preserve_weights": "pre_normalized",
-        "soft_sign": "softsign",
-        "weights": "pre_normalized",
-        "x_over_1_abs_x": "softsign",
-        "x_over_sqrt_1_x2": "isru",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized in {"identity", "linear", "none", "raw"}:
-        return "identity"
-    valid = {"tanh", "softsign", "isru", "erf", "atan", "gudermannian", "pre_normalized"}
-    if normalized not in valid:
-        raise ValueError(
-            "portfolio activation must be one of "
-            "'identity', 'tanh', 'softsign', 'isru', 'erf', 'atan', 'gd', or 'pre_normalized'"
-        )
-    return normalized
-
 
 def apply_portfolio_activation(logits: torch.Tensor, activation: str | None = None) -> torch.Tensor:
     with profile_range("portfolio.activation"):
         activation_name = normalize_portfolio_activation(activation)
         if activation_name in {"identity", "pre_normalized"}:
-            return torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+            return torch.nan_to_num(logits, nan=0.0)
+        logits = torch.nan_to_num(logits, nan=0.0)
         if activation_name == "tanh":
             return torch.tanh(logits)
         if activation_name == "softsign":
@@ -133,7 +100,7 @@ def _masked_distribution(
         transform_name = str(transform).strip().lower().replace("-", "_")
         if transform_name in {"softmax", "action_softmax"}:
             mask_fill = finite_mask_fill_value(logits)
-            safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+            safe_logits = torch.nan_to_num(logits, nan=0.0)
             safe_logits = safe_logits.masked_fill(~mask, mask_fill)
             probs = torch.softmax(safe_logits.float(), dim=1).to(dtype=logits.dtype)
             return probs.masked_fill(~mask, 0.0)
@@ -153,7 +120,7 @@ def _masked_sparsemax(
     """Masked sparsemax over dim=1."""
     with profile_range("portfolio.sparsemax"):
         mask_bool = mask.bool()
-        logits_f = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        logits_f = torch.nan_to_num(logits.float(), nan=0.0)
         valid_count = mask_bool.sum(dim=1, keepdim=True)
         safe_logits = logits_f.masked_fill(~mask_bool, -1e9)
         sorted_logits = torch.sort(safe_logits, dim=1, descending=True).values
@@ -187,7 +154,7 @@ def _masked_entmax15(
     """
     with profile_range("portfolio.entmax15"):
         mask_bool = mask.bool()
-        logits_f = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        logits_f = torch.nan_to_num(logits.float(), nan=0.0)
         valid_count = mask_bool.sum(dim=1, keepdim=True)
         safe_logits = logits_f.masked_fill(~mask_bool, -1e9)
         max_val = safe_logits.max(dim=1, keepdim=True).values
@@ -233,7 +200,7 @@ def masked_signed_action_weights(
             mask_bool = torch.ones_like(logits, dtype=torch.bool)
         else:
             mask_bool = mask.to(device=logits.device, dtype=torch.bool)
-        clean_logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        clean_logits = torch.nan_to_num(logits, nan=0.0)
         with profile_range("portfolio.action_mask_where"):
             clean_logits = clean_logits.masked_fill(~mask_bool, 0.0)
         cash = torch.full(
@@ -295,7 +262,7 @@ def masked_l1_projection_weights(
             mask_bool = torch.ones_like(logits, dtype=torch.bool)
         else:
             mask_bool = mask.to(device=logits.device, dtype=torch.bool)
-        clean = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        clean = torch.nan_to_num(logits.float(), nan=0.0)
         clean = clean.masked_fill(~mask_bool, 0.0)
         if long_only:
             clean = clean.clamp_min(0.0)

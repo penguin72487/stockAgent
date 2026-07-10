@@ -248,6 +248,85 @@ def test_integer_backtest_uses_future_returns_not_close_price_delta_for_pnl() ->
     assert first_day_stock_rows[0].price == 100.0
 
 
+def test_integer_gross_cap_never_resizes_frozen_long_or_short_positions() -> None:
+    dates = np.array(["2024-01-01", "2024-01-02"], dtype="datetime64[D]")
+    prices = np.full((2, 2), 100.0, dtype=np.float32)
+    tradable = np.ones((2, 2), dtype=bool)
+    benchmark = np.zeros((2,), dtype=np.float32)
+
+    cases = [
+        {
+            "weights": np.asarray([[0.8, 0.2], [0.0, -1.0]], dtype=np.float32),
+            "can_buy": np.ones((2, 2), dtype=bool),
+            "can_sell": np.asarray([[True, True], [False, True]], dtype=bool),
+            "expected_frozen": 8,
+            "expected_other": -2,
+        },
+        {
+            "weights": np.asarray([[-0.8, -0.2], [0.0, 1.0]], dtype=np.float32),
+            "can_buy": np.asarray([[True, True], [False, True]], dtype=bool),
+            "can_sell": np.ones((2, 2), dtype=bool),
+            "expected_frozen": -8,
+            "expected_other": 2,
+        },
+    ]
+    for case in cases:
+        _, records = run_backtest_integer_shares(
+            weights=case["weights"],
+            future_returns=np.zeros((2, 2), dtype=np.float32),
+            tradable_mask=tradable,
+            benchmark_returns=benchmark,
+            can_buy_mask=case["can_buy"],
+            can_sell_mask=case["can_sell"],
+            can_short_open_mask=tradable,
+            initial_capital=1000.0,
+            buy_fee_rate=0.0,
+            sell_fee_rate=0.0,
+            long_only=False,
+            gross_leverage=1.0,
+            portfolio_activation="pre_normalized",
+            close_prices=prices,
+            symbols=["FROZEN", "OTHER"],
+            dates=dates,
+        )
+
+        frozen = _shares_by_date(records, "FROZEN")
+        other = _shares_by_date(records, "OTHER")
+        assert frozen["2024-01-02"] == case["expected_frozen"]
+        assert other["2024-01-02"] == case["expected_other"]
+
+
+def test_integer_long_only_gross_cap_blocks_new_exposure_beside_frozen_long() -> None:
+    weights = np.asarray([[0.5, 0.0], [0.0, 0.5]], dtype=np.float32)
+    tradable = np.ones((2, 2), dtype=bool)
+    can_buy = np.ones((2, 2), dtype=bool)
+    can_sell = np.asarray([[True, True], [False, True]], dtype=bool)
+    dates = np.asarray(["2024-01-01", "2024-01-02"], dtype="datetime64[D]")
+
+    _, records = run_backtest_integer_shares(
+        weights=weights,
+        future_returns=np.zeros_like(weights),
+        tradable_mask=tradable,
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        initial_capital=1000.0,
+        buy_fee_rate=0.0,
+        sell_fee_rate=0.0,
+        long_only=True,
+        gross_leverage=0.5,
+        portfolio_activation="pre_normalized",
+        close_prices=np.full((2, 2), 100.0, dtype=np.float32),
+        symbols=["FROZEN", "NEW"],
+        dates=dates,
+    )
+
+    frozen = _shares_by_date(records, "FROZEN")
+    newly_requested = _shares_by_date(records, "NEW")
+    assert frozen["2024-01-02"] == 5
+    assert newly_requested.get("2024-01-02", 0) == 0
+
+
 def main() -> None:
     test_limit_price_examples()
     test_limit_masks()
@@ -257,6 +336,8 @@ def main() -> None:
     test_no_sell_on_limit_down_day()
     test_tw_holdings_price_has_no_float_tail()
     test_integer_backtest_uses_future_returns_not_close_price_delta_for_pnl()
+    test_integer_gross_cap_never_resizes_frozen_long_or_short_positions()
+    test_integer_long_only_gross_cap_blocks_new_exposure_beside_frozen_long()
     print("All TW limit rule tests passed.")
 
 

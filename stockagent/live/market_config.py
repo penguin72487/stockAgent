@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 import shlex
@@ -154,12 +154,45 @@ def _int_tuple(value: Any) -> tuple[int, ...]:
     return tuple(out)
 
 
+_MARKET_CONFIG_ALIASES = {"id", "config", "checkpoint"}
+
+
+def _validate_market_config_keys(raw: dict[str, Any], *, path: Path) -> None:
+    allowed = {item.name for item in fields(LiveMarketConfig)} | _MARKET_CONFIG_ALIASES
+    unknown = sorted(str(key) for key in raw if key not in allowed)
+    if unknown:
+        raise ValueError(
+            f"Unknown market config key(s) in {path}: " + ", ".join(unknown)
+        )
+
+    nested_keys: list[str] = []
+
+    def collect_nested(value: Any, prefix: str) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{prefix}.{key}"
+                nested_keys.append(child_path)
+                collect_nested(child, child_path)
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                collect_nested(child, f"{prefix}[{index}]")
+
+    for key, value in raw.items():
+        collect_nested(value, str(key))
+    if nested_keys:
+        raise ValueError(
+            f"Nested market config key(s) are not supported in {path}: "
+            + ", ".join(nested_keys)
+        )
+
+
 def load_market_config(path: str | Path) -> LiveMarketConfig:
     path = Path(path)
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"Market config must be a YAML mapping: {path}")
+    _validate_market_config_keys(raw, path=path)
 
     market = str(raw.get("market") or raw.get("id") or path.stem).strip()
     if not market:

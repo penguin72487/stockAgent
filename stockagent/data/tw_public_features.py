@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
 import json
 from pathlib import Path
 from typing import Iterable
 
 import polars as pl
+
+from stockagent.data.tw_delisting_rules import (
+    classify_delisting_notice,
+    split_announcement_symbols,
+)
 
 
 DEFAULT_MARKET_SYMBOL = "__MARKET__"
@@ -65,6 +71,27 @@ STOCK_FEATURE_COLUMNS = (
     "twpub_attention_close_log",
     "twpub_attention_pe_log",
     "twpub_disposal_count_log",
+    "twpub_monthly_revenue_log",
+    "twpub_monthly_revenue_mom",
+    "twpub_monthly_revenue_yoy",
+    "twpub_cumulative_revenue_yoy",
+    "twpub_financial_eps",
+    "twpub_financial_revenue_log",
+    "twpub_financial_net_income_asinh",
+    "twpub_financial_gross_margin",
+    "twpub_financial_operating_margin",
+    "twpub_financial_net_margin",
+    "twpub_financial_assets_log",
+    "twpub_financial_debt_ratio",
+    "twpub_financial_current_ratio",
+    "twpub_financial_equity_ratio",
+    "twpub_financial_book_value_per_share_log",
+    "twpub_insider_holdings_log",
+    "twpub_insider_pledge_ratio",
+    "twpub_insider_transfer_shares_log",
+    "twpub_borrow_available_log",
+    "twpub_sbl_balance_log",
+    "twpub_short_sale_available_log",
 )
 
 MARKET_FEATURE_COLUMNS = (
@@ -113,11 +140,19 @@ MARKET_FEATURE_COLUMNS = (
 
 FEATURE_COLUMNS = (*STOCK_FEATURE_COLUMNS, *MARKET_FEATURE_COLUMNS)
 RULE_COLUMNS = (
+    "_twpub_official_traded",
+    "_twpub_delisted",
     "_twpub_tpex_next_limit_up_ret",
     "_twpub_tpex_next_limit_down_ret",
     "_twpub_dividend_year",
     "_twpub_attention_flag",
     "_twpub_disposal_flag",
+    "_twpub_short_open_ban",
+    "_twpub_force_short_cover",
+    "_twpub_force_cover_lead_sessions",
+    "_twpub_force_cover_anchor_ordinal",
+    "_twpub_force_cover_cancel_ordinal",
+    "_twpub_trading_halt",
 )
 OUTPUT_COLUMNS = (*FEATURE_COLUMNS, *RULE_COLUMNS)
 KEY_COLUMNS = ("date", "symbol")
@@ -128,6 +163,7 @@ AVAILABILITY_POLICY = {
     "quarterly_macro": "quarter end plus 90 calendar days when no explicit release date is provided",
     "snapshot_openapi": "announcement/report date when present; otherwise downloader as-of date",
     "future_event_snapshot": "downloader as-of date for known future-event snapshot rows",
+    "delisting_short_rules": "explicit effective date not before publication; otherwise next calendar day after notice",
 }
 
 
@@ -155,6 +191,7 @@ def build_tw_public_training_features(
     symbols = _load_symbol_filter(symbols_root)
     stock_frames = [
         _build_official_ohlcv_features(input_dir),
+        _build_delisted_company_rules(input_dir),
         _build_valuation_features(input_dir),
         _build_margin_features(input_dir),
         _build_institutional_features(input_dir),
@@ -164,6 +201,10 @@ def build_tw_public_training_features(
         _build_ex_dividend_preview_features(input_dir),
         _build_material_info_features(input_dir),
         _build_attention_disposal_features(input_dir),
+        _build_model_useful_financial_features(input_dir),
+        _build_model_useful_ownership_features(input_dir),
+        _build_model_useful_shorting_features(input_dir),
+        _build_model_useful_rule_features(input_dir),
     ]
     stock_features = _merge_feature_frames(stock_frames)
     if symbols is not None and not stock_features.is_empty():
@@ -518,6 +559,7 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                 [
                     _date_column_expr("date").alias("date"),
                     _symbol_expr("證券代號").alias("symbol"),
+                    pl.lit(1.0).alias("_twpub_official_traded"),
                     close.alias("_close"),
                     _positive_log1p(volume).alias("twpub_official_trading_volume_log"),
                     _positive_log1p(value).alias("twpub_official_trading_value_log"),
@@ -542,6 +584,7 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
                 [
                     _date_column_expr("date").alias("date"),
                     _symbol_expr("代號").alias("symbol"),
+                    pl.lit(1.0).alias("_twpub_official_traded"),
                     close.alias("_close"),
                     _positive_log1p(volume).alias("twpub_official_trading_volume_log"),
                     _positive_log1p(value).alias("twpub_official_trading_value_log"),
@@ -565,6 +608,582 @@ def _build_official_ohlcv_features(input_dir: Path) -> pl.DataFrame:
         .with_columns(_safe_log(pl.col("_close") / pl.col("_close").shift(1).over("symbol")).alias("twpub_official_close_logret_1d"))
         .drop("_close")
     )
+
+
+def _build_delisted_company_rules(input_dir: Path) -> pl.DataFrame:
+    # TPEx's official "delisted" lifecycle table also records same-symbol
+    # transfers to the TWSE.  Those are venue migrations, not terminal asset
+    # exits: the TWSE new-listing table identifies them explicitly as 櫃轉市.
+    # Treating them as terminal would fabricate a sale, fee and portfolio reset
+    # even though the security continues trading under the same symbol.
+    twse_new_listings = _read_optional(input_dir, "twse_api_company_newlisting")
+    tpex_to_twse_symbols: set[str] = set()
+    if (
+        not twse_new_listings.is_empty()
+        and {"Code", "Note"}.issubset(twse_new_listings.columns)
+    ):
+        tpex_to_twse_symbols = {
+            str(symbol).strip().upper()
+            for symbol in (
+                twse_new_listings.filter(
+                    pl.col("Note")
+                    .cast(pl.Utf8, strict=False)
+                    .fill_null("")
+                    .str.contains("櫃轉市", literal=True)
+                )
+                .get_column("Code")
+                .cast(pl.Utf8, strict=False)
+                .drop_nulls()
+                .to_list()
+            )
+            if str(symbol).strip()
+        }
+
+    frames: list[pl.DataFrame] = []
+    for dataset in ("twse_delisted_company", "tpex_delisted_company"):
+        frame = _read_optional(input_dir, dataset)
+        if frame.is_empty() or not {"date", "symbol"}.issubset(frame.columns):
+            continue
+        if dataset == "tpex_delisted_company" and tpex_to_twse_symbols:
+            frame = frame.filter(
+                ~_symbol_expr("symbol").is_in(sorted(tpex_to_twse_symbols))
+            )
+        frames.append(
+            frame.select(
+                [
+                    _date_column_expr("date").alias("date"),
+                    _symbol_expr("symbol").alias("symbol"),
+                    pl.lit(1.0).alias("_twpub_delisted"),
+                ]
+            ).drop_nulls(["date", "symbol"])
+        )
+    if not frames:
+        return pl.DataFrame()
+    return pl.concat(frames, how="diagonal_relaxed").unique(["date", "symbol"], keep="last")
+
+
+def _snapshot_date_expr(columns: set[str]):
+    explicit = _first_existing(columns, ("出表日期", "Date", "日期"))
+    return _date_column_expr(explicit) if explicit else _date_column_expr("date")
+
+
+def _snapshot_symbol_expr(columns: set[str]):
+    name = _first_existing(columns, ("公司代號", "SecuritiesCompanyCode", "Code", "TWSECode"))
+    return _symbol_expr(name) if name else pl.lit("")
+
+
+def _read_glob(input_dir: Path, pattern: str) -> list[pl.DataFrame]:
+    return [pl.read_parquet(path) for path in sorted(input_dir.glob(pattern))]
+
+
+def _build_model_useful_financial_features(input_dir: Path) -> pl.DataFrame:
+    monthly_frames: list[pl.DataFrame] = []
+    income_frames: list[pl.DataFrame] = []
+    balance_frames: list[pl.DataFrame] = []
+    for frame in _read_glob(input_dir, "*_api_*t187ap05_[lo].parquet"):
+        columns = set(frame.columns)
+        revenue = _first_num_expr(columns, ("營業收入-當月營收",))
+        monthly_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _positive_log1p(revenue).alias("twpub_monthly_revenue_log"),
+                (_first_num_expr(columns, ("營業收入-上月比較增減(%)",)) / 100.0).alias("twpub_monthly_revenue_mom"),
+                (_first_num_expr(columns, ("營業收入-去年同月增減(%)",)) / 100.0).alias("twpub_monthly_revenue_yoy"),
+                (_first_num_expr(columns, ("累計營業收入-前期比較增減(%)",)) / 100.0).alias("twpub_cumulative_revenue_yoy"),
+            )
+        )
+
+    for frame in _read_glob(input_dir, "*_api_*t187ap06_*parquet"):
+        columns = set(frame.columns)
+        revenue = _first_num_expr(columns, ("營業收入", "收益", "利息淨收益"))
+        gross = _first_num_expr(columns, ("營業毛利（毛損）淨額", "營業毛利（毛損）"))
+        operating = _first_num_expr(columns, ("營業利益（損失）", "繼續營業單位稅前淨利（淨損）"))
+        net_income = _first_num_expr(columns, ("本期淨利（淨損）", "本期稅後淨利（淨損）"))
+        income_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _first_num_expr(columns, ("基本每股盈餘（元）", "基本每股盈餘")).alias("twpub_financial_eps"),
+                _positive_log1p(revenue).alias("twpub_financial_revenue_log"),
+                _signed_asinh(net_income, scale=100000.0).alias("twpub_financial_net_income_asinh"),
+                _safe_ratio(gross, revenue).alias("twpub_financial_gross_margin"),
+                _safe_ratio(operating, revenue).alias("twpub_financial_operating_margin"),
+                _safe_ratio(net_income, revenue).alias("twpub_financial_net_margin"),
+            )
+        )
+
+    for frame in _read_glob(input_dir, "*_api_*t187ap07_*parquet"):
+        columns = set(frame.columns)
+        assets = _first_num_expr(columns, ("資產總額", "資產總計"))
+        liabilities = _first_num_expr(columns, ("負債總額", "負債總計"))
+        current_assets = _first_num_expr(columns, ("流動資產",))
+        current_liabilities = _first_num_expr(columns, ("流動負債",))
+        equity = _first_num_expr(columns, ("權益總額", "權益總計"))
+        balance_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _positive_log1p(assets).alias("twpub_financial_assets_log"),
+                _safe_ratio(liabilities, assets).alias("twpub_financial_debt_ratio"),
+                _safe_ratio(current_assets, current_liabilities).alias("twpub_financial_current_ratio"),
+                _safe_ratio(equity, assets).alias("twpub_financial_equity_ratio"),
+                _positive_log(_first_num_expr(columns, ("每股參考淨值",))).alias("twpub_financial_book_value_per_share_log"),
+            )
+        )
+    groups = [
+        pl.concat(group, how="diagonal_relaxed")
+        for group in (monthly_frames, income_frames, balance_frames)
+        if group
+    ]
+    return _merge_feature_frames(groups)
+
+
+def _build_model_useful_ownership_features(input_dir: Path) -> pl.DataFrame:
+    holding_frames: list[pl.DataFrame] = []
+    transfer_frames: list[pl.DataFrame] = []
+    for frame in _read_glob(input_dir, "*_api_*t187ap11_[lo].parquet"):
+        columns = set(frame.columns)
+        holding_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _num_expr("目前持股").alias("holdings"),
+                _num_expr("設質股數").alias("pledged"),
+            ).group_by(["date", "symbol"]).agg(
+                _positive_log1p(pl.col("holdings").sum()).alias("twpub_insider_holdings_log"),
+                _safe_ratio(pl.col("pledged").sum(), pl.col("holdings").sum()).alias("twpub_insider_pledge_ratio"),
+            )
+        )
+    for frame in _read_glob(input_dir, "*_api_*t187ap12_[lo].parquet"):
+        columns = set(frame.columns)
+        transfer_frames.append(
+            frame.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _num_expr("預定轉讓方式及股數-轉讓股數").alias("shares"),
+            ).group_by(["date", "symbol"]).agg(
+                _positive_log1p(pl.col("shares").sum()).alias("twpub_insider_transfer_shares_log")
+            )
+        )
+    groups = [
+        pl.concat(group, how="diagonal_relaxed")
+        for group in (holding_frames, transfer_frames)
+        if group
+    ]
+    return _merge_feature_frames(groups)
+
+
+def _build_model_useful_shorting_features(input_dir: Path) -> pl.DataFrame:
+    frames: list[pl.DataFrame] = []
+    tpex = _read_optional(input_dir, "tpex_api_tpex_margin_sbl")
+    if not tpex.is_empty():
+        columns = set(tpex.columns)
+        frames.append(
+            tpex.select(
+                _snapshot_date_expr(columns).alias("date"),
+                _snapshot_symbol_expr(columns).alias("symbol"),
+                _positive_log1p(_num_expr("SaleAvailableVolumes")).alias("twpub_short_sale_available_log"),
+                _positive_log1p(_num_expr("SecuritiesBorrowingBalanceOfTheMarketDay")).alias("twpub_sbl_balance_log"),
+                _positive_log1p(_num_expr("AvailableVolumesForSBLShortSale")).alias("twpub_borrow_available_log"),
+            )
+        )
+    twse = _read_optional(input_dir, "twse_api_sbl_twt96u")
+    if not twse.is_empty():
+        for code, volume in (("TWSECode", "TWSEAvailableVolume"), ("GRETAICode", "GRETAIAvailableVolume")):
+            frames.append(
+                twse.select(
+                    _date_column_expr("date").alias("date"),
+                    _symbol_expr(code).alias("symbol"),
+                    _positive_log1p(_num_expr(volume)).alias("twpub_borrow_available_log"),
+                )
+            )
+    return _finalize_feature_frame(pl.concat(frames, how="diagonal_relaxed")) if frames else pl.DataFrame()
+
+
+def _expand_rule_range(
+    frame: pl.DataFrame,
+    *,
+    symbol: str,
+    start: str,
+    end: str | None,
+    rule: str,
+    end_exclusive: bool = False,
+) -> pl.DataFrame:
+    columns = set(frame.columns)
+    start_expr = _date_column_expr(start)
+    if end and end in columns:
+        parsed_end = _date_column_expr(end)
+        end_expr = pl.coalesce([parsed_end.dt.offset_by("-1d") if end_exclusive else parsed_end, start_expr])
+    else:
+        end_expr = start_expr
+    return (
+        frame.select(
+            _symbol_expr(symbol).alias("symbol"),
+            pl.date_ranges(start_expr, end_expr, interval="1d", closed="both").alias("date"),
+        )
+        .explode("date", empty_as_null=True)
+        .drop_nulls(["date", "symbol"])
+        .with_columns(pl.lit(1.0).alias(rule))
+    )
+
+
+def _build_model_useful_rule_features(input_dir: Path) -> pl.DataFrame:
+    frames: list[pl.DataFrame] = []
+    specs = (
+        ("twse_api_exchangereport_bfi84u", "Code", "StartDate", "EndDate", "_twpub_short_open_ban", False),
+        ("tpex_api_tpex_margin_trading_term", "SecuritiesCompanyCode", "ShortSaleSuspensionStartDate", "ShortSaleSuspensionEndDate", "_twpub_short_open_ban", False),
+        ("tpex_short_sale_suspension_terms", "symbol", "short_open_ban_date", "short_open_resume_date", "_twpub_short_open_ban", False),
+        ("twse_api_exchangereport_twtawu", "Code", "TradingHaltDate", "TradingResumptionDate", "_twpub_trading_halt", True),
+        ("tpex_api_tpex_spendi_history", "SecuritiesCompanyCode", "DateOfSuspendedTrading", "DateOfResumedTrading", "_twpub_trading_halt", True),
+    )
+    for dataset, symbol, start, end, rule, end_exclusive in specs:
+        frame = _read_optional(input_dir, dataset)
+        if not frame.is_empty() and {symbol, start}.issubset(frame.columns):
+            frames.append(
+                _expand_rule_range(
+                    frame,
+                    symbol=symbol,
+                    start=start,
+                    end=end,
+                    rule=rule,
+                    end_exclusive=end_exclusive,
+                )
+            )
+    cmode = _read_optional(input_dir, "tpex_api_tpex_cmode")
+    if not cmode.is_empty():
+        frames.append(
+            cmode.filter(_text_expr("SuspensionOfTrading").is_in(["Y", "Ｙ", "是"]))
+            .select(
+                _date_column_expr("Date").alias("date"),
+                _symbol_expr("SecuritiesCompanyCode").alias("symbol"),
+                pl.lit(1.0).alias("_twpub_trading_halt"),
+            )
+        )
+    announcement_rules = _build_delisting_announcement_rules(input_dir)
+    if not announcement_rules.is_empty():
+        frames.append(announcement_rules)
+    return _finalize_feature_frame(pl.concat(frames, how="diagonal_relaxed")) if frames else pl.DataFrame()
+
+
+def _build_delisting_announcement_rules(input_dir: Path) -> pl.DataFrame:
+    """Turn point-in-time delisting notices into executable short rules.
+
+    Explicit effective dates are authoritative but are never applied before the
+    announcement.  When a delisting notice has no explicit short-sale start,
+    the conservative rule starts on the next calendar day; the panel later
+    aligns calendar dates to actual sessions. Explicit cover dates are emitted
+    directly; an announcement that explicitly requires cover N trading sessions
+    before delisting emits a point-in-time relative marker for the panel to
+    resolve against its actual exchange-session calendar.
+    """
+    announcements = _read_optional(input_dir, "tw_delisting_short_sale_announcements")
+    if announcements.is_empty() or not {"announcement_date", "symbols"}.issubset(announcements.columns):
+        return pl.DataFrame()
+
+    columns = set(announcements.columns)
+
+    def date_expr(name: str):
+        return _date_column_expr(name) if name in columns else pl.lit(None, dtype=pl.Date)
+
+    normalized = announcements.select(
+        date_expr("announcement_date").alias("announcement_date"),
+        (
+            pl.col("market")
+            .cast(pl.Utf8, strict=False)
+            .fill_null("")
+            .str.to_lowercase()
+            if "market" in columns
+            else pl.lit("")
+        ).alias("market"),
+        pl.col("symbols").cast(pl.Utf8, strict=False).fill_null("").alias("symbols"),
+        date_expr("short_open_ban_date").alias("short_open_ban_date"),
+        date_expr("short_open_resume_date").alias("short_open_resume_date"),
+        date_expr("short_cover_deadline").alias("short_cover_deadline"),
+        date_expr("short_cover_anchor_date").alias("short_cover_anchor_date"),
+        date_expr("delisting_date").alias("delisting_date"),
+        (
+            pl.col("short_cover_lead_trading_days").cast(pl.Int64, strict=False)
+            if "short_cover_lead_trading_days" in columns
+            else pl.lit(None, dtype=pl.Int64)
+        ).alias("short_cover_lead_trading_days"),
+        (
+            pl.col("short_cover_anchor_lead_trading_days").cast(pl.Int64, strict=False)
+            if "short_cover_anchor_lead_trading_days" in columns
+            else pl.lit(None, dtype=pl.Int64)
+        ).alias("short_cover_anchor_lead_trading_days"),
+        (
+            pl.col("article_78_exempt").cast(pl.Boolean, strict=False).fill_null(False)
+            if "article_78_exempt" in columns
+            else pl.lit(False)
+        ).alias("article_78_exempt"),
+        (
+            pl.col("technical_share_replacement").cast(pl.Boolean, strict=False).fill_null(False)
+            if "technical_share_replacement" in columns
+            else pl.lit(False)
+        ).alias("technical_share_replacement"),
+        (
+            pl.col("delisting_cancelled").cast(pl.Boolean, strict=False).fill_null(False)
+            if "delisting_cancelled" in columns
+            else pl.lit(False)
+        ).alias("delisting_cancelled"),
+        (
+            pl.col("continues_short_open_ban").cast(pl.Boolean, strict=False).fill_null(False)
+            if "continues_short_open_ban" in columns
+            else pl.lit(False)
+        ).alias("continues_short_open_ban"),
+        (
+            pl.col("subject").cast(pl.Utf8, strict=False).fill_null("")
+            if "subject" in columns
+            else pl.lit("")
+        ).alias("subject"),
+        (
+            pl.col("body_text").cast(pl.Utf8, strict=False).fill_null("")
+            if "body_text" in columns
+            else pl.lit("")
+        ).alias("body_text"),
+    )
+    horizon_values = [
+        value
+        for name in ("announcement_date", "short_open_resume_date", "delisting_date")
+        for value in normalized[name].drop_nulls().to_list()
+    ]
+    # An explicit ban is persistent state. The absence of newer announcement
+    # rows is not a resume event, so an open-ended ban must survive through the
+    # build date unless a real resume/delisting transition closes it.
+    rule_horizon = max([date.today(), *horizon_values])
+
+    rows = normalized.iter_rows(named=True)
+    resume_events: dict[tuple[str, str], list[date]] = {}
+    cancellation_events: dict[tuple[str, str], list[date]] = {}
+    delisting_cancellation_events: dict[tuple[str, str], list[date]] = {}
+    for row in rows:
+        resume_date = row["short_open_resume_date"]
+        announcement_date = row["announcement_date"]
+        if announcement_date is None:
+            continue
+        symbols = split_announcement_symbols(row["symbols"])
+        market = row["market"]
+        if resume_date is not None:
+            for symbol in symbols:
+                resume_events.setdefault((market, symbol), []).append(
+                    max(resume_date, announcement_date)
+                )
+        classification = classify_delisting_notice(
+            f"{row['subject']} {row['body_text']}"
+        )
+        if classification.restriction_cancelled:
+            for symbol in symbols:
+                cancellation_events.setdefault((market, symbol), []).append(
+                    announcement_date
+                )
+        if bool(row["delisting_cancelled"]) or classification.delisting_cancelled:
+            for symbol in symbols:
+                delisting_cancellation_events.setdefault(
+                    (market, symbol), []
+                ).append(announcement_date)
+    for dates in resume_events.values():
+        dates.sort()
+    for dates in cancellation_events.values():
+        dates.sort()
+    for dates in delisting_cancellation_events.values():
+        dates.sort()
+
+    output: list[dict[str, object]] = []
+    for row in normalized.iter_rows(named=True):
+        announcement_date = row["announcement_date"]
+        if announcement_date is None:
+            continue
+        text = f"{row['subject']} {row['body_text']}"
+        classification = classify_delisting_notice(text)
+        article_78_exempt = bool(row["article_78_exempt"]) or classification.article_78_exempt
+        technical_share_replacement = bool(
+            row["technical_share_replacement"]
+        ) or classification.technical_share_replacement
+        delisting_cancelled = bool(
+            row["delisting_cancelled"]
+        ) or classification.delisting_cancelled
+        continues_short_open_ban = bool(
+            row["continues_short_open_ban"]
+        ) or classification.continues_short_open_ban
+        delisting_date = row["delisting_date"]
+        inferred_delisting_rule = bool(
+            classification.is_delisting_notice
+            and delisting_date is not None
+            and not article_78_exempt
+            and not technical_share_replacement
+            and not delisting_cancelled
+            and not classification.restriction_cancelled
+        )
+        market = row["market"]
+        symbols = split_announcement_symbols(row["symbols"])
+        for symbol in symbols:
+            event_key = (market, symbol)
+            explicit_start = (
+                None
+                if classification.restriction_cancelled
+                else row["short_open_ban_date"]
+            )
+            if explicit_start is None and continues_short_open_ban:
+                explicit_start = announcement_date
+            if explicit_start is not None:
+                # A cached notice must never alter dates before its publication.
+                start = max(explicit_start, announcement_date)
+            elif inferred_delisting_rule:
+                start = announcement_date + timedelta(days=1)
+            else:
+                start = None
+
+            if start is not None:
+                next_cancellation = next(
+                    (
+                        value
+                        for value in cancellation_events.get(event_key, ())
+                        if value >= announcement_date
+                    ),
+                    None,
+                )
+                next_delisting_cancellation = next(
+                    (
+                        value
+                        for value in delisting_cancellation_events.get(
+                            event_key, ()
+                        )
+                        if value >= announcement_date
+                    ),
+                    None,
+                )
+                if next_cancellation is not None and next_cancellation <= start:
+                    start = None
+                if (
+                    inferred_delisting_rule
+                    and next_delisting_cancellation is not None
+                    and next_delisting_cancellation <= start
+                ):
+                    start = None
+            else:
+                next_delisting_cancellation = next(
+                    (
+                        value
+                        for value in delisting_cancellation_events.get(
+                            event_key, ()
+                        )
+                        if value >= announcement_date
+                    ),
+                    None,
+                )
+
+            # Company terminal events are sourced from the authoritative TWSE
+            # / TPEx delisted-company datasets.  Those datasets do not include
+            # ETF beneficiary certificates, so for leading-zero fund symbols
+            # use the official, uncancelled delisting notice itself.  Keeping
+            # this fund-only avoids replacing observed company outcomes with a
+            # merely scheduled announcement.
+            if (
+                symbol.startswith("0")
+                and inferred_delisting_rule
+                and delisting_date is not None
+                and (
+                    next_delisting_cancellation is None
+                    or next_delisting_cancellation > delisting_date
+                )
+            ):
+                output.append(
+                    {
+                        "date": delisting_date,
+                        "symbol": symbol,
+                        "_twpub_delisted": 1.0,
+                    }
+                )
+
+            if start is not None:
+                end_candidates = [
+                    value
+                    for value in (delisting_date,)
+                    if value is not None
+                    and value >= start
+                    and classification.is_delisting_notice
+                    and not delisting_cancelled
+                ]
+                next_resume = next(
+                    (
+                        value
+                        for value in resume_events.get(event_key, ())
+                        if value > start
+                    ),
+                    None,
+                )
+                if next_resume is not None:
+                    end_candidates.append(next_resume - timedelta(days=1))
+                if next_cancellation is not None and next_cancellation > start:
+                    end_candidates.append(next_cancellation - timedelta(days=1))
+                if (
+                    inferred_delisting_rule
+                    and next_delisting_cancellation is not None
+                    and next_delisting_cancellation > start
+                ):
+                    end_candidates.append(
+                        next_delisting_cancellation - timedelta(days=1)
+                    )
+                # A ban is a state, not a one-day event.  In the absence of an
+                # explicit resume/delisting transition, keep it active through
+                # the latest date known by this point-in-time announcement set.
+                end = min(end_candidates) if end_candidates else max(start, rule_horizon or start)
+                cursor = start
+                while cursor <= end:
+                    output.append({"date": cursor, "symbol": symbol, "_twpub_short_open_ban": 1.0})
+                    cursor += timedelta(days=1)
+
+            deadline = row["short_cover_deadline"]
+            deadline_cancelled = bool(
+                next_delisting_cancellation is not None
+                and deadline is not None
+                and next_delisting_cancellation <= deadline
+            )
+            if (
+                deadline is not None
+                and deadline >= announcement_date
+                and not deadline_cancelled
+            ):
+                output.append({"date": deadline, "symbol": symbol, "_twpub_force_short_cover": 1.0})
+
+            # Some TPEx notices key the mandatory short close to the first
+            # stop-transfer date (six exchange sessions before it), rather
+            # than to delisting (the usual ten-session rule). The panel resolves
+            # this explicit anchor against its own observed exchange sessions.
+            anchor_date = row["short_cover_anchor_date"]
+            anchor_lead_sessions = row["short_cover_anchor_lead_trading_days"]
+            if anchor_date is not None and anchor_lead_sessions is not None:
+                cover_anchor = anchor_date
+                lead_sessions = anchor_lead_sessions
+            else:
+                cover_anchor = delisting_date
+                lead_sessions = row["short_cover_lead_trading_days"]
+                if lead_sessions is None and classification.requires_relative_cover:
+                    lead_sessions = 10
+            if (
+                inferred_delisting_rule
+                and cover_anchor is not None
+                and lead_sessions is not None
+                and int(lead_sessions) > 0
+            ):
+                output.append(
+                    {
+                        "date": announcement_date,
+                        "symbol": symbol,
+                        "_twpub_force_cover_lead_sessions": float(lead_sessions),
+                        "_twpub_force_cover_anchor_ordinal": float(
+                            cover_anchor.toordinal()
+                        ),
+                        "_twpub_force_cover_cancel_ordinal": (
+                            float(next_delisting_cancellation.toordinal())
+                            if next_delisting_cancellation is not None
+                            else None
+                        ),
+                    }
+                )
+
+    return pl.DataFrame(output, infer_schema_length=None) if output else pl.DataFrame()
 
 
 def _build_twse_market_index_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
