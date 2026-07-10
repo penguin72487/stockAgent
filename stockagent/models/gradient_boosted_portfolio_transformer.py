@@ -13,62 +13,7 @@ from stockagent.models.normalization import (
     masked_signed_action_weights,
     normalize_portfolio_activation,
 )
-
-
-def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-    normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-    if normalized in {"long", "long_only", "longonly"}:
-        return "long_only"
-    if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-        return "long_short"
-    raise ValueError("portfolio_mode must be 'long_only' or 'long_short'")
-
-
-def _normalize_portfolio_output_mode(mode: str) -> str:
-    normalized = str(mode).strip().lower().replace("-", "_")
-    if normalized in {
-        "activation_l1",
-        "activated_l1",
-        "activation",
-        "bounded_l1",
-        "bounded_activation_l1",
-        "default",
-    }:
-        return "activation_l1"
-    if normalized in {"l1", "raw_l1", "score_l1", "linear_l1", "identity_l1"}:
-        return "l1"
-    if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
-        return "logits"
-    if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
-        return "signed_softmax"
-    if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
-        return "signed_sparsemax"
-    if normalized in {
-        "signed_entmax",
-        "signed_entmax15",
-        "signed_entmax_15",
-        "signed_action_entmax",
-        "signed_action_entmax15",
-        "action_entmax",
-        "action_entmax15",
-        "entmax",
-        "entmax15",
-        "entmax_15",
-    }:
-        return "signed_entmax15"
-    if normalized in {
-        "projection",
-        "projection_l1",
-        "l1_projection",
-        "project_l1",
-        "differentiable_projection",
-        "differentiable_l1_projection",
-    }:
-        return "projection_l1"
-    raise ValueError(
-        "portfolio_output_mode must be 'activation_l1', 'l1', 'logits', "
-        "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
-    )
+from stockagent.portfolio_contract import normalize_portfolio_mode, normalize_portfolio_output_mode
 
 
 def _repeat_or_trim_eta(values: Sequence[float], count: int) -> list[float]:
@@ -460,9 +405,9 @@ class GradientBoostedPortfolioTransformer(nn.Module):
         self.num_residual_stages = max(0, int(num_residual_stages))
         self.detach_stage_condition = bool(detach_stage_condition)
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = _normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
-        self.portfolio_output_mode = _normalize_portfolio_output_mode(portfolio_output_mode)
+        self.portfolio_output_mode = normalize_portfolio_output_mode(portfolio_output_mode)
         self.center_final_logits = bool(center_final_logits)
         self.return_aux = bool(return_aux)
         self.return_aux_details = bool(return_aux_details)

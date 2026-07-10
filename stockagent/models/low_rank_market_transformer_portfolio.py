@@ -15,6 +15,7 @@ from stockagent.models.normalization import (
     masked_softmax,
     normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode
 
 
 class TemporalSelfAttentionBlock(nn.Module):
@@ -323,7 +324,7 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         self.num_latent_factors = max(1, int(num_latent_factors))
         self.num_market_tokens = max(1, int(num_market_tokens))
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.return_aux = bool(return_aux)
         self.return_aux_details = bool(return_aux_details)
@@ -422,18 +423,6 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
             in_dim = int(head_hidden_dim)
         head.append(nn.Linear(in_dim, 1))
         self.score_head = nn.Sequential(*head)
-
-    @staticmethod
-    def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-        normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-        if normalized in {"long", "long_only", "longonly"}:
-            return "long_only"
-        if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-            return "long_short"
-        raise ValueError(
-            "LowRankMarketTransformerPortfolioModel portfolio_mode must be "
-            "'long_only' or 'long_short'"
-        )
 
     @staticmethod
     def _normalize_temporal_mixer(temporal_mixer: str) -> str:

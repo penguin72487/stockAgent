@@ -1,8 +1,15 @@
 # AGENTS.md
 
-This file is the persistent operating contract for future coding agents working
-in this repository. Read it before changing code, configs, training logic, model
-architecture, or explainability artifacts.
+This file records persistent correctness constraints plus the latest measured
+engineering recommendations for future coding agents. Read it before changing
+code, configs, training logic, model architecture, or explainability artifacts.
+
+Correctness rules (point-in-time data, fee/mask semantics, checkpoint
+compatibility, and reproducibility) are contracts. Model choices,
+hyperparameters, compile modes, batch sizes, benchmark timings, and the phrase
+"active baseline" are experimental snapshots and recommendations, not frozen
+requirements. Re-measure them when the hardware, data, objective, or experiment
+changes, and follow the user's latest explicit experiment settings.
 
 ## Communication
 
@@ -13,32 +20,29 @@ architecture, or explainability artifacts.
 
 ## Workspace And Environment
 
-- Repo root: `/home/user/stockAgent`.
+- Repo root is the directory containing this file; its absolute path differs across machines.
 - Preferred Python runtime is the `fintech` Conda/Mamba environment, whose absolute
   path differs across machines. Source `scripts/runtime_env.sh` and use
-  `resolve_fintech_python`; `FINTECH_ENV_PATH` or `PYTHON_BIN` may override discovery.
+  `run_fintech_python`; `FINTECH_ENV_PATH` or `PYTHON_BIN` may override discovery.
 - Do not assume `python` exists on PATH or hard-code one user's home directory.
-  Run `$(resolve_fintech_python) scripts/check_environment.py` before expensive jobs.
+  Run `run_fintech_python scripts/check_environment.py --require-cuda --strict` before expensive jobs.
 - CUDA is expected for training. If CUDA is unavailable and `runner.require_cuda` is true, do not silently fall back to CPU.
 - Use `rg` / `rg --files` for search.
 - Use `apply_patch` for manual file edits.
 - Do not revert user changes or unrelated dirty files.
 - Do not use destructive git commands such as `git reset --hard` or `git checkout --` unless the user explicitly asks.
 
-## Current Baseline Precision Contract
+## Current Baseline Precision Recommendation
 
 The baseline should use BF16 AMP, not FP16.
 
-Required config state:
+Recommended baseline config:
 
 ```yaml
 environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-
-training:
-  prefer_fp16: false
 ```
 
 Implementation expectations:
@@ -102,7 +106,7 @@ Rules:
   single-pass full-table read is faster than adding a per-file schema projection
   pass.
 
-## Current Main Model Contract
+## Current Main Model Recommendation
 
 The active model is `transformer_base_portfolio`.
 
@@ -126,7 +130,6 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
-  fused_log_utility_loss: true
   loss_portfolio_activation: identity
   auto_batch_size: false
   allow_dynamic_symbols: false
@@ -134,7 +137,6 @@ training:
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   eval_auto_chunk_rows_cap: 64
-  num_workers: 0
   backtest_compile: true
   backtest_compile_stateful: true
   backtest_compile_dynamic: false
@@ -200,8 +202,10 @@ Notes:
   - learned static market-token anchors read stocks through cross-attention with stock masks
   - stocks read updated market tokens through cross-attention
   - stock-level market gate applies `z = RMSNorm(z_base_or_factor + sigmoid(g_i) * market_delta)`
-  - portfolio head uses three scalar heads: `mu`, `sigma`, `confidence`
-  - score is `mu / softplus(sigma) * sigmoid(confidence)`, then masked de-mean for long/short, then configured bounded activation + L1 portfolio normalization
+  - one configurable scalar `score_head` maps each stock embedding to raw score logits
+  - long/short logits are masked and optionally de-meaned; the selected output mode
+    either returns logits or transforms them through its configured signed action,
+    projection, or activation-plus-L1 rule
 - Keep `stock_market_gate`, `z_market_delta`, market tokens, latent factors, and stock embeddings available in aux outputs when detailed explainability is requested.
 
 Modern Transformer module contract:
@@ -266,6 +270,11 @@ Guidelines:
 - Do not use dual-branch softmax as the active long/short position calculator. Legacy `dual_branch_softmax` / `masked_softmax` names are now compatibility wrappers around configured activation + L1 portfolio normalization.
 - If changing `trading.long_only`, understand that it affects loss/backtest interpretation, not just the model head.
 - Keep model output mode, loss assumptions, backtest assumptions, and report wording aligned. If they disagree, flag it explicitly.
+- `trading.reporting_leverage` is a reporting/post-processing multiplier only.
+  Canonical training, validation/test metrics, and integer-share execution keep
+  gross exposure at `1.0`; the multiplier produces separate `leverage_*` plots with
+  turnover and fees recomputed from scaled weights. It remains part of the
+  checkpoint configuration fingerprint so resumed reporting is reproducible.
 - Rank-only loss can over-concentrate positions. If using rank objectives, keep turnover/concentration/backtest regularization in mind.
 - If the user switches back to only-long behavior, change both the model direction mode and the loss/backtest direction assumptions deliberately and report the change.
 
@@ -284,7 +293,47 @@ Rules:
 - Cross-batch/chunk portfolio state should be detached and cloned on GPU:
   - `t.detach().clone(memory_format=torch.contiguous_format)`
 - `initial_weights` is trading state, not a gradient path across batches.
+- Cross-period state is the previous executed portfolio after mark-to-market
+  drift, not the previous target weights. Price moves and paid fees change the
+  weights used to compute the next rebalance turnover.
+- Carry both `final_weights` and scalar `final_alive` across train/eval chunks.
+  Ruin is absorbing; a later model signal must not recreate capital.
+- A mandatory short cover floors an executable position at zero but does not
+  prohibit a same-day discretionary long. Only the cover-to-zero quantity may
+  bypass voluntary turnover/volume limits.
+- `CANONICAL_BACKTEST_CONTRACT_VERSION` is part of schema-4 semantic checkpoint
+  compatibility. Bump it whenever return, fee, turnover, or recurrent-state
+  accounting changes; old-contract weights may be used for inference but must
+  not silently resume an optimizer trajectory.
 - If compiled loss hits CUDA Graph overwritten-output errors, only fall back the loss wrapper to eager tensor loss; do not disable model `torch.compile` globally.
+
+## Intentional Walk-Forward Semantics
+
+- When `walk_forward.require_future_test_year: false`, the final experimental fold
+  deliberately reuses its validation window as its test window. Keep that overlap;
+  label it as latest-year experimentation rather than unbiased model selection.
+- Every split requires a complete lookback contained inside that split. Therefore a
+  lookback of 32 deliberately starts evaluation at the split's 32nd trading row
+  (drops the first 31 rows). Do not prepend rows from the preceding split to make a
+  fold appear to start on its first calendar trading day.
+- For stitched deployment tests, the warmup rows before the next model's first valid
+  row remain owned by the preceding model. This preserves chronological coverage
+  without changing the per-fold lookback rule.
+
+## Trainer Executor Boundaries
+
+- Neural training has one lazy `WindowedSplitTensors` executor per process. The
+  single-device and torchrun DDP variants share the same canonical model, loss,
+  side masks, fees, and stateful backtest semantics.
+- A contiguous fixed-shape batch may use `forward_from_panel_slab`; unsupported,
+  non-contiguous, or auxiliary-output cases materialize the window inside that same
+  guarded executor. These are input representations, not separate loss/backtest
+  implementations.
+- LightGBM/XGBoost intentionally retain a separate CPU materialized fit/evaluation
+  route because they are a different algorithm family. Do not add another neural
+  DataLoader or single-process multi-GPU executor.
+- The loss path is canonical `risk_aware_loss` plus `run_backtest_torch`; compile it
+  when useful, but do not add an alternate return formula.
 
 ## Epoch-Level Timing And Throughput
 
@@ -325,18 +374,19 @@ Compile/runtime rules:
 - Build Transformer Engine for Blackwell consumer GPUs with `NVTE_CUDA_ARCHS=120a` / `CMAKE_CUDA_ARCHITECTURES=120a`, and force CUDA library discovery to the conda env. Do not let `libtransformer_engine.so` link to system CUDA 12 libraries; set RPATH or `LD_LIBRARY_PATH` so `libcublas.so.13`, `libcudart.so.13`, `libcublasLt.so.13`, and `libcudnn.so.9` resolve from the `fintech` env.
 - On RTX 5070 Ti, NVFP4 stochastic rounding is not supported by ptxas for `sm_120a` (`cvt.rs.satfinite.e2m1x4.f32` rejects `.rs`). Use native deterministic NVFP4 recipes such as `NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)` for project benchmarks and training probes.
 - Transformer Engine NVFP4 `te.Linear` needs a conservative padding adapter in this project: pad input/K to 32, output/N to 32, and leading rows to 32, then slice outputs back. The lower FP4 type granularity is 16, but `K=48` FFN output projections failed on RTX 5070 Ti unless padded to `K=64`.
-- When invoking `/home/user/miniforge3/envs/fintech/bin/python` directly, PATH may not include the env `bin`. Compile helpers must prepend that path so Triton can find `/home/user/miniforge3/envs/fintech/bin/ptxas`.
+- Source `scripts/runtime_env.sh` before invoking Python. It prepends the selected
+  environment's `bin`, so Triton resolves that environment's `ptxas` regardless
+  of where the environment is installed.
 - Compile cache paths should be stable and persistent across runs:
   - `TORCHINDUCTOR_CACHE_DIR=~/.cache/torchinductor`
   - `TRITON_CACHE_DIR=~/.cache/triton`
   - `CUDA_CACHE_PATH=~/.cache/nv_cuda`
   - do not delete these caches between repeated same-shape benchmarks unless explicitly testing cold compile behavior
-- Current benchmark result for the active `data_okx` lookback32 run: compare only epoch 2 or later. The fastest measured compile combination is model compile plus fullgraph fused log-utility loss:
+- Current benchmark result for the active `data_okx` lookback32 run: compare only epoch 2 or later. The fastest measured compile combination was model compile plus the canonical fullgraph log-utility loss:
   - `enable_torch_compile: true`
   - `backtest_compile: true`
   - `backtest_compile_stateful: true`
   - `backtest_compile_dynamic: false` for fixed train/eval shapes
-  - `fused_log_utility_loss: true`
   - `compile_loss: true`
   - epoch 2 wall time improved from about `67.54s` with all compile off to about `18.99s`.
 - Compile mode benchmark result:
@@ -348,7 +398,9 @@ Compile/runtime rules:
   - keep `batch_size_train: 32`; `batch_size_train: 64` was only marginally faster in one epoch-2 run and changes optimizer batch granularity
   - keep `backtest_autotune: true`; disabling it was only noise-level faster in one epoch-2 run and can hurt other shapes
   - keep backtest prep compile enabled; `STOCKAGENT_BACKTEST_COMPILE_PREP=0` was not faster on epoch 2
-- Trainer compile checks should discover `/home/user/miniforge3/envs/fintech/bin/ptxas` and the conda compilers `x86_64-conda-linux-gnu-gcc/g++` even when the parent shell PATH is sparse.
+- Trainer compile checks should discover the selected fintech environment's
+  `ptxas` and conda compilers `x86_64-conda-linux-gnu-gcc/g++` even when the
+  parent shell PATH is sparse.
 - Historical actual-shape compile probes on the 2000-2024 TW checkpoint showed:
   - compiled `transformer_base_portfolio` model forward is beneficial
   - compiled tensor backtest is beneficial and may use fallback on unsupported graph states
@@ -360,14 +412,12 @@ Compile/runtime rules:
   - `backtest_compile_stateful: true`
   - `backtest_compile_dynamic: false`
   - `backtest_autotune: true`
-  - `fused_log_utility_loss: true`
   - `compile_loss: true`
-  - only compile the fullgraph fused log-utility fast path; keep general `risk_aware_loss` as the debug/research path
+  - compile canonical `risk_aware_loss` with `fullgraph=true` for log utility; do not maintain a second loss formula
 - Eval model forward chunking and eval backtest chunking are intentionally decoupled:
   - keep model chunk sizing VRAM-driven, often `eval_model_chunk_rows: auto`
   - use larger `eval_backtest_chunk_rows`, currently `512`, to reduce `run_backtest_torch()` calls without skipping any val/test curve rows
   - preserve `prev_weights` continuation across backtest chunks and reset only at fold/segment boundaries
-- `run_backtest_torch_reduced(..., reduction="log_utility")` exists for exact in-loop log utility reduction, but it is opt-in via `STOCKAGENT_LOSS_REDUCED_LOG_UTILITY=1` until a stateful compiled/Triton/C++ path benchmarks faster. The eager reduced loop was slower, and independent reduced runner compile warmup stalled in testing.
 
 ## Crypto Downloader Baseline
 
@@ -391,16 +441,63 @@ Rules:
 - If changing feature schema, update cache/versioning so stale panel caches are not reused.
 - Keep `return_1d`, tradable masks, TW limit guards, and benchmark construction aligned with the canonical backtest.
 
+## TW Public Execution-Rule Contract
+
+- Backfill official lifecycle/short-sale announcements with
+  `run_fintech_python downloader/download_tw_short_sale_restrictions.py --output-dir data_tw_public --start-year 1995 --end-year <year>`, then rebuild
+  `data_tw_public/features/tw_public_stock_daily.parquet` with
+  `scripts/build_tw_public_training_features.py`. The downloader is strict by
+  default: it writes a completeness report and refuses to replace data after an
+  incomplete archive request unless `--allow-partial` is explicitly chosen.
+
+- `data.use_tw_public_features` controls model inputs; `data.use_tw_public_rules`
+  independently controls execution masks. A rules-only TW baseline must not append
+  `twpub_*` features or read their parquet columns.
+- When `use_tw_public_rules: true`, the configured public parquet is required;
+  fail before panel construction instead of silently training without market rules.
+- `can_sell_mask` means an existing long may be sold. `can_short_open_mask` means a
+  new/increased short may be opened. Do not merge them: a short-sale ban must not
+  prevent an investor from selling an owned long position.
+- Ordinary non-tradability, missing data, zero volume, halts, and price-limit blocks
+  freeze the affected position. Only an explicit official permanent-exit event sets
+  `force_exit_mask` and settles a position (with the applicable buy/sell fee).
+- Do not treat every venue-level delisting as a terminal asset exit. TPEx rows
+  identified by the official TWSE new-listing feed as `櫃轉市` continue under the
+  same symbol and must not fabricate a sale/fee. Likewise, if a symbol resumes on
+  the immediately following panel session, treat it as a same-symbol market or
+  corporate transition; a later relisting after a real gap remains a new
+  incarnation and the old position exits first.
+- `_twpub_official_traded` may contain disjoint archive snapshots. Infer a missing
+  trading session only between nearby observations (currently at most seven
+  calendar days); never convert a long source-coverage gap into a multi-year halt.
+  Long halts come from explicit official halt/resume events.
+- Fund notices often write an ETF code only in parentheses. Keep broker-tradable
+  ETF beneficiary certificates in the short-ban/terminal parser while continuing
+  to exclude warrants, ETNs, preferreds, and ordinary debt instruments.
+- Delisting and short-cover announcements are point-in-time state transitions.
+  Process them chronologically by market and symbol, and allow a later cancellation
+  to remove only a still-pending delisting/cover obligation while preserving an
+  explicitly continuing short-open ban.
+- Relative cover rules use their stated anchor. The usual rule is ten exchange
+  sessions before delisting; notices that say six sessions before stop-transfer use
+  the stop-transfer start date instead.
+- Panel cache v2 writes immutable generations under a writer lock and atomically
+  commits metadata last. Readers retry the complete snapshot if a concurrent writer
+  reclaims the generation sampled by an earlier metadata read.
+- Panel cache validation fingerprints every source byte (including the external
+  rule parquet), so a same-size replacement with preserved timestamps cannot
+  silently reuse stale execution masks.
+
 ## Explainability Contract
 
 The user wants detailed model explainability to detect strange rules and judge strategy trustworthiness.
 
 Expected explainability workflow:
 
-- `python explain_model.py` should default to drawing the full explainability set unless the user asks for a smaller run.
+- `run_fintech_python explain_model.py` should default to drawing the full explainability set unless the user asks for a smaller run.
 - Analyze all folds when making model-level claims.
 - Keep `training.explain_after_each_fold: false` by default so training VRAM/time stays focused on train/eval/test artifacts.
-- Generate explainability after training with `python explain_model.py`, which defaults to scanning all folds that have `checkpoint_best.pt`.
+- Generate explainability after training with `run_fintech_python explain_model.py`, which defaults to scanning all folds that have `checkpoint_best.pt`.
 - Only enable `training.explain_after_each_fold: true` for deliberate smoke/debug runs, because paper explainability can be slow and VRAM-heavy.
 - Default test explainability should use only each fold's first test year unless the user explicitly asks for all test years.
 - Paper-grade explainability is the default report style:
@@ -457,23 +554,26 @@ Use focused tests after small changes, then broader tests when training/model/lo
 Common commands:
 
 ```bash
-/home/user/miniforge3/envs/fintech/bin/python -m py_compile \
+source scripts/runtime_env.sh
+run_fintech_python -m py_compile \
   stockagent/config.py \
   stockagent/training/trainer.py \
   stockagent/training/loss.py \
   stockagent/backtest/simulator.py
 
-/home/user/miniforge3/envs/fintech/bin/python -m pytest -q -s test
+run_fintech_python -m pytest -q -s test
 ```
 
 Known repo quirk:
 
-- Prefer `python -m pytest -q -s test` for the formal test suite to keep collection scoped to the maintained test directory.
+- Prefer `run_fintech_python -m pytest -q -s test` for the formal test suite to
+  keep collection scoped to the maintained test directory.
 
 Model-specific tests:
 
 ```bash
-/home/user/miniforge3/envs/fintech/bin/python -m pytest -q -s \
+source scripts/runtime_env.sh
+run_fintech_python -m pytest -q -s \
   test/test_low_rank_market_transformer_portfolio.py \
   test/test_explainability_smoke.py
 ```
@@ -481,7 +581,8 @@ Model-specific tests:
 Loss/backtest consistency tests:
 
 ```bash
-/home/user/miniforge3/envs/fintech/bin/python -m pytest -q -s \
+source scripts/runtime_env.sh
+run_fintech_python -m pytest -q -s \
   test/test_backtest_tensor_consistency.py \
   test/test_pure_rank_loss.py
 ```

@@ -43,6 +43,7 @@ from stockagent.training.trainer import (
     _resolve_amp_dtype,
     _resolve_device,
     _training_loss_portfolio_activation,
+    _volume_limit_weights_from_notional,
 )
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -80,12 +81,11 @@ def _finite_float(value: Any, default: float = float("nan")) -> float:
     return out if math.isfinite(out) else default
 
 
-def _configure_runtime(config: Any, *, backtest_compile: bool, reduced_log_utility: bool) -> None:
+def _configure_runtime(config: Any, *, backtest_compile: bool) -> None:
     config.training.backtest_compile = bool(backtest_compile)
     config.training.backtest_autotune = bool(backtest_compile)
     config.training.backtest_compile_stateful = bool(backtest_compile)
     config.training.backtest_compile_dynamic = False
-    os.environ["STOCKAGENT_LOSS_REDUCED_LOG_UTILITY"] = "1" if reduced_log_utility else "0"
     os.environ["STOCKAGENT_COMPILE_LOSS"] = "0"
     _configure_backtest_runtime_from_config(config)
     if torch.cuda.is_available():
@@ -202,7 +202,6 @@ def _loss_kwargs(config: Any, *, loss_portfolio_activation: str) -> dict[str, An
         "factor_temperature": float(fg.factor_temperature),
         "factor_block_count": int(fg.block_count),
         "factor_worst_fraction": float(fg.worst_fraction),
-        "autoencoder_cost_rate": float(ae.cost_rate),
         "autoencoder_lambda_turnover": float(ae.lambda_turnover),
         "autoencoder_lambda_concentration": float(ae.lambda_concentration),
         "autoencoder_lambda_latent": float(ae.lambda_latent),
@@ -232,6 +231,16 @@ def _forward_loss(
             benchmark_returns=batch["benchmark"],
             can_buy_mask=batch["can_buy_mask"],
             can_sell_mask=batch["can_sell_mask"],
+            can_short_open_mask=batch["can_short_open_mask"],
+            force_short_cover_mask=batch["force_short_cover_mask"],
+            force_exit_mask=batch["force_exit_mask"],
+            volume_limit_weights=_volume_limit_weights_from_notional(
+                batch.get("volume_notional"),
+                max_volume_participation=float(config.trading.max_volume_participation),
+                volume_participation_equity=float(config.trading.volume_participation_equity),
+                device=weights.device,
+                dtype=weights.dtype,
+            ),
             sample_mask=batch.get("sample_mask"),
             aux_outputs=aux,
             **_loss_kwargs(config, loss_portfolio_activation=loss_portfolio_activation),
@@ -554,6 +563,16 @@ def _backtest_from_weights(
         portfolio_activation=portfolio_activation,
         can_buy_mask=batch["can_buy_mask"].bool(),
         can_sell_mask=batch["can_sell_mask"].bool(),
+        can_short_open_mask=batch["can_short_open_mask"].bool(),
+        force_short_cover_mask=batch["force_short_cover_mask"].bool(),
+        force_exit_mask=batch["force_exit_mask"].bool(),
+        volume_limit_weights=_volume_limit_weights_from_notional(
+            batch.get("volume_notional"),
+            max_volume_participation=float(config.trading.max_volume_participation),
+            volume_participation_equity=float(config.trading.volume_participation_equity),
+            device=weights.device,
+            dtype=weights.dtype,
+        ),
         return_weights_history=return_weights_history,
     )
 
@@ -969,7 +988,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--jacobian-sources", default="zero,random")
     parser.add_argument("--jacobian-score-scale", type=float, default=1.0)
     parser.add_argument("--backtest-compile", action="store_true")
-    parser.add_argument("--reduced-log-utility", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
 
@@ -985,7 +1003,6 @@ def main() -> None:
     _configure_runtime(
         config,
         backtest_compile=bool(args.backtest_compile),
-        reduced_log_utility=bool(args.reduced_log_utility),
     )
     device = _resolve_device(config)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
@@ -995,7 +1012,6 @@ def main() -> None:
 
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
@@ -1005,9 +1021,14 @@ def main() -> None:
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
         external_feature_path=(
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
     )

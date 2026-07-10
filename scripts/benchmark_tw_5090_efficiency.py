@@ -16,7 +16,7 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PYTHON = Path("/venv/fintech/bin/python")
+DEFAULT_PYTHON = Path(sys.executable).resolve()
 
 
 @dataclass(frozen=True)
@@ -28,38 +28,19 @@ class Variant:
 
 
 VARIANTS: dict[str, Variant] = {
-    "dual_dp_b128": Variant(
-        name="dual_dp_b128",
+    "dual_ddp_b128": Variant(
+        name="dual_ddp_b128",
         cuda_visible_devices="0,1",
         args=(
             "--multi-gpu-strategy",
-            "data_parallel",
-            "--data-parallel-device-ids",
-            "0,1",
+            "distributed_data_parallel",
             "--batch-size-train",
             "128",
             "--batch-size-eval",
             "128",
             "--no-cache-eval-tensors-on-gpu",
         ),
-        notes="Current dual-RTX-5090 DataParallel production shape.",
-    ),
-    "dual_dp_b128_serial": Variant(
-        name="dual_dp_b128_serial",
-        cuda_visible_devices="0,1",
-        args=(
-            "--multi-gpu-strategy",
-            "data_parallel",
-            "--data-parallel-device-ids",
-            "0,1",
-            "--no-data-parallel-threaded-replicas",
-            "--batch-size-train",
-            "128",
-            "--batch-size-eval",
-            "128",
-            "--no-cache-eval-tensors-on-gpu",
-        ),
-        notes="Same shape with serial replica launches, useful for isolating threaded apply.",
+        notes="Canonical dual-RTX-5090 DDP fixed-shape panel-slab production path.",
     ),
     "single_b64": Variant(
         name="single_b64",
@@ -73,7 +54,7 @@ VARIANTS: dict[str, Variant] = {
             "64",
             "--no-cache-eval-tensors-on-gpu",
         ),
-        notes="Fair single-GPU baseline; per-step GPU batch matches one DP shard.",
+        notes="Fair single-GPU baseline; per-step GPU batch matches one DDP shard.",
     ),
 }
 
@@ -296,8 +277,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark TW RTX 5090 training efficiency variants.")
     parser.add_argument("--config", default="configs/markets/tw_parallel.yaml")
     parser.add_argument("--output-base", default="artifacts/benchmarks/tw_5090_efficiency")
-    parser.add_argument("--variants", default="dual_dp_b128,single_b64")
-    parser.add_argument("--python", default=str(DEFAULT_PYTHON if DEFAULT_PYTHON.exists() else sys.executable))
+    parser.add_argument("--variants", default="dual_ddp_b128,single_b64")
+    parser.add_argument("--python", default=str(DEFAULT_PYTHON))
     parser.add_argument("--start-fold", type=int, default=23)
     parser.add_argument("--max-folds", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=3)

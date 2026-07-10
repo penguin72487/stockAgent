@@ -2,8 +2,8 @@
 set -euo pipefail
 
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/workspace/stockAgent}"
-REMOTE_ENV_DIR="${REMOTE_ENV_DIR:-/home/user/miniforge3/envs/fintech}"
-ENV_ARCHIVE="${ENV_ARCHIVE:-/workspace/fintech-env.tar.gz}"
+REMOTE_ENV_DIR="${REMOTE_ENV_DIR:-${FINTECH_ENV_PATH:-}}"
+ENV_ARCHIVE="${ENV_ARCHIVE:-}"
 
 usage() {
   cat <<'EOF'
@@ -11,8 +11,8 @@ Usage: bash scripts/setup_vast.sh [options]
 
 Options:
   --project-dir <path>    Project directory on Vast (default: /workspace/stockAgent)
-  --env-dir <path>        fintech env install path (default: /home/user/miniforge3/envs/fintech)
-  --env-archive <path>    conda-pack archive path (default: /workspace/fintech-env.tar.gz)
+  --env-dir <path>        fintech env install path (default: <project-parent>/fintech-env)
+  --env-archive <path>    conda-pack archive path (default: <project-parent>/fintech-env.tar.gz)
   -h, --help              Show this help
 
 Environment overrides:
@@ -46,6 +46,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+REMOTE_WORKSPACE="$(dirname "$REMOTE_PROJECT_DIR")"
+REMOTE_ENV_DIR="${REMOTE_ENV_DIR:-$REMOTE_WORKSPACE/fintech-env}"
+ENV_ARCHIVE="${ENV_ARCHIVE:-$REMOTE_WORKSPACE/fintech-env.tar.gz}"
+
 if [[ ! -d "$REMOTE_PROJECT_DIR" ]]; then
   echo "Project directory not found: $REMOTE_PROJECT_DIR" >&2
   exit 2
@@ -70,15 +74,6 @@ fi
 if [[ -x "$REMOTE_ENV_DIR/bin/conda-unpack" ]]; then
   echo "[setup-vast] running conda-unpack"
   "$REMOTE_ENV_DIR/bin/conda-unpack"
-fi
-
-# Keep compatibility with project docs/configs and older absolute paths.
-mkdir -p /root /home/user
-if [[ "$REMOTE_PROJECT_DIR" != "/root/stockAgent" && ! -e /root/stockAgent ]]; then
-  ln -s "$REMOTE_PROJECT_DIR" /root/stockAgent
-fi
-if [[ "$REMOTE_PROJECT_DIR" != "/home/user/stockAgent" && ! -e /home/user/stockAgent ]]; then
-  ln -s "$REMOTE_PROJECT_DIR" /home/user/stockAgent
 fi
 
 export FINTECH_ENV_PATH="$REMOTE_ENV_DIR"

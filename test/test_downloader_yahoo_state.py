@@ -39,6 +39,10 @@ def _base_args(tmp_path, **overrides):
 
 
 def test_daily_resolution_preserves_known_manifest_without_retrying_missing(tmp_path, monkeypatch):
+    # A caller-provided namespace is the resolved configuration boundary.  An
+    # unrelated in-process workflow may have set this global environment flag,
+    # but it must not turn off the repo fallback behind the caller's back.
+    monkeypatch.setenv("STOCKAGENT_STRICT_NO_FALLBACK", "1")
     output_dir = tmp_path / "tw_stocks"
     output_dir.mkdir()
     pl.DataFrame(

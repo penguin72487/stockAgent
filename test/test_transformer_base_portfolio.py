@@ -19,7 +19,7 @@ from stockagent.models.normalization import (
     masked_l1_projection_weights,
     masked_signed_action_weights,
 )
-from stockagent.training.trainer import _extract_weights_and_aux
+from stockagent.training.trainer import _extract_weights_and_aux, _PanelSlabForwardWrapper
 from stockagent.training.windowed import WindowedSplitTensors
 
 
@@ -322,6 +322,51 @@ def test_forward_from_panel_slab_equivalence_for_contiguous_rows() -> None:
     assert torch.allclose(aux_x["score_logits"], aux_slab["score_logits"], atol=1e-5, rtol=1e-5)
 
 
+def test_panel_slab_compiles_fullgraph_on_cpu_with_compact_symbols_and_backward() -> None:
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile is unavailable")
+
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="projection_l1",
+        temporal_pooling="attention",
+        temporal_query_mode="full_then_last",
+        allow_dynamic_symbols=False,
+        return_aux=False,
+        return_aux_details=False,
+    ).cpu().train()
+    wrapper = _PanelSlabForwardWrapper(model)
+    compiled = torch.compile(
+        wrapper,
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+
+    batch_rows = 3
+    compact_symbols = torch.tensor([0, 2, 5, 8, 12], dtype=torch.long)
+    feature_slab = torch.randn(
+        batch_rows + model.lookback - 1,
+        int(compact_symbols.numel()),
+        model.num_features,
+        requires_grad=True,
+    )
+    mask = torch.ones(batch_rows, int(compact_symbols.numel()), dtype=torch.bool)
+    mask[-1, -1] = False
+
+    with torch.no_grad():
+        expected = wrapper(feature_slab, mask, compact_symbols)
+    actual = compiled(feature_slab, mask, compact_symbols)
+    actual.square().sum().backward()
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.all(actual.abs().sum(dim=1) <= 1.0 + 1e-6)
+    assert actual[-1, -1].item() == 0.0
+    assert feature_slab.grad is not None
+    assert torch.isfinite(feature_slab.grad).all()
+
+
 def test_symbol_indices_preserve_full_universe_symbol_positions() -> None:
     device = _device()
     symbol_indices_cpu = torch.tensor([0, 2, 5, 8], dtype=torch.long)
@@ -421,6 +466,35 @@ def test_last_only_temporal_shapes_and_finite() -> None:
     assert weights.shape == (3, 13)
     assert torch.isfinite(weights).all()
     assert weights[0, 9:].abs().max().item() < 1e-6
+
+
+def test_last_only_main_output_is_invariant_to_aux_collection() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_layers=2,
+        temporal_query_mode="last_only",
+        return_aux=True,
+        return_aux_details=True,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 10:] = False
+
+    with torch.no_grad():
+        weights_without_aux = model(x, mask, return_aux=False)
+        weights_with_aux, _, aux = model(x, mask, return_aux=True)
+        default_output = model(x, mask)
+
+    assert aux["token_embedding"].shape == (2, 1, 13, 24)
+    assert torch.allclose(weights_without_aux, weights_with_aux, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(
+        weights_without_aux,
+        default_output["weights"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_market_token_fast_path_matches_generic_branch() -> None:

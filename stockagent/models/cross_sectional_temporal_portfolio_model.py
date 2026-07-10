@@ -49,9 +49,6 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         stock_embedding_dim: int,
         stock_hidden_dim: int,
         stock_n_blocks: int,
-        temporal_hidden_dim: int,
-        temporal_blocks: int,
-        temporal_kernel_size: int,
         cross_hidden_dim: int,
         cross_heads: int,
         cross_layers: int,
@@ -65,9 +62,6 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         portfolio_top_k: int = 10,
     ) -> None:
         super().__init__()
-        _ = temporal_hidden_dim
-        _ = temporal_blocks
-        _ = temporal_kernel_size
 
         self.lookback = int(lookback)
         self.num_features = int(num_features)

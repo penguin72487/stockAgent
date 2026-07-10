@@ -19,12 +19,6 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
-from stockagent.backtest.simulator import (
-    _asset_log_returns_to_simple_torch,
-    _portfolio_simple_returns_to_log_torch,
-    _prepare_scan_inputs,
-    _resolve_exposure_budget,
-)
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -35,6 +29,7 @@ from stockagent.training.trainer import (
     _align_panel_to_state_dict_universe,
     _autocast_context,
     _call_model,
+    _checkpoint_manifest,
     _compute_metrics_from_tensors,
     _configure_backtest_runtime_from_config,
     _extract_weights_and_aux,
@@ -44,6 +39,8 @@ from stockagent.training.trainer import (
     _resolve_device,
     _resolve_inference_backtest_chunk_rows,
     _resolve_inference_model_chunk_rows,
+    _volume_limit_weights_from_notional,
+    _validate_checkpoint_manifest,
 )
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -179,6 +176,10 @@ def _collect_raw_scores(
     tradable_chunks: list[torch.Tensor] = []
     can_buy_chunks: list[torch.Tensor] = []
     can_sell_chunks: list[torch.Tensor] = []
+    can_short_open_chunks: list[torch.Tensor] = []
+    force_short_cover_chunks: list[torch.Tensor] = []
+    force_exit_chunks: list[torch.Tensor] = []
+    volume_notional_chunks: list[torch.Tensor] = []
     benchmark_chunks: list[torch.Tensor] = []
 
     with torch.inference_mode():
@@ -193,6 +194,10 @@ def _collect_raw_scores(
             tradable_chunks.append(batch["tradable_mask"].detach().to(device=device, dtype=torch.bool))
             can_buy_chunks.append(batch["can_buy_mask"].detach().to(device=device, dtype=torch.bool))
             can_sell_chunks.append(batch["can_sell_mask"].detach().to(device=device, dtype=torch.bool))
+            can_short_open_chunks.append(batch["can_short_open_mask"].detach().to(device=device, dtype=torch.bool))
+            force_short_cover_chunks.append(batch["force_short_cover_mask"].detach().to(device=device, dtype=torch.bool))
+            force_exit_chunks.append(batch["force_exit_mask"].detach().to(device=device, dtype=torch.bool))
+            volume_notional_chunks.append(batch["volume_notional"].detach().to(device=device, dtype=torch.float32))
             benchmark_chunks.append(batch["benchmark"].detach().to(device=device, dtype=torch.float32))
 
     if device.type == "cuda":
@@ -204,6 +209,10 @@ def _collect_raw_scores(
         "tradable_mask": torch.cat(tradable_chunks, dim=0).contiguous(),
         "can_buy_mask": torch.cat(can_buy_chunks, dim=0).contiguous(),
         "can_sell_mask": torch.cat(can_sell_chunks, dim=0).contiguous(),
+        "can_short_open_mask": torch.cat(can_short_open_chunks, dim=0).contiguous(),
+        "force_short_cover_mask": torch.cat(force_short_cover_chunks, dim=0).contiguous(),
+        "force_exit_mask": torch.cat(force_exit_chunks, dim=0).contiguous(),
+        "volume_notional": torch.cat(volume_notional_chunks, dim=0).contiguous(),
         "benchmark": torch.cat(benchmark_chunks, dim=0).contiguous(),
     }
 
@@ -255,6 +264,10 @@ def _collect_trained_and_raw_scores(
     tradable_chunks: list[torch.Tensor] = []
     can_buy_chunks: list[torch.Tensor] = []
     can_sell_chunks: list[torch.Tensor] = []
+    can_short_open_chunks: list[torch.Tensor] = []
+    force_short_cover_chunks: list[torch.Tensor] = []
+    force_exit_chunks: list[torch.Tensor] = []
+    volume_notional_chunks: list[torch.Tensor] = []
     benchmark_chunks: list[torch.Tensor] = []
 
     with torch.inference_mode():
@@ -276,6 +289,10 @@ def _collect_trained_and_raw_scores(
             tradable_chunks.append(batch["tradable_mask"].detach().to(device=device, dtype=torch.bool))
             can_buy_chunks.append(batch["can_buy_mask"].detach().to(device=device, dtype=torch.bool))
             can_sell_chunks.append(batch["can_sell_mask"].detach().to(device=device, dtype=torch.bool))
+            can_short_open_chunks.append(batch["can_short_open_mask"].detach().to(device=device, dtype=torch.bool))
+            force_short_cover_chunks.append(batch["force_short_cover_mask"].detach().to(device=device, dtype=torch.bool))
+            force_exit_chunks.append(batch["force_exit_mask"].detach().to(device=device, dtype=torch.bool))
+            volume_notional_chunks.append(batch["volume_notional"].detach().to(device=device, dtype=torch.float32))
             benchmark_chunks.append(batch["benchmark"].detach().to(device=device, dtype=torch.float32))
 
     if device.type == "cuda":
@@ -286,6 +303,10 @@ def _collect_trained_and_raw_scores(
         "tradable_mask": torch.cat(tradable_chunks, dim=0).contiguous(),
         "can_buy_mask": torch.cat(can_buy_chunks, dim=0).contiguous(),
         "can_sell_mask": torch.cat(can_sell_chunks, dim=0).contiguous(),
+        "can_short_open_mask": torch.cat(can_short_open_chunks, dim=0).contiguous(),
+        "force_short_cover_mask": torch.cat(force_short_cover_chunks, dim=0).contiguous(),
+        "force_exit_mask": torch.cat(force_exit_chunks, dim=0).contiguous(),
+        "volume_notional": torch.cat(volume_notional_chunks, dim=0).contiguous(),
         "benchmark": torch.cat(benchmark_chunks, dim=0).contiguous(),
     }
     trained = {"scores": torch.cat(trained_chunks, dim=0).contiguous(), **shared}
@@ -324,6 +345,17 @@ def _run_single_backtest(
     scan_chunk_size: int | None,
     return_weights_history: bool = False,
 ) -> Any:
+    max_volume_participation = float(getattr(config.trading, "max_volume_participation", 0.0))
+    volume_participation_equity = float(
+        getattr(config.trading, "volume_participation_equity", 1_000_000.0)
+    )
+    volume_limit_weights = _volume_limit_weights_from_notional(
+        buffers.get("volume_notional"),
+        max_volume_participation=max_volume_participation,
+        volume_participation_equity=volume_participation_equity,
+        device=buffers["scores"].device,
+        dtype=buffers["scores"].dtype,
+    )
     return run_backtest_torch(
         buffers["scores"],
         buffers["future_returns"],
@@ -338,18 +370,13 @@ def _run_single_backtest(
         portfolio_activation=activation,
         can_buy_mask=buffers["can_buy_mask"],
         can_sell_mask=buffers["can_sell_mask"],
+        can_short_open_mask=buffers.get("can_short_open_mask", buffers["can_sell_mask"]),
+        force_short_cover_mask=buffers.get("force_short_cover_mask"),
+        force_exit_mask=buffers.get("force_exit_mask"),
+        volume_limit_weights=volume_limit_weights,
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
     )
-
-
-def _effective_turnover_cap(*, max_turnover_ratio: float, gross_leverage: float) -> float:
-    gross_budget = _resolve_exposure_budget(gross_leverage)
-    value = float(max_turnover_ratio)
-    max_possible_turnover = 2.0 * gross_budget
-    if value >= max_possible_turnover:
-        return 0.0
-    return max(0.0, value)
 
 
 def _run_row_backtest(
@@ -404,158 +431,43 @@ def _batched_backtest_candidates(
     candidates: list[dict[str, Any]],
     scan_chunk_size: int | None,
 ) -> tuple[list[dict[str, Any]], float]:
+    """Evaluate a presentation batch by repeatedly calling the canonical backtest."""
     if not candidates:
         return [], 0.0
 
-    scores = buffers["scores"]
-    future_returns = buffers["future_returns"]
-    tradable_mask = buffers["tradable_mask"]
-    can_buy_mask = buffers["can_buy_mask"]
-    can_sell_mask = buffers["can_sell_mask"]
-    benchmark = buffers["benchmark"]
-    device = scores.device
-    dtype = scores.dtype
-    long_only = bool(config.trading.long_only)
-    gross_leverage = 1.0
-    gross_budget = _resolve_exposure_budget(gross_leverage)
-    max_turnover_ratio = _effective_turnover_cap(
-        max_turnover_ratio=float(config.trading.max_turnover_ratio),
-        gross_leverage=gross_leverage,
-    )
-    chunk_size = max(1, int(scan_chunk_size or 256))
-
     started = time.perf_counter()
-    prepared_weights: list[torch.Tensor] = []
-    prepped_tradable: torch.Tensor | None = None
-    prepped_buy: torch.Tensor | None = None
-    prepped_sell: torch.Tensor | None = None
-
-    with torch.inference_mode():
-        for row in candidates:
-            weights, tradable, buy_mask, sell_mask = _prepare_scan_inputs(
-                scores,
-                tradable_mask,
-                can_buy_mask,
-                can_sell_mask,
-                long_only,
-                gross_leverage,
-                float(row["min_trade_weight"]),
-                str(row["activation"]),
-            )
-            prepared_weights.append(weights)
-            prepped_tradable = tradable
-            prepped_buy = buy_mask
-            prepped_sell = sell_mask
-
-        if prepped_tradable is None or prepped_buy is None or prepped_sell is None:
-            return [], 0.0
-
-        target_weights = torch.stack(prepared_weights, dim=0).contiguous()
-        candidate_count, t_len, n_symbols = target_weights.shape
-        returns_t = _asset_log_returns_to_simple_torch(
-            future_returns,
-            device=device,
-            dtype=dtype,
-        )
-        strategy_returns = torch.empty((candidate_count, t_len), device=device, dtype=dtype)
-        turnovers = torch.empty((candidate_count, t_len), device=device, dtype=dtype)
-        prev = torch.zeros((candidate_count, n_symbols), device=device, dtype=dtype)
-        cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
-        gross_cap = torch.as_tensor(gross_budget, device=device, dtype=dtype)
-        one = torch.ones((), device=device, dtype=dtype)
-
-        diag_positions = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
-        diag_gross = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
-        diag_long_gross = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
-        diag_short_gross = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
-        diag_max_abs = torch.zeros((candidate_count,), device=device, dtype=torch.float64)
-
-        for start in range(0, t_len, chunk_size):
-            end = min(start + chunk_size, t_len)
-            target_chunk = target_weights[:, start:end, :]
-            tradable_chunk = prepped_tradable[start:end]
-            buy_chunk = prepped_buy[start:end]
-            sell_chunk = prepped_sell[start:end]
-
-            for offset in range(end - start):
-                idx = start + offset
-                target_t = torch.where(tradable_chunk[offset].unsqueeze(0), target_chunk[:, offset, :], prev)
-                delta = target_t - prev
-                buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype).unsqueeze(0)
-                sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype).unsqueeze(0)
-                if long_only:
-                    base_after_sells = prev + sell_delta
-                    buy_sum = buy_delta.sum(dim=1, keepdim=True)
-                    buy_capacity = (one - base_after_sells.sum(dim=1, keepdim=True)).clamp_min(0.0)
-                    buy_scale = torch.minimum(torch.ones_like(buy_sum), buy_capacity / buy_sum.clamp_min(1e-12))
-                    delta = sell_delta + buy_delta * buy_scale
-                else:
-                    delta = sell_delta + buy_delta
-
-                next_weights = prev + delta
-                if max_turnover_ratio > 0.0:
-                    turnover_raw = delta.abs().sum(dim=1, keepdim=True)
-                    turnover_scale = torch.minimum(
-                        torch.ones_like(turnover_raw),
-                        cap / turnover_raw.clamp_min(1e-12),
-                    )
-                    next_weights = prev + delta * turnover_scale
-                    delta = next_weights - prev
-
-                if not long_only:
-                    gross_next = next_weights.abs().sum(dim=1, keepdim=True)
-                    gross_scale = torch.minimum(
-                        torch.ones_like(gross_next),
-                        gross_cap / gross_next.clamp_min(1e-12),
-                    )
-                    next_weights = next_weights * gross_scale
-                    delta = next_weights - prev
-
-                buy_turnover = delta.clamp_min(0.0).sum(dim=1)
-                sell_turnover = (-delta).clamp_min(0.0).sum(dim=1)
-                turnover = buy_turnover + sell_turnover
-                gross_return = (next_weights * returns_t[idx].unsqueeze(0)).sum(dim=1)
-                net_simple_return = (
-                    gross_return
-                    - float(config.trading.buy_fee_rate) * buy_turnover
-                    - float(config.trading.sell_fee_rate) * sell_turnover
-                )
-                strategy_returns[:, idx] = _portfolio_simple_returns_to_log_torch(net_simple_return)
-                turnovers[:, idx] = turnover
-
-                abs_weights = next_weights.abs().to(torch.float64)
-                diag_positions += (abs_weights > 0.0).sum(dim=1).to(torch.float64)
-                diag_gross += abs_weights.sum(dim=1)
-                diag_long_gross += next_weights.clamp_min(0.0).to(torch.float64).sum(dim=1)
-                diag_short_gross += (-next_weights.clamp_max(0.0)).to(torch.float64).sum(dim=1)
-                diag_max_abs += abs_weights.max(dim=1).values
-                prev = next_weights
-
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elapsed_s = time.perf_counter() - started
-
-    denom = float(max(1, int(t_len)))
     rows: list[dict[str, Any]] = []
-    for idx, row in enumerate(candidates):
-        metrics = _compute_metrics_from_tensors(strategy_returns[idx], benchmark, turnovers[idx])
-        diagnostics = {
-            "avg_positions": float((diag_positions[idx] / denom).detach().cpu().item()),
-            "avg_gross": float((diag_gross[idx] / denom).detach().cpu().item()),
-            "avg_long_gross": float((diag_long_gross[idx] / denom).detach().cpu().item()),
-            "avg_short_gross": float((diag_short_gross[idx] / denom).detach().cpu().item()),
-            "avg_max_abs_weight": float((diag_max_abs[idx] / denom).detach().cpu().item()),
-        }
+    for row in candidates:
+        candidate_started = time.perf_counter()
+        backtest = _run_single_backtest(
+            buffers=buffers,
+            config=config,
+            activation=str(row["activation"]),
+            threshold=float(row["min_trade_weight"]),
+            scan_chunk_size=scan_chunk_size,
+            return_weights_history=True,
+        )
+        if buffers["scores"].device.type == "cuda":
+            torch.cuda.synchronize(buffers["scores"].device)
+        candidate_elapsed_s = time.perf_counter() - candidate_started
+        metrics = _compute_metrics_from_tensors(
+            backtest.strategy_returns,
+            backtest.benchmark_returns,
+            backtest.turnovers,
+        )
         rows.append(
             {
                 **row,
-                "elapsed_s": float(elapsed_s / max(1, len(candidates))),
-                "batch_elapsed_s": float(elapsed_s),
+                "elapsed_s": float(candidate_elapsed_s),
                 "sweep_batch_size": int(len(candidates)),
                 **metrics,
-                **diagnostics,
+                **_weight_diagnostics(backtest.weights_history),
             }
         )
+
+    elapsed_s = time.perf_counter() - started
+    for row in rows:
+        row["batch_elapsed_s"] = float(elapsed_s)
     return rows, elapsed_s
 
 
@@ -1064,7 +976,6 @@ def main() -> None:
 
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
@@ -1074,9 +985,14 @@ def main() -> None:
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
         external_feature_path=(
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
     )
@@ -1095,6 +1011,13 @@ def main() -> None:
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint has no model_state_dict: {checkpoint_path}")
     panel = _align_panel_to_state_dict_universe(panel, fold_dir, state_dict, context=f"postprocess benchmark fold {args.fold}")
+    _validate_checkpoint_manifest(
+        checkpoint,
+        _checkpoint_manifest(panel, config, include_data_content=False),
+        checkpoint_path=checkpoint_path,
+        scope="model",
+        expected_fold=fold,
+    )
 
     indices = _select_fold_indices(fold, args.split)
     dataset = CrossSectionalDataset(panel, indices, config.training.lookback)
@@ -1110,6 +1033,7 @@ def main() -> None:
             can_sell_mask=split.can_sell_mask,
             can_short_open_mask=split.can_short_open_mask,
             force_short_cover_mask=split.force_short_cover_mask,
+            force_exit_mask=split.force_exit_mask,
             benchmark=split.benchmark,
             lookback=split.lookback,
             sample_mask=None if split.sample_mask is None else split.sample_mask[:max_rows],
