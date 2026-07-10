@@ -920,12 +920,13 @@ def main() -> None:
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
-    folds = build_expanding_year_folds(
+    all_folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
+    folds = list(all_folds)
     if start_fold is not None:
         if start_fold < 1:
             raise ValueError(f"start_fold must be >= 1, got {start_fold}")
@@ -945,12 +946,32 @@ def main() -> None:
         folds = folds[: int(args.max_folds)]
         print(f"[runner] max_folds={args.max_folds}: selected {len(folds)}/{original_count} folds")
     if mode == "infer":
-        results = run_inference(panel, folds, config, output_dir)
+        results = run_inference(
+            panel,
+            folds,
+            config,
+            output_dir,
+            deployment_folds=all_folds,
+        )
     else:
-        results = run_training(panel, folds, config, output_dir, resume=resume, profile_timing=args.profile_timing)
+        results = run_training(
+            panel,
+            folds,
+            config,
+            output_dir,
+            resume=resume,
+            profile_timing=args.profile_timing,
+            deployment_folds=all_folds,
+        )
         if post_train_infer:
             print("[post-train] running inference+plot pass on saved models...")
-            results = run_inference(panel, folds, config, output_dir)
+            results = run_inference(
+                panel,
+                folds,
+                config,
+                output_dir,
+                deployment_folds=all_folds,
+            )
 
     dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
     is_rank0 = (not dist_ready) or int(torch.distributed.get_rank()) == 0
