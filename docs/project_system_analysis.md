@@ -112,7 +112,10 @@ WindowedSplitTensors.batch_by_rows
 
 重點:
 
-- `materialize_window_tensors: false` 應該是長 lookback 預設。
+- Neural executor 固定從 lazy `WindowedSplitTensors` 開始；舊的
+  `materialize_window_tensors` 選項與整個 split 的 materialized executor 已移除。
+- 連續 batch 優先走 compile-friendly panel slab；無法滿足 slab 合約時才在該
+  batch 做 guarded window gather，不會常駐 `[rows, lookback, symbols, features]`。
 - `cache_train_tensors_on_gpu` / `cache_eval_tensors_on_gpu` 只 cache base tensors，
   不 cache 展開 windows。
 - portfolio state 跨 batch/chunk 用 detached GPU clone，不搬 CPU。
@@ -327,8 +330,6 @@ UMAP candidates:
 - `market_tokens`
 - `dynamic_latent_queries`
 - `dynamic_market_queries`
-- `dynamic_latent_delta`
-- `dynamic_market_delta`
 - `z_factor_context`
 - `z_market_context`
 - `token_embedding`
@@ -347,15 +348,14 @@ UMAP 解讀:
 
 ```yaml
 training:
-  materialize_window_tensors: false
   model_name: transformer_base_portfolio
   lookback: 32
   plot_backend: auto
   explain_umap_enabled: true
   transformer_base_portfolio:
-    attention_mode: latent   # or market_token for tighter VRAM
+    attention_mode: market_token
     use_flash_attention: true
-    sdpa_batch_limit: 4096
+    sdpa_batch_limit: 16384
     return_aux_details: false
 ```
 

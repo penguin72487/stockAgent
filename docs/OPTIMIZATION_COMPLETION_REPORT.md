@@ -283,7 +283,7 @@ Model Params        1.44M   30K      count_parameters()
 ### 文件位置
 
 ```
-/root/stockAgent/
+<repo-root>/
 ├── OPTIMIZATION_INDEX.md           ← 📍 開始這裡
 ├── OPTIMIZATION_SUMMARY.md         ← 執行摘要
 ├── OPTIMIZATION_ANALYSIS.md        ← 詳細分析

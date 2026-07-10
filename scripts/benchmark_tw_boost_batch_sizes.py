@@ -13,7 +13,7 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYTHON = Path("/home/user/miniforge3/envs/fintech/bin/python")
+PYTHON = Path(sys.executable).resolve()
 
 
 def _parse_ints(value: str) -> list[int]:
@@ -89,7 +89,6 @@ def main() -> None:
         cfg["runner"]["resume"] = False
         cfg["runner"]["start_fold"] = int(args.start_fold)
         training = cfg["training"]
-        training["batch_size"] = int(batch_size)
         training["batch_size_train"] = int(batch_size)
         training["batch_size_eval"] = int(batch_size)
         training["auto_batch_size"] = False

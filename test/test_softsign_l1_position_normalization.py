@@ -14,6 +14,7 @@ from stockagent.models.normalization import (
     masked_tanh_l1_weights,
     normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode, normalize_portfolio_output_mode
 
 
 def test_masked_softsign_l1_long_short_weights_use_softsign_direction_and_l1_norm() -> None:
@@ -208,12 +209,13 @@ def test_portfolio_activation_formulas_match_supported_switches() -> None:
             assert bool((actual.abs() <= 1.0).all().item())
 
 
-def test_identity_activation_keeps_large_finite_scores_unclipped() -> None:
+def test_identity_activation_keeps_finite_scores_and_uses_dtype_bounds_for_infinities() -> None:
     x = torch.tensor([[200.0, -50.0, float("nan"), float("inf"), float("-inf")]], dtype=torch.float32)
 
     actual = apply_portfolio_activation(x, "identity")
 
-    expected = torch.tensor([[200.0, -50.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    finfo = torch.finfo(torch.float32)
+    expected = torch.tensor([[200.0, -50.0, 0.0, finfo.max, finfo.min]], dtype=torch.float32)
     assert torch.allclose(actual, expected)
 
 
@@ -224,6 +226,14 @@ def test_portfolio_activation_aliases_normalize() -> None:
     assert normalize_portfolio_activation("none") == "identity"
     assert normalize_portfolio_activation("preserve_weights") == "pre_normalized"
     assert normalize_portfolio_activation(None) == "identity"
+
+
+def test_portfolio_mode_contract_normalizes_shared_aliases() -> None:
+    assert normalize_portfolio_mode("long") == "long_only"
+    assert normalize_portfolio_mode("long-and-short") == "long_short"
+    assert normalize_portfolio_output_mode("raw_scores") == "logits"
+    assert normalize_portfolio_output_mode("differentiable_projection") == "projection_l1"
+    assert normalize_portfolio_output_mode("signed_action_entmax15") == "signed_entmax15"
 
 
 def test_tensor_backtest_portfolio_activation_switch_changes_target_normalizer() -> None:

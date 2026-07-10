@@ -476,6 +476,14 @@ def _make_batch(args: argparse.Namespace, device: torch.device) -> dict[str, tor
     benchmark = benchmark / tradable_mask.sum(dim=1).clamp_min(1).to(dtype=future_log_returns.dtype)
     can_buy_mask = tradable_mask.clone()
     can_sell_mask = tradable_mask.clone()
+    can_short_open_mask = can_sell_mask.clone()
+    if symbols >= 2:
+        can_short_open_mask[:, -1] = False
+    force_short_cover_mask = torch.zeros_like(tradable_mask)
+    if batch >= 2 and symbols >= 2:
+        force_short_cover_mask[batch // 2, 1] = True
+    force_exit_mask = torch.zeros_like(tradable_mask)
+    volume_limit_weights = torch.full((batch, symbols), 0.20, dtype=torch.float32)
     sample_mask = torch.ones(batch, dtype=torch.bool)
     return {
         "x": x.to(device),
@@ -484,6 +492,10 @@ def _make_batch(args: argparse.Namespace, device: torch.device) -> dict[str, tor
         "benchmark": benchmark.to(device),
         "can_buy_mask": can_buy_mask.to(device),
         "can_sell_mask": can_sell_mask.to(device),
+        "can_short_open_mask": can_short_open_mask.to(device),
+        "force_short_cover_mask": force_short_cover_mask.to(device),
+        "force_exit_mask": force_exit_mask.to(device),
+        "volume_limit_weights": volume_limit_weights.to(device),
         "sample_mask": sample_mask.to(device),
     }
 
@@ -540,6 +552,10 @@ def _forward_loss(
             benchmark_returns=batch["benchmark"],
             can_buy_mask=batch["can_buy_mask"],
             can_sell_mask=batch["can_sell_mask"],
+            can_short_open_mask=batch["can_short_open_mask"],
+            force_short_cover_mask=batch["force_short_cover_mask"],
+            force_exit_mask=batch["force_exit_mask"],
+            volume_limit_weights=batch["volume_limit_weights"],
             sample_mask=batch["sample_mask"],
             aux_outputs=aux_outputs,
             **_loss_kwargs(),
@@ -593,7 +609,7 @@ def _run_supported_mode(
                 batch=batch,
                 device=device,
                 plan=plan,
-                initial_weights=None,
+                initial_weights=torch.zeros(int(args.symbols), device=device, dtype=torch.float32),
             )
             initial_loss = float(initial_loss_t.detach().float().cpu().item())
             initial_finite = bool(torch.isfinite(initial_loss_t.detach()).item())
@@ -611,7 +627,11 @@ def _run_supported_mode(
         timed_steps = int(args.steps)
         warmup = int(args.warmup)
         total_steps = warmup + timed_steps
-        previous_weights: torch.Tensor | None = None
+        previous_weights: torch.Tensor | None = torch.zeros(
+            int(args.symbols),
+            device=device,
+            dtype=torch.float32,
+        )
         final_loss = float("nan")
         started = None
         for step in range(total_steps):

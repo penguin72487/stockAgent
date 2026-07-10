@@ -3,7 +3,8 @@
 Run the bot from the repository root:
 
 ```bash
-/home/user/miniforge3/envs/fintech/bin/python services/discord_bot/bot.py
+source scripts/runtime_env.sh
+run_fintech_python services/discord_bot/bot.py
 ```
 
 The entrypoint runs with a built-in reload supervisor by default. It watches

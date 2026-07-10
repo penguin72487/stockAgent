@@ -12,6 +12,7 @@ from stockagent.models.normalization import (
     masked_softmax,
     normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode
 
 
 class CausalDepthwiseSeparableTCNBlock(nn.Module):
@@ -277,7 +278,7 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         self.temporal_enabled = bool(temporal_enabled)
         self.set_enabled = bool(set_enabled)
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.return_aux = bool(return_aux)
         self.runtime_shape_check = bool(runtime_shape_check)
@@ -336,18 +337,6 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
             in_dim = int(head_hidden_dim)
         head.append(nn.Linear(in_dim, 1))
         self.score_head = nn.Sequential(*head)
-
-    @staticmethod
-    def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-        normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-        if normalized in {"long", "long_only", "longonly"}:
-            return "long_only"
-        if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-            return "long_short"
-        raise ValueError(
-            "EfficientTCNTabularSetPortfolioModel portfolio_mode must be "
-            "'long_only' or 'long_short'"
-        )
 
     def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:
         if x.dim() != 4:

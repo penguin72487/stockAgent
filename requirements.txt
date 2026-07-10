@@ -10,3 +10,4 @@ flash-attn>=2.5
 xformers>=0.0.24
 lightgbm>=4.3
 xgboost>=2.0
+beautifulsoup4>=4.12

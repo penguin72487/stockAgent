@@ -21,11 +21,21 @@ from stockagent.models.factory import build_model
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import (
+    _PanelSlabForwardWrapper,
     _autocast_context,
     _can_enable_torch_compile,
+    _call_model,
+    _configure_backtest_runtime_from_config,
     _detach_portfolio_state,
     _extract_weights_and_aux,
+    _is_log_utility_objective,
+    _model_supports_panel_slab_forward,
+    _normalize_risk_objective,
+    _pad_windowed_training_split,
     _resolve_amp_dtype,
+    _training_loss_portfolio_activation,
+    _training_needs_aux,
+    _volume_limit_weights_from_notional,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -54,6 +64,8 @@ def _loss_kwargs(config) -> dict:
         "sell_fee_rate": float(config.trading.sell_fee_rate),
         "max_turnover_ratio": float(config.trading.max_turnover_ratio),
         "gross_leverage": 1.0,
+        "min_trade_weight": float(config.trading.min_trade_weight),
+        "portfolio_activation": _training_loss_portfolio_activation(config),
         "gamma_sharpe": float(config.evaluation.gamma_sharpe),
         "gamma_excess": float(config.evaluation.gamma_excess),
         "gamma_cvar": float(config.evaluation.gamma_cvar),
@@ -71,6 +83,7 @@ def _loss_kwargs(config) -> dict:
         "gamma_turnover_budget": float(config.evaluation.gamma_turnover_budget),
         "objective": str(config.training.loss_type),
         "rank_ic_weight": float(config.training.multitask_loss.rank_ic_weight),
+        "return_rank_ic_weight": float(config.training.multitask_loss.return_rank_ic_weight),
         "direction_weight": float(config.training.multitask_loss.direction_weight),
         "volatility_regime_weight": float(config.training.multitask_loss.volatility_regime_weight),
         "concentration_weight": float(config.training.multitask_loss.concentration_weight),
@@ -102,9 +115,20 @@ def _run_case(
         config.training.transformer_base_portfolio.temporal_pooling = temporal_pooling
 
     dataset = CrossSectionalDataset(panel, fold.train_indices, int(lookback))
-    rows = len(dataset)
-    batch_size = max(1, min(int(batch_size), rows))
-    split = dataset_to_windowed_tensors(dataset)
+    real_rows = len(dataset)
+    batch_size = max(1, min(int(batch_size), real_rows))
+    objective = _normalize_risk_objective(config.training.loss_type)
+    if _training_needs_aux(
+        objective,
+        direction_weight=float(config.training.multitask_loss.direction_weight),
+        volatility_regime_weight=float(config.training.multitask_loss.volatility_regime_weight),
+    ):
+        raise ValueError(
+            "benchmark_transformer_hotpath measures the production no-aux panel-slab executor; "
+            f"objective={objective!r} requires the research aux path"
+        )
+    split = _pad_windowed_training_split(dataset_to_windowed_tensors(dataset), batch_size)
+    rows = len(split)
     if cache_on_device and device.type != "cpu":
         split = split.to_device_cache(device)
 
@@ -119,24 +143,39 @@ def _run_case(
         can_compile, reason = _can_enable_torch_compile(device)
         if not can_compile:
             raise RuntimeError(f"torch.compile requested but unavailable: {reason}")
+    forward_model: torch.nn.Module = model
+    use_panel_slab = _model_supports_panel_slab_forward(model)
+    if use_panel_slab:
+        forward_model = _PanelSlabForwardWrapper(model)
     if compile_model:
-        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        forward_model = torch.compile(
+            forward_model,
+            fullgraph=True,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config.training.learning_rate),
         weight_decay=float(config.training.weight_decay),
     )
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    _configure_backtest_runtime_from_config(config)
     loss_fn = partial(risk_aware_loss, **_loss_kwargs(config))
     if compile_loss:
-        loss_fn = torch.compile(loss_fn, dynamic=False, options={"triton.cudagraphs": False})
+        loss_fn = torch.compile(
+            loss_fn,
+            fullgraph=_is_log_utility_objective(objective),
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    total_batches = max(1, (rows + batch_size - 1) // batch_size)
+    total_batches = max(1, rows // batch_size)
     total_steps = int(warmup) + int(batches)
-    portfolio_prev_weights: torch.Tensor | None = None
+    portfolio_prev_weights = torch.zeros(panel.num_symbols, device=device, dtype=torch.float32)
     last_loss = float("nan")
 
     _sync(device)
@@ -149,12 +188,35 @@ def _run_case(
                 torch.cuda.reset_peak_memory_stats(device)
         batch_idx = step % total_batches
         start = batch_idx * batch_size
-        end = min(start + batch_size, rows)
-        batch = split.batch_by_rows(start, end, device=device, non_blocking=(device.type == "cuda"))
+        end = start + batch_size
+        if use_panel_slab:
+            batch = split.panel_slab_batch_by_rows(
+                start,
+                end,
+                device=device,
+                non_blocking=(device.type == "cuda"),
+            )
+            if batch is None:
+                raise RuntimeError(f"production panel-slab batch unavailable for rows=[{start},{end})")
+        else:
+            batch = split.batch_by_rows(start, end, device=device, non_blocking=(device.type == "cuda"))
 
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
-            model_output = model(batch["x"], batch["tradable_mask"])
+            if use_panel_slab:
+                model_output = forward_model(
+                    batch["feature_slab"],
+                    batch["tradable_mask"],
+                    batch.get("symbol_indices"),
+                )
+            else:
+                model_output = _call_model(
+                    forward_model,
+                    batch["x"],
+                    batch["tradable_mask"],
+                    return_aux=False,
+                    symbol_indices=batch.get("symbol_indices"),
+                )
             weights, aux_outputs = _extract_weights_and_aux(model_output)
             aux_outputs = dict(aux_outputs or {})
             aux_outputs["initial_weights"] = portfolio_prev_weights
@@ -165,6 +227,16 @@ def _run_case(
                 benchmark_returns=batch["benchmark"],
                 can_buy_mask=batch["can_buy_mask"],
                 can_sell_mask=batch["can_sell_mask"],
+                can_short_open_mask=batch["can_short_open_mask"],
+                force_short_cover_mask=batch["force_short_cover_mask"],
+                force_exit_mask=batch["force_exit_mask"],
+                volume_limit_weights=_volume_limit_weights_from_notional(
+                    batch.get("volume_notional"),
+                    max_volume_participation=float(config.trading.max_volume_participation),
+                    volume_participation_equity=float(config.trading.volume_participation_equity),
+                    device=device,
+                    dtype=weights.dtype,
+                ),
                 sample_mask=batch["sample_mask"],
                 aux_outputs=aux_outputs,
             )
@@ -180,7 +252,8 @@ def _run_case(
     return {
         "fold_id": int(fold.fold_id),
         "lookback": int(lookback),
-        "rows": int(rows),
+        "rows": int(real_rows),
+        "padded_rows": int(rows),
         "symbols": int(panel.num_symbols),
         "features": int(len(panel.feature_names)),
         "batch_size": int(batch_size),
@@ -223,7 +296,6 @@ def main() -> None:
 
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
@@ -233,9 +305,14 @@ def main() -> None:
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
         external_feature_path=(
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
     )

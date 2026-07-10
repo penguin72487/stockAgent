@@ -224,6 +224,6 @@ if __name__ == "__main__":
     test_dynamic_symbols_attention_pooling_and_token_counts()
     test_conv_temporal_dilations_support_lookback32()
     test_default_can_opt_into_detailed_aux()
-    test_long_only_and_empty_mask_rows_are_safe()
+    test_long_only_rejects_empty_mask_rows()
     test_factory_builds_low_rank_market_transformer_model()
     print("SUCCESS")

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import polars as pl
+import pytest
 
-from stockagent.data.panel import build_panel
+import stockagent.data.panel as panel_module
+from stockagent.data.panel import build_panel, build_tail_panel
 from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
     FEATURE_COLUMNS,
@@ -91,6 +94,7 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     assert "9999" not in set(out["symbol"].to_list())
     assert set(FEATURE_COLUMNS).issubset(set(out.columns))
     assert set(RULE_COLUMNS).issubset(set(out.columns))
+    assert "_twpub_force_cover_delisting_ordinal" not in out.columns
     stock = out.filter(pl.col("symbol") == "2330").row(0, named=True)
     assert stock["twpub_pe_log"] is not None
     assert stock["twpub_margin_balance_log"] is not None
@@ -198,3 +202,808 @@ def test_external_tpex_limit_rule_columns_update_masks_without_becoming_features
     assert bool(panel.can_sell_mask[date_0103, symbol_idx]) is True
     assert bool(panel.can_buy_mask[date_0104, symbol_idx]) is True
     assert bool(panel.can_sell_mask[date_0104, symbol_idx]) is False
+
+
+def test_external_rules_can_be_enabled_without_appending_model_features(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-03"],
+            "symbol": ["2330"],
+            "twpub_pe_log": [3.0],
+            "_twpub_short_open_ban": [1.0],
+        }
+    ).write_parquet(external_path)
+
+    rule_only = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+    symbol_idx = rule_only.symbols.index("2330")
+    date_idx = int(
+        np.where(
+            rule_only.dates == np.datetime64("2024-01-03T00:00:00.000000000")
+        )[0][0]
+    )
+    assert "twpub_pe_log" not in rule_only.feature_names
+    assert bool(rule_only.can_short_open_mask[date_idx, symbol_idx]) is False
+    assert bool(rule_only.can_sell_mask[date_idx, symbol_idx]) is True
+
+    # The same source path with the opposite switches must not reuse the
+    # rule-only panel cache.
+    feature_only = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=True,
+        external_include_rules=False,
+        external_data_required=True,
+    )
+    assert "twpub_pe_log" in feature_only.feature_names
+    assert bool(feature_only.can_short_open_mask[date_idx, symbol_idx]) is True
+
+    live_tail = build_tail_panel(
+        tmp_path,
+        tail_rows=3,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+    assert "twpub_pe_log" not in live_tail.feature_names
+    assert bool(live_tail.can_short_open_mask[date_idx, symbol_idx]) is False
+
+
+def test_rules_only_external_loader_projects_rule_columns(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-03"],
+            "symbol": ["2330"],
+            "twpub_large_unused_feature": [123.0],
+            "_twpub_short_open_ban": [1.0],
+        }
+    ).write_parquet(external_path)
+    observed_columns: list[list[str] | None] = []
+    original_read_table = panel_module.pq.read_table
+
+    def recording_read_table(path, *args, **kwargs):
+        observed_columns.append(kwargs.get("columns"))
+        return original_read_table(path, *args, **kwargs)
+
+    monkeypatch.setattr(panel_module.pq, "read_table", recording_read_table)
+    loaded = panel_module._load_external_feature_arrays(
+        external_path,
+        include_features=False,
+        include_rules=True,
+    )
+
+    assert observed_columns == [["date", "symbol", "_twpub_short_open_ban"]]
+    assert loaded.feature_names == []
+    assert loaded.rule_names == ["_twpub_short_open_ban"]
+
+
+def test_required_external_rule_source_fails_fast_when_missing(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0])
+    with pytest.raises(FileNotFoundError, match="external_feature_path not found"):
+        build_panel(
+            tmp_path,
+            panel_backend="pyarrow",
+            panel_load_workers=0,
+            external_feature_path=tmp_path / "missing.parquet",
+            external_include_features=False,
+            external_include_rules=True,
+            external_data_required=True,
+        )
+
+
+def test_official_missing_day_inside_listing_lifetime_is_frozen_suspension(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 100.0, 101.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04"],
+            "symbol": ["2330", "2330"],
+            "_twpub_official_traded": [1.0, 1.0],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    suspended_idx = int(np.where(panel.dates == np.datetime64("2024-01-03T00:00:00.000000000"))[0][0])
+    assert bool(panel.tradable_mask[suspended_idx, symbol_idx]) is True
+    assert bool(panel.can_buy_mask[suspended_idx, symbol_idx]) is False
+    assert bool(panel.can_sell_mask[suspended_idx, symbol_idx]) is False
+    assert panel.returns_1d[suspended_idx, symbol_idx] == np.float32(0.0)
+
+
+def test_official_delisting_event_extends_suspension_then_marks_untradable(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 100.0, 100.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04"],
+            "symbol": ["2330", "2330"],
+            "_twpub_official_traded": [1.0, None],
+            "_twpub_delisted": [None, 1.0],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    suspended_idx = int(np.where(panel.dates == np.datetime64("2024-01-03T00:00:00.000000000"))[0][0])
+    delisted_idx = int(np.where(panel.dates == np.datetime64("2024-01-04T00:00:00.000000000"))[0][0])
+    assert bool(panel.tradable_mask[suspended_idx, symbol_idx]) is True
+    assert bool(panel.can_sell_mask[suspended_idx, symbol_idx]) is False
+    assert bool(panel.tradable_mask[delisted_idx, symbol_idx]) is False
+    assert bool(panel.force_exit_mask[suspended_idx, symbol_idx]) is False
+    assert bool(panel.force_exit_mask[delisted_idx, symbol_idx]) is True
+
+
+def test_same_symbol_trading_next_session_is_not_a_terminal_delisting(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2301_features.parquet", [100.0, 101.0, 102.0, 103.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-04"],
+            "symbol": ["2301"],
+            "_twpub_delisted": [1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2301")
+    transition_idx = int(
+        np.where(
+            panel.dates == np.datetime64("2024-01-04T00:00:00.000000000")
+        )[0][0]
+    )
+    next_session_idx = int(
+        np.where(
+            panel.dates == np.datetime64("2024-01-05T00:00:00.000000000")
+        )[0][0]
+    )
+
+    assert bool(panel.force_exit_mask[transition_idx, symbol_idx]) is False
+    assert bool(panel.tradable_mask[transition_idx, symbol_idx]) is True
+    assert bool(panel.tradable_mask[next_session_idx, symbol_idx]) is True
+    assert bool(panel.can_sell_mask[next_session_idx, symbol_idx]) is True
+
+
+def test_sparse_official_traded_snapshots_do_not_imply_a_multi_year_halt(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0] * 10)
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-11"],
+            "symbol": ["2330", "2330"],
+            "_twpub_official_traded": [1.0, 1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    gap_rows = (panel.dates > np.datetime64("2024-01-02")) & (
+        panel.dates < np.datetime64("2024-01-11")
+    )
+
+    assert bool(panel.can_buy_mask[gap_rows, symbol_idx].all()) is True
+    assert bool(panel.can_sell_mask[gap_rows, symbol_idx].all()) is True
+
+
+def test_feature_builder_emits_official_delisting_rule(tmp_path: Path) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "date": ["2024-01-03"],
+            "market": ["twse"],
+            "symbol": ["2330"],
+            "company_name": ["測試"],
+            "delisting_reason": ["測試原因"],
+        }
+    ).write_parquet(tmp_path / "twse_delisted_company.parquet")
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "2330")
+    assert out.filter(pl.col("_twpub_delisted") == 1.0).height == 1
+
+
+def test_feature_builder_does_not_force_exit_same_symbol_tpex_to_twse_transfer(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "4722_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "date": ["2012-08-15"],
+            "market": ["tpex"],
+            "symbol": ["4722"],
+            "company_name": ["國精化學"],
+            "delisting_reason": ["依本中心業務規則第12條之2第1項第1款"],
+        }
+    ).write_parquet(tmp_path / "tpex_delisted_company.parquet")
+    pl.DataFrame(
+        {
+            "Code": ["4722"],
+            "Company": ["國精化"],
+            "ApprovedListingDate": ["1010815"],
+            "Note": ["櫃轉市"],
+        }
+    ).write_parquet(tmp_path / "twse_api_company_newlisting.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "4722")
+
+    assert out.filter(pl.col("_twpub_delisted") == 1.0).is_empty()
+
+
+def test_model_useful_features_use_official_report_date_and_emit_rules(tmp_path: Path) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "出表日期": ["1130215"],
+            "公司代號": ["2330"],
+            "營業收入-當月營收": ["1000000"],
+            "營業收入-上月比較增減(%)": ["10"],
+            "營業收入-去年同月增減(%)": ["20"],
+            "累計營業收入-前期比較增減(%)": ["30"],
+            "date": ["2024-03-01"],
+        }
+    ).write_parquet(tmp_path / "twse_api_opendata_t187ap05_l.parquet")
+    pl.DataFrame(
+        {
+            "Date": ["1130216"],
+            "SecuritiesCompanyCode": ["2330"],
+            "ShortSaleSuspensionStartDate": ["1130219"],
+            "ShortSaleSuspensionEndDate": ["1130220"],
+            "date": ["2024-03-01"],
+        }
+    ).write_parquet(tmp_path / "tpex_api_tpex_margin_trading_term.parquet")
+    pl.DataFrame(
+        {
+            "Code": ["2330"],
+            "TradingHaltDate": ["1130221"],
+            "TradingResumptionDate": ["1130223"],
+            "date": ["2024-03-01"],
+        }
+    ).write_parquet(tmp_path / "twse_api_exchangereport_twtawu.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "2330").sort("date")
+
+    revenue = out.filter(pl.col("twpub_monthly_revenue_log").is_not_null())
+    assert revenue["date"].to_list() == [date(2024, 2, 15)]
+    assert revenue["twpub_monthly_revenue_yoy"].to_list() == [0.2]
+    assert out.filter(pl.col("_twpub_short_open_ban") == 1.0)["date"].to_list() == [
+        date(2024, 2, 19),
+        date(2024, 2, 20),
+    ]
+    assert out.filter(pl.col("_twpub_trading_halt") == 1.0)["date"].to_list() == [
+        date(2024, 2, 21),
+        date(2024, 2, 22),
+    ]
+
+
+def test_upcoming_delisting_announcement_bans_new_shorts_without_post_event_delisted_file(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "announcement_date": ["2024-01-02"],
+            "symbols": ["2330"],
+            "subject": ["公告2330將終止上市"],
+            "body_text": ["應於終止上市前第10個營業日前償還或還券了結"],
+            "short_open_ban_date": [None],
+            "short_cover_deadline": ["2024-01-04"],
+            "delisting_date": ["2024-01-05"],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "2330").sort("date")
+
+    assert out.filter(pl.col("_twpub_short_open_ban") == 1.0)["date"].to_list() == [
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+        date(2024, 1, 5),
+    ]
+    assert out.filter(pl.col("_twpub_force_short_cover") == 1.0)["date"].to_list() == [date(2024, 1, 4)]
+    relative = out.filter(pl.col("_twpub_force_cover_lead_sessions") == 10.0)
+    assert relative["date"].to_list() == [date(2024, 1, 2)]
+    assert relative["_twpub_force_cover_anchor_ordinal"].to_list() == [
+        float(date(2024, 1, 5).toordinal())
+    ]
+    assert out.filter(pl.col("_twpub_delisted").is_not_null()).is_empty()
+
+
+def test_uncancelled_etf_delisting_notice_emits_terminal_rule_without_company_file(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "00925_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "announcement_date": ["2025-04-28"],
+            "symbols": ["00925"],
+            "subject": ["新光標普電動車ETF（00925）受益憑證終止上市"],
+            "body_text": ["自114年6月5日起終止上市並暫停融資融券交易"],
+            "short_open_ban_date": ["2025-04-28"],
+            "short_cover_deadline": [None],
+            "delisting_date": ["2025-06-05"],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "00925")
+
+    assert out.filter(pl.col("_twpub_short_open_ban") == 1.0).height > 0
+    assert out.filter(pl.col("_twpub_delisted") == 1.0)["date"].to_list() == [
+        date(2025, 6, 5)
+    ]
+
+
+def test_article_78_exempt_notice_does_not_infer_short_ban_or_relative_cover(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "4130_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "announcement_date": ["2024-01-02"],
+            "symbols": ["4130"],
+            "subject": ["公告健亞公司（股票代號：4130）終止上櫃"],
+            "body_text": [
+                "依第78條第1項第3款規定，證券商無須通知委託人於股票終止上櫃"
+                "前10個營業日前償還或還券了結"
+            ],
+            "short_open_ban_date": [None],
+            "short_cover_deadline": [None],
+            "short_cover_lead_trading_days": [10],
+            "delisting_date": ["2024-01-05"],
+            "article_78_exempt": [True],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "4130")
+
+    assert out.filter(pl.col("_twpub_short_open_ban").is_not_null()).is_empty()
+    assert out.filter(pl.col("_twpub_force_short_cover").is_not_null()).is_empty()
+    assert out.filter(pl.col("_twpub_force_cover_lead_sessions").is_not_null()).is_empty()
+
+
+def test_historical_short_exemptions_and_cancelled_ban_are_clause_specific(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    for symbol in ("3068", "5349", "5301"):
+        _write_symbol(symbols_root / f"{symbol}_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "announcement_date": [
+                "2018-05-17",
+                "2020-10-15",
+                "2018-05-16",
+                "2018-05-17",
+            ],
+            "symbols": ["3068", "5349", "5301", "5301"],
+            "subject": [
+                "3068普通股自107年6月13日起終止櫃檯買賣",
+                "5349普通股自109年11月4日起終止櫃檯買賣",
+                "5301自107年5月18日起暫停融資融券交易",
+                "5301原公告自107年5月18日起暫停融資融券交易乙案，免予執行",
+            ],
+            "body_text": [
+                "股票於終止櫃檯買賣前，融資融券交易無須提前了結。",
+                (
+                    "融券餘額應於停止過戶第六個營業日前還券了結，"
+                    "融資餘額則無須適用終止上櫃前第十個營業日前償還之規定。"
+                ),
+                "自107年5月18日起停止買賣，並自同日起暫停融資融券交易。",
+                "原停止買賣及暫停融資融券交易原因業已消滅，免予執行。",
+            ],
+            # Include stale cached fields to verify the shared classifier wins.
+            "short_open_ban_date": [None, None, "2018-05-18", "2018-05-18"],
+            "short_cover_deadline": [None, None, None, None],
+            "short_cover_lead_trading_days": [10, None, None, None],
+            "short_cover_anchor_date": [None, "2020-10-31", None, None],
+            "short_cover_anchor_lead_trading_days": [None, 6, None, None],
+            "delisting_date": ["2018-06-13", "2020-11-04", None, None],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path)
+
+    exempt = out.filter(pl.col("symbol") == "3068")
+    assert exempt.filter(pl.col("_twpub_short_open_ban").is_not_null()).is_empty()
+    assert exempt.filter(pl.col("_twpub_force_cover_lead_sessions").is_not_null()).is_empty()
+
+    financing_only = out.filter(pl.col("symbol") == "5349")
+    assert financing_only.filter(pl.col("_twpub_short_open_ban") == 1.0).height > 0
+    stop_transfer_cover = financing_only.filter(
+        pl.col("_twpub_force_cover_lead_sessions") == 6.0
+    )
+    assert stop_transfer_cover["date"].to_list() == [date(2020, 10, 15)]
+    assert stop_transfer_cover["_twpub_force_cover_anchor_ordinal"].to_list() == [
+        float(date(2020, 10, 31).toordinal())
+    ]
+
+    cancelled = out.filter(pl.col("symbol") == "5301")
+    assert cancelled.filter(pl.col("_twpub_short_open_ban").is_not_null()).is_empty()
+
+
+def test_delisting_cancellation_removes_pending_cover_but_preserves_continuing_ban(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "1435_features.parquet", [10.0, 10.0])
+    cancellation_text = (
+        "上市有價證券原將於112年4月2日終止上市，已融資融券者應於"
+        "終止上市前第10個營業日前償還或還券了結，惟已免除終止上市，"
+        "故同步免除前開了結事宜，爰繼續暫停融資融券交易。"
+    )
+    pl.DataFrame(
+        {
+            "announcement_date": ["2023-02-20", "2023-03-16"],
+            "market": ["twse", "twse"],
+            "symbols": ["1435", "1435"],
+            "subject": [
+                "1435上市有價證券將於112年4月2日終止上市",
+                cancellation_text,
+            ],
+            "body_text": [
+                "應於終止上市前第10個營業日前償還或還券了結。",
+                cancellation_text,
+            ],
+            "short_open_ban_date": [None, None],
+            "short_cover_deadline": [None, None],
+            # The second row deliberately mimics a stale cached parse.  Its
+            # cancellation semantics must override these copied values.
+            "short_cover_lead_trading_days": [10, 10],
+            "delisting_date": ["2023-04-02", "2023-04-02"],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "1435")
+
+    pending_cover = out.filter(
+        pl.col("_twpub_force_cover_lead_sessions").is_not_null()
+    )
+    assert pending_cover.height == 1
+    assert pending_cover["_twpub_force_cover_anchor_ordinal"].to_list() == [
+        float(date(2023, 4, 2).toordinal())
+    ]
+    assert pending_cover["_twpub_force_cover_cancel_ordinal"].to_list() == [
+        float(date(2023, 3, 16).toordinal())
+    ]
+    ban_dates = out.filter(pl.col("_twpub_short_open_ban") == 1.0)["date"]
+    assert ban_dates.min() == date(2023, 2, 21)
+    assert date(2023, 3, 15) in ban_dates
+    assert date(2023, 3, 16) in ban_dates
+    assert ban_dates.max() >= date.today()
+
+
+def test_replacement_share_termination_is_not_treated_as_company_delisting(tmp_path: Path) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "6531_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "announcement_date": ["2024-01-02"],
+            "symbols": ["6531"],
+            "subject": ["因變更股票面額，舊股票將終止上市並換發新股票"],
+            "body_text": ["新股票將於同日繼續上市買賣"],
+            "short_open_ban_date": [None],
+            "short_cover_deadline": [None],
+            "delisting_date": ["2024-01-05"],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "6531")
+    assert out.filter(pl.col("_twpub_short_open_ban").is_not_null()).is_empty()
+
+
+def test_announcement_short_ban_ends_before_separate_resume_notice(tmp_path: Path) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "1333_features.parquet", [10.0, 10.0])
+    pl.DataFrame(
+        {
+            "announcement_date": ["2024-01-02", "2024-01-04"],
+            "symbols": ["1333", "1333"],
+            "subject": ["暫停融資融券", "恢復融資融券"],
+            "body_text": ["", ""],
+            "short_open_ban_date": ["2024-01-03", None],
+            "short_open_resume_date": [None, "2024-01-05"],
+            "short_cover_deadline": [None, None],
+            "delisting_date": [None, None],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    out = pl.read_parquet(output_path).filter(pl.col("symbol") == "1333")
+    assert out.filter(pl.col("_twpub_short_open_ban") == 1.0)["date"].sort().to_list() == [
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+    ]
+
+
+def test_open_ended_explicit_short_ban_persists_through_build_date(
+    tmp_path: Path,
+) -> None:
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "1333_features.parquet", [10.0, 10.0])
+    announcement = date.today() - timedelta(days=3)
+    ban_start = date.today() - timedelta(days=2)
+    pl.DataFrame(
+        {
+            "announcement_date": [announcement.isoformat()],
+            "symbols": ["1333"],
+            "subject": ["1333自明日起暫停融資融券"],
+            "body_text": ["禁令另行公告恢復"],
+            "short_open_ban_date": [ban_start.isoformat()],
+            "short_open_resume_date": [None],
+            "short_cover_deadline": [None],
+            "delisting_date": [None],
+        }
+    ).write_parquet(tmp_path / "tw_delisting_short_sale_announcements.parquet")
+
+    output_path = tmp_path / "features.parquet"
+    build_tw_public_training_features(tmp_path, output_path, symbols_root=symbols_root)
+    banned_dates = (
+        pl.read_parquet(output_path)
+        .filter(
+            (pl.col("symbol") == "1333")
+            & (pl.col("_twpub_short_open_ban") == 1.0)
+        )["date"]
+        .to_list()
+    )
+
+    assert ban_start in banned_dates
+    assert date.today() in banned_dates
+
+
+def test_external_short_ban_and_halt_rules_update_directional_masks(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 100.0, 100.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-01", "2024-01-02", "2024-01-03"],
+            "symbol": ["2330", "2330", "2330"],
+            "_twpub_short_open_ban": [None, 1.0, None],
+            "_twpub_force_short_cover": [1.0, None, 1.0],
+            "_twpub_trading_halt": [None, None, 1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    assert bool(panel.can_short_open_mask[0, symbol_idx]) is False
+    assert bool(panel.force_short_cover_mask[0, symbol_idx]) is True
+    assert bool(panel.force_short_cover_mask[1, symbol_idx]) is False
+    assert bool(panel.force_short_cover_mask[2, symbol_idx]) is True
+    assert bool(panel.can_buy_mask[0, symbol_idx]) is True
+    # A short-sale ban blocks borrowing/increasing a short.  It must not block
+    # selling an already-owned long position.
+    assert bool(panel.can_sell_mask[0, symbol_idx]) is True
+    assert bool(panel.can_buy_mask[1, symbol_idx]) is False
+    assert bool(panel.can_sell_mask[1, symbol_idx]) is False
+
+
+def test_relative_delisting_cover_rule_uses_panel_sessions_without_lookahead(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0] * 20)
+    announcement = date(2024, 1, 2)
+    delisting = date(2024, 1, 18)
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": [announcement],
+            "symbol": ["2330"],
+            "_twpub_force_cover_lead_sessions": [10.0],
+            "_twpub_force_cover_anchor_ordinal": [float(delisting.toordinal())],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    forced_rows = np.flatnonzero(panel.force_short_cover_mask[:, symbol_idx])
+    assert forced_rows.tolist() == [6]
+    assert panel.dates[forced_rows[0]] == np.datetime64("2024-01-08")
+
+
+def test_relative_cover_cancellation_is_prospective_at_actual_session_deadline(
+    tmp_path: Path,
+) -> None:
+    for symbol in ("1111", "2222"):
+        _write_symbol(tmp_path / f"{symbol}_features.parquet", [100.0] * 20)
+    anchor = date(2024, 1, 18)
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 2)],
+            "symbol": ["1111", "2222"],
+            "_twpub_force_cover_lead_sessions": [10.0, 10.0],
+            "_twpub_force_cover_anchor_ordinal": [
+                float(anchor.toordinal()),
+                float(anchor.toordinal()),
+            ],
+            # 1111 is cancelled before its Jan-08 deadline; 2222 is cancelled
+            # after that deadline and therefore cannot undo an executed cover.
+            "_twpub_force_cover_cancel_ordinal": [
+                float(date(2024, 1, 5).toordinal()),
+                float(date(2024, 1, 10).toordinal()),
+            ],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+
+    early_idx = panel.symbols.index("1111")
+    late_idx = panel.symbols.index("2222")
+    assert np.flatnonzero(panel.force_short_cover_mask[:, early_idx]).tolist() == []
+    assert np.flatnonzero(panel.force_short_cover_mask[:, late_idx]).tolist() == [6]
+
+
+def test_relative_cover_moves_forward_when_all_predeadline_sessions_are_blocked(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0] * 20)
+    announcement = date(2024, 1, 2)
+    delisting = date(2024, 1, 18)
+    blocked_dates = [date(2024, 1, day) for day in range(3, 9)]
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": [announcement, *blocked_dates],
+            "symbol": ["2330"] * (1 + len(blocked_dates)),
+            "_twpub_force_cover_lead_sessions": [10.0, *([None] * len(blocked_dates))],
+            # Legacy column remains readable for already-built public parquets.
+            "_twpub_force_cover_delisting_ordinal": [
+                float(delisting.toordinal()),
+                *([None] * len(blocked_dates)),
+            ],
+            "_twpub_trading_halt": [None, *([1.0] * len(blocked_dates))],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    forced_rows = np.flatnonzero(panel.force_short_cover_mask[:, symbol_idx])
+
+    assert forced_rows.tolist() == [7]
+    assert panel.dates[forced_rows[0]] == np.datetime64("2024-01-09")
+    assert panel.dates[forced_rows[0]] < np.datetime64(delisting)
+
+
+def test_point_in_time_financial_features_forward_fill_only_after_publication(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-03"],
+            "symbol": ["2330"],
+            "twpub_monthly_revenue_yoy": [0.25],
+        }
+    ).write_parquet(external_path)
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    feature_idx = panel.feature_names.index("twpub_monthly_revenue_yoy")
+    symbol_idx = panel.symbols.index("2330")
+    assert panel.features[0, symbol_idx, feature_idx] == np.float32(0.0)
+    assert panel.features[1, symbol_idx, feature_idx] == np.float32(0.25)
+    assert panel.features[2, symbol_idx, feature_idx] == np.float32(0.25)

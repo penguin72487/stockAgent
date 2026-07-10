@@ -209,7 +209,6 @@ def main() -> None:
 
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
@@ -219,9 +218,14 @@ def main() -> None:
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
         external_feature_path=(
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
     )
@@ -261,6 +265,7 @@ def main() -> None:
         can_sell_mask=base_split.can_sell_mask,
         can_short_open_mask=base_split.can_short_open_mask,
         force_short_cover_mask=base_split.force_short_cover_mask,
+        force_exit_mask=base_split.force_exit_mask,
         benchmark=base_split.benchmark,
         lookback=base_split.lookback,
     )

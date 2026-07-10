@@ -127,7 +127,7 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.tcn_hybrid_tabular_resnet.embedding_dim)
     if model_name in {"cross_sectional_temporal_portfolio_model", "portfolio_multitask", "cstpm"}:
         cstpm_cfg = config.training.cross_sectional_temporal_portfolio_model
-        return int(getattr(cstpm_cfg, "d_model", cstpm_cfg.cross_hidden_dim))
+        return int(cstpm_cfg.d_model)
     if model_name in {"temporal_tabular_resnet", "temporal_resnet", "temporal_tabresnet"}:
         return int(config.training.temporal_tabular_resnet.hidden_dim)
     if model_name in {"lightgbm", "lgbm"}:
@@ -363,6 +363,7 @@ def build_model(
             portfolio_mode=portfolio_mode,
             portfolio_activation=config.trading.portfolio_activation,
             portfolio_output_mode=tbp_cfg.portfolio_output_mode,
+            center_long_short_logits=tbp_cfg.center_long_short_logits,
             max_full_tokens=tbp_cfg.max_full_tokens,
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,
@@ -485,23 +486,20 @@ def build_model(
             lookback=lookback,
             num_features=num_features,
             num_symbols=num_symbols,
-            stock_embedding_dim=int(getattr(cstpm_cfg, "d_model", cstpm_cfg.stock_embedding_dim)),
-            stock_hidden_dim=int(getattr(cstpm_cfg, "scorer_hidden", cstpm_cfg.stock_hidden_dim)),
-            stock_n_blocks=int(getattr(cstpm_cfg, "scorer_blocks", cstpm_cfg.stock_n_blocks)),
-            temporal_hidden_dim=cstpm_cfg.temporal_hidden_dim,
-            temporal_blocks=cstpm_cfg.temporal_blocks,
-            temporal_kernel_size=cstpm_cfg.temporal_kernel_size,
-            cross_hidden_dim=int(getattr(cstpm_cfg, "d_model", cstpm_cfg.cross_hidden_dim)),
-            cross_heads=int(getattr(cstpm_cfg, "heads", cstpm_cfg.cross_heads)),
-            cross_layers=int(getattr(cstpm_cfg, "layers", cstpm_cfg.cross_layers)),
+            stock_embedding_dim=cstpm_cfg.d_model,
+            stock_hidden_dim=cstpm_cfg.scorer_hidden,
+            stock_n_blocks=cstpm_cfg.scorer_blocks,
+            cross_hidden_dim=cstpm_cfg.d_model,
+            cross_heads=cstpm_cfg.heads,
+            cross_layers=cstpm_cfg.layers,
             dropout=cstpm_cfg.dropout,
             regime_classes=cstpm_cfg.regime_classes,
             long_only=config.trading.long_only,
             portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
-            candidate_top_m=int(getattr(cstpm_cfg, "candidate_k", cstpm_cfg.candidate_top_m)),
-            portfolio_top_k=int(getattr(cstpm_cfg, "trade_k", cstpm_cfg.portfolio_top_k)),
+            candidate_top_m=cstpm_cfg.candidate_k,
+            portfolio_top_k=cstpm_cfg.trade_k,
         )
 
     if model_name in {"lightgbm", "lgbm"}:

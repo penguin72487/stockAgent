@@ -8,5 +8,4 @@ runner:
 training:
   loss_type: sharpck
   early_stopping_min_delta: 0.005
-  fused_log_utility_loss: false
   compile_loss: false

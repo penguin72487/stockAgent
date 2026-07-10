@@ -103,8 +103,13 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _strict_no_fallback(args: argparse.Namespace | None = None) -> bool:
-    if args is not None and hasattr(args, "strict_no_fallback"):
-        return bool(getattr(args, "strict_no_fallback"))
+    if args is not None:
+        # Environment variables are an input-boundary concern: ``parse_args``
+        # already folds STOCKAGENT_STRICT_NO_FALLBACK into this field.  Once a
+        # namespace has been passed down, do not let ambient process state
+        # silently change symbol resolution (notably after another in-process
+        # workflow has toggled the shared training environment).
+        return bool(getattr(args, "strict_no_fallback", False))
     return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
 
 
@@ -2456,9 +2461,9 @@ def _download_symbol(
                 std_capture = io.StringIO()
                 err_capture = io.StringIO()
 
-                def _download_frame() -> object:
+                def _download_frame(symbol: str = candidate_symbol) -> object:
                     return _download_yahoo_chart_frame(
-                        symbol=candidate_symbol,
+                        symbol=symbol,
                         start_date=effective_start_date,
                         end_date_exclusive=period_end_exclusive,
                         interval=yf_interval,

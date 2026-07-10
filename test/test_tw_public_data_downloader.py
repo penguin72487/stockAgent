@@ -88,6 +88,16 @@ def test_select_specs_accepts_tags_and_names():
     assert "dgbas_unemployment_rate" in names
 
 
+def test_model_useful_group_is_curated_and_has_unique_dataset_names():
+    specs = twpub._select_specs(["model_useful"])
+    names = [spec.name for spec in specs]
+
+    assert len(specs) == 117
+    assert len(names) == len(set(names))
+    assert all("model_useful" in spec.tags for spec in specs)
+    assert not any("warrant" in spec.name or "bond" in spec.name or "gold" in spec.name for spec in specs)
+
+
 def test_merge_frames_replaces_existing_dates():
     existing = pl.DataFrame(
         {
@@ -105,3 +115,33 @@ def test_merge_frames_replaces_existing_dates():
     merged = twpub._merge_frames(existing, incoming, refresh=False)
 
     assert merged.sort("date")["value"].to_list() == ["new", "keep"]
+
+
+def test_parse_twse_delisted_company_payload():
+    payload = [{"DelistingDate": "114/07/24", "Company": "新光金", "Code": "2888"}]
+
+    frame = twpub._twse_delisted_frame(payload)
+
+    assert frame.to_dicts() == [{
+        "date": "2025-07-24",
+        "market": "twse",
+        "symbol": "2888",
+        "company_name": "新光金",
+        "delisting_reason": "",
+    }]
+
+
+def test_parse_tpex_delisted_company_payload():
+    payload = {
+        "tables": [{
+            "fields": ["股票代號", "公司名稱", "終止上櫃日期", "終止上櫃原因", "公司資料網址"],
+            "data": [["6747", "亨泰光學股份有限公司", "114-12-04", "業務規則第15條之18", "https://example.test"]],
+        }],
+        "stat": "ok",
+    }
+
+    frame = twpub._tpex_delisted_frame(payload)
+
+    assert frame["symbol"].to_list() == ["6747"]
+    assert frame["date"].to_list() == ["2025-12-04"]
+    assert frame["delisting_reason"].to_list() == ["業務規則第15條之18"]

@@ -19,6 +19,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.lookback = int(lookback)
         self.date_indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
         tradable = panel.tradable_mask & np.isfinite(panel.returns_1d)
+        force_exit = (
+            panel.force_exit_mask
+            if panel.force_exit_mask is not None
+            else np.zeros_like(tradable, dtype=bool)
+        )
         if self.date_indices.size == 0:
             valid_indices = self.date_indices
             if not allow_empty:
@@ -29,7 +34,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             min_valid_idx = fold_start_idx + self.lookback - 1
             valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
             if valid_indices.size > 0:
-                valid_indices = valid_indices[tradable[valid_indices].any(axis=1)]
+                executable_or_terminal = (
+                    tradable[valid_indices].any(axis=1)
+                    | force_exit[valid_indices].any(axis=1)
+                )
+                valid_indices = valid_indices[executable_or_terminal]
         self.valid_indices = valid_indices
 
         if len(self.valid_indices) == 0 and not allow_empty:
@@ -54,14 +63,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         can_short_open = (
             panel.can_short_open_mask
             if panel.can_short_open_mask is not None
-            else can_sell
+            else can_sell.copy()
         )
         force_short_cover = (
             panel.force_short_cover_mask
             if panel.force_short_cover_mask is not None
             else np.zeros_like(tradable, dtype=bool)
         )
-
         # build_panel sanitizes feature NaN/inf values before caching.  Re-running
         # torch.nan_to_num here would duplicate the full panel for every split.
         features = panel.features.astype(np.float32, copy=False)
@@ -82,6 +90,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.can_sell_mask_t = torch.from_numpy(can_sell)
         self.can_short_open_mask_t = torch.from_numpy(can_short_open)
         self.force_short_cover_mask_t = torch.from_numpy(force_short_cover)
+        self.force_exit_mask_t = torch.from_numpy(force_exit)
         self.benchmark_t = torch.from_numpy(panel.benchmark_returns.astype(np.float32, copy=False))
 
     def __len__(self) -> int:
@@ -99,6 +108,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "can_sell_mask": self.can_sell_mask_t[date_idx],
             "can_short_open_mask": self.can_short_open_mask_t[date_idx],
             "force_short_cover_mask": self.force_short_cover_mask_t[date_idx],
+            "force_exit_mask": self.force_exit_mask_t[date_idx],
             "benchmark": self.benchmark_t[date_idx],
         }
 
@@ -117,6 +127,7 @@ def collate_batch(
             "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
             "can_short_open_mask": torch.stack([s["can_short_open_mask"] for s in samples]),
             "force_short_cover_mask": torch.stack([s["force_short_cover_mask"] for s in samples]),
+            "force_exit_mask": torch.stack([s["force_exit_mask"] for s in samples]),
             "benchmark": torch.stack([s["benchmark"] for s in samples]),
             "sample_mask": torch.ones(len(samples), dtype=torch.bool),
         }
@@ -138,6 +149,7 @@ def collate_batch(
         "can_sell_mask": _pad_tensor_list("can_sell_mask"),
         "can_short_open_mask": _pad_tensor_list("can_short_open_mask"),
         "force_short_cover_mask": _pad_tensor_list("force_short_cover_mask"),
+        "force_exit_mask": _pad_tensor_list("force_exit_mask"),
         "benchmark": _pad_tensor_list("benchmark"),
         "sample_mask": torch.tensor([True] * len(samples) + [False] * pad_count, dtype=torch.bool),
     }

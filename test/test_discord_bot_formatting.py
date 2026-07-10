@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,6 +38,7 @@ from services.discord_bot.bot import (
     _public_broadcasts_enabled,
     _rebalance_line,
     _remove_user_watch_symbol,
+    _resolve_pre_signal_command,
     _remove_user_subscription,
     _replace_user_watch_symbol,
     _risk_message,
@@ -62,6 +64,12 @@ from services.discord_bot.bot import (
     _watch_delay_seconds,
     _watch_poll_seconds,
 )
+
+
+def test_pre_signal_python_sentinel_uses_running_interpreter() -> None:
+    command = _resolve_pre_signal_command(("{python}", "downloader/example.py", "--mode", "incremental"))
+
+    assert command == [sys.executable, "downloader/example.py", "--mode", "incremental"]
 
 
 def test_scheduled_markets_defaults_to_all_configured_markets(monkeypatch) -> None:
