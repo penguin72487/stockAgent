@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import json
+import os
 from pathlib import Path
+import shutil
 from typing import Any
+import uuid
 
 import numpy as np
 
@@ -17,6 +22,7 @@ ARRAY_NAMES = (
     "can_sell_mask",
     "can_short_open_mask",
     "force_short_cover_mask",
+    "force_exit_mask",
     "alive_mask",
     "benchmark_returns",
     "close_prices",
@@ -49,10 +55,16 @@ def _json_file(cache_dir: Path, name: str) -> Path:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+        _fsync_directory(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> Any:
@@ -60,13 +72,54 @@ def _read_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory fsync so rename durability matches file durability."""
+
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _cache_writer_lock(cache_dir: Path):
+    """Serialize generation commit/cleanup across training and live processes."""
+
+    lock_path = cache_dir / ".write.lock"
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _save_array(cache_dir: Path, name: str, array: np.ndarray) -> dict[str, Any]:
     path = _array_file(cache_dir, name)
+    tmp = cache_dir / f".{path.name}.{uuid.uuid4().hex}.tmp"
     arr = np.asarray(array)
-    mmap = np.lib.format.open_memmap(path, mode="w+", dtype=arr.dtype, shape=arr.shape)
-    mmap[...] = arr
-    mmap.flush()
-    del mmap
+    try:
+        mmap = np.lib.format.open_memmap(
+            tmp,
+            mode="w+",
+            dtype=arr.dtype,
+            shape=arr.shape,
+        )
+        mmap[...] = arr
+        mmap.flush()
+        del mmap
+        with tmp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+        _fsync_directory(cache_dir)
+    finally:
+        tmp.unlink(missing_ok=True)
     return {
         "file": path.name,
         "shape": list(arr.shape),
@@ -84,6 +137,31 @@ def save_panel_cache_v2(
 ) -> Path:
     cache_dir = panel_cache_v2_dir(parquet_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    with _cache_writer_lock(cache_dir):
+        return _save_panel_cache_v2_locked(
+            parquet_root,
+            panel_like,
+            source_hash=source_hash,
+            backend_key=backend_key,
+            version=version,
+        )
+
+
+def _save_panel_cache_v2_locked(
+    parquet_root: str | Path,
+    panel_like: Any,
+    *,
+    source_hash: str,
+    backend_key: str,
+    version: int,
+) -> Path:
+    cache_dir = panel_cache_v2_dir(parquet_root)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    generations_dir = cache_dir / "generations"
+    generations_dir.mkdir(parents=True, exist_ok=True)
+    generation = uuid.uuid4().hex
+    generation_dir = generations_dir / generation
+    generation_dir.mkdir()
 
     arrays = {
         "dates": np.asarray(panel_like.dates),
@@ -108,6 +186,11 @@ def save_panel_cache_v2(
             if getattr(panel_like, "force_short_cover_mask", None) is not None
             else np.zeros_like(panel_like.tradable_mask, dtype=bool)
         ),
+        "force_exit_mask": np.asarray(
+            panel_like.force_exit_mask
+            if getattr(panel_like, "force_exit_mask", None) is not None
+            else np.zeros_like(panel_like.tradable_mask, dtype=bool)
+        ),
         "alive_mask": np.asarray(panel_like.alive_mask),
         "benchmark_returns": np.asarray(panel_like.benchmark_returns),
         "close_prices": np.asarray(panel_like.close_prices),
@@ -117,18 +200,56 @@ def save_panel_cache_v2(
             else np.full_like(panel_like.close_prices, np.nan, dtype=np.float32)
         ),
     }
-    array_meta = {name: _save_array(cache_dir, name, array) for name, array in arrays.items()}
-    _write_json(_json_file(cache_dir, "symbols"), list(panel_like.symbols))
-    _write_json(_json_file(cache_dir, "feature_names"), list(panel_like.feature_names))
-    meta = {
-        "version": int(version),
-        "source_hash": str(source_hash),
-        "backend_key": str(backend_key),
-        "num_dates": int(panel_like.num_dates),
-        "num_symbols": int(panel_like.num_symbols),
-        "arrays": array_meta,
-    }
-    _write_json(panel_cache_v2_meta_path(parquet_root), meta)
+    try:
+        array_meta: dict[str, dict[str, Any]] = {}
+        for name, array in arrays.items():
+            item_meta = _save_array(generation_dir, name, array)
+            item_meta["file"] = str(
+                Path("generations") / generation / item_meta["file"]
+            )
+            array_meta[name] = item_meta
+        symbols_path = _json_file(generation_dir, "symbols")
+        feature_names_path = _json_file(generation_dir, "feature_names")
+        _write_json(symbols_path, list(panel_like.symbols))
+        _write_json(feature_names_path, list(panel_like.feature_names))
+        _fsync_directory(generation_dir)
+        meta = {
+            "version": int(version),
+            "source_hash": str(source_hash),
+            "backend_key": str(backend_key),
+            "num_dates": int(panel_like.num_dates),
+            "num_symbols": int(panel_like.num_symbols),
+            "generation": generation,
+            "symbols_file": str(Path("generations") / generation / symbols_path.name),
+            "feature_names_file": str(
+                Path("generations") / generation / feature_names_path.name
+            ),
+            "arrays": array_meta,
+        }
+        # This is the single commit point. Before this atomic replace, readers
+        # keep seeing the complete previous generation.
+        _write_json(panel_cache_v2_meta_path(parquet_root), meta)
+    except Exception:
+        shutil.rmtree(generation_dir, ignore_errors=True)
+        raise
+
+    # Reclaim superseded immutable generations and pre-generation payloads only
+    # after the new metadata pointer is durable.
+    try:
+        for candidate in generations_dir.iterdir():
+            if candidate.name != generation:
+                if candidate.is_dir():
+                    shutil.rmtree(candidate, ignore_errors=True)
+                else:
+                    candidate.unlink(missing_ok=True)
+        for name in ARRAY_NAMES:
+            _array_file(cache_dir, name).unlink(missing_ok=True)
+        _json_file(cache_dir, "symbols").unlink(missing_ok=True)
+        _json_file(cache_dir, "feature_names").unlink(missing_ok=True)
+    except OSError:
+        # Cleanup is not part of the transaction. A later successful save can
+        # reclaim any superseded generation or legacy payload.
+        pass
     return cache_dir
 
 
@@ -145,20 +266,72 @@ def read_panel_cache_v2_meta(parquet_root: str | Path) -> dict[str, Any] | None:
     return meta
 
 
-def load_panel_cache_v2(parquet_root: str | Path, *, mmap_mode: str | None = "r") -> dict[str, Any]:
-    cache_dir = panel_cache_v2_dir(parquet_root)
-    meta = read_panel_cache_v2_meta(parquet_root)
-    if meta is None:
-        raise FileNotFoundError(f"missing panel cache v2 metadata under {cache_dir}")
+def _load_panel_cache_v2_generation(
+    cache_dir: Path,
+    meta: dict[str, Any],
+    *,
+    mmap_mode: str | None,
+) -> dict[str, Any]:
+    symbols_file = str(meta.get("symbols_file", "symbols.json"))
+    feature_names_file = str(meta.get("feature_names_file", "feature_names.json"))
     payload: dict[str, Any] = {
-        "symbols": list(_read_json(_json_file(cache_dir, "symbols"))),
-        "feature_names": list(_read_json(_json_file(cache_dir, "feature_names"))),
+        "symbols": list(_read_json(cache_dir / symbols_file)),
+        "feature_names": list(_read_json(cache_dir / feature_names_file)),
     }
     arrays_meta = meta.get("arrays", {})
     for name in ARRAY_NAMES:
         file_name = arrays_meta.get(name, {}).get("file", f"{name}.npy")
-        payload[name] = np.load(cache_dir / file_name, mmap_mode=mmap_mode, allow_pickle=False)
+        payload[name] = np.load(
+            cache_dir / file_name,
+            mmap_mode=mmap_mode,
+            allow_pickle=False,
+        )
     return payload
+
+
+def load_panel_cache_v2(parquet_root: str | Path, *, mmap_mode: str | None = "r") -> dict[str, Any]:
+    cache_dir = panel_cache_v2_dir(parquet_root)
+    last_error: FileNotFoundError | None = None
+    for _ in range(3):
+        meta = read_panel_cache_v2_meta(parquet_root)
+        if meta is None:
+            last_error = FileNotFoundError(
+                f"missing panel cache v2 metadata under {cache_dir}"
+            )
+            continue
+        try:
+            return _load_panel_cache_v2_generation(
+                cache_dir,
+                meta,
+                mmap_mode=mmap_mode,
+            )
+        except FileNotFoundError as exc:
+            # A concurrent writer may have committed and reclaimed the
+            # generation whose metadata this reader sampled. Retry the entire
+            # snapshot from the latest atomic metadata pointer.
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise FileNotFoundError(f"unable to load panel cache v2 under {cache_dir}")
+
+
+def _panel_cache_required_paths(
+    cache_dir: Path,
+    meta: dict[str, Any],
+    parquet_root: str | Path,
+) -> list[Path]:
+    arrays_meta = meta.get("arrays", {})
+    required_paths = [
+        panel_cache_v2_meta_path(parquet_root),
+        cache_dir / str(meta.get("symbols_file", "symbols.json")),
+        cache_dir / str(meta.get("feature_names_file", "feature_names.json")),
+    ]
+    required_paths.extend(
+        cache_dir
+        / str(arrays_meta.get(name, {}).get("file", f"{name}.npy"))
+        for name in ARRAY_NAMES
+    )
+    return required_paths
 
 
 def panel_cache_v2_is_valid(
@@ -179,12 +352,31 @@ def panel_cache_v2_is_valid(
     ):
         return False
     cache_dir = panel_cache_v2_dir(parquet_root)
-    required_paths = [panel_cache_v2_meta_path(parquet_root), _json_file(cache_dir, "symbols"), _json_file(cache_dir, "feature_names")]
-    required_paths.extend(_array_file(cache_dir, name) for name in ARRAY_NAMES)
+    required_paths = _panel_cache_required_paths(cache_dir, meta, parquet_root)
     if not all(path.exists() for path in required_paths):
-        return False
+        # Avoid a false invalidation when metadata changed during this check.
+        latest_meta = read_panel_cache_v2_meta(parquet_root)
+        if latest_meta is None or latest_meta == meta:
+            return False
+        meta = latest_meta
+        if (
+            meta.get("source_hash") != source_hash
+            or int(meta.get("version", -1)) != int(version)
+            or meta.get("backend_key") != backend_key
+        ):
+            return False
+        required_paths = _panel_cache_required_paths(
+            cache_dir,
+            meta,
+            parquet_root,
+        )
+        if not all(path.exists() for path in required_paths):
+            return False
     if not source_paths:
         return True
     newest_source_mtime = max(path.stat().st_mtime for path in source_paths)
-    oldest_cache_mtime = min(path.stat().st_mtime for path in required_paths)
+    try:
+        oldest_cache_mtime = min(path.stat().st_mtime for path in required_paths)
+    except FileNotFoundError:
+        return False
     return oldest_cache_mtime >= newest_source_mtime

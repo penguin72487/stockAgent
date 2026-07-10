@@ -4052,6 +4052,21 @@ def load_model_from_checkpoint(
     *,
     strict: bool = False,
 ) -> tuple[nn.Module, dict[str, Any]]:
+    # Keep explainability under the same schema/model compatibility contract as
+    # inference and live signals.  Import lazily because trainer imports this
+    # module lazily for post-fold reports as well.
+    from stockagent.training.trainer import (
+        _checkpoint_manifest,
+        _validate_checkpoint_manifest,
+    )
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    _validate_checkpoint_manifest(
+        checkpoint,
+        _checkpoint_manifest(panel, config, include_data_content=False),
+        checkpoint_path=checkpoint_path,
+        scope="model",
+    )
     model = build_model(
         config=config,
         lookback=config.training.lookback,
@@ -4059,7 +4074,6 @@ def load_model_from_checkpoint(
         num_symbols=panel.num_symbols,
         feature_names=panel.feature_names,
     ).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     state_dict = _strip_orig_mod_prefix(state_dict)
     state_dict, adapted_state_keys = _adapt_dynamic_symbol_position_state(model, state_dict, strict=strict)
@@ -4158,6 +4172,11 @@ def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
         ),
         force_short_cover_mask=(
             panel.force_short_cover_mask[:, indices] if panel.force_short_cover_mask is not None else None
+        ),
+        force_exit_mask=(
+            panel.force_exit_mask[:, indices]
+            if panel.force_exit_mask is not None
+            else None
         ),
     )
 
@@ -4268,7 +4287,6 @@ def load_explanation_context(
     resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
@@ -4278,9 +4296,16 @@ def load_explanation_context(
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
         external_feature_path=(
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
         ),
         external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=(
+            config.data.use_tw_public_features or config.data.use_tw_public_rules
+        ),
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
     )
@@ -4673,7 +4698,6 @@ def _run_explainability_for_config(
         resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
         panel = build_panel(
             config.data.parquet_root,
-            use_rapids=config.data.use_rapids,
             benchmark_name=config.data.benchmark_name,
             usd_only_trading_pairs=config.data.usd_only_trading_pairs,
             tradable_mode=config.data.tradable_mode,
@@ -4683,9 +4707,16 @@ def _run_explainability_for_config(
             panel_backend=config.data.panel_backend,
             panel_load_workers=config.data.panel_load_workers,
             external_feature_path=(
-                config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+                config.data.tw_public_feature_path
+                if config.data.use_tw_public_features or config.data.use_tw_public_rules
+                else None
             ),
             external_market_symbol=config.data.tw_public_market_symbol,
+            external_include_features=config.data.use_tw_public_features,
+            external_include_rules=config.data.use_tw_public_rules,
+            external_data_required=(
+                config.data.use_tw_public_features or config.data.use_tw_public_rules
+            ),
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
         )

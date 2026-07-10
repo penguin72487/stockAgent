@@ -7,15 +7,25 @@ import torch
 import yaml
 
 from stockagent.backtest.simulator import _resolve_exposure_budget, run_backtest, run_backtest_torch
-from stockagent.config import load_config
+from stockagent.config import (
+    DataConfig,
+    EnvironmentConfig,
+    EvaluationConfig,
+    GradientBoostedPortfolioTransformerConfig,
+    RunnerConfig,
+    TradingConfig,
+    TrainingConfig,
+    WalkForwardConfig,
+    _dataclass_default_values,
+    _nested_training_schemas,
+    load_config,
+)
+from stockagent.models.factory import build_model
 
 
 def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = None) -> Path:
     config_path = tmp_path / "config.yaml"
     training = {
-        "backend": "pytorch",
-        "target": "next_1d_rank",
-        "batch_mode": "time_window_x_all_symbols",
         "non_blocking_transfer": True,
         "model_name": "transformer_base_portfolio",
     }
@@ -25,7 +35,6 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
             {
                 "experiment_name": "gross-leverage-test",
                 "environment": {
-                    "conda_env": "fintech",
                     "device": "cuda",
                     "use_tensor_cores": True,
                     "amp_dtype": "bf16",
@@ -33,7 +42,6 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
                 "data": {
                     "parquet_root": "data_yahoo/tw_stocks",
                     "benchmark_name": "2330",
-                    "universe_mode": "all_daily_symbols",
                 },
                 "walk_forward": {
                     "min_train_years": 1,
@@ -49,9 +57,6 @@ def _write_minimal_config(tmp_path: Path, *, training_overrides: dict | None = N
                 },
                 "training": training,
                 "evaluation": {
-                    # Legacy key should be ignored; market benchmark lives in data.benchmark_name.
-                    "primary_baseline": "universe_average",
-                    "metrics": ["cumulative_return"],
                 },
             }
         ),
@@ -65,20 +70,115 @@ def test_load_config_migrates_legacy_gross_leverage_to_reporting_leverage(tmp_pa
 
     config = load_config(config_path)
 
-    assert config.trading.leverage == 2.5
+    assert config.trading.reporting_leverage == 2.5
     assert not hasattr(config.trading, "gross_leverage")
-    assert not hasattr(config.evaluation, "primary_baseline")
-    assert not hasattr(config.evaluation, "metrics")
 
 
-def test_load_config_preserves_lr_scheduler_warmup_fields(tmp_path: Path) -> None:
+def test_load_config_migrates_legacy_leverage_to_reporting_leverage(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["trading"].pop("gross_leverage")
+    payload["trading"]["leverage"] = 1.75
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.trading.reporting_leverage == 1.75
+    assert not hasattr(config.trading, "leverage")
+
+
+def test_reporting_leverage_rejects_conflicting_legacy_alias(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["trading"]["reporting_leverage"] = 1.5
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="reporting_leverage conflicts"):
+        load_config(config_path)
+
+
+def test_loaded_defaults_match_dataclass_defaults_for_every_config_section(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["walk_forward"].pop("min_train_years")
+    payload["walk_forward"].pop("require_future_test_year")
+    payload["trading"].pop("gross_leverage")
+    payload["training"].pop("model_name")
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    config = load_config(config_path)
+    top_level_schemas = {
+        "runner": RunnerConfig,
+        "environment": EnvironmentConfig,
+        "data": DataConfig,
+        "walk_forward": WalkForwardConfig,
+        "trading": TradingConfig,
+        "training": TrainingConfig,
+        "evaluation": EvaluationConfig,
+    }
+    nested_names = set(_nested_training_schemas())
+    for section_name, schema in top_level_schemas.items():
+        actual_section = getattr(config, section_name)
+        for field_name, expected in _dataclass_default_values(schema).items():
+            if section_name == "training" and field_name in nested_names:
+                continue
+            assert getattr(actual_section, field_name) == expected, (
+                f"{section_name}.{field_name} loader default drifted from "
+                f"{schema.__name__}.{field_name}"
+            )
+
+    for section_name, schema in _nested_training_schemas().items():
+        actual_section = getattr(config.training, section_name)
+        for field_name, expected in _dataclass_default_values(schema).items():
+            assert getattr(actual_section, field_name) == expected, (
+                f"training.{section_name}.{field_name} loader default drifted from "
+                f"{schema.__name__}.{field_name}"
+            )
+
+
+def test_one_model_block_cannot_change_another_model_blocks_defaults(tmp_path: Path) -> None:
+    config = load_config(
+        _write_minimal_config(
+            tmp_path,
+            training_overrides={"transformer_base_portfolio": {"d_model": 96}},
+        )
+    )
+
+    assert config.training.transformer_base_portfolio.d_model == 96
+    assert config.training.gradient_boosted_portfolio_transformer.d_model == (
+        _dataclass_default_values(GradientBoostedPortfolioTransformerConfig)["d_model"]
+    )
+
+
+def test_load_config_rejects_duplicate_yaml_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "duplicate.yaml"
+    config_path.write_text(
+        """
+experiment_name: duplicate-key-test
+training:
+  non_blocking_transfer: true
+  save_best_val_artifacts: false
+  save_best_val_artifacts: true
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate YAML key 'save_best_val_artifacts'"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("legacy_interval", ["step", "batch", "epoch"])
+def test_load_config_removes_noop_lr_scheduler_interval(
+    tmp_path: Path,
+    legacy_interval: str,
+) -> None:
     config_path = _write_minimal_config(
         tmp_path,
         training_overrides={
             "enable_lr_scheduler": True,
             "lr_scheduler": "warmup_cosine",
             "lr_scheduler_warmup_steps": 123,
-            "lr_scheduler_interval": "step",
+            "lr_scheduler_interval": legacy_interval,
         },
     )
 
@@ -86,7 +186,185 @@ def test_load_config_preserves_lr_scheduler_warmup_fields(tmp_path: Path) -> Non
 
     assert config.training.lr_scheduler == "warmup_cosine"
     assert config.training.lr_scheduler_warmup_steps == 123
-    assert config.training.lr_scheduler_interval == "step"
+    assert not hasattr(config.training, "lr_scheduler_interval")
+
+
+def test_load_config_rejects_unknown_legacy_lr_scheduler_interval(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cadence is fixed"):
+        load_config(
+            _write_minimal_config(
+                tmp_path,
+                training_overrides={"lr_scheduler_interval": "sometimes"},
+            )
+        )
+
+
+def test_legacy_batch_size_is_migrated_to_both_canonical_batch_fields(tmp_path: Path) -> None:
+    config = load_config(
+        _write_minimal_config(tmp_path, training_overrides={"batch_size": 7})
+    )
+
+    assert config.training.batch_size_train == 7
+    assert config.training.batch_size_eval == 7
+    assert not hasattr(config.training, "batch_size")
+
+
+def test_legacy_noop_symbol_subsample_default_is_silently_removed(tmp_path: Path) -> None:
+    config = load_config(
+        _write_minimal_config(
+            tmp_path,
+            training_overrides={"train_symbol_subsample_ratio": 1.0},
+        )
+    )
+
+    assert not hasattr(config.training, "train_symbol_subsample_ratio")
+
+
+def test_unimplemented_symbol_subsample_value_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="never implemented"):
+        load_config(
+            _write_minimal_config(
+                tmp_path,
+                training_overrides={"train_symbol_subsample_ratio": 0.5},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "key_path",
+    [
+        ("environment", "use_tensor_cores"),
+        ("trading", "long_only"),
+        ("training", "non_blocking_transfer"),
+        ("training", "enable_torch_compile"),
+        ("training", "compile_loss"),
+        ("training", "transformer_base_portfolio", "return_aux"),
+    ],
+)
+def test_load_config_rejects_string_booleans(tmp_path: Path, key_path: tuple[str, ...]) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    target = payload
+    for key in key_path[:-1]:
+        target = target.setdefault(key, {})
+    target[key_path[-1]] = "false"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"YAML true/false") as exc_info:
+        load_config(config_path)
+
+    assert ".".join(key_path) in str(exc_info.value)
+
+
+def test_legacy_csv_output_flags_migrate_to_canonical_table_flags(tmp_path: Path) -> None:
+    config = load_config(
+        _write_minimal_config(
+            tmp_path,
+            training_overrides={
+                "save_daily_weights_csv": False,
+                "save_integer_share_daily_weights_csv": False,
+                "save_integer_share_holdings_csv": False,
+            },
+        )
+    )
+
+    assert config.training.save_daily_weights_table is False
+    assert config.training.save_integer_share_daily_weights_table is False
+    assert config.training.save_integer_share_holdings_table is False
+    assert not hasattr(config.training, "save_daily_weights_csv")
+    assert not hasattr(config.training, "save_integer_share_daily_weights_csv")
+    assert not hasattr(config.training, "save_integer_share_holdings_csv")
+
+
+@pytest.mark.parametrize(
+    ("key_path", "value"),
+    [
+        (("environment", "conda_env"), "fintech"),
+        (("environment", "target_vram_fraction"), 0.8),
+        (("data", "universe_mode"), "all_daily_symbols"),
+        (("data", "use_rapids"), True),
+        (("data", "benchmark_source"), "legacy"),
+        (("trading", "cash_allowed"), True),
+        (("trading", "use_all_tradable_symbols"), True),
+        (("evaluation", "primary_baseline"), "universe_average"),
+        (("evaluation", "metrics"), ["sharpe"]),
+        (("training", "backend"), "pytorch"),
+        (("training", "target"), "next_1d_rank"),
+        (("training", "batch_mode"), "time_window_x_all_symbols"),
+        (("training", "top_k"), 10),
+        (("training", "prefer_fp16"), False),
+        (("training", "data_parallel_device_ids"), [0, 1]),
+        (("training", "data_parallel_output_device"), 0),
+        (("training", "data_parallel_disable_panel_forward"), True),
+        (("training", "data_parallel_compile_model"), True),
+        (("training", "data_parallel_threaded_replicas"), True),
+        (("training", "cross_sectional_temporal_portfolio_model", "stock_embedding_dim"), 64),
+        (("training", "cross_sectional_temporal_portfolio_model", "temporal_blocks"), 2),
+        (("training", "cross_sectional_temporal_portfolio_model", "scorer"), "tabular_resnet"),
+        (("training", "cross_sectional_temporal_portfolio_model", "reranker"), "set_transformer"),
+    ],
+)
+def test_load_config_rejects_removed_noop_keys(
+    tmp_path: Path,
+    key_path: tuple[str, ...],
+    value: object,
+) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    target = payload
+    for key in key_path[:-1]:
+        target = target.setdefault(key, {})
+    target[key_path[-1]] = value
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        load_config(config_path)
+
+    assert ".".join(key_path) in str(exc_info.value)
+
+
+def test_load_config_rejects_removed_data_parallel_strategy(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={"multi_gpu_strategy": "data_parallel"},
+    )
+
+    with pytest.raises(ValueError, match=r"data_parallel.*removed.*distributed_data_parallel"):
+        load_config(config_path)
+
+
+def test_cstpm_config_has_one_effective_name_per_model_knob(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(
+        tmp_path,
+        training_overrides={
+            "model_name": "cross_sectional_temporal_portfolio_model",
+            "cross_sectional_temporal_portfolio_model": {
+                "candidate_k": 7,
+                "trade_k": 3,
+                "scorer_hidden": 48,
+                "scorer_blocks": 3,
+                "d_model": 24,
+                "heads": 4,
+                "layers": 2,
+                "dropout": 0.0,
+            },
+        },
+    )
+    config = load_config(config_path)
+    model = build_model(
+        config=config,
+        lookback=4,
+        num_features=5,
+        num_symbols=12,
+    )
+
+    assert model.candidate_top_m == 7
+    assert model.portfolio_top_k == 3
+    assert model.stock_scorer[0].out_features == 48
+    assert model.reranker_input_proj.in_features == 25
+    assert model.reranker_input_proj.out_features == 24
+    assert len(model.reranker.layers) == 2
+    assert model.reranker.layers[0].self_attn.num_heads == 4
 
 
 def test_load_config_supports_relative_base_config_deep_merge(tmp_path: Path) -> None:
@@ -167,6 +445,8 @@ def test_backtest_exposure_budget_caps_multiplier_at_one() -> None:
         sell_fee_rate=0.0,
         long_only=False,
         gross_leverage=2.5,
+        can_buy_mask=tradable,
+        can_sell_mask=tradable,
     )
 
     expected_weights = torch.tensor([[0.5, -0.5]], dtype=torch.float32)
@@ -192,6 +472,8 @@ def test_backtest_converts_asset_log_returns_to_portfolio_log_return() -> None:
         sell_fee_rate=0.0,
         long_only=False,
         gross_leverage=1.0,
+        can_buy_mask=tradable_np,
+        can_sell_mask=tradable_np,
     )
 
     weights_t = torch.from_numpy(weights_np)
@@ -207,6 +489,8 @@ def test_backtest_converts_asset_log_returns_to_portfolio_log_return() -> None:
         sell_fee_rate=0.0,
         long_only=False,
         gross_leverage=1.0,
+        can_buy_mask=tradable_t,
+        can_sell_mask=tradable_t,
     )
     dense_result = run_backtest_torch(
         weights_t,
@@ -219,7 +503,6 @@ def test_backtest_converts_asset_log_returns_to_portfolio_log_return() -> None:
         gross_leverage=1.0,
         can_buy_mask=tradable_t,
         can_sell_mask=tradable_t,
-        dense_mask_constraints=True,
     )
 
     assert math.isclose(float(numpy_result.strategy_returns[0]), expected_strategy_log_return, rel_tol=1e-6)
@@ -327,3 +610,27 @@ def test_load_config_rejects_unknown_portfolio_output_mode(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="portfolio_output_mode"):
         load_config(config_path)
+
+
+def test_tw_rule_switch_is_independent_from_tw_model_features() -> None:
+    tw = load_config("configs/markets/tw.yaml")
+    tw_public = load_config("configs/markets/tw_public.yaml")
+    derived_tw = load_config("configs/markets/tw_parallel_latefold_stable.yaml")
+
+    assert tw.data.use_tw_public_rules is True
+    assert tw.data.use_tw_public_features is False
+    assert tw_public.data.use_tw_public_rules is True
+    assert tw_public.data.use_tw_public_features is True
+    assert derived_tw.data.use_tw_public_rules is True
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "configs/markets/crypto.yaml",
+        "configs/markets/forex.yaml",
+        "configs/markets/us.yaml",
+    ],
+)
+def test_non_tw_market_configs_disable_tw_public_rules(config_path: str) -> None:
+    assert load_config(config_path).data.use_tw_public_rules is False

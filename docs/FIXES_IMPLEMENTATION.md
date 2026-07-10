@@ -381,9 +381,9 @@ def run_training(panel: PanelData, folds: Iterable[WalkForwardFold], config: Exp
             test_batch_size = train_batch_size // 2
         else:
             # 回退到靜態估算
-            train_batch_size = config.training.batch_size
-            val_batch_size = config.training.batch_size
-            test_batch_size = config.training.batch_size
+            train_batch_size = config.training.batch_size_train
+            val_batch_size = config.training.batch_size_eval
+            test_batch_size = config.training.batch_size_eval
         
         print(f"[Fold {fold.fold_id}] Batch sizes: train={train_batch_size}, val={val_batch_size}, test={test_batch_size}")
         

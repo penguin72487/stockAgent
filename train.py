@@ -8,12 +8,12 @@ import random
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Mapping, Sequence
 
 import numpy as np
 
-# Set allocator policy before torch can initialize CUDA.  The dual-GPU compiled
-# DataParallel path has large transient backward allocations on GPU0, and
-# expandable segments reduce allocator fragmentation across compile/eval phases.
+# Set allocator policy before torch can initialize CUDA. Expandable segments
+# reduce fragmentation across compiled DDP train/eval phases.
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", os.environ["PYTORCH_CUDA_ALLOC_CONF"])
@@ -33,9 +33,6 @@ def _normalize_multi_gpu_strategy(value: object) -> str:
         "no": "none",
         "single": "none",
         "single_gpu": "none",
-        "dp": "data_parallel",
-        "dataparallel": "data_parallel",
-        "torch_data_parallel": "data_parallel",
         "ddp": "distributed_data_parallel",
         "distributed": "distributed_data_parallel",
         "torch_ddp": "distributed_data_parallel",
@@ -54,20 +51,8 @@ def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("training.multi_gpu_strategy=distributed_data_parallel requires CUDA")
 
-    raw_ids = list(getattr(config.training, "data_parallel_device_ids", []) or [])
     visible_count = int(torch.cuda.device_count())
-    if not raw_ids:
-        raw_ids = list(range(visible_count))
-    device_ids: list[int] = []
-    for raw_id in raw_ids:
-        device_id = int(raw_id)
-        if device_id < 0 or device_id >= visible_count:
-            raise RuntimeError(
-                "training.data_parallel_device_ids contains an unavailable CUDA device "
-                f"{device_id}; visible CUDA device_count={visible_count}"
-            )
-        if device_id not in device_ids:
-            device_ids.append(device_id)
+    device_ids = list(range(visible_count))
     if len(device_ids) < 2:
         raise RuntimeError(
             "training.multi_gpu_strategy=distributed_data_parallel needs at least two visible CUDA devices; "
@@ -81,26 +66,43 @@ def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
     configured_cpu_threads = _resolve_cpu_thread_count(
         args.cpu_threads if args.cpu_threads is not None else getattr(config.environment, "cpu_threads", None)
     )
-    if configured_cpu_threads is not None:
-        env.setdefault("STOCKAGENT_CPU_THREADS", str(max(1, configured_cpu_threads // world_size)))
+    resolved_cpu_threads = _resolve_process_thread_count(
+        configured_cpu_threads,
+        inherited_names=("STOCKAGENT_CPU_THREADS", "OMP_NUM_THREADS"),
+        local_world_size=world_size,
+        environ=env,
+    )
+    env["STOCKAGENT_CPU_THREADS"] = str(resolved_cpu_threads)
     configured_compile_threads = _resolve_cpu_thread_count(
         args.torch_compile_threads
         if args.torch_compile_threads is not None
         else getattr(config.environment, "torch_compile_threads", None)
     )
-    if configured_compile_threads is not None:
-        env.setdefault("STOCKAGENT_TORCH_COMPILE_THREADS", str(max(1, configured_compile_threads // world_size)))
-    env.setdefault("OMP_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
-    env.setdefault("MKL_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
-    env.setdefault("OPENBLAS_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
-    env.setdefault("NUMEXPR_NUM_THREADS", env.get("STOCKAGENT_CPU_THREADS", "1"))
+    resolved_compile_threads = _resolve_process_thread_count(
+        configured_compile_threads,
+        inherited_names=(
+            "STOCKAGENT_TORCH_COMPILE_THREADS",
+            "TORCHINDUCTOR_COMPILE_THREADS",
+        ),
+        local_world_size=world_size,
+        environ=env,
+        fallback=resolved_cpu_threads,
+    )
+    env["STOCKAGENT_TORCH_COMPILE_THREADS"] = str(resolved_compile_threads)
+    for env_name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        env[env_name] = str(resolved_cpu_threads)
     # Panel loading parallelizes across symbol files via panel_load_workers.
     # Keep Polars/Rayon inner pools small unless explicitly overridden, otherwise
     # DDP can multiply into workers * inner_threads * ranks.
     polars_threads = env.get("STOCKAGENT_POLARS_THREADS", "1")
     env["POLARS_MAX_THREADS"] = polars_threads
     env["RAYON_NUM_THREADS"] = polars_threads
-    env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", env.get("STOCKAGENT_TORCH_COMPILE_THREADS", "16"))
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = str(resolved_compile_threads)
 
     cmd = [
         sys.executable,
@@ -132,14 +134,72 @@ def _resolve_cpu_thread_count(raw: object | None) -> int | None:
     return threads
 
 
-def _configure_cpu_parallelism(*, cpu_threads: int | None, compile_threads: int | None) -> None:
-    resolved_cpu_threads = cpu_threads
-    if resolved_cpu_threads is None:
-        raw_env = os.environ.get("STOCKAGENT_CPU_THREADS")
-        if raw_env:
-            resolved_cpu_threads = _resolve_cpu_thread_count(raw_env)
-    if resolved_cpu_threads is None:
-        resolved_cpu_threads = max(1, int(os.cpu_count() or 1))
+def _available_cpu_count() -> int:
+    """Return this process's affinity-aware CPU capacity."""
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if callable(get_affinity):
+        try:
+            return max(1, len(get_affinity(0)))
+        except (OSError, TypeError):
+            pass
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _local_world_size(active_strategy: str | None = None) -> int:
+    if active_strategy is not None and active_strategy != "distributed_data_parallel":
+        return 1
+    raw = os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _resolve_process_thread_count(
+    configured_total: int | None,
+    *,
+    inherited_names: Sequence[str],
+    local_world_size: int,
+    environ: Mapping[str, str] | None = None,
+    fallback: int | None = None,
+) -> int:
+    """Resolve one rank's thread budget without multiplying host-wide pools.
+
+    Explicit config/CLI values are host-wide budgets and are divided across
+    local ranks. Inherited OMP/Inductor values are already process-local
+    contracts, so they are preserved. With neither, CPU affinity is divided by
+    LOCAL_WORLD_SIZE (not global WORLD_SIZE, which is wrong on multi-node jobs).
+    """
+    ranks = max(1, int(local_world_size))
+    if configured_total is not None:
+        return max(1, int(configured_total) // ranks)
+
+    source = os.environ if environ is None else environ
+    for name in inherited_names:
+        raw = source.get(name)
+        if raw is None:
+            continue
+        resolved = _resolve_cpu_thread_count(raw)
+        if resolved is not None:
+            return resolved
+
+    if fallback is not None:
+        return max(1, int(fallback))
+    return max(1, _available_cpu_count() // ranks)
+
+
+def _configure_cpu_parallelism(
+    *,
+    cpu_threads: int | None,
+    compile_threads: int | None,
+    local_world_size: int = 1,
+) -> None:
+    resolved_cpu_threads = _resolve_process_thread_count(
+        cpu_threads,
+        inherited_names=("STOCKAGENT_CPU_THREADS", "OMP_NUM_THREADS"),
+        local_world_size=local_world_size,
+    )
+    os.environ["STOCKAGENT_CPU_THREADS"] = str(resolved_cpu_threads)
 
     for env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[env_name] = str(resolved_cpu_threads)
@@ -159,13 +219,16 @@ def _configure_cpu_parallelism(*, cpu_threads: int | None, compile_threads: int 
         # Inter-op threads can only be set before parallel work starts.
         pass
 
-    resolved_compile_threads = compile_threads
-    if resolved_compile_threads is None:
-        raw_env = os.environ.get("STOCKAGENT_TORCH_COMPILE_THREADS")
-        if raw_env:
-            resolved_compile_threads = _resolve_cpu_thread_count(raw_env)
-    if resolved_compile_threads is None:
-        resolved_compile_threads = resolved_cpu_threads
+    resolved_compile_threads = _resolve_process_thread_count(
+        compile_threads,
+        inherited_names=(
+            "STOCKAGENT_TORCH_COMPILE_THREADS",
+            "TORCHINDUCTOR_COMPILE_THREADS",
+        ),
+        local_world_size=local_world_size,
+        fallback=resolved_cpu_threads,
+    )
+    os.environ["STOCKAGENT_TORCH_COMPILE_THREADS"] = str(resolved_compile_threads)
     os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(resolved_compile_threads)
     try:
         import torch._inductor.config as inductor_config  # type: ignore
@@ -250,21 +313,11 @@ def _maybe_init_distributed_for_panel(active_strategy: str, config) -> None:
     atexit.register(_destroy_distributed_at_exit)
 
 
-def _distributed_barrier() -> None:
-    if not _distributed_ready() or _distributed_world_size() <= 1:
-        return
-    if torch.cuda.is_available():
-        try:
-            torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
-            return
-        except TypeError:
-            pass
-    torch.distributed.barrier()
-
-
 def _build_panel_kwargs(config) -> dict:
+    use_tw_public_features = bool(config.data.use_tw_public_features)
+    use_tw_public_rules = bool(config.data.use_tw_public_rules)
+    use_tw_public_data = use_tw_public_features or use_tw_public_rules
     return {
-        "use_rapids": config.data.use_rapids,
         "benchmark_name": config.data.benchmark_name,
         "usd_only_trading_pairs": config.data.usd_only_trading_pairs,
         "tradable_mode": config.data.tradable_mode,
@@ -274,9 +327,12 @@ def _build_panel_kwargs(config) -> dict:
         "panel_backend": config.data.panel_backend,
         "panel_load_workers": config.data.panel_load_workers,
         "external_feature_path": (
-            config.data.tw_public_feature_path if config.data.use_tw_public_features else None
+            config.data.tw_public_feature_path if use_tw_public_data else None
         ),
         "external_market_symbol": config.data.tw_public_market_symbol,
+        "external_include_features": use_tw_public_features,
+        "external_include_rules": use_tw_public_rules,
+        "external_data_required": use_tw_public_data,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
     }
@@ -289,24 +345,75 @@ def _build_panel_rank_coordinated(build_panel, config, active_strategy: str):
 
     rank = _distributed_rank()
     world_size = _distributed_world_size()
+    panel = None
+    rank0_error: Exception | None = None
     if rank == 0:
         print(
             f"[panel-ddp] rank0 builds or loads panel cache first; "
             f"{world_size - 1} rank(s) wait to avoid duplicate materialization",
             flush=True,
         )
-        panel = build_panel(config.data.parquet_root, **kwargs)
-    else:
-        panel = None
+        try:
+            panel = build_panel(config.data.parquet_root, **kwargs)
+            if panel is None:
+                raise RuntimeError("rank0 panel builder returned None")
+        except Exception as exc:  # synchronize failure before any rank advances
+            rank0_error = exc
 
-    _distributed_barrier()
+    _raise_if_distributed_phase_failed("rank0_build", rank0_error)
+
+    worker_error: Exception | None = None
     if rank != 0:
         print(f"[panel-ddp] rank{rank} loading panel after rank0 cache barrier", flush=True)
-        panel = build_panel(config.data.parquet_root, **kwargs)
-    _distributed_barrier()
-    if panel is None:
-        raise RuntimeError("DDP panel build coordination failed to produce a panel")
+        try:
+            panel = build_panel(config.data.parquet_root, **kwargs)
+            if panel is None:
+                raise RuntimeError(f"rank{rank} panel loader returned None")
+        except Exception as exc:  # every rank reports before the shared decision
+            worker_error = exc
+
+    _raise_if_distributed_phase_failed("worker_cache_load", worker_error)
+    if panel is None:  # defensive: synchronized phases should make this unreachable
+        raise RuntimeError(f"DDP panel build produced no panel on rank {rank}")
     return panel
+
+
+def _raise_if_distributed_phase_failed(phase: str, local_error: Exception | None) -> None:
+    """Make every rank take the same error branch after a coordinated phase."""
+    if not _distributed_ready() or _distributed_world_size() <= 1:
+        if local_error is not None:
+            raise RuntimeError(
+                f"DDP panel phase {phase!r} failed: "
+                f"{type(local_error).__name__}: {local_error}"
+            ) from local_error
+        return
+
+    local_status = {
+        "rank": int(_distributed_rank()),
+        "phase": str(phase),
+        "ok": local_error is None,
+        "error": (
+            None
+            if local_error is None
+            else f"{type(local_error).__name__}: {local_error}"
+        ),
+    }
+    statuses: list[dict | None] = [None] * _distributed_world_size()
+    torch.distributed.all_gather_object(statuses, local_status)
+    failures = sorted(
+        (status for status in statuses if status is not None and not bool(status.get("ok"))),
+        key=lambda status: int(status.get("rank", -1)),
+    )
+    if not failures:
+        return
+    details = "; ".join(
+        f"rank{int(status.get('rank', -1))}: {status.get('error', 'unknown error')}"
+        for status in failures
+    )
+    message = f"DDP panel phase {phase!r} failed consistently across ranks ({details})"
+    if local_error is not None:
+        raise RuntimeError(message) from local_error
+    raise RuntimeError(message)
 
 
 def _set_global_seed(seed: int) -> None:
@@ -316,6 +423,27 @@ def _set_global_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _rank_seed(base_seed: int, rank: int) -> int:
+    # NumPy's legacy global RNG requires a 32-bit seed. The mapping remains
+    # stable across hosts and gives each DDP rank a distinct stochastic stream.
+    return (int(base_seed) + int(rank)) % (2**32)
+
+
+def _set_rank_local_seed(base_seed: int, active_strategy: str) -> int:
+    rank = (
+        _distributed_rank()
+        if active_strategy == "distributed_data_parallel" and _distributed_ready()
+        else 0
+    )
+    resolved = _rank_seed(base_seed, rank)
+    _set_global_seed(resolved)
+    print(
+        f"[runtime] rng_seed base={int(base_seed)} rank={rank} resolved={resolved}",
+        flush=True,
+    )
+    return resolved
 
 
 def parse_args() -> argparse.Namespace:
@@ -371,30 +499,25 @@ def parse_args() -> argparse.Namespace:
         "--cpu-threads",
         type=int,
         default=None,
-        help="Set PyTorch/BLAS CPU worker threads. Defaults to all logical CPUs.",
+        help=(
+            "Set a host-wide PyTorch/BLAS thread budget (divided across local DDP ranks). "
+            "Default: inherited OMP_NUM_THREADS, otherwise CPU affinity/local rank count."
+        ),
     )
     parser.add_argument(
         "--torch-compile-threads",
         type=int,
         default=None,
-        help="Set TorchInductor compile worker threads. Defaults to --cpu-threads/all logical CPUs.",
+        help=(
+            "Set a host-wide TorchInductor compile-thread budget (divided across local DDP ranks). "
+            "Default: inherited Inductor setting, otherwise the per-rank CPU budget."
+        ),
     )
     parser.add_argument(
         "--multi-gpu-strategy",
-        choices=("none", "data_parallel", "distributed_data_parallel", "ddp"),
+        choices=("none", "distributed_data_parallel", "ddp"),
         default=None,
         help="Override training.multi_gpu_strategy for efficiency A/B runs.",
-    )
-    parser.add_argument(
-        "--data-parallel-device-ids",
-        default=None,
-        help="Comma-separated CUDA device ids for DataParallel, e.g. 0,1.",
-    )
-    parser.add_argument(
-        "--data-parallel-threaded-replicas",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override STOCKAGENT_DP_THREADED_REPLICAS for the persistent compiled DataParallel wrapper.",
     )
     parser.add_argument("--batch-size-train", type=int, default=None, help="Override training.batch_size_train.")
     parser.add_argument("--batch-size-eval", type=int, default=None, help="Override training.batch_size_eval.")
@@ -409,12 +532,6 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override training.cache_eval_tensors_on_gpu.",
-    )
-    parser.add_argument(
-        "--compile-fused-log-utility-loss",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override training.compile_fused_log_utility_loss.",
     )
     parser.add_argument(
         "--explain-after-each-fold",
@@ -631,23 +748,20 @@ def main() -> None:
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
     _maybe_relaunch_for_ddp(config, args)
-    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
     config_strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
     cli_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = cli_strategy or config_strategy
     configured_cpu_threads = args.cpu_threads if args.cpu_threads is not None else config.environment.cpu_threads
-    if active_strategy == "distributed_data_parallel" and world_size > 1 and configured_cpu_threads is not None:
-        cpu_threads = max(1, int(configured_cpu_threads) // world_size)
-    else:
-        cpu_threads = configured_cpu_threads
     compile_threads = (
         args.torch_compile_threads
         if args.torch_compile_threads is not None
         else config.environment.torch_compile_threads
     )
-    if active_strategy == "distributed_data_parallel" and world_size > 1 and compile_threads is not None:
-        compile_threads = max(1, int(compile_threads) // world_size)
-    _configure_cpu_parallelism(cpu_threads=cpu_threads, compile_threads=compile_threads)
+    _configure_cpu_parallelism(
+        cpu_threads=configured_cpu_threads,
+        compile_threads=compile_threads,
+        local_world_size=_local_world_size(active_strategy),
+    )
 
     from stockagent.data.panel import build_panel
     from stockagent.data.walkforward import build_expanding_year_folds
@@ -657,21 +771,6 @@ def main() -> None:
         config.training.seed = int(args.seed)
     if args.multi_gpu_strategy is not None:
         config.training.multi_gpu_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
-        if config.training.multi_gpu_strategy == "none":
-            config.training.data_parallel_device_ids = []
-    if args.data_parallel_device_ids is not None:
-        ids = [
-            int(value.strip())
-            for value in str(args.data_parallel_device_ids).split(",")
-            if value.strip()
-        ]
-        config.training.data_parallel_device_ids = ids
-        if ids and (args.multi_gpu_strategy is None):
-            config.training.multi_gpu_strategy = "data_parallel"
-    if args.data_parallel_threaded_replicas is not None:
-        os.environ["STOCKAGENT_DP_THREADED_REPLICAS"] = (
-            "1" if bool(args.data_parallel_threaded_replicas) else "0"
-        )
     if args.batch_size_train is not None:
         if args.batch_size_train < 1:
             raise ValueError(f"--batch-size-train must be >= 1, got {args.batch_size_train}")
@@ -684,9 +783,6 @@ def main() -> None:
         config.training.cache_train_tensors_on_gpu = bool(args.cache_train_tensors_on_gpu)
     if args.cache_eval_tensors_on_gpu is not None:
         config.training.cache_eval_tensors_on_gpu = bool(args.cache_eval_tensors_on_gpu)
-    if args.compile_fused_log_utility_loss is not None:
-        config.training.compile_fused_log_utility_loss = bool(args.compile_fused_log_utility_loss)
-    _set_global_seed(int(config.training.seed))
     if args.epochs is not None:
         if args.epochs < 1:
             raise ValueError(f"--epochs must be >= 1, got {args.epochs}")
@@ -751,11 +847,8 @@ def main() -> None:
             int(args.explain_cross_asset_graph_plot_max_nodes),
         )
     if args.save_daily_weights_csv is not None:
-        config.training.save_daily_weights_csv = bool(args.save_daily_weights_csv)
         config.training.save_daily_weights_table = bool(args.save_daily_weights_csv)
     if args.save_integer_share_heavy_csv is not None:
-        config.training.save_integer_share_daily_weights_csv = bool(args.save_integer_share_heavy_csv)
-        config.training.save_integer_share_holdings_csv = bool(args.save_integer_share_heavy_csv)
         config.training.save_integer_share_daily_weights_table = bool(args.save_integer_share_heavy_csv)
         config.training.save_integer_share_holdings_table = bool(args.save_integer_share_heavy_csv)
     if args.save_daily_weights_table is not None:
@@ -788,6 +881,10 @@ def main() -> None:
         config.training.backtest_compile_dynamic = bool(args.backtest_compile_dynamic)
     _configure_cuda_runtime()
     _maybe_init_distributed_for_panel(active_strategy, config)
+    # DDP model parameters are synchronized by the DDP constructor later, but
+    # rank-local dropout/augmentation streams must not be identical. Seed only
+    # after process-group initialization so rank is authoritative.
+    _set_rank_local_seed(int(config.training.seed), active_strategy)
 
     # Keep runtime switches consistent with YAML config.
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if config.training.backtest_autotune else "0"
@@ -864,9 +961,9 @@ def main() -> None:
             json.dump([asdict(result) for result in results], handle, indent=2)
 
         for result in results:
-            configured_leverage = float(config.trading.leverage)
-            leveraged_sharpe = float(result.test_metrics.get("sharpe", 0.0))
-            leveraged_sortino = float(result.test_metrics.get("sortino", 0.0))
+            reporting_leverage = float(config.trading.reporting_leverage)
+            canonical_sharpe = float(result.test_metrics.get("sharpe", 0.0))
+            canonical_sortino = float(result.test_metrics.get("sortino", 0.0))
             print(
                 json.dumps(
                     {
@@ -875,9 +972,9 @@ def main() -> None:
                         "val_years": result.val_years,
                         "test_years": result.test_years,
                         "best_val_loss": result.best_val_loss,
-                        "configured_leverage": configured_leverage,
-                        "leveraged_sharpe": leveraged_sharpe,
-                        "leveraged_sortino": leveraged_sortino,
+                        "reporting_leverage_multiplier": reporting_leverage,
+                        "canonical_sharpe": canonical_sharpe,
+                        "canonical_sortino": canonical_sortino,
                         "test_metrics": result.test_metrics,
                     },
                     ensure_ascii=False,

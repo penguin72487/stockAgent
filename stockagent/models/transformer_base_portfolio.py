@@ -18,6 +18,7 @@ from stockagent.models.normalization import (
     masked_softmax,
     normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode, normalize_portfolio_output_mode
 from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, profile_range
 
 
@@ -511,9 +512,9 @@ class TransformerBasePortfolioModel(nn.Module):
         self.temporal_pooling = self._normalize_pooling(temporal_pooling)
         self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
         self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
-        self.portfolio_output_mode = self._normalize_portfolio_output_mode(portfolio_output_mode)
+        self.portfolio_output_mode = normalize_portfolio_output_mode(portfolio_output_mode)
         self.center_long_short_logits = bool(center_long_short_logits)
         self.max_full_tokens = int(max_full_tokens)
         self.checkpoint_blocks = bool(checkpoint_blocks)
@@ -717,62 +718,6 @@ class TransformerBasePortfolioModel(nn.Module):
         if normalized in {"last_only", "last_query_only"}:
             return "last_only"
         raise ValueError("temporal_query_mode must be 'full_then_last' or 'last_only'")
-
-    @staticmethod
-    def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-        normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-        if normalized in {"long", "long_only", "longonly"}:
-            return "long_only"
-        if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-            return "long_short"
-        raise ValueError("portfolio_mode must be 'long_only' or 'long_short'")
-
-    @staticmethod
-    def _normalize_portfolio_output_mode(mode: str) -> str:
-        normalized = str(mode).strip().lower().replace("-", "_")
-        if normalized in {
-            "activation_l1",
-            "activated_l1",
-            "activation",
-            "bounded_l1",
-            "bounded_activation_l1",
-            "default",
-        }:
-            return "activation_l1"
-        if normalized in {"l1", "raw_l1", "score_l1", "linear_l1", "identity_l1"}:
-            return "l1"
-        if normalized in {"logits", "raw_logits", "scores", "raw_scores", "score_logits"}:
-            return "logits"
-        if normalized in {"signed_softmax", "signed_action_softmax", "action_softmax"}:
-            return "signed_softmax"
-        if normalized in {"signed_sparsemax", "signed_action_sparsemax", "action_sparsemax", "sparsemax"}:
-            return "signed_sparsemax"
-        if normalized in {
-            "signed_entmax",
-            "signed_entmax15",
-            "signed_entmax_15",
-            "signed_action_entmax",
-            "signed_action_entmax15",
-            "action_entmax",
-            "action_entmax15",
-            "entmax",
-            "entmax15",
-            "entmax_15",
-        }:
-            return "signed_entmax15"
-        if normalized in {
-            "projection",
-            "projection_l1",
-            "l1_projection",
-            "project_l1",
-            "differentiable_projection",
-            "differentiable_l1_projection",
-        }:
-            return "projection_l1"
-        raise ValueError(
-            "portfolio_output_mode must be 'activation_l1', 'l1', 'logits', "
-            "'signed_softmax', 'signed_sparsemax', 'signed_entmax15', or 'projection_l1'"
-        )
 
     def _check_symbol_indices(self, symbol_indices: torch.Tensor | None, n_symbols: int) -> None:
         if symbol_indices is None:
@@ -1155,7 +1100,10 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
+        h = self._apply_temporal_blocks(
+            h,
+            keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
+        )
         h = self._apply_cross_blocks(h, safe_mask)
         aux = {"token_embedding": h} if collect_aux else {}
         return self._pool_temporal(h, safe_mask), aux
@@ -1167,7 +1115,10 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
+        h = self._apply_temporal_blocks(
+            h,
+            keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
+        )
         aux = {"token_embedding": h} if collect_aux else {}
         return self._pool_temporal(h, safe_mask), aux
 
@@ -1179,7 +1130,10 @@ class TransformerBasePortfolioModel(nn.Module):
         use_latent: bool,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
+        h = self._apply_temporal_blocks(
+            h,
+            keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
+        )
         z_base = self._pool_temporal(h, safe_mask)
         bsz = int(h.size(0))
         aux: dict[str, torch.Tensor] = {}
@@ -1239,7 +1193,10 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         collect_aux: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        h = self._apply_temporal_blocks(h, keep_all_steps=collect_aux)
+        h = self._apply_temporal_blocks(
+            h,
+            keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
+        )
         z_base = self._pool_temporal(h, safe_mask)
         bsz = int(h.size(0))
         aux: dict[str, torch.Tensor] = {}

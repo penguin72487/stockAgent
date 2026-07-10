@@ -187,10 +187,12 @@ class BottleneckPortfolioAutoencoder(nn.Module):
 
     @staticmethod
     def _safe_attention_mask(mask_bool: torch.Tensor) -> torch.Tensor:
-        torch._assert(
-            mask_bool.any(dim=1).all(),
-            "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row",
-        )
+        condition = mask_bool.any(dim=1).all()
+        message = "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row"
+        if torch.compiler.is_compiling():
+            torch._assert_async(condition, message)
+        else:
+            torch._assert(condition, message)
         return mask_bool
 
     def _encode_temporal(self, embedded: torch.Tensor) -> torch.Tensor:

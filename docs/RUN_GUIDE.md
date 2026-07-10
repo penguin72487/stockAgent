@@ -1,327 +1,236 @@
-# 🎯 修復後的執行指南
+# stockAgent 執行指南
 
-## 快速檢查清單 ✅
+本指南只描述目前程式實際支援的入口與合約。模型超參數與效能數字應以
+各市場 YAML、當前資料與硬體重新量測，不把歷史 benchmark 當成保證。
 
-在運行訓練之前，請確認以下項目:
+## 1. 載入可攜式環境
 
-- [x] 所有 5 個 Bug 已修復
-- [x] 語法檢查通過
-- [x] 驗證腳本通過
-- [ ] 環境已設置 (fintech conda env)
-- [ ] GPU 可用 (如果使用 CUDA)
+所有機器都從專案根目錄解析 runtime，不使用固定的使用者家目錄：
 
----
-
-## 🚀 開始訓練
-
-### 方式 1: 使用腳本 (推薦)
 ```bash
-cd /root/stockAgent
-
-# 激活環境
-mamba activate fintech
-# 或
-conda activate fintech
-
-# 直接運行
-./coda_runner.sh
+cd /path/to/stockAgent
+source scripts/runtime_env.sh
+run_fintech_python scripts/check_environment.py --require-cuda --strict
 ```
 
-### 方式 2: 直接命令
+`run_fintech_python` 會尋找 `fintech` Conda/Mamba 環境並把該環境的 `bin`
+放到 `PATH` 前端，讓 PyTorch/Triton 使用同一套 Python、CUDA 與 `ptxas`。
+非標準安裝位置可用下列任一方式覆寫：
+
 ```bash
-python train.py \
-  --config configs/experiment_baseline.yaml \
-  --output-dir artifacts
+export FINTECH_ENV_PATH=/path/to/fintech
+source scripts/runtime_env.sh
+# 或改用：export PYTHON_BIN=/path/to/python
 ```
 
-### 方式 3: 自定義配置
+訓練設定要求 CUDA 時，檢查失敗就應修復環境，不應靜默改用 CPU。
+
+## 2. 更新台股公開規則資料
+
+一般公開資料與官方下市公司歷史：
+
 ```bash
-# 創建新配置 (可選)
-cp configs/experiment_baseline.yaml configs/experiment_v2.yaml
-
-# 編輯配置
-vim configs/experiment_v2.yaml
-
-# 運行
-python train.py --config configs/experiment_v2.yaml --output-dir artifacts_v2
+run_fintech_python downloader/download_tw_public_data.py \
+  --mode daily-update \
+  --datasets all \
+  --output-dir data_tw_public
 ```
 
----
+下市、停止融券與強制回補等 point-in-time 公告有獨立下載器。第一次建置
+建議回補完整官方可得範圍；日常批次會只抓當年：
 
-## 📊 預期輸出
-
-### 訓練過程
-```
-[runtime] device=cuda cuda_available=True num_gpus=1
-[panel] loading cache (valid): data_parquet/panel_cache.npz
-[panel] feature normalization: mean=-0.000001, std=1.000000
-[Fold 1]  train=[2015] val=[2016] test=[2017-2026]
-[batch search] single sample: 125.5MB, target: 10.2GB, range: [1, 81]
-  ✅ batch_size 40: 8.5GB OK
-  ❌ batch_size 60: 11.2GB exceeds
-  [batch search] final result: 40
-[Fold 1] using batch_size train=40 val=80 test=80
-
-Fold 1 Epochs: 100%|████████| 100/100 [2h 15m<00:00, 1m 22s/it]
-  [val]   IC=+0.0524  IC_IR=+0.2341  sharpe=+0.8234  cum_ret=+0.1243  excess=+0.0434
-  [test]  IC=+0.0501  IC_IR=+0.2156  sharpe=+0.7891  cum_ret=+0.1102  excess=+0.0387
+```bash
+run_fintech_python downloader/download_tw_short_sale_restrictions.py \
+  --output-dir data_tw_public \
+  --start-year 1995 \
+  --end-year "$(date +%Y)"
 ```
 
-### 最終輸出
+此下載器預設採嚴格模式。任何實際請求失敗時會更新
+`data_tw_public/tw_short_sale_download_report.json`，但不會以部分結果覆蓋
+既有 parquet；只有明確接受不完整資料時才可加 `--allow-partial`。
+
+報告中的 `requests_complete` 與 `complete` 要分開解讀：前者表示所有官方
+可請求月份均成功；後者也要求官方端點涵蓋整個要求年代。TPEx 月公告檔自
+2002-11、TWSE 公告檔自 2018-01 才可查，因此回補 1995 年起時，即使網路
+失敗為 0，`complete` 仍會如實為 false；不可用下市日期反推公告日，否則
+會造成 look-ahead bias。
+
+下載完成後重建同一份 sparse daily parquet；執行規則與可選的模型特徵都
+由這份輸出依設定取用：
+
+```bash
+run_fintech_python scripts/build_tw_public_training_features.py \
+  --input-dir data_tw_public \
+  --output-path data_tw_public/features/tw_public_stock_daily.parquet \
+  --symbols-root data_yahoo/tw_stocks
 ```
-artifacts/
-├── summary.json                    # 所有 fold 結果
+
+`data.use_tw_public_rules` 與 `data.use_tw_public_features` 是兩個不同開關：
+
+- `use_tw_public_rules: true` 只套用執行遮罩，缺檔會直接失敗。
+- `use_tw_public_features: true` 才會把 `twpub_*` 欄位加入模型輸入。
+- 官方 `櫃轉市` 與下一交易日同代號續掛不屬於 terminal exit；官方每日
+  成交資料的多年空窗也不等於停牌。這兩者都已在 panel 規則層明確區分。
+- `downloader/run_daily_all_markets.sh` 預設會依序更新規則並重建特徵；可用
+  `RUN_TW_SHORT_RESTRICTIONS=0` 或 `RUN_TW_PUBLIC_FEATURES=0` 個別停用。
+
+## 3. 啟動訓練
+
+單 GPU／單程序：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python train.py --config configs/markets/tw.yaml
+```
+
+臨時覆寫輸出位置、fold 與 epoch：
+
+```bash
+run_fintech_python train.py \
+  --config configs/markets/tw.yaml \
+  --output-dir artifacts/tw_probe \
+  --start-fold 1 \
+  --max-folds 1 \
+  --epochs 2 \
+  --profile-timing
+```
+
+多 GPU 使用 torchrun DDP，一張 GPU 對應一個程序：
+
+```bash
+run_fintech_python -m torch.distributed.run \
+  --standalone \
+  --nproc_per_node=2 \
+  train.py \
+  --config configs/markets/tw.yaml \
+  --multi-gpu-strategy distributed_data_parallel
+```
+
+DDP 目前支援不需要模型 auxiliary tensors 的 canonical return-series
+objectives；若 objective 需要 aux，請使用單程序路徑。手動指定的全域
+`batch_size_train` 必須可被 world size 整除。
+
+## 4. 刻意保留的 walk-forward 語義
+
+以下不是待修 bug，請勿為了讓日期看起來整齊而改掉：
+
+- `walk_forward.require_future_test_year: false` 會增加最後一個實驗 fold，
+  並刻意讓該 fold 的 validation 與 test 使用同一期間。它適合最新年度
+  實驗，不是無偏的模型選擇結果。
+- 每個 split 的 lookback 必須完整落在該 split 裡。`lookback: 32` 因此
+  刻意丟掉每個 split 的前 31 個交易日，第一筆樣本是第 32 個交易日。
+- stitched deployment test 會把下一個模型尚未累積完 lookback 的 warmup
+  日期留給上一個模型，避免在跨 fold 曲線產生日期缺口。
+
+## 5. 目前 executor 邊界
+
+訓練路徑只有下列演算法邊界：
+
+- 神經網路單程序：一個 lazy `WindowedSplitTensors` executor。
+- 神經網路 DDP：每個 rank 使用同一份 lazy-window 語義並同步 canonical
+  return-series loss/backtest state。
+- LightGBM/XGBoost：獨立的 CPU materialized fit/evaluation route。
+
+神經網路 executor 內，連續且固定形狀的 batch 優先使用
+`forward_from_panel_slab`；不連續、需要 auxiliary outputs，或模型不支援
+slab 時才在同一 executor 內 materialize window。兩者共用同一個
+`risk_aware_loss`、`run_backtest_torch`、費率、交易遮罩與跨 chunk state，
+不是兩套損益公式。固定 batch padding 由 `sample_mask` 排除，不應改變 loss。
+
+`torch.compile` 可花超過十分鐘建立目前形狀的圖；是否值得應比較第二個
+epoch 之後的穩態時間。改 batch、symbol 數或 chunk shape 可能觸發新圖。
+
+## 6. 交易規則與槓桿語義
+
+- `can_sell_mask`：是否能減少既有多頭。
+- `can_short_open_mask`：是否能新增或增加借券空頭。
+- 兩者不能合併；禁止放空不等於禁止賣出自己持有的股票。
+- 一般停牌、缺值、零成交量與漲跌停單側限制會凍結受影響部位。
+- 只有明確的官方永久退出事件才設 `force_exit_mask`，並依平多或回補空頭
+  計入相應的賣出或買進手續費。
+- 官方回補期限由 `force_short_cover_mask` 表示，和永久退出是不同事件。
+
+Canonical train/validation/test tensor backtest 與整股 audit 的 gross exposure
+固定為 `1.0`。`trading.reporting_leverage` 只是報表後處理倍率，只影響
+`leverage_*` 圖；程式會在縮放後重新計算 turnover 與買賣費用。它不會
+回頭改變 checkpoint 選擇、canonical metrics 或模型梯度，但仍屬於完整
+設定快照／稽核指紋。它不屬於語義 resume gate，因此可用同一模型重產不同
+倍率報表；報表必須保留所用倍率，不能把它誤寫成訓練曝險。
+
+## 7. Checkpoint、恢復與輸出
+
+`--resume`（或 YAML 的 `runner.resume`）會讀取 checkpoint；`--no-resume`
+可明確關閉。恢復前會驗證資料內容、執行遮罩、前處理、設定與 fold 語義
+指紋，避免拿不相容的 checkpoint 繼續訓練。
+
+Schema 4 checkpoint 同時保存完整設定快照／指紋供稽核，以及分層的
+data、model、training、evaluation、trading、walk-forward 語義指紋供恢復
+判定。輸出路徑、cache 位置、compile/chunk/VRAM 等機器本地執行選項不會
+阻止跨電腦恢復；實際模型、資料、費率、fold 或有效 global batch 改變仍會
+拒絕。DDP checkpoint 會保存每個 rank 的 RNG；增加 rank 時產生不同且穩定
+的衍生 stream，不複製既有 rank 的隨機序列。
+
+Canonical backtest contract 目前是 version 2：成交後持倉會依資產報酬與淨
+費用做 mark-to-market，並攜帶 absorbing `alive` 狀態跨 batch/chunk。舊的
+schema 4（version 1／未記錄版本）checkpoint 仍可載入模型做 inference，
+但不能 resume optimizer，避免在不同報酬與 turnover 數學下靜默續訓。
+
+主要輸出如下；實際表格格式由 YAML 決定：
+
+```text
+<output_dir>/
+├── summary.json
 ├── fold_01/
-│   ├── model_best.pt             # 最佳模型
-│   ├── predictions_val.npy
-│   ├── predictions_test.npy
+│   ├── checkpoint_best.pt
+│   ├── checkpoint_last.pt
+│   ├── metrics.json
+│   ├── fold_complete.json
+│   ├── test_backtest.npz
+│   ├── annual_report.txt
 │   ├── equity_curve.png
-│   └── annual_report.txt
-├── fold_02/
-├── ...
-└── fold_N/
+│   └── leverage_equity_curve.png
+└── train_<years>/
+    └── epoch_curve.jsonl
 ```
 
----
+Tree models 另有 `fold_XX/model.pt`。大型 daily weights／holdings 表是否寫出
+以及 CSV/Parquet 格式，由 `training.save_*_table` 與
+`training.table_output_format` 控制。
 
-## 🔍 監控訓練
+## 8. 監控與除錯
 
-### 實時日誌
+先找出實際 group curve，再追蹤它；不要假設存在 `training.log`：
+
 ```bash
-# 監控最新 fold 的訓練
-tail -f artifacts/fold_*/training.log
-
-# 或監控 stdout
-# (訓練時會持續打印進度)
+find artifacts -path '*/train_*/epoch_curve.jsonl' -print
+tail -f artifacts/<experiment>/train_<years>/epoch_curve.jsonl
 ```
 
-### 檢查結果
+效能調整以完整 epoch wall time 為準，並同時檢查 train、validation、test
+curve、plot、checkpoint 與 reporting。常見處理：
+
+- OOM：先降低 `batch_size_train`、`batch_size_eval` 或 eval chunk cap；只有
+  設定 `training.auto_batch_size: true` 時才會自動搜尋批次。
+- compile 失敗：先看環境檢查中的 `ptxas`、編譯器與 CUDA roots；
+  `strict_no_fallback: true` 會刻意拒絕靜默切回 eager。
+- 找不到資料：核對 YAML 的 `data.parquet_root`；TW rules 開啟時也要核對
+  `data.tw_public_feature_path` 並先完成第 2 節的 rebuild。
+- checkpoint 拒絕恢復：閱讀 mismatch 訊息；不要繞過資料／設定指紋，應
+  使用相容資料設定或另開輸出目錄重新訓練。
+
+## 9. 驗證
+
 ```bash
-# 查看摘要 (JSON 格式)
-python -c "import json; print(json.dumps(json.load(open('artifacts/summary.json')), indent=2))"
-
-# 或用 jq (如果已安裝)
-jq . artifacts/summary.json
+source scripts/runtime_env.sh
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+run_fintech_python -m py_compile \
+  stockagent/config.py \
+  stockagent/training/trainer.py \
+  stockagent/training/loss.py \
+  stockagent/backtest/simulator.py
+run_fintech_python -m pytest -q -s test
 ```
 
-### 驗證性能改進
-```bash
-# 對比修復前後的指標 (如果有備份)
-# 檢查點:
-# 1. 訓練時間: 應減少 50-70% (更快)
-# 2. Sharpe 比率: 應增加 5-15% (更穩定)
-# 3. IC 信息係數: 應增加 10-20% (更有效)
-```
-
----
-
-## ⚙️ 配置建議
-
-### 如果訓練很慢 (< 1 GPU 利用率)
-修改 `configs/experiment_baseline.yaml`:
-```yaml
-training:
-  num_workers: 32          # 增加到 CPU 核心數
-  batch_size: 2048         # 增加批次大小
-  epochs: 50               # 減少 epoch 數測試
-```
-
-### 如果訓練出現 OOM
-不需要手動調整 - 自適應批次大小會自動處理:
-1. 系統會執行二分搜索
-2. 自動找到最大安全批次大小
-3. 並相應調整
-
-### 如果訓練收斂太慢
-```yaml
-training:
-  learning_rate: 0.01      # 增加 10 倍
-  gamma_sharpe: 2.0        # 增加 Sharpe 權重
-  weight_decay: 1e-4       # 增加正則化
-```
-
----
-
-## 🐛 故障排除
-
-### 問題 1: ImportError
-```
-ModuleNotFoundError: No module named 'stockagent'
-```
-**解決方案:**
-```bash
-# 確保在正確的目錄
-cd /root/stockAgent
-python train.py ...
-
-# 或添加到 PYTHONPATH
-export PYTHONPATH=/root/stockAgent:$PYTHONPATH
-```
-
-### 問題 2: CUDA 不可用
-```
-RuntimeError: CUDA was requested but torch.cuda.is_available() is False
-```
-**解決方案:**
-```bash
-# 檢查 GPU
-nvidia-smi
-
-# 修改配置使用 CPU
-sed -i 's/device: cuda/device: cpu/' configs/experiment_baseline.yaml
-```
-
-### 問題 3: 找不到 Parquet 文件
-```
-FileNotFoundError: No parquet files found under data_parquet
-```
-**解決方案:**
-```bash
-# 檢查數據目錄
-ls -la data_parquet/ | grep parquet
-
-# 若沒有，從源數據生成
-# (參見 docs/training_spec.md)
-```
-
----
-
-## 📈 性能基準
-
-### 修復前 (舊代碼)
-```
-訓練時間/fold:   ~6 小時
-GPU 利用率:       ~50%
-Sharpe (平均):    0.65
-IC (平均):        0.040
-OOM 頻率:         每 3 fold 發生 1 次
-```
-
-### 修復後 (新代碼)
-```
-訓練時間/fold:   ~2 小時      ⬇️ -67%
-GPU 利用率:       ~85%        ⬆️ +70%
-Sharpe (平均):    0.75        ⬆️ +15%
-IC (平均):        0.048       ⬆️ +20%
-OOM 頻率:         幾乎不發生   ✅
-```
-
----
-
-## 💾 保存結果
-
-### 備份訓練結果
-```bash
-# 創建帶時間戳的備份
-mkdir -p backups
-cp -r artifacts backups/artifacts_$(date +%Y%m%d_%H%M%S)
-
-# 或壓縮
-tar czf backups/artifacts_$(date +%Y%m%d).tar.gz artifacts
-```
-
-### 提取模型
-```bash
-# 複製最佳模型
-cp artifacts/fold_01/model_best.pt ./model_best_fold01.pt
-
-# 或全部 fold
-for i in {01..15}; do
-    cp artifacts/fold_$i/model_best.pt ./model_best_fold_$i.pt
-done
-```
-
----
-
-## 🔬 驗證修復
-
-### 驗證梯度穩定性
-```python
-import torch
-from stockagent.training.loss import sharpe_aware_loss
-
-# 測試代碼
-weights = torch.randn(32, 100, requires_grad=True)
-returns = torch.randn(32, 100)
-mask = torch.ones(32, 100, dtype=torch.bool)
-
-loss = sharpe_aware_loss(weights, returns, mask)
-loss.backward()
-grad_norm = weights.grad.norm()
-
-assert grad_norm < 100, f"梯度過大: {grad_norm}"
-print(f"✅ 梯度正常: {grad_norm:.2f}")
-```
-
-### 驗證特徵標準化
-```python
-from stockagent.data.panel import build_panel
-
-panel = build_panel("data_parquet")
-feature_mean = panel.features.mean()
-feature_std = panel.features.std()
-
-print(f"特徵平均值: {feature_mean:.6f} (應接近 0)")
-print(f"特徵標準差: {feature_std:.6f} (應接近 1)")
-
-assert abs(feature_mean) < 0.01, "特徵未正確標準化"
-assert abs(feature_std - 1.0) < 0.1, "特徵標準差不對"
-```
-
----
-
-## 📚 相關文檔
-
-- **ARCHITECTURE_REVIEW.md** - 完整架構分析與 8 個 Bug 詳解
-- **FIXES_IMPLEMENTATION.md** - 每個修復的代碼實現細節
-- **FIXES_COMPLETED.md** - 修復完成報告
-- **CODE_ORGANIZATION.md** - 代碼組織建議
-- **verify_fixes.py** - 自動驗證腳本
-
----
-
-## ✉️ 常見問題
-
-**Q: 修復會改變模型權重嗎?**  
-A: 是的。特徵標準化等修復會改變輸入，需要重新訓練。
-
-**Q: 舊模型還能用嗎?**  
-A: 不建議。新特徵格式與舊模型不兼容。建議重新訓練。
-
-**Q: 需要改變配置嗎?**  
-A: 不需要。所有修復都向後兼容，自動啟用。
-
-**Q: 修復需要多長時間?**  
-A: 無 - 已完成。現在可以直接訓練。
-
-**Q: 能否回滾?**  
-A: 可以通過 git 恢復舊代碼: `git checkout HEAD~1 stockagent/`
-
----
-
-## 🎉 下一步
-
-1. **立即運行:**
-   ```bash
-   python train.py --config configs/experiment_baseline.yaml
-   ```
-
-2. **監控進度:**
-   - 觀察批次搜索的結果
-   - 檢查訓練速度改進
-   - 驗證 Sharpe 比率上升
-
-3. **評估改進:**
-   - 對比修復前後的 summary.json
-   - 檢查訓練時間縮短
-   - 驗證準確度提高
-
-4. **後續優化** (可選):
-   - 嘗試更大的批次大小
-   - 調整 learning rate
-   - 實施梯度檢查點
-
----
-
-**準備好了嗎?運行 `python train.py` 開始享受 80% 的速度提升吧!** 🚀
-
+正式測試應限定在維護中的 `test/` 目錄。涉及 compile 或 DDP 的變更，還
+需要以實際 GPU、固定 shape 與至少第二個 epoch 的數據驗證。

@@ -202,8 +202,6 @@ def _build_command(args: argparse.Namespace, seed: int, output_dir: Path) -> lis
         command.extend(["--epochs", str(args.epochs)])
     if args.multi_gpu_strategy:
         command.extend(["--multi-gpu-strategy", args.multi_gpu_strategy])
-    if args.data_parallel_device_ids:
-        command.extend(["--data-parallel-device-ids", args.data_parallel_device_ids])
     return command
 
 
@@ -226,7 +224,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-fail", action="store_true")
     parser.add_argument("--multi-gpu-strategy", default=None)
-    parser.add_argument("--data-parallel-device-ids", default=None)
     return parser.parse_args()
 
 

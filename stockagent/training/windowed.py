@@ -22,6 +22,7 @@ class WindowedSplitTensors:
     volume_notional: torch.Tensor | None = None
     can_short_open_mask: torch.Tensor | None = None
     force_short_cover_mask: torch.Tensor | None = None
+    force_exit_mask: torch.Tensor | None = None
     sample_mask: torch.Tensor | None = None
     symbol_indices: torch.Tensor | None = None
     _window_offsets: torch.Tensor = field(init=False, repr=False)
@@ -48,9 +49,11 @@ class WindowedSplitTensors:
                 f"{tuple(self.volume_notional.shape)} != {tuple(self.future_log_returns.shape)}"
             )
         if self.can_short_open_mask is None:
-            self.can_short_open_mask = self.can_sell_mask
+            self.can_short_open_mask = self.can_sell_mask.clone()
         if self.force_short_cover_mask is None:
             self.force_short_cover_mask = torch.zeros_like(self.tradable_mask, dtype=torch.bool)
+        if self.force_exit_mask is None:
+            self.force_exit_mask = torch.zeros_like(self.tradable_mask, dtype=torch.bool)
         if self.symbol_indices is not None:
             self.symbol_indices = self.symbol_indices.detach().to(device=self.features.device, dtype=torch.long)
             if self.symbol_indices.dim() != 1:
@@ -149,6 +152,7 @@ class WindowedSplitTensors:
             ),
             can_short_open_mask=self.can_short_open_mask.to(device=device, non_blocking=non_blocking),
             force_short_cover_mask=self.force_short_cover_mask.to(device=device, non_blocking=non_blocking),
+            force_exit_mask=self.force_exit_mask.to(device=device, non_blocking=non_blocking),
             sample_mask=(
                 None if self.sample_mask is None else self.sample_mask.to(device=device, non_blocking=non_blocking)
             ),
@@ -180,6 +184,7 @@ class WindowedSplitTensors:
             volume_notional=None if self.volume_notional is None else _pin(self.volume_notional),
             can_short_open_mask=_pin(self.can_short_open_mask),
             force_short_cover_mask=_pin(self.force_short_cover_mask),
+            force_exit_mask=_pin(self.force_exit_mask),
             sample_mask=None if self.sample_mask is None else _pin(self.sample_mask),
             symbol_indices=None if self.symbol_indices is None else _pin(self.symbol_indices),
         )
@@ -211,6 +216,7 @@ class WindowedSplitTensors:
             ),
             can_short_open_mask=self.can_short_open_mask.index_select(1, local_indices),
             force_short_cover_mask=self.force_short_cover_mask.index_select(1, local_indices),
+            force_exit_mask=self.force_exit_mask.index_select(1, local_indices),
             sample_mask=self.sample_mask,
             symbol_indices=original_indices,
         )
@@ -258,6 +264,7 @@ class WindowedSplitTensors:
             volume_notional=None if self.volume_notional is None else _pad_symbol_dim(self.volume_notional, 0.0),
             can_short_open_mask=_pad_symbol_dim(self.can_short_open_mask, False),
             force_short_cover_mask=_pad_symbol_dim(self.force_short_cover_mask, False),
+            force_exit_mask=_pad_symbol_dim(self.force_exit_mask, False),
             sample_mask=self.sample_mask,
             symbol_indices=padded_symbol_indices,
         )
@@ -283,6 +290,7 @@ class WindowedSplitTensors:
             volume_notional=self.volume_notional,
             can_short_open_mask=self.can_short_open_mask,
             force_short_cover_mask=self.force_short_cover_mask,
+            force_exit_mask=self.force_exit_mask,
             sample_mask=self.sample_mask,
             symbol_indices=clamped_indices,
         )
@@ -358,6 +366,7 @@ class WindowedSplitTensors:
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
         force_short_cover_mask = self.force_short_cover_mask[date_idx]
+        force_exit_mask = self.force_exit_mask[date_idx]
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         return {
             "x": self._to_device(x, device, non_blocking, prepare_timing),
@@ -377,6 +386,7 @@ class WindowedSplitTensors:
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
             "force_short_cover_mask": self._to_device(force_short_cover_mask, device, non_blocking, prepare_timing),
+            "force_exit_mask": self._to_device(force_exit_mask, device, non_blocking, prepare_timing),
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "sample_mask": self._to_device(sample_mask, device, non_blocking, prepare_timing),
         }
@@ -411,6 +421,7 @@ class WindowedSplitTensors:
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
         force_short_cover_mask = self.force_short_cover_mask[date_idx]
+        force_exit_mask = self.force_exit_mask[date_idx]
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
@@ -437,6 +448,7 @@ class WindowedSplitTensors:
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
             "force_short_cover_mask": self._to_device(force_short_cover_mask, device, non_blocking, prepare_timing),
+            "force_exit_mask": self._to_device(force_exit_mask, device, non_blocking, prepare_timing),
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "sample_mask": self._to_device(sample_mask, device, non_blocking, prepare_timing),
         }
@@ -467,6 +479,7 @@ class WindowedSplitTensors:
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
         force_short_cover_mask = self.force_short_cover_mask[date_idx]
+        force_exit_mask = self.force_exit_mask[date_idx]
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         timer = self._prepare_timer_start()
         future_log_returns = self.future_log_returns[date_idx]
@@ -493,6 +506,7 @@ class WindowedSplitTensors:
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
             "force_short_cover_mask": self._to_device(force_short_cover_mask, device, non_blocking, prepare_timing),
+            "force_exit_mask": self._to_device(force_exit_mask, device, non_blocking, prepare_timing),
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "sample_mask": self._to_device(sample_mask, device, non_blocking, prepare_timing),
         }
@@ -525,6 +539,7 @@ class WindowedSplitTensors:
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
         force_short_cover_mask = self.force_short_cover_mask.narrow(0, date_start, rows)
+        force_exit_mask = self.force_exit_mask.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         return {
             "x": self._to_device(x, device, non_blocking, prepare_timing),
@@ -544,6 +559,7 @@ class WindowedSplitTensors:
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
             "force_short_cover_mask": self._to_device(force_short_cover_mask, device, non_blocking, prepare_timing),
+            "force_exit_mask": self._to_device(force_exit_mask, device, non_blocking, prepare_timing),
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "sample_mask": self._to_device(sample_mask, device, non_blocking, prepare_timing),
         }
@@ -582,6 +598,7 @@ class WindowedSplitTensors:
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
         force_short_cover_mask = self.force_short_cover_mask.narrow(0, date_start, rows)
+        force_exit_mask = self.force_exit_mask.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         return {
             "date_indices": self._to_device(date_indices, device, non_blocking, prepare_timing),
@@ -603,6 +620,7 @@ class WindowedSplitTensors:
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
             "force_short_cover_mask": self._to_device(force_short_cover_mask, device, non_blocking, prepare_timing),
+            "force_exit_mask": self._to_device(force_exit_mask, device, non_blocking, prepare_timing),
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "sample_mask": self._to_device(sample_mask, device, non_blocking, prepare_timing),
         }
@@ -642,6 +660,7 @@ class WindowedSplitTensors:
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
         force_short_cover_mask = self.force_short_cover_mask.narrow(0, date_start, rows)
+        force_exit_mask = self.force_exit_mask.narrow(0, date_start, rows)
         self._prepare_timer_stop(prepare_timing, "mask_build", timer)
         return {
             "feature_slab": self._to_device(feature_slab, device, non_blocking, prepare_timing),
@@ -661,8 +680,110 @@ class WindowedSplitTensors:
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
             "force_short_cover_mask": self._to_device(force_short_cover_mask, device, non_blocking, prepare_timing),
+            "force_exit_mask": self._to_device(force_exit_mask, device, non_blocking, prepare_timing),
             "benchmark": self._to_device(benchmark, device, non_blocking, prepare_timing),
             "sample_mask": self._to_device(sample_mask, device, non_blocking, prepare_timing),
+        }
+
+    def _panel_slab_batch_from_padded_tail(
+        self,
+        start: int,
+        end: int,
+        device: torch.device,
+        non_blocking: bool,
+        prepare_timing: Any | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        """Build one fixed-shape slab for the final sample-masked train batch.
+
+        The leading rows are the original contiguous observations.  Synthetic
+        feature rows only produce outputs whose sample mask is false, so they
+        cannot affect the valid loss or recurrent state consumed by another
+        batch.  Keeping the slab shape fixed avoids a second generic gather
+        graph solely for the padded epoch tail.
+        """
+        rows = int(end) - int(start)
+        real_rows = self._contiguous_prefix_len - int(start)
+        if (
+            rows <= 0
+            or real_rows <= 0
+            or real_rows >= rows
+            or self.sample_mask is None
+            or int(end) > len(self)
+        ):
+            return None
+        sample_mask_cpu = self.sample_mask[int(start) : int(end)].detach().to(device="cpu", dtype=torch.bool)
+        if not bool(sample_mask_cpu[:real_rows].all()) or bool(sample_mask_cpu[real_rows:].any()):
+            return None
+
+        date_start = self._first_valid_index + int(start)
+        feature_start = date_start - self.lookback + 1
+        source_rows = real_rows + self.lookback - 1
+        if feature_start < 0 or feature_start + source_rows > int(self.features.size(0)):
+            return None
+
+        timer = self._prepare_timer_start()
+        real_slab = self.features.narrow(0, feature_start, source_rows)
+        pad_rows = rows - real_rows
+        feature_slab = torch.cat(
+            (real_slab, real_slab[-1:].expand(pad_rows, *real_slab.shape[1:])),
+            dim=0,
+        ).contiguous()
+        self._prepare_timer_stop(prepare_timing, "window_slice", timer)
+
+        metadata = self._batch_metadata_from_row_range(
+            start,
+            end,
+            device,
+            non_blocking,
+            prepare_timing=prepare_timing,
+        )
+        metadata.pop("date_indices", None)
+        metadata.pop("date_start", None)
+        metadata.pop("rows_are_contiguous", None)
+        return {
+            "feature_slab": self._to_device(feature_slab, device, non_blocking, prepare_timing),
+            **metadata,
+        }
+
+    def _panel_slab_batch_from_padded_rows(
+        self,
+        start: int,
+        end: int,
+        device: torch.device,
+        non_blocking: bool,
+        prepare_timing: Any | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        """Build a fixed-shape harmless slab for a DDP shard containing only padding."""
+        rows = int(end) - int(start)
+        if rows <= 0 or self.sample_mask is None or int(end) > len(self):
+            return None
+        sample_mask_cpu = self.sample_mask[int(start) : int(end)].detach().to(device="cpu", dtype=torch.bool)
+        if bool(sample_mask_cpu.any()):
+            return None
+
+        last_date = int(self._valid_indices_cpu[self._contiguous_prefix_len - 1].item())
+        if last_date < 0 or last_date >= int(self.features.size(0)):
+            return None
+        timer = self._prepare_timer_start()
+        feature_slab = self.features[last_date : last_date + 1].expand(
+            rows + self.lookback - 1,
+            *self.features.shape[1:],
+        ).contiguous()
+        self._prepare_timer_stop(prepare_timing, "window_slice", timer)
+
+        metadata = self._batch_metadata_from_row_range(
+            start,
+            end,
+            device,
+            non_blocking,
+            prepare_timing=prepare_timing,
+        )
+        metadata.pop("date_indices", None)
+        metadata.pop("date_start", None)
+        metadata.pop("rows_are_contiguous", None)
+        return {
+            "feature_slab": self._to_device(feature_slab, device, non_blocking, prepare_timing),
+            **metadata,
         }
 
     def batch_by_rows(
@@ -708,6 +829,22 @@ class WindowedSplitTensors:
             raise ValueError("end must be >= start")
         if int(start) >= 0 and int(end) <= self._contiguous_prefix_len:
             return self._panel_slab_batch_from_contiguous_rows(start, end, device, non_blocking, prepare_timing=prepare_timing)
+        if int(start) < self._contiguous_prefix_len < int(end):
+            return self._panel_slab_batch_from_padded_tail(
+                start,
+                end,
+                device,
+                non_blocking,
+                prepare_timing=prepare_timing,
+            )
+        if int(start) >= self._contiguous_prefix_len:
+            return self._panel_slab_batch_from_padded_rows(
+                start,
+                end,
+                device,
+                non_blocking,
+                prepare_timing=prepare_timing,
+            )
         return None
 
     def batch_by_batch_indices(
@@ -768,4 +905,5 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         volume_notional=dataset.volume_notional_t,
         can_short_open_mask=dataset.can_short_open_mask_t,
         force_short_cover_mask=dataset.force_short_cover_mask_t,
+        force_exit_mask=dataset.force_exit_mask_t,
     )
