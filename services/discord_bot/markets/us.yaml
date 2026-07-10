@@ -13,17 +13,19 @@ freshness_scan_limit: 1000
 holidays: []
 pre_signal_command:
   - /home/user/miniforge3/envs/fintech/bin/python
-  - downloader/download_cboe_us_ohlcv.py
+  - downloader/download_alpaca_us_ohlcv.py
   - --mode
   - daily-update
   - --output-root
   - data_yahoo
   - --workers
+  - "16"
+  - --metadata-workers
   - "4"
+  - --batch-size
+  - "500"
   - --retries
-  - "3"
-  - --request-interval
-  - "0.25"
+  - "4"
   - --repair-overlap-days
   - "7"
   - --daily-stale-max-lag-days

@@ -21,7 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import resolve_end_date, run_parallel_tasks
+from common import describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
 
 
 BASE_URL = "https://api.bybit.com"
@@ -31,8 +31,6 @@ OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Vo
 KLINE_INTERVAL = "15"
 KLINE_INTERVAL_LABEL = "15m"
 CANDLE_INTERVAL_MS = 15 * 60 * 1000
-BYBIT_MAX_REQ_PER_SEC = 10.0
-BYBIT_MIN_REQUEST_INTERVAL = 1.0 / BYBIT_MAX_REQ_PER_SEC
 BYBIT_MAX_KLINE_LIMIT = "1000"
 BYBIT_MAX_CANDLES_PER_REQUEST = int(BYBIT_MAX_KLINE_LIMIT)
 BYBIT_WINDOW_SPAN_MS = (BYBIT_MAX_CANDLES_PER_REQUEST - 1) * CANDLE_INTERVAL_MS
@@ -121,8 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-interval",
         type=float,
-        default=0.1,
-        help="Global minimum seconds between API requests (default 0.1 = 10 req/s).",
+        default=None,
+        help="Global minimum seconds between API requests. Default uses official Bybit public REST IP profile.",
     )
     parser.add_argument("--max-retries", type=int, default=8, help="Max retries per HTTP request")
     parser.add_argument("--retry-base", type=float, default=0.6, help="Base seconds for exponential backoff")
@@ -290,18 +288,13 @@ def _iter_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
 
 
 class BybitClient:
-    def __init__(self, request_interval: float, max_retries: int, retry_base: float) -> None:
-        self.request_interval = max(0.0, request_interval)
-        if 0.0 < self.request_interval < BYBIT_MIN_REQUEST_INTERVAL:
-            print(
-                "[bybit] request_interval too small for 10 req/s limit; "
-                f"clamp {self.request_interval} -> {BYBIT_MIN_REQUEST_INTERVAL:.3f}"
-            )
-            self.request_interval = BYBIT_MIN_REQUEST_INTERVAL
+    def __init__(self, request_interval: float | None, max_retries: int, retry_base: float) -> None:
+        self.request_interval = resolve_request_interval("bybit_public_rest", request_interval)
         self.max_retries = max(0, max_retries)
         self.retry_base = max(0.1, retry_base)
         self._lock = threading.Lock()
         self._last_request_time = 0.0
+        print(f"[bybit] {describe_rate_limit('bybit_public_rest', self.request_interval)}", flush=True)
 
     def _wait_for_slot(self) -> None:
         if self.request_interval <= 0:
@@ -621,7 +614,7 @@ def main() -> None:
     print(
         "[bybit] start "
         f"symbols={total_symbols} interval={KLINE_INTERVAL_LABEL} "
-        f"workers={args.workers} request_interval={args.request_interval}s"
+        f"workers={args.workers} request_interval={client.request_interval:.6f}s"
     )
 
     progress_lock = threading.Lock()

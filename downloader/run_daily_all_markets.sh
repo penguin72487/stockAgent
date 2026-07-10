@@ -47,23 +47,26 @@ FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
 FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_yahoo/forex}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
 FRANKFURTER_SKIP_MANIFEST="${FRANKFURTER_SKIP_MANIFEST:-0}"
+FRANKFURTER_REQUEST_INTERVAL="${FRANKFURTER_REQUEST_INTERVAL:-}"
 RUN_FRANKFURTER="${RUN_FRANKFURTER:-1}"
 RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-0}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
-OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-0.1}"
+OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-}"
 OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
 BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
-BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
+BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
-RUN_CBOE_US="${RUN_CBOE_US:-1}"
-CBOE_US_WORKERS="${CBOE_US_WORKERS:-4}"
-CBOE_US_RETRIES="${CBOE_US_RETRIES:-3}"
-CBOE_US_TIMEOUT="${CBOE_US_TIMEOUT:-20}"
-CBOE_US_REQUEST_INTERVAL="${CBOE_US_REQUEST_INTERVAL:-0.25}"
-CBOE_US_STEP_TIMEOUT_SECONDS="${CBOE_US_STEP_TIMEOUT_SECONDS:-7200}"  # 0 disables timeout
+RUN_ALPACA_US="${RUN_ALPACA_US:-1}"
+ALPACA_US_WORKERS="${ALPACA_US_WORKERS:-16}"
+ALPACA_US_METADATA_WORKERS="${ALPACA_US_METADATA_WORKERS:-4}"
+ALPACA_US_BATCH_SIZE="${ALPACA_US_BATCH_SIZE:-500}"
+ALPACA_US_RETRIES="${ALPACA_US_RETRIES:-4}"
+ALPACA_US_TIMEOUT="${ALPACA_US_TIMEOUT:-30}"
+ALPACA_REQUESTS_PER_MINUTE="${ALPACA_REQUESTS_PER_MINUTE:-200}"
+ALPACA_US_STEP_TIMEOUT_SECONDS="${ALPACA_US_STEP_TIMEOUT_SECONDS:-1800}"  # 0 disables timeout
 RUN_YAHOO="${RUN_YAHOO:-0}"
 YAHOO_ASSETS="${YAHOO_ASSETS:-}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-900}"  # 0 disables timeout
@@ -76,6 +79,7 @@ TW_PUBLIC_TIMEOUT="${TW_PUBLIC_TIMEOUT:-30}"
 TW_PUBLIC_RETRIES="${TW_PUBLIC_RETRIES:-3}"
 TW_PUBLIC_RETRY_BACKOFF="${TW_PUBLIC_RETRY_BACKOFF:-1.0}"
 TW_PUBLIC_SLEEP="${TW_PUBLIC_SLEEP:-0.15}"
+TW_PUBLIC_REQUEST_INTERVAL="${TW_PUBLIC_REQUEST_INTERVAL:-}"
 TW_PUBLIC_FLUSH_EVERY_DATES="${TW_PUBLIC_FLUSH_EVERY_DATES:-250}"
 TW_PUBLIC_SKIP_RAW="${TW_PUBLIC_SKIP_RAW:-0}"
 TW_PUBLIC_MAX_DATES="${TW_PUBLIC_MAX_DATES:-}"
@@ -378,40 +382,41 @@ run_yahoo_incremental() {
   return "$rc"
 }
 
-run_cboe_us_incremental() {
+run_alpaca_us_incremental() {
   local today
   local -a base_cmd=()
   local -a run_cmd=()
 
-  today="$(date +%F)"
-  if [[ "$RUN_CBOE_US" != "1" ]]; then
-    log "skip=cboe_us_incremental reason=RUN_CBOE_US=${RUN_CBOE_US}"
+  today="$(TZ="$US_CLOSE_TZ" date +%F)"
+  if [[ "$RUN_ALPACA_US" != "1" ]]; then
+    log "skip=alpaca_us_incremental reason=RUN_ALPACA_US=${RUN_ALPACA_US}"
     return 0
   fi
 
   base_cmd=(
-    "$PYTHON_BIN" downloader/download_cboe_us_ohlcv.py
+    "$PYTHON_BIN" downloader/download_alpaca_us_ohlcv.py
     --mode daily-update
     --end-date "$today"
     --output-root data_yahoo
-    --workers "$CBOE_US_WORKERS"
-    --retries "$CBOE_US_RETRIES"
-    --timeout "$CBOE_US_TIMEOUT"
-    --request-interval "$CBOE_US_REQUEST_INTERVAL"
+    --workers "$ALPACA_US_WORKERS"
+    --metadata-workers "$ALPACA_US_METADATA_WORKERS"
+    --batch-size "$ALPACA_US_BATCH_SIZE"
+    --retries "$ALPACA_US_RETRIES"
+    --timeout "$ALPACA_US_TIMEOUT"
+    --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE"
     --repair-overlap-days "$REPAIR_OVERLAP_DAYS"
     --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
   )
-
   run_cmd=("${base_cmd[@]}")
-  if [[ "$CBOE_US_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$CBOE_US_STEP_TIMEOUT_SECONDS" -gt 0 ]]; then
+  if [[ "$ALPACA_US_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$ALPACA_US_STEP_TIMEOUT_SECONDS" -gt 0 ]]; then
     if command -v timeout >/dev/null 2>&1; then
-      run_cmd=(timeout --signal=TERM --kill-after=30s "${CBOE_US_STEP_TIMEOUT_SECONDS}" "${base_cmd[@]}")
+      run_cmd=(timeout --signal=TERM --kill-after=30s "${ALPACA_US_STEP_TIMEOUT_SECONDS}" "${base_cmd[@]}")
     else
       log "timeout command not found; continue without per-asset timeout"
     fi
   fi
 
-  run_step "cboe_us_daily_update" "${run_cmd[@]}"
+  run_step "alpaca_us_daily_update" "${run_cmd[@]}"
 }
 
 run_frankfurter_incremental() {
@@ -432,6 +437,9 @@ run_frankfurter_incremental() {
       --workers "$WORKERS"
       --timeout "$FRANKFURTER_TIMEOUT"
     )
+    if [[ -n "$FRANKFURTER_REQUEST_INTERVAL" ]]; then
+      cmd+=(--request-interval "$FRANKFURTER_REQUEST_INTERVAL")
+    fi
     if [[ "$FRANKFURTER_SKIP_MANIFEST" == "1" ]]; then
       cmd+=(--skip-manifest)
     fi
@@ -469,23 +477,33 @@ run_cex_incremental() {
     return 0
   fi
 
-  run_step okx_perp_15m_update \
-    "$PYTHON_BIN" downloader/download_okx_perp_15m.py \
-    --mode incremental \
-    --end-date "$today" \
-    --workers "$OKX_WORKERS" \
-    --request-interval "$OKX_REQUEST_INTERVAL" \
-    --max-retries "$OKX_MAX_RETRIES" || rc=1
-
   read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
-  run_step bybit_perp_15m_update \
-    "$PYTHON_BIN" downloader/download_bybit_perp_15m.py \
-    --mode incremental \
-    --end-date "$today" \
-    --workers "$BYBIT_WORKERS" \
-    --request-interval "$BYBIT_REQUEST_INTERVAL" \
-    --max-retries "$BYBIT_MAX_RETRIES" \
-    --categories "${bybit_categories[@]}" || rc=1
+  local -a okx_cmd=()
+  local -a bybit_cmd=()
+  okx_cmd=(
+    "$PYTHON_BIN" downloader/download_okx_perp_15m.py
+    --mode incremental
+    --end-date "$today"
+    --workers "$OKX_WORKERS"
+    --max-retries "$OKX_MAX_RETRIES"
+  )
+  if [[ -n "$OKX_REQUEST_INTERVAL" ]]; then
+    okx_cmd+=(--request-interval "$OKX_REQUEST_INTERVAL")
+  fi
+  run_step okx_perp_15m_update "${okx_cmd[@]}" || rc=1
+
+  bybit_cmd=(
+    "$PYTHON_BIN" downloader/download_bybit_perp_15m.py
+    --mode incremental
+    --end-date "$today"
+    --workers "$BYBIT_WORKERS"
+    --max-retries "$BYBIT_MAX_RETRIES"
+    --categories "${bybit_categories[@]}"
+  )
+  if [[ -n "$BYBIT_REQUEST_INTERVAL" ]]; then
+    bybit_cmd+=(--request-interval "$BYBIT_REQUEST_INTERVAL")
+  fi
+  run_step bybit_perp_15m_update "${bybit_cmd[@]}" || rc=1
   return "$rc"
 }
 
@@ -522,6 +540,9 @@ run_tw_public_data_update() {
     --sleep "$TW_PUBLIC_SLEEP"
     --flush-every-dates "$TW_PUBLIC_FLUSH_EVERY_DATES"
   )
+  if [[ -n "$TW_PUBLIC_REQUEST_INTERVAL" ]]; then
+    cmd+=(--request-interval "$TW_PUBLIC_REQUEST_INTERVAL")
+  fi
   if [[ "$TW_PUBLIC_SKIP_RAW" == "1" ]]; then
     cmd+=(--skip-raw)
   fi
@@ -619,7 +640,7 @@ run_market_close_cycle() {
     us_date="$(TZ="$US_CLOSE_TZ" date +%F)"
     log "market=us due date=${us_date} close=${US_CLOSE_TIME} tz=${US_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_cboe_us_incremental || true
+    run_alpaca_us_incremental || true
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_US="$us_date"
@@ -681,7 +702,7 @@ run_once_cycle() {
   log "cycle=${cycle_id} start mode=${RUN_MODE} root=${ROOT_DIR}"
 
   run_parallel_groups \
-    cboe_us run_cboe_us_incremental \
+    alpaca_us run_alpaca_us_incremental \
     yahoo run_yahoo_incremental \
     tw_public run_tw_public_data_update \
     frankfurter run_frankfurter_incremental \
