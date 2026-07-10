@@ -29,13 +29,16 @@ from stockagent.training.trainer import (
     _detach_portfolio_state,
     _extract_weights_and_aux,
     _is_log_utility_objective,
+    _maybe_compact_train_windowed_symbols,
     _model_supports_panel_slab_forward,
     _normalize_risk_objective,
     _pad_windowed_training_split,
     _resolve_amp_dtype,
     _training_loss_portfolio_activation,
     _training_needs_aux,
+    _torch_compile_options,
     _volume_limit_weights_from_notional,
+    _volume_participation_enabled,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
@@ -114,7 +117,16 @@ def _run_case(
     if temporal_pooling:
         config.training.transformer_base_portfolio.temporal_pooling = temporal_pooling
 
-    dataset = CrossSectionalDataset(panel, fold.train_indices, int(lookback))
+    include_volume_notional = _volume_participation_enabled(
+        config.trading.max_volume_participation,
+        config.trading.volume_participation_equity,
+    )
+    dataset = CrossSectionalDataset(
+        panel,
+        fold.train_indices,
+        int(lookback),
+        include_volume_notional=include_volume_notional,
+    )
     real_rows = len(dataset)
     batch_size = max(1, min(int(batch_size), real_rows))
     objective = _normalize_risk_objective(config.training.loss_type)
@@ -127,10 +139,21 @@ def _run_case(
             "benchmark_transformer_hotpath measures the production no-aux panel-slab executor; "
             f"objective={objective!r} requires the research aux path"
         )
-    split = _pad_windowed_training_split(dataset_to_windowed_tensors(dataset), batch_size)
+    split = _maybe_compact_train_windowed_symbols(
+        dataset_to_windowed_tensors(dataset),
+        config,
+        label="hotpath benchmark",
+    )
+    split = _pad_windowed_training_split(split, batch_size)
     rows = len(split)
+    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
     if cache_on_device and device.type != "cpu":
         split = split.to_device_cache(device)
+        if (
+            bool(getattr(config.training, "cache_train_features_in_amp_dtype", False))
+            and amp_dtype in {torch.float16, torch.bfloat16}
+        ):
+            split.features = split.features.to(dtype=amp_dtype)
 
     model = build_model(
         config=config,
@@ -148,18 +171,24 @@ def _run_case(
     if use_panel_slab:
         forward_model = _PanelSlabForwardWrapper(model)
     if compile_model:
+        compile_mode = str(getattr(config.training, "torch_compile_mode", "default") or "default")
         forward_model = torch.compile(
             forward_model,
             fullgraph=True,
             dynamic=False,
-            options={"triton.cudagraphs": False},
+            options=_torch_compile_options(compile_mode, cudagraphs=False),
         )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config.training.learning_rate),
-        weight_decay=float(config.training.weight_decay),
-    )
-    amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
+    optimizer_kwargs = {
+        "lr": float(config.training.learning_rate),
+        "weight_decay": float(config.training.weight_decay),
+    }
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    except TypeError:
+        optimizer_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
     _configure_backtest_runtime_from_config(config)
     loss_fn = partial(risk_aware_loss, **_loss_kwargs(config))
     if compile_loss:
@@ -175,8 +204,9 @@ def _run_case(
 
     total_batches = max(1, rows // batch_size)
     total_steps = int(warmup) + int(batches)
-    portfolio_prev_weights = torch.zeros(panel.num_symbols, device=device, dtype=torch.float32)
-    last_loss = float("nan")
+    portfolio_prev_weights = torch.zeros(split.num_symbols, device=device, dtype=torch.float32)
+    portfolio_prev_alive = torch.ones((), device=device, dtype=torch.bool)
+    last_loss_tensor: torch.Tensor | None = None
 
     _sync(device)
     start_timed: float | None = None
@@ -220,6 +250,7 @@ def _run_case(
             weights, aux_outputs = _extract_weights_and_aux(model_output)
             aux_outputs = dict(aux_outputs or {})
             aux_outputs["initial_weights"] = portfolio_prev_weights
+            aux_outputs["initial_alive"] = portfolio_prev_alive
             loss = loss_fn(
                 weights,
                 batch["future_log_returns"],
@@ -243,18 +274,29 @@ def _run_case(
         loss.backward()
         optimizer.step()
         next_prev = aux_outputs.get("_final_weights")
+        next_alive = aux_outputs.get("_final_alive")
         portfolio_prev_weights = _detach_portfolio_state(next_prev) if next_prev is not None else None
-        last_loss = float(loss.detach().float().cpu().item())
+        if next_alive is not None:
+            portfolio_prev_alive = _detach_portfolio_state(next_alive)
+        # Do not synchronize CUDA inside the timed loop. Production training
+        # consumes the scalar only after the epoch, so the benchmark should too.
+        last_loss_tensor = loss.detach()
 
     _sync(device)
     elapsed = time.perf_counter() - float(start_timed if start_timed is not None else time.perf_counter())
+    last_loss = (
+        float(last_loss_tensor.float().cpu().item())
+        if last_loss_tensor is not None
+        else float("nan")
+    )
     peak_bytes = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
     return {
         "fold_id": int(fold.fold_id),
         "lookback": int(lookback),
         "rows": int(real_rows),
         "padded_rows": int(rows),
-        "symbols": int(panel.num_symbols),
+        "symbols": int(split.num_symbols),
+        "universe_symbols": int(panel.num_symbols),
         "features": int(len(panel.feature_names)),
         "batch_size": int(batch_size),
         "timed_batches": int(batches),

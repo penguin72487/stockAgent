@@ -41,9 +41,7 @@ class WindowedSplitTensors:
         if self.valid_indices.dim() != 1:
             raise ValueError("valid_indices must be 1D")
         self._valid_indices_cpu = self.valid_indices.detach().to(device=torch.device("cpu"), dtype=torch.long)
-        if self.volume_notional is None:
-            self.volume_notional = torch.full_like(self.future_log_returns, float("inf"), dtype=torch.float32)
-        if self.volume_notional.shape != self.future_log_returns.shape:
+        if self.volume_notional is not None and self.volume_notional.shape != self.future_log_returns.shape:
             raise ValueError(
                 "volume_notional must have the same shape as future_log_returns: "
                 f"{tuple(self.volume_notional.shape)} != {tuple(self.future_log_returns.shape)}"

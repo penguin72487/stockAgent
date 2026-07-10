@@ -449,6 +449,10 @@ class TransformerBasePortfolioModelConfig:
     use_time_pos: bool = True
     use_symbol_pos: bool = True
     input_dropout: float = 0.0
+    sanitize_inputs: bool = True
+    amp_native_position_add: bool = False
+    temporal_self_attention_fast_path: bool = False
+    compiled_cross_attention_backend: str = "auto"
     sdpa_batch_limit: int = 4096
     norm_type: str = "rmsnorm"
     ffn_type: str = "swiglu"
@@ -744,6 +748,7 @@ class TrainingConfig:
     postprocess_benchmark_strict: bool = False
     cache_train_tensors_on_gpu: bool = True
     cache_eval_tensors_on_gpu: bool = True
+    cache_train_features_in_amp_dtype: bool = False
     learning_rate: float = 1e-3
     enable_lr_scheduler: bool = True
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
@@ -1622,6 +1627,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             postprocess_benchmark_strict=training_raw["postprocess_benchmark_strict"],
             cache_train_tensors_on_gpu=training_raw["cache_train_tensors_on_gpu"],
             cache_eval_tensors_on_gpu=training_raw["cache_eval_tensors_on_gpu"],
+            cache_train_features_in_amp_dtype=training_raw["cache_train_features_in_amp_dtype"],
             learning_rate=training_raw["learning_rate"],
             enable_lr_scheduler=training_raw["enable_lr_scheduler"],
             lr_scheduler=training_raw["lr_scheduler"],

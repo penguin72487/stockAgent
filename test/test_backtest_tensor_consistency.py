@@ -25,6 +25,7 @@ from stockagent.training.loss import (
     sharpe_aware_loss,
 )
 from stockagent.training.trainer import (
+    _auto_backtest_chunk_rows,
     _batched_loss_from_backtest_segments,
     _CompiledLossFallback,
     _dataset_to_tensors,
@@ -36,6 +37,7 @@ from stockagent.training.trainer import (
     _evaluate_tensor_batch,
     _evaluate_windowed_aux_objective_loss,
     _evaluate_windowed_tensor_batch,
+    _maybe_cache_tensors_on_device,
     _maybe_share_windowed_base_from_cached,
     _normalize_ddp_global_batch_size,
     _PanelSlabForwardWrapper,
@@ -48,6 +50,7 @@ from stockagent.training.trainer import (
     _probe_compiled_loss_forward_backward,
     _probe_compiled_train_forward,
     _raise_if_distributed_phase_failed,
+    _resolve_train_feature_cache_dtype,
     _require_training_aux_outputs,
     _requires_full_objective_evaluation,
     _should_check_finite,
@@ -134,6 +137,27 @@ class _SlabOnlyTrainModel(nn.Module):
 
     def forward(self, *args, **kwargs):
         raise AssertionError("padded fixed-shape training must use panel-slab forward")
+
+
+class _FeatureDtypeSlabTrainModel(_SlabOnlyTrainModel):
+    def __init__(self, lookback: int) -> None:
+        super().__init__(lookback)
+        self.seen_feature_dtypes: list[torch.dtype] = []
+
+    def forward_from_panel_slab(
+        self,
+        feature_slab: torch.Tensor,
+        mask: torch.Tensor,
+        return_aux: bool = False,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self.seen_feature_dtypes.append(feature_slab.dtype)
+        return super().forward_from_panel_slab(
+            feature_slab,
+            mask,
+            return_aux=return_aux,
+            symbol_indices=symbol_indices,
+        )
 
 
 class _BatchNormProbeModel(nn.Module):
@@ -1172,6 +1196,21 @@ def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
     assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048, max_chunk_rows=0) == 2048
 
 
+@pytest.mark.parametrize(
+    ("total_rows", "expected"),
+    [(64, 64), (65, 128), (98, 128), (128, 128), (129, 256), (513, 512)],
+)
+def test_auto_backtest_chunk_rows_uses_stable_power_of_two_bucket(
+    total_rows: int,
+    expected: int,
+) -> None:
+    assert _auto_backtest_chunk_rows(
+        total_rows=total_rows,
+        model_chunk_rows=64,
+        configured_cap=512,
+    ) == expected
+
+
 def test_backtest_compile_gate_skips_toolchain_lookup_while_dynamo_compiling(monkeypatch) -> None:
     monkeypatch.setattr(simulator, "_torch_dynamo_is_compiling", lambda: True)
     monkeypatch.setattr(
@@ -1783,6 +1822,36 @@ def test_compile_probe_routes_panel_slab_without_generic_gather() -> None:
     assert all(parameter.grad is None for parameter in base_model.parameters())
 
 
+def test_compile_probe_uses_actual_cached_feature_dtype_for_panel_slab() -> None:
+    lookback = 2
+    panel = _make_panel(rows=10, symbols=4, features=3)
+    dataset = CrossSectionalDataset(panel, np.arange(panel.num_dates), lookback=lookback)
+    split = _pad_windowed_training_split(dataset_to_windowed_tensors(dataset), batch_size=4)
+    split.features = split.features.to(dtype=torch.bfloat16)
+    base_model = _FeatureDtypeSlabTrainModel(lookback)
+    slab_model = _PanelSlabForwardWrapper(base_model)
+
+    ok, error = _probe_compiled_train_forward(
+        slab_model,
+        split,
+        batch_size=4,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        non_blocking=False,
+        use_panel_slab=True,
+        return_aux=False,
+        objective="log_utility",
+        factor_aug_kwargs=None,
+        direction_weight=0.0,
+        volatility_regime_weight=0.0,
+    )
+
+    assert ok, error
+    assert base_model.seen_feature_dtypes == [torch.bfloat16]
+    assert split.features.dtype == torch.bfloat16
+    assert all(parameter.grad is None for parameter in base_model.parameters())
+
+
 def test_compile_probe_restores_stateful_buffers_mixed_modes_and_existing_gradients() -> None:
     panel = _make_panel(rows=9, symbols=4, features=3)
     dataset = CrossSectionalDataset(panel, np.arange(panel.num_dates), lookback=3)
@@ -2290,6 +2359,294 @@ def test_cross_sectional_dataset_allows_empty_split_when_requested() -> None:
 
     assert len(dataset) == 0
     assert dataset.valid_indices.size == 0
+
+
+def test_dataset_can_omit_disabled_volume_notional() -> None:
+    panel = _make_panel(rows=6, symbols=4, features=3)
+    dataset = CrossSectionalDataset(
+        panel,
+        np.arange(panel.num_dates),
+        lookback=2,
+        include_volume_notional=False,
+    )
+    split = dataset_to_windowed_tensors(dataset)
+
+    assert dataset.volume_notional_t is None
+    assert split.volume_notional is None
+    assert "volume_notional" not in dataset[0]
+    assert "volume_notional" not in split.panel_slab_batch_by_rows(
+        0,
+        2,
+        torch.device("cpu"),
+        non_blocking=False,
+    )
+
+
+def test_optional_volume_none_survives_windowed_cache_and_padding() -> None:
+    panel = _make_panel(rows=7, symbols=4, features=3)
+    dataset = CrossSectionalDataset(
+        panel,
+        np.arange(panel.num_dates),
+        lookback=3,
+        include_volume_notional=False,
+    )
+    split = dataset_to_windowed_tensors(dataset)
+    prepared = _prepare_windowed_split(split, torch.device("cpu"), non_blocking=False)
+    cached = prepared.to_device_cache(torch.device("cpu"), non_blocking=False)
+    symbol_padded = cached.subset_symbols(torch.tensor([0, 2])).pad_symbols(
+        4,
+        pad_symbol_index=0,
+    )
+    row_padded = _pad_windowed_training_split(cached, batch_size=4)
+
+    for candidate in (split, prepared, cached, symbol_padded, row_padded):
+        assert candidate.volume_notional is None
+        batch = candidate.batch_by_rows(0, min(2, len(candidate)), torch.device("cpu"), non_blocking=False)
+        assert "volume_notional" not in batch
+    tail_batch = row_padded.panel_slab_batch_by_rows(
+        4,
+        8,
+        torch.device("cpu"),
+        non_blocking=False,
+    )
+    assert tail_batch is not None
+    assert "volume_notional" not in tail_batch
+    assert tail_batch["sample_mask"].tolist() == [True, False, False, False]
+    assert symbol_padded.symbol_indices is not None
+    assert symbol_padded.symbol_indices.tolist() == [0, 2, 0, 0]
+    assert not symbol_padded.tradable_mask[:, 2:].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA cache dtype conversion contract")
+def test_gpu_cache_target_dtypes_convert_feature_only_and_preserve_none() -> None:
+    source = (
+        torch.randn(4, 3, dtype=torch.float32),
+        torch.randn(4, 3, dtype=torch.float32),
+        torch.arange(4, dtype=torch.long),
+        None,
+    )
+    cached = _maybe_cache_tensors_on_device(
+        name="test dtype-aware cache",
+        tensors=source,
+        device=torch.device("cuda"),
+        enabled=True,
+        target_fraction=1.0,
+        safety_margin_gb=0.0,
+        target_dtypes=(torch.bfloat16, None, torch.bfloat16, torch.bfloat16),
+    )
+
+    assert cached[0] is not None and cached[0].device.type == "cuda"
+    assert cached[0].dtype == torch.bfloat16
+    assert cached[1] is not None and cached[1].device.type == "cuda"
+    assert cached[1].dtype == torch.float32
+    assert cached[2] is not None and cached[2].device.type == "cuda"
+    assert cached[2].dtype == torch.long
+    assert cached[3] is None
+    cached_again = _maybe_cache_tensors_on_device(
+        name="test dtype-aware cache reuse",
+        tensors=cached,
+        device=torch.device("cuda"),
+        enabled=True,
+        target_fraction=1.0,
+        safety_margin_gb=0.0,
+        target_dtypes=(torch.bfloat16, None, torch.bfloat16, torch.bfloat16),
+    )
+    assert cached_again is cached
+
+
+def test_train_feature_amp_cache_default_is_backward_compatible_noop() -> None:
+    config = load_config("configs/experiment_baseline.yaml")
+    assert config.training.cache_train_features_in_amp_dtype is False
+    assert _resolve_train_feature_cache_dtype(
+        config,
+        torch.device("cpu"),
+        None,
+        train_uses_panel_slab=False,
+        has_categorical_features=True,
+    ) is None
+
+
+@pytest.mark.parametrize("amp_dtype", [torch.float16, torch.bfloat16])
+def test_train_feature_amp_cache_resolves_only_supported_dtype(amp_dtype: torch.dtype) -> None:
+    config = load_config("configs/experiment_baseline.yaml")
+    config.training.cache_train_features_in_amp_dtype = True
+    config.training.model_name = "transformer_base_portfolio"
+    config.training.transformer_base_portfolio.sanitize_inputs = False
+    config.training.transformer_base_portfolio.categorical_feature_names = []
+
+    assert _resolve_train_feature_cache_dtype(
+        config,
+        torch.device("cuda"),
+        amp_dtype,
+        train_uses_panel_slab=True,
+        has_categorical_features=False,
+    ) == amp_dtype
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "cpu",
+        "amp_none",
+        "amp_float32",
+        "model",
+        "sanitize",
+        "categorical",
+        "no_panel_slab",
+    ],
+)
+def test_train_feature_amp_cache_rejects_unsupported_capability(unsupported: str) -> None:
+    config = load_config("configs/experiment_baseline.yaml")
+    config.training.cache_train_features_in_amp_dtype = True
+    config.training.model_name = "transformer_base_portfolio"
+    config.training.transformer_base_portfolio.sanitize_inputs = False
+    config.training.transformer_base_portfolio.categorical_feature_names = []
+    device = torch.device("cuda")
+    amp_dtype: torch.dtype | None = torch.bfloat16
+    train_uses_panel_slab = True
+    has_categorical_features = False
+    if unsupported == "cpu":
+        device = torch.device("cpu")
+    elif unsupported == "amp_none":
+        amp_dtype = None
+    elif unsupported == "amp_float32":
+        amp_dtype = torch.float32
+    elif unsupported == "model":
+        config.training.model_name = "mlp"
+    elif unsupported == "sanitize":
+        config.training.transformer_base_portfolio.sanitize_inputs = True
+    elif unsupported == "categorical":
+        has_categorical_features = True
+    elif unsupported == "no_panel_slab":
+        train_uses_panel_slab = False
+
+    with pytest.raises(ValueError, match="cache_train_features_in_amp_dtype requires"):
+        _resolve_train_feature_cache_dtype(
+            config,
+            device,
+            amp_dtype,
+            train_uses_panel_slab=train_uses_panel_slab,
+            has_categorical_features=has_categorical_features,
+        )
+
+
+def test_no_volume_limit_matches_explicit_infinite_limit_for_backtest_loss_and_grad() -> None:
+    torch.manual_seed(109)
+    rows, symbols = 5, 4
+    raw = torch.randn(rows, symbols) * 0.2
+    returns = torch.randn(rows, symbols) * 0.01
+    tradable = torch.ones(rows, symbols, dtype=torch.bool)
+    tradable[2, 3] = False
+    can_buy = tradable.clone()
+    can_sell = tradable.clone()
+    can_short_open = tradable.clone()
+    can_short_open[1, 0] = False
+    force_short_cover = torch.zeros_like(tradable)
+    force_short_cover[3, 1] = True
+    force_exit = torch.zeros_like(tradable)
+    force_exit[4, 2] = True
+    benchmark = returns.mean(dim=1)
+    initial_weights = torch.tensor([0.08, -0.04, 0.03, 0.0])
+    initial_alive = torch.tensor(True)
+    backtest_kwargs = {
+        "buy_fee_rate": 0.001,
+        "sell_fee_rate": 0.002,
+        "long_only": False,
+        "max_turnover_ratio": 0.5,
+        "gross_leverage": 1.0,
+        "min_trade_weight": 0.0,
+        "portfolio_activation": "identity",
+        "can_buy_mask": can_buy,
+        "can_sell_mask": can_sell,
+        "can_short_open_mask": can_short_open,
+        "force_short_cover_mask": force_short_cover,
+        "force_exit_mask": force_exit,
+        "initial_weights": initial_weights,
+        "initial_alive": initial_alive,
+    }
+    no_limit = run_backtest_torch(
+        raw,
+        returns,
+        tradable,
+        benchmark,
+        volume_limit_weights=None,
+        **backtest_kwargs,
+    )
+    infinite_limit = run_backtest_torch(
+        raw,
+        returns,
+        tradable,
+        benchmark,
+        volume_limit_weights=torch.full_like(raw, float("inf")),
+        **backtest_kwargs,
+    )
+
+    for field in (
+        "strategy_returns",
+        "benchmark_returns",
+        "turnovers",
+        "weights_history",
+        "final_weights",
+        "final_alive",
+    ):
+        actual = getattr(no_limit, field)
+        expected = getattr(infinite_limit, field)
+        assert actual is not None and expected is not None
+        assert torch.allclose(actual, expected, atol=0.0, rtol=0.0), field
+
+    no_limit_weights = raw.detach().clone().requires_grad_(True)
+    infinite_weights = raw.detach().clone().requires_grad_(True)
+    no_limit_state = {"initial_weights": initial_weights, "initial_alive": initial_alive}
+    infinite_state = {"initial_weights": initial_weights, "initial_alive": initial_alive}
+    loss_kwargs = {
+        "benchmark_returns": benchmark,
+        "can_buy_mask": can_buy,
+        "can_sell_mask": can_sell,
+        "can_short_open_mask": can_short_open,
+        "force_short_cover_mask": force_short_cover,
+        "force_exit_mask": force_exit,
+        "long_only": False,
+        "buy_fee_rate": 0.001,
+        "sell_fee_rate": 0.002,
+        "max_turnover_ratio": 0.5,
+        "gross_leverage": 1.0,
+        "min_trade_weight": 0.0,
+        "portfolio_activation": "identity",
+        "gamma_sharpe": 1.0,
+        "gamma_turnover": 0.05,
+        "objective": "log_utility",
+        "concentration_weight": 0.0,
+        "net_exposure_weight": 0.0,
+    }
+    no_limit_loss = risk_aware_loss(
+        no_limit_weights,
+        returns,
+        tradable,
+        volume_limit_weights=None,
+        aux_outputs=no_limit_state,
+        **loss_kwargs,
+    )
+    infinite_loss = risk_aware_loss(
+        infinite_weights,
+        returns,
+        tradable,
+        volume_limit_weights=torch.full_like(raw, float("inf")),
+        aux_outputs=infinite_state,
+        **loss_kwargs,
+    )
+    no_limit_loss.backward()
+    infinite_loss.backward()
+
+    assert torch.allclose(no_limit_loss, infinite_loss, atol=0.0, rtol=0.0)
+    assert no_limit_weights.grad is not None and infinite_weights.grad is not None
+    assert torch.allclose(no_limit_weights.grad, infinite_weights.grad, atol=0.0, rtol=0.0)
+    assert torch.equal(no_limit_state["_final_alive"], infinite_state["_final_alive"])
+    assert torch.allclose(
+        no_limit_state["_final_weights"],
+        infinite_state["_final_weights"],
+        atol=0.0,
+        rtol=0.0,
+    )
 
 
 def test_windowed_split_matches_materialized_dataset_tensors() -> None:

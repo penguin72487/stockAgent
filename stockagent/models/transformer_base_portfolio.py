@@ -13,7 +13,7 @@ from stockagent.models.normalization import (
     dual_branch_softmax,
     finite_mask_fill_value,
     masked_l1_projection_weights,
-    masked_cross_sectional_mean,
+    masked_cross_sectional_mean_finite,
     masked_signed_action_weights,
     masked_softmax,
     normalize_portfolio_activation,
@@ -169,6 +169,25 @@ def _rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(variance + eps).to(dtype=x.dtype)
 
 
+def _compiled_cross_attention_requires_blackwell_workaround(
+    device: torch.device | str | int | None = None,
+) -> bool:
+    """Keep the known compiled-BF16 workaround scoped to Blackwell GPUs."""
+    if not torch.cuda.is_available():
+        return False
+    if isinstance(device, (torch.device, str)) and torch.device(device).type != "cuda":
+        return False
+    try:
+        major, _minor = (
+            torch.cuda.get_device_capability()
+            if device is None
+            else torch.cuda.get_device_capability(device)
+        )
+    except (AssertionError, RuntimeError):
+        return False
+    return int(major) >= 12
+
+
 class FlashSDPAAttention(nn.Module):
     """Multi-head attention backed by PyTorch SDPA.
 
@@ -199,6 +218,10 @@ class FlashSDPAAttention(nn.Module):
         self.sdpa_batch_limit = int(sdpa_batch_limit)
         self.qk_norm = bool(qk_norm)
         self.rope_base = float(rope_base)
+        self.compiled_cross_attention_blackwell_workaround = (
+            _compiled_cross_attention_requires_blackwell_workaround()
+        )
+        self.compiled_cross_attention_backend = "auto"
 
         self.in_proj = nn.Linear(self.dim, self.dim * 3)
         self.out_proj = nn.Linear(self.dim, self.dim)
@@ -212,6 +235,13 @@ class FlashSDPAAttention(nn.Module):
         self.capture_max_elements = 2_000_000
         self.captured_attention: torch.Tensor | None = None
         self.captured_attention_shape: tuple[int, ...] | None = None
+
+    def _apply(self, fn, recurse: bool = True):
+        module = super()._apply(fn, recurse=recurse)
+        module.compiled_cross_attention_blackwell_workaround = (
+            _compiled_cross_attention_requires_blackwell_workaround(module.in_proj.weight.device)
+        )
+        return module
 
     def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
         bsz, steps, _ = tensor.shape
@@ -321,13 +351,22 @@ class FlashSDPAAttention(nn.Module):
         if (
             use_sdpa_attention
             and context is not None
+            and query.device.type == "cuda"
             and _torch_is_compiling()
             and q.dtype in {torch.float16, torch.bfloat16}
         ):
-            # Inductor + BF16 SDPA cross-attention can emit unstable Blackwell
-            # kernels in the current CUDA/PyTorch stack. Keep temporal SDPA, but
-            # use the explicit attention path for compiled cross-attention.
-            use_sdpa_attention = False
+            # Small temporal last-query attention is faster through the explicit
+            # path on Ada, while the large market-token cross-attention benefits
+            # from SDPA. Blackwell keeps the conservative workaround because its
+            # compiled BF16 cross-attention kernel is unstable in this stack.
+            attention_elements = int(query_steps) * int(key_steps)
+            backend = str(self.compiled_cross_attention_backend)
+            if (
+                backend == "manual"
+                or self.compiled_cross_attention_blackwell_workaround
+                or (backend == "auto" and attention_elements <= 4096)
+            ):
+                use_sdpa_attention = False
 
         if use_sdpa_attention:
             if self.sdpa_batch_limit > 0 and int(q.size(0)) > self.sdpa_batch_limit:
@@ -356,12 +395,28 @@ class FlashSDPAAttention(nn.Module):
                     is_causal=False,
                 )
         else:
-            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            if attn_mask is not None:
-                scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
-            attn = torch.softmax(scores, dim=-1)
-            attn = F.dropout(attn, p=self.dropout_p, training=self.training)
-            y = torch.matmul(attn, v)
+            if query_steps == 1 and _torch_is_compiling() and not bool(self.capture_attention):
+                # The active temporal fast path has N=B*S independent
+                # [1 x L] attentions. Two batched GEMMs materialize tiny matrices
+                # and scale poorly at that very large N, while direct reductions
+                # express the identical dot-product/weighted-sum algebra and let
+                # Inductor fuse the elementwise work around them.
+                scores = (q * k).sum(dim=-1) * self.scale
+                if attn_mask is not None:
+                    scores = scores.masked_fill(
+                        ~attn_mask.squeeze(-2),
+                        torch.finfo(scores.dtype).min,
+                    )
+                attn = torch.softmax(scores, dim=-1)
+                attn = F.dropout(attn, p=self.dropout_p, training=self.training)
+                y = (attn.unsqueeze(-1) * v).sum(dim=-2, keepdim=True)
+            else:
+                scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+                if attn_mask is not None:
+                    scores = scores.masked_fill(~attn_mask, torch.finfo(scores.dtype).min)
+                attn = torch.softmax(scores, dim=-1)
+                attn = F.dropout(attn, p=self.dropout_p, training=self.training)
+                y = torch.matmul(attn, v)
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, query_steps, self.dim)
         return self.out_proj(y)
@@ -416,6 +471,7 @@ class TransformerPortfolioBlock(nn.Module):
         rope_positions: torch.Tensor | None = None,
         query_rope_positions: torch.Tensor | None = None,
         key_rope_positions: torch.Tensor | None = None,
+        context_is_self_sequence: bool = False,
     ) -> torch.Tensor:
         if context is None:
             attn_out = self.attn(
@@ -427,9 +483,14 @@ class TransformerPortfolioBlock(nn.Module):
                 key_rope_positions=key_rope_positions,
             )
         else:
+            normalized_context = (
+                self.norm_query(context)
+                if bool(context_is_self_sequence)
+                else self.norm_context(context)
+            )
             attn_out = self.attn(
                 self.norm_query(query),
-                self.norm_context(context),
+                normalized_context,
                 key_mask=key_mask,
                 rope_positions=rope_positions,
                 query_rope_positions=query_rope_positions,
@@ -464,6 +525,10 @@ class TransformerBasePortfolioModel(nn.Module):
         use_time_pos: bool = True,
         use_symbol_pos: bool = True,
         input_dropout: float = 0.0,
+        sanitize_inputs: bool = True,
+        amp_native_position_add: bool = False,
+        temporal_self_attention_fast_path: bool = False,
+        compiled_cross_attention_backend: str = "auto",
         sdpa_batch_limit: int = 4096,
         norm_type: str = "rmsnorm",
         ffn_type: str = "swiglu",
@@ -524,6 +589,13 @@ class TransformerBasePortfolioModel(nn.Module):
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
         self.use_time_pos = bool(use_time_pos)
         self.use_symbol_pos = bool(use_symbol_pos)
+        self.sanitize_inputs = bool(sanitize_inputs)
+        self.amp_native_position_add = bool(amp_native_position_add)
+        self.temporal_self_attention_fast_path = bool(temporal_self_attention_fast_path)
+        compiled_cross_backend = str(compiled_cross_attention_backend).strip().lower().replace("-", "_")
+        if compiled_cross_backend not in {"auto", "manual", "sdpa"}:
+            raise ValueError("compiled_cross_attention_backend must be 'auto', 'manual', or 'sdpa'")
+        self.compiled_cross_attention_backend = compiled_cross_backend
         self.sdpa_batch_limit = int(sdpa_batch_limit)
         self.norm_type = _normalize_norm_type(norm_type)
         self.ffn_type = _normalize_ffn_type(ffn_type)
@@ -579,7 +651,7 @@ class TransformerBasePortfolioModel(nn.Module):
         )
 
         def make_block(num_heads: int, ffn_mult: int) -> TransformerPortfolioBlock:
-            return TransformerPortfolioBlock(
+            block = TransformerPortfolioBlock(
                 dim=self.d_model,
                 num_heads=int(num_heads),
                 ffn_mult=int(ffn_mult),
@@ -592,6 +664,8 @@ class TransformerBasePortfolioModel(nn.Module):
                 rope_base=self.rope_base,
                 max_rope_steps=self.lookback,
             )
+            block.attn.compiled_cross_attention_backend = self.compiled_cross_attention_backend
+            return block
 
         self.temporal_blocks = nn.ModuleList(
             [
@@ -863,17 +937,6 @@ class TransformerBasePortfolioModel(nn.Module):
         if symbol_indices is not None:
             indices = symbol_indices.to(device=self.symbol_position.device, dtype=torch.long)
             indices = indices.clamp(0, int(self.symbol_position.size(2)) - 1)
-            if _torch_is_compiling():
-                position_matrix = self.symbol_position.reshape(
-                    int(self.symbol_position.size(2)),
-                    int(self.symbol_position.size(3)),
-                )
-                selector = F.one_hot(indices, num_classes=int(self.symbol_position.size(2))).to(
-                    device=position_matrix.device,
-                    dtype=position_matrix.dtype,
-                )
-                selected = selector.matmul(position_matrix)
-                return selected.reshape(1, 1, int(indices.numel()), int(self.symbol_position.size(3)))
             return self.symbol_position.index_select(2, indices)
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]
@@ -887,12 +950,16 @@ class TransformerBasePortfolioModel(nn.Module):
 
     def _project_features(self, x: torch.Tensor) -> torch.Tensor:
         model_device = self.feature_proj.weight.device
-        clean_fp32 = torch.nan_to_num(
-            x.to(device=model_device, dtype=torch.float32),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
+        if not self.sanitize_inputs and not self.categorical_feature_indices:
+            return self.feature_proj(x.to(device=model_device))
+        clean_fp32 = x.to(device=model_device, dtype=torch.float32)
+        if self.sanitize_inputs:
+            clean_fp32 = torch.nan_to_num(
+                clean_fp32,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
         clean = clean_fp32.to(dtype=self.feature_proj.weight.dtype)
         if not self.categorical_feature_indices:
             return self.feature_proj(clean)
@@ -916,9 +983,15 @@ class TransformerBasePortfolioModel(nn.Module):
     def _embed_inputs(self, x: torch.Tensor, symbol_indices: torch.Tensor | None = None) -> torch.Tensor:
         h = self._project_features(x)
         if self.use_time_pos:
-            h = h + self.time_position[:, : int(x.size(1)), :, :]
+            time_position = self.time_position[:, : int(x.size(1)), :, :]
+            if self.amp_native_position_add:
+                time_position = time_position.to(dtype=h.dtype)
+            h = h + time_position
         if self.use_symbol_pos:
-            h = h + self._symbol_position(int(x.size(2)), symbol_indices)
+            symbol_position = self._symbol_position(int(x.size(2)), symbol_indices)
+            if self.amp_native_position_add:
+                symbol_position = symbol_position.to(dtype=h.dtype)
+            h = h + symbol_position
         return self.input_dropout(h)
 
     def _add_window_positions(
@@ -928,9 +1001,15 @@ class TransformerBasePortfolioModel(nn.Module):
         symbol_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_time_pos:
-            h = h + self.time_position[:, : self.lookback, :, :]
+            time_position = self.time_position[:, : self.lookback, :, :]
+            if self.amp_native_position_add:
+                time_position = time_position.to(dtype=h.dtype)
+            h = h + time_position
         if self.use_symbol_pos:
-            h = h + self._symbol_position(int(n_symbols), symbol_indices)
+            symbol_position = self._symbol_position(int(n_symbols), symbol_indices)
+            if self.amp_native_position_add:
+                symbol_position = symbol_position.to(dtype=h.dtype)
+            h = h + symbol_position
         return self.input_dropout(h)
 
     def _project_panel_rows(self, features: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
@@ -1010,6 +1089,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     rope_positions,
                     last_pos,
                     rope_positions,
+                    self.temporal_self_attention_fast_path,
                 )
             return last_query.reshape(bsz, n_symbols, 1, dim).permute(0, 2, 1, 3).contiguous()
         use_last_query_fast_path = (
@@ -1033,6 +1113,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 rope_positions,
                 last_pos,
                 rope_positions,
+                self.temporal_self_attention_fast_path,
             )
             steps = 1
         return seq.reshape(bsz, n_symbols, steps, dim).permute(0, 2, 1, 3).contiguous()
@@ -1336,7 +1417,7 @@ class TransformerBasePortfolioModel(nn.Module):
             if PROFILE_RANGES_ENABLED:
                 with profile_range("model.portfolio.center_scores"):
                     centered_scores = (
-                        scores - masked_cross_sectional_mean(scores, mask_bool)
+                        scores - masked_cross_sectional_mean_finite(scores, mask_bool)
                         if self.center_long_short_logits
                         else scores
                     )
@@ -1344,7 +1425,7 @@ class TransformerBasePortfolioModel(nn.Module):
                     target_logits = (centered_scores / temp).masked_fill(~mask_bool, 0.0)
             else:
                 centered_scores = (
-                    scores - masked_cross_sectional_mean(scores, mask_bool)
+                    scores - masked_cross_sectional_mean_finite(scores, mask_bool)
                     if self.center_long_short_logits
                     else scores
                 )
