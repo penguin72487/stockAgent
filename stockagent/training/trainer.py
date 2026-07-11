@@ -766,6 +766,7 @@ def _call_model(
     return_aux: bool | None = None,
     symbol_indices: torch.Tensor | None = None,
 ):
+    mask = _model_attention_mask(mask)
     if symbol_indices is not None:
         if return_aux is None or not _model_accepts_return_aux(model):
             return model(x, mask, symbol_indices=symbol_indices)
@@ -773,6 +774,19 @@ def _call_model(
     if return_aux is None or not _model_accepts_return_aux(model):
         return model(x, mask)
     return model(x, mask, return_aux=return_aux)
+
+
+def _model_attention_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Ensure every model row has a visible attention token.
+
+    Dataset rows containing only a forced exit legitimately have no tradable
+    symbols.  The model still needs one visible token to keep attention kernels
+    well-defined, while callers retain the original mask for every loss and
+    backtest calculation.
+    """
+    mask_bool = mask.to(dtype=torch.bool)
+    empty_rows = ~mask_bool.any(dim=-1, keepdim=True)
+    return torch.cat((mask_bool[..., :1] | empty_rows, mask_bool[..., 1:]), dim=-1)
 
 
 def _loss_from_backtest_series(
@@ -2578,9 +2592,7 @@ class _PanelSlabForwardWrapper(nn.Module):
         # row.  Expose one dummy token to the model only; callers retain the
         # original all-false trading mask for the canonical loss/backtest, so
         # this cannot create a position, return, fee, or recurrent state update.
-        mask = mask.to(dtype=torch.bool)
-        empty_rows = ~mask.any(dim=-1, keepdim=True)
-        mask = torch.cat((mask[..., :1] | empty_rows, mask[..., 1:]), dim=-1)
+        mask = _model_attention_mask(mask)
         kwargs: dict[str, Any] = {"return_aux": False}
         if symbol_indices is not None:
             if not self._accepts_symbol_indices:
@@ -2668,6 +2680,7 @@ def _call_panel_forward_for_batch(
     allow_slab: bool = True,
     rows: int | None = None,
 ):
+    model_mask = _model_attention_mask(mask)
     if allow_slab and panel_slab_model is not None and return_aux is False:
         feature_slab = _feature_slab_from_metadata(
             split,
@@ -2677,14 +2690,14 @@ def _call_panel_forward_for_batch(
             rows=rows,
         )
         if feature_slab is not None:
-            return panel_slab_model(feature_slab, mask, batch.get("symbol_indices"))
+            return panel_slab_model(feature_slab, model_mask, batch.get("symbol_indices"))
     kwargs: dict[str, Any] = {"return_aux": return_aux}
     symbol_indices = batch.get("symbol_indices")
     if symbol_indices is not None:
         if not _callable_accepts_parameter(panel_forward_model.forward_from_panel, "symbol_indices"):
             raise ValueError("compact symbol batches require forward_from_panel(..., symbol_indices=...)")
         kwargs["symbol_indices"] = symbol_indices
-    return panel_forward_model.forward_from_panel(split.features, batch["date_indices"], mask, **kwargs)
+    return panel_forward_model.forward_from_panel(split.features, batch["date_indices"], model_mask, **kwargs)
 
 
 def _objective_uses_deterministic_multitask_aux(objective: str) -> bool:
