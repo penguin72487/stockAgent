@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ import polars as pl
 import pytest
 
 import stockagent.data.panel as panel_module
+from scripts.audit_tw_public_data_layer import audit_feature_build_receipt
 from stockagent.data.panel import build_panel, build_tail_panel
 from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
@@ -101,6 +103,19 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     market = out.filter(pl.col("symbol") == DEFAULT_MARKET_SYMBOL).sort("date")
     assert market.height == 2
     assert market["twpub_usdtwd_logret_1d"][1] is not None
+    summary = json.loads(output_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    assert summary["source_receipts"]
+    assert summary["output_receipt"]["sha256"]
+    assert summary["symbol_universe_receipt"]["file_count"] == 1
+    receipt, findings = audit_feature_build_receipt(output_path, input_dir, symbols_root)
+    assert receipt["valid"] is True
+    assert findings == []
+
+    with (input_dir / "twse_daily_valuation.parquet").open("ab") as handle:
+        handle.write(b"changed")
+    receipt, findings = audit_feature_build_receipt(output_path, input_dir, symbols_root)
+    assert receipt["valid"] is False
+    assert [item.code for item in findings] == ["stale_feature_build_receipt"]
 
 
 def test_build_panel_aligns_external_stock_and_market_features(tmp_path: Path) -> None:
@@ -166,6 +181,67 @@ def test_build_panel_manual_feature_switch_supports_glob_include_and_exclude(tmp
 
     assert panel.feature_names == ["close_logret_1d", "twpub_usdtwd_logret_1d"]
     assert panel.features.shape[-1] == 2
+
+
+def test_build_panel_zero_fill_keeps_feature_slots_and_zeros_matching_values(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "symbol": [DEFAULT_MARKET_SYMBOL, "2330"],
+            "twpub_usdtwd_logret_1d": [0.01, None],
+            "twpub_pe_log": [None, 3.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["close_logret_1d", "twpub_*"],
+        feature_zero_fill=["twpub_*"],
+    )
+
+    assert panel.feature_names == [
+        "close_logret_1d",
+        "twpub_usdtwd_logret_1d",
+        "twpub_pe_log",
+    ]
+    assert panel.features.shape[-1] == 3
+    assert np.count_nonzero(panel.features[:, :, 1:]) == 0
+
+
+def test_market_point_in_time_state_is_forward_filled_after_release(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    _write_symbol(tmp_path / "2317_features.parquet", [50.0, 51.0, 52.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04"],
+            "symbol": [DEFAULT_MARKET_SYMBOL, DEFAULT_MARKET_SYMBOL],
+            "twpub_dgbas_cpi_log": [4.5, 4.6],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="2330",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["twpub_dgbas_cpi_log"],
+    )
+
+    feature_idx = panel.feature_names.index("twpub_dgbas_cpi_log")
+    date_0103 = int(np.flatnonzero(panel.dates == np.datetime64("2024-01-03"))[0])
+    assert np.allclose(panel.features[date_0103, :, feature_idx], 4.5)
 
 
 def test_external_tpex_limit_rule_columns_update_masks_without_becoming_features(tmp_path: Path) -> None:

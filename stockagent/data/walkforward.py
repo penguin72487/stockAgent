@@ -16,6 +16,35 @@ class WalkForwardFold:
     test_years: list[int]
 
 
+def validate_walk_forward_year_contract(
+    dates: np.ndarray,
+    *,
+    expected_first_year: int | None = None,
+    require_contiguous_years: bool = False,
+) -> list[int]:
+    years = sorted(
+        np.unique(np.asarray(dates, dtype="datetime64[Y]").astype(np.int64) + 1970)
+        .astype(int)
+        .tolist()
+    )
+    if not years:
+        raise ValueError("walk-forward dates are empty")
+    if expected_first_year is not None and years[0] != int(expected_first_year):
+        raise ValueError(
+            "walk-forward first-year contract failed: "
+            f"expected={int(expected_first_year)}, actual={years[0]}. "
+            "Backfill the missing source years; do not silently renumber folds."
+        )
+    if require_contiguous_years:
+        missing_years = sorted(set(range(years[0], years[-1] + 1)) - set(years))
+        if missing_years:
+            raise ValueError(
+                "walk-forward year-continuity contract failed: "
+                f"missing_years={missing_years}. Backfill the official source before training."
+            )
+    return years
+
+
 def build_expanding_year_folds(
     dates: np.ndarray,
     min_train_years: int,

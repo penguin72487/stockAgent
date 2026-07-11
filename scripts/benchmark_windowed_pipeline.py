@@ -59,6 +59,7 @@ def main() -> None:
         external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

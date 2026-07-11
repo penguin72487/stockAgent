@@ -101,7 +101,11 @@ def _run_case(
     benchmark_rows: int,
     warmup: bool,
 ) -> dict[str, Any]:
-    backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(config, chunk_rows)
+    backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(
+        config,
+        chunk_rows,
+        len(split),
+    )
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
@@ -228,6 +232,7 @@ def main() -> None:
         external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

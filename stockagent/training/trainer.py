@@ -3291,6 +3291,9 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         contract["loss_portfolio_activation"] = normalize_portfolio_activation(
             _training_loss_portfolio_activation(config)
         )
+        loss_min_trade_weight = _training_loss_min_trade_weight(config)
+        if loss_min_trade_weight != float(config.trading.min_trade_weight):
+            contract["loss_min_trade_weight"] = loss_min_trade_weight
     multitask = _active_multitask_checkpoint_contract(config, objective)
     if multitask:
         contract["multitask_loss"] = multitask
@@ -3316,6 +3319,9 @@ def _training_checkpoint_contract_schema_3(
     # synthesized into a historical schema-3 fingerprint; the compatibility
     # constraint below separately prevents unsafe optimizer resume when enabled.
     contract.pop("cache_train_features_in_amp_dtype", None)
+    # This decoupling control did not exist in schema 3; historical runs always
+    # used trading.min_trade_weight in the loss.
+    contract.pop("loss_min_trade_weight", None)
     # Schema 3 recorded this field even though no executor ever consumed it.
     # Reconstruct the only honest/effective historical value after removing the
     # no-op from TrainingConfig so old fingerprints remain verifiable.
@@ -8336,6 +8342,13 @@ def _training_loss_portfolio_activation(config: ExperimentConfig) -> str:
     return activation
 
 
+def _training_loss_min_trade_weight(config: ExperimentConfig) -> float:
+    configured = getattr(config.training, "loss_min_trade_weight", None)
+    if configured is None:
+        return max(0.0, float(config.trading.min_trade_weight))
+    return max(0.0, float(configured))
+
+
 def _postprocess_benchmark_script() -> Path:
     return Path(__file__).resolve().parents[2] / "scripts" / "benchmark_postprocess.py"
 
@@ -10857,8 +10870,9 @@ def run_training(
     factor_loss_kwargs = _factor_loss_kwargs(config)
     portfolio_autoencoder_loss_kwargs = _portfolio_autoencoder_loss_kwargs(config)
     loss_portfolio_activation = _training_loss_portfolio_activation(config)
+    loss_min_trade_weight = _training_loss_min_trade_weight(config)
     risk_loss_kwargs = {**factor_loss_kwargs, **portfolio_autoencoder_loss_kwargs}
-    risk_loss_kwargs["min_trade_weight"] = config.trading.min_trade_weight
+    risk_loss_kwargs["min_trade_weight"] = loss_min_trade_weight
     risk_loss_kwargs["portfolio_activation"] = loss_portfolio_activation
     risk_loss_kwargs["net_exposure_weight"] = config.training.multitask_loss.net_exposure_weight
     factor_aug_kwargs = _factor_augmentation_kwargs(config, loss_objective)
@@ -11278,7 +11292,10 @@ def run_training(
             combined_test_windowed,
             device,
             non_blocking,
-            shared_base=train_windowed,
+            # Validation is the canonical full-universe eval base. The train
+            # split may be symbol-compacted, while validation and test always
+            # share the same immutable panel tensors.
+            shared_base=combined_val_windowed,
             name=f"test windowed tensors {train_years}",
         )
         curve_test_start_row = 0
@@ -12060,7 +12077,7 @@ def run_training(
             device=device,
             non_blocking=non_blocking,
             enabled=bool(config.training.cache_eval_tensors_on_gpu),
-            cached_base=train_windowed,
+            cached_base=combined_val_windowed,
         )
         if combined_test_windowed_shared is not None:
             combined_test_windowed = combined_test_windowed_shared

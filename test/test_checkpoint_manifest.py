@@ -152,6 +152,10 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         ),
         (
             "training",
+            lambda cfg: setattr(cfg.training, "loss_min_trade_weight", 0.001),
+        ),
+        (
+            "training",
             lambda cfg: setattr(cfg.training.multitask_loss, "direction_weight", 0.987),
         ),
         ("training", lambda cfg: setattr(cfg.environment, "amp_dtype", "fp16")),
@@ -305,6 +309,21 @@ def test_rank_objectives_ignore_inactive_loss_portfolio_activation(objective: st
 
     changed_config = copy.deepcopy(config)
     changed_config.training.loss_portfolio_activation = "tanh"
+    changed = _checkpoint_manifest(panel, changed_config)
+
+    assert changed["fingerprints"] == baseline["fingerprints"]
+    assert changed["configuration_fingerprint"] != baseline["configuration_fingerprint"]
+
+
+@pytest.mark.parametrize("objective", ["pure_rank", "rank_ic"])
+def test_rank_objectives_ignore_inactive_loss_min_trade_weight(objective: str) -> None:
+    panel = _panel()
+    config = _config()
+    config.training.loss_type = objective
+    baseline = _checkpoint_manifest(panel, config)
+
+    changed_config = copy.deepcopy(config)
+    changed_config.training.loss_min_trade_weight = 0.001
     changed = _checkpoint_manifest(panel, changed_config)
 
     assert changed["fingerprints"] == baseline["fingerprints"]

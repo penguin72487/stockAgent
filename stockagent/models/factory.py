@@ -334,6 +334,7 @@ def build_model(
             use_flash_attention=tbp_cfg.use_flash_attention,
             use_time_pos=tbp_cfg.use_time_pos,
             use_symbol_pos=tbp_cfg.use_symbol_pos,
+            symbol_position_capacity=tbp_cfg.symbol_position_capacity,
             input_dropout=tbp_cfg.input_dropout,
             sanitize_inputs=tbp_cfg.sanitize_inputs,
             amp_native_position_add=tbp_cfg.amp_native_position_add,

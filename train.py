@@ -334,6 +334,7 @@ def _build_panel_kwargs(config) -> dict:
         "external_data_required": use_tw_public_data,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
+        "feature_zero_fill": config.data.feature_zero_fill,
     }
 
 
@@ -775,7 +776,10 @@ def main() -> None:
     )
 
     from stockagent.data.panel import build_panel
-    from stockagent.data.walkforward import build_expanding_year_folds
+    from stockagent.data.walkforward import (
+        build_expanding_year_folds,
+        validate_walk_forward_year_contract,
+    )
     from stockagent.training.trainer import run_inference, run_training
 
     if args.seed is not None:
@@ -935,7 +939,12 @@ def main() -> None:
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
-    all_folds = build_expanding_year_folds(
+    validate_walk_forward_year_contract(
+        panel.dates,
+        expected_first_year=config.walk_forward.expected_first_year,
+        require_contiguous_years=config.walk_forward.require_contiguous_years,
+    )
+    folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
