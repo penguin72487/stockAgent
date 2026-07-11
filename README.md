@@ -87,15 +87,16 @@ Multi-asset Taiwan stock trading research workspace.
 
 ## Taiwan Public Data Download
 
-- Run `run_fintech_python downloader/download_tw_public_data.py --mode daily-update --datasets all --output-dir data_tw_public` to collect Taiwan free public datasets from TWSE, TPEx, MOPS-backed OpenAPI feeds, TDCC, TAIFEX, CBC, DGBAS, and MOF.
-- The same daily update also maintains official delisted-company histories in `twse_delisted_company.parquet` and `tpex_delisted_company.parquet`. Use `--datasets delisted` to update only these two datasets.
+- Use `run_fintech_python downloader/download_tw_official_data.py --mode rebuild|repair|daily` as the canonical TWSE/TPEx-first data-layer entry point. `rebuild` stages an atomic replacement, `repair` checks and fills historical gaps, and `daily` requires a verified baseline. From 2000 onward, the default audited Yahoo archive fills only missing stock/ETF OHLCV keys; official rows always win and row-level lineage is retained. Use `--ohlcv-fallback none` to disable it.
+- On a new machine, run `run_fintech_python downloader/download_tw_official_data.py --mode rebuild --stage-root artifacts/data_rebuild/tw_2000_bootstrap --promote`. Reuse the same stage path after a rate-limited retry so completed symbols are skipped. To reuse existing Yahoo TW files, add `--yahoo-fallback-dir data_yahoo/tw_stocks --skip-yahoo-download`.
+- The high-level daily update also maintains official delisted-company histories in `twse_delisted_company.parquet` and `tpex_delisted_company.parquet`. For source diagnostics only, the low-level `download_tw_public_data.py --mode repair --datasets delisted` command can restrict the request to those tables.
 - Backfill point-in-time delisting and short-sale/cover announcements separately:
   `run_fintech_python downloader/download_tw_short_sale_restrictions.py --output-dir data_tw_public --start-year 1995 --end-year "$(date +%Y)"`.
   The downloader writes `tw_short_sale_download_report.json` and refuses to replace
   the parquet outputs after an incomplete request unless `--allow-partial` is
   explicitly supplied.
-- Daily stock-model inputs from TWSE/TPEx can be updated as a curated group with `--datasets model_useful`. This group archives 117 point-in-time snapshots covering financial statements and monthly revenue, ownership and institutional flows, company/lifecycle events, shorting and securities-lending inputs, corporate actions, market-state rules, calendars, and index/constituent data. It intentionally excludes intraday leaderboards, broker rankings, auction-frequency-only feeds, warrants, bonds, gold, and funds.
-- The first `daily-update` run backfills historical daily datasets where the official endpoint supports dates, including TWSE/TPEx OHLCV, margin balance, institutional trades, and valuation tables. Later runs append only missing dates.
+- The low-level source downloader exposes `--datasets model_useful` for diagnostics. This group archives 117 point-in-time snapshots covering financial statements and monthly revenue, ownership and institutional flows, company/lifecycle events, shorting and securities-lending inputs, corporate actions, market-state rules, calendars, and index/constituent data. It intentionally excludes intraday leaderboards, broker rankings, auction-frequency-only feeds, warrants, bonds, gold, and funds.
+- Run `repair` or `rebuild` before the first `daily` update. Daily mode never treats a few recent rows as a complete historical database.
 - Snapshot-style OpenAPI feeds that only publish the latest table are stored with a `date` batch column, so daily runs accumulate same-day-replaced snapshots instead of discarding prior days.
 - Government Data Platform datasets are resolved through `data.gov.tw` metadata at runtime, then written to parquet with raw metadata under `data_tw_public/metadata/`.
 - Use tags to limit scope, for example `--datasets price`, `--datasets twse tpex`, `--datasets macro`, `--datasets taifex tdcc`, or a concrete dataset such as `twse_daily_ohlcv`.
@@ -103,7 +104,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Outputs include one parquet per dataset, raw responses under `raw/` unless `--skip-raw` is set, plus `download_report.csv`, `download_summary.json`, and `dataset_manifest.json`.
 - Historical backfills use both dataset-level concurrency (`--workers`) and date-level concurrency (`--date-workers`), and periodically flush partial parquet output with `--flush-every-dates` so long first runs can resume.
 - For a smoke run, use `--start-date 2024-06-03 --end-date 2024-06-03 --datasets twse_daily_ohlcv tpex_daily_ohlcv --skip-raw`.
-- Build the training feature parquet with `run_fintech_python scripts/build_tw_public_training_features.py --input-dir data_tw_public --output-path data_tw_public/features/tw_public_stock_daily.parquet --symbols-root data_yahoo/tw_stocks`.
+- Build the training feature parquet with `run_fintech_python scripts/build_tw_public_training_features.py --input-dir data_tw_public --output-path data_tw_public/features/tw_public_stock_daily.parquet --symbols-root data_tw_public/stocks`.
 - Run that rebuild after updating the dedicated restriction archive. The generated
   rule columns keep `can_sell_mask` (may reduce an owned long) separate from
   `can_short_open_mask` (may open/increase a borrowed short). Ordinary halts,
@@ -116,7 +117,7 @@ Multi-asset Taiwan stock trading research workspace.
   gaps; explicit halt/resume notices remain authoritative.
 - The feature parquet is a sparse `date` x `symbol` long table. Stock-specific rows align by ticker/date; macro/TAIFEX market rows use symbol `__MARKET__` and are broadcast to all stocks during panel build.
 - Its `date` is the conservative availability date: daily market tables use trading date, TDCC uses data date plus a safety lag, monthly/quarterly macro uses period end plus lag when no explicit release date exists, and event tables use announcement/report date or downloader as-of date.
-- `downloader/run_daily_all_markets.sh` and `downloader/daily_downloader_daemon.sh` update the restriction archive and then rebuild `data_tw_public/features/tw_public_stock_daily.parquet` by default. Set `RUN_TW_SHORT_RESTRICTIONS=0` to skip the dedicated rules update, `RUN_TW_PUBLIC_DATA=0` to skip raw public data, `RUN_TW_PUBLIC_FEATURES=0` to skip feature rebuild, narrow scope with `TW_PUBLIC_DATASETS="twse tpex macro"`, or set `TW_PUBLIC_SKIP_RAW=1` when raw response archives are not needed.
+- `downloader/run_daily_all_markets.sh` and `downloader/daily_downloader_daemon.sh` update the restriction archive and then rebuild `data_tw_public/features/tw_public_stock_daily.parquet` by default. The TW stage uses `TW_PUBLIC_OHLCV_FALLBACK=yahoo` and `TW_PUBLIC_FALLBACK_START_DATE=2000-01-01` by default. Set `RUN_TW_SHORT_RESTRICTIONS=0` to skip the dedicated rules update, `RUN_TW_PUBLIC_DATA=0` to skip raw public data, `RUN_TW_PUBLIC_FEATURES=0` to skip feature rebuild, or `TW_PUBLIC_SKIP_RAW=1` when raw response archives are not needed.
 
 ### Repair Mode
 

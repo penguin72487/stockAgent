@@ -16,12 +16,12 @@ environment:
   torch_compile_threads: 128
 
 data:
-  parquet_root: data_yahoo/tw_stocks
+  parquet_root: data_tw_public/stocks
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 128
-  trading_volume_policy: auto
+  trading_volume_policy: required
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
   use_tw_public_rules: true

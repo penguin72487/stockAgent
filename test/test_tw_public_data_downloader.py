@@ -1,10 +1,48 @@
 from __future__ import annotations
 
 from datetime import date
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import polars as pl
+import pytest
 
 from downloader import download_tw_public_data as twpub
+
+
+def _historical_args(mode: str, *, end_date: str = "2024-01-04") -> SimpleNamespace:
+    return SimpleNamespace(
+        mode=mode,
+        start_date="earliest",
+        end_date=end_date,
+        include_weekends=False,
+        max_dates=None,
+        refresh=False,
+        empty_recheck_days=0,
+        daily_overlap_days=2,
+        flush_every_dates=0,
+        date_workers=2,
+        progress=False,
+        timeout=1,
+        verify_ssl=True,
+        retries=0,
+        retry_backoff=0.0,
+        skip_raw=True,
+        sleep=0.0,
+    )
+
+
+def _historical_spec() -> twpub.DatasetSpec:
+    return twpub.DatasetSpec(
+        name="sample_history",
+        kind="historical_json_table",
+        source="official-test",
+        description="sample",
+        tags=("test",),
+        url_template="https://example.test/{date}",
+        start_date="2024-01-02",
+    )
 
 
 def test_parse_json_table_payload_keeps_stock_codes_as_strings():
@@ -31,6 +69,195 @@ def test_parse_json_table_payload_keeps_stock_codes_as_strings():
     assert "買進_2" in frame.columns
     assert frame.schema["證券代號"] == pl.String
     assert frame["date"].to_list() == ["2024-06-03", "2024-06-03"]
+
+
+def test_download_modes_have_stable_legacy_aliases():
+    assert twpub._canonical_mode("from-zero") == "rebuild"
+    assert twpub._canonical_mode("full") == "repair"
+    assert twpub._canonical_mode("daily-update") == "daily"
+
+
+def test_repair_fetches_only_missing_weekdays(tmp_path: Path, monkeypatch):
+    spec = _historical_spec()
+    output_path = tmp_path / f"{spec.name}.parquet"
+    pl.DataFrame(
+        {"date": ["2024-01-02", "2024-01-04"], "value": ["old-2", "old-4"]}
+    ).write_parquet(output_path)
+    requested: list[date] = []
+
+    def fake_download(spec, day, args, output_dir):
+        requested.append(day)
+        return twpub.HistoricalDateResult(
+            day=day,
+            url=f"https://example.test/{day}",
+            frame=pl.DataFrame({"date": [day.isoformat()], "value": ["repaired"]}),
+        )
+
+    monkeypatch.setattr(twpub, "_download_historical_date", fake_download)
+    result = twpub._download_historical(spec, _historical_args("repair"), tmp_path)
+
+    assert requested == [date(2024, 1, 3)]
+    assert result.status == "ok"
+    assert result.coverage_complete is True
+    assert result.missing_dates_before == 1
+    assert pl.read_parquet(output_path).get_column("date").to_list() == [
+        "2024-01-02",
+        "2024-01-03",
+        "2024-01-04",
+    ]
+    state = json.loads((tmp_path / "state" / f"{spec.name}.json").read_text())
+    assert state["baseline_established"] is True
+    assert state["checked_through"] == "2024-01-04"
+
+
+def test_rebuild_keeps_previous_parquet_when_any_date_fails(tmp_path: Path, monkeypatch):
+    spec = _historical_spec()
+    output_path = tmp_path / f"{spec.name}.parquet"
+    original = pl.DataFrame({"date": ["2024-01-02"], "value": ["production"]})
+    original.write_parquet(output_path)
+
+    def fake_download(spec, day, args, output_dir):
+        if day == date(2024, 1, 3):
+            return twpub.HistoricalDateResult(
+                day=day,
+                url="https://example.test/failure",
+                frame=pl.DataFrame(),
+                error="simulated failure",
+            )
+        return twpub.HistoricalDateResult(
+            day=day,
+            url=f"https://example.test/{day}",
+            frame=pl.DataFrame({"date": [day.isoformat()], "value": ["staged"]}),
+        )
+
+    monkeypatch.setattr(twpub, "_download_historical_date", fake_download)
+    result = twpub._download_historical(spec, _historical_args("rebuild"), tmp_path)
+
+    assert result.status == "failed"
+    assert result.failed_dates == 1
+    assert pl.read_parquet(output_path).to_dicts() == original.to_dicts()
+    assert list(tmp_path.glob("*.rebuild.parquet")) == []
+
+
+def test_repair_does_not_accept_empty_response_for_suspicious_existing_date(
+    tmp_path: Path, monkeypatch
+):
+    spec = twpub.DatasetSpec(
+        name="twse_daily_ohlcv",
+        kind="historical_json_table",
+        source="TWSE",
+        description="sample",
+        tags=("test",),
+        url_template="https://example.test/{date}",
+        start_date="2024-01-02",
+    )
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-02"],
+            "證券代號": ["2330", "2330"],
+            "成交股數": ["1,000", "1,000"],
+            "開盤價": ["100", "100"],
+            "最高價": ["101", "101"],
+            "最低價": ["99", "99"],
+            "收盤價": ["100", "100"],
+        }
+    ).write_parquet(tmp_path / "twse_daily_ohlcv.parquet")
+
+    def empty_download(spec, day, args, output_dir):
+        return twpub.HistoricalDateResult(
+            day=day,
+            url="https://example.test/empty",
+            frame=pl.DataFrame(),
+        )
+
+    monkeypatch.setattr(twpub, "_download_historical_date", empty_download)
+    result = twpub._download_historical(
+        spec,
+        _historical_args("repair", end_date="2024-01-02"),
+        tmp_path,
+    )
+
+    assert result.status == "failed"
+    assert result.coverage_complete is False
+    assert result.failed_dates == 1
+
+
+def test_daily_requires_a_completed_rebuild_or_repair(tmp_path: Path):
+    spec = _historical_spec()
+    pl.DataFrame({"date": ["2024-01-04"], "value": ["partial"]}).write_parquet(
+        tmp_path / f"{spec.name}.parquet"
+    )
+
+    with pytest.raises(RuntimeError, match="complete baseline"):
+        twpub._plan_historical_download(
+            spec,
+            _historical_args("daily", end_date="2024-01-05"),
+            tmp_path,
+        )
+
+
+def test_daily_refreshes_overlap_and_appends_after_verified_baseline(tmp_path: Path):
+    spec = _historical_spec()
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03", "2024-01-04"],
+            "value": ["2", "3", "4"],
+        }
+    ).write_parquet(tmp_path / f"{spec.name}.parquet")
+    state_path = tmp_path / "state" / f"{spec.name}.json"
+    state_path.parent.mkdir()
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": twpub.COVERAGE_STATE_SCHEMA_VERSION,
+                "dataset": spec.name,
+                "baseline_established": True,
+                "coverage_complete": True,
+                "checked_through": "2024-01-04",
+                "confirmed_empty_dates": [],
+                "failed_dates": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = twpub._plan_historical_download(
+        spec,
+        _historical_args("daily", end_date="2024-01-05"),
+        tmp_path,
+    )
+
+    assert plan.dates == [date(2024, 1, 4), date(2024, 1, 5)]
+
+
+def test_repair_trusts_confirmed_historical_holidays(tmp_path: Path):
+    spec = _historical_spec()
+    pl.DataFrame(
+        {"date": ["2024-01-02", "2024-01-04"], "value": ["2", "4"]}
+    ).write_parquet(tmp_path / f"{spec.name}.parquet")
+    state_path = tmp_path / "state" / f"{spec.name}.json"
+    state_path.parent.mkdir()
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": twpub.COVERAGE_STATE_SCHEMA_VERSION,
+                "dataset": spec.name,
+                "confirmed_empty_dates": ["2024-01-03"],
+                "failed_dates": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = twpub._plan_historical_download(spec, _historical_args("repair"), tmp_path)
+
+    assert plan.dates == []
+
+
+def test_official_status_distinguishes_no_data_from_server_errors():
+    assert twpub._json_payload_status_error({"stat": "很抱歉，沒有符合條件的資料!"}) is None
+    assert twpub._json_payload_status_error({"stat": "OK"}) is None
+    assert twpub._json_payload_status_error({"stat": "系統忙碌，請稍後再試"}) == "系統忙碌，請稍後再試"
 
 
 def test_table_mode_filters_json_tables_by_title():

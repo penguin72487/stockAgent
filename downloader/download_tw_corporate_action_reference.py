@@ -42,8 +42,15 @@ def parse_args() -> argparse.Namespace:
         description="Download official TWSE/TPEx ex-right/ex-dividend reference prices by year."
     )
     parser.add_argument("--output-dir", type=Path, default=Path("data_tw_public"))
+    parser.add_argument(
+        "--mode",
+        choices=("rebuild", "repair", "daily"),
+        default="repair",
+        help="rebuild replaces all history; repair merges the requested years; daily refreshes recent years.",
+    )
     parser.add_argument("--start-year", type=int, default=2000)
     parser.add_argument("--end-date", default=date.today().isoformat())
+    parser.add_argument("--daily-overlap-years", type=int, default=2)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=4)
@@ -207,11 +214,33 @@ def _file_receipt(path: Path) -> dict[str, Any]:
 def main() -> None:
     args = parse_args()
     end_date = date.fromisoformat(args.end_date)
+    if args.daily_overlap_years < 1:
+        raise ValueError("--daily-overlap-years must be >= 1")
+    output_path = args.output_dir / "tw_corporate_action_reference.parquet"
+    summary_path = args.output_dir / "tw_corporate_action_reference.summary.json"
+    previous_summary: dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            previous_summary = payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            previous_summary = {}
+    if args.mode == "daily":
+        if not output_path.exists() or not bool(previous_summary.get("baseline_established")):
+            raise RuntimeError(
+                "daily corporate-action update requires a complete baseline; run --mode repair first"
+            )
+        request_start_year = max(
+            int(args.start_year),
+            end_date.year - int(args.daily_overlap_years) + 1,
+        )
+    else:
+        request_start_year = int(args.start_year)
     tasks: list[tuple[str, int]] = []
     for market, first_year in (("twse", 2003), ("tpex", 2000)):
         tasks.extend(
             (market, year)
-            for year in range(max(int(args.start_year), first_year), end_date.year + 1)
+            for year in range(max(request_start_year, first_year), end_date.year + 1)
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     results: list[FetchResult] = []
@@ -253,7 +282,23 @@ def main() -> None:
             .unique(["date", "symbol"], keep="first", maintain_order=True)
             .drop("_has_reference")
         )
-    output_path = args.output_dir / "tw_corporate_action_reference.parquet"
+    if args.mode != "rebuild" and output_path.exists():
+        existing = pl.read_parquet(output_path)
+        if not existing.is_empty():
+            requested_start = date(request_start_year, 1, 1)
+            existing_date = pl.col("date").cast(pl.Date, strict=False)
+            existing = existing.filter(
+                (existing_date < requested_start) | (existing_date > end_date)
+            )
+            frame = (
+                existing
+                if frame.is_empty()
+                else pl.concat([existing, frame], how="diagonal_relaxed")
+            )
+            if not frame.is_empty():
+                frame = frame.sort(["date", "symbol"]).unique(
+                    ["date", "symbol"], keep="last", maintain_order=True
+                )
     handle = tempfile.NamedTemporaryFile(
         prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent, delete=False
     )
@@ -264,10 +309,22 @@ def main() -> None:
         os.replace(temporary_path, output_path)
     finally:
         temporary_path.unlink(missing_ok=True)
+    previous_baseline = bool(previous_summary.get("baseline_established"))
+    baseline_established = previous_baseline or (
+        args.mode in {"rebuild", "repair"} and request_start_year <= 2000
+    )
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "start_year": int(args.start_year),
+        "mode": args.mode,
+        "requested_start_year": request_start_year,
+        "coverage_start_year": (
+            min(int(previous_summary.get("coverage_start_year", request_start_year)), request_start_year)
+            if args.mode != "rebuild" and previous_summary
+            else request_start_year
+        ),
+        "baseline_established": baseline_established,
+        "coverage_complete": baseline_established,
         "end_date": str(end_date),
         "request_count": len(results),
         "failure_count": 0,
@@ -276,7 +333,6 @@ def main() -> None:
         "raw_files": [result.raw_path for result in results if result.raw_path],
         "output_receipt": _file_receipt(output_path),
     }
-    summary_path = args.output_dir / "tw_corporate_action_reference.summary.json"
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
