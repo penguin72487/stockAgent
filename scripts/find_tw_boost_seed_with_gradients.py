@@ -25,6 +25,7 @@ from stockagent.training.trainer import (
     _autocast_context,
     _extract_weights_and_aux,
     _resolve_amp_dtype,
+    _training_loss_min_trade_weight,
     _volume_limit_weights_from_notional,
 )
 from stockagent.training.windowed import dataset_to_windowed_tensors
@@ -49,7 +50,7 @@ def _loss_kwargs(config) -> dict:
         "sell_fee_rate": float(config.trading.sell_fee_rate),
         "max_turnover_ratio": float(config.trading.max_turnover_ratio),
         "gross_leverage": 1.0,
-        "min_trade_weight": float(config.trading.min_trade_weight),
+        "min_trade_weight": _training_loss_min_trade_weight(config),
         "portfolio_activation": str(config.training.loss_portfolio_activation),
         "gamma_sharpe": float(config.evaluation.gamma_sharpe),
         "gamma_excess": float(config.evaluation.gamma_excess),
@@ -192,6 +193,7 @@ def main() -> None:
         external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
