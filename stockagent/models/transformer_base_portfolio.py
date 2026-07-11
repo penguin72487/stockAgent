@@ -524,6 +524,7 @@ class TransformerBasePortfolioModel(nn.Module):
         use_flash_attention: bool = True,
         use_time_pos: bool = True,
         use_symbol_pos: bool = True,
+        symbol_position_capacity: int | None = None,
         input_dropout: float = 0.0,
         sanitize_inputs: bool = True,
         amp_native_position_add: bool = False,
@@ -573,6 +574,12 @@ class TransformerBasePortfolioModel(nn.Module):
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.d_model = int(d_model)
+        resolved_symbol_capacity = (
+            self.num_symbols if symbol_position_capacity is None else int(symbol_position_capacity)
+        )
+        if resolved_symbol_capacity <= 0:
+            raise ValueError("symbol_position_capacity must be positive")
+        self.symbol_position_capacity = resolved_symbol_capacity
         self.attention_mode = self._normalize_attention_mode(attention_mode)
         self.temporal_pooling = self._normalize_pooling(temporal_pooling)
         self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
@@ -643,7 +650,9 @@ class TransformerBasePortfolioModel(nn.Module):
             self.categorical_proj = None
         self.input_dropout = nn.Dropout(float(input_dropout))
         self.time_position = nn.Parameter(torch.randn(1, self.lookback, 1, self.d_model) * 0.02)
-        self.symbol_position = nn.Parameter(torch.randn(1, 1, self.num_symbols, self.d_model) * 0.02)
+        self.symbol_position = nn.Parameter(
+            torch.randn(1, 1, self.symbol_position_capacity, self.d_model) * 0.02
+        )
         self.register_buffer(
             "temporal_rope_positions",
             torch.arange(self.lookback, dtype=torch.float32),
@@ -936,8 +945,11 @@ class TransformerBasePortfolioModel(nn.Module):
     def _symbol_position(self, n_symbols: int, symbol_indices: torch.Tensor | None = None) -> torch.Tensor:
         if symbol_indices is not None:
             indices = symbol_indices.to(device=self.symbol_position.device, dtype=torch.long)
-            indices = indices.clamp(0, int(self.symbol_position.size(2)) - 1)
-            return self.symbol_position.index_select(2, indices)
+            capacity = int(self.symbol_position.size(2))
+            valid = indices.ge(0) & indices.lt(capacity)
+            safe_indices = indices.clamp(0, capacity - 1)
+            positions = self.symbol_position.index_select(2, safe_indices)
+            return positions * valid.view(1, 1, -1, 1).to(dtype=positions.dtype)
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]
         extra = self.symbol_position.new_zeros(

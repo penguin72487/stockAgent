@@ -3188,6 +3188,44 @@ def test_prepare_windowed_split_reuses_prepared_shared_base() -> None:
         assert torch.equal(actual[key], expected[key]), key
 
 
+def test_full_eval_splits_share_base_when_train_symbols_are_compacted() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=3)
+    train_raw = dataset_to_windowed_tensors(
+        CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    )
+    train = _prepare_windowed_split(
+        train_raw.subset_symbols(torch.tensor([0, 2, 4])),
+        torch.device("cpu"),
+        non_blocking=False,
+        name="compacted train",
+    )
+    validation = _prepare_windowed_split(
+        dataset_to_windowed_tensors(
+            CrossSectionalDataset(panel, torch.arange(4, 11).numpy(), lookback=3)
+        ),
+        torch.device("cpu"),
+        non_blocking=False,
+        shared_base=train,
+        name="validation",
+    )
+    test = _prepare_windowed_split(
+        dataset_to_windowed_tensors(
+            CrossSectionalDataset(panel, torch.arange(7, 14).numpy(), lookback=3)
+        ),
+        torch.device("cpu"),
+        non_blocking=False,
+        shared_base=validation,
+        name="test",
+    )
+
+    assert validation.num_symbols == panel.num_symbols
+    assert validation.features.data_ptr() != train.features.data_ptr()
+    assert test.features.data_ptr() == validation.features.data_ptr()
+    assert test.future_log_returns.data_ptr() == validation.future_log_returns.data_ptr()
+    assert test.tradable_mask.data_ptr() == validation.tradable_mask.data_ptr()
+    assert test.valid_indices.data_ptr() != validation.valid_indices.data_ptr()
+
+
 def test_short_open_fallback_does_not_alias_sell_mask_storage() -> None:
     panel = _make_panel(rows=6, symbols=2, features=1)
     panel.can_short_open_mask = None

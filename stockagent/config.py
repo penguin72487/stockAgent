@@ -281,6 +281,7 @@ class DataConfig:
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
+    feature_zero_fill: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -288,6 +289,8 @@ class WalkForwardConfig:
     min_train_years: int = 1
     val_years: int = 1
     require_future_test_year: bool = True
+    expected_first_year: int | None = None
+    require_contiguous_years: bool = False
 
 
 @dataclass(slots=True)
@@ -448,6 +451,7 @@ class TransformerBasePortfolioModelConfig:
     use_flash_attention: bool = True
     use_time_pos: bool = True
     use_symbol_pos: bool = True
+    symbol_position_capacity: int | None = None
     input_dropout: float = 0.0
     sanitize_inputs: bool = True
     amp_native_position_add: bool = False
@@ -642,6 +646,7 @@ class TrainingConfig:
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
     loss_portfolio_activation: str = "auto"
+    loss_min_trade_weight: float | None = None
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
     eval_model_chunk_rows: int | str = "auto"
@@ -1341,6 +1346,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     data["feature_include"] = _normalize_string_list(data["feature_include"], field_name="data.feature_include")
     data["feature_exclude"] = _normalize_string_list(data["feature_exclude"], field_name="data.feature_exclude")
+    data["feature_zero_fill"] = _normalize_string_list(
+        data["feature_zero_fill"], field_name="data.feature_zero_fill"
+    )
     plot_backend = str(training["plot_backend"]).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:
@@ -1461,6 +1469,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         training["loss_portfolio_activation"] = "auto"
     else:
         training["loss_portfolio_activation"] = normalize_portfolio_activation(loss_activation)
+    loss_min_trade_weight = training["loss_min_trade_weight"]
+    if loss_min_trade_weight is None or str(loss_min_trade_weight).strip().lower() in {
+        "",
+        "auto",
+        "trading",
+        "same",
+        "same_as_trading",
+    }:
+        training["loss_min_trade_weight"] = None
+    else:
+        training["loss_min_trade_weight"] = max(0.0, float(loss_min_trade_weight))
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
@@ -1519,6 +1538,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
+            loss_min_trade_weight=training_raw["loss_min_trade_weight"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
             eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],

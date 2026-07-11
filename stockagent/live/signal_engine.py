@@ -140,6 +140,7 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
         "external_data_required": use_tw_public_data,
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
+        "feature_zero_fill": config.data.feature_zero_fill,
     }
     if live_tail and not _is_intraday_frequency(getattr(config.trading, "frequency", "")):
         cached_panel = load_cached_panel(config.data.parquet_root, **panel_kwargs)
@@ -169,6 +170,7 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
             external_data_required=use_tw_public_data,
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
+            feature_zero_fill=config.data.feature_zero_fill,
         )
     return build_panel(
         config.data.parquet_root,

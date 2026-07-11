@@ -45,6 +45,28 @@ from stockagent.training.trainer import (
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
 
+def _resolve_benchmark_chunk_rows(
+    config: Any,
+    *,
+    total_rows: int,
+    model_chunk_rows: int | None,
+    scan_chunk_size: int | None,
+) -> tuple[int, int]:
+    """Resolve model and backtest chunks against the same row count."""
+    rows = max(1, int(total_rows))
+    resolved_model_rows = (
+        max(1, int(model_chunk_rows))
+        if model_chunk_rows is not None
+        else _resolve_inference_model_chunk_rows(config, rows)
+    )
+    resolved_scan_rows = (
+        max(1, int(scan_chunk_size))
+        if scan_chunk_size is not None
+        else _resolve_inference_backtest_chunk_rows(config, resolved_model_rows, rows)
+    )
+    return resolved_model_rows, resolved_scan_rows
+
+
 DEFAULT_ACTIVATIONS = "identity,softsign,tanh,isru,erf,atan,gd"
 DEFAULT_THRESHOLDS = "0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02"
 BEST_HIGHER_IS_BETTER = {
@@ -995,6 +1017,7 @@ def main() -> None:
         external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -1040,15 +1063,11 @@ def main() -> None:
         )
     if len(split) <= 0:
         raise ValueError(f"fold_id={args.fold} split={args.split} has no rows")
-    chunk_rows = (
-        max(1, int(args.chunk_rows))
-        if args.chunk_rows is not None
-        else _resolve_inference_model_chunk_rows(config, len(split))
-    )
-    scan_chunk_size = (
-        max(1, int(args.scan_chunk_size))
-        if args.scan_chunk_size is not None
-        else _resolve_inference_backtest_chunk_rows(config, chunk_rows)
+    chunk_rows, scan_chunk_size = _resolve_benchmark_chunk_rows(
+        config,
+        total_rows=len(split),
+        model_chunk_rows=args.chunk_rows,
+        scan_chunk_size=args.scan_chunk_size,
     )
 
     model = build_model(

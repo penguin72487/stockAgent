@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from stockagent.data.walkforward import build_expanding_year_folds
+from stockagent.data.walkforward import (
+    build_expanding_year_folds,
+    validate_walk_forward_year_contract,
+)
 
 
 def _year_end_dates(start_year: int, end_year: int) -> np.ndarray:
@@ -47,3 +51,23 @@ def test_expanding_folds_overlap_uses_full_validation_window_when_val_years_gt_o
     assert folds[-1].val_years == [2024, 2025]
     assert folds[-1].test_years == [2024, 2025]
     assert np.array_equal(folds[-1].val_indices, folds[-1].test_indices)
+
+
+def test_walk_forward_year_contract_rejects_first_year_shift() -> None:
+    with pytest.raises(ValueError, match="expected=2000, actual=2004"):
+        validate_walk_forward_year_contract(
+            _year_end_dates(2004, 2026),
+            expected_first_year=2000,
+            require_contiguous_years=True,
+        )
+
+
+def test_walk_forward_year_contract_rejects_missing_whole_year() -> None:
+    dates = np.asarray(["2000-12-31", "2002-12-31"], dtype="datetime64[D]")
+
+    with pytest.raises(ValueError, match=r"missing_years=\[2001\]"):
+        validate_walk_forward_year_contract(
+            dates,
+            expected_first_year=2000,
+            require_contiguous_years=True,
+        )

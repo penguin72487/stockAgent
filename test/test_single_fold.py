@@ -43,6 +43,7 @@ def main():
         ),
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
     )
     print(f"  Panel shape: {panel.features.shape} (T={panel.num_dates}, S={panel.num_symbols}, F={len(panel.feature_names)})")
     
