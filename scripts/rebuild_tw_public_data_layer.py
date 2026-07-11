@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -18,6 +19,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.config import load_config
+
+
+_DATA_LAYER_LOCK_HANDLE = None
 
 
 @dataclass
@@ -39,6 +43,24 @@ def _utc_now() -> str:
 
 def _run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _acquire_data_layer_lock(path: Path) -> None:
+    global _DATA_LAYER_LOCK_HANDLE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise RuntimeError(
+            f"another TW official data-layer process is running: lock={path}"
+        ) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()} acquired_at_utc={_utc_now()}\n")
+    handle.flush()
+    _DATA_LAYER_LOCK_HANDLE = handle
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
@@ -177,10 +199,19 @@ def _python_command(*args: str) -> list[str]:
     return [sys.executable, *args]
 
 
+def _production_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
+    production_stocks = Path(args.stock_root or config.data.parquet_root)
+    production_public_feature = Path(
+        args.public_feature_path or config.data.tw_public_feature_path
+    )
+    production_public = Path(args.public_dir or production_public_feature.parent.parent)
+    return production_stocks, production_public, production_public_feature
+
+
 def _data_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
-    production_stocks = Path(config.data.parquet_root)
-    production_public_feature = Path(config.data.tw_public_feature_path)
-    production_public = production_public_feature.parent.parent
+    production_stocks, production_public, production_public_feature = _production_paths(
+        args, config
+    )
     if args.operation != "from-zero":
         return production_stocks, production_public, production_public_feature
 
@@ -188,11 +219,12 @@ def _data_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
     public = stage_root / "data_tw_public"
     try:
         stock_relative_path = production_stocks.relative_to(production_public)
+        feature_relative_path = production_public_feature.relative_to(production_public)
     except ValueError as exc:
         raise ValueError(
-            "TW official parquet_root must be inside the data_tw_public tree for atomic promotion"
+            "TW official stock and feature outputs must be inside the public-data tree for atomic promotion"
         ) from exc
-    return public / stock_relative_path, public, public / "features" / "tw_public_stock_daily.parquet"
+    return public / stock_relative_path, public, public / feature_relative_path
 
 
 def _preflight(
@@ -212,7 +244,7 @@ def _preflight(
                 f"insufficient free disk for staged rebuild: free={free_gb:.1f}GB "
                 f"required={float(min_free_gb):.1f}GB"
             )
-    else:
+    elif operation in {"audit", "daily"}:
         if not stock_root.exists():
             raise FileNotFoundError(f"TW official stock root is missing: {stock_root}")
         if not public_dir.exists():
@@ -285,17 +317,37 @@ def _rollback_promoted_tree(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Rebuild the TWSE/TPEx-only data layer through immutable stages, then fail-closed audit it. "
-            "Snapshot-only history is quarantined rather than fabricated."
+            "Manage the TWSE/TPEx-first data layer in rebuild, repair, or daily mode. "
+            "Yahoo may fill otherwise-missing OHLCV rows from 2000 onward; every "
+            "derived artifact is then audited fail-closed."
         )
     )
     parser.add_argument("--config", type=Path, default=Path("configs/markets/tw_public.yaml"))
-    parser.add_argument(
+    parser.add_argument("--public-dir", type=Path, default=None)
+    parser.add_argument("--stock-root", type=Path, default=None)
+    parser.add_argument("--public-feature-path", type=Path, default=None)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--mode",
+        choices=("rebuild", "repair", "daily"),
+        default=None,
+        help=(
+            "rebuild stages a from-zero replacement; repair checks and fills historical gaps; "
+            "daily refreshes a recent overlap and appends new sessions"
+        ),
+    )
+    mode_group.add_argument(
         "--operation",
         choices=("audit", "repair", "from-zero"),
-        default="audit",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--stage-root", type=Path, default=None)
+    parser.add_argument(
+        "--lock-file",
+        type=Path,
+        default=Path("artifacts/data_locks/tw_official_data.lock"),
+    )
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--end-date", default=date.today().isoformat())
     parser.add_argument("--public-start-date", default="earliest")
@@ -305,10 +357,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date-workers", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=4)
+    parser.add_argument("--retry-backoff", type=float, default=1.0)
+    parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--request-interval", type=float, default=None)
     parser.add_argument("--flush-every-dates", type=int, default=250)
+    parser.add_argument("--daily-overlap-days", type=int, default=7)
+    parser.add_argument("--empty-recheck-days", type=int, default=30)
     parser.add_argument("--min-free-gb", type=float, default=40.0)
+    parser.add_argument(
+        "--ohlcv-fallback",
+        choices=("yahoo", "none"),
+        default="yahoo",
+        help=(
+            "Lower-priority source for date-symbol OHLCV rows absent from official "
+            "TWSE/TPEx data. Yahoo fallback is restricted to 2000 onward."
+        ),
+    )
+    parser.add_argument("--fallback-start-date", default="2000-01-01")
+    parser.add_argument(
+        "--yahoo-fallback-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Yahoo per-symbol source directory. Defaults to "
+            "<public-dir>/fallback/yahoo_tw_stocks so staged rebuilds remain portable."
+        ),
+    )
+    parser.add_argument("--yahoo-workers", type=int, default=1)
+    parser.add_argument("--yahoo-retries", type=int, default=3)
+    parser.add_argument("--yahoo-request-interval", type=float, default=1.5)
+    parser.add_argument(
+        "--skip-yahoo-download",
+        action="store_true",
+        help="Use the existing Yahoo fallback directory without contacting Yahoo.",
+    )
     parser.add_argument("--skip-symbol-build", action="store_true")
+    parser.add_argument("--skip-feature-build", action="store_true")
     parser.add_argument("--skip-public", action="store_true")
     parser.add_argument("--skip-corporate-actions", action="store_true")
     parser.add_argument("--skip-short-rules", action="store_true")
@@ -334,6 +418,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    requested_mode = args.mode
+    if args.mode is None:
+        args.mode = {
+            "from-zero": "rebuild",
+            "repair": "repair",
+            "audit": "audit",
+            None: "repair",
+        }[args.operation]
+    args.operation = {
+        "rebuild": "from-zero",
+        "repair": "repair",
+        "daily": "daily",
+        "audit": "audit",
+    }[args.mode]
+    _acquire_data_layer_lock(args.lock_file)
     run_id = args.run_id or _run_id()
     if args.stage_root is None:
         args.stage_root = Path("artifacts/data_rebuild") / run_id
@@ -343,6 +442,21 @@ def main() -> None:
         raise ValueError("--promote is valid only with --operation from-zero")
     if args.legacy_official_ohlcv and not args.legacy_source_name:
         raise ValueError("--legacy-source-name is required with --legacy-official-ohlcv")
+    missing_legacy_paths = [
+        str(path) for path in args.legacy_official_ohlcv if not Path(path).is_file()
+    ]
+    if missing_legacy_paths and not args.dry_run:
+        raise FileNotFoundError(
+            f"legacy official OHLCV input is missing: {missing_legacy_paths}"
+        )
+    fallback_start = date.fromisoformat(args.fallback_start_date)
+    requested_end = date.fromisoformat(args.end_date)
+    if fallback_start < date(2000, 1, 1):
+        raise ValueError("Yahoo OHLCV fallback is restricted to 2000-01-01 and later")
+    if fallback_start > requested_end:
+        raise ValueError("--fallback-start-date must not be after --end-date")
+    if args.yahoo_request_interval < 0.0:
+        raise ValueError("--yahoo-request-interval must be >= 0")
 
     config = load_config(args.config)
     expected_first_year = config.walk_forward.expected_first_year
@@ -351,16 +465,24 @@ def main() -> None:
         and expected_first_year is not None
         and int(expected_first_year) < 2004
         and not args.legacy_official_ohlcv
+        and args.ohlcv_fallback == "none"
     ):
         raise ValueError(
             f"config requires official history from {int(expected_first_year)}, but the free TWSE "
-            "daily OHLCV archive starts in 2004. Supply a provenance-backed TWSE/TPEx archive "
-            "with --legacy-official-ohlcv and --legacy-source-name; fold IDs must not be renumbered."
+            "daily OHLCV archive starts in 2004. Keep --ohlcv-fallback yahoo or supply a "
+            "provenance-backed TWSE/TPEx archive with --legacy-official-ohlcv and "
+            "--legacy-source-name; fold IDs must not be renumbered."
         )
-    production_stocks = Path(config.data.parquet_root)
-    production_public_feature = Path(config.data.tw_public_feature_path)
-    production_public = production_public_feature.parent.parent
+    production_stocks, production_public, production_public_feature = _production_paths(
+        args, config
+    )
     stock_root, public_dir, public_feature_path = _data_paths(args, config)
+    yahoo_fallback_dir = (
+        Path(args.yahoo_fallback_dir)
+        if args.yahoo_fallback_dir is not None
+        else public_dir / "fallback" / "yahoo_tw_stocks"
+    )
+    yahoo_fallback_archive = public_dir / "fallback" / "yahoo_tw_ohlcv.parquet"
     audit_output = Path(args.stage_root) / "audit"
     manifest_path = Path(args.stage_root) / "rebuild_manifest.json"
     runner = RebuildRunner(
@@ -371,6 +493,8 @@ def main() -> None:
     runner.update_metadata(
         run_id=run_id,
         operation=args.operation,
+        mode=args.mode,
+        requested_mode=requested_mode,
         config=str(args.config),
         stage_root=str(args.stage_root),
         stock_root=str(stock_root),
@@ -378,6 +502,11 @@ def main() -> None:
         public_feature_path=str(public_feature_path),
         production_stocks=str(production_stocks),
         production_public=str(production_public),
+        ohlcv_fallback=args.ohlcv_fallback,
+        fallback_start_date=fallback_start.isoformat(),
+        yahoo_fallback_dir=str(yahoo_fallback_dir),
+        yahoo_fallback_archive=str(yahoo_fallback_archive),
+        yahoo_request_interval=float(args.yahoo_request_interval),
         started_at_utc=runner.manifest.get("started_at_utc", _utc_now()),
     )
     _preflight(
@@ -406,10 +535,11 @@ def main() -> None:
     public_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_public:
+        public_mode = "rebuild" if args.operation == "from-zero" else args.mode
         public_command = _python_command(
             "downloader/download_tw_public_data.py",
             "--mode",
-            "full",
+            public_mode,
             "--datasets",
             "all",
             "--start-date",
@@ -426,8 +556,16 @@ def main() -> None:
             str(args.timeout),
             "--retries",
             str(args.retries),
+            "--retry-backoff",
+            str(args.retry_backoff),
+            "--sleep",
+            str(args.sleep),
             "--flush-every-dates",
             str(args.flush_every_dates),
+            "--daily-overlap-days",
+            str(args.daily_overlap_days),
+            "--empty-recheck-days",
+            str(args.empty_recheck_days),
         )
         if args.request_interval is not None:
             public_command.extend(["--request-interval", str(args.request_interval)])
@@ -440,10 +578,13 @@ def main() -> None:
         )
 
     if not args.skip_corporate_actions:
+        corporate_mode = "rebuild" if args.operation == "from-zero" else args.mode
         corporate_command = _python_command(
             "downloader/download_tw_corporate_action_reference.py",
             "--output-dir",
             str(public_dir),
+            "--mode",
+            corporate_mode,
             "--start-year",
             "2000",
             "--end-date",
@@ -466,6 +607,76 @@ def main() -> None:
             ],
         )
 
+    if not args.skip_symbol_build and args.ohlcv_fallback == "yahoo":
+        yahoo_fallback_dir.mkdir(parents=True, exist_ok=True)
+        yahoo_bootstrap = not any(yahoo_fallback_dir.glob("*_features.parquet"))
+        if yahoo_bootstrap:
+            yahoo_mode = "download"
+        elif args.operation == "from-zero" and args.yahoo_fallback_dir is None:
+            # A fixed staged rebuild is resumable: download mode skips files that
+            # were already written atomically by a prior attempt.
+            yahoo_mode = "download"
+        elif args.mode == "daily":
+            yahoo_mode = "incremental"
+        else:
+            yahoo_mode = "repair"
+        if not args.skip_yahoo_download:
+            yahoo_command = _python_command(
+                "downloader/download_yahoo_ohlcv.py",
+                "--mode",
+                yahoo_mode,
+                "--asset",
+                "tw_stocks",
+                "--output-dir",
+                str(yahoo_fallback_dir),
+                "--output-root",
+                str(yahoo_fallback_dir.parent),
+                "--start-date",
+                fallback_start.isoformat(),
+                "--end-date",
+                args.end_date,
+                "--workers",
+                str(args.yahoo_workers),
+                "--retries",
+                str(args.yahoo_retries),
+                "--request-interval",
+                str(args.yahoo_request_interval),
+                "--include-tw-delisted",
+            )
+            yahoo_report = (
+                yahoo_fallback_dir / "download_report.csv"
+                if yahoo_mode == "download"
+                else yahoo_fallback_dir / "repair_report.csv"
+            )
+            runner.run(
+                "yahoo_ohlcv_fallback_download",
+                yahoo_command,
+                outputs=[yahoo_fallback_dir / "symbols.csv", yahoo_report],
+            )
+        runner.run(
+            "yahoo_ohlcv_fallback_archive",
+            _python_command(
+                "scripts/build_tw_yahoo_fallback_archive.py",
+                "--input-dir",
+                str(yahoo_fallback_dir),
+                "--official-input-dir",
+                str(public_dir),
+                "--output-path",
+                str(yahoo_fallback_archive),
+                "--start-date",
+                fallback_start.isoformat(),
+                "--end-date",
+                args.end_date,
+                "--workers",
+                str(args.workers),
+            ),
+            outputs=[
+                yahoo_fallback_archive,
+                yahoo_fallback_archive.with_suffix(".summary.json"),
+                yahoo_fallback_archive.with_suffix(".report.csv"),
+            ],
+        )
+
     if not args.skip_symbol_build:
         symbol_build_command = _python_command(
             "scripts/build_tw_official_symbol_parquets.py",
@@ -480,6 +691,15 @@ def main() -> None:
             symbol_build_command.extend(["--legacy-official-ohlcv", str(input_path)])
         if args.legacy_source_name:
             symbol_build_command.extend(["--legacy-source-name", str(args.legacy_source_name)])
+        if args.ohlcv_fallback == "yahoo":
+            symbol_build_command.extend(
+                [
+                    "--fallback-ohlcv",
+                    str(yahoo_fallback_archive),
+                    "--fallback-source-name",
+                    "yahoo_fallback",
+                ]
+            )
         runner.run(
             "official_symbol_parquets",
             symbol_build_command,
@@ -492,6 +712,9 @@ def main() -> None:
         )
 
     if not args.skip_short_rules:
+        short_start_year = (
+            int(args.end_date[:4]) if args.mode == "daily" else int(args.short_start_year)
+        )
         runner.run(
             "short_sale_and_lifecycle_rules",
             _python_command(
@@ -499,7 +722,7 @@ def main() -> None:
                 "--output-dir",
                 str(public_dir),
                 "--start-year",
-                str(args.short_start_year),
+                str(short_start_year),
                 "--end-year",
                 str(int(args.end_date[:4])),
                 "--workers",
@@ -508,6 +731,8 @@ def main() -> None:
                 str(args.timeout),
                 "--retries",
                 str(args.retries),
+                "--retry-backoff",
+                str(args.retry_backoff),
             ),
             outputs=[
                 public_dir / "tw_delisting_short_sale_announcements.parquet",
@@ -515,21 +740,22 @@ def main() -> None:
             ],
         )
 
-    runner.run(
-        "build_public_features",
-        _python_command(
-            "scripts/build_tw_public_training_features.py",
-            "--input-dir",
-            str(public_dir),
-            "--output-path",
-            str(public_feature_path),
-            "--symbols-root",
-            str(stock_root),
-            "--market-symbol",
-            str(config.data.tw_public_market_symbol),
-        ),
-        outputs=[public_feature_path, public_feature_path.with_suffix(".summary.json")],
-    )
+    if not args.skip_feature_build:
+        runner.run(
+            "build_public_features",
+            _python_command(
+                "scripts/build_tw_public_training_features.py",
+                "--input-dir",
+                str(public_dir),
+                "--output-path",
+                str(public_feature_path),
+                "--symbols-root",
+                str(stock_root),
+                "--market-symbol",
+                str(config.data.tw_public_market_symbol),
+            ),
+            outputs=[public_feature_path, public_feature_path.with_suffix(".summary.json")],
+        )
 
     runner.run(
         "audit",

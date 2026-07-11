@@ -12,7 +12,7 @@ environment:
   amp_dtype: bf16
 
 data:
-  parquet_root: data_yahoo/tw_stocks
+  parquet_root: data_tw_public/stocks
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto

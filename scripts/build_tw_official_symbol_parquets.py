@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import math
@@ -34,6 +34,8 @@ from stockagent.data.tw_security import (
 
 
 OFFICIAL_SOURCE_NAME = "twse_tpex_official"
+MIXED_FALLBACK_SOURCE_NAME = "twse_tpex_official_with_yahoo_fallback"
+YAHOO_FALLBACK_SOURCE_NAME = "yahoo_fallback"
 LEGACY_COLUMN_ALIASES = {
     "code": "symbol",
     "security_code": "symbol",
@@ -49,6 +51,7 @@ LEGACY_COLUMN_ALIASES = {
     "adjclose": "source_adjclose",
     "reference_price": "source_reference",
     "opening_reference_price": "source_reference",
+    "adjustment_factor": "source_factor",
 }
 PARQUET_METADATA = {
     "source": b"stockagent.source",
@@ -73,14 +76,18 @@ class BuildResult:
     first_date: str | None
     last_date: str | None
     output_path: str
+    source: str = OFFICIAL_SOURCE_NAME
+    fallback_rows: int = 0
+    fallback_adjustment_rows: int = 0
     message: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build canonical per-symbol TW parquet files exclusively from official TWSE/TPEx daily data. "
-            "adjclose is a reference-return index normalized to 10 at each symbol's first row."
+            "Build canonical per-symbol TW parquet files with official TWSE/TPEx rows at "
+            "highest priority and an explicitly identified lower-priority fallback. adjclose "
+            "is a reference-return index normalized to 10 at each symbol's first row."
         )
     )
     parser.add_argument("--input-dir", type=Path, default=Path("data_tw_public"))
@@ -97,6 +104,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--legacy-source-name", default=None)
+    parser.add_argument(
+        "--fallback-ohlcv",
+        type=Path,
+        action="append",
+        default=[],
+        help="Lower-priority OHLCV fallback archive; repeatable. Official date-symbol rows always win.",
+    )
+    parser.add_argument("--fallback-source-name", default=None)
     parser.add_argument("--summary-path", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -114,8 +129,16 @@ def _validate_download_receipts(input_dir: Path, *, allow_incomplete: bool) -> N
     problems: list[str] = []
     try:
         public_summary = json.loads(public_summary_path.read_text(encoding="utf-8"))
-        if public_summary.get("mode") != "full":
-            problems.append(f"public download mode={public_summary.get('mode')!r}")
+        legacy_full_receipt = (
+            "coverage_complete" not in public_summary
+            and public_summary.get("mode") == "full"
+        )
+        if public_summary.get("coverage_complete") is not True and not legacy_full_receipt:
+            problems.append(
+                "public historical coverage is incomplete "
+                f"(mode={public_summary.get('mode')!r}, "
+                f"coverage_complete={public_summary.get('coverage_complete')!r})"
+            )
         if int(public_summary.get("failed_count", -1)) != 0:
             problems.append(f"public failed_count={public_summary.get('failed_count')!r}")
     except Exception as exc:
@@ -126,6 +149,11 @@ def _validate_download_receipts(input_dir: Path, *, allow_incomplete: bool) -> N
             problems.append(
                 f"corporate-action failure_count={corporate_summary.get('failure_count')!r}"
             )
+        if (
+            int(corporate_summary.get("schema_version", 1)) >= 2
+            and corporate_summary.get("coverage_complete") is not True
+        ):
+            problems.append("corporate-action historical coverage is incomplete")
         output_path = input_dir / "tw_corporate_action_reference.parquet"
         if corporate_summary.get("output_receipt") != _receipt(output_path):
             problems.append("corporate-action output receipt mismatch")
@@ -145,6 +173,43 @@ def _receipt(path: Path) -> dict[str, Any]:
     return {"path": str(path), "size": int(path.stat().st_size), "sha256": digest.hexdigest()}
 
 
+def _validate_yahoo_fallback_archive(path: Path) -> None:
+    summary_path = path.with_suffix(".summary.json")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"missing or invalid Yahoo fallback receipt {summary_path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    actual_receipt = _receipt(path)
+    recorded_receipt = summary.get("output_receipt", {}) if isinstance(summary, dict) else {}
+    receipt_matches = (
+        isinstance(recorded_receipt, dict)
+        and recorded_receipt.get("size") == actual_receipt["size"]
+        and recorded_receipt.get("sha256") == actual_receipt["sha256"]
+    )
+    checks = {
+        "summary_object": isinstance(summary, dict),
+        "source": isinstance(summary, dict)
+        and summary.get("source") == YAHOO_FALLBACK_SOURCE_NAME,
+        "failed_symbols": isinstance(summary, dict)
+        and int(summary.get("failed_symbol_count", -1)) == 0,
+        "output_receipt": receipt_matches,
+    }
+    try:
+        checks["start_date"] = (
+            date.fromisoformat(str(summary.get("start_date"))) >= date(2000, 1, 1)
+        )
+    except (TypeError, ValueError):
+        checks["start_date"] = False
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(
+            f"Yahoo fallback receipt failed checks {failed}: {summary_path}"
+        )
+
+
 def _fsync_directory(path: Path) -> None:
     if os.name != "posix":
         return
@@ -160,6 +225,7 @@ def _write_official_quote_parquet(
     output_path: Path,
     *,
     checked_through: str,
+    source: str = OFFICIAL_SOURCE_NAME,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     first_date = str(frame["date"].min())
@@ -168,7 +234,7 @@ def _write_official_quote_parquet(
     metadata = dict(table.schema.metadata or {})
     metadata.update(
         {
-            PARQUET_METADATA["source"]: OFFICIAL_SOURCE_NAME.encode("utf-8"),
+            PARQUET_METADATA["source"]: str(source).encode("utf-8"),
             PARQUET_METADATA["asset_class"]: b"tw_stocks",
             PARQUET_METADATA["checked_through"]: str(checked_through).encode("utf-8"),
             PARQUET_METADATA["first_date"]: first_date.encode("utf-8"),
@@ -209,15 +275,22 @@ def _update_return_price_provenance(
     root: Path,
     symbols: set[str],
     *,
+    fallback_symbols: set[str] | None = None,
     dry_run: bool,
 ) -> None:
     path = root / "return_price_provenance.json"
     payload: dict[str, Any] = {"schema_version": 1, "symbols": {}}
     updated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    fallback_symbols = set(fallback_symbols or set())
     for symbol in sorted(symbols):
+        uses_fallback = symbol in fallback_symbols
         payload["symbols"][symbol] = {
-            "kind": "official_reference_index_10",
-            "source": OFFICIAL_SOURCE_NAME,
+            "kind": (
+                "official_reference_index_10_with_yahoo_fallback"
+                if uses_fallback
+                else "official_reference_index_10"
+            ),
+            "source": MIXED_FALLBACK_SOURCE_NAME if uses_fallback else OFFICIAL_SOURCE_NAME,
             "updated_at_utc": updated_at,
         }
     if dry_run:
@@ -244,7 +317,7 @@ def _remove_stale_official_symbol_files(
             continue
         metadata = pq.read_schema(path).metadata or {}
         source = metadata.get(PARQUET_METADATA["source"], b"").decode("utf-8", errors="replace")
-        if source != OFFICIAL_SOURCE_NAME:
+        if source not in {OFFICIAL_SOURCE_NAME, MIXED_FALLBACK_SOURCE_NAME}:
             raise RuntimeError(f"refusing to remove non-official stale symbol file: {path}")
         removed.append(symbol)
         if not dry_run:
@@ -337,7 +410,11 @@ def _tpex_frame(path: Path) -> pl.DataFrame:
     )
 
 
-def _legacy_official_frame(path: Path) -> pl.DataFrame:
+def _legacy_official_frame(
+    path: Path,
+    *,
+    default_quote_source: str = "official_archive",
+) -> pl.DataFrame:
     if path.suffix.lower() in {".parquet", ".pq"}:
         frame = pl.read_parquet(path)
     elif path.suffix.lower() in {".csv", ".txt"}:
@@ -375,6 +452,16 @@ def _legacy_official_frame(path: Path) -> pl.DataFrame:
         if "source_adjclose" in frame.columns
         else pl.lit(None, dtype=pl.Float64)
     )
+    source_factor = (
+        pl.col("source_factor").cast(pl.Float64, strict=False).fill_nan(None)
+        if "source_factor" in frame.columns
+        else pl.lit(None, dtype=pl.Float64)
+    )
+    quote_source = (
+        pl.col("quote_source").cast(pl.Utf8, strict=False).str.strip_chars()
+        if "quote_source" in frame.columns
+        else pl.lit(default_quote_source)
+    )
     normalized_market = (
         pl.col("market")
         .cast(pl.Utf8, strict=False)
@@ -401,6 +488,8 @@ def _legacy_official_frame(path: Path) -> pl.DataFrame:
         signed_change.alias("signed_change"),
         source_reference.alias("source_reference"),
         source_adjclose.alias("source_adjclose"),
+        source_factor.alias("source_factor"),
+        quote_source.alias("quote_source"),
     )
     invalid_market = normalized.filter(~pl.col("market").is_in(["twse", "tpex"]))
     if invalid_market.height:
@@ -419,7 +508,13 @@ def _legacy_official_frame(path: Path) -> pl.DataFrame:
 def _official_frame(
     input_dir: Path,
     legacy_paths: list[Path] | None = None,
-) -> tuple[pl.DataFrame, list[dict[str, Any]], list[dict[str, Any]]]:
+    fallback_paths: list[Path] | None = None,
+) -> tuple[
+    pl.DataFrame,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     paths = [
         input_dir / "twse_daily_ohlcv.parquet",
         input_dir / "tpex_daily_ohlcv.parquet",
@@ -429,36 +524,109 @@ def _official_frame(
     if missing:
         raise FileNotFoundError(f"official daily OHLCV sources are missing: {missing}")
     legacy_paths = list(legacy_paths or [])
+    fallback_paths = list(fallback_paths or [])
     missing_legacy = [str(path) for path in legacy_paths if not path.is_file()]
     if missing_legacy:
         raise FileNotFoundError(f"official legacy archives are missing: {missing_legacy}")
+    missing_fallback = [str(path) for path in fallback_paths if not path.is_file()]
+    if missing_fallback:
+        raise FileNotFoundError(f"OHLCV fallback archives are missing: {missing_fallback}")
     before = [_file_content_receipt(path) for path in paths]
     legacy_before = [_receipt(path) for path in legacy_paths]
-    current = pl.concat([_twse_frame(paths[0]), _tpex_frame(paths[1])], how="vertical_relaxed").with_columns(
+    fallback_before = [_receipt(path) for path in fallback_paths]
+    merge_columns = [
+        "date",
+        "symbol",
+        "name",
+        "market",
+        "open",
+        "max",
+        "min",
+        "close",
+        "Trading_Volume",
+        "signed_change",
+        "source_reference",
+        "source_adjclose",
+        "source_factor",
+        "quote_source",
+        "_legacy_source_id",
+        "_source_priority",
+    ]
+    current = pl.concat(
+        [
+            _twse_frame(paths[0]).with_columns(pl.lit("twse_official").alias("quote_source")),
+            _tpex_frame(paths[1]).with_columns(pl.lit("tpex_official").alias("quote_source")),
+        ],
+        how="vertical_relaxed",
+    ).with_columns(
         pl.lit(None, dtype=pl.Float64).alias("source_reference"),
         pl.lit(None, dtype=pl.Float64).alias("source_adjclose"),
+        pl.lit(None, dtype=pl.Float64).alias("source_factor"),
         pl.lit(-1, dtype=pl.Int32).alias("_legacy_source_id"),
-        pl.lit(1, dtype=pl.Int8).alias("_source_priority"),
-    )
+        pl.lit(2, dtype=pl.Int8).alias("_source_priority"),
+    ).select(merge_columns)
     legacy_frames = [
-        _legacy_official_frame(path).with_columns(
+        _legacy_official_frame(path, default_quote_source="official_archive").with_columns(
             pl.lit(source_id, dtype=pl.Int32).alias("_legacy_source_id"),
-            pl.lit(0, dtype=pl.Int8).alias("_source_priority"),
-        )
+            pl.lit(1, dtype=pl.Int8).alias("_source_priority"),
+        ).select(merge_columns)
         for source_id, path in enumerate(legacy_paths)
     ]
-    if len(legacy_frames) > 1:
-        duplicate_legacy = (
-            pl.concat(legacy_frames, how="vertical_relaxed")
+    fallback_frames = [
+        _legacy_official_frame(
+            path,
+            default_quote_source=YAHOO_FALLBACK_SOURCE_NAME,
+        ).with_columns(
+            pl.lit(YAHOO_FALLBACK_SOURCE_NAME).alias("quote_source"),
+            pl.lit(len(legacy_frames) + source_id, dtype=pl.Int32).alias(
+                "_legacy_source_id"
+            ),
+            pl.lit(0, dtype=pl.Int8).alias("_source_priority"),
+        ).select(merge_columns)
+        for source_id, path in enumerate(fallback_paths)
+    ]
+    for path, fallback_frame in zip(fallback_paths, fallback_frames, strict=True):
+        before_2000 = fallback_frame.filter(pl.col("date") < pl.lit(date(2000, 1, 1)))
+        if before_2000.height:
+            raise ValueError(
+                f"{path} has {before_2000.height} fallback rows before 2000-01-01"
+            )
+
+    def reject_overlaps(frames: list[pl.DataFrame], label: str) -> None:
+        if len(frames) <= 1:
+            return
+        duplicate = (
+            pl.concat(frames, how="vertical_relaxed")
             .group_by(["date", "symbol"])
             .len()
             .filter(pl.col("len") > 1)
         )
-        if duplicate_legacy.height:
+        if duplicate.height:
             raise ValueError(
-                f"legacy official archives overlap on {duplicate_legacy.height} date-symbol keys"
+                f"{label} archives overlap on {duplicate.height} date-symbol keys"
             )
-    frame = pl.concat([*legacy_frames, current], how="vertical_relaxed")
+
+    reject_overlaps(legacy_frames, "legacy official")
+    reject_overlaps(fallback_frames, "fallback")
+    frame = pl.concat(
+        [*fallback_frames, *legacy_frames, current],
+        how="vertical_relaxed",
+    )
+    if fallback_frames:
+        fallback_adjustments = (
+            pl.concat(fallback_frames, how="vertical_relaxed")
+            .select(
+                "date",
+                "symbol",
+                pl.col("source_factor").alias("_yahoo_fallback_factor"),
+            )
+            .unique(["date", "symbol"], keep="last", maintain_order=True)
+        )
+        frame = frame.join(fallback_adjustments, on=["date", "symbol"], how="left")
+    else:
+        frame = frame.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("_yahoo_fallback_factor")
+        )
     reference = (
         pl.read_parquet(paths[2])
         .select(
@@ -477,7 +645,12 @@ def _official_frame(
     )
     after = [_file_content_receipt(path) for path in paths]
     legacy_after = [_receipt(path) for path in legacy_paths]
-    if before != after or legacy_before != legacy_after:
+    fallback_after = [_receipt(path) for path in fallback_paths]
+    if (
+        before != after
+        or legacy_before != legacy_after
+        or fallback_before != fallback_after
+    ):
         raise RuntimeError("official OHLCV source changed during symbol build")
     stock_symbol = pl.col("symbol").str.contains(TW_STOCK_SYMBOL_PATTERN).fill_null(False)
     etf_symbol = pl.col("symbol").str.contains(TW_ETF_SYMBOL_PATTERN).fill_null(False)
@@ -492,13 +665,14 @@ def _official_frame(
         )
         .drop_nulls("security_type")
         .drop_nulls(["date", "symbol", "close"])
+        .filter(pl.col("date") >= pl.lit(date(2000, 1, 1)))
         .filter(pl.col("close").is_finite() & (pl.col("close") > 0))
         .sort(["symbol", "date", "_source_priority", "market"])
         .unique(["symbol", "date"], keep="last", maintain_order=True)
     )
     if frame.is_empty():
         raise RuntimeError("official TWSE/TPEx sources produced no valid stock rows")
-    return frame, before, legacy_before
+    return frame, before, legacy_before, fallback_before
 
 
 def _normalized_reference_index(
@@ -587,19 +761,70 @@ def _write_symbol(
     path = output_dir / f"{symbol}_features.parquet"
     try:
         frame = frame.sort("date")
+        fallback_rows = int(
+            frame.select(
+                (pl.col("quote_source") == YAHOO_FALLBACK_SOURCE_NAME)
+                .sum()
+                .alias("fallback_rows")
+            ).item()
+        )
+        output_source = (
+            MIXED_FALLBACK_SOURCE_NAME if fallback_rows else OFFICIAL_SOURCE_NAME
+        )
+        explicit_factor = frame["source_factor"].to_numpy()
+        source_adjusted_factor = _source_adjustment_factors(
+            frame["source_adjclose"].to_numpy(),
+            frame["_legacy_source_id"].to_numpy(),
+        )
+        factor_override = np.where(
+            np.isfinite(explicit_factor),
+            explicit_factor,
+            source_adjusted_factor,
+        )
+        fallback_factor = frame["_yahoo_fallback_factor"].to_numpy()
+        official_factor_unavailable = (
+            ~np.isfinite(factor_override)
+            & ~np.isfinite(frame["reference_override"].to_numpy())
+            & ~np.isfinite(frame["signed_change"].to_numpy())
+            & np.isfinite(frame["Trading_Volume"].to_numpy())
+            & (frame["Trading_Volume"].to_numpy() > 0.0)
+        )
+        uses_fallback_adjustment = (
+            official_factor_unavailable
+            & np.isfinite(fallback_factor)
+            & (fallback_factor > 0.0)
+        )
+        factor_override = np.where(
+            uses_fallback_adjustment,
+            fallback_factor,
+            factor_override,
+        )
+        fallback_adjustment_rows = int(np.count_nonzero(uses_fallback_adjustment))
+        if fallback_adjustment_rows:
+            output_source = MIXED_FALLBACK_SOURCE_NAME
         adjusted, missing = _normalized_reference_index(
             frame["close"].to_numpy(),
             frame["signed_change"].to_numpy(),
             frame["Trading_Volume"].to_numpy(),
             frame["reference_override"].to_numpy(),
-            _source_adjustment_factors(
-                frame["source_adjclose"].to_numpy(),
-                frame["_legacy_source_id"].to_numpy(),
-            ),
+            factor_override,
         )
+        adjustment_source = np.asarray(
+            frame["quote_source"].to_list(), dtype=object
+        )
+        adjustment_source[uses_fallback_adjustment] = YAHOO_FALLBACK_SOURCE_NAME
         quotes = frame.select(
-            ["date", "open", "max", "min", "close", "Trading_Volume"]
-        ).with_columns(pl.Series("adjclose", adjusted))
+            "date",
+            "open",
+            "max",
+            "min",
+            "close",
+            "Trading_Volume",
+            pl.col("quote_source").alias("data_source"),
+        ).with_columns(
+            pl.Series("adjustment_source", adjustment_source, dtype=pl.String),
+            pl.Series("adjclose", adjusted),
+        )
         first = frame["date"].min()
         last = frame["date"].max()
         market = str(frame["market"][-1])
@@ -609,6 +834,7 @@ def _write_symbol(
                 quotes,
                 path,
                 checked_through=requested_end_date,
+                source=output_source,
             )
         return BuildResult(
             symbol=symbol,
@@ -622,6 +848,9 @@ def _write_symbol(
             first_date=str(first),
             last_date=str(last),
             output_path=str(path),
+            source=output_source,
+            fallback_rows=fallback_rows,
+            fallback_adjustment_rows=fallback_adjustment_rows,
         )
     except Exception as exc:
         return BuildResult(
@@ -646,13 +875,25 @@ def main() -> None:
         raise ValueError("--legacy-source-name is required with --legacy-official-ohlcv")
     if args.legacy_source_name and not args.legacy_official_ohlcv:
         raise ValueError("--legacy-official-ohlcv is required with --legacy-source-name")
+    if args.fallback_ohlcv and not args.fallback_source_name:
+        raise ValueError("--fallback-source-name is required with --fallback-ohlcv")
+    if args.fallback_source_name and not args.fallback_ohlcv:
+        raise ValueError("--fallback-ohlcv is required with --fallback-source-name")
+    if args.fallback_source_name and args.fallback_source_name != YAHOO_FALLBACK_SOURCE_NAME:
+        raise ValueError(
+            f"unsupported fallback source {args.fallback_source_name!r}; "
+            f"expected {YAHOO_FALLBACK_SOURCE_NAME!r}"
+        )
+    for fallback_path in args.fallback_ohlcv:
+        _validate_yahoo_fallback_archive(fallback_path)
     _validate_download_receipts(
         args.input_dir,
         allow_incomplete=bool(args.allow_incomplete_source),
     )
-    frame, receipts, legacy_receipts = _official_frame(
+    frame, receipts, legacy_receipts, fallback_receipts = _official_frame(
         args.input_dir,
         list(args.legacy_official_ohlcv),
+        list(args.fallback_ohlcv),
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     requested_end_date = str(frame["date"].max())
@@ -688,7 +929,7 @@ def main() -> None:
             "name": [result.name for result in results],
             "market": [result.market for result in results],
             "security_type": [result.security_type for result in results],
-            "source": [OFFICIAL_SOURCE_NAME] * len(results),
+            "source": [result.source for result in results],
         }
     ).sort("code")
     if not args.dry_run:
@@ -698,6 +939,11 @@ def main() -> None:
     _update_return_price_provenance(
         args.output_dir,
         target_symbols,
+        fallback_symbols={
+            result.symbol
+            for result in results
+            if result.fallback_rows > 0 or result.fallback_adjustment_rows > 0
+        },
         dry_run=bool(args.dry_run),
     )
     status_counts: dict[str, int] = {}
@@ -705,14 +951,23 @@ def main() -> None:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
     summary = {
         "schema_version": 1,
-        "source": OFFICIAL_SOURCE_NAME,
+        "source": (
+            MIXED_FALLBACK_SOURCE_NAME
+            if any(
+                result.fallback_rows > 0 or result.fallback_adjustment_rows > 0
+                for result in results
+            )
+            else OFFICIAL_SOURCE_NAME
+        ),
         "adjusted_price_method": (
-            "first=10; next=previous_index*(close/reference); "
-            "reference=corporate_action_reference else close-signed_change"
+            "first=10; next=previous_index*factor; factor=fallback source-adjusted ratio "
+            "else corporate_action_reference ratio else close/(close-signed_change)"
         ),
         "source_receipts": receipts,
         "legacy_source_name": str(args.legacy_source_name or ""),
         "legacy_source_receipts": legacy_receipts,
+        "fallback_source_name": str(args.fallback_source_name or ""),
+        "fallback_source_receipts": fallback_receipts,
         "rows": int(frame.height),
         "symbols": len(results),
         "security_type_counts": {
@@ -724,6 +979,14 @@ def main() -> None:
         "last_date": str(frame["date"].max()),
         "adjusted_rows": sum(result.adjusted_rows for result in results),
         "missing_adjustment_rows": sum(result.missing_adjustment_rows for result in results),
+        "fallback_rows": sum(result.fallback_rows for result in results),
+        "fallback_adjustment_rows": sum(
+            result.fallback_adjustment_rows for result in results
+        ),
+        "fallback_symbols": sum(
+            result.fallback_rows > 0 or result.fallback_adjustment_rows > 0
+            for result in results
+        ),
         "status_counts": status_counts,
         "dry_run": bool(args.dry_run),
     }

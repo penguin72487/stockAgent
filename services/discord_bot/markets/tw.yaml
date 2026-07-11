@@ -13,17 +13,23 @@ freshness_scan_limit: 0
 holidays: []
 pre_signal_command:
   - "{python}"
-  - downloader/update_tw_official_ohlcv.py
-  - --public-output-dir
+  - downloader/download_tw_official_data.py
+  - --mode
+  - daily
+  - --public-dir
   - data_tw_public
-  - --symbols-root
-  - data_yahoo/tw_stocks
+  - --stock-root
+  - data_tw_public/stocks
   - --public-workers
   - "2"
   - --date-workers
   - "4"
-  - --backfill-workers
+  - --workers
   - "8"
+  - --ohlcv-fallback
+  - yahoo
+  - --fallback-start-date
+  - "2000-01-01"
   - --skip-raw
 pre_signal_timeout_seconds: 1800
 

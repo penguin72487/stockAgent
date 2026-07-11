@@ -22,7 +22,7 @@ REQUIRED_COLUMNS = ("date", "open", "max", "min", "close")
 READ_COLUMNS = ("date", "open", "max", "min", "close", "adjclose", "Trading_Volume")
 INTRADAY_ROOT_HINTS = ("crypto", "data_okx", "data_bybit")
 DEFAULT_ROOTS = (
-    "data_yahoo/tw_stocks",
+    "data_tw_public/stocks",
     "data_yahoo/us_stocks",
     "data_yahoo/forex",
     "data_yahoo/crypto",
