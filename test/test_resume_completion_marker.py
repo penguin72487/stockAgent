@@ -22,8 +22,16 @@ def _write_fold_artifacts(root, fold_id: int, *, marker: bool) -> None:
     (fold_dir / "model.pt").write_bytes(b"placeholder")
     (fold_dir / "test_backtest.npz").write_bytes(b"placeholder")
     if marker:
+        (fold_dir / "deployment_test_backtest.npz").write_bytes(b"placeholder")
         (fold_dir / "fold_complete.json").write_text(
-            json.dumps({"status": "complete"}),
+            json.dumps(
+                {
+                    "status": "complete",
+                    "artifact_scope_version": 2,
+                    "test_scope": "full_horizon",
+                    "deployment_scope": "stitched_deployment",
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -41,3 +49,14 @@ def test_resume_loads_fold_only_when_complete_marker_exists(tmp_path):
 
     assert result is not None
     assert result.fold_id == 25
+
+
+def test_resume_rejects_legacy_completed_marker_until_scope_migration(tmp_path):
+    _write_fold_artifacts(tmp_path, 24, marker=False)
+    fold_dir = _fold_dir(tmp_path, 24)
+    (fold_dir / "fold_complete.json").write_text(
+        json.dumps({"status": "complete"}),
+        encoding="utf-8",
+    )
+
+    assert _load_completed_fold_result(tmp_path, 24) is None

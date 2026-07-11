@@ -248,8 +248,14 @@ def _configure_log_y_axis(ax: plt.Axes, *series: np.ndarray) -> None:
 def _max_drawdown_from_log_returns(log_returns: np.ndarray) -> float:
     """Compute max drawdown in log-space without unstable exp/divide operations."""
     clean = _clean_log_returns(log_returns)
+    if clean.size == 0:
+        return 0.0
     cum_log = np.cumsum(clean)
-    running_max_log = np.maximum.accumulate(cum_log)
+    # NAV starts at 1.0 (log NAV 0.0), so a loss on the first observed day is
+    # already a drawdown.  Without the initial zero peak, a series that starts
+    # negative and never recovers incorrectly reports no drawdown.
+    cumulative_with_initial = np.concatenate((np.zeros(1, dtype=np.float64), cum_log))
+    running_max_log = np.maximum.accumulate(cumulative_with_initial)[1:]
     dd = np.expm1(np.clip(cum_log - running_max_log, _PLOT_LOG_MIN, 0.0))
     return float(dd.min(initial=0.0))
 
@@ -352,6 +358,40 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     }
 
 
+def _aligned_dated_backtest_rows(
+    result: BacktestResult,
+    dates: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the common valid dated rows used by annual and total metrics."""
+    date_values = np.asarray(dates, dtype="datetime64[D]").reshape(-1)
+    strategy_returns = _clean_log_returns(result.strategy_returns).reshape(-1)
+    benchmark_returns = _clean_log_returns(result.benchmark_returns).reshape(-1)
+    turnovers = _finite_values(result.turnovers).reshape(-1)
+
+    row_count = min(
+        int(date_values.size),
+        int(strategy_returns.size),
+        int(benchmark_returns.size),
+        int(turnovers.size),
+    )
+    if row_count <= 0:
+        return (
+            date_values[:0],
+            strategy_returns[:0],
+            benchmark_returns[:0],
+            turnovers[:0],
+        )
+
+    date_values = date_values[:row_count]
+    valid_dates = ~np.isnat(date_values)
+    return (
+        date_values[valid_dates],
+        strategy_returns[:row_count][valid_dates],
+        benchmark_returns[:row_count][valid_dates],
+        turnovers[:row_count][valid_dates],
+    )
+
+
 def compute_metrics_by_year(
     result: BacktestResult,
     dates: np.ndarray,
@@ -364,22 +404,10 @@ def compute_metrics_by_year(
     Returns:
         dict mapping year -> annual metrics
     """
-    r = _clean_log_returns(result.strategy_returns)
-    b = _clean_log_returns(result.benchmark_returns)
-    turnover = _finite_values(result.turnovers)
-
-    date_values = np.asarray(dates, dtype="datetime64[D]")
-    n = min(int(date_values.size), int(r.size), int(b.size), int(turnover.size))
-    if n <= 0:
+    date_values, r, b, turnover = _aligned_dated_backtest_rows(result, dates)
+    if date_values.size == 0:
         return {}
-    date_values = date_values[:n]
-    valid_dates = ~np.isnat(date_values)
-    if not bool(valid_dates.any()):
-        return {}
-    years = date_values[valid_dates].astype("datetime64[Y]").astype(np.int64) + 1970
-    r = r[:n][valid_dates]
-    b = b[:n][valid_dates]
-    turnover = turnover[:n][valid_dates]
+    years = date_values.astype("datetime64[Y]").astype(np.int64) + 1970
 
     annual_metrics = {}
     for year in np.unique(years):
@@ -442,6 +470,7 @@ def generate_annual_report(
         formatted report string
     """
     annual_metrics = compute_metrics_by_year(result, dates)
+    _, r_all, b_all, turnover_all = _aligned_dated_backtest_rows(result, dates)
 
     # Column widths: Year(8) Strategy(12) Benchmark(12) Excess(12) Sharpe(10) BenchSharpe(11) MaxDD(10) Turnover(10)
     width = 109
@@ -452,9 +481,6 @@ def generate_annual_report(
     )
     lines.append(header)
     lines.append("-" * width)
-
-    r_all = _clean_log_returns(result.strategy_returns)
-    b_all = _clean_log_returns(result.benchmark_returns)
 
     for year in sorted(annual_metrics.keys()):
         m = annual_metrics[year]
@@ -482,7 +508,7 @@ def generate_annual_report(
     sortino_total = float(avg / downside_total_dev * math.sqrt(252.0)) if downside_total_dev > 0 else 0.0
     benchmark_sortino_total = float(avg_b / downside_total_dev_b * math.sqrt(252.0)) if downside_total_dev_b > 0 else 0.0
     max_dd_total = _max_drawdown_from_log_returns(r_all)
-    turnover_total = float(result.turnovers.mean()) if result.turnovers.size else 0.0
+    turnover_total = float(turnover_all.mean()) if turnover_all.size else 0.0
 
     summary_row = (
         f"{'TOTAL':<8} {cum_r_total:>11.2%} {cum_b_total:>12.2%} "
