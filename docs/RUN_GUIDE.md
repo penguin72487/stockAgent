@@ -25,46 +25,73 @@ source scripts/runtime_env.sh
 
 訓練設定要求 CUDA 時，檢查失敗就應修復環境，不應靜默改用 CPU。
 
-## 2. 更新台股公開規則資料
+## 2. 管理台股官方資料層
 
-一般公開資料與官方下市公司歷史：
+唯一的高階入口有三種模式。三者都以 TWSE／TPEx 為第一順位，並串接
+OHLCV、除權息參考價、股票／ETF 個股 parquet、交易規則、公開特徵與嚴格
+稽核。自 2000-01-01 起，官方缺少的 `date + symbol` OHLCV 才允許由 Yahoo
+替補；同鍵官方列永遠覆蓋 Yahoo，輸出逐列保留 `data_source`。若官方 OHLCV
+存在但漲跌／除權息參考因子缺失，只借用 Yahoo 調整比率並另標
+`adjustment_source`，不覆蓋官方 OHLCV。
 
-```bash
-run_fintech_python downloader/download_tw_public_data.py \
-  --mode daily-update \
-  --datasets all \
-  --output-dir data_tw_public
-```
-
-下市、停止融券與強制回補等 point-in-time 公告有獨立下載器。第一次建置
-建議回補完整官方可得範圍；日常批次會只抓當年：
+從零重建會先寫入 immutable stage，稽核通過後才原子替換 production：
 
 ```bash
-run_fintech_python downloader/download_tw_short_sale_restrictions.py \
-  --output-dir data_tw_public \
-  --start-year 1995 \
-  --end-year "$(date +%Y)"
+run_fintech_python downloader/download_tw_official_data.py \
+  --mode rebuild \
+  --stage-root artifacts/data_rebuild/tw_2000_bootstrap \
+  --promote
 ```
 
-此下載器預設採嚴格模式。任何實際請求失敗時會更新
-`data_tw_public/tw_short_sale_download_report.json`，但不會以部分結果覆蓋
-既有 parquet；只有明確接受不完整資料時才可加 `--allow-partial`。
+`configs/markets/tw_public.yaml` 保留從 2000 年開始的原始 fold 編號，但免費
+TWSE 每日行情只從 2004-02-11 起提供。預設 `--ohlcv-fallback yahoo` 會把
+Yahoo 每檔資料下載到 `data_tw_public/fallback/yahoo_tw_stocks`，轉成有收據的
+低優先封存，再只填官方空缺。Yahoo 不會補融資融券、法人、估值、公司事件、
+交易規則或其他 `twpub_*` 公開特徵；這些仍按官方可得年代與 point-in-time
+規則處理。
 
-報告中的 `requests_complete` 與 `complete` 要分開解讀：前者表示所有官方
-可請求月份均成功；後者也要求官方端點涵蓋整個要求年代。TPEx 月公告檔自
-2002-11、TWSE 公告檔自 2018-01 才可查，因此回補 1995 年起時，即使網路
-失敗為 0，`complete` 仍會如實為 false；不可用下市日期反推公告日，否則
-會造成 look-ahead bias。
-
-下載完成後重建同一份 sparse daily parquet；執行規則與可選的模型特徵都
-由這份輸出依設定取用：
+新機器從零開始使用上面的 `rebuild --promote` 即可。若機器已經有完整的
+`data_yahoo/tw_stocks`，可避免重抓並重用現有檔案：
 
 ```bash
-run_fintech_python scripts/build_tw_public_training_features.py \
-  --input-dir data_tw_public \
-  --output-path data_tw_public/features/tw_public_stock_daily.parquet \
-  --symbols-root data_yahoo/tw_stocks
+run_fintech_python downloader/download_tw_official_data.py \
+  --mode rebuild \
+  --stage-root artifacts/data_rebuild/tw_2000_bootstrap \
+  --yahoo-fallback-dir data_yahoo/tw_stocks \
+  --skip-yahoo-download \
+  --promote
 ```
+
+若要完全禁用 Yahoo，使用 `--ohlcv-fallback none`；此時 2000--2004 缺口必須
+另以 `--legacy-official-ohlcv` 與 `--legacy-source-name` 提供可追溯官方舊檔。
+
+檢查並補漏會掃描官方歷史來源的日期、schema、重複代碼及異常低筆數，並
+修復 Yahoo 替補檔後重新做官方優先合併；成功確認的休市日會寫入 coverage
+state：
+
+```bash
+run_fintech_python downloader/download_tw_official_data.py --mode repair
+```
+
+首次 Yahoo 回補採單工與 1.5 秒請求間隔，避免追求速度反而觸發 429。若仍被
+限流，保留相同 `--stage-root` 重跑同一條命令；已成功且原子寫入的個股檔會
+直接略過，只續抓未完成項目。不要刪除 stage，也不必從第一檔重來。
+
+每日增量要求先有通過 `rebuild` 或 `repair` 的完整基線，並重抓最近七個
+日曆日以接收官方更正；Yahoo 替補也會增量更新後再重新合併：
+
+```bash
+run_fintech_python downloader/download_tw_official_data.py --mode daily
+```
+
+任何日期請求失敗或仍有未解析缺口時，`download_summary.json` 的
+`coverage_complete` 會是 `false`，命令以非零狀態結束，且 `rebuild` 不會
+覆蓋既有 production。`downloader/run_daily_all_markets.sh` 的台股階段使用
+同一個 `daily` 入口；新機器必須先執行一次 `rebuild` 或 `repair`。
+
+下市、停止融券與強制回補公告仍採 fail-closed：請求失敗時只更新完整性
+報告，不以部分結果覆蓋既有 parquet。官方公告 archive 的起始年代限制仍
+會如實保留，不可用下市日期反推公告日，避免 look-ahead bias。
 
 `data.use_tw_public_rules` 與 `data.use_tw_public_features` 是兩個不同開關：
 

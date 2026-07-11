@@ -12,8 +12,8 @@ environment:
   amp_dtype: bf16
 
 data:
-  # Canonical symbol files are built only from TWSE/TPEx official archives.
-  # Run scripts/rebuild_tw_public_data_layer.py before training.
+  # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
+  # Run downloader/download_tw_official_data.py before training.
   parquet_root: data_tw_public/stocks
   benchmark_name: "2330"
   usd_only_trading_pairs: false

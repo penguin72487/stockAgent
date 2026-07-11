@@ -81,6 +81,7 @@ BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Tradi
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose", "Trading_Volume"}
 PARQUET_META_SOURCE_KEY = b"stockagent.source"
 PARQUET_META_ASSET_CLASS_KEY = b"stockagent.asset_class"
+PARQUET_META_REQUESTED_START_KEY = b"stockagent.yahoo_requested_start"
 PARQUET_META_CHECKED_THROUGH_KEY = b"stockagent.yahoo_checked_through"
 PARQUET_META_REQUESTED_END_KEY = b"stockagent.yahoo_requested_end"
 PARQUET_META_FIRST_DATE_KEY = b"stockagent.first_date"
@@ -96,6 +97,23 @@ UNAVAILABLE_TRIGGER_TEXTS = (
     "unavailable or delisted",
 )
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
+
+
+class RequestRateLimiter:
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def wait(self) -> None:
+        if self.interval_seconds <= 0.0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_request_at - now)
+            self._next_request_at = max(now, self._next_request_at) + self.interval_seconds
+        if delay > 0.0:
+            time.sleep(delay)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -325,6 +343,7 @@ class ExistingFileInfo:
     error: str | None
     columns: set[str]
     checked_through_date: str | None = None
+    requested_start_date: str | None = None
 
 
 @dataclass(slots=True)
@@ -530,6 +549,12 @@ def parse_args() -> argparse.Namespace:
         help="When --asset all, run up to this many asset classes in parallel.",
     )
     parser.add_argument("--retries", type=int, default=2, help="Retries per symbol when Yahoo temporarily fails.")
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between Yahoo chart requests across all workers.",
+    )
     parser.add_argument("--refresh", action="store_true", help="Re-download full history even if parquet exists.")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N symbols after filtering.")
     parser.add_argument("--symbols", nargs="+", default=None, help="Override symbols for the selected asset. Values can be codes or Yahoo symbols.")
@@ -805,16 +830,23 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
         metadata = dict(parquet_metadata.metadata or {})
         metadata.update(arrow_schema.metadata or {})
         checked_through = _decode_metadata_date(metadata.get(PARQUET_META_CHECKED_THROUGH_KEY))
+        requested_start = _decode_metadata_date(
+            metadata.get(PARQUET_META_REQUESTED_START_KEY)
+        )
     except Exception as exc:
         return ExistingFileInfo(None, None, f"schema_error: {exc}", set())
 
     if "date" not in columns:
-        return ExistingFileInfo(None, None, "empty", columns, checked_through)
+        return ExistingFileInfo(
+            None, None, "empty", columns, checked_through, requested_start
+        )
 
     first_meta = _decode_metadata_date(metadata.get(PARQUET_META_FIRST_DATE_KEY))
     last_meta = _decode_metadata_date(metadata.get(PARQUET_META_LAST_DATE_KEY))
     if first_meta is not None and last_meta is not None:
-        return ExistingFileInfo(first_meta, last_meta, None, columns, checked_through)
+        return ExistingFileInfo(
+            first_meta, last_meta, None, columns, checked_through, requested_start
+        )
 
     try:
         date_column_index = arrow_schema.get_field_index("date")
@@ -823,16 +855,29 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
     if date_column_index >= 0:
         first_date, last_date = _date_bounds_from_parquet_metadata(parquet_metadata, date_column_index)
         if first_date is not None and last_date is not None:
-            return ExistingFileInfo(first_date, last_date, None, columns, checked_through)
+            return ExistingFileInfo(
+                first_date, last_date, None, columns, checked_through, requested_start
+            )
 
     try:
         date_table = pq.read_table(output_path, columns=["date"], memory_map=True)
         first_date, last_date = _date_bounds_from_arrow_table(date_table)
     except Exception as exc:
-        return ExistingFileInfo(None, None, f"read_error: {exc}", columns, checked_through)
+        return ExistingFileInfo(
+            None,
+            None,
+            f"read_error: {exc}",
+            columns,
+            checked_through,
+            requested_start,
+        )
     if first_date is None or last_date is None:
-        return ExistingFileInfo(None, None, "no_valid_date", columns, checked_through)
-    return ExistingFileInfo(first_date, last_date, None, columns, checked_through)
+        return ExistingFileInfo(
+            None, None, "no_valid_date", columns, checked_through, requested_start
+        )
+    return ExistingFileInfo(
+        first_date, last_date, None, columns, checked_through, requested_start
+    )
 
 
 def _prepare_arrow_table_for_write(frame: object) -> object:
@@ -878,6 +923,7 @@ def _write_feature_parquet_atomic(
     *,
     asset_class: str,
     requested_end_date: str,
+    requested_start_date: str | None = None,
     source: str = "yahoo",
 ) -> tuple[str | None, str | None]:
     frame = _canonicalize_feature_frame(frame, keep_zero_volume=asset_class != "forex")
@@ -909,6 +955,10 @@ def _write_feature_parquet_atomic(
                     ),
                 }
             )
+            if requested_start_date is not None:
+                metadata[PARQUET_META_REQUESTED_START_KEY] = requested_start_date.encode(
+                    "utf-8"
+                )
             if first_date is not None:
                 metadata[PARQUET_META_FIRST_DATE_KEY] = first_date.encode("utf-8")
             if last_date is not None:
@@ -1276,6 +1326,38 @@ def _download_yahoo_chart_frame(
             }
         )
     return pl.DataFrame(rows, infer_schema_length=None) if rows else _empty_feature_frame()
+
+
+def _download_yfinance_frame(
+    *,
+    symbol: str,
+    start_date: str,
+    end_date_exclusive: str,
+    interval: str,
+    timeout: int = 20,
+) -> object:
+    try:
+        import yfinance as yf
+    except ImportError as exc:  # pragma: no cover - fintech environment contract
+        raise RuntimeError(
+            "Yahoo chart request failed and yfinance fallback is unavailable"
+        ) from exc
+    frame = yf.download(
+        symbol,
+        start=start_date,
+        end=end_date_exclusive,
+        interval=interval,
+        actions=True,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        timeout=timeout,
+        multi_level_index=False,
+    )
+    if frame is None or bool(frame.empty):
+        return _empty_feature_frame()
+    frame = frame.reset_index()
+    return pl.from_pandas(frame)
 
 
 class _HTMLTableRowParser(HTMLParser):
@@ -2368,6 +2450,7 @@ def _download_symbol(
     whitelist_symbols: set[str] | None = None,
     whitelist_path: Path | None = None,
     whitelist_lock: threading.Lock | None = None,
+    request_rate_limiter: RequestRateLimiter | None = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     candidates_to_try = _available_candidate_symbols(asset_class, record, blacklist_symbols)
@@ -2425,8 +2508,12 @@ def _download_symbol(
                 )
 
     existing_frame: object | None = None
+    existing_requested_start_date: str | None = None
     if output_path.exists() and merge_existing:
         try:
+            existing_requested_start_date = _load_existing_file_info(
+                output_path
+            ).requested_start_date
             existing_frame = _read_parquet_frame(output_path)
             if asset_class == "crypto" and not _frame_matches_expected_interval(
                 existing_frame,
@@ -2463,13 +2550,24 @@ def _download_symbol(
                 err_capture = io.StringIO()
 
                 def _download_frame(symbol: str = candidate_symbol) -> object:
-                    return _download_yahoo_chart_frame(
-                        symbol=symbol,
-                        start_date=effective_start_date,
-                        end_date_exclusive=period_end_exclusive,
-                        interval=yf_interval,
-                        timeout=20,
-                    )
+                    if request_rate_limiter is not None:
+                        request_rate_limiter.wait()
+                    try:
+                        return _download_yahoo_chart_frame(
+                            symbol=symbol,
+                            start_date=effective_start_date,
+                            end_date_exclusive=period_end_exclusive,
+                            interval=yf_interval,
+                            timeout=20,
+                        )
+                    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+                        return _download_yfinance_frame(
+                            symbol=symbol,
+                            start_date=effective_start_date,
+                            end_date_exclusive=period_end_exclusive,
+                            interval=yf_interval,
+                            timeout=20,
+                        )
 
                 with contextlib.redirect_stdout(std_capture), contextlib.redirect_stderr(err_capture):
                     # Guard Yahoo chart API calls against indefinite socket/DNS stalls.
@@ -2502,6 +2600,11 @@ def _download_symbol(
                     output_path,
                     asset_class=asset_class,
                     requested_end_date=end_date,
+                    requested_start_date=(
+                        min(existing_requested_start_date, effective_start_date)
+                        if existing_requested_start_date is not None
+                        else effective_start_date
+                    ),
                 )
                 _whitelist_symbol(candidate_symbol, whitelist_symbols, whitelist_path, whitelist_lock)
                 return DownloadResult(
@@ -2522,7 +2625,11 @@ def _download_symbol(
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
                     break
                 if attempt < retries:
-                    time.sleep(0.8 * (attempt + 1))
+                    is_rate_limited = isinstance(exc, HTTPError) and exc.code == 429
+                    if is_rate_limited or "too many requests" in str(exc).lower():
+                        time.sleep(5.0 * (2**attempt))
+                    else:
+                        time.sleep(0.8 * (attempt + 1))
 
     return DownloadResult(
         asset_class=asset_class,
@@ -2888,6 +2995,33 @@ def _resolve_repair_plan(
                 checks.append(_unavailable_skip(record, output_path, first_date, last_date))
                 continue
 
+            requested_start_dt = _parse_date(args.start_date).date()
+            checked_start_dt = (
+                _parse_date(info.requested_start_date).date()
+                if info.requested_start_date
+                else None
+            )
+            if asset_class == "tw_stocks" and (
+                checked_start_dt is None or checked_start_dt > requested_start_dt
+            ):
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="historical_start_unverified",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=args.start_date,
+                        checked_through_date=checked_through_date,
+                        merge_existing=True,
+                        message=(
+                            f"requested_start={args.start_date}, "
+                            f"checked_start={info.requested_start_date}"
+                        ),
+                    )
+                )
+                continue
+
             if _is_incremental_mode(args) and args.daily_stale_max_lag_days > 0:
                 lag_days = (target_end_dt - local_last_dt).days
                 if lag_days > args.daily_stale_max_lag_days:
@@ -2984,6 +3118,9 @@ def _run_parallel_symbol_downloads(
     completed = 0
     rate_limited_failures = 0
     abort_after = max(0, int(getattr(args, "rate_limit_abort_after", 20) or 0))
+    request_rate_limiter = RequestRateLimiter(
+        float(getattr(args, "request_interval", 0.0) or 0.0)
+    )
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
             executor.submit(
@@ -3002,6 +3139,7 @@ def _run_parallel_symbol_downloads(
                 whitelist_symbols,
                 whitelist_path,
                 whitelist_lock,
+                request_rate_limiter,
             ): (record, meta)
             for record, start_date, refresh, merge_existing, meta in tasks
         }
@@ -3120,13 +3258,22 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
 
     needs_update = sum(
         status_counts.get(status, 0)
-        for status in ("missing", "new_symbol", "stale", "empty", "broken", "schema_mismatch")
+        for status in (
+            "missing",
+            "new_symbol",
+            "stale",
+            "empty",
+            "broken",
+            "schema_mismatch",
+            "historical_start_unverified",
+        )
     )
     print(
         f"[repair] asset={asset_class} up_to_date={status_counts.get('current', 0)} "
         f"needs_update={needs_update} stale={status_counts.get('stale', 0)} "
         f"missing={status_counts.get('missing', 0)} new_symbol={status_counts.get('new_symbol', 0)} "
         f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)} "
+        f"historical_unverified={status_counts.get('historical_start_unverified', 0)} "
         f"delisted_skip={status_counts.get('delisted_skip', 0)} "
         f"delisted_no_history={status_counts.get('delisted_no_history', 0)} "
         f"delisted_removed={status_counts.get('delisted_removed', 0)} "
@@ -3308,6 +3455,8 @@ def main() -> None:
     # so any single blocking call can't hang the process indefinitely.
     socket.setdefaulttimeout(30)
     args = parse_args()
+    if args.request_interval < 0.0:
+        raise ValueError("--request-interval must be >= 0")
     asset_classes = list(ASSET_CLASSES) if args.asset == "all" else [args.asset]
     summaries: dict[str, dict[str, int]] = {}
 

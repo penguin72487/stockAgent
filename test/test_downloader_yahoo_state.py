@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from urllib.error import HTTPError
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -453,6 +454,7 @@ def test_daily_repair_plan_treats_weekend_stock_target_as_current(tmp_path):
         ),
         output_path,
         asset_class="tw_stocks",
+        requested_start_date="2000-01-01",
         requested_end_date="2026-06-12",
     )
 
@@ -487,11 +489,13 @@ def test_daily_repair_plan_uses_checked_through_metadata_to_avoid_same_day_refet
         ),
         output_path,
         asset_class="tw_stocks",
+        requested_start_date="2000-01-01",
         requested_end_date="2026-06-15",
     )
 
     info = yahoo._load_existing_file_info(output_path)
     assert info.checked_through_date == "2026-06-15"
+    assert info.requested_start_date == "2000-01-01"
 
     record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
     checks = yahoo._resolve_repair_plan(
@@ -504,3 +508,78 @@ def test_daily_repair_plan_uses_checked_through_metadata_to_avoid_same_day_refet
     assert [(check.status, check.last_date, check.checked_through_date, check.repair_start_date) for check in checks] == [
         ("current", "2026-06-12", "2026-06-15", None),
     ]
+
+
+def test_repair_plan_backfills_when_historical_start_was_never_checked(tmp_path):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    output_path = output_dir / "2330_features.parquet"
+    yahoo._write_feature_parquet_atomic(
+        pl.DataFrame(
+            {
+                "date": ["2026-06-11"],
+                "open": [100.0],
+                "max": [102.0],
+                "min": [99.0],
+                "close": [101.0],
+                "adjclose": [101.0],
+                "Trading_Volume": [1000],
+            }
+        ),
+        output_path,
+        asset_class="tw_stocks",
+        requested_end_date="2026-06-11",
+    )
+
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+    checks = yahoo._resolve_repair_plan(
+        "tw_stocks",
+        _base_args(tmp_path),
+        [record],
+        output_dir,
+    )
+
+    assert [(check.status, check.repair_start_date, check.merge_existing) for check in checks] == [
+        ("historical_start_unverified", "2000-01-01", True),
+    ]
+
+
+def test_chart_rate_limit_falls_back_to_yfinance_session(tmp_path, monkeypatch):
+    def rate_limited(**kwargs):
+        raise HTTPError(kwargs["symbol"], 429, "Too Many Requests", None, None)
+
+    fallback_calls = []
+
+    def yfinance_fallback(**kwargs):
+        fallback_calls.append(kwargs["symbol"])
+        return pl.DataFrame(
+            {
+                "Date": ["2000-01-04"],
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.0],
+                "Adj Close": [50.0],
+                "Volume": [1000.0],
+            }
+        )
+
+    monkeypatch.setattr(yahoo, "_download_yahoo_chart_frame", rate_limited)
+    monkeypatch.setattr(yahoo, "_download_yfinance_frame", yfinance_fallback)
+    record = yahoo.SymbolRecord("2330", "TSMC", "tw_stocks", "2330.TW")
+
+    result = yahoo._download_symbol(
+        "tw_stocks",
+        record,
+        tmp_path,
+        "2000-01-01",
+        "2000-01-10",
+        retries=0,
+        refresh=True,
+        request_rate_limiter=yahoo.RequestRateLimiter(0.0),
+    )
+
+    assert result.status == "updated"
+    assert fallback_calls == ["2330.TW"]
+    info = yahoo._load_existing_file_info(tmp_path / "2330_features.parquet")
+    assert info.requested_start_date == "2000-01-01"

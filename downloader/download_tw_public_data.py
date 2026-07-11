@@ -83,8 +83,14 @@ class DownloadResult:
     output_path: str | None
     message: str | None = None
     raw_path: str | None = None
+    requested_dates: int = 0
     fetched_dates: int = 0
     skipped_dates: int = 0
+    empty_dates: int = 0
+    failed_dates: int = 0
+    missing_dates_before: int = 0
+    missing_dates_after: int = 0
+    coverage_complete: bool | None = None
 
 
 @dataclass(slots=True)
@@ -94,6 +100,43 @@ class HistoricalDateResult:
     frame: pl.DataFrame
     raw_path: str | None = None
     error: str | None = None
+
+
+@dataclass(slots=True)
+class HistoricalDownloadPlan:
+    start: date
+    end: date
+    dates: list[date]
+    all_weekdays: set[date]
+    existing_dates: set[date]
+    confirmed_empty_dates: set[date]
+    suspicious_dates: set[date]
+    missing_before: set[date]
+    replace_output: bool
+    state: dict[str, Any]
+
+
+MODE_ALIASES = {
+    "full": "repair",
+    "daily-update": "daily",
+    "from-zero": "rebuild",
+}
+DOWNLOAD_MODES = ("rebuild", "repair", "daily", "list", *MODE_ALIASES)
+COVERAGE_STATE_SCHEMA_VERSION = 1
+NO_DATA_STATUS_MARKERS = (
+    "沒有符合條件",
+    "查無資料",
+    "無資料",
+    "no data",
+)
+OHLCV_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "twse_daily_ohlcv": ("證券代號", "成交股數", "開盤價", "最高價", "最低價", "收盤價"),
+    "tpex_daily_ohlcv": ("代號", "成交股數", "開盤", "最高", "最低", "收盤"),
+}
+OHLCV_SYMBOL_COLUMNS = {
+    "twse_daily_ohlcv": "證券代號",
+    "tpex_daily_ohlcv": "代號",
+}
 
 
 HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
@@ -603,7 +646,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download Taiwan free public datasets from TWSE, TPEx, MOPS, TDCC, TAIFEX, CBC, DGBAS, and MOF."
     )
-    parser.add_argument("--mode", choices=("daily-update", "full", "list"), default="daily-update")
+    parser.add_argument(
+        "--mode",
+        choices=DOWNLOAD_MODES,
+        default="daily",
+        help=(
+            "rebuild: refetch the requested range into an atomic replacement; "
+            "repair: inspect local coverage and fetch only missing/suspicious dates; "
+            "daily: refresh a short overlap and append new dates. "
+            "Legacy aliases full and daily-update remain accepted."
+        ),
+    )
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -638,6 +691,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-dates", type=int, default=None, help="Optional smoke-test cap per historical dataset.")
     parser.add_argument("--refresh", action="store_true", help="Overwrite existing parquet instead of merging.")
+    parser.add_argument(
+        "--daily-overlap-days",
+        type=int,
+        default=7,
+        help="Calendar-day overlap refreshed by daily mode to capture official corrections.",
+    )
+    parser.add_argument(
+        "--empty-recheck-days",
+        type=int,
+        default=30,
+        help="Repair mode rechecks recently empty weekdays instead of trusting them as holidays.",
+    )
     parser.add_argument("--skip-raw", action="store_true", help="Do not persist raw response bytes.")
     parser.add_argument(
         "--progress",
@@ -698,6 +763,298 @@ def _iter_dates(start: date, end: date, *, include_weekends: bool) -> list[date]
     return days
 
 
+def _canonical_mode(value: str) -> str:
+    return MODE_ALIASES.get(str(value), str(value))
+
+
+def _coverage_state_path(output_dir: Path, spec: DatasetSpec) -> Path:
+    return output_dir / "state" / f"{spec.name}.json"
+
+
+def _load_coverage_state(path: Path, spec: DatasetSpec) -> dict[str, Any]:
+    empty = {
+        "schema_version": COVERAGE_STATE_SCHEMA_VERSION,
+        "dataset": spec.name,
+        "confirmed_empty_dates": [],
+        "failed_dates": {},
+        "coverage_complete": False,
+    }
+    if not path.exists():
+        return empty
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return empty
+    if not isinstance(payload, dict):
+        return empty
+    if payload.get("dataset") != spec.name:
+        return empty
+    if int(payload.get("schema_version", -1)) != COVERAGE_STATE_SCHEMA_VERSION:
+        return empty
+    return {**empty, **payload}
+
+
+def _state_date_set(state: dict[str, Any], key: str) -> set[date]:
+    values = state.get(key, [])
+    if not isinstance(values, list):
+        return set()
+    parsed: set[date] = set()
+    for value in values:
+        try:
+            parsed.add(_parse_date(str(value)[:10]))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _state_failed_date_set(state: dict[str, Any]) -> set[date]:
+    values = state.get("failed_dates", {})
+    if not isinstance(values, dict):
+        return set()
+    parsed: set[date] = set()
+    for value in values:
+        try:
+            parsed.add(_parse_date(str(value)[:10]))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _existing_date_counts(path: Path) -> tuple[dict[date, int], list[str]]:
+    if not path.exists():
+        return {}, []
+    schema = pq.read_schema(path).names
+    if DATE_COLUMN not in schema:
+        raise ValueError(f"existing parquet has no {DATE_COLUMN!r} column: {path}")
+    counts = (
+        pl.scan_parquet(path)
+        .select(pl.col(DATE_COLUMN).cast(pl.Utf8, strict=False).alias(DATE_COLUMN))
+        .group_by(DATE_COLUMN)
+        .len()
+        .collect()
+    )
+    output: dict[date, int] = {}
+    invalid: list[str] = []
+    for raw_date, count in counts.iter_rows():
+        try:
+            parsed = _parse_date(str(raw_date)[:10])
+        except (TypeError, ValueError):
+            invalid.append(str(raw_date))
+            continue
+        output[parsed] = output.get(parsed, 0) + int(count)
+    return output, invalid
+
+
+def _suspicious_ohlcv_dates(
+    path: Path,
+    spec: DatasetSpec,
+    counts: dict[date, int],
+) -> tuple[set[date], list[str]]:
+    required = OHLCV_REQUIRED_COLUMNS.get(spec.name)
+    if not required or not path.exists() or not counts:
+        return set(), []
+    schema = set(pq.read_schema(path).names)
+    missing_columns = [column for column in required if column not in schema]
+    if missing_columns:
+        return set(counts), [f"missing_columns={','.join(missing_columns)}"]
+
+    suspicious: set[date] = set()
+    issues: list[str] = []
+    symbol_column = OHLCV_SYMBOL_COLUMNS[spec.name]
+    duplicate_dates = (
+        pl.scan_parquet(path)
+        .select(
+            pl.col(DATE_COLUMN).cast(pl.Utf8, strict=False).alias(DATE_COLUMN),
+            pl.col(symbol_column).cast(pl.Utf8, strict=False).alias("_symbol"),
+        )
+        .drop_nulls([DATE_COLUMN, "_symbol"])
+        .group_by([DATE_COLUMN, "_symbol"])
+        .len()
+        .filter(pl.col("len") > 1)
+        .select(DATE_COLUMN)
+        .unique()
+        .collect()
+    )
+    for value in duplicate_dates.get_column(DATE_COLUMN).to_list():
+        try:
+            suspicious.add(_parse_date(str(value)[:10]))
+        except ValueError:
+            continue
+    if suspicious:
+        issues.append(f"duplicate_symbol_dates={len(suspicious)}")
+
+    def number(column: str) -> pl.Expr:
+        return (
+            pl.col(column)
+            .cast(pl.Utf8, strict=False)
+            .str.replace_all(",", "")
+            .str.strip_chars()
+            .cast(pl.Float64, strict=False)
+        )
+
+    volume_column, open_column, high_column, low_column, close_column = required[1:]
+    invalid_bar_dates = (
+        pl.scan_parquet(path)
+        .select(
+            pl.col(DATE_COLUMN).cast(pl.Utf8, strict=False).alias(DATE_COLUMN),
+            number(volume_column).alias("_volume"),
+            number(open_column).alias("_open"),
+            number(high_column).alias("_high"),
+            number(low_column).alias("_low"),
+            number(close_column).alias("_close"),
+        )
+        .filter(
+            (pl.col("_volume").is_not_null() & (pl.col("_volume") < 0.0))
+            | (
+                pl.all_horizontal(
+                    pl.col("_open").is_not_null(),
+                    pl.col("_high").is_not_null(),
+                    pl.col("_low").is_not_null(),
+                    pl.col("_close").is_not_null(),
+                )
+                & (pl.col("_volume").fill_null(0.0) > 0.0)
+                & (
+                    (pl.min_horizontal("_open", "_high", "_low", "_close") <= 0.0)
+                    | (pl.col("_high") < pl.max_horizontal("_open", "_low", "_close"))
+                    | (pl.col("_low") > pl.min_horizontal("_open", "_high", "_close"))
+                )
+            )
+        )
+        .select(DATE_COLUMN)
+        .unique()
+        .collect()
+    )
+    invalid_dates: set[date] = set()
+    for value in invalid_bar_dates.get_column(DATE_COLUMN).to_list():
+        try:
+            invalid_dates.add(_parse_date(str(value)[:10]))
+        except ValueError:
+            continue
+    suspicious.update(invalid_dates)
+    if invalid_dates:
+        issues.append(f"invalid_ohlcv_dates={len(invalid_dates)}")
+
+    ordered = sorted(counts)
+    low_row_dates: set[date] = set()
+    for idx in range(1, len(ordered) - 1):
+        current = ordered[idx]
+        neighbor_floor = min(counts[ordered[idx - 1]], counts[ordered[idx + 1]])
+        if neighbor_floor >= 100 and counts[current] < max(10, int(neighbor_floor * 0.35)):
+            low_row_dates.add(current)
+    suspicious.update(low_row_dates)
+    if low_row_dates:
+        issues.append(f"abnormally_low_row_dates={len(low_row_dates)}")
+    return suspicious, issues
+
+
+def _historical_bounds(spec: DatasetSpec, args: argparse.Namespace) -> tuple[date, date]:
+    configured_start = _parse_date(spec.start_date or "2000-01-01")
+    start = configured_start if args.start_date == "earliest" else max(configured_start, _parse_date(args.start_date))
+    end = _parse_date(resolve_end_date(args.end_date))
+    return start, end
+
+
+def _plan_historical_download(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> HistoricalDownloadPlan:
+    mode = _canonical_mode(args.mode)
+    start, end = _historical_bounds(spec, args)
+    all_weekdays = set(_iter_dates(start, end, include_weekends=bool(args.include_weekends))
+    )
+    parquet_path = output_dir / f"{spec.name}.parquet"
+    state_path = _coverage_state_path(output_dir, spec)
+    state = _load_coverage_state(state_path, spec)
+    replace_output = mode == "rebuild" or bool(args.refresh)
+
+    try:
+        counts, invalid_date_values = _existing_date_counts(parquet_path)
+    except Exception as exc:
+        if mode == "daily":
+            raise RuntimeError(
+                f"daily mode requires a readable baseline for {spec.name}; run --mode repair: {exc}"
+            ) from exc
+        counts, invalid_date_values = {}, [f"unreadable:{type(exc).__name__}:{exc}"]
+        replace_output = True
+    existing_dates = set(counts) & all_weekdays
+    confirmed_empty = _state_date_set(state, "confirmed_empty_dates") & all_weekdays
+    unresolved_failed = _state_failed_date_set(state) & all_weekdays
+    try:
+        suspicious_dates, suspicious_issues = _suspicious_ohlcv_dates(
+            parquet_path, spec, counts
+        )
+    except Exception as exc:
+        if mode == "daily":
+            raise RuntimeError(
+                f"daily mode could not validate {spec.name}; run --mode repair: {exc}"
+            ) from exc
+        suspicious_dates = set(counts)
+        suspicious_issues = [f"validation_error={type(exc).__name__}:{exc}"]
+    suspicious_dates &= all_weekdays
+    if invalid_date_values:
+        suspicious_issues.append(f"invalid_date_values={len(invalid_date_values)}")
+
+    if replace_output:
+        requested = sorted(all_weekdays)
+        missing_before = set(all_weekdays)
+        confirmed_empty = set()
+    elif mode == "repair":
+        recheck_days = max(0, int(args.empty_recheck_days))
+        recent_cutoff = end - timedelta(days=max(0, recheck_days - 1))
+        trusted_empty = (
+            set(confirmed_empty)
+            if recheck_days == 0
+            else {day for day in confirmed_empty if day < recent_cutoff}
+        )
+        missing_before = (all_weekdays - existing_dates - trusted_empty) | unresolved_failed
+        requested = sorted(missing_before | suspicious_dates)
+    elif mode == "daily":
+        if not parquet_path.exists() or not bool(state.get("baseline_established")):
+            raise RuntimeError(
+                f"daily mode requires a complete baseline for {spec.name}; run --mode rebuild or --mode repair first"
+            )
+        try:
+            checked_through = _parse_date(str(state.get("checked_through", ""))[:10])
+        except ValueError as exc:
+            raise RuntimeError(
+                f"daily mode found invalid coverage state for {spec.name}; run --mode repair"
+            ) from exc
+        overlap_days = max(1, int(args.daily_overlap_days))
+        overlap_start = max(start, end - timedelta(days=overlap_days - 1))
+        gap_start = max(start, checked_through + timedelta(days=1))
+        requested_start = min(overlap_start, gap_start)
+        requested = sorted(
+            set(
+                _iter_dates(
+                    requested_start,
+                    end,
+                    include_weekends=bool(args.include_weekends),
+                )
+            )
+            | unresolved_failed
+        )
+        missing_before = set(requested) - existing_dates - confirmed_empty
+    else:
+        raise ValueError(f"unsupported download mode: {mode}")
+
+    if args.max_dates is not None:
+        requested = requested[: max(0, int(args.max_dates))]
+    state["last_plan_issues"] = suspicious_issues
+    return HistoricalDownloadPlan(
+        start=start,
+        end=end,
+        dates=requested,
+        all_weekdays=all_weekdays,
+        existing_dates=existing_dates,
+        confirmed_empty_dates=confirmed_empty,
+        suspicious_dates=suspicious_dates,
+        missing_before=missing_before,
+        replace_output=replace_output,
+        state=state,
+    )
+
+
 def _roc_date_to_iso(value: str) -> str | None:
     text = value.strip()
     if not ROC_DATE_PATTERN.match(text):
@@ -708,6 +1065,19 @@ def _roc_date_to_iso(value: str) -> str | None:
 
 def _format_date(value: date, fmt: str) -> str:
     return value.strftime(fmt)
+
+
+def _json_payload_status_error(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_status = payload.get("stat", payload.get("status", ""))
+    status = _strip_html(raw_status).strip()
+    if not status or status.lower() == "ok":
+        return None
+    lowered = status.lower()
+    if any(marker in lowered for marker in NO_DATA_STATUS_MARKERS):
+        return None
+    return status
 
 
 def _http_get(
@@ -1268,6 +1638,74 @@ def _latest_existing_date(path: Path) -> date | None:
         return None
 
 
+def _finish_historical_coverage_state(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    output_dir: Path,
+    plan: HistoricalDownloadPlan,
+    *,
+    data_dates: set[date],
+    empty_dates: set[date],
+    errors: dict[date, str],
+    replacement_promoted: bool,
+) -> tuple[bool, int]:
+    mode = _canonical_mode(args.mode)
+    if plan.replace_output:
+        if replacement_promoted:
+            existing_after = set(data_dates)
+            confirmed_empty = set(empty_dates)
+        else:
+            existing_after = set(plan.existing_dates)
+            confirmed_empty = set(plan.confirmed_empty_dates)
+    else:
+        existing_after = set(plan.existing_dates) | set(data_dates)
+        confirmed_empty = set(plan.confirmed_empty_dates)
+        confirmed_empty.update(empty_dates)
+    confirmed_empty.difference_update(data_dates)
+    confirmed_empty.difference_update(errors)
+
+    missing_after = plan.all_weekdays - existing_after - confirmed_empty
+    state = dict(plan.state)
+    failed_dates = state.get("failed_dates", {})
+    if not isinstance(failed_dates, dict):
+        failed_dates = {}
+    for day in data_dates | empty_dates:
+        failed_dates.pop(day.isoformat(), None)
+    failed_dates.update({day.isoformat(): message for day, message in errors.items()})
+    unresolved_failed = _state_failed_date_set(
+        {"failed_dates": failed_dates}
+    ) & plan.all_weekdays
+    unresolved_after = missing_after | unresolved_failed
+    full_coverage = not unresolved_after
+    previous_baseline = bool(state.get("baseline_established"))
+    baseline_established = previous_baseline or (
+        mode in {"rebuild", "repair"} and full_coverage
+    )
+    state.update(
+        {
+            "schema_version": COVERAGE_STATE_SCHEMA_VERSION,
+            "dataset": spec.name,
+            "updated_at_utc": _now_utc(),
+            "last_mode": mode,
+            "coverage_start": plan.start.isoformat(),
+            "coverage_end": plan.end.isoformat(),
+            "baseline_established": baseline_established,
+            "coverage_complete": full_coverage,
+            "confirmed_empty_dates": sorted(day.isoformat() for day in confirmed_empty),
+            "failed_dates": dict(sorted(failed_dates.items())),
+            "last_requested_dates": len(plan.dates),
+            "last_fetched_dates": len(data_dates),
+            "last_empty_dates": len(empty_dates),
+            "last_failed_dates": len(errors),
+            "missing_dates_after": len(unresolved_after),
+        }
+    )
+    if full_coverage:
+        state["checked_through"] = plan.end.isoformat()
+    _write_json(_coverage_state_path(output_dir, spec), state)
+    return full_coverage, len(unresolved_after)
+
+
 def _download_historical_date(
     spec: DatasetSpec,
     day: date,
@@ -1294,6 +1732,9 @@ def _download_historical_date(
             raw_suffix = ".html"
         else:
             payload = response.json()
+            status_error = _json_payload_status_error(payload)
+            if status_error is not None:
+                raise RuntimeError(f"official response status is not OK: {status_error}")
             if response_kind == "legacy_json_html":
                 frame = _parse_tpex_daily_quotes_html(str(payload.get("html", "")), day)
             else:
@@ -1324,28 +1765,30 @@ def _download_historical_date(
 def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir: Path) -> DownloadResult:
     assert spec.url_template is not None
     parquet_path = output_dir / f"{spec.name}.parquet"
-    configured_start = spec.start_date or "2000-01-01"
-    start = _parse_date(configured_start if args.start_date == "earliest" else args.start_date)
-    end = _parse_date(resolve_end_date(args.end_date))
+    plan = _plan_historical_download(spec, args, output_dir)
+    dates = plan.dates
 
-    if args.mode == "daily-update" and not args.refresh:
-        latest = _latest_existing_date(parquet_path)
-        if latest is not None:
-            start = max(start, latest + timedelta(days=1))
-
-    dates = _iter_dates(start, end, include_weekends=bool(args.include_weekends))
-    if args.max_dates is not None:
-        dates = dates[: max(0, int(args.max_dates))]
-    if not dates:
-        return DownloadResult(spec.name, "up_to_date", _read_existing_row_count(parquet_path), str(parquet_path))
+    working_path = parquet_path
+    if plan.replace_output:
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{parquet_path.name}.",
+            suffix=".rebuild.parquet",
+            dir=parquet_path.parent,
+            delete=False,
+        )
+        working_path = Path(handle.name)
+        handle.close()
+        working_path.unlink(missing_ok=True)
 
     fetched_at = _now_utc()
     frames: list[pl.DataFrame] = []
     fetched_dates = 0
-    skipped_dates = 0
+    empty_dates: set[date] = set()
+    errors: dict[date, str] = {}
+    data_dates: set[date] = set()
     new_rows = 0
     raw_path: str | None = None
-    last_error: str | None = None
     rows = _read_existing_row_count(parquet_path)
     wrote_any = False
     flush_every_dates = max(0, int(getattr(args, "flush_every_dates", 0) or 0))
@@ -1364,84 +1807,131 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
         if not frames:
             return
         incoming = pl.concat(frames, how="diagonal_relaxed")
-        rows = _write_parquet_merged(parquet_path, incoming, refresh=bool(args.refresh) and not wrote_any)
+        rows = _write_parquet_merged(
+            working_path,
+            incoming,
+            refresh=plan.replace_output and not wrote_any,
+        )
         frames = []
         wrote_any = True
         if final or bool(getattr(args, "progress", True)):
             progress_iter.set_postfix(
                 fetched=fetched_dates,
-                skipped=skipped_dates,
+                empty=len(empty_dates),
+                failed=len(errors),
                 rows=rows,
                 flushed=int(wrote_any),
             )
 
     def consume(result: HistoricalDateResult) -> None:
-        nonlocal fetched_dates, skipped_dates, new_rows, raw_path, last_error
+        nonlocal fetched_dates, new_rows, raw_path
         if result.error is not None:
-            last_error = result.error
-            skipped_dates += 1
+            errors[result.day] = result.error
         elif result.frame.is_empty():
-            skipped_dates += 1
+            if result.day in plan.suspicious_dates:
+                errors[result.day] = "suspicious existing date returned no official rows"
+            else:
+                empty_dates.add(result.day)
         else:
             frames.append(_append_common_columns(result.frame, spec, fetched_at=fetched_at, url=result.url))
             fetched_dates += 1
             new_rows += int(result.frame.height)
+            data_dates.add(result.day)
             raw_path = result.raw_path or raw_path
             if flush_every_dates and len(frames) >= flush_every_dates:
                 flush_frames()
         if bool(getattr(args, "progress", True)):
             progress_iter.set_postfix(
                 fetched=fetched_dates,
-                skipped=skipped_dates,
+                empty=len(empty_dates),
+                failed=len(errors),
                 rows=(rows + new_rows if not wrote_any else rows),
-                refresh=bool(args.refresh),
+                mode=_canonical_mode(args.mode),
                 date_workers=date_workers,
             )
 
     completed: dict[date, HistoricalDateResult] = {}
     next_idx = 0
+    replacement_promoted = False
     try:
-        with ThreadPoolExecutor(max_workers=date_workers) as executor:
-            futures = {
-                executor.submit(_download_historical_date, spec, day, args, output_dir): day
-                for day in dates
-            }
-            for future in as_completed(futures):
-                day = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = HistoricalDateResult(day=day, url="", frame=pl.DataFrame(), error=str(exc))
-                completed[day] = result
-                progress_iter.update(1)
-                while next_idx < len(dates) and dates[next_idx] in completed:
-                    consume(completed.pop(dates[next_idx]))
-                    next_idx += 1
-        flush_frames(final=True)
-    finally:
-        progress_iter.close()
+        try:
+            with ThreadPoolExecutor(max_workers=date_workers) as executor:
+                futures = {
+                    executor.submit(_download_historical_date, spec, day, args, output_dir): day
+                    for day in dates
+                }
+                for future in as_completed(futures):
+                    day = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = HistoricalDateResult(
+                            day=day,
+                            url="",
+                            frame=pl.DataFrame(),
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    completed[day] = result
+                    progress_iter.update(1)
+                    while next_idx < len(dates) and dates[next_idx] in completed:
+                        consume(completed.pop(dates[next_idx]))
+                        next_idx += 1
+            flush_frames(final=True)
+        finally:
+            progress_iter.close()
 
-    if not wrote_any:
-        status = "failed" if last_error is not None and fetched_dates == 0 else "no_new_rows"
-        return DownloadResult(
-            spec.name,
-            status,
-            rows,
-            str(parquet_path) if parquet_path.exists() else None,
-            message=last_error,
-            raw_path=raw_path,
-            fetched_dates=fetched_dates,
-            skipped_dates=skipped_dates,
+        if plan.replace_output and not errors and wrote_any:
+            os.replace(working_path, parquet_path)
+            replacement_promoted = True
+            rows = _read_existing_row_count(parquet_path)
+        elif not plan.replace_output:
+            replacement_promoted = True
+
+        coverage_complete, missing_after = _finish_historical_coverage_state(
+            spec,
+            args,
+            output_dir,
+            plan,
+            data_dates=data_dates,
+            empty_dates=empty_dates,
+            errors=errors,
+            replacement_promoted=replacement_promoted,
         )
+    finally:
+        if plan.replace_output:
+            working_path.unlink(missing_ok=True)
+
+    if errors:
+        examples = "; ".join(
+            f"{day.isoformat()}={message}" for day, message in sorted(errors.items())[:5]
+        )
+        status = "failed"
+        message = f"{len(errors)} date request(s) failed: {examples}"
+    elif not coverage_complete:
+        status = "incomplete"
+        message = f"{missing_after} weekday date(s) remain unchecked"
+    elif fetched_dates or empty_dates:
+        status = "ok"
+        message = None
+    else:
+        status = "up_to_date"
+        message = None
 
     return DownloadResult(
         spec.name,
-        "ok",
+        status,
         rows,
-        str(parquet_path),
+        str(parquet_path) if parquet_path.exists() else None,
+        message=message,
         raw_path=raw_path,
+        requested_dates=len(dates),
         fetched_dates=fetched_dates,
-        skipped_dates=skipped_dates,
+        skipped_dates=len(empty_dates) + len(errors),
+        empty_dates=len(empty_dates),
+        failed_dates=len(errors),
+        missing_dates_before=len(plan.missing_before),
+        missing_dates_after=missing_after,
+        coverage_complete=coverage_complete,
     )
 
 
@@ -1464,7 +1954,11 @@ def _download_snapshot_url(spec: DatasetSpec, args: argparse.Namespace, output_d
         return DownloadResult(spec.name, "empty", 0, None, raw_path=str(raw_path) if raw_path else None)
     frame = _append_common_columns(frame, spec, fetched_at=fetched_at, url=spec.url, as_of_date=date.today().isoformat())
     parquet_path = output_dir / f"{spec.name}.parquet"
-    rows = _write_parquet_merged(parquet_path, frame, refresh=bool(args.refresh))
+    rows = _write_parquet_merged(
+        parquet_path,
+        frame,
+        refresh=bool(args.refresh) or _canonical_mode(args.mode) == "rebuild",
+    )
     return DownloadResult(spec.name, "ok", rows, str(parquet_path), raw_path=str(raw_path) if raw_path else None)
 
 
@@ -1534,7 +2028,7 @@ def _download_delisted_history(
     configured_start = _parse_date(spec.start_date or "2000-01-01")
     start = configured_start if args.start_date == "earliest" else max(configured_start, _parse_date(args.start_date))
     end = _parse_date(resolve_end_date(args.end_date))
-    if args.mode == "daily-update" and not args.refresh:
+    if _canonical_mode(args.mode) == "daily" and not args.refresh:
         latest = _latest_existing_date(parquet_path)
         if latest is not None:
             start = max(configured_start, latest - timedelta(days=31))
@@ -1582,7 +2076,11 @@ def _download_delisted_history(
             raw_path=str(raw_path) if raw_path else None,
         )
     incoming = pl.concat(frames, how="diagonal_relaxed")
-    rows = _write_parquet_merged(parquet_path, incoming, refresh=bool(args.refresh))
+    rows = _write_parquet_merged(
+        parquet_path,
+        incoming,
+        refresh=bool(args.refresh) or _canonical_mode(args.mode) == "rebuild",
+    )
     return DownloadResult(
         spec.name,
         "ok",
@@ -1623,7 +2121,13 @@ def _download_data_gov(spec: DatasetSpec, args: argparse.Namespace, output_dir: 
     metadata = metadata_response.json().get("result", {})
     distributions = metadata.get("distribution") or []
     if not isinstance(distributions, list) or not distributions:
-        return DownloadResult(spec.name, "no_distribution", 0, None, message=f"dataset_id={spec.data_gov_id}")
+        return DownloadResult(
+            spec.name,
+            "failed",
+            0,
+            None,
+            message=f"data.gov.tw dataset has no downloadable distribution: {spec.data_gov_id}",
+        )
 
     frames: list[pl.DataFrame] = []
     raw_path: Path | None = None
@@ -1676,10 +2180,23 @@ def _download_data_gov(spec: DatasetSpec, args: argparse.Namespace, output_dir: 
     if not frames:
         return DownloadResult(
             spec.name,
-            "empty",
-            0,
-            None,
+            "failed" if messages else "empty",
+            _read_existing_row_count(output_dir / f"{spec.name}.parquet"),
+            str(output_dir / f"{spec.name}.parquet")
+            if (output_dir / f"{spec.name}.parquet").exists()
+            else None,
             message="; ".join(messages) if messages else None,
+            raw_path=str(raw_path) if raw_path else None,
+        )
+
+    if messages:
+        parquet_path = output_dir / f"{spec.name}.parquet"
+        return DownloadResult(
+            spec.name,
+            "failed",
+            _read_existing_row_count(parquet_path),
+            str(parquet_path) if parquet_path.exists() else None,
+            message="; ".join(messages),
             raw_path=str(raw_path) if raw_path else None,
         )
 
@@ -1742,6 +2259,12 @@ def _print_dataset_list(specs: list[DatasetSpec]) -> None:
 def main() -> None:
     global _RATE_LIMITER
     args = parse_args()
+    requested_mode = args.mode
+    args.mode = _canonical_mode(args.mode)
+    if args.daily_overlap_days < 1:
+        raise ValueError("--daily-overlap-days must be >= 1")
+    if args.empty_recheck_days < 0:
+        raise ValueError("--empty-recheck-days must be >= 0")
     request_interval = resolve_request_interval("tw_public", args.request_interval)
     _RATE_LIMITER = SharedRateLimiter(request_interval, name="tw_public")
     print(f"[tw-public] {describe_rate_limit('tw_public', request_interval)}", flush=True)
@@ -1765,22 +2288,46 @@ def main() -> None:
     results.sort(key=lambda row: row.dataset)
     _write_csv_report(output_dir / "download_report.csv", results)
 
+    failed_statuses = {"failed", "incomplete", "unsupported"}
+    historical_names = {
+        spec.name for spec in specs if spec.kind == "historical_json_table"
+    }
+    historical_results = [row for row in results if row.dataset in historical_names]
     summary = {
+        "schema_version": 2,
         "generated_at_utc": _now_utc(),
         "mode": args.mode,
+        "requested_mode": requested_mode,
+        "start_date": args.start_date,
+        "end_date": resolve_end_date(args.end_date),
         "output_dir": str(output_dir),
         "dataset_count": len(results),
         "ok_count": sum(row.status == "ok" for row in results),
-        "failed_count": sum(row.status == "failed" for row in results),
+        "up_to_date_count": sum(row.status == "up_to_date" for row in results),
+        "failed_count": sum(row.status in failed_statuses for row in results),
+        "incomplete_count": sum(row.status == "incomplete" for row in results),
         "empty_count": sum(row.status in {"empty", "no_new_rows", "no_distribution"} for row in results),
+        "historical_dataset_count": len(historical_results),
+        "coverage_complete": (
+            all(row.coverage_complete is True for row in historical_results)
+            if historical_results
+            else None
+        ),
+        "requested_dates": sum(row.requested_dates for row in results),
+        "fetched_dates": sum(row.fetched_dates for row in results),
+        "confirmed_empty_dates": sum(row.empty_dates for row in results),
+        "failed_dates": sum(row.failed_dates for row in results),
+        "missing_dates_after": sum(row.missing_dates_after for row in results),
         "rows_total": sum(row.rows for row in results),
     }
     _write_json(output_dir / "download_summary.json", summary)
     print(f"[tw-public] download_report.csv -> {output_dir / 'download_report.csv'}")
     print(f"[tw-public] download_summary.json -> {output_dir / 'download_summary.json'}")
     print(
-        f"[tw-public] ok={summary['ok_count']} failed={summary['failed_count']} "
-        f"empty={summary['empty_count']} rows={summary['rows_total']}"
+        f"[tw-public] mode={args.mode} ok={summary['ok_count']} "
+        f"up_to_date={summary['up_to_date_count']} failed={summary['failed_count']} "
+        f"empty={summary['empty_count']} coverage_complete={summary['coverage_complete']} "
+        f"rows={summary['rows_total']}"
     )
 
     if summary["failed_count"]:

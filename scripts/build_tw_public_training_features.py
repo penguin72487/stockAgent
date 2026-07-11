@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--symbols-root",
-        default="data_yahoo/tw_stocks",
+        default="data_tw_public/stocks",
         help="Optional *_features.parquet directory used to keep only trainable TW symbols.",
     )
     parser.add_argument("--market-symbol", default=DEFAULT_MARKET_SYMBOL, help="Synthetic symbol for market-wide rows.")
