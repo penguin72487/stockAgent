@@ -4,12 +4,13 @@ runner:
   output_dir: artifacts/markets/tw_parallel_epyc7662_dual5090
   mode: train
   resume: true
-  post_train_infer: false
-  start_fold: 23
+  post_train_infer: true
+  start_fold: 1
 environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
+  cudnn_benchmark: false
   # AMD EPYC 7662: 64 physical cores / usually 128 logical threads with SMT.
   cpu_threads: 128
   torch_compile_threads: 128
@@ -286,8 +287,8 @@ training:
   lookback: 32
   # DDP treats this as the effective global batch and divides it across ranks;
   # with world_size=2 the current local batch is 16.
-  batch_size_train: 32
-  batch_size_eval: 32
+  batch_size_train: 128
+  batch_size_eval: 128
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -512,7 +513,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: full_then_last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
