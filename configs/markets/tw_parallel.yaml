@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: true
-  start_fold: 1
+  start_fold: 23
 environment:
   device: cuda
   use_tensor_cores: true
