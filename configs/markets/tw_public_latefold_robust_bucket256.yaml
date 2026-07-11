@@ -1,0 +1,12 @@
+base_config: tw_public_latefold_robust.yaml
+
+experiment_name: tw-stock-transformer-market-public-data-latefold-robust-bucket256
+
+runner:
+  output_dir: artifacts/diagnostics/tw_public_latefold_robust_bucket256
+
+training:
+  # Late folds have 2.1k-2.3k active symbols. Padding masked symbols to a
+  # shared 2304-token shape lets TorchInductor reuse one compiled train graph
+  # across folds while leaving the model and all executable outputs unchanged.
+  train_symbol_compaction_bucket_size: 256

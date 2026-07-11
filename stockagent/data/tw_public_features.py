@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -176,6 +178,44 @@ class TwPublicFeatureBuildResult:
     market_rows: int
     market_symbol: str
     source_files: list[str]
+    source_receipts: list[dict[str, str | int]]
+    output_receipt: dict[str, str | int]
+    symbol_universe_receipt: dict[str, str | int | bool]
+
+
+def _file_content_receipt(path: Path) -> dict[str, str | int]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "name": path.name,
+        "size": int(path.stat().st_size),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _source_content_receipts(input_dir: Path) -> list[dict[str, str | int]]:
+    return [
+        _file_content_receipt(path)
+        for path in sorted(input_dir.glob("*.parquet"))
+    ]
+
+
+def _symbol_universe_receipt(symbols_root: str | Path | None) -> dict[str, str | int | bool]:
+    if symbols_root is None or str(symbols_root).strip() == "":
+        names: list[str] = []
+        available = False
+    else:
+        root = Path(symbols_root)
+        available = root.exists()
+        names = sorted(path.name for path in root.glob("*_features.parquet")) if available else []
+    payload = "\n".join(names).encode("utf-8")
+    return {
+        "available": available,
+        "file_count": len(names),
+        "names_sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def build_tw_public_training_features(
@@ -188,6 +228,8 @@ def build_tw_public_training_features(
 ) -> TwPublicFeatureBuildResult:
     input_dir = Path(input_dir)
     output_path = Path(output_path)
+    source_receipts = _source_content_receipts(input_dir)
+    symbol_universe_receipt = _symbol_universe_receipt(symbols_root)
     symbols = _load_symbol_filter(symbols_root)
     stock_frames = [
         _build_official_ohlcv_features(input_dir),
@@ -240,7 +282,15 @@ def build_tw_public_training_features(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output.write_parquet(output_path, compression="snappy", statistics=True)
+    temporary_output = output_path.with_suffix(output_path.suffix + ".tmp")
+    output.write_parquet(temporary_output, compression="snappy", statistics=True)
+    if source_receipts != _source_content_receipts(input_dir):
+        temporary_output.unlink(missing_ok=True)
+        raise RuntimeError("TW public source parquet changed while features were being built")
+    if symbol_universe_receipt != _symbol_universe_receipt(symbols_root):
+        temporary_output.unlink(missing_ok=True)
+        raise RuntimeError("TW symbol universe changed while public features were being built")
+    os.replace(temporary_output, output_path)
 
     source_files = sorted(str(path) for path in input_dir.glob("*.parquet"))
     result = TwPublicFeatureBuildResult(
@@ -251,6 +301,9 @@ def build_tw_public_training_features(
         market_rows=int(output.filter(pl.col("symbol") == market_symbol).height) if not output.is_empty() else 0,
         market_symbol=market_symbol,
         source_files=source_files,
+        source_receipts=source_receipts,
+        output_receipt=_file_content_receipt(output_path),
+        symbol_universe_receipt=symbol_universe_receipt,
     )
     _write_summary(summary_path or output_path.with_suffix(".summary.json"), result)
     return result
@@ -266,6 +319,9 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "stock_rows": result.stock_rows,
         "market_rows": result.market_rows,
         "source_files": result.source_files,
+        "source_receipts": result.source_receipts,
+        "output_receipt": result.output_receipt,
+        "symbol_universe_receipt": result.symbol_universe_receipt,
         "feature_columns": list(FEATURE_COLUMNS),
         "rule_columns": list(RULE_COLUMNS),
         "market_symbol": result.market_symbol,

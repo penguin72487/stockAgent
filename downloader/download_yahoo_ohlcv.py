@@ -878,6 +878,7 @@ def _write_feature_parquet_atomic(
     *,
     asset_class: str,
     requested_end_date: str,
+    source: str = "yahoo",
 ) -> tuple[str | None, str | None]:
     frame = _canonicalize_feature_frame(frame, keep_zero_volume=asset_class != "forex")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -896,7 +897,7 @@ def _write_feature_parquet_atomic(
             metadata = dict(table.schema.metadata or {})
             metadata.update(
                 {
-                    PARQUET_META_SOURCE_KEY: b"yahoo",
+                    PARQUET_META_SOURCE_KEY: str(source).encode("utf-8"),
                     PARQUET_META_ASSET_CLASS_KEY: asset_class.encode("utf-8"),
                     PARQUET_META_REQUESTED_END_KEY: requested_end_date.encode("utf-8"),
                     PARQUET_META_CHECKED_THROUGH_KEY: requested_end_date.encode("utf-8"),

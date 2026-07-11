@@ -40,6 +40,8 @@ USER_AGENT = (
 DATE_COLUMN = "date"
 ROC_DATE_PATTERN = re.compile(r"^\d{2,3}/\d{1,2}/\d{1,2}$")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+HTML_ROW_START_PATTERN = re.compile(r"<tr\b[^>]*>", re.IGNORECASE)
+HTML_CELL_START_PATTERN = re.compile(r"<td\b[^>]*>", re.IGNORECASE)
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _HTTP_LOCAL = threading.local()
 _RATE_LIMITER: SharedRateLimiter | None = None
@@ -174,7 +176,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
             "?date={date}&type=EW&response=json"
         ),
         date_format="%Y/%m/%d",
-        start_date="2007-01-01",
+        start_date="2003-08-01",
     ),
     DatasetSpec(
         name="tpex_margin_balance",
@@ -875,6 +877,90 @@ def _parse_json_table_payload(payload: Any, spec: DatasetSpec, request_date: dat
     return _frame_from_records(records)
 
 
+def _parse_tpex_daily_quotes_html(raw_html: str, request_date: date) -> pl.DataFrame:
+    records: list[dict[str, str]] = []
+    for raw_row in HTML_ROW_START_PATTERN.split(raw_html)[1:]:
+        raw_row = raw_row.split("</tr>", 1)[0]
+        cells = [
+            _strip_html(value)
+            for value in HTML_CELL_START_PATTERN.split(raw_row)[1:]
+        ]
+        if len(cells) >= 27 and re.fullmatch(r"[0-9A-Z]{4,6}", cells[1].upper()):
+            code, name = cells[1], cells[3]
+            close, change, open_price, high, low, volume = (
+                cells[5],
+                cells[7],
+                cells[9],
+                cells[11],
+                cells[13],
+                cells[17],
+            )
+        elif len(cells) >= 19:
+            code, name = cells[0], cells[1]
+            direction = cells[4]
+            magnitude = cells[5]
+            if direction in {"▽", "-"}:
+                change = f"-{magnitude}"
+            elif direction in {"△", "+"}:
+                change = f"+{magnitude}"
+            else:
+                change = magnitude
+            close, open_price, high, low, volume = (
+                cells[3],
+                cells[6],
+                cells[7],
+                cells[8],
+                cells[10],
+            )
+        elif len(cells) >= 17:
+            code, name = cells[0], cells[1]
+            close, change, open_price, high, low, volume = (
+                cells[2],
+                cells[3],
+                cells[4],
+                cells[5],
+                cells[6],
+                cells[8],
+            )
+        else:
+            continue
+        if re.fullmatch(r"[0-9A-Z]{4,6}", code.upper()) is None:
+            continue
+        records.append(
+            {
+                DATE_COLUMN: request_date.isoformat(),
+                "代號": code.upper(),
+                "名稱": name,
+                "收盤": close,
+                "漲跌": change,
+                "開盤": open_price,
+                "最高": high,
+                "最低": low,
+                "成交股數": volume,
+                "_table_title": "上櫃股票每日收盤行情",
+            }
+        )
+    return _frame_from_records(records)
+
+
+def _tpex_historical_request(day: date, spec: DatasetSpec) -> tuple[str, str]:
+    if day < date(2007, 1, 1):
+        roc_date = f"{day.year - 1911}{day:%m%d}"
+        return (
+            "https://hist.tpex.org.tw/Hist/STOCK/AFTERTRADING/DAILY_CLOSE_QUOTES/"
+            f"RSTA3104_{roc_date}.HTML",
+            "archive_html",
+        )
+    if day < date(2007, 7, 2):
+        return (
+            "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotesHis"
+            f"?date={day:%Y/%m/%d}&response=json",
+            "legacy_json_html",
+        )
+    assert spec.url_template is not None
+    return spec.url_template.format(date=_format_date(day, spec.date_format)), "json"
+
+
 def _table_matches(table_mode: str, title: str) -> bool:
     if not table_mode or table_mode == "all":
         return True
@@ -1189,7 +1275,11 @@ def _download_historical_date(
     output_dir: Path,
 ) -> HistoricalDateResult:
     assert spec.url_template is not None
-    url = spec.url_template.format(date=_format_date(day, spec.date_format))
+    if spec.name == "tpex_daily_ohlcv":
+        url, response_kind = _tpex_historical_request(day, spec)
+    else:
+        url = spec.url_template.format(date=_format_date(day, spec.date_format))
+        response_kind = "json"
     try:
         response = _http_get(
             url,
@@ -1198,15 +1288,24 @@ def _download_historical_date(
             retries=int(args.retries),
             retry_backoff=float(args.retry_backoff),
         )
-        payload = response.json()
-        frame = _parse_json_table_payload(payload, spec, day)
+        if response_kind == "archive_html":
+            decoded, _ = _decode_bytes(response.content)
+            frame = _parse_tpex_daily_quotes_html(decoded, day)
+            raw_suffix = ".html"
+        else:
+            payload = response.json()
+            if response_kind == "legacy_json_html":
+                frame = _parse_tpex_daily_quotes_html(str(payload.get("html", "")), day)
+            else:
+                frame = _parse_json_table_payload(payload, spec, day)
+            raw_suffix = ".json"
         raw_path: Path | None = None
         if not frame.is_empty() and not args.skip_raw:
             raw_path = _write_raw(
                 response.content,
                 output_dir / "raw" / spec.name,
                 spec.name,
-                ".json",
+                raw_suffix,
                 stem=day.isoformat(),
             )
         return HistoricalDateResult(

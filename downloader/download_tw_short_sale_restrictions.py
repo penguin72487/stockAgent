@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data.tw_delisting_rules import (
+    _company_name_keys,
     classify_delisting_notice,
     extract_announcement_symbols,
     extract_stock_symbols,
@@ -53,6 +54,7 @@ class _AnnouncementDownloadBatch:
     records: list[dict] = field(default_factory=list)
     filtered_irrelevant: int = 0
     unparseable: int = 0
+    unresolved_records: list[dict] = field(default_factory=list)
     detail_failure_urls: list[str] = field(default_factory=list)
     retry_count: int = 0
 
@@ -87,8 +89,115 @@ def _coerce_announcement_batch(
     return _AnnouncementDownloadBatch(
         records=records,
         unparseable=unparseable,
+        unresolved_records=[
+            record
+            for record in value
+            if not split_announcement_symbols(str(record.get("symbols", "") or ""))
+        ],
         detail_failure_urls=detail_failure_urls,
     )
+
+
+CompanySymbolLookup = dict[tuple[str, str], set[str]]
+
+
+def _canonical_company_alias(value: str) -> str:
+    alias = str(value or "")
+    if "公告有關" in alias:
+        alias = alias.rsplit("公告有關", 1)[-1]
+    alias = re.sub(r"^主旨", "", alias)
+    alias = re.sub(r"^(?:以下簡稱|下稱)", "", alias)
+    return alias
+
+
+def _add_company_symbol_aliases(
+    lookup: CompanySymbolLookup,
+    *,
+    market: str,
+    text: str,
+    symbols: list[str],
+) -> None:
+    normalized_market = str(market).strip().lower()
+    normalized_symbols = {
+        symbol.upper()
+        for symbol in symbols
+        if re.fullmatch(r"[0-9]{4,6}[A-Z]?", str(symbol).upper())
+    }
+    if not normalized_market or not normalized_symbols:
+        return
+    for raw_alias in _company_name_keys(str(text or "")):
+        alias = _canonical_company_alias(raw_alias)
+        if len(alias) >= 2:
+            lookup.setdefault((normalized_market, alias), set()).update(normalized_symbols)
+
+
+def _load_company_symbol_lookup(output_dir: Path) -> CompanySymbolLookup:
+    lookup: CompanySymbolLookup = {}
+    for market in ("twse", "tpex"):
+        path = output_dir / f"{market}_delisted_company.parquet"
+        if not path.exists():
+            continue
+        frame = pl.read_parquet(path)
+        if not {"symbol", "company_name"} <= set(frame.columns):
+            continue
+        for row in frame.select(["symbol", "company_name"]).iter_rows(named=True):
+            _add_company_symbol_aliases(
+                lookup,
+                market=market,
+                text=str(row.get("company_name", "") or ""),
+                symbols=[str(row.get("symbol", "") or "")],
+            )
+    existing_path = output_dir / "tw_delisting_short_sale_announcements.parquet"
+    if existing_path.exists():
+        existing = pl.read_parquet(existing_path)
+        required = {"market", "symbols", "subject"}
+        if required <= set(existing.columns):
+            for row in existing.select(sorted(required)).iter_rows(named=True):
+                _add_company_symbol_aliases(
+                    lookup,
+                    market=str(row.get("market", "") or ""),
+                    text=str(row.get("subject", "") or ""),
+                    symbols=split_announcement_symbols(str(row.get("symbols", "") or "")),
+                )
+    return lookup
+
+
+def _resolve_unparsed_announcement(
+    record: dict,
+    lookup: CompanySymbolLookup,
+) -> str:
+    market = str(record.get("market", "") or "").strip().lower()
+    subject = str(record.get("subject", "") or "")
+    if "到期日" in subject and "最後交易日" in subject:
+        return "non_equity"
+    aliases = [
+        _canonical_company_alias(alias)
+        for alias in _company_name_keys(subject)
+    ]
+    scores: dict[str, int] = {}
+    for alias in aliases:
+        for (candidate_market, known_alias), symbols in lookup.items():
+            if candidate_market != market:
+                continue
+            if alias == known_alias:
+                score = 2
+            elif len(alias) >= 2 and len(known_alias) >= 2 and (
+                alias in known_alias or known_alias in alias
+            ):
+                score = 1
+            else:
+                continue
+            for symbol in symbols:
+                scores[symbol] = max(score, scores.get(symbol, 0))
+    best_symbols: set[str] = set()
+    if scores:
+        best_score = max(scores.values())
+        best_symbols = {symbol for symbol, score in scores.items() if score == best_score}
+    if len(best_symbols) == 1:
+        symbol = next(iter(best_symbols))
+        record["symbols"] = symbol
+        return "resolved"
+    return "unparseable"
 
 
 def _roc_date(text: str, *, default_year: int | None = None) -> str | None:
@@ -454,6 +563,7 @@ def _download_tpex_month(
         )
         if not split_announcement_symbols(record["symbols"]):
             batch.unparseable += 1
+            batch.unresolved_records.append(record)
             continue
         batch.records.append(record)
     return batch
@@ -569,6 +679,7 @@ def _download_twse_current_month(
         )
         if not split_announcement_symbols(record["symbols"]):
             batch.unparseable += 1
+            batch.unresolved_records.append(record)
             continue
         batch.records.append(record)
     return batch
@@ -646,6 +757,7 @@ def _download_twse_legacy_month(
         )
         if not split_announcement_symbols(record["symbols"]):
             batch.unparseable += 1
+            batch.unresolved_records.append(record)
             continue
         batch.records.append(record)
     return batch
@@ -727,6 +839,7 @@ def _download_twse_keyword(timeout: int) -> _AnnouncementDownloadBatch:
         )
         if not split_announcement_symbols(record["symbols"]):
             batch.unparseable += 1
+            batch.unresolved_records.append(record)
             continue
         batch.records.append(record)
     return batch
@@ -811,6 +924,7 @@ def _download_announcement_archive(
     timeout: int,
     retries: int = 4,
     retry_backoff: float = 0.75,
+    company_symbol_lookup: CompanySymbolLookup | None = None,
 ) -> tuple[list[dict], list[str], list[dict[str, object]]]:
     today = date.today()
     months = [
@@ -822,6 +936,7 @@ def _download_announcement_archive(
     records: list[dict] = []
     failures: list[str] = []
     completeness: list[dict[str, object]] = []
+    unresolved: list[tuple[dict, dict[str, object]]] = []
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
         tasks = {}
         for year, month in months:
@@ -937,23 +1052,47 @@ def _download_announcement_archive(
             detail_failure_urls = batch.detail_failure_urls
             for url in detail_failure_urls:
                 failures.append(f"{label}: detail fetch failed: {url}")
-            completeness.append(
-                {
-                    **task_info,
-                    "status": "partial" if detail_failure_urls else "ok",
-                    "records": len(batch.records),
-                    "raw_rows": (
-                        len(batch.records)
-                        + batch.filtered_irrelevant
-                        + batch.unparseable
-                    ),
-                    "filtered_irrelevant": batch.filtered_irrelevant,
-                    "unparseable": batch.unparseable,
-                    "detail_failures": len(detail_failure_urls),
-                    "detail_failure_urls": detail_failure_urls,
-                    "retries": int(batch.retry_count),
-                }
+            entry: dict[str, object] = {
+                **task_info,
+                "status": "partial" if detail_failure_urls else "ok",
+                "records": len(batch.records),
+                "raw_rows": (
+                    len(batch.records)
+                    + batch.filtered_irrelevant
+                    + batch.unparseable
+                ),
+                "filtered_irrelevant": batch.filtered_irrelevant,
+                "unparseable": batch.unparseable,
+                "detail_failures": len(detail_failure_urls),
+                "detail_failure_urls": detail_failure_urls,
+                "retries": int(batch.retry_count),
+            }
+            completeness.append(entry)
+            unresolved.extend((record, entry) for record in batch.unresolved_records)
+
+    lookup = company_symbol_lookup if company_symbol_lookup is not None else {}
+    for record in records:
+        _add_company_symbol_aliases(
+            lookup,
+            market=str(record.get("market", "") or ""),
+            text=str(record.get("subject", "") or ""),
+            symbols=split_announcement_symbols(str(record.get("symbols", "") or "")),
+        )
+    for record, entry in unresolved:
+        resolution = _resolve_unparsed_announcement(record, lookup)
+        if resolution == "resolved":
+            records.append(record)
+            entry["records"] = int(entry.get("records", 0) or 0) + 1
+            entry["unparseable"] = int(entry.get("unparseable", 0) or 0) - 1
+            _add_company_symbol_aliases(
+                lookup,
+                market=str(record.get("market", "") or ""),
+                text=str(record.get("subject", "") or ""),
+                symbols=split_announcement_symbols(str(record.get("symbols", "") or "")),
             )
+        elif resolution == "non_equity":
+            entry["filtered_irrelevant"] = int(entry.get("filtered_irrelevant", 0) or 0) + 1
+            entry["unparseable"] = int(entry.get("unparseable", 0) or 0) - 1
     completeness.sort(
         key=lambda item: (
             str(item.get("market", "")),
@@ -1287,6 +1426,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.end_year < args.start_year:
         parser.error("--end-year must be greater than or equal to --start-year")
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     records, failures, completeness = _download_announcement_archive(
         start_year=args.start_year,
         end_year=args.end_year,
@@ -1294,6 +1435,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.timeout,
         retries=max(0, int(args.retries)),
         retry_backoff=max(0.0, float(args.retry_backoff)),
+        company_symbol_lookup=_load_company_symbol_lookup(output_dir),
     )
     try:
         terms = _download_archive_task(
@@ -1338,8 +1480,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         terms = pl.DataFrame()
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     announcement_path = output_dir / "tw_delisting_short_sale_announcements.parquet"
 
     if failures:

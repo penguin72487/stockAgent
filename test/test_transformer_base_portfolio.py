@@ -432,6 +432,45 @@ def test_symbol_indices_preserve_full_universe_symbol_positions() -> None:
     assert torch.allclose(slab_full, slab_compact, atol=1e-5, rtol=1e-5)
 
 
+def test_fixed_symbol_position_capacity_preserves_parameter_count_for_larger_universe() -> None:
+    baseline = _make_model(num_symbols=13, symbol_position_capacity=13).cpu()
+    expanded = _make_model(num_symbols=19, symbol_position_capacity=13).cpu()
+
+    assert baseline.symbol_position.shape == (1, 1, 13, baseline.d_model)
+    assert expanded.symbol_position.shape == baseline.symbol_position.shape
+    assert sum(parameter.numel() for parameter in expanded.parameters()) == sum(
+        parameter.numel() for parameter in baseline.parameters()
+    )
+    expanded.load_state_dict(baseline.state_dict(), strict=True)
+
+    positions = expanded._symbol_position(
+        4,
+        torch.tensor([0, 12, 13, 18], dtype=torch.long),
+    )
+    assert torch.equal(positions[:, :, :2], expanded.symbol_position[:, :, [0, 12]])
+    assert torch.count_nonzero(positions[:, :, 2:]).item() == 0
+
+
+def test_fixed_symbol_position_capacity_supports_full_runtime_universe() -> None:
+    device = _device()
+    model = _make_model(
+        num_symbols=19,
+        symbol_position_capacity=13,
+        attention_mode="market_token",
+        allow_dynamic_symbols=False,
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    x = torch.randn(2, model.lookback, model.num_symbols, model.num_features, device=device)
+    mask = torch.ones(2, model.num_symbols, dtype=torch.bool, device=device)
+
+    with torch.no_grad():
+        weights = model(x, mask)
+
+    assert weights.shape == (2, model.num_symbols)
+    assert torch.isfinite(weights).all()
+
+
 def test_train_union_bucket_padding_preserves_output_loss_grad_and_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -640,6 +679,57 @@ def test_amp_native_position_add_keeps_bfloat16_residual() -> None:
         embedded = model._embed_inputs(x)
 
     assert embedded.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA BF16 cache equivalence")
+def test_bfloat16_feature_cache_path_matches_amp_output_and_gradients() -> None:
+    reference = _make_model(
+        attention_mode="market_token",
+        temporal_pooling="last",
+        temporal_query_mode="last_only",
+        temporal_layers=2,
+        sanitize_inputs=True,
+        amp_native_position_add=False,
+        return_aux=False,
+        return_aux_details=False,
+    ).train()
+    optimized = copy.deepcopy(reference)
+    optimized.sanitize_inputs = False
+    optimized.amp_native_position_add = False
+
+    feature_slab = torch.randn(9, 13, 11, device="cuda", dtype=torch.float32)
+    mask = torch.ones(4, 13, device="cuda", dtype=torch.bool)
+    mask[1, 11:] = False
+    upstream = torch.randn(4, 13, device="cuda", dtype=torch.float32)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        reference_output = reference.forward_from_panel_slab(feature_slab, mask, return_aux=False)
+        optimized_output = optimized.forward_from_panel_slab(
+            feature_slab.to(dtype=torch.bfloat16),
+            mask,
+            return_aux=False,
+        )
+    (reference_output.float() * upstream).sum().backward()
+    (optimized_output.float() * upstream).sum().backward()
+
+    torch.testing.assert_close(optimized_output.float(), reference_output.float(), atol=1e-6, rtol=1e-6)
+    reference_parameters = dict(reference.named_parameters())
+    optimized_parameters = dict(optimized.named_parameters())
+    assert reference_parameters.keys() == optimized_parameters.keys()
+    assert sum(parameter.numel() for parameter in reference_parameters.values()) == sum(
+        parameter.numel() for parameter in optimized_parameters.values()
+    )
+    for name, reference_parameter in reference_parameters.items():
+        optimized_parameter = optimized_parameters[name]
+        assert (reference_parameter.grad is None) == (optimized_parameter.grad is None), name
+        if reference_parameter.grad is not None:
+            torch.testing.assert_close(
+                optimized_parameter.grad,
+                reference_parameter.grad,
+                atol=1e-6,
+                rtol=1e-6,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
 
 
 def test_compiled_cross_attention_workaround_is_blackwell_only(monkeypatch: pytest.MonkeyPatch) -> None:

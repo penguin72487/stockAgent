@@ -59,6 +59,46 @@ def test_announcement_parser_handles_historical_symbol_labels_and_exact_cover_de
     assert record["short_cover_deadline"] == "2009-10-16"
 
 
+def test_unparsed_company_notice_resolves_only_from_unique_same_market_alias() -> None:
+    lookup: downloader.CompanySymbolLookup = {}
+    downloader._add_company_symbol_aliases(
+        lookup,
+        market="tpex",
+        text="光洋應用材料科技股份有限公司（股票代號：1785）",
+        symbols=["1785"],
+    )
+    record = _announcement_record(
+        market="tpex",
+        issued_date="2016-05-13",
+        number="correction",
+        subject=(
+            "本中心105年5月13日證櫃監字第10502004811號公告有關"
+            "光洋應用材料科技股份有限公司停止買賣公告更正"
+        ),
+        body="刪除惟了結交易不在此限文字",
+        url="https://example.test/correction",
+    )
+    assert record["symbols"] == ""
+    assert downloader._resolve_unparsed_announcement(record, lookup) == "resolved"
+    assert record["symbols"] == "1785"
+
+    lookup[("tpex", "光洋應用材料科技")] = {"1785", "9999"}
+    record["symbols"] = ""
+    assert downloader._resolve_unparsed_announcement(record, lookup) == "unparseable"
+
+
+def test_symbol_less_expiry_correction_is_classified_non_equity() -> None:
+    record = _announcement_record(
+        market="twse",
+        issued_date="2020-04-16",
+        number="warrant-correction",
+        subject="更正本公司原到期日、最後交易日及終止上市日，請查照。",
+        body="",
+        url="https://example.test/warrant-correction",
+    )
+    assert downloader._resolve_unparsed_announcement(record, {}) == "non_equity"
+
+
 def test_announcement_parser_extracts_short_sale_resume_date() -> None:
     record = _announcement_record(
         market="tpex",

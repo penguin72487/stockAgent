@@ -1,33 +1,34 @@
 experiment_name: tw-stock-transformer-market-public-data-all
 
 runner:
-  output_dir: artifacts/markets/tw_public_all
+  output_dir: artifacts/markets/tw_public_official_v1
   mode: train
   resume: true
-  post_train_infer: false
-  start_fold: 25
+  post_train_infer: true
+  start_fold: 23
 environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
 
 data:
-  parquet_root: data_yahoo/tw_stocks
+  # Canonical symbol files are built only from TWSE/TPEx official archives.
+  # Run scripts/rebuild_tw_public_data_layer.py before training.
+  parquet_root: data_tw_public/stocks
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
-  trading_volume_policy: auto
+  trading_volume_policy: required
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
   use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
-  # Manual feature switch.
-  # Default below keeps every current panel feature enabled.
-  # To disable one feature, add "#" before that feature line.
-  # Changing this list changes model input_dim; use a fresh output_dir or resume=false.
-  # Exact feature names and glob patterns are both supported.
+  # The 64-slot schema is retained for parameter-count/checkpoint-shape parity.
+  # Eleven audited OHLCV/K-bar inputs are live; 53 public-data slots below are
+  # explicitly zero-filled until complete point-in-time history is certified.
+  # Removing a slot changes input_dim and therefore changes parameter count.
   feature_include:
     # Base price log returns
     # - open_logret_1d
@@ -207,11 +208,42 @@ data:
   feature_exclude:
     # - twpub_company_*
     # - twpub_dividend_*
+  # Retain these input slots so model parameter count stays unchanged, but do
+  # not let late vendor/archive coverage become a calendar-regime shortcut.
+  # Remove a pattern only after that family has point-in-time history covering
+  # every training/validation period used by the walk-forward experiment.
+  feature_zero_fill:
+    # Valuation archives begin after the 2000 training start and current TWSE
+    # history is incomplete. Keep the slots until a complete PIT backfill exists.
+    - twpub_pe_log
+    - twpub_pb_log
+    - twpub_margin_*
+    - twpub_short_*
+    - twpub_foreign_*
+    - twpub_investment_trust_*
+    - twpub_dealer_*
+    - twpub_institutional_*
+    - twpub_monthly_revenue_*
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_*
+    - twpub_insider_*
+    - twpub_borrow_*
+    - twpub_sbl_*
+    - twpub_tdcc_*
+    - twpub_company_*
+    # DGBAS/MOF files are complete-looking single current vintages. A fixed
+    # release lag cannot reconstruct revisions that were knowable historically.
+    - twpub_dgbas_*
+    - twpub_mof_*
   # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
   val_years: 1
+  # Fold IDs are part of the experiment identity: fold23/24/25 mean validation
+  # years 2023/2024/2025 only when the panel begins in 2000 with no missing year.
+  expected_first_year: 2000
+  require_contiguous_years: true
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
 
@@ -262,8 +294,11 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size_train: 64
-  batch_size_eval: 64
+  # Fold23 RTX 5070 Ti benchmark: 32 reaches about 1.1k samples/s while
+  # retaining ample VRAM headroom; 64 adds only a small steady-state gain and
+  # materially increases cold compile time.
+  batch_size_train: 32
+  batch_size_eval: 4
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -324,7 +359,9 @@ training:
   save_best_val_artifacts: false
   postprocess_benchmark_after_fold: true
   postprocess_benchmark_after_best_val: true
-  postprocess_benchmark_split: test
+  # Hyperparameter selection belongs to validation. Test-only sweeps may be
+  # run as diagnostics, but must never choose deployment settings.
+  postprocess_benchmark_split: val
   postprocess_benchmark_activations: identity,softsign,tanh,isru,erf,atan,gd
   postprocess_benchmark_thresholds: 0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02
   postprocess_benchmark_rank_metric: cumulative_return
@@ -335,6 +372,9 @@ training:
   postprocess_benchmark_strict: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
+  # Feature projection already consumes BF16 under AMP. Caching the finite,
+  # non-categorical train panel in that dtype removes a redundant FP32 copy.
+  cache_train_features_in_amp_dtype: true
   learning_rate: 0.0003
   enable_lr_scheduler: true
   lr_scheduler: warmup_cosine
@@ -463,7 +503,19 @@ training:
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true
+    # Keep the trainable symbol-position table at the original fold23 universe
+    # size. Official TWSE/TPEx coverage may add symbols, but must not change the
+    # model's 120,802 trainable parameters; symbols beyond this capacity receive
+    # a neutral zero position vector instead of sharing the last learned slot.
+    symbol_position_capacity: 2330
     input_dropout: 0.0
+    # build_panel guarantees finite feature storage. Keep position addition in
+    # FP32 for numerical parity, and make the stable Blackwell attention
+    # backend explicit; these switches do not change model parameters.
+    sanitize_inputs: false
+    amp_native_position_add: false
+    temporal_self_attention_fast_path: false
+    compiled_cross_attention_backend: manual
     # Fold18 full-TW benchmark: 65535 is the largest stable SDPA chunk in the
     # current CUDA/PyTorch environment. 65536 and 131071 both failed in SDPA
     # forward with CUDA invalid argument, so this is a kernel shape boundary,
@@ -487,7 +539,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: full_then_last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
