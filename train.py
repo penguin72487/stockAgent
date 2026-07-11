@@ -246,15 +246,14 @@ def _configure_cpu_parallelism(
     )
 
 
-def _configure_cuda_runtime() -> None:
+def _configure_cuda_runtime(*, cudnn_benchmark: bool = True) -> None:
     normalize_cuda_env()
     if not torch.cuda.is_available():
         return
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # Keep convolution autotuner on for mostly-stable shapes.
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
     torch.backends.cudnn.deterministic = False
     for attr in (
         "allow_fp16_reduced_precision_reduction",
@@ -514,6 +513,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cudnn-benchmark",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override environment.cudnn_benchmark.",
+    )
+    parser.add_argument(
         "--multi-gpu-strategy",
         choices=("none", "distributed_data_parallel", "ddp"),
         default=None,
@@ -723,6 +728,12 @@ def parse_args() -> argparse.Namespace:
         help="Compile eval/test backtest scans. Model and loss compile are controlled separately.",
     )
     parser.add_argument(
+        "--backtest-autotune",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override training.backtest_autotune.",
+    )
+    parser.add_argument(
         "--backtest-compile",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -771,6 +782,8 @@ def main() -> None:
         config.training.seed = int(args.seed)
     if args.multi_gpu_strategy is not None:
         config.training.multi_gpu_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+    if args.cudnn_benchmark is not None:
+        config.environment.cudnn_benchmark = bool(args.cudnn_benchmark)
     if args.batch_size_train is not None:
         if args.batch_size_train < 1:
             raise ValueError(f"--batch-size-train must be >= 1, got {args.batch_size_train}")
@@ -873,13 +886,15 @@ def main() -> None:
     if args.eval_backtest_compile is not None:
         config.training.eval_backtest_compile = bool(args.eval_backtest_compile)
         os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(args.eval_backtest_compile) else "0"
+    if args.backtest_autotune is not None:
+        config.training.backtest_autotune = bool(args.backtest_autotune)
     if args.backtest_compile is not None:
         config.training.backtest_compile = bool(args.backtest_compile)
     if args.backtest_compile_stateful is not None:
         config.training.backtest_compile_stateful = bool(args.backtest_compile_stateful)
     if args.backtest_compile_dynamic is not None:
         config.training.backtest_compile_dynamic = bool(args.backtest_compile_dynamic)
-    _configure_cuda_runtime()
+    _configure_cuda_runtime(cudnn_benchmark=bool(config.environment.cudnn_benchmark))
     _maybe_init_distributed_for_panel(active_strategy, config)
     # DDP model parameters are synchronized by the DDP constructor later, but
     # rank-local dropout/augmentation streams must not be identical. Seed only

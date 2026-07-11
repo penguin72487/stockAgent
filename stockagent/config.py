@@ -260,6 +260,7 @@ class EnvironmentConfig:
     device: str
     use_tensor_cores: bool
     amp_dtype: str
+    cudnn_benchmark: bool = True
     cpu_threads: int | None = None
     torch_compile_threads: int | None = None
 
