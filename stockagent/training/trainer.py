@@ -16,6 +16,7 @@ import hashlib
 import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -163,6 +164,146 @@ def _raise_if_distributed_phase_failed(
     raise RuntimeError(message)
 
 
+def _run_rank0_store_synchronized_phase(
+    phase: str,
+    operation: Callable[[], None],
+    *,
+    timeout: timedelta | None = None,
+) -> None:
+    """Run long rank-0-only work without holding an NCCL collective open.
+
+    Object collectives inherit the process-group timeout, which is too short
+    for a multi-fold artifact inference migration.  A quick broadcast gives
+    every rank a fresh key, then nonzero ranks wait on the process store while
+    rank 0 performs the work.  The final status is therefore propagated
+    without keeping a CUDA collective pending for the duration of inference.
+    """
+    if timeout is None:
+        timeout_seconds = float(
+            os.environ.get("STOCKAGENT_DISTRIBUTED_PHASE_TIMEOUT_SECONDS", "86400")
+        )
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+            raise ValueError(
+                "STOCKAGENT_DISTRIBUTED_PHASE_TIMEOUT_SECONDS must be finite and > 0"
+            )
+        timeout = timedelta(seconds=timeout_seconds)
+
+    if not _distributed_is_initialized():
+        if _distributed_world_size() > 1:
+            raise RuntimeError(
+                f"Distributed phase {phase!r} requires an initialized process group"
+            )
+        operation()
+        return
+    if _distributed_world_size() <= 1:
+        operation()
+        return
+
+    token: list[str | None] = [
+        f"{time.time_ns()}-{os.getpid()}" if _distributed_is_rank0() else None
+    ]
+    dist.broadcast_object_list(token, src=0)
+    if token[0] is None:
+        raise RuntimeError(f"Distributed phase {phase!r} did not receive a store token")
+    phase_key = f"stockagent/{phase}/{token[0]}"
+    store = dist.distributed_c10d._get_default_store()
+    rank = _distributed_rank()
+    ack_key = f"{phase_key}/ack/{rank}"
+    ack_keys = [
+        f"{phase_key}/ack/{item_rank}"
+        for item_rank in range(_distributed_world_size())
+    ]
+
+    local_error: BaseException | None = None
+    status: dict[str, Any]
+    if _distributed_is_rank0():
+        try:
+            operation()
+            status = {"ok": True, "error": None}
+        except BaseException as exc:
+            local_error = exc
+            status = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        store.set(phase_key, json.dumps(status))
+        store.set(ack_key, json.dumps({"ok": True, "error": None}))
+        try:
+            store.wait(ack_keys, timeout)
+            acknowledgements = [
+                json.loads(store.get(key).decode("utf-8"))
+                for key in ack_keys
+            ]
+        except BaseException as exc:
+            raise RuntimeError(
+                f"Distributed phase {phase!r} did not receive every rank acknowledgement"
+            ) from exc
+        failed_acknowledgements = [
+            (item_rank, acknowledgement.get("error"))
+            for item_rank, acknowledgement in enumerate(acknowledgements)
+            if not bool(acknowledgement.get("ok", False))
+        ]
+        if failed_acknowledgements:
+            details = "; ".join(
+                f"rank{item_rank}: {error}"
+                for item_rank, error in failed_acknowledgements
+            )
+            raise RuntimeError(
+                f"Distributed phase {phase!r} acknowledgement failed ({details})"
+            )
+    else:
+        receive_error: BaseException | None = None
+        try:
+            store.wait([phase_key], timeout)
+            raw_status = store.get(phase_key)
+            status = json.loads(raw_status.decode("utf-8"))
+        except BaseException as exc:
+            receive_error = exc
+            status = {
+                "ok": False,
+                "error": f"rank 0 status unavailable: {type(exc).__name__}: {exc}",
+            }
+        store.set(
+            ack_key,
+            json.dumps(
+                {
+                    "ok": receive_error is None,
+                    "error": None if receive_error is None else status["error"],
+                }
+            ),
+        )
+        if receive_error is not None:
+            raise RuntimeError(
+                f"Distributed phase {phase!r} did not receive rank 0 status"
+            ) from receive_error
+
+    if not bool(status.get("ok", False)):
+        message = f"Distributed phase {phase!r} failed on rank 0: {status.get('error')}"
+        if local_error is not None:
+            raise RuntimeError(message) from local_error
+        raise RuntimeError(message)
+
+
+@contextmanager
+def _preserve_process_rng_state(device: torch.device | None = None):
+    """Keep non-training preflight work from advancing any stochastic stream."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    rng_devices: list[int] = []
+    if device is not None and device.type == "cuda":
+        rng_devices = [
+            int(device.index)
+            if device.index is not None
+            else int(torch.cuda.current_device())
+        ]
+    try:
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
 def _all_gather_autograd(x: torch.Tensor) -> torch.Tensor:
     if _distributed_world_size() <= 1:
         return x
@@ -221,6 +362,7 @@ class FoldRuntimeContext:
     fold_dir: Path
     val_ds: CrossSectionalDataset
     test_ds: CrossSectionalDataset
+    deployment_test_rows: int
     checkpoint_best_path: Path
     best_val_loss: float = float("inf")
 
@@ -1461,6 +1603,10 @@ def _backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "test_backtest.npz"
 
 
+def _deployment_backtest_path(fold_dir: Path) -> Path:
+    return fold_dir / "deployment_test_backtest.npz"
+
+
 def _best_val_backtest_path(fold_dir: Path) -> Path:
     return fold_dir / "best_val_backtest.npz"
 
@@ -2211,7 +2357,23 @@ def _write_fold_complete_marker(
 ) -> None:
     if not _distributed_should_write():
         return
+
+    def _date_coverage(path: Path) -> dict[str, int | str | None]:
+        if not path.exists():
+            return {"rows": 0, "date_start": None, "date_end": None}
+        with np.load(path) as archive:
+            dates = np.asarray(archive["dates"], dtype="datetime64[D]").reshape(-1)
+        dates = dates[~np.isnat(dates)]
+        return {
+            "rows": int(dates.size),
+            "date_start": str(dates.min()) if dates.size else None,
+            "date_end": str(dates.max()) if dates.size else None,
+        }
+
+    test_coverage = _date_coverage(_backtest_path(fold_dir))
+    deployment_coverage = _date_coverage(_deployment_backtest_path(fold_dir))
     marker = {
+        "artifact_scope_version": 2,
         "status": "complete",
         "source": str(source),
         "fold_id": int(fold_result.fold_id),
@@ -2226,6 +2388,19 @@ def _write_fold_complete_marker(
             else None
         ),
         "backtest_npz": _backtest_path(fold_dir).name,
+        "test_scope": "full_horizon",
+        "test_rows": test_coverage["rows"],
+        "test_date_start": test_coverage["date_start"],
+        "test_date_end": test_coverage["date_end"],
+        "deployment_backtest_npz": (
+            _deployment_backtest_path(fold_dir).name
+            if _deployment_backtest_path(fold_dir).exists()
+            else None
+        ),
+        "deployment_scope": "stitched_deployment",
+        "deployment_rows": deployment_coverage["rows"],
+        "deployment_date_start": deployment_coverage["date_start"],
+        "deployment_date_end": deployment_coverage["date_end"],
         "written_at_unix_seconds": float(time.time()),
     }
     marker_path = _fold_complete_marker_path(fold_dir)
@@ -2234,16 +2409,43 @@ def _write_fold_complete_marker(
         json.dump(marker, handle, indent=2)
 
 
-def _has_completed_fold_marker(fold_dir: Path) -> bool:
+def _read_fold_complete_marker(fold_dir: Path) -> dict[str, Any] | None:
     marker_path = _fold_complete_marker_path(fold_dir)
     if not marker_path.exists():
-        return False
+        return None
     try:
         with marker_path.open("r", encoding="utf-8") as handle:
             marker = json.load(handle)
     except (OSError, json.JSONDecodeError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _has_completed_fold_marker(fold_dir: Path) -> bool:
+    marker = _read_fold_complete_marker(fold_dir)
+    if marker is None:
         return False
-    return str(marker.get("status", "")).lower() == "complete"
+    try:
+        scope_version = int(marker.get("artifact_scope_version", 0))
+    except (TypeError, ValueError):
+        scope_version = 0
+    return (
+        str(marker.get("status", "")).lower() == "complete"
+        and scope_version >= 2
+        and str(marker.get("test_scope", "")) == "full_horizon"
+        and str(marker.get("deployment_scope", "")) == "stitched_deployment"
+        and _backtest_path(fold_dir).exists()
+        and _deployment_backtest_path(fold_dir).exists()
+    )
+
+
+def _fold_needs_artifact_scope_migration(fold_dir: Path) -> bool:
+    marker = _read_fold_complete_marker(fold_dir)
+    return (
+        marker is not None
+        and str(marker.get("status", "")).lower() == "complete"
+        and not _has_completed_fold_marker(fold_dir)
+    )
 
 
 def _write_summary(results: list[FoldResult], output_path: Path) -> None:
@@ -4607,6 +4809,64 @@ def _save_integer_share_holdings_table_enabled(config: ExperimentConfig) -> bool
     return bool(config.training.save_integer_share_holdings_table)
 
 
+def _save_deployment_test_artifacts(
+    fold_dir: Path,
+    result: BacktestResult,
+    dates: np.ndarray,
+    *,
+    backtest_artifact_compression: str = "none",
+) -> dict[str, float | int | str]:
+    """Persist the non-overlapping deployment view separately from full test."""
+    date_values = np.asarray(dates)
+    rows = int(date_values.size)
+    lengths = {
+        int(result.strategy_returns.shape[0]),
+        int(result.benchmark_returns.shape[0]),
+        int(result.turnovers.shape[0]),
+        int(result.weights_history.shape[0]),
+        rows,
+    }
+    if len(lengths) != 1:
+        raise ValueError(
+            "deployment backtest arrays and dates must have equal row counts: "
+            f"dates={rows}, strategy={int(result.strategy_returns.shape[0])}, "
+            f"benchmark={int(result.benchmark_returns.shape[0])}, "
+            f"turnover={int(result.turnovers.shape[0])}, "
+            f"weights={int(result.weights_history.shape[0])}"
+        )
+
+    timing: dict[str, float | int | str] = {"rows": rows}
+    stage_start = time.perf_counter()
+    _save_backtest_artifact(
+        _deployment_backtest_path(fold_dir),
+        result,
+        date_values,
+        compression=backtest_artifact_compression,
+    )
+    timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
+    timing["backtest_artifact_compression"] = str(backtest_artifact_compression)
+
+    stage_start = time.perf_counter()
+    if rows > 0:
+        report = generate_annual_report(result, date_values).replace(
+            "Annual Performance Report",
+            "Annual Performance Report (Stitched Deployment)",
+            1,
+        )
+    else:
+        report = (
+            "Annual Performance Report (Stitched Deployment)\n"
+            "No rows are owned by this fold after in-split lookback and "
+            "next-fold handoff.\n"
+        )
+    (fold_dir / "deployment_annual_report.txt").write_text(report, encoding="utf-8")
+    timing["annual_report_s"] = float(time.perf_counter() - stage_start)
+    timing["total_s"] = float(
+        float(timing["backtest_npz_s"]) + float(timing["annual_report_s"])
+    )
+    return timing
+
+
 def _save_fold_output_artifacts(
     *,
     fold_dir: Path,
@@ -4619,16 +4879,18 @@ def _save_fold_output_artifacts(
     test_future_returns: np.ndarray | torch.Tensor | None = None,
     test_integer_backtest: BacktestResult | None = None,
     holdings_records: list[HoldingsRecord] | None = None,
+    deployment_backtest: BacktestResult | None = None,
+    deployment_dates: np.ndarray | None = None,
     backtest_artifact_compression: str | None = None,
     print_report: bool = True,
     write_plots: bool = True,
     mark_complete: bool = False,
-) -> tuple[dict[str, float | str], dict[str, float | str]]:
+) -> tuple[dict[str, float | int | str], dict[str, float | str]]:
     if not _distributed_should_write():
         return {"skipped_nonzero_rank": "1", "total_s": 0.0}, {"skipped_nonzero_rank": "1", "total_s": 0.0}
     fold_dir.mkdir(parents=True, exist_ok=True)
     save_start = time.perf_counter()
-    save_timing: dict[str, float | str] = {}
+    save_timing: dict[str, float | int | str] = {}
     stage_start = time.perf_counter()
     torch.save(_state_dict_for_save(model), _model_path(fold_dir))
     save_timing["model_checkpoint_s"] = float(time.perf_counter() - stage_start)
@@ -4689,6 +4951,19 @@ def _save_fold_output_artifacts(
     with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
         f.write(report)
     save_timing["annual_report_write_s"] = float(time.perf_counter() - stage_start)
+    if (deployment_backtest is None) != (deployment_dates is None):
+        raise ValueError(
+            "deployment_backtest and deployment_dates must either both be provided or both be omitted"
+        )
+    if deployment_backtest is not None and deployment_dates is not None:
+        deployment_timing = _save_deployment_test_artifacts(
+            fold_dir,
+            deployment_backtest,
+            deployment_dates,
+            backtest_artifact_compression=compression,
+        )
+        for key, value in deployment_timing.items():
+            save_timing[f"deployment_{key}"] = value
     save_timing["total_s"] = float(time.perf_counter() - save_start)
     (fold_dir / "save_timing.json").write_text(
         json.dumps(save_timing, indent=2, ensure_ascii=False),
@@ -5284,6 +5559,143 @@ def _deployment_test_indices(
     if next_valid.size == 0:
         return indices
     return indices[indices < int(next_valid[0])]
+
+
+def _deployment_test_prefix_rows(
+    panel: PanelData,
+    fold: WalkForwardFold,
+    next_fold: WalkForwardFold | None,
+    lookback: int,
+    full_valid_indices: np.ndarray,
+) -> int:
+    """Return the stitched-deployment prefix length inside a full test split.
+
+    The deployment interval and the full fold test interval have the same
+    starting row.  Therefore, after applying the same in-split lookback and
+    executable-row filters, deployment rows must be an exact prefix of the
+    full test rows.  Keeping this as an asserted invariant lets final
+    evaluation run once over the full horizon and derive the non-overlapping
+    deployment artifact without a second model/backtest pass.
+    """
+    deployment_indices = _deployment_test_indices(
+        panel,
+        fold,
+        next_fold,
+        lookback,
+    )
+    deployment_valid = _split_valid_indices(panel, deployment_indices, lookback)
+    full_valid = np.asarray(full_valid_indices, dtype=np.int64)
+    deployment_rows = int(deployment_valid.size)
+    if deployment_rows > int(full_valid.size) or not np.array_equal(
+        deployment_valid,
+        full_valid[:deployment_rows],
+    ):
+        raise RuntimeError(
+            "Stitched deployment rows are not a prefix of the full fold test split: "
+            f"fold={fold.fold_id}, deployment_rows={deployment_rows}, "
+            f"full_rows={int(full_valid.size)}"
+        )
+    return deployment_rows
+
+
+def _prefix_backtest_result(result: BacktestResult, rows: int) -> BacktestResult:
+    rows = max(0, min(int(rows), int(result.strategy_returns.shape[0])))
+    return BacktestResult(
+        strategy_returns=np.asarray(result.strategy_returns[:rows]).copy(),
+        benchmark_returns=np.asarray(result.benchmark_returns[:rows]).copy(),
+        turnovers=np.asarray(result.turnovers[:rows]).copy(),
+        weights_history=np.asarray(result.weights_history[:rows]).copy(),
+    )
+
+
+def _upgrade_full_horizon_artifacts_without_inference(
+    *,
+    panel: PanelData,
+    fold: WalkForwardFold,
+    next_fold: WalkForwardFold | None,
+    config: ExperimentConfig,
+    output_path: Path,
+) -> bool:
+    """Upgrade a legacy full-horizon artifact set without rerunning the model.
+
+    Legacy artifacts produced before scope version 2 can already contain every
+    nominal test year. In that case the saved causal backtest is sufficient to
+    regenerate the corrected annual report and derive the deployment prefix.
+    Truncated legacy artifacts return ``False`` and must be rebuilt by the
+    normal inference path.
+    """
+    fold_dir = _fold_dir(output_path, fold.fold_id)
+    backtest_path = _backtest_path(fold_dir)
+    metrics_path = _metrics_path(fold_dir)
+    if not backtest_path.exists() or not metrics_path.exists():
+        return False
+
+    try:
+        full_backtest, saved_dates = _load_backtest_artifact(backtest_path)
+    except (OSError, ValueError, KeyError):
+        return False
+    dates = np.asarray(saved_dates, dtype="datetime64[D]").reshape(-1)
+    row_count = int(dates.size)
+    if row_count <= 0 or np.isnat(dates).any():
+        return False
+    lengths = {
+        row_count,
+        int(full_backtest.strategy_returns.shape[0]),
+        int(full_backtest.benchmark_returns.shape[0]),
+        int(full_backtest.turnovers.shape[0]),
+        int(full_backtest.weights_history.shape[0]),
+    }
+    if len(lengths) != 1 or np.any(dates[1:] <= dates[:-1]):
+        return False
+    expected_indices = _split_valid_indices(
+        panel,
+        fold.test_indices,
+        config.training.lookback,
+    )
+    expected_dates = np.asarray(
+        panel.dates[expected_indices],
+        dtype="datetime64[D]",
+    ).reshape(-1)
+    if not np.array_equal(dates, expected_dates):
+        return False
+
+    deployment_rows = row_count
+    if next_fold is not None:
+        next_valid = _split_valid_indices(
+            panel,
+            next_fold.test_indices,
+            config.training.lookback,
+        )
+        if next_valid.size > 0:
+            cutoff_date = np.asarray(panel.dates[int(next_valid[0])], dtype="datetime64[D]")
+            deployment_rows = int(np.searchsorted(dates, cutoff_date, side="left"))
+
+    deployment_backtest = _prefix_backtest_result(full_backtest, deployment_rows)
+    deployment_dates = dates[:deployment_rows]
+    _save_deployment_test_artifacts(
+        fold_dir,
+        deployment_backtest,
+        deployment_dates,
+        backtest_artifact_compression=str(
+            getattr(config.training, "backtest_artifact_compression", "none")
+        ),
+    )
+    (fold_dir / "annual_report.txt").write_text(
+        generate_annual_report(full_backtest, dates),
+        encoding="utf-8",
+    )
+    fold_result = _load_fold_result(metrics_path)
+    fold_result.test_metrics = compute_metrics(full_backtest)
+    metrics_path.write_text(
+        json.dumps(asdict(fold_result), indent=2),
+        encoding="utf-8",
+    )
+    _write_fold_complete_marker(
+        fold_dir,
+        fold_result,
+        source="artifact_scope_v2_migration",
+    )
+    return True
 
 
 def _prepare_host_tensor(tensor: torch.Tensor, pin_memory: bool) -> torch.Tensor:
@@ -7203,6 +7615,15 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
     stale_first_test_year_only_plot = output_path / "walkforward_first_test_year_only.png"
     if stale_first_test_year_only_plot.exists():
         stale_first_test_year_only_plot.unlink()
+    first_year_plot_paths = (
+        output_path / "walkforward_first_year_cumulative_returns.png",
+        output_path / "walkforward_first_year_cumulative_returns_log10.png",
+        output_path / "walkforward_first_year_fold_metrics.png",
+        output_path / "walkforward_first_year_turnover_concentration.png",
+    )
+    for stale_path in first_year_plot_paths:
+        if stale_path.exists():
+            stale_path.unlink()
 
     all_strategy_returns: list[np.ndarray] = []
     all_benchmark_returns: list[np.ndarray] = []
@@ -7218,10 +7639,13 @@ def _refresh_walkforward_artifacts(output_path: Path, results: list[FoldResult])
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
-        backtest_path = _backtest_path(fold_dir)
+        deployment_path = _deployment_backtest_path(fold_dir)
+        backtest_path = deployment_path if deployment_path.exists() else _backtest_path(fold_dir)
         if not backtest_path.exists():
             continue
         fold_backtest, fold_dates = _load_backtest_artifact(backtest_path)
+        if int(fold_dates.size) == 0:
+            continue
         all_strategy_returns.append(fold_backtest.strategy_returns)
         all_benchmark_returns.append(fold_backtest.benchmark_returns)
         all_turnovers.append(fold_backtest.turnovers)
@@ -9300,9 +9724,13 @@ def _compute_metrics_from_tensors(
     sortino = float((avg / downside_dev * np.sqrt(252.0)).item()) if float(downside_dev.item()) > 0 else 0.0
     benchmark_sortino = float((avg_b / downside_dev_b * np.sqrt(252.0)).item()) if float(downside_dev_b.item()) > 0 else 0.0
 
-    equity = torch.exp(torch.cumsum(r, dim=0))
-    running_max = torch.cummax(equity, dim=0).values
-    dd = equity / running_max.clamp_min(1e-12) - 1.0
+    cumulative_log = torch.cumsum(r, dim=0)
+    cumulative_with_initial = torch.cat(
+        (torch.zeros(1, dtype=r.dtype, device=r.device), cumulative_log),
+        dim=0,
+    )
+    running_max_log = torch.cummax(cumulative_with_initial, dim=0).values[1:]
+    dd = torch.expm1((cumulative_log - running_max_log).clamp(min=-60.0, max=0.0))
     max_dd = float(dd.min().item()) if dd.numel() else 0.0
     calmar = ann_r / abs(max_dd) if max_dd < 0.0 else 0.0
 
@@ -9329,6 +9757,7 @@ def _run_training_tree_models(
     config: ExperimentConfig,
     output_dir: str | Path,
     resume: bool = True,
+    deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -9336,7 +9765,10 @@ def _run_training_tree_models(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
-    next_fold_by_id = _next_fold_by_id(fold_list)
+    deployment_fold_list = (
+        fold_list if deployment_folds is None else list(deployment_folds)
+    )
+    next_fold_by_id = _next_fold_by_id(deployment_fold_list)
 
     if resume:
         for fold in fold_list:
@@ -9397,16 +9829,22 @@ def _run_training_tree_models(
         for fold in pending_folds:
             print(f"[Fold {fold.fold_id}]  val={fold.val_years}  test={fold.test_years}")
             val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-            test_indices = _deployment_test_indices(
+            test_ds = CrossSectionalDataset(
+                panel,
+                fold.test_indices,
+                config.training.lookback,
+                allow_empty=True,
+            )
+            if len(test_ds) == 0:
+                print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
+                continue
+            deployment_test_rows = _deployment_test_prefix_rows(
                 panel,
                 fold,
                 next_fold_by_id.get(int(fold.fold_id)),
                 config.training.lookback,
+                test_ds.valid_indices,
             )
-            test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback, allow_empty=True)
-            if len(test_ds) == 0:
-                print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
-                continue
 
             fold_dir = _fold_dir(output_path, fold.fold_id)
             fold_dir.mkdir(parents=True, exist_ok=True)
@@ -9497,6 +9935,8 @@ def _run_training_tree_models(
             test_close_prices = panel.close_prices[test_eval_indices]
             test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
+            deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+            deployment_test_dates = test_dates[:deployment_test_rows]
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt.weights_history,
@@ -9578,6 +10018,14 @@ def _run_training_tree_models(
             print("\n" + report)
             with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
                 f.write(report)
+            _save_deployment_test_artifacts(
+                fold_dir,
+                deployment_test_bt,
+                deployment_test_dates,
+                backtest_artifact_compression=str(
+                    getattr(config.training, "backtest_artifact_compression", "none")
+                ),
+            )
 
             plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
             plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
@@ -9607,6 +10055,7 @@ def _run_inference_tree_models(
     folds: Iterable[WalkForwardFold],
     config: ExperimentConfig,
     output_dir: str | Path,
+    deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -9614,7 +10063,10 @@ def _run_inference_tree_models(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = sorted(list(folds), key=lambda item: item.fold_id)
-    next_fold_by_id = _next_fold_by_id(fold_list)
+    deployment_fold_list = (
+        fold_list if deployment_folds is None else list(deployment_folds)
+    )
+    next_fold_by_id = _next_fold_by_id(deployment_fold_list)
 
     device = torch.device("cpu")
     amp_dtype: torch.dtype | None = None
@@ -9649,16 +10101,22 @@ def _run_inference_tree_models(
             model = pickle.load(model_file)
 
         val_ds = CrossSectionalDataset(panel, fold.val_indices, config.training.lookback)
-        test_indices = _deployment_test_indices(
+        test_ds = CrossSectionalDataset(
+            panel,
+            fold.test_indices,
+            config.training.lookback,
+            allow_empty=True,
+        )
+        if len(test_ds) == 0:
+            print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
+            continue
+        deployment_test_rows = _deployment_test_prefix_rows(
             panel,
             fold,
             next_fold_by_id.get(int(fold.fold_id)),
             config.training.lookback,
+            test_ds.valid_indices,
         )
-        test_ds = CrossSectionalDataset(panel, test_indices, config.training.lookback, allow_empty=True)
-        if len(test_ds) == 0:
-            print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
-            continue
 
         val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
         val_short_open_masks, val_force_cover_masks, val_force_exit_masks = _dataset_short_rule_masks_to_tensors(val_ds)
@@ -9748,6 +10206,8 @@ def _run_inference_tree_models(
         test_close_prices = panel.close_prices[test_eval_indices]
         test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
+        deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+        deployment_test_dates = test_dates[:deployment_test_rows]
         write_integer_holdings_table = bool(config.training.save_integer_share_holdings_table)
         test_integer_bt, holdings_records = run_backtest_integer_shares(
             weights=test_bt.weights_history,
@@ -9814,6 +10274,14 @@ def _run_inference_tree_models(
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
+        _save_deployment_test_artifacts(
+            fold_dir,
+            deployment_test_bt,
+            deployment_test_dates,
+            backtest_artifact_compression=str(
+                getattr(config.training, "backtest_artifact_compression", "none")
+            ),
+        )
 
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
         plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
@@ -9844,6 +10312,7 @@ def _run_inference_neural_models(
     folds: Iterable[WalkForwardFold],
     config: ExperimentConfig,
     output_dir: str | Path,
+    deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
     _configure_backtest_runtime_from_config(config)
     experiment_manifest = _checkpoint_manifest(panel, config)
@@ -9869,7 +10338,10 @@ def _run_inference_neural_models(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = sorted(list(folds), key=lambda item: item.fold_id)
-    next_fold_by_id = _next_fold_by_id(fold_list)
+    deployment_fold_list = (
+        fold_list if deployment_folds is None else list(deployment_folds)
+    )
+    next_fold_by_id = _next_fold_by_id(deployment_fold_list)
 
     print(f"[inference] model={config.training.model_name} folds={len(fold_list)} device={device}")
     for fold in tqdm(fold_list, desc="Inference folds", unit="fold"):
@@ -9931,22 +10403,23 @@ def _run_inference_neural_models(
             config.training.lookback,
             include_volume_notional=include_volume_notional,
         )
-        test_indices = _deployment_test_indices(
-            fold_panel,
-            fold,
-            next_fold_by_id.get(int(fold.fold_id)),
-            config.training.lookback,
-        )
         test_ds = CrossSectionalDataset(
             fold_panel,
-            test_indices,
+            fold.test_indices,
             config.training.lookback,
             allow_empty=True,
             include_volume_notional=include_volume_notional,
         )
         if len(test_ds) == 0:
-            print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+            print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
             continue
+        deployment_test_rows = _deployment_test_prefix_rows(
+            fold_panel,
+            fold,
+            next_fold_by_id.get(int(fold.fold_id)),
+            config.training.lookback,
+            test_ds.valid_indices,
+        )
 
         val_windowed = _prepare_windowed_split(
             dataset_to_windowed_tensors(val_ds),
@@ -10102,6 +10575,8 @@ def _run_inference_neural_models(
         test_close_prices = fold_panel.close_prices[test_eval_indices]
         test_daily_volumes = None if fold_panel.daily_volumes is None else fold_panel.daily_volumes[test_eval_indices]
         test_bt = test_bt_t.to_numpy()
+        deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+        deployment_test_dates = test_dates[:deployment_test_rows]
         write_integer_holdings_table = bool(config.training.save_integer_share_holdings_table)
         test_integer_bt, holdings_records = run_backtest_integer_shares(
             weights=test_bt.weights_history,
@@ -10168,6 +10643,14 @@ def _run_inference_neural_models(
         report = generate_annual_report(test_bt, test_dates)
         with (fold_dir / "annual_report.txt").open("w", encoding="utf-8") as f:
             f.write(report)
+        _save_deployment_test_artifacts(
+            fold_dir,
+            deployment_test_bt,
+            deployment_test_dates,
+            backtest_artifact_compression=str(
+                getattr(config.training, "backtest_artifact_compression", "none")
+            ),
+        )
 
         plot_equity_curve(test_bt, test_dates, fold_dir / "equity_curve.png")
         plot_equity_curve_log(test_bt, test_dates, fold_dir / "equity_curve_log.png")
@@ -10199,10 +10682,23 @@ def run_inference(
     folds: Iterable[WalkForwardFold],
     config: ExperimentConfig,
     output_dir: str | Path,
+    deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
     if _is_tree_model_name(config.training.model_name):
-        return _run_inference_tree_models(panel, folds, config, output_dir)
-    return _run_inference_neural_models(panel, folds, config, output_dir)
+        return _run_inference_tree_models(
+            panel,
+            folds,
+            config,
+            output_dir,
+            deployment_folds=deployment_folds,
+        )
+    return _run_inference_neural_models(
+        panel,
+        folds,
+        config,
+        output_dir,
+        deployment_folds=deployment_folds,
+    )
 
 
 @_isolate_backtest_runtime_environment
@@ -10213,9 +10709,149 @@ def run_training(
     output_dir: str | Path,
     resume: bool = True,
     profile_timing: bool = False,
+    deployment_folds: Iterable[WalkForwardFold] | None = None,
 ) -> list[FoldResult]:
+    fold_list_for_run = list(folds)
+    deployment_fold_list_for_run = (
+        fold_list_for_run
+        if deployment_folds is None
+        else list(deployment_folds)
+    )
+    multi_gpu_strategy = str(
+        getattr(config.training, "multi_gpu_strategy", "none") or "none"
+    ).strip().lower().replace("-", "_")
+    distributed_data_parallel_enabled = multi_gpu_strategy in {
+        "distributed_data_parallel",
+        "ddp",
+        "distributed",
+        "torch_ddp",
+    }
+    if (
+        resume
+        and distributed_data_parallel_enabled
+        and _distributed_world_size() > 1
+    ):
+        migration_device = _resolve_device(config)
+        if migration_device.type != "cuda":
+            raise RuntimeError(
+                "training.multi_gpu_strategy=distributed_data_parallel requires "
+                "environment.device=cuda"
+            )
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if local_rank < 0 or local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is unavailable; "
+                f"visible CUDA device_count={torch.cuda.device_count()}"
+            )
+        torch.cuda.set_device(local_rank)
+        if not _distributed_is_initialized():
+            dist.init_process_group(backend="nccl")
+
+    if resume:
+        if _distributed_is_initialized() and _distributed_world_size() > 1:
+            candidate_ids_payload: list[list[int] | None] = [
+                [
+                    int(fold.fold_id)
+                    for fold in fold_list_for_run
+                    if _fold_needs_artifact_scope_migration(
+                        _fold_dir(Path(output_dir), fold.fold_id)
+                    )
+                ]
+                if _distributed_is_rank0()
+                else None
+            ]
+            dist.broadcast_object_list(candidate_ids_payload, src=0)
+            candidate_ids = candidate_ids_payload[0]
+            if candidate_ids is None:
+                raise RuntimeError("Rank 0 did not broadcast artifact migration candidates")
+            folds_by_id = {int(fold.fold_id): fold for fold in fold_list_for_run}
+            unknown_ids = sorted(set(candidate_ids) - set(folds_by_id))
+            if unknown_ids:
+                raise RuntimeError(
+                    "Rank 0 broadcast unknown artifact migration folds: "
+                    f"{unknown_ids}"
+                )
+            migration_candidates = [folds_by_id[fold_id] for fold_id in candidate_ids]
+        else:
+            migration_candidates = [
+                fold
+                for fold in fold_list_for_run
+                if _fold_needs_artifact_scope_migration(
+                    _fold_dir(Path(output_dir), fold.fold_id)
+                )
+            ]
+        if migration_candidates:
+
+            def _migrate_legacy_fold_artifacts() -> None:
+                migration_rng_device = (
+                    None if _is_tree_model_name(config.training.model_name)
+                    else _resolve_device(config)
+                )
+                try:
+                    with _preserve_process_rng_state(migration_rng_device):
+                        next_fold_by_id = _next_fold_by_id(deployment_fold_list_for_run)
+                        inference_migrations: list[WalkForwardFold] = []
+                        for fold in migration_candidates:
+                            upgraded = _upgrade_full_horizon_artifacts_without_inference(
+                                panel=panel,
+                                fold=fold,
+                                next_fold=next_fold_by_id.get(int(fold.fold_id)),
+                                config=config,
+                                output_path=Path(output_dir),
+                            )
+                            if upgraded:
+                                print(
+                                    f"[resume] fold {fold.fold_id} artifacts upgraded to "
+                                    "full_horizon + stitched_deployment without model inference"
+                                )
+                            else:
+                                inference_migrations.append(fold)
+                        if inference_migrations:
+                            fold_ids = [int(fold.fold_id) for fold in inference_migrations]
+                            print(
+                                "[resume] rebuilding legacy fold artifacts by inference: "
+                                f"folds={fold_ids}"
+                            )
+                            run_inference(
+                                panel,
+                                inference_migrations,
+                                config,
+                                output_dir,
+                                deployment_folds=deployment_fold_list_for_run,
+                            )
+                        incomplete_fold_ids = [
+                            int(fold.fold_id)
+                            for fold in migration_candidates
+                            if not _has_completed_fold_marker(
+                                _fold_dir(Path(output_dir), fold.fold_id)
+                            )
+                        ]
+                        if incomplete_fold_ids:
+                            raise RuntimeError(
+                                "Artifact scope migration did not produce complete v2 "
+                                f"artifacts for folds={incomplete_fold_ids}"
+                            )
+                finally:
+                    if migration_rng_device is not None:
+                        _release_cuda_memory(migration_rng_device)
+
+            _run_rank0_store_synchronized_phase(
+                "legacy_fold_artifact_scope_migration",
+                _migrate_legacy_fold_artifacts,
+            )
+
     if _is_tree_model_name(config.training.model_name):
-        return _run_training_tree_models(panel, folds, config, output_dir, resume=resume)
+        return _run_training_tree_models(
+            panel,
+            fold_list_for_run,
+            config,
+            output_dir,
+            resume=resume,
+            deployment_folds=deployment_fold_list_for_run,
+        )
+
+    folds = fold_list_for_run
+    deployment_folds = deployment_fold_list_for_run
 
     loss_objective = _normalize_risk_objective(config.training.loss_type)
     factor_loss_kwargs = _factor_loss_kwargs(config)
@@ -10233,18 +10869,11 @@ def run_training(
             "validation/test use the deterministic factor objective"
         )
 
-    multi_gpu_strategy = str(getattr(config.training, "multi_gpu_strategy", "none") or "none").strip().lower().replace("-", "_")
     if multi_gpu_strategy in {"data_parallel", "dp"}:
         raise ValueError(
             "training.multi_gpu_strategy=data_parallel was removed because it duplicated the neural executor "
             "and disabled the panel-slab fast path; use 'distributed_data_parallel' (torchrun) or 'none'"
         )
-    distributed_data_parallel_enabled = multi_gpu_strategy in {
-        "distributed_data_parallel",
-        "ddp",
-        "distributed",
-        "torch_ddp",
-    }
     if distributed_data_parallel_enabled and _training_needs_aux(
         loss_objective,
         factor_aug_kwargs,
@@ -10320,7 +10949,10 @@ def run_training(
 
     results_by_fold: dict[int, FoldResult] = {}
     fold_list = list(folds)
-    next_fold_by_id = _next_fold_by_id(fold_list)
+    deployment_fold_list = (
+        fold_list if deployment_folds is None else list(deployment_folds)
+    )
+    next_fold_by_id = _next_fold_by_id(deployment_fold_list)
 
     retrain_completed_folds = _env_truthy("STOCKAGENT_RETRAIN_COMPLETED_FOLDS", "0")
     resume_artifact_error: BaseException | None = None
@@ -10539,23 +11171,24 @@ def run_training(
                 config.training.lookback,
                 include_volume_notional=include_volume_notional,
             )
-            test_indices = _deployment_test_indices(
-                panel,
-                fold,
-                next_fold_by_id.get(int(fold.fold_id)),
-                config.training.lookback,
-            )
             test_ds = CrossSectionalDataset(
                 panel,
-                test_indices,
+                fold.test_indices,
                 config.training.lookback,
                 allow_empty=True,
                 include_volume_notional=include_volume_notional,
             )
 
             if len(test_ds) == 0:
-                print(f"[Fold {fold.fold_id}] skip: empty test split after lookback filtering")
+                print(f"[Fold {fold.fold_id}] skip: empty full test split after lookback filtering")
                 continue
+            deployment_test_rows = _deployment_test_prefix_rows(
+                panel,
+                fold,
+                next_fold_by_id.get(int(fold.fold_id)),
+                config.training.lookback,
+                test_ds.valid_indices,
+            )
 
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
             test_batch_size = _split_batch_size(len(test_ds), config.training.batch_size_eval)
@@ -10572,6 +11205,7 @@ def run_training(
                 fold_dir=fold_dir,
                 val_ds=val_ds,
                 test_ds=test_ds,
+                deployment_test_rows=deployment_test_rows,
                 checkpoint_best_path=checkpoint_best_path,
             )
 
@@ -11679,6 +12313,9 @@ def run_training(
             test_close_prices = panel.close_prices[test_eval_indices]
             test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
             test_bt = test_bt_t.to_numpy()
+            deployment_test_rows = int(context.deployment_test_rows)
+            deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+            deployment_test_dates = test_dates[:deployment_test_rows]
             write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
             test_integer_bt, holdings_records = run_backtest_integer_shares(
                 weights=test_bt.weights_history,
@@ -11729,6 +12366,8 @@ def run_training(
                 test_future_returns=test_returns,
                 test_integer_backtest=test_integer_bt,
                 holdings_records=holdings_records,
+                deployment_backtest=deployment_test_bt,
+                deployment_dates=deployment_test_dates,
                 backtest_artifact_compression="compressed",
                 print_report=False,
                 write_plots=bool(getattr(config.training, "save_best_val_fold_plots", True)),
@@ -12568,6 +13207,9 @@ def run_training(
                 test_close_prices = panel.close_prices[test_eval_indices]
                 test_daily_volumes = None if panel.daily_volumes is None else panel.daily_volumes[test_eval_indices]
                 test_bt = test_bt_t.to_numpy()
+                deployment_test_rows = int(context.deployment_test_rows)
+                deployment_test_bt = _prefix_backtest_result(test_bt, deployment_test_rows)
+                deployment_test_dates = test_dates[:deployment_test_rows]
                 write_integer_holdings_table = _save_integer_share_holdings_table_enabled(config)
                 test_integer_bt, holdings_records = run_backtest_integer_shares(
                     weights=test_bt.weights_history,
@@ -12638,6 +13280,8 @@ def run_training(
                     test_future_returns=test_returns,
                     test_integer_backtest=test_integer_bt,
                     holdings_records=holdings_records,
+                    deployment_backtest=deployment_test_bt,
+                    deployment_dates=deployment_test_dates,
                     print_report=True,
                     write_plots=True,
                     mark_complete=True,
