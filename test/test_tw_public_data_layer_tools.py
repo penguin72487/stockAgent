@@ -15,6 +15,7 @@ from scripts.audit_tw_public_data_layer import (
     audit_delisted_universe_coverage,
     audit_feature_lineage_registry,
     audit_non_vintage_archive_contract,
+    audit_official_symbol_build,
     audit_panel_contract,
     audit_quote_source_files,
     audit_return_price_provenance,
@@ -27,8 +28,14 @@ from scripts.rebuild_tw_public_data_layer import (
     _promote_one,
     _rollback_promoted_tree,
 )
+from scripts.build_tw_official_symbol_parquets import (
+    MIXED_FALLBACK_SOURCE_NAME,
+    _receipt,
+    _write_official_quote_parquet,
+)
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData
+from stockagent.data.tw_public_features import _file_content_receipt
 
 
 def _panel(dates: list[str]) -> PanelData:
@@ -255,6 +262,148 @@ def test_quote_source_audit_rejects_non_stock_non_etf_security(tmp_path: Path) -
 
     assert summary["unsupported_security_files"] == 1
     assert any(item.code == "unsupported_tw_security_type" for item in findings)
+
+
+def test_quote_source_audit_accepts_audited_yahoo_fallback_lineage(tmp_path: Path) -> None:
+    frame = pl.DataFrame(
+        {
+            "date": [date(2000, 1, 4), date(2004, 2, 11)],
+            "open": [10.0, 20.0],
+            "max": [10.5, 21.0],
+            "min": [9.5, 19.0],
+            "close": [10.0, 20.0],
+            "Trading_Volume": [1000.0, 2000.0],
+            "data_source": ["yahoo_fallback", "twse_official"],
+            "adjustment_source": ["yahoo_fallback", "twse_official"],
+            "adjclose": [10.0, 10.5],
+        }
+    )
+    _write_official_quote_parquet(
+        frame,
+        tmp_path / "2330_features.parquet",
+        checked_through="2004-02-11",
+        source=MIXED_FALLBACK_SOURCE_NAME,
+    )
+
+    _, summary, findings = audit_quote_source_files(
+        tmp_path,
+        np.asarray(["2000-01-04", "2004-02-11"], dtype="datetime64[D]"),
+        workers=1,
+        require_official=True,
+    )
+
+    assert summary["unapproved_source_files"] == 0
+    assert summary["yahoo_fallback_rows"] == 1
+    assert summary["yahoo_fallback_adjustment_rows"] == 1
+    assert summary["source_lineage_mismatch"] == 0
+    assert not any("source" in finding.code for finding in findings)
+
+
+def test_official_symbol_build_audit_accepts_relocated_yahoo_receipt(
+    tmp_path: Path,
+) -> None:
+    public_dir = tmp_path / "data_tw_public"
+    parquet_root = public_dir / "stocks"
+    fallback_dir = public_dir / "fallback"
+    parquet_root.mkdir(parents=True)
+    fallback_dir.mkdir()
+    for name in (
+        "twse_daily_ohlcv.parquet",
+        "tpex_daily_ohlcv.parquet",
+        "tw_corporate_action_reference.parquet",
+    ):
+        pl.DataFrame({"marker": [name]}).write_parquet(public_dir / name)
+
+    fallback = fallback_dir / "yahoo_tw_ohlcv.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2000, 1, 4)],
+            "symbol": ["2330"],
+            "name": ["TSMC"],
+            "market": ["twse"],
+            "open": [100.0],
+            "max": [101.0],
+            "min": [99.0],
+            "close": [100.0],
+            "Trading_Volume": [1000.0],
+            "source_adjclose": [50.0],
+            "source_factor": [None],
+            "quote_source": ["yahoo_fallback"],
+        }
+    ).write_parquet(fallback)
+    fallback_receipt = _receipt(fallback)
+    stale_fallback_receipt = {
+        **fallback_receipt,
+        "path": "/old/staged/data_tw_public/fallback/yahoo_tw_ohlcv.parquet",
+    }
+    fallback.with_suffix(".summary.json").write_text(
+        json.dumps(
+            {
+                "source": "yahoo_fallback",
+                "start_date": "2000-01-01",
+                "failed_symbol_count": 0,
+                "output_receipt": stale_fallback_receipt,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _write_official_quote_parquet(
+        pl.DataFrame(
+            {
+                "date": [date(2000, 1, 4)],
+                "open": [100.0],
+                "max": [101.0],
+                "min": [99.0],
+                "close": [100.0],
+                "Trading_Volume": [1000.0],
+                "data_source": ["yahoo_fallback"],
+                "adjustment_source": ["yahoo_fallback"],
+                "adjclose": [10.0],
+            }
+        ),
+        parquet_root / "2330_features.parquet",
+        checked_through="2000-01-04",
+        source=MIXED_FALLBACK_SOURCE_NAME,
+    )
+    pl.DataFrame(
+        {
+            "code": ["2330"],
+            "name": ["TSMC"],
+            "market": ["twse"],
+            "security_type": ["stock"],
+            "source": [MIXED_FALLBACK_SOURCE_NAME],
+        }
+    ).write_csv(parquet_root / "symbols.csv")
+    source_paths = [
+        public_dir / "twse_daily_ohlcv.parquet",
+        public_dir / "tpex_daily_ohlcv.parquet",
+        public_dir / "tw_corporate_action_reference.parquet",
+    ]
+    (parquet_root / "official_symbol_build_summary.json").write_text(
+        json.dumps(
+            {
+                "source": MIXED_FALLBACK_SOURCE_NAME,
+                "adjusted_price_method": "first=10; test",
+                "missing_adjustment_rows": 0,
+                "source_receipts": [_file_content_receipt(path) for path in source_paths],
+                "legacy_source_name": "",
+                "legacy_source_receipts": [],
+                "fallback_source_name": "yahoo_fallback",
+                "fallback_source_receipts": [stale_fallback_receipt],
+                "fallback_rows": 1,
+                "fallback_adjustment_rows": 0,
+                "fallback_symbols": 1,
+                "symbols": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, findings = audit_official_symbol_build(parquet_root, public_dir)
+
+    assert summary["valid"] is True
+    assert findings == []
 
 
 def test_walk_forward_audit_fails_when_configured_fold_is_unavailable() -> None:

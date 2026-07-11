@@ -71,28 +71,31 @@ RUN_YAHOO="${RUN_YAHOO:-0}"
 YAHOO_ASSETS="${YAHOO_ASSETS:-}"
 YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-900}"  # 0 disables timeout
 RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
-TW_PUBLIC_DATASETS="${TW_PUBLIC_DATASETS:-all}"
+TW_PUBLIC_CONFIG="${TW_PUBLIC_CONFIG:-configs/markets/tw_public.yaml}"
 TW_PUBLIC_OUTPUT_DIR="${TW_PUBLIC_OUTPUT_DIR:-data_tw_public}"
+TW_PUBLIC_STOCKS_ROOT="${TW_PUBLIC_STOCKS_ROOT:-data_tw_public/stocks}"
 TW_PUBLIC_WORKERS="${TW_PUBLIC_WORKERS:-4}"
 TW_PUBLIC_DATE_WORKERS="${TW_PUBLIC_DATE_WORKERS:-4}"
 TW_PUBLIC_TIMEOUT="${TW_PUBLIC_TIMEOUT:-30}"
 TW_PUBLIC_RETRIES="${TW_PUBLIC_RETRIES:-3}"
-TW_PUBLIC_RETRY_BACKOFF="${TW_PUBLIC_RETRY_BACKOFF:-1.0}"
-TW_PUBLIC_SLEEP="${TW_PUBLIC_SLEEP:-0.15}"
 TW_PUBLIC_REQUEST_INTERVAL="${TW_PUBLIC_REQUEST_INTERVAL:-}"
 TW_PUBLIC_FLUSH_EVERY_DATES="${TW_PUBLIC_FLUSH_EVERY_DATES:-250}"
+TW_PUBLIC_DAILY_OVERLAP_DAYS="${TW_PUBLIC_DAILY_OVERLAP_DAYS:-7}"
+TW_PUBLIC_EMPTY_RECHECK_DAYS="${TW_PUBLIC_EMPTY_RECHECK_DAYS:-30}"
 TW_PUBLIC_SKIP_RAW="${TW_PUBLIC_SKIP_RAW:-0}"
-TW_PUBLIC_MAX_DATES="${TW_PUBLIC_MAX_DATES:-}"
+TW_PUBLIC_OHLCV_FALLBACK="${TW_PUBLIC_OHLCV_FALLBACK:-yahoo}"
+TW_PUBLIC_FALLBACK_START_DATE="${TW_PUBLIC_FALLBACK_START_DATE:-2000-01-01}"
+TW_PUBLIC_YAHOO_FALLBACK_DIR="${TW_PUBLIC_YAHOO_FALLBACK_DIR:-}"
+TW_PUBLIC_YAHOO_WORKERS="${TW_PUBLIC_YAHOO_WORKERS:-1}"
+TW_PUBLIC_YAHOO_RETRIES="${TW_PUBLIC_YAHOO_RETRIES:-3}"
+TW_PUBLIC_YAHOO_REQUEST_INTERVAL="${TW_PUBLIC_YAHOO_REQUEST_INTERVAL:-1.5}"
+TW_PUBLIC_SKIP_YAHOO_DOWNLOAD="${TW_PUBLIC_SKIP_YAHOO_DOWNLOAD:-0}"
 RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
 RUN_TW_SHORT_RESTRICTIONS="${RUN_TW_SHORT_RESTRICTIONS:-1}"
-TW_SHORT_RESTRICTION_WORKERS="${TW_SHORT_RESTRICTION_WORKERS:-2}"
 TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
-TW_PUBLIC_FEATURE_SYMBOLS_ROOT="${TW_PUBLIC_FEATURE_SYMBOLS_ROOT:-data_yahoo/tw_stocks}"
-TW_PUBLIC_MARKET_SYMBOL="${TW_PUBLIC_MARKET_SYMBOL:-__MARKET__}"
-RUN_TW_OFFICIAL_OHLCV_BACKFILL="${RUN_TW_OFFICIAL_OHLCV_BACKFILL:-1}"
 TW_OFFICIAL_BACKFILL_WORKERS="${TW_OFFICIAL_BACKFILL_WORKERS:-8}"
 RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-0}"
-AUDIT_ROOTS="${AUDIT_ROOTS:-data_yahoo/tw_stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
+AUDIT_ROOTS="${AUDIT_ROOTS:-data_tw_public/stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
 AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
 AUDIT_WORKERS="${AUDIT_WORKERS:-16}"
 AUDIT_STALE_MAX_LAG_DAYS="${AUDIT_STALE_MAX_LAG_DAYS:-14}"
@@ -512,9 +515,7 @@ run_cex_incremental() {
 run_tw_public_data_update() {
   local today
   local rc=0
-  local -a datasets=()
   local -a cmd=()
-  local -a feature_cmd=()
 
   if [[ "$RUN_TW_PUBLIC_DATA" != "1" ]]; then
     log "skip=tw_public_data_daily_update reason=RUN_TW_PUBLIC_DATA=${RUN_TW_PUBLIC_DATA}"
@@ -522,25 +523,27 @@ run_tw_public_data_update() {
   fi
 
   today="$(date +%F)"
-  read -r -a datasets <<< "$TW_PUBLIC_DATASETS"
-  if (( ${#datasets[@]} == 0 )); then
-    log "skip=tw_public_data_daily_update reason=empty_TW_PUBLIC_DATASETS"
-    return 0
-  fi
-
   cmd=(
-    "$PYTHON_BIN" downloader/download_tw_public_data.py
-    --mode daily-update
-    --datasets "${datasets[@]}"
-    --output-dir "$TW_PUBLIC_OUTPUT_DIR"
+    "$PYTHON_BIN" downloader/download_tw_official_data.py
+    --mode daily
+    --config "$TW_PUBLIC_CONFIG"
+    --public-dir "$TW_PUBLIC_OUTPUT_DIR"
+    --stock-root "$TW_PUBLIC_STOCKS_ROOT"
+    --public-feature-path "$TW_PUBLIC_FEATURE_PATH"
     --end-date "$today"
-    --workers "$TW_PUBLIC_WORKERS"
+    --workers "$TW_OFFICIAL_BACKFILL_WORKERS"
+    --public-workers "$TW_PUBLIC_WORKERS"
     --date-workers "$TW_PUBLIC_DATE_WORKERS"
     --timeout "$TW_PUBLIC_TIMEOUT"
     --retries "$TW_PUBLIC_RETRIES"
-    --retry-backoff "$TW_PUBLIC_RETRY_BACKOFF"
-    --sleep "$TW_PUBLIC_SLEEP"
     --flush-every-dates "$TW_PUBLIC_FLUSH_EVERY_DATES"
+    --daily-overlap-days "$TW_PUBLIC_DAILY_OVERLAP_DAYS"
+    --empty-recheck-days "$TW_PUBLIC_EMPTY_RECHECK_DAYS"
+    --ohlcv-fallback "$TW_PUBLIC_OHLCV_FALLBACK"
+    --fallback-start-date "$TW_PUBLIC_FALLBACK_START_DATE"
+    --yahoo-workers "$TW_PUBLIC_YAHOO_WORKERS"
+    --yahoo-retries "$TW_PUBLIC_YAHOO_RETRIES"
+    --yahoo-request-interval "$TW_PUBLIC_YAHOO_REQUEST_INTERVAL"
   )
   if [[ -n "$TW_PUBLIC_REQUEST_INTERVAL" ]]; then
     cmd+=(--request-interval "$TW_PUBLIC_REQUEST_INTERVAL")
@@ -548,48 +551,20 @@ run_tw_public_data_update() {
   if [[ "$TW_PUBLIC_SKIP_RAW" == "1" ]]; then
     cmd+=(--skip-raw)
   fi
-  if [[ -n "$TW_PUBLIC_MAX_DATES" ]]; then
-    cmd+=(--max-dates "$TW_PUBLIC_MAX_DATES")
+  if [[ -n "$TW_PUBLIC_YAHOO_FALLBACK_DIR" ]]; then
+    cmd+=(--yahoo-fallback-dir "$TW_PUBLIC_YAHOO_FALLBACK_DIR")
+  fi
+  if [[ "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" == "1" ]]; then
+    cmd+=(--skip-yahoo-download)
+  fi
+  if [[ "$RUN_TW_SHORT_RESTRICTIONS" != "1" ]]; then
+    cmd+=(--skip-short-rules)
+  fi
+  if [[ "$RUN_TW_PUBLIC_FEATURES" != "1" ]]; then
+    cmd+=(--skip-feature-build)
   fi
 
   run_step tw_public_data_daily_update "${cmd[@]}" || rc=1
-
-  if [[ "$RUN_TW_SHORT_RESTRICTIONS" == "1" ]]; then
-    run_step tw_short_sale_restrictions_update \
-      "$PYTHON_BIN" downloader/download_tw_short_sale_restrictions.py \
-      --output-dir "$TW_PUBLIC_OUTPUT_DIR" \
-      --start-year "$(date +%Y)" \
-      --end-year "$(date +%Y)" \
-      --workers "$TW_SHORT_RESTRICTION_WORKERS" \
-      --timeout "$TW_PUBLIC_TIMEOUT" || rc=1
-  else
-    log "skip=tw_short_sale_restrictions_update reason=RUN_TW_SHORT_RESTRICTIONS=${RUN_TW_SHORT_RESTRICTIONS}"
-  fi
-
-  if [[ "$RUN_TW_OFFICIAL_OHLCV_BACKFILL" == "1" ]]; then
-    backfill_cmd=(
-      "$PYTHON_BIN" downloader/backfill_tw_public_to_yahoo.py
-      --input-dir "$TW_PUBLIC_OUTPUT_DIR"
-      --symbols-root "$TW_PUBLIC_FEATURE_SYMBOLS_ROOT"
-      --workers "$TW_OFFICIAL_BACKFILL_WORKERS"
-    )
-    run_step tw_official_ohlcv_to_yahoo_backfill "${backfill_cmd[@]}" || rc=1
-  else
-    log "skip=tw_official_ohlcv_to_yahoo_backfill reason=RUN_TW_OFFICIAL_OHLCV_BACKFILL=${RUN_TW_OFFICIAL_OHLCV_BACKFILL}"
-  fi
-
-  if [[ "$RUN_TW_PUBLIC_FEATURES" == "1" ]]; then
-    feature_cmd=(
-      "$PYTHON_BIN" scripts/build_tw_public_training_features.py
-      --input-dir "$TW_PUBLIC_OUTPUT_DIR"
-      --output-path "$TW_PUBLIC_FEATURE_PATH"
-      --symbols-root "$TW_PUBLIC_FEATURE_SYMBOLS_ROOT"
-      --market-symbol "$TW_PUBLIC_MARKET_SYMBOL"
-    )
-    run_step tw_public_training_feature_build "${feature_cmd[@]}" || rc=1
-  else
-    log "skip=tw_public_training_feature_build reason=RUN_TW_PUBLIC_FEATURES=${RUN_TW_PUBLIC_FEATURES}"
-  fi
 
   return "$rc"
 }
@@ -795,6 +770,14 @@ validate_settings() {
   fi
   if [[ "$RUN_DATA_QUALITY_AUDIT" != "0" && "$RUN_DATA_QUALITY_AUDIT" != "1" ]]; then
     echo "[daily] RUN_DATA_QUALITY_AUDIT must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$TW_PUBLIC_OHLCV_FALLBACK" != "yahoo" && "$TW_PUBLIC_OHLCV_FALLBACK" != "none" ]]; then
+    echo "[daily] TW_PUBLIC_OHLCV_FALLBACK must be yahoo or none" >&2
+    exit 2
+  fi
+  if [[ "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" != "0" && "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" != "1" ]]; then
+    echo "[daily] TW_PUBLIC_SKIP_YAHOO_DOWNLOAD must be 0 or 1" >&2
     exit 2
   fi
   if [[ "$RUN_YAHOO" != "0" && "$RUN_YAHOO" != "1" ]]; then

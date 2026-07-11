@@ -58,6 +58,17 @@ MARKET_FEATURE_PREFIXES = (
     "twpub_taifex_",
 )
 
+OFFICIAL_QUOTE_SOURCE = "twse_tpex_official"
+MIXED_QUOTE_SOURCE = "twse_tpex_official_with_yahoo_fallback"
+YAHOO_FALLBACK_SOURCE = "yahoo_fallback"
+APPROVED_FILE_SOURCES = {OFFICIAL_QUOTE_SOURCE, MIXED_QUOTE_SOURCE}
+APPROVED_ROW_SOURCES = {
+    "twse_official",
+    "tpex_official",
+    "official_archive",
+    YAHOO_FALLBACK_SOURCE,
+}
+
 
 @dataclass(frozen=True)
 class HistoricalSourceExpectation:
@@ -457,13 +468,35 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
                 "missing_columns": ",".join(missing),
                 "source": source,
             }
-        frame = pl.read_parquet(path, columns=list(required)).select(
+        has_data_source = "data_source" in schema
+        has_adjustment_source = "adjustment_source" in schema
+        read_columns = list(required)
+        if has_data_source:
+            read_columns.append("data_source")
+        if has_adjustment_source:
+            read_columns.append("adjustment_source")
+        select_expressions: list[pl.Expr] = [
             _date_column_expr("date").alias("date"),
             *[
                 pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column)
                 for column in required[1:]
             ],
-        )
+        ]
+        if has_data_source:
+            select_expressions.append(
+                pl.col("data_source")
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("data_source")
+            )
+        if has_adjustment_source:
+            select_expressions.append(
+                pl.col("adjustment_source")
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("adjustment_source")
+            )
+        frame = pl.read_parquet(path, columns=read_columns).select(select_expressions)
     except Exception as exc:
         return {
             "symbol": symbol,
@@ -529,6 +562,54 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
         or not math.isfinite(float(first_adjusted))
         or not math.isclose(float(first_adjusted), 10.0, rel_tol=0.0, abs_tol=1e-6)
     )
+    fallback_rows = 0
+    fallback_adjustment_rows = 0
+    unapproved_data_source_rows = 0
+    unapproved_adjustment_source_rows = 0
+    if has_data_source:
+        fallback_rows = int(
+            frame.select((pl.col("data_source") == YAHOO_FALLBACK_SOURCE).sum()).item()
+            or 0
+        )
+        unapproved_data_source_rows = int(
+            frame.select(
+                (~pl.col("data_source").is_in(sorted(APPROVED_ROW_SOURCES)))
+                .fill_null(True)
+                .sum()
+            ).item()
+            or 0
+        )
+    if has_adjustment_source:
+        fallback_adjustment_rows = int(
+            frame.select(
+                (pl.col("adjustment_source") == YAHOO_FALLBACK_SOURCE).sum()
+            ).item()
+            or 0
+        )
+        unapproved_adjustment_source_rows = int(
+            frame.select(
+                (~pl.col("adjustment_source").is_in(sorted(APPROVED_ROW_SOURCES)))
+                .fill_null(True)
+                .sum()
+            ).item()
+            or 0
+        )
+    source_lineage_mismatch = int(
+        source in APPROVED_FILE_SOURCES
+        and (
+            not has_data_source
+            or not has_adjustment_source
+            or (
+                source == OFFICIAL_QUOTE_SOURCE
+                and (fallback_rows != 0 or fallback_adjustment_rows != 0)
+            )
+            or (
+                source == MIXED_QUOTE_SOURCE
+                and fallback_rows == 0
+                and fallback_adjustment_rows == 0
+            )
+        )
+    )
 
     ordered = (
         in_panel_range.drop_nulls("close")
@@ -574,6 +655,13 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
         "path": str(path),
         "status": "ok" if rows else "empty",
         "source": source,
+        "has_data_source": has_data_source,
+        "has_adjustment_source": has_adjustment_source,
+        "yahoo_fallback_rows": fallback_rows,
+        "yahoo_fallback_adjustment_rows": fallback_adjustment_rows,
+        "unapproved_data_source_rows": unapproved_data_source_rows,
+        "unapproved_adjustment_source_rows": unapproved_adjustment_source_rows,
+        "source_lineage_mismatch": source_lineage_mismatch,
         "rows": rows,
         "audited_rows": int(in_panel_range.height),
         "outside_panel_range_rows": outside_panel_range,
@@ -615,8 +703,8 @@ def audit_quote_source_files(
         "unsupported_security_files": sum(
             item.get("security_type") not in {"stock", "etf"} for item in profiles
         ),
-        "non_official_source_files": sum(
-            str(item.get("source", "")) != "twse_tpex_official"
+        "unapproved_source_files": sum(
+            str(item.get("source", "")) not in APPROVED_FILE_SOURCES
             for item in profiles
         )
         if require_official
@@ -634,6 +722,11 @@ def audit_quote_source_files(
         "first_adjclose_not_ten",
         "invalid_ohlc_geometry",
         "negative_volume",
+        "yahoo_fallback_rows",
+        "yahoo_fallback_adjustment_rows",
+        "unapproved_data_source_rows",
+        "unapproved_adjustment_source_rows",
+        "source_lineage_mismatch",
         "raw_close_jumps_gt_2x",
         "adjusted_index_jumps_gt_3x",
     ):
@@ -649,11 +742,32 @@ def audit_quote_source_files(
             "Rebuild with the canonical TW stock/ETF classifier and remove stale official files.",
         ),
         (
-            "non_official_quote_source",
+            "unapproved_quote_source",
             "critical",
-            "non_official_source_files",
-            "TW training data includes Yahoo or unverifiable symbol files.",
-            "Rebuild every symbol parquet exclusively from TWSE/TPEx official archives.",
+            "unapproved_source_files",
+            "TW training data includes a file outside the approved official-first lineage.",
+            "Rebuild with official TWSE/TPEx priority and the audited Yahoo fallback converter.",
+        ),
+        (
+            "unapproved_row_source",
+            "critical",
+            "unapproved_data_source_rows",
+            "Some quote rows have missing or unknown source lineage.",
+            "Rebuild canonical symbol files so every row records its approved data_source.",
+        ),
+        (
+            "unapproved_adjustment_source",
+            "critical",
+            "unapproved_adjustment_source_rows",
+            "Some adjusted-return rows have missing or unknown source lineage.",
+            "Rebuild canonical symbol files so every row records its approved adjustment_source.",
+        ),
+        (
+            "quote_source_lineage_mismatch",
+            "critical",
+            "source_lineage_mismatch",
+            "File-level source metadata disagrees with row-level fallback usage.",
+            "Rebuild the symbol parquet and regenerate its source receipt.",
         ),
         (
             "invalid_adjusted_index",
@@ -766,30 +880,86 @@ def audit_official_symbol_build(
         public_dir / "tpex_daily_ohlcv.parquet",
         public_dir / "tw_corporate_action_reference.parquet",
     ]
+
+    def resolve_receipt_path(receipt: dict[str, Any]) -> Path | None:
+        raw_path = Path(str(receipt.get("path", "")))
+        if raw_path.is_file():
+            return raw_path
+        if not raw_path.name:
+            return None
+        candidates = [
+            candidate
+            for candidate in public_dir.rglob(raw_path.name)
+            if candidate.is_file()
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def receipt_matches(path_to_check: Path, receipt: dict[str, Any]) -> bool:
+        try:
+            digest = hashlib.sha256()
+            with path_to_check.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return (
+                int(receipt["size"]) == int(path_to_check.stat().st_size)
+                and str(receipt["sha256"]) == digest.hexdigest()
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+    def validate_receipts(receipts: Any) -> bool:
+        if not isinstance(receipts, list):
+            return False
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                return False
+            source = resolve_receipt_path(receipt)
+            if source is None or not receipt_matches(source, receipt):
+                return False
+        return True
+
     legacy_receipts = summary.get("legacy_source_receipts", [])
     legacy_source_name = str(summary.get("legacy_source_name", "")).strip()
-    legacy_receipts_valid = isinstance(legacy_receipts, list)
-    if legacy_receipts_valid:
-        for receipt in legacy_receipts:
+    legacy_receipts_valid = validate_receipts(legacy_receipts)
+    fallback_receipts = summary.get("fallback_source_receipts", [])
+    fallback_source_name = str(summary.get("fallback_source_name", "")).strip()
+    fallback_receipts_valid = validate_receipts(fallback_receipts)
+    fallback_converter_receipts_valid = fallback_receipts_valid
+    if fallback_converter_receipts_valid:
+        for receipt in fallback_receipts:
+            source = resolve_receipt_path(receipt)
+            if source is None:
+                fallback_converter_receipts_valid = False
+                break
+            converter_summary = _read_json_object(source.with_suffix(".summary.json"))
             try:
-                source = Path(str(receipt["path"]))
-                digest = hashlib.sha256()
-                with source.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                actual = {
-                    "path": str(source),
-                    "size": int(source.stat().st_size),
-                    "sha256": digest.hexdigest(),
-                }
-                if actual != receipt:
-                    legacy_receipts_valid = False
-                    break
-            except (KeyError, OSError, TypeError, ValueError):
-                legacy_receipts_valid = False
+                output_receipt = converter_summary.get("output_receipt", {})
+                converter_start = date.fromisoformat(
+                    str(converter_summary.get("start_date"))
+                )
+                archive_schema = set(pq.read_schema(source).names)
+                converter_ok = (
+                    converter_summary.get("source") == YAHOO_FALLBACK_SOURCE
+                    and int(converter_summary.get("failed_symbol_count", -1)) == 0
+                    and converter_start >= date(2000, 1, 1)
+                    and receipt_matches(source, output_receipt)
+                    and {
+                        "date",
+                        "symbol",
+                        "market",
+                        "source_factor",
+                        "quote_source",
+                    }
+                    <= archive_schema
+                )
+            except (AttributeError, OSError, TypeError, ValueError):
+                converter_ok = False
+            if not converter_ok:
+                fallback_converter_receipts_valid = False
                 break
     manifest_path = parquet_root / "symbols.csv"
     manifest_valid = False
+    manifest_fallback_symbols = -1
     if manifest_path.exists():
         try:
             manifest = pl.read_csv(manifest_path, infer_schema_length=None)
@@ -801,23 +971,48 @@ def audit_official_symbol_build(
                 item.name.removesuffix("_features.parquet")
                 for item in parquet_root.glob("*_features.parquet")
             }
+            manifest_sources = set(manifest["source"].drop_nulls().to_list())
+            manifest_fallback_symbols = int(
+                manifest.select((pl.col("source") == MIXED_QUOTE_SOURCE).sum()).item()
+                or 0
+            )
             manifest_valid = (
                 required_manifest_columns <= set(manifest.columns)
                 and manifest_codes == parquet_codes
                 and set(manifest["security_type"].drop_nulls().to_list()) <= {"stock", "etf"}
                 and all(is_tw_stock_or_etf(code) for code in manifest_codes)
-                and set(manifest["source"].drop_nulls().to_list()) == {"twse_tpex_official"}
+                and bool(manifest_sources)
+                and manifest_sources <= APPROVED_FILE_SOURCES
             )
         except Exception:
             manifest_valid = False
+    fallback_rows = int(summary.get("fallback_rows", -1))
+    fallback_adjustment_rows = int(summary.get("fallback_adjustment_rows", -1))
+    fallback_symbols = int(summary.get("fallback_symbols", -1))
+    uses_fallback = fallback_rows > 0 or fallback_adjustment_rows > 0
+    expected_source = MIXED_QUOTE_SOURCE if uses_fallback else OFFICIAL_QUOTE_SOURCE
     checks: dict[str, bool] = {
-        "source": summary.get("source") == "twse_tpex_official",
+        "source": summary.get("source") == expected_source,
         "adjusted_method": str(summary.get("adjusted_price_method", "")).startswith("first=10;"),
         "all_adjustments_resolved": int(summary.get("missing_adjustment_rows", -1)) == 0,
         "source_receipts": all(source.exists() for source in source_paths)
         and summary.get("source_receipts") == [_file_content_receipt(source) for source in source_paths],
         "legacy_source_identity": bool(legacy_source_name) == bool(legacy_receipts),
         "legacy_source_receipts": legacy_receipts_valid,
+        "fallback_source_identity": (
+            bool(fallback_source_name) == bool(fallback_receipts)
+            and (not fallback_receipts or fallback_source_name == YAHOO_FALLBACK_SOURCE)
+        ),
+        "fallback_source_receipts": fallback_receipts_valid,
+        "fallback_converter_receipts": fallback_converter_receipts_valid,
+        "fallback_usage_counts": (
+            fallback_rows >= 0
+            and fallback_adjustment_rows >= 0
+            and fallback_symbols >= 0
+            and fallback_symbols == manifest_fallback_symbols
+            and uses_fallback == (fallback_symbols > 0)
+            and (bool(fallback_receipts) or not uses_fallback)
+        ),
         "stock_etf_manifest": manifest_valid,
         "symbol_count": int(summary.get("symbols", -1))
         == len(list(parquet_root.glob("*_features.parquet"))),
@@ -832,8 +1027,8 @@ def audit_official_symbol_build(
             "quote_sources",
             str(path),
             f"failed_checks={[name for name, passed in checks.items() if not passed]}",
-            "The per-symbol prices are stale, incomplete, or not exclusively official.",
-            "Rebuild symbol parquets after completing official OHLCV and corporate-action downloads.",
+            "The per-symbol prices are stale, incomplete, or outside the approved official-first lineage.",
+            "Rebuild symbol parquets after completing official downloads and the audited Yahoo fallback conversion.",
         )
     ]
 
@@ -883,7 +1078,7 @@ def audit_return_price_provenance(parquet_root: Path) -> tuple[dict[str, Any], l
             "adjclose",
             f"symbols={len(raw_symbols)}, examples={raw_symbols[:20]}",
             "Raw official close omits distributions and is not a total-return reference index.",
-            "Import a provenance-backed TWSE/TPEx legacy archive and reconstruct the normalized reference-return index.",
+            "Use a provenance-backed TWSE/TPEx archive or the audited 2000+ Yahoo fallback and reconstruct the normalized reference-return index.",
         )
     ]
 
@@ -912,7 +1107,7 @@ def audit_walk_forward_availability(
                 "expected_first_year",
                 f"expected={int(expected_first_year)}, actual={unique_years[0] if unique_years else None}",
                 "Fold IDs no longer refer to the same validation and test years as the original experiment.",
-                "Backfill the missing TWSE/TPEx official years; do not change the expected year to hide the gap.",
+                "Backfill with official data first and the audited 2000+ Yahoo OHLCV fallback where official rows do not exist; do not renumber folds.",
             )
         )
     if config.walk_forward.require_contiguous_years and missing_years:
@@ -1227,6 +1422,9 @@ def audit_source_receipts(
         "public_download_summary": str(public_path),
         "public_download_mode": public_receipt.get("mode") if public_receipt else None,
         "public_download_failed_count": public_receipt.get("failed_count") if public_receipt else None,
+        "public_download_coverage_complete": (
+            public_receipt.get("coverage_complete") if public_receipt else None
+        ),
     }
     if public_receipt is None:
         findings.append(
@@ -1254,16 +1452,23 @@ def audit_source_receipts(
                     "Repair every failed dataset before rebuilding features.",
                 )
             )
-        if str(public_receipt.get("mode", "")) != "full":
+        legacy_full_receipt = (
+            "coverage_complete" not in public_receipt
+            and str(public_receipt.get("mode", "")) == "full"
+        )
+        if public_receipt.get("coverage_complete") is not True and not legacy_full_receipt:
             findings.append(
                 Finding(
-                    "medium",
-                    "non_full_public_download_receipt",
+                    "critical",
+                    "incomplete_public_download_coverage",
                     "source_receipt",
                     str(public_path),
-                    f"mode={public_receipt.get('mode')!r}",
-                    "A daily update receipt does not prove historical reconstruction completed.",
-                    "Use --operation from-zero or full public repair for a historical completeness receipt.",
+                    (
+                        f"mode={public_receipt.get('mode')!r}, "
+                        f"coverage_complete={public_receipt.get('coverage_complete')!r}"
+                    ),
+                    "The receipt does not prove every requested historical weekday was resolved.",
+                    "Run --mode rebuild or --mode repair until coverage_complete is true.",
                 )
             )
 
@@ -2004,11 +2209,13 @@ def _write_report(
             "",
             "## OHLCV Sources",
             "",
-            "| files | rows | unsupported type | non-official | read/schema errors | duplicate dates | invalid bars/volume | invalid adjclose | origin != 10 | off-calendar | raw close >2x | adjusted >3x |",
-            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| files | rows | Yahoo OHLCV/adjustment rows | unsupported type | unapproved files | lineage errors | read/schema errors | duplicate dates | invalid bars/volume | invalid adjclose | origin != 10 | off-calendar | raw close >2x | adjusted >3x |",
+            "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             f"| {quote_summary.get('files', 0)} | {quote_summary.get('rows', 0)} | "
+            f"{quote_summary.get('yahoo_fallback_rows', 0)}/{quote_summary.get('yahoo_fallback_adjustment_rows', 0)} | "
             f"{quote_summary.get('unsupported_security_files', 0)} | "
-            f"{quote_summary.get('non_official_source_files', 0)} | "
+            f"{quote_summary.get('unapproved_source_files', 0)} | "
+            f"{quote_summary.get('unapproved_data_source_rows', 0) + quote_summary.get('unapproved_adjustment_source_rows', 0) + quote_summary.get('source_lineage_mismatch', 0)} | "
             f"{quote_summary.get('read_errors', 0) + quote_summary.get('schema_errors', 0)} | "
             f"{quote_summary.get('duplicate_dates', 0)} | "
             f"{quote_summary.get('invalid_ohlc_geometry', 0) + quote_summary.get('negative_volume', 0)} | "

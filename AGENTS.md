@@ -443,6 +443,33 @@ Rules:
 
 ## TW Public Execution-Rule Contract
 
+- Use `downloader/download_tw_official_data.py` as the canonical TWSE/TPEx-first
+  data-layer entry point. Its modes are `rebuild` (staged from-zero replacement),
+  `repair` (audit local historical coverage and fetch missing/suspicious dates),
+  and `daily` (verified-baseline incremental update with a recent correction
+  overlap). Daily mode must fail when no completed rebuild/repair baseline exists.
+- Canonical TW OHLCV starts at 2000-01-01. TWSE/TPEx rows always win the same
+  `date + symbol` key. The approved `yahoo_fallback` may fill only otherwise
+  missing stock/ETF OHLCV rows from 2000 onward; it must pass through
+  `scripts/build_tw_yahoo_fallback_archive.py`, preserve row-level `data_source`,
+  preserve `adjustment_source` when Yahoo supplies only a missing return factor,
+  and retain content receipts. Official OHLCV must remain untouched when only its
+  reference/change factor is missing. Yahoo must not fill public features, execution
+  rules, valuation, margin, institutional, lifecycle, or corporate-action data.
+- Fresh TW Yahoo fallback downloads default to one worker and a 1.5-second global
+  request interval. If the bare chart endpoint is rate-limited, the installed
+  yfinance session is the same-provider fallback. Persist
+  `stockagent.yahoo_requested_start`; repair must re-query from 2000 when that
+  historical coverage receipt is absent. Reusing one fixed rebuild stage must
+  skip already-completed atomic symbol files.
+- Historical downloader success is coverage-based, not inferred from receiving
+  any rows. Persist confirmed no-data weekdays separately from request failures;
+  any unresolved date failure must produce a nonzero exit. A failed rebuild must
+  leave production parquet files untouched.
+- Canonical TW stock/ETF symbol files live under `data_tw_public/stocks`. Do not
+  run the former in-place official-to-Yahoo mutation script; the canonical
+  lower-priority archive merge is the only approved Yahoo fallback path.
+
 - Backfill official lifecycle/short-sale announcements with
   `run_fintech_python downloader/download_tw_short_sale_restrictions.py --output-dir data_tw_public --start-year 1995 --end-year <year>`, then rebuild
   `data_tw_public/features/tw_public_stock_daily.parquet` with
