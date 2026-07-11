@@ -944,7 +944,7 @@ def main() -> None:
         expected_first_year=config.walk_forward.expected_first_year,
         require_contiguous_years=config.walk_forward.require_contiguous_years,
     )
-    folds = build_expanding_year_folds(
+    all_folds = build_expanding_year_folds(
         dates=panel.dates,
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
