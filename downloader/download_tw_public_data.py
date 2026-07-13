@@ -2484,7 +2484,9 @@ def _http_get(
         "X-Requested-With": "XMLHttpRequest",
     }
     retry_count = max(0, int(retries))
-    transient_statuses = {403, 408, 429, 500, 502, 503, 504}
+    # TWSE's edge can return a location-less 307 when its rate guard trips.
+    # It is a retryable throttle response, not a successful redirect.
+    transient_statuses = {307, 403, 408, 429, 500, 502, 503, 504}
     last_error: requests.exceptions.RequestException | None = None
     network_attempts = 0
 
@@ -2495,6 +2497,41 @@ def _http_get(
             pass
         return response
 
+    def close_response(response: requests.Response) -> None:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+    def request_once(session: requests.Session, *, verify: bool) -> requests.Response:
+        started = time.monotonic()
+        response = session.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=(timeout, timeout),
+            verify=verify,
+            stream=True,
+        )
+        iter_content = getattr(response, "iter_content", None)
+        if not callable(iter_content):
+            return response
+        try:
+            chunks: list[bytes] = []
+            for chunk in iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    chunks.append(chunk)
+                if time.monotonic() - started > timeout:
+                    raise requests.exceptions.Timeout(
+                        f"response exceeded {timeout}s wall timeout: "
+                        f"{getattr(response, 'url', url)}"
+                    )
+            response._content = b"".join(chunks)
+            response._content_consumed = True
+            return response
+        except BaseException:
+            close_response(response)
+            raise
+
     for attempt in range(retry_count + 1):
         try:
             limiter = _global_tw_public_rate_limiter()
@@ -2502,14 +2539,14 @@ def _http_get(
             session = _http_session()
             try:
                 network_attempts += 1
-                response = session.get(url, params=params, headers=headers, timeout=timeout, verify=verify_ssl)
+                response = request_once(session, verify=verify_ssl)
             except requests.exceptions.SSLError:
                 if not verify_ssl:
                     raise
                 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
                 limiter.wait()
                 network_attempts += 1
-                response = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+                response = request_once(session, verify=False)
             security_block = _response_is_tw_public_security_block(response)
             if security_block:
                 delay = _retry_delay_seconds(response, attempt, retry_backoff)
@@ -2517,11 +2554,13 @@ def _http_get(
                 time.sleep(delay)
                 if not retry_security_blocks or attempt >= retry_count:
                     return annotate_attempts(response)
+                close_response(response)
                 continue
             if response.status_code in transient_statuses and attempt < retry_count:
                 delay = _retry_delay_seconds(response, attempt, retry_backoff)
                 limiter.defer(delay)
                 time.sleep(delay)
+                close_response(response)
                 continue
             response.raise_for_status()
             return annotate_attempts(response)
@@ -2563,6 +2602,8 @@ def _retry_delay_seconds(response: requests.Response | None, attempt: int, retry
             )
         if retry_after_seconds is not None:
             return min(60.0, retry_after_seconds)
+        if response.status_code == 307 and not response.headers.get("Location"):
+            return min(120.0, 30.0 * (2**attempt))
     return max(0.0, float(retry_backoff)) * (2**attempt)
 
 

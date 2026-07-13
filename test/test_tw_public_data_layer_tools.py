@@ -164,6 +164,22 @@ def test_single_vintage_macro_archives_are_quarantined() -> None:
     assert dgbas.severity == "critical"
 
 
+def test_zero_filled_unregistered_feature_has_no_effective_lineage() -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    assert audit_feature_lineage_registry(config) == []
+
+    config.data.feature_zero_fill = [
+        pattern
+        for pattern in config.data.feature_zero_fill
+        if pattern != "twpub_cbc_*"
+    ]
+
+    findings = audit_feature_lineage_registry(config)
+    assert len(findings) == 1
+    assert findings[0].severity == "critical"
+    assert "twpub_cbc_overnight_rate" in findings[0].evidence
+
+
 def test_rule_receipt_is_required_and_machine_checked(tmp_path: Path) -> None:
     config = load_config("configs/markets/tw_public.yaml")
     (tmp_path / "download_summary.json").write_text(

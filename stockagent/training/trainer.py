@@ -8612,6 +8612,62 @@ def _isolate_backtest_runtime_environment(func: Callable[..., Any]) -> Callable[
     return wrapped
 
 
+@contextmanager
+def _dynamo_recompile_budget_for_train_groups(group_count: int):
+    """Temporarily cover intentional fixed-shape graphs for expanding universes.
+
+    The panel-slab model deliberately uses ``dynamic=False``.  Walk-forward
+    train unions therefore create one graph per distinct symbol width, and all
+    wrapper instances share the same Python ``forward`` code object.  Dynamo's
+    default per-code recompile limit (currently 8) is too small for long
+    expanding-universe runs even though each individual group is stable.
+    """
+    try:
+        import torch._dynamo.config as dynamo_config
+
+        current_limit = int(dynamo_config.recompile_limit)
+        required_limit = max(current_limit, max(0, int(group_count)) + 1)
+        patch = dynamo_config.patch
+    except (AttributeError, ImportError, TypeError):
+        # Older PyTorch builds may not expose the patchable setting. Compile
+        # availability is validated separately by _can_enable_torch_compile.
+        yield None
+        return
+    if required_limit == current_limit:
+        yield current_limit
+        return
+    with patch(recompile_limit=required_limit):
+        yield required_limit
+
+
+def _isolate_dynamo_recompile_budget(func: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        bound = inspect.signature(func).bind_partial(*args, **kwargs)
+        folds = list(bound.arguments.get("folds", ()))
+        bound.arguments["folds"] = folds
+        group_count = len({_group_key(fold.train_years) for fold in folds})
+        config = bound.arguments.get("config")
+        compile_requested = bool(
+            config is not None
+            and (
+                getattr(config.training, "enable_torch_compile", False)
+                or getattr(config.training, "auto_torch_compile_sharpe", False)
+            )
+        )
+        if not compile_requested:
+            return func(*bound.args, **bound.kwargs)
+        with _dynamo_recompile_budget_for_train_groups(group_count) as limit:
+            if limit is not None and group_count > 0 and _distributed_is_rank0():
+                print(
+                    "[torch.compile] fixed-shape train-group recompile budget: "
+                    f"groups={group_count} recompile_limit={limit}"
+                )
+            return func(*bound.args, **bound.kwargs)
+
+    return wrapped
+
+
 def _training_loss_portfolio_activation(config: ExperimentConfig) -> str:
     activation = str(getattr(config.training, "loss_portfolio_activation", "auto")).strip().lower().replace("-", "_")
     if activation in {"", "auto", "trading", "same", "same_as_trading"}:
@@ -10992,6 +11048,7 @@ def run_inference(
 
 
 @_isolate_backtest_runtime_environment
+@_isolate_dynamo_recompile_budget
 def run_training(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -11740,11 +11797,17 @@ def run_training(
         compiled_train_model: nn.Module = model
         eval_model: nn.Module = model
         panel_slab_model: nn.Module | None = None
+        eval_panel_slab_model: nn.Module | None = None
         panel_slab_compile_status = "off"
         ddp_enabled = bool(distributed_data_parallel_enabled)
         ddp_panel_slab_enabled = bool(ddp_enabled and _model_supports_panel_slab_forward(model))
         if _model_supports_panel_slab_forward(model):
             panel_slab_model = _PanelSlabForwardWrapper(model)
+            # Keep eval eager and separate from the train-only compiled
+            # wrapper. Evaluation runs under inference_mode; sharing the
+            # compiled wrapper would add a grad_mode graph variant for every
+            # expanding symbol width and exhaust Dynamo's recompile budget.
+            eval_panel_slab_model = _PanelSlabForwardWrapper(model)
             panel_slab_compile_status = "eager"
         if ddp_enabled:
             print(
@@ -12506,7 +12569,7 @@ def run_training(
         )
 
         eval_model_status = (
-            "eager_with_compiled_panel_slab"
+            "eager_panel_slab_separate_from_compiled_train"
             if panel_slab_compile_status.startswith("compiled")
             else "compiled"
             if eval_model is not model
@@ -12760,7 +12823,7 @@ def run_training(
             )
             test_bt_t, test_ic, test_met = _evaluate_windowed_tensor_batch(
                 final_eval_model,
-                panel_slab_model,
+                eval_panel_slab_model,
                 test_windowed,
                 device,
                 amp_dtype,
@@ -13124,7 +13187,7 @@ def run_training(
                 val_eval_start = time.perf_counter()
                 val_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                     eval_model,
-                    panel_slab_model,
+                    eval_panel_slab_model,
                     combined_val_windowed,
                     device,
                     amp_dtype,
@@ -13244,7 +13307,7 @@ def run_training(
                 else:
                     test_backtest_epoch, _, _ = _evaluate_windowed_tensor_batch(
                         eval_model,
-                        panel_slab_model,
+                        eval_panel_slab_model,
                         combined_test_windowed,
                         device,
                         amp_dtype,
@@ -13609,6 +13672,7 @@ def run_training(
             compiled_train_model = None
             eval_model = None
             panel_slab_model = None
+            eval_panel_slab_model = None
             optimizer = None
             scaler = None
             scheduler = None
@@ -13659,7 +13723,7 @@ def run_training(
                 )
                 val_bt_t, val_ic, val_met = _evaluate_windowed_tensor_batch(
                     eval_model,
-                    panel_slab_model,
+                    eval_panel_slab_model,
                     val_windowed,
                     device,
                     amp_dtype,
@@ -13687,7 +13751,7 @@ def run_training(
                 )
                 test_bt_t, test_ic, test_met = _evaluate_windowed_tensor_batch(
                     eval_model,
-                    panel_slab_model,
+                    eval_panel_slab_model,
                     test_windowed,
                     device,
                     amp_dtype,
