@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import json
 import multiprocessing as mp
 from pathlib import Path
 import queue
@@ -12,6 +13,28 @@ import pytest
 import torch
 
 import train as train_entry
+
+
+def test_startup_timing_buffers_until_output_path_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("STOCKAGENT_ROOT_LAUNCH_MONOTONIC_NS", raising=False)
+    monkeypatch.delenv("STOCKAGENT_RUN_ID", raising=False)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    recorder = train_entry._StartupTimingRecorder()
+    recorder.checkpoint("config", config="tw_public")
+    path = tmp_path / "startup_timing.jsonl"
+
+    recorder.bind(path)
+    recorder.checkpoint("panel", rows=123)
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["stage"] for record in records] == ["config", "panel"]
+    assert records[0]["world_size"] == 2
+    assert records[1]["rows"] == 123
+    assert records[1]["cumulative_s"] >= records[0]["cumulative_s"]
 
 
 def test_auto_multi_gpu_strategy_tracks_visible_device_count(
