@@ -1774,6 +1774,7 @@ def test_compile_probe_uses_fixed_aux_shape_and_restores_rng_and_gradients() -> 
     model = _RequiredAuxTrainModel()
     torch.manual_seed(1234)
     rng_before = torch.get_rng_state().clone()
+    observed_output_dtypes: list[torch.dtype] = []
 
     ok, error = _probe_compiled_train_forward(
         model,
@@ -1788,11 +1789,13 @@ def test_compile_probe_uses_fixed_aux_shape_and_restores_rng_and_gradients() -> 
         factor_aug_kwargs=None,
         direction_weight=0.0,
         volatility_regime_weight=0.0,
+        observed_output_dtypes=observed_output_dtypes,
     )
 
     assert ok, error
     assert torch.equal(torch.get_rng_state(), rng_before)
     assert model.return_aux_requests == [True]
+    assert observed_output_dtypes == [torch.float32]
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
@@ -1917,10 +1920,12 @@ def test_compiled_loss_probe_executes_rules_and_backward_at_fixed_batch_shape() 
         loss_kwargs={},
         max_volume_participation=0.0,
         volume_participation_equity=1_000_000.0,
+        weights_dtype=torch.float64,
     )
 
     assert ok, error
     assert captured["weights"].shape == (4, panel.num_symbols)
+    assert captured["weights"].dtype == torch.float64
     assert captured["weights"].grad is not None
     assert bool(captured["force_exit"][0, 0]) is True
 
@@ -3143,6 +3148,32 @@ def test_distributed_compile_and_auto_batch_consensus_observe_remote_minimum(mon
     # failure and take the same fallback/strict branch on every rank.
     assert not _distributed_probe_succeeded(True, torch.device("cpu"))
     assert _distributed_min_int(32, torch.device("cpu")) == 24
+
+
+def test_rank_ordered_compile_probe_runs_once_on_each_rank_turn(monkeypatch) -> None:
+    monkeypatch.setattr(trainer_module, "_distributed_is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 3)
+    monkeypatch.setattr(trainer_module, "_distributed_rank", lambda: 1)
+    events: list[str] = []
+    monkeypatch.setattr(
+        trainer_module,
+        "_distributed_barrier",
+        lambda: events.append("barrier"),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "_distributed_probe_succeeded",
+        lambda local_success, device: bool(local_success),
+    )
+
+    ok, error = trainer_module._run_distributed_compile_probe(
+        lambda: (events.append("probe") or True, None),
+        device=torch.device("cpu"),
+        rank_ordered=True,
+    )
+
+    assert ok and error is None
+    assert events == ["barrier", "probe", "barrier", "barrier"]
 
 
 def test_rank0_final_artifact_failure_is_raised_on_waiting_worker(monkeypatch) -> None:

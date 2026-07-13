@@ -247,7 +247,10 @@ training:
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: auto
+  # Measured on the active 2x RTX 5090 setup: auto always selects 64 after a
+  # ~4.9s full-universe VRAM probe. Pin the verified result so 21 train groups
+  # do not repeat the same probe; re-run auto when hardware/model shape changes.
+  eval_model_chunk_rows: 64
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   # Keep train model/loss compile on. Eval backtest scan compile stalls in
@@ -257,6 +260,10 @@ training:
   # Explicit comparison knob: train_union changes the training symbol universe
   # to the fold's active-symbol union; set none for full-symbol parity runs.
   train_symbol_compaction: train_union
+  # Keep 0 to resume the existing all-available checkpoints exactly. For a new
+  # artifact root trained from scratch, 512 reduces 21 symbol shapes
+  # (1237..2658) to 1536/2048/2560/2735 at about 10.4% extra masked-token work.
+  train_symbol_compaction_bucket_size: 0
   backtest_autotune: true
   backtest_compile: true
   backtest_compile_stateful: true
@@ -510,7 +517,8 @@ training:
     # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
     # two-epoch benchmark, using epoch 2 only: temporal_layers=1,
     # temporal_heads=1, temporal_ffn_mult=1, d_model=16, cross_heads=2, and
-    # eval_model_chunk_rows=auto reduced epoch wall from 20.16s to 4.93s while
+    # eval_model_chunk_rows=64 (originally selected by auto) reduced epoch wall
+    # from 20.16s to 4.93s while
     # preserving attention pooling semantics. Adding train_symbol_compaction:
     # train_union then reduced epoch-2 wall to 3.72s and train time to
     # 175.1ms/batch on fold18 by training only the fold's active symbol union.
