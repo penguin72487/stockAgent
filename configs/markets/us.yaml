@@ -5,7 +5,7 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 1
+  start_fold: 20
 environment:
   device: cuda
   use_tensor_cores: true
@@ -70,8 +70,8 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size_train: 8
-  batch_size_eval: 8
+  batch_size_train: 256
+  batch_size_eval: 256
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -255,12 +255,16 @@ training:
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
+    # latent_only: temporal + latent factors without market tokens
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
     attention_mode: market_token
+    # Independent compact-bottleneck switches; null falls back to attention_mode.
+    use_latent_factors: null
+    use_market_tokens: null
     use_flash_attention: true
     use_time_pos: true
-    use_symbol_pos: true
+    use_symbol_pos: false
     input_dropout: 0.0
     # build_panel guarantees finite features; retain BF16 after projection and
     # prevent FP32 position parameters from upcasting the full residual stream.

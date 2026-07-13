@@ -33,6 +33,24 @@ from stockagent.data.tw_public_features import (
     _symbol_universe_receipt,
 )
 from stockagent.data.tw_security import classify_tw_stock_or_etf, is_tw_stock_or_etf
+from scripts.build_tw_official_symbol_parquets import (
+    LIFECYCLE_EVIDENCE_FILENAMES,
+    OFFICIAL_SYMBOL_ADJUSTED_PRICE_METHOD,
+    OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION,
+    RETURN_QUARANTINE_REASONS,
+    _load_verified_taiex_session_calendar,
+    _official_symbol_source_paths,
+    _validate_yahoo_fallback_archive,
+)
+from downloader.download_tw_public_data import (
+    DEFAULT_DATASETS,
+    HistoricalResponseError,
+    TAIEX_SESSION_CALENDAR_DATASET,
+    TPEX_OFFICIAL_CALENDAR_DATASET,
+    _parse_tpex_daily_quotes_html,
+    _validated_source_unavailable_receipt_dates,
+    _validated_taiex_session_dates,
+)
 
 
 BASE_FEATURES = {
@@ -90,12 +108,12 @@ HISTORICAL_SOURCES = (
     ),
     HistoricalSourceExpectation(
         "twse_daily_valuation",
-        "2004-02-11",
+        "2005-09-02",
         ("twpub_pe_log", "twpub_pb_log", "twpub_dividend_yield"),
     ),
     HistoricalSourceExpectation(
         "tpex_daily_valuation",
-        "2007-01-01",
+        "2003-08-01",
         ("twpub_pe_log", "twpub_pb_log", "twpub_dividend_yield"),
     ),
     HistoricalSourceExpectation(
@@ -105,7 +123,7 @@ HISTORICAL_SOURCES = (
     ),
     HistoricalSourceExpectation(
         "tpex_margin_balance",
-        "2007-01-01",
+        "2003-08-01",
         ("twpub_margin_*", "twpub_short_*"),
     ),
     HistoricalSourceExpectation(
@@ -120,7 +138,7 @@ HISTORICAL_SOURCES = (
     ),
     HistoricalSourceExpectation(
         "tpex_institutional_trades",
-        "2007-04-20",
+        "2004-06-01",
         (
             "twpub_foreign_*",
             "twpub_investment_trust_*",
@@ -195,6 +213,11 @@ class SourceProfile:
     expected_sessions: int
     covered_sessions: int
     session_coverage: float | None
+    observed_sessions: int
+    observed_session_coverage: float | None
+    source_unavailable_sessions: int
+    resolved_sessions: int
+    resolved_session_coverage: float | None
     selected_features: str
     quarantined: bool
 
@@ -246,33 +269,42 @@ def _benchmark_sessions(
     root: Path,
     benchmark_name: str,
     public_feature_path: Path | None = None,
+    public_dir: Path | None = None,
+    expected_first_year: int | None = None,
+    panel_start_date: str | None = None,
 ) -> np.ndarray:
     path = root / f"{benchmark_name}_features.parquet"
     if not path.exists():
         raise FileNotFoundError(f"benchmark parquet is missing: {path}")
-    frame = pl.read_parquet(path, columns=["date"]).select(
-        _date_column_expr("date").alias("date")
-    )
-    values = frame.drop_nulls("date").unique("date").sort("date").get_column("date")
-    sessions = np.asarray(values.to_numpy(), dtype="datetime64[D]")
-    if public_feature_path is not None and public_feature_path.exists():
-        schema = set(pq.read_schema(public_feature_path).names)
-        if {"date", "symbol", "_twpub_official_traded"} <= schema:
-            official = (
-                pl.scan_parquet(public_feature_path)
-                .filter(pl.col("_twpub_official_traded").cast(pl.Float64, strict=False).fill_null(0.0) > 0.0)
-                .select(_date_column_expr("date").alias("date"))
-                .drop_nulls("date")
-                .unique("date")
-                .sort("date")
-                .collect()
+    if public_dir is None:
+        if public_feature_path is None:
+            raise ValueError(
+                "public_dir or public_feature_path is required for the official session calendar"
             )
-            if not official.is_empty():
-                sessions = np.union1d(
-                    sessions,
-                    np.asarray(official["date"].to_numpy(), dtype="datetime64[D]"),
-                )
-    return sessions
+        public_dir = public_feature_path.parent.parent
+    calendar, _, _ = _load_verified_taiex_session_calendar(public_dir)
+    if panel_start_date:
+        calendar = calendar.filter(
+            pl.col("date") >= date.fromisoformat(str(panel_start_date))
+        )
+    elif expected_first_year is not None:
+        calendar = calendar.filter(
+            pl.col("date") >= date(int(expected_first_year), 1, 1)
+        )
+    else:
+        benchmark_first = (
+            pl.scan_parquet(path)
+            .select(_date_column_expr("date").alias("date"))
+            .drop_nulls("date")
+            .select(pl.col("date").min())
+            .collect()
+            .item()
+        )
+        if benchmark_first is not None:
+            calendar = calendar.filter(pl.col("date") >= benchmark_first)
+    if calendar.is_empty():
+        raise ValueError("receipt-verified TAIEX session calendar is empty")
+    return np.asarray(calendar["date"].to_numpy(), dtype="datetime64[D]")
 
 
 def audit_delisted_universe_coverage(
@@ -449,7 +481,11 @@ def audit_delisted_universe_coverage(
     return profiles, missing_rows, findings
 
 
-def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, Any]:
+def _audit_quote_file(
+    path: Path,
+    benchmark_sessions: np.ndarray,
+    source_sessions: np.ndarray | None = None,
+) -> dict[str, Any]:
     symbol = path.name.removesuffix("_features.parquet")
     security_type = classify_tw_stock_or_etf(symbol)
     required = ("date", "open", "max", "min", "close", "adjclose", "Trading_Volume")
@@ -470,11 +506,29 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
             }
         has_data_source = "data_source" in schema
         has_adjustment_source = "adjustment_source" in schema
+        has_ohlc_normalization = "ohlc_normalization" in schema
+        has_fallback_reason = "fallback_reason" in schema
+        has_return_quarantined = "return_quarantined" in schema
+        has_return_quarantine_reason = "return_quarantine_reason" in schema
+        has_lifecycle_episode_id = "lifecycle_episode_id" in schema
+        has_official_listing_evidence = "official_listing_evidence" in schema
         read_columns = list(required)
         if has_data_source:
             read_columns.append("data_source")
         if has_adjustment_source:
             read_columns.append("adjustment_source")
+        if has_ohlc_normalization:
+            read_columns.append("ohlc_normalization")
+        if has_fallback_reason:
+            read_columns.append("fallback_reason")
+        if has_return_quarantined:
+            read_columns.append("return_quarantined")
+        if has_return_quarantine_reason:
+            read_columns.append("return_quarantine_reason")
+        if has_lifecycle_episode_id:
+            read_columns.append("lifecycle_episode_id")
+        if has_official_listing_evidence:
+            read_columns.append("official_listing_evidence")
         select_expressions: list[pl.Expr] = [
             _date_column_expr("date").alias("date"),
             *[
@@ -496,6 +550,47 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
                 .str.strip_chars()
                 .alias("adjustment_source")
             )
+        if has_ohlc_normalization:
+            select_expressions.append(
+                pl.col("ohlc_normalization")
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("ohlc_normalization")
+            )
+        if has_fallback_reason:
+            select_expressions.append(
+                pl.col("fallback_reason")
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("fallback_reason")
+            )
+        if has_return_quarantined:
+            select_expressions.append(
+                pl.col("return_quarantined")
+                .cast(pl.Boolean, strict=False)
+                .fill_null(False)
+                .alias("return_quarantined")
+            )
+        if has_return_quarantine_reason:
+            select_expressions.append(
+                pl.col("return_quarantine_reason")
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("return_quarantine_reason")
+            )
+        if has_lifecycle_episode_id:
+            select_expressions.append(
+                pl.col("lifecycle_episode_id")
+                .cast(pl.Int64, strict=False)
+                .alias("lifecycle_episode_id")
+            )
+        if has_official_listing_evidence:
+            select_expressions.append(
+                pl.col("official_listing_evidence")
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("official_listing_evidence")
+            )
         frame = pl.read_parquet(path, columns=read_columns).select(select_expressions)
     except Exception as exc:
         return {
@@ -515,9 +610,12 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
     )
     outside_panel_range = int(valid_dates.height - in_panel_range.height)
     duplicate_dates = int(in_panel_range.height - in_panel_range["date"].n_unique())
+    calendar_sessions = (
+        benchmark_sessions if source_sessions is None else source_sessions
+    )
     off_calendar_rows = int(
-        in_panel_range.select(
-            (~pl.col("date").is_in(benchmark_sessions.astype(object).tolist())).sum()
+        valid_dates.select(
+            (~pl.col("date").is_in(calendar_sessions.astype(object).tolist())).sum()
         ).item()
         or 0
     )
@@ -610,6 +708,265 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
             )
         )
     )
+    unapproved_ohlc_normalization_rows = 0
+    invalid_flat_bar_normalization_rows = 0
+    audited_data_source = (
+        pl.col("data_source")
+        if has_data_source
+        else pl.lit(None, dtype=pl.String)
+    )
+    if has_ohlc_normalization:
+        normalization = pl.col("ohlc_normalization")
+        unapproved_ohlc_normalization_rows = int(
+            frame.select(
+                (~normalization.is_null() & (normalization != "official_close_flat_bar"))
+                .sum()
+            ).item()
+            or 0
+        )
+        invalid_flat_bar_normalization_rows = int(
+            frame.select(
+                (
+                    (normalization == "official_close_flat_bar")
+                    & (
+                        (pl.col("open") != pl.col("close"))
+                        | (pl.col("max") != pl.col("close"))
+                        | (pl.col("min") != pl.col("close"))
+                        | (audited_data_source == YAHOO_FALLBACK_SOURCE)
+                    )
+                )
+                .fill_null(False)
+                .sum()
+            ).item()
+            or 0
+        )
+    unapproved_fallback_reason_rows = 0
+    fallback_reason_lineage_mismatch = 0
+    fallback_reason_rows = 0
+    if has_fallback_reason:
+        fallback_reason = pl.col("fallback_reason")
+        fallback_reason_rows = int(
+            frame.select((fallback_reason == "official_ohlcv_unusable").sum()).item()
+            or 0
+        )
+        unapproved_fallback_reason_rows = int(
+            frame.select(
+                (
+                    ~fallback_reason.is_null()
+                    & (fallback_reason != "official_ohlcv_unusable")
+                ).sum()
+            ).item()
+            or 0
+        )
+        fallback_reason_lineage_mismatch = int(
+            frame.select(
+                (
+                    (fallback_reason == "official_ohlcv_unusable")
+                    & (audited_data_source != YAHOO_FALLBACK_SOURCE)
+                )
+                .fill_null(False)
+                .sum()
+            ).item()
+            or 0
+        )
+
+    return_quarantined_rows = 0
+    lifecycle_episode_quarantined_rows = 0
+    listing_boundary_quarantined_rows = 0
+    unverified_extreme_quarantined_rows = 0
+    unapproved_return_quarantine_reason_rows = 0
+    return_quarantine_lineage_mismatch = 0
+    return_quarantine_evidence_mismatch = 0
+    validated_quarantine_source_dates: set[date] = set()
+    return_quarantine_schema_mismatch = int(
+        source in APPROVED_FILE_SOURCES
+        and not (has_return_quarantined and has_return_quarantine_reason)
+    )
+    return_quarantine_evidence_schema_mismatch = int(
+        source in APPROVED_FILE_SOURCES
+        and not (has_lifecycle_episode_id and has_official_listing_evidence)
+    )
+    if has_return_quarantined and has_return_quarantine_reason:
+        quarantine_reason_present = (
+            pl.col("return_quarantine_reason").is_not_null()
+            & (pl.col("return_quarantine_reason") != "")
+        )
+        approved_quarantine_reason = pl.col("return_quarantine_reason").is_in(
+            sorted(RETURN_QUARANTINE_REASONS)
+        )
+        return_quarantined_rows = int(
+            frame.select(pl.col("return_quarantined").sum()).item() or 0
+        )
+        lifecycle_episode_quarantined_rows = int(
+            frame.select(
+                (
+                    pl.col("return_quarantined")
+                    & (
+                        pl.col("return_quarantine_reason")
+                        == "official_lifecycle_episode_boundary"
+                    )
+                ).sum()
+            ).item()
+            or 0
+        )
+        listing_boundary_quarantined_rows = int(
+            frame.select(
+                (
+                    pl.col("return_quarantined")
+                    & (
+                        pl.col("return_quarantine_reason")
+                        == "official_listing_boundary"
+                    )
+                ).sum()
+            ).item()
+            or 0
+        )
+        unverified_extreme_quarantined_rows = int(
+            frame.select(
+                (
+                    pl.col("return_quarantined")
+                    & (
+                        pl.col("return_quarantine_reason")
+                        == "unverified_extreme_adjusted_return"
+                    )
+                ).sum()
+            ).item()
+            or 0
+        )
+        unapproved_return_quarantine_reason_rows = int(
+            frame.select(
+                (quarantine_reason_present & ~approved_quarantine_reason)
+                .fill_null(False)
+                .sum()
+            ).item()
+            or 0
+        )
+
+        # Validate both directions of the label-isolation contract.  A
+        # whitelist reason is not evidence by itself: it must match the next
+        # quote row that the source row's forward return targets.  Conversely,
+        # every lifecycle/listing boundary (and every unverified >3x Yahoo
+        # transition) must have the exact precedence-selected source reason.
+        full_ordered = (
+            valid_dates.drop_nulls("close")
+            .filter(pl.col("close").is_finite() & (pl.col("close") > 0))
+            .sort("date")
+            .unique("date", keep="last", maintain_order=True)
+        )
+        if full_ordered.height:
+            quarantine_flags = np.asarray(
+                full_ordered["return_quarantined"].to_numpy(), dtype=bool
+            )
+            quarantine_reasons = full_ordered[
+                "return_quarantine_reason"
+            ].to_list()
+            episode_ids = (
+                full_ordered["lifecycle_episode_id"].to_list()
+                if has_lifecycle_episode_id
+                else [None] * full_ordered.height
+            )
+            listing_evidence = (
+                full_ordered["official_listing_evidence"].to_list()
+                if has_official_listing_evidence
+                else [None] * full_ordered.height
+            )
+            data_sources = (
+                full_ordered["data_source"].to_list()
+                if has_data_source
+                else [None] * full_ordered.height
+            )
+            adjustment_sources = (
+                full_ordered["adjustment_source"].to_list()
+                if has_adjustment_source
+                else [None] * full_ordered.height
+            )
+            adjusted_values = np.asarray(
+                full_ordered["adjclose"].to_numpy(), dtype=np.float64
+            )
+            ordered_dates = full_ordered["date"].to_list()
+
+            for source_index in range(full_ordered.height):
+                actual_reason = (
+                    str(quarantine_reasons[source_index] or "").strip()
+                    if quarantine_flags[source_index]
+                    else ""
+                )
+                if source_index + 1 >= full_ordered.height:
+                    if actual_reason:
+                        return_quarantine_evidence_mismatch += 1
+                    continue
+
+                destination_index = source_index + 1
+                current_episode = episode_ids[source_index]
+                next_episode = episode_ids[destination_index]
+                episode_boundary = (
+                    current_episode is not None
+                    and next_episode is not None
+                    and current_episode != next_episode
+                )
+                destination_listing_evidence = str(
+                    listing_evidence[destination_index] or ""
+                ).strip()
+                listing_boundary = bool(destination_listing_evidence)
+                current_adjusted = adjusted_values[source_index]
+                next_adjusted = adjusted_values[destination_index]
+                extreme_transition = bool(
+                    math.isfinite(current_adjusted)
+                    and math.isfinite(next_adjusted)
+                    and current_adjusted > 0.0
+                    and next_adjusted > 0.0
+                    and abs(math.log(next_adjusted / current_adjusted))
+                    > math.log(3.0) + 1e-9
+                )
+                destination_uses_yahoo = (
+                    str(data_sources[destination_index] or "").strip()
+                    == YAHOO_FALLBACK_SOURCE
+                    or str(adjustment_sources[destination_index] or "").strip()
+                    == YAHOO_FALLBACK_SOURCE
+                )
+                # Non-canonical fixtures without lineage columns may still
+                # prove the numerical extreme. Approved official files must
+                # carry both lineage columns and cannot use this compatibility
+                # allowance.
+                unverified_lineage = destination_uses_yahoo or (
+                    source not in APPROVED_FILE_SOURCES
+                    and not has_data_source
+                    and not has_adjustment_source
+                )
+
+                expected_reason = ""
+                if episode_boundary:
+                    expected_reason = "official_lifecycle_episode_boundary"
+                elif listing_boundary:
+                    expected_reason = "official_listing_boundary"
+                elif extreme_transition and unverified_lineage:
+                    expected_reason = "unverified_extreme_adjusted_return"
+
+                if actual_reason != expected_reason:
+                    if actual_reason or expected_reason:
+                        return_quarantine_evidence_mismatch += 1
+                    continue
+                if actual_reason:
+                    validated_quarantine_source_dates.add(
+                        ordered_dates[source_index]
+                    )
+        return_quarantine_lineage_mismatch = int(
+            frame.select(
+                (
+                    (
+                        pl.col("return_quarantined")
+                        & ~approved_quarantine_reason.fill_null(False)
+                    )
+                    | (
+                        ~pl.col("return_quarantined")
+                        & quarantine_reason_present
+                    )
+                )
+                .fill_null(False)
+                .sum()
+            ).item()
+            or 0
+        )
 
     ordered = (
         in_panel_range.drop_nulls("close")
@@ -619,6 +976,8 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
     )
     raw_close_jumps_gt_2x = 0
     adjusted_index_jumps_gt_3x = 0
+    quarantined_adjusted_index_jumps_gt_3x = 0
+    unresolved_adjusted_index_jumps_gt_3x = 0
     if ordered.height > 1:
         dates = np.asarray(ordered["date"].to_numpy(), dtype="datetime64[D]")
         close = np.asarray(ordered["close"].to_numpy(), dtype=np.float64)
@@ -642,12 +1001,26 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
         adjusted_log_change[valid_adjusted_pair] = np.abs(
             np.log(adjusted[1:][valid_adjusted_pair] / adjusted[:-1][valid_adjusted_pair])
         )
-        adjusted_index_jumps_gt_3x = int(
-            np.count_nonzero(
-                consecutive
-                & valid_adjusted_pair
-                & (adjusted_log_change > math.log(3.0) + 1e-9)
+        extreme_adjusted = (
+            consecutive
+            & valid_adjusted_pair
+            & (adjusted_log_change > math.log(3.0) + 1e-9)
+        )
+        adjusted_index_jumps_gt_3x = int(np.count_nonzero(extreme_adjusted))
+        if has_return_quarantined and has_return_quarantine_reason:
+            approved_source_quarantine = np.asarray(
+                [
+                    value in validated_quarantine_source_dates
+                    for value in ordered["date"].to_list()
+                ],
+                dtype=bool,
             )
+            quarantined_adjusted_index_jumps_gt_3x = int(
+                np.count_nonzero(extreme_adjusted & approved_source_quarantine[:-1])
+            )
+        unresolved_adjusted_index_jumps_gt_3x = (
+            adjusted_index_jumps_gt_3x
+            - quarantined_adjusted_index_jumps_gt_3x
         )
     return {
         "symbol": symbol,
@@ -657,11 +1030,37 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
         "source": source,
         "has_data_source": has_data_source,
         "has_adjustment_source": has_adjustment_source,
+        "has_ohlc_normalization": has_ohlc_normalization,
+        "has_fallback_reason": has_fallback_reason,
+        "has_return_quarantined": has_return_quarantined,
+        "has_return_quarantine_reason": has_return_quarantine_reason,
         "yahoo_fallback_rows": fallback_rows,
         "yahoo_fallback_adjustment_rows": fallback_adjustment_rows,
         "unapproved_data_source_rows": unapproved_data_source_rows,
         "unapproved_adjustment_source_rows": unapproved_adjustment_source_rows,
         "source_lineage_mismatch": source_lineage_mismatch,
+        "fallback_reason_rows": fallback_reason_rows,
+        "unapproved_fallback_reason_rows": unapproved_fallback_reason_rows,
+        "fallback_reason_lineage_mismatch": fallback_reason_lineage_mismatch,
+        "return_quarantined_rows": return_quarantined_rows,
+        "lifecycle_episode_quarantined_rows": (
+            lifecycle_episode_quarantined_rows
+        ),
+        "listing_boundary_quarantined_rows": listing_boundary_quarantined_rows,
+        "unverified_extreme_quarantined_rows": (
+            unverified_extreme_quarantined_rows
+        ),
+        "unapproved_return_quarantine_reason_rows": (
+            unapproved_return_quarantine_reason_rows
+        ),
+        "return_quarantine_lineage_mismatch": return_quarantine_lineage_mismatch,
+        "return_quarantine_evidence_mismatch": return_quarantine_evidence_mismatch,
+        "return_quarantine_schema_mismatch": return_quarantine_schema_mismatch,
+        "return_quarantine_evidence_schema_mismatch": (
+            return_quarantine_evidence_schema_mismatch
+        ),
+        "unapproved_ohlc_normalization_rows": unapproved_ohlc_normalization_rows,
+        "invalid_flat_bar_normalization_rows": invalid_flat_bar_normalization_rows,
         "rows": rows,
         "audited_rows": int(in_panel_range.height),
         "outside_panel_range_rows": outside_panel_range,
@@ -677,6 +1076,12 @@ def _audit_quote_file(path: Path, benchmark_sessions: np.ndarray) -> dict[str, A
         "negative_volume": negative_volume,
         "raw_close_jumps_gt_2x": raw_close_jumps_gt_2x,
         "adjusted_index_jumps_gt_3x": adjusted_index_jumps_gt_3x,
+        "quarantined_adjusted_index_jumps_gt_3x": (
+            quarantined_adjusted_index_jumps_gt_3x
+        ),
+        "unresolved_adjusted_index_jumps_gt_3x": (
+            unresolved_adjusted_index_jumps_gt_3x
+        ),
     }
 
 
@@ -686,12 +1091,17 @@ def audit_quote_source_files(
     *,
     workers: int = 16,
     require_official: bool = False,
+    source_sessions: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[Finding]]:
     paths = sorted(parquet_root.glob("*_features.parquet"))
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
         profiles = list(
             executor.map(
-                lambda path: _audit_quote_file(path, benchmark_sessions),
+                lambda path: _audit_quote_file(
+                    path,
+                    benchmark_sessions,
+                    source_sessions,
+                ),
                 paths,
             )
         )
@@ -727,8 +1137,24 @@ def audit_quote_source_files(
         "unapproved_data_source_rows",
         "unapproved_adjustment_source_rows",
         "source_lineage_mismatch",
+        "fallback_reason_rows",
+        "unapproved_fallback_reason_rows",
+        "fallback_reason_lineage_mismatch",
+        "return_quarantined_rows",
+        "lifecycle_episode_quarantined_rows",
+        "listing_boundary_quarantined_rows",
+        "unverified_extreme_quarantined_rows",
+        "unapproved_return_quarantine_reason_rows",
+        "return_quarantine_lineage_mismatch",
+        "return_quarantine_evidence_mismatch",
+        "return_quarantine_schema_mismatch",
+        "return_quarantine_evidence_schema_mismatch",
+        "unapproved_ohlc_normalization_rows",
+        "invalid_flat_bar_normalization_rows",
         "raw_close_jumps_gt_2x",
         "adjusted_index_jumps_gt_3x",
+        "quarantined_adjusted_index_jumps_gt_3x",
+        "unresolved_adjusted_index_jumps_gt_3x",
     ):
         totals[field] = int(sum(int(item.get(field, 0) or 0) for item in profiles))
 
@@ -768,6 +1194,69 @@ def audit_quote_source_files(
             "source_lineage_mismatch",
             "File-level source metadata disagrees with row-level fallback usage.",
             "Rebuild the symbol parquet and regenerate its source receipt.",
+        ),
+        (
+            "unapproved_fallback_reason",
+            "critical",
+            "unapproved_fallback_reason_rows",
+            "Some Yahoo rows carry an unknown reason for bypassing official data.",
+            "Rebuild canonical symbol files with the approved official_ohlcv_unusable reason.",
+        ),
+        (
+            "fallback_reason_lineage_mismatch",
+            "critical",
+            "fallback_reason_lineage_mismatch",
+            "Fallback reasons are attached to rows that do not use Yahoo quote data.",
+            "Repair row lineage and rebuild the official-first merge.",
+        ),
+        (
+            "return_quarantine_schema_mismatch",
+            "critical",
+            "return_quarantine_schema_mismatch",
+            "Canonical quote files cannot prove which forward labels were isolated.",
+            "Rebuild canonical symbol files with return_quarantined and return_quarantine_reason.",
+        ),
+        (
+            "unapproved_return_quarantine_reason",
+            "critical",
+            "unapproved_return_quarantine_reason_rows",
+            "Unknown quarantine reasons can hide labels outside the approved fail-closed contract.",
+            "Use only the canonical listing, lifecycle episode, or unverified-extreme reasons.",
+        ),
+        (
+            "return_quarantine_lineage_mismatch",
+            "critical",
+            "return_quarantine_lineage_mismatch",
+            "The quarantine boolean and its reason disagree.",
+            "Rebuild symbol files so a label is quarantined if and only if it has an approved reason.",
+        ),
+        (
+            "return_quarantine_evidence_mismatch",
+            "critical",
+            "return_quarantine_evidence_mismatch",
+            "A forward-label quarantine is missing, spurious, or does not match the destination lifecycle/listing/extreme evidence.",
+            "Rebuild canonical symbol files and keep the exact source-row to destination-event quarantine contract.",
+        ),
+        (
+            "return_quarantine_evidence_schema_mismatch",
+            "critical",
+            "return_quarantine_evidence_schema_mismatch",
+            "Canonical quote files lack the episode or listing evidence needed to validate label isolation.",
+            "Rebuild canonical symbol files with lifecycle_episode_id and official_listing_evidence.",
+        ),
+        (
+            "unapproved_ohlc_normalization",
+            "critical",
+            "unapproved_ohlc_normalization_rows",
+            "Some official bars use an unknown OHLC normalization.",
+            "Retain only the audited official_close_flat_bar normalization.",
+        ),
+        (
+            "invalid_flat_bar_normalization",
+            "critical",
+            "invalid_flat_bar_normalization_rows",
+            "A declared official flat bar does not match its close or uses Yahoo data.",
+            "Rebuild the row from the positive official close sentinel and its provenance.",
         ),
         (
             "invalid_adjusted_index",
@@ -827,17 +1316,17 @@ def audit_quote_source_files(
         ),
         (
             "off_calendar_quote_rows",
-            "medium",
+            "critical",
             "off_calendar_rows",
-            "Non-canonical dates must never expand the official market calendar.",
-            "Verify the events; the panel must continue excluding these rows.",
+            "Canonical symbol files contain rows outside the receipt-verified official market calendar.",
+            "Remove off-calendar fallback rows and rebuild every dependent feature and panel artifact.",
         ),
         (
             "extreme_adjusted_index_jump",
             "medium",
-            "adjusted_index_jumps_gt_3x",
+            "unresolved_adjusted_index_jumps_gt_3x",
             "An unresolved corporate action or scale error can dominate forward labels.",
-            "Verify the official reference price for each event and rebuild the normalized index.",
+            "Verify the official reference price or explicitly quarantine the affected forward label.",
         ),
     ):
         value = int(totals[field])
@@ -853,6 +1342,21 @@ def audit_quote_source_files(
                     remediation,
                 )
             )
+    quarantined_extremes = int(
+        totals["quarantined_adjusted_index_jumps_gt_3x"]
+    )
+    if quarantined_extremes:
+        findings.append(
+            Finding(
+                "low",
+                "quarantined_extreme_adjusted_index_jump",
+                "quote_sources",
+                "quarantined_adjusted_index_jumps_gt_3x",
+                f"count={quarantined_extremes}",
+                "The source quote jump remains visible, but its forward label is explicitly isolated.",
+                "Retain the provenance and replace the quarantine only if an official reference resolves the transition.",
+            )
+        )
     return profiles, totals, findings
 
 
@@ -875,11 +1379,15 @@ def audit_official_symbol_build(
                 "Run build_tw_official_symbol_parquets.py from complete official sources.",
             )
         ]
-    source_paths = [
-        public_dir / "twse_daily_ohlcv.parquet",
-        public_dir / "tpex_daily_ohlcv.parquet",
-        public_dir / "tw_corporate_action_reference.parquet",
+    source_paths = _official_symbol_source_paths(public_dir)
+    lifecycle_paths = [
+        public_dir / name for name in LIFECYCLE_EVIDENCE_FILENAMES
     ]
+    expected_lifecycle_receipts = (
+        [_file_content_receipt(source) for source in lifecycle_paths]
+        if all(source.is_file() for source in lifecycle_paths)
+        else []
+    )
 
     def resolve_receipt_path(receipt: dict[str, Any]) -> Path | None:
         raw_path = Path(str(receipt.get("path", "")))
@@ -925,38 +1433,48 @@ def audit_official_symbol_build(
     fallback_source_name = str(summary.get("fallback_source_name", "")).strip()
     fallback_receipts_valid = validate_receipts(fallback_receipts)
     fallback_converter_receipts_valid = fallback_receipts_valid
+    fallback_sources: list[Path] = []
     if fallback_converter_receipts_valid:
         for receipt in fallback_receipts:
             source = resolve_receipt_path(receipt)
             if source is None:
                 fallback_converter_receipts_valid = False
                 break
-            converter_summary = _read_json_object(source.with_suffix(".summary.json"))
+            fallback_sources.append(source)
             try:
-                output_receipt = converter_summary.get("output_receipt", {})
-                converter_start = date.fromisoformat(
-                    str(converter_summary.get("start_date"))
-                )
-                archive_schema = set(pq.read_schema(source).names)
-                converter_ok = (
-                    converter_summary.get("source") == YAHOO_FALLBACK_SOURCE
-                    and int(converter_summary.get("failed_symbol_count", -1)) == 0
-                    and converter_start >= date(2000, 1, 1)
-                    and receipt_matches(source, output_receipt)
-                    and {
-                        "date",
-                        "symbol",
-                        "market",
-                        "source_factor",
-                        "quote_source",
-                    }
-                    <= archive_schema
-                )
-            except (AttributeError, OSError, TypeError, ValueError):
+                _validate_yahoo_fallback_archive(source)
+                converter_ok = True
+            except Exception:
                 converter_ok = False
             if not converter_ok:
                 fallback_converter_receipts_valid = False
                 break
+    calendar_valid = False
+    calendar_receipt: dict[str, str | int] = {}
+    calendar_summary_receipt: dict[str, str | int] = {}
+    calendar_rows = -1
+    actual_dropped_off_calendar_fallback_rows = -1
+    try:
+        (
+            session_calendar,
+            calendar_receipt,
+            calendar_summary_receipt,
+        ) = _load_verified_taiex_session_calendar(public_dir)
+        calendar_rows = int(session_calendar.height)
+        actual_dropped_off_calendar_fallback_rows = 0
+        for source in fallback_sources:
+            actual_dropped_off_calendar_fallback_rows += int(
+                pl.scan_parquet(source)
+                .select(_date_column_expr("date").alias("date"))
+                .join(session_calendar.lazy(), on="date", how="anti")
+                .select(pl.len())
+                .collect()
+                .item()
+                or 0
+            )
+        calendar_valid = True
+    except Exception:
+        calendar_valid = False
     manifest_path = parquet_root / "symbols.csv"
     manifest_valid = False
     manifest_fallback_symbols = -1
@@ -989,14 +1507,119 @@ def audit_official_symbol_build(
     fallback_rows = int(summary.get("fallback_rows", -1))
     fallback_adjustment_rows = int(summary.get("fallback_adjustment_rows", -1))
     fallback_symbols = int(summary.get("fallback_symbols", -1))
+    official_unusable_rows = int(summary.get("official_unusable_ohlcv_rows", -1))
+    fallback_replaced_unusable_rows = int(
+        summary.get("fallback_replaced_unusable_official_rows", -1)
+    )
+    unfilled_unusable_rows = int(
+        summary.get("unfilled_unusable_official_rows", -1)
+    )
+    normalized_zero_rows = int(summary.get("normalized_zero_ohlc_rows", -1))
+    actual_fallback_reason_rows = 0
+    actual_normalized_zero_rows = 0
+    actual_return_quarantined_rows = 0
+    actual_lifecycle_episode_quarantined_rows = 0
+    actual_listing_boundary_quarantined_rows = 0
+    actual_unverified_extreme_quarantined_rows = 0
+    lineage_columns_valid = True
+    for quote_path in parquet_root.glob("*_features.parquet"):
+        try:
+            quote_schema = set(pq.read_schema(quote_path).names)
+            required_lineage_columns = {
+                "fallback_reason",
+                "ohlc_normalization",
+                "return_quarantined",
+                "return_quarantine_reason",
+            }
+            if required_lineage_columns - quote_schema:
+                lineage_columns_valid = False
+                continue
+            lineage = pl.read_parquet(
+                quote_path,
+                columns=sorted(required_lineage_columns),
+            )
+            actual_fallback_reason_rows += int(
+                lineage.select(
+                    (pl.col("fallback_reason") == "official_ohlcv_unusable").sum()
+                ).item()
+                or 0
+            )
+            actual_normalized_zero_rows += int(
+                lineage.select(
+                    (pl.col("ohlc_normalization") == "official_close_flat_bar").sum()
+                ).item()
+                or 0
+            )
+            quarantined = pl.col("return_quarantined").cast(
+                pl.Boolean, strict=False
+            ).fill_null(False)
+            actual_return_quarantined_rows += int(
+                lineage.select(quarantined.sum()).item() or 0
+            )
+            actual_lifecycle_episode_quarantined_rows += int(
+                lineage.select(
+                    (
+                        quarantined
+                        & (
+                            pl.col("return_quarantine_reason")
+                            == "official_lifecycle_episode_boundary"
+                        )
+                    ).sum()
+                ).item()
+                or 0
+            )
+            actual_listing_boundary_quarantined_rows += int(
+                lineage.select(
+                    (
+                        quarantined
+                        & (
+                            pl.col("return_quarantine_reason")
+                            == "official_listing_boundary"
+                        )
+                    ).sum()
+                ).item()
+                or 0
+            )
+            actual_unverified_extreme_quarantined_rows += int(
+                lineage.select(
+                    (
+                        quarantined
+                        & (
+                            pl.col("return_quarantine_reason")
+                            == "unverified_extreme_adjusted_return"
+                        )
+                    ).sum()
+                ).item()
+                or 0
+            )
+        except Exception:
+            lineage_columns_valid = False
     uses_fallback = fallback_rows > 0 or fallback_adjustment_rows > 0
     expected_source = MIXED_QUOTE_SOURCE if uses_fallback else OFFICIAL_QUOTE_SOURCE
     checks: dict[str, bool] = {
+        "summary_schema": int(summary.get("schema_version", -1))
+        == OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION,
         "source": summary.get("source") == expected_source,
-        "adjusted_method": str(summary.get("adjusted_price_method", "")).startswith("first=10;"),
+        "adjusted_method": summary.get("adjusted_price_method")
+        == OFFICIAL_SYMBOL_ADJUSTED_PRICE_METHOD,
         "all_adjustments_resolved": int(summary.get("missing_adjustment_rows", -1)) == 0,
         "source_receipts": all(source.exists() for source in source_paths)
         and summary.get("source_receipts") == [_file_content_receipt(source) for source in source_paths],
+        "lifecycle_source_receipts": summary.get("lifecycle_source_receipts")
+        == expected_lifecycle_receipts,
+        "session_calendar_receipts": (
+            calendar_valid
+            and summary.get("session_calendar_receipt") == calendar_receipt
+            and summary.get("session_calendar_summary_receipt")
+            == calendar_summary_receipt
+            and int(summary.get("session_calendar_rows", -1)) == calendar_rows
+        ),
+        "off_calendar_fallback_reconciliation": (
+            calendar_valid
+            and actual_dropped_off_calendar_fallback_rows >= 0
+            and int(summary.get("dropped_off_calendar_fallback_rows", -1))
+            == actual_dropped_off_calendar_fallback_rows
+        ),
         "legacy_source_identity": bool(legacy_source_name) == bool(legacy_receipts),
         "legacy_source_receipts": legacy_receipts_valid,
         "fallback_source_identity": (
@@ -1013,11 +1636,61 @@ def audit_official_symbol_build(
             and uses_fallback == (fallback_symbols > 0)
             and (bool(fallback_receipts) or not uses_fallback)
         ),
+        "unusable_official_reconciliation": (
+            official_unusable_rows >= 0
+            and fallback_replaced_unusable_rows >= 0
+            and unfilled_unusable_rows >= 0
+            and official_unusable_rows
+            == fallback_replaced_unusable_rows + unfilled_unusable_rows
+            and fallback_replaced_unusable_rows <= fallback_rows
+            and fallback_replaced_unusable_rows == actual_fallback_reason_rows
+            and normalized_zero_rows == actual_normalized_zero_rows
+            and lineage_columns_valid
+        ),
+        "quarantine_count_reconciliation": (
+            lineage_columns_valid
+            and actual_return_quarantined_rows
+            == actual_lifecycle_episode_quarantined_rows
+            + actual_listing_boundary_quarantined_rows
+            + actual_unverified_extreme_quarantined_rows
+            and int(summary.get("return_quarantined_rows", -1))
+            == actual_return_quarantined_rows
+            and int(summary.get("lifecycle_episode_quarantined_rows", -1))
+            == actual_lifecycle_episode_quarantined_rows
+            and int(summary.get("listing_boundary_quarantined_rows", -1))
+            == actual_listing_boundary_quarantined_rows
+            and int(summary.get("unverified_extreme_quarantined_rows", -1))
+            == actual_unverified_extreme_quarantined_rows
+        ),
         "stock_etf_manifest": manifest_valid,
         "symbol_count": int(summary.get("symbols", -1))
         == len(list(parquet_root.glob("*_features.parquet"))),
     }
-    result.update({"valid": all(checks.values()), "checks": checks})
+    result.update(
+        {
+            "valid": all(checks.values()),
+            "checks": checks,
+            "official_unusable_ohlcv_rows": official_unusable_rows,
+            "fallback_replaced_unusable_official_rows": (
+                fallback_replaced_unusable_rows
+            ),
+            "unfilled_unusable_official_rows": unfilled_unusable_rows,
+            "return_quarantined_rows": actual_return_quarantined_rows,
+            "lifecycle_episode_quarantined_rows": (
+                actual_lifecycle_episode_quarantined_rows
+            ),
+            "listing_boundary_quarantined_rows": (
+                actual_listing_boundary_quarantined_rows
+            ),
+            "unverified_extreme_quarantined_rows": (
+                actual_unverified_extreme_quarantined_rows
+            ),
+            "session_calendar_rows": calendar_rows,
+            "dropped_off_calendar_fallback_rows": int(
+                summary.get("dropped_off_calendar_fallback_rows", -1)
+            ),
+        }
+    )
     if result["valid"]:
         return result, []
     return result, [
@@ -1196,6 +1869,115 @@ def _source_dates(path: Path) -> np.ndarray:
     return np.asarray(frame.get_column("date").to_numpy(), dtype="datetime64[D]")
 
 
+def _authoritative_source_unavailable_dates(
+    public_dir: Path,
+    dataset: str,
+    expected_sessions: np.ndarray,
+    observed_dates: np.ndarray,
+) -> np.ndarray:
+    """Return provider-receipted no-data sessions, never fabricated rows.
+
+    A historical endpoint can have an immutable archive gap even though the
+    exchange was open.  Such dates resolve downloader completeness but must
+    remain absent from the source parquet so feature construction continues to
+    zero-fill them.  Only a completed strict-calendar state receipt may resolve
+    audit coverage.
+    """
+
+    if expected_sessions.size == 0:
+        return np.asarray([], dtype="datetime64[D]")
+    state = _read_json_object(public_dir / "state" / f"{dataset}.json")
+    if state is None:
+        return np.asarray([], dtype="datetime64[D]")
+    calendar_kind = str(state.get("coverage_calendar_kind", "") or "").lower()
+    required_checks = (
+        state.get("dataset") == dataset,
+        state.get("baseline_established") is True,
+        state.get("coverage_complete") is True,
+        state.get("replacement_promoted") is True,
+        not bool(state.get("failed_dates")),
+        int(state.get("missing_dates_after", -1)) == 0,
+        "official" in calendar_kind and "session" in calendar_kind,
+    )
+    if not all(required_checks):
+        return np.asarray([], dtype="datetime64[D]")
+
+    try:
+        coverage_start = np.datetime64(str(state["coverage_start"]), "D")
+        coverage_end = np.datetime64(str(state["coverage_end"]), "D")
+    except (KeyError, TypeError, ValueError):
+        return np.asarray([], dtype="datetime64[D]")
+    if coverage_start > expected_sessions[0] or coverage_end < expected_sessions[-1]:
+        return np.asarray([], dtype="datetime64[D]")
+
+    if (
+        state.get("coverage_calendar_source") != TPEX_OFFICIAL_CALENDAR_DATASET
+        or state.get("root_coverage_calendar_source")
+        != TAIEX_SESSION_CALENDAR_DATASET
+    ):
+        return np.asarray([], dtype="datetime64[D]")
+
+    expected_days = {
+        date.fromisoformat(str(value))
+        for value in expected_sessions.astype("datetime64[D]")
+    }
+    try:
+        taiex_days, taiex_sha256 = _validated_taiex_session_dates(
+            public_dir,
+            min(expected_days),
+            max(expected_days),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return np.asarray([], dtype="datetime64[D]")
+    if (
+        taiex_days != expected_days
+        or state.get("root_coverage_calendar_sha256") != taiex_sha256
+    ):
+        return np.asarray([], dtype="datetime64[D]")
+
+    spec = DEFAULT_DATASETS.get(dataset)
+    if spec is None:
+        return np.asarray([], dtype="datetime64[D]")
+    validated_receipt_days = _validated_source_unavailable_receipt_dates(
+        public_dir,
+        spec,
+        expected_days,
+    )
+
+    raw_unavailable = state.get("confirmed_source_unavailable_dates")
+    raw_empty = state.get("confirmed_empty_dates")
+    accounting = state.get("confirmed_empty_date_accounting")
+    if not isinstance(raw_unavailable, list) or not isinstance(raw_empty, list):
+        return np.asarray([], dtype="datetime64[D]")
+    if not isinstance(accounting, dict):
+        return np.asarray([], dtype="datetime64[D]")
+    try:
+        unavailable_days = {
+            date.fromisoformat(str(np.datetime64(str(value), "D")))
+            for value in raw_unavailable
+        }
+        confirmed_empty = {
+            date.fromisoformat(str(np.datetime64(str(value), "D")))
+            for value in raw_empty
+        }
+        accounted = int(accounting.get("source_unavailable", -1))
+    except (TypeError, ValueError):
+        return np.asarray([], dtype="datetime64[D]")
+    if accounted != len(unavailable_days):
+        return np.asarray([], dtype="datetime64[D]")
+    if not unavailable_days.issubset(confirmed_empty):
+        return np.asarray([], dtype="datetime64[D]")
+
+    # The state is only accounting metadata.  A date is resolved exclusively
+    # when the append-only journal and immutable raw body independently pass
+    # the downloader's URL/HTTP/size/hash/explicit-no-data validator.
+    unavailable = np.asarray(
+        sorted(validated_receipt_days & unavailable_days),
+        dtype="datetime64[D]",
+    )
+    return np.setdiff1d(unavailable, observed_dates, assume_unique=False)
+
+
 def audit_historical_sources(
     public_dir: Path,
     benchmark_sessions: np.ndarray,
@@ -1227,6 +2009,11 @@ def audit_historical_sources(
                     expected_sessions=0,
                     covered_sessions=0,
                     session_coverage=None,
+                    observed_sessions=0,
+                    observed_session_coverage=None,
+                    source_unavailable_sessions=0,
+                    resolved_sessions=0,
+                    resolved_session_coverage=None,
                     selected_features=",".join(selected_for_source),
                     quarantined=quarantined,
                 )
@@ -1248,14 +2035,26 @@ def audit_historical_sources(
         source_dates = _source_dates(path)
         first = np.datetime64(expectation.first_date, "D")
         expected = benchmark_sessions[(benchmark_sessions >= first) & (benchmark_sessions <= end)]
-        covered = np.intersect1d(expected, source_dates, assume_unique=False)
-        coverage = float(covered.size / expected.size) if expected.size else None
+        observed = np.intersect1d(expected, source_dates, assume_unique=False)
+        observed_coverage = (
+            float(observed.size / expected.size) if expected.size else None
+        )
+        source_unavailable = _authoritative_source_unavailable_dates(
+            public_dir,
+            expectation.name,
+            expected,
+            observed,
+        )
+        resolved = np.union1d(observed, source_unavailable)
+        resolved_coverage = (
+            float(resolved.size / expected.size) if expected.size else None
+        )
         rows = int(pq.ParquetFile(path).metadata.num_rows)
-        if coverage is None:
+        if resolved_coverage is None:
             status = "no_expected_sessions"
-        elif coverage >= 0.98:
+        elif resolved_coverage >= 0.98:
             status = "complete"
-        elif coverage >= 0.80:
+        elif resolved_coverage >= 0.80:
             status = "degraded"
         else:
             status = "incomplete"
@@ -1269,14 +2068,31 @@ def audit_historical_sources(
                 first_date=str(source_dates[0]) if source_dates.size else "",
                 last_date=str(source_dates[-1]) if source_dates.size else "",
                 expected_sessions=int(expected.size),
-                covered_sessions=int(covered.size),
-                session_coverage=coverage,
+                # Legacy fields retain observed-row semantics.  New explicit
+                # fields separate actual rows from receipt-resolved sessions.
+                covered_sessions=int(observed.size),
+                session_coverage=observed_coverage,
+                observed_sessions=int(observed.size),
+                observed_session_coverage=observed_coverage,
+                source_unavailable_sessions=int(source_unavailable.size),
+                resolved_sessions=int(resolved.size),
+                resolved_session_coverage=resolved_coverage,
                 selected_features=",".join(selected_for_source),
                 quarantined=quarantined,
             )
         )
-        if selected_for_source and (coverage is None or coverage < 0.98):
-            severity = "medium" if quarantined else ("high" if coverage and coverage >= 0.80 else "critical")
+        if selected_for_source and (
+            resolved_coverage is None or resolved_coverage < 0.98
+        ):
+            severity = (
+                "medium"
+                if quarantined
+                else (
+                    "high"
+                    if resolved_coverage and resolved_coverage >= 0.80
+                    else "critical"
+                )
+            )
             findings.append(
                 Finding(
                     severity=severity,
@@ -1284,8 +2100,11 @@ def audit_historical_sources(
                     component="source",
                     item=expectation.name,
                     evidence=(
-                        f"covered={covered.size}/{expected.size} "
-                        f"({0.0 if coverage is None else coverage:.2%}), "
+                        f"observed={observed.size}/{expected.size} "
+                        f"({0.0 if observed_coverage is None else observed_coverage:.2%}), "
+                        f"source_unavailable={source_unavailable.size}, "
+                        f"resolved={resolved.size}/{expected.size} "
+                        f"({0.0 if resolved_coverage is None else resolved_coverage:.2%}), "
                         f"range={profiles[-1].first_date}..{profiles[-1].last_date}, "
                         f"quarantined={quarantined}"
                     ),
@@ -1411,6 +2230,262 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _audit_tpex_daily_name_provenance(
+    public_dir: Path,
+) -> tuple[dict[str, Any], list[Finding]]:
+    """Reconcile receipt-level lossy bytes with row-level name provenance."""
+
+    path = public_dir / "tpex_daily_ohlcv.parquet"
+    summary: dict[str, Any] = {
+        "path": str(path),
+        "present": path.is_file(),
+    }
+    if not path.is_file():
+        # Missing selected sources are handled by audit_historical_sources.
+        return summary, []
+
+    expected_status = "official_receipt_name_bytes_unrecoverable"
+    schema = set(pq.read_schema(path).names)
+    if not {"date", "代號", "名稱", "_name_decode_status"} <= schema:
+        summary["schema_complete"] = False
+        return summary, [
+            Finding(
+                "critical",
+                "tpex_name_provenance_mismatch",
+                "source_receipt",
+                str(path),
+                "missing date, 代號, 名稱, or _name_decode_status column",
+                "Lossy official name bytes can enter issuer identity matching without provenance.",
+                "Reparse TPEx daily OHLCV with parser contract v12 from verified raw receipts.",
+            )
+        ]
+
+    status = (
+        pl.col("_name_decode_status")
+        .cast(pl.String, strict=False)
+        .fill_null("")
+        .str.strip_chars()
+    )
+    name = pl.col("名稱").cast(pl.String, strict=False).fill_null("")
+    per_date = (
+        pl.scan_parquet(path)
+        .select(
+            pl.col("date").cast(pl.String, strict=False).str.slice(0, 10).alias("date"),
+            pl.col("代號")
+            .cast(pl.String, strict=False)
+            .fill_null("")
+            .str.strip_chars()
+            .str.to_uppercase()
+            .alias("symbol"),
+            status.alias("status"),
+            name.alias("name"),
+        )
+        .group_by("date")
+        .agg(
+            pl.len().alias("rows"),
+            (pl.col("status") == expected_status).sum().alias("unrecoverable_rows"),
+            (
+                (pl.col("status") != "")
+                & (pl.col("status") != expected_status)
+            )
+            .sum()
+            .alias("unknown_status_rows"),
+            (
+                (pl.col("status") == "")
+                & pl.col("name").str.contains(r"(?:\ufffd|嚙|ï¿½)")
+            )
+            .sum()
+            .alias("unmarked_rendered_damage_rows"),
+        )
+        .collect()
+    )
+    rows_by_date = {
+        str(row["date"]): (
+            int(row["rows"]),
+            int(row["unrecoverable_rows"] or 0),
+        )
+        for row in per_date.iter_rows(named=True)
+    }
+    status_dates = {
+        value
+        for value, (_, marked) in rows_by_date.items()
+        if marked > 0
+    }
+    unknown_status_rows = int(per_date.get_column("unknown_status_rows").sum() or 0)
+    unmarked_rendered_damage_rows = int(
+        per_date.get_column("unmarked_rendered_damage_rows").sum() or 0
+    )
+    actual_status_keys = {
+        (str(row["date"]), str(row["symbol"]))
+        for row in (
+            pl.scan_parquet(path)
+            .select(
+                pl.col("date")
+                .cast(pl.String, strict=False)
+                .str.slice(0, 10)
+                .alias("date"),
+                pl.col("代號")
+                .cast(pl.String, strict=False)
+                .fill_null("")
+                .str.strip_chars()
+                .str.to_uppercase()
+                .alias("symbol"),
+                status.alias("status"),
+            )
+            .filter(pl.col("status") == expected_status)
+            .collect()
+            .iter_rows(named=True)
+        )
+    }
+
+    raw_dir = public_dir / "raw" / "tpex_daily_ohlcv"
+    # The pre-2007 archive is a CP950 byte stream. Any undecodable byte or
+    # embedded UTF-8 replacement marker makes the entire receipt's name column
+    # ambiguous, because CP950 can re-pair those bytes into plausible CJK text.
+    # The 2007 legacy endpoint instead wraps already-decoded HTML in UTF-8 JSON;
+    # its upstream U+FFFD damage is therefore attributable to exact symbol rows.
+    lossy_receipt_dates: set[str] = set()
+    row_damage_evidence_keys: set[tuple[str, str]] = set()
+    unreadable_raw_files: list[str] = []
+    for raw_path in sorted(raw_dir.glob("*.html")):
+        try:
+            receipt_date = date.fromisoformat(raw_path.stem[:10]).isoformat()
+            raw = raw_path.read_bytes()
+        except (OSError, ValueError):
+            unreadable_raw_files.append(str(raw_path))
+            continue
+        lossy = b"\xef\xbf\xbd" in raw
+        if not lossy:
+            try:
+                raw.decode("cp950")
+            except UnicodeDecodeError:
+                lossy = True
+        if lossy:
+            lossy_receipt_dates.add(receipt_date)
+
+    json_damage_markers = (
+        b"\xef\xbf\xbd",
+        "ï¿½".encode("utf-8"),
+        "嚙".encode("utf-8"),
+    )
+    for raw_path in sorted(raw_dir.glob("*.json")):
+        try:
+            receipt_date = date.fromisoformat(raw_path.stem[:10]).isoformat()
+            raw = raw_path.read_bytes()
+        except (OSError, ValueError):
+            unreadable_raw_files.append(str(raw_path))
+            continue
+        lowered_raw = raw.lower()
+        if not (
+            any(marker in raw for marker in json_damage_markers)
+            or b"\\ufffd" in lowered_raw
+            or b"\\u5699" in lowered_raw
+            or b"\\u00ef\\u00bf\\u00bd" in lowered_raw
+        ):
+            continue
+        try:
+            payload = json.loads(raw.decode("utf-8-sig"))
+            raw_html = payload.get("html") if isinstance(payload, dict) else None
+            if not isinstance(raw_html, str):
+                raise ValueError("JSON receipt has no string html field")
+            raw_rows = _parse_tpex_daily_quotes_html(
+                raw_html,
+                date.fromisoformat(receipt_date),
+            )
+            if raw_rows.is_empty():
+                raise ValueError("damaged JSON receipt produced no quote rows")
+            damaged_rows = raw_rows.filter(
+                pl.col("_name_decode_status") == expected_status
+            )
+            row_damage_evidence_keys.update(
+                (receipt_date, str(symbol).strip().upper())
+                for symbol in damaged_rows.get_column("代號").to_list()
+            )
+        except (
+            HistoricalResponseError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            OSError,
+            ValueError,
+            TypeError,
+        ):
+            unreadable_raw_files.append(str(raw_path))
+
+    missing_or_partial_status_dates = sorted(
+        value
+        for value in lossy_receipt_dates
+        if value not in rows_by_date
+        or rows_by_date[value][1] != rows_by_date[value][0]
+    )
+    missing_row_damage_status_keys = sorted(
+        row_damage_evidence_keys - actual_status_keys
+    )
+    status_without_raw_evidence_keys = sorted(
+        key
+        for key in actual_status_keys - row_damage_evidence_keys
+        if key[0] not in lossy_receipt_dates
+    )
+    status_without_raw_evidence_dates = sorted(
+        {value[0] for value in status_without_raw_evidence_keys}
+    )
+    checks = {
+        "schema_complete": True,
+        "raw_receipts_present": raw_dir.is_dir(),
+        "raw_receipts_readable": not unreadable_raw_files,
+        "known_status_only": unknown_status_rows == 0,
+        "rendered_damage_marked": unmarked_rendered_damage_rows == 0,
+        "lossy_receipts_fully_marked": not missing_or_partial_status_dates,
+        "raw_row_damage_marked": not missing_row_damage_status_keys,
+        "status_has_raw_evidence": not status_without_raw_evidence_keys,
+    }
+    summary.update(
+        {
+            "checks": checks,
+            "lossy_receipt_dates": len(lossy_receipt_dates),
+            "row_damage_evidence_dates": len(
+                {value[0] for value in row_damage_evidence_keys}
+            ),
+            "row_damage_evidence_rows": len(row_damage_evidence_keys),
+            "status_dates": len(status_dates),
+            "unrecoverable_name_rows": sum(
+                marked for _, marked in rows_by_date.values()
+            ),
+            "unknown_status_rows": unknown_status_rows,
+            "unmarked_rendered_damage_rows": unmarked_rendered_damage_rows,
+            "missing_or_partial_status_dates": missing_or_partial_status_dates[:20],
+            "missing_row_damage_status_keys": [
+                {"date": value[0], "symbol": value[1]}
+                for value in missing_row_damage_status_keys[:20]
+            ],
+            "status_without_raw_evidence_dates": status_without_raw_evidence_dates[:20],
+            "status_without_raw_evidence_keys": [
+                {"date": value[0], "symbol": value[1]}
+                for value in status_without_raw_evidence_keys[:20]
+            ],
+            "unreadable_raw_files": unreadable_raw_files[:20],
+        }
+    )
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    if not failed_checks:
+        return summary, []
+    return summary, [
+        Finding(
+            "critical",
+            "tpex_name_provenance_mismatch",
+            "source_receipt",
+            str(path),
+            (
+                f"failed_checks={failed_checks}, "
+                f"lossy_receipt_dates={len(lossy_receipt_dates)}, "
+                f"status_dates={len(status_dates)}, "
+                f"unrecoverable_rows={summary['unrecoverable_name_rows']}"
+            ),
+            "Lossy official name bytes can enter issuer identity matching or appear falsely recoverable.",
+            "Reparse TPEx daily OHLCV with parser contract v12 from receipt-verified raw bytes.",
+        )
+    ]
+
+
 def audit_source_receipts(
     public_dir: Path,
     config: ExperimentConfig,
@@ -1472,6 +2547,147 @@ def audit_source_receipts(
                 )
             )
 
+    tpex_name_summary, tpex_name_findings = _audit_tpex_daily_name_provenance(
+        public_dir
+    )
+    receipt_summary["tpex_daily_name_provenance"] = tpex_name_summary
+    findings.extend(tpex_name_findings)
+
+    taiex_path = public_dir / "twse_taiex_ohlc.parquet"
+    taiex_summary_path = taiex_path.with_suffix(".summary.json")
+    taiex_receipt = _read_json_object(taiex_summary_path)
+    receipt_summary["taiex_archive_summary"] = str(taiex_summary_path)
+    taiex_checks: dict[str, bool] = {
+        "summary_present": taiex_receipt is not None,
+        "parquet_present": taiex_path.is_file(),
+    }
+    if taiex_receipt is not None and taiex_path.is_file():
+        expected_columns = {
+            "date",
+            "opening_index",
+            "highest_index",
+            "lowest_index",
+            "closing_index",
+            "_dataset",
+            "_source",
+            "_source_product",
+            "_request_month",
+            "_downloaded_at_utc",
+            "_url",
+        }
+        try:
+            schema = set(pq.read_schema(taiex_path).names)
+            stats = (
+                pl.scan_parquet(taiex_path)
+                .select(
+                    [
+                        pl.len().alias("rows"),
+                        pl.col("date").n_unique().alias("distinct_dates"),
+                        pl.col("date").min().alias("first_date"),
+                        pl.col("date").max().alias("last_date"),
+                        (
+                            pl.col("date").is_null()
+                            | pl.col("opening_index").is_null()
+                            | pl.col("highest_index").is_null()
+                            | pl.col("lowest_index").is_null()
+                            | pl.col("closing_index").is_null()
+                            | ~pl.col("opening_index").is_finite()
+                            | ~pl.col("highest_index").is_finite()
+                            | ~pl.col("lowest_index").is_finite()
+                            | ~pl.col("closing_index").is_finite()
+                            | (pl.col("opening_index") <= 0)
+                            | (pl.col("highest_index") <= 0)
+                            | (pl.col("lowest_index") <= 0)
+                            | (pl.col("closing_index") <= 0)
+                            | (
+                                pl.col("highest_index")
+                                < pl.max_horizontal(
+                                    "opening_index", "lowest_index", "closing_index"
+                                )
+                            )
+                            | (
+                                pl.col("lowest_index")
+                                > pl.min_horizontal(
+                                    "opening_index", "highest_index", "closing_index"
+                                )
+                            )
+                        )
+                        .sum()
+                        .alias("invalid_rows"),
+                    ]
+                )
+                .collect()
+                .row(0, named=True)
+            )
+            content_receipt = _file_content_receipt(taiex_path)
+            declared_receipt = taiex_receipt.get("output_receipt")
+            declared_receipt = (
+                declared_receipt if isinstance(declared_receipt, dict) else {}
+            )
+            public_end = (
+                str(public_receipt.get("end_date", ""))[:10]
+                if public_receipt is not None
+                else ""
+            )
+            taiex_end = str(taiex_receipt.get("effective_end_date", ""))[:10]
+            taiex_checks.update(
+                {
+                    "identity": (
+                        taiex_receipt.get("dataset") == "twse_taiex_ohlc"
+                        and taiex_receipt.get("source") == "TWSE"
+                    ),
+                    "official_start": (
+                        taiex_receipt.get("official_start_date") == "1999-01-05"
+                        and taiex_receipt.get("effective_start_date") == "1999-01-05"
+                        and str(stats["first_date"])[:10] == "1999-01-05"
+                    ),
+                    "coverage_complete": taiex_receipt.get("coverage_complete") is True,
+                    "baseline_established": taiex_receipt.get("baseline_established") is True,
+                    "replacement_promoted": taiex_receipt.get("replacement_promoted") is True,
+                    "no_failures": (
+                        int(taiex_receipt.get("failed_count", -1)) == 0
+                        and int(taiex_receipt.get("unresolved_month_count", -1)) == 0
+                    ),
+                    "date_range_matches_public": (
+                        bool(taiex_end) and (not public_end or taiex_end >= public_end)
+                    ),
+                    "schema": expected_columns <= schema,
+                    "rows": (
+                        int(stats["rows"]) > 0
+                        and int(stats["rows"]) == int(stats["distinct_dates"])
+                        and int(stats["rows"])
+                        == int(taiex_receipt.get("output_rows", -1))
+                    ),
+                    "ohlc": int(stats["invalid_rows"] or 0) == 0,
+                    "output_receipt": (
+                        int(declared_receipt.get("size", -1))
+                        == int(content_receipt["size"])
+                        and str(declared_receipt.get("sha256", ""))
+                        == str(content_receipt["sha256"])
+                    ),
+                }
+            )
+            receipt_summary["taiex_archive_first_date"] = str(stats["first_date"])[:10]
+            receipt_summary["taiex_archive_last_date"] = str(stats["last_date"])[:10]
+            receipt_summary["taiex_archive_rows"] = int(stats["rows"])
+        except Exception as exc:
+            taiex_checks["readable_and_valid"] = False
+            receipt_summary["taiex_archive_error"] = f"{type(exc).__name__}: {exc}"
+    receipt_summary["taiex_archive_checks"] = taiex_checks
+    failed_taiex_checks = [name for name, passed in taiex_checks.items() if not passed]
+    if failed_taiex_checks:
+        findings.append(
+            Finding(
+                "critical",
+                "incomplete_taiex_archive_receipt",
+                "source_receipt",
+                str(taiex_summary_path),
+                f"failed_checks={failed_taiex_checks}",
+                "The official monthly TAIEX session/OHLC archive is missing, incomplete, or does not match its receipt.",
+                "Run download_tw_taiex_ohlc.py in rebuild/repair mode through the audit end date.",
+            )
+        )
+
     if config.data.use_tw_public_rules:
         short_path = public_dir / "tw_short_sale_download_report.json"
         short_receipt = _read_json_object(short_path)
@@ -1491,10 +2707,27 @@ def audit_source_receipts(
         else:
             quality = short_receipt.get("data_quality")
             quality = quality if isinstance(quality, dict) else {}
+            unparseable = int(short_receipt.get("unparseable", -1))
+            detail_content_unavailable = int(
+                short_receipt.get(
+                    "detail_content_unavailable",
+                    0 if unparseable == 0 else -1,
+                )
+            )
+            unresolved_unparseable = (
+                unparseable - detail_content_unavailable
+                if unparseable >= 0
+                and 0 <= detail_content_unavailable <= unparseable
+                else -1
+            )
             checks = {
                 "requests_complete": short_receipt.get("requests_complete") is True,
                 "failure_count_zero": int(short_receipt.get("failure_count", -1)) == 0,
-                "unparseable_zero": int(short_receipt.get("unparseable", -1)) == 0,
+                # Empty legacy detail shells are explicit provider-source
+                # unavailability, not parser ambiguity.  Every other row must
+                # still resolve to a symbol or an explicit out-of-universe
+                # classification.
+                "unparseable_accounted": unresolved_unparseable == 0,
                 "data_output_written": short_receipt.get("data_output_written") is True,
                 "no_duplicate_rows": int(quality.get("composite_key_duplicate_rows", -1)) == 0,
                 "all_symbols_parsed": (
@@ -1503,6 +2736,9 @@ def audit_source_receipts(
                 ),
             }
             receipt_summary["short_rule_checks"] = checks
+            receipt_summary["short_rule_unresolved_unparseable"] = (
+                unresolved_unparseable
+            )
             failed_checks = [name for name, passed in checks.items() if not passed]
             if failed_checks:
                 findings.append(
@@ -1759,6 +2995,7 @@ def _panel_kwargs(config: ExperimentConfig, public_feature_path: Path) -> dict[s
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "panel_start_date": config.data.panel_start_date,
     }
 
 
@@ -2209,13 +3446,13 @@ def _write_report(
             "",
             "## OHLCV Sources",
             "",
-            "| files | rows | Yahoo OHLCV/adjustment rows | unsupported type | unapproved files | lineage errors | read/schema errors | duplicate dates | invalid bars/volume | invalid adjclose | origin != 10 | off-calendar | raw close >2x | adjusted >3x |",
+            "| files | rows | Yahoo OHLCV/adjustment rows | unsupported type | unapproved files | lineage errors | read/schema errors | duplicate dates | invalid bars/volume | invalid adjclose | origin != 10 | off-calendar | raw close >2x | adjusted >3x total/quarantined/unresolved |",
             "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             f"| {quote_summary.get('files', 0)} | {quote_summary.get('rows', 0)} | "
             f"{quote_summary.get('yahoo_fallback_rows', 0)}/{quote_summary.get('yahoo_fallback_adjustment_rows', 0)} | "
             f"{quote_summary.get('unsupported_security_files', 0)} | "
             f"{quote_summary.get('unapproved_source_files', 0)} | "
-            f"{quote_summary.get('unapproved_data_source_rows', 0) + quote_summary.get('unapproved_adjustment_source_rows', 0) + quote_summary.get('source_lineage_mismatch', 0)} | "
+            f"{quote_summary.get('unapproved_data_source_rows', 0) + quote_summary.get('unapproved_adjustment_source_rows', 0) + quote_summary.get('source_lineage_mismatch', 0) + quote_summary.get('unapproved_return_quarantine_reason_rows', 0) + quote_summary.get('return_quarantine_lineage_mismatch', 0) + quote_summary.get('return_quarantine_schema_mismatch', 0)} | "
             f"{quote_summary.get('read_errors', 0) + quote_summary.get('schema_errors', 0)} | "
             f"{quote_summary.get('duplicate_dates', 0)} | "
             f"{quote_summary.get('invalid_ohlc_geometry', 0) + quote_summary.get('negative_volume', 0)} | "
@@ -2223,7 +3460,9 @@ def _write_report(
             f"{quote_summary.get('first_adjclose_not_ten', 0)} | "
             f"{quote_summary.get('off_calendar_rows', 0)} | "
             f"{quote_summary.get('raw_close_jumps_gt_2x', 0)} | "
-            f"{quote_summary.get('adjusted_index_jumps_gt_3x', 0)} |",
+            f"{quote_summary.get('adjusted_index_jumps_gt_3x', 0)}/"
+            f"{quote_summary.get('quarantined_adjusted_index_jumps_gt_3x', 0)}/"
+            f"{quote_summary.get('unresolved_adjusted_index_jumps_gt_3x', 0)} |",
             "",
             f"Return-price provenance: tracked={return_price_summary.get('tracked_symbols', 0)}, "
             f"raw-close-only={return_price_summary.get('raw_close_symbols', 0)}.",
@@ -2245,14 +3484,16 @@ def _write_report(
             "",
             "## Historical Sources",
             "",
-            "| source | status | dates | expected | coverage | range | selected | quarantined |",
-            "| --- | --- | ---: | ---: | ---: | --- | --- | --- |",
+            "| source | status | observed | source unavailable | resolved | expected | observed coverage | resolved coverage | range | selected | quarantined |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     for item in profiles:
         lines.append(
-            f"| {item.source} | {item.status} | {item.distinct_dates} | "
-            f"{item.expected_sessions} | {_fmt(item.session_coverage, percent=True)} | "
+            f"| {item.source} | {item.status} | {item.observed_sessions} | "
+            f"{item.source_unavailable_sessions} | {item.resolved_sessions} | "
+            f"{item.expected_sessions} | {_fmt(item.observed_session_coverage, percent=True)} | "
+            f"{_fmt(item.resolved_session_coverage, percent=True)} | "
             f"{item.first_date}..{item.last_date} | {item.selected_features} | {item.quarantined} |"
         )
     lines.extend(
@@ -2307,12 +3548,20 @@ def main() -> None:
         parquet_root,
         config.data.benchmark_name,
         public_feature_path,
+        public_dir,
+        config.walk_forward.expected_first_year,
+        config.data.panel_start_date,
+    )
+    source_calendar, _, _ = _load_verified_taiex_session_calendar(public_dir)
+    source_sessions = np.asarray(
+        source_calendar["date"].to_numpy(), dtype="datetime64[D]"
     )
     quote_profiles, quote_summary, quote_findings = audit_quote_source_files(
         parquet_root,
         sessions,
         workers=max(1, int(config.data.panel_load_workers)),
         require_official=True,
+        source_sessions=source_sessions,
     )
     official_build_summary, official_build_findings = audit_official_symbol_build(
         parquet_root,

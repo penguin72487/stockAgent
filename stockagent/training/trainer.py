@@ -3315,6 +3315,16 @@ def _training_checkpoint_contract_schema_3(
 ) -> dict[str, Any]:
     """Exact training contract written by schema 3 before semantic layering."""
     contract = asdict(config.training)
+    transformer_values = contract.get("transformer_base_portfolio")
+    if isinstance(transformer_values, Mapping):
+        projected_transformer_values = dict(transformer_values)
+        projected_transformer_values.pop("use_latent_factors", None)
+        projected_transformer_values.pop("use_market_tokens", None)
+        if _active_model_config(config)["config_name"] == "transformer_base_portfolio":
+            projected_transformer_values = (
+                _legacy_transformer_base_switch_projection(transformer_values)
+            )
+        contract["transformer_base_portfolio"] = projected_transformer_values
     # This storage-precision option was introduced by schema 4.  It must not be
     # synthesized into a historical schema-3 fingerprint; the compatibility
     # constraint below separately prevents unsafe optimizer resume when enabled.
@@ -3398,9 +3408,14 @@ def _legacy_checkpoint_setting_contract(
     *,
     legacy_lr_scheduler_interval: str = "epoch",
 ) -> dict[str, Any]:
+    legacy_model_values = dict(active_model["values"])
+    if str(active_model.get("config_name", "")) == "transformer_base_portfolio":
+        legacy_model_values = _legacy_transformer_base_switch_projection(
+            legacy_model_values
+        )
     return {
         "model_name": str(config.training.model_name),
-        "model": active_model["values"],
+        "model": legacy_model_values,
         "loss_type": str(config.training.loss_type),
         "loss_portfolio_activation": str(config.training.loss_portfolio_activation),
         "trading": _trading_checkpoint_contract_schema_2(config),
@@ -3455,11 +3470,40 @@ _SCHEMA_4_MODEL_RUNTIME_FIELDS = _SCHEMA_3_MODEL_RUNTIME_FIELDS | {
 }
 
 
+def _legacy_transformer_base_switch_projection(
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project new bottleneck switches onto pre-switch checkpoint semantics.
+
+    Omit the new fields and, only when the switches change the requested preset,
+    rewrite it to the effective historical mode. This lets schema 1--3 accept an
+    architecture-identical cross-preset spelling. ``latent_only`` remains a new,
+    unmatchable mode and therefore cannot resume an old optimizer trajectory.
+    """
+    projected = dict(values)
+    use_latent_factors = projected.pop("use_latent_factors", None)
+    use_market_tokens = projected.pop("use_market_tokens", None)
+    requested_mode = TransformerBasePortfolioModel._normalize_attention_mode(
+        str(projected["attention_mode"])
+    )
+    effective_mode = TransformerBasePortfolioModel._resolve_attention_mode(
+        requested_mode,
+        use_latent_factors=use_latent_factors,
+        use_market_tokens=use_market_tokens,
+    )
+    if effective_mode != requested_mode:
+        projected["attention_mode"] = effective_mode
+    return projected
+
+
 def _schema_3_checkpoint_model_values(active_model: Mapping[str, Any]) -> dict[str, Any]:
     """Reproduce schema 3's exact generic model-field filtering."""
+    values = dict(active_model["values"])
+    if str(active_model.get("config_name", "")) == "transformer_base_portfolio":
+        values = _legacy_transformer_base_switch_projection(values)
     return {
         name: value
-        for name, value in dict(active_model["values"]).items()
+        for name, value in values.items()
         if name not in _SCHEMA_3_MODEL_RUNTIME_FIELDS
     }
 
@@ -3488,8 +3532,13 @@ def _transformer_base_checkpoint_model_values(
     feature_names: Sequence[str],
 ) -> dict[str, Any]:
     """Resolve only architecture/behavior fields active in the selected TBP mode."""
-    mode = TransformerBasePortfolioModel._normalize_attention_mode(
+    requested_mode = TransformerBasePortfolioModel._normalize_attention_mode(
         str(values["attention_mode"])
+    )
+    mode = TransformerBasePortfolioModel._resolve_attention_mode(
+        requested_mode,
+        use_latent_factors=values.get("use_latent_factors"),
+        use_market_tokens=values.get("use_market_tokens"),
     )
     pooling = TransformerBasePortfolioModel._normalize_pooling(
         str(values["temporal_pooling"])
@@ -3595,17 +3644,18 @@ def _transformer_base_checkpoint_model_values(
         if layers > 0:
             contract["cross_heads"] = int(values["cross_heads"])
             contract["cross_ffn_mult"] = int(values["cross_ffn_mult"])
-    elif mode == "latent":
+    elif mode in {"latent", "latent_only"}:
         contract.update(
             {
                 "latent_layers": max(1, int(values["latent_layers"])),
                 "num_latent_factors": max(1, int(values["num_latent_factors"])),
-                "num_market_tokens": max(1, int(values["num_market_tokens"])),
                 "market_layers": max(1, int(values["market_layers"])),
                 "cross_heads": int(values["cross_heads"]),
                 "cross_ffn_mult": int(values["cross_ffn_mult"]),
             }
         )
+        if mode == "latent":
+            contract["num_market_tokens"] = max(1, int(values["num_market_tokens"]))
     elif mode == "market_token":
         contract.update(
             {
@@ -5197,14 +5247,12 @@ def _align_panel_to_state_dict_universe(
             )
         return panel
 
-    if len(trained_symbols) != int(expected_symbols):
-        if int(panel.num_symbols) != int(expected_symbols):
-            raise ValueError(
-                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"{weights_path} has {len(trained_symbols)} symbols, so it cannot be used for alignment."
-            )
-        return panel
-
+    # ``symbol_position`` can be a configured positional-capacity tensor rather
+    # than a one-row-per-security universe manifest.  This is the case when a
+    # full panel is trained/evaluated with symbol indices mapped into a bounded
+    # position table.  The emitted weight table is the authoritative ordered
+    # universe whenever it exists, so do not reject it merely because its width
+    # differs from the positional capacity stored in the checkpoint.
     if list(trained_symbols) == list(panel.symbols):
         return panel
 

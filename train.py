@@ -24,7 +24,7 @@ from stockagent.runtime_env import normalize_cuda_env
 
 
 def _normalize_multi_gpu_strategy(value: object) -> str:
-    strategy = str(value or "none").strip().lower().replace("-", "_")
+    strategy = str(value or "auto").strip().lower().replace("-", "_")
     aliases = {
         "": "none",
         "0": "none",
@@ -40,10 +40,18 @@ def _normalize_multi_gpu_strategy(value: object) -> str:
     return aliases.get(strategy, strategy)
 
 
+def _resolve_multi_gpu_strategy(value: object) -> str:
+    """Resolve auto from the GPUs made visible by the process launcher."""
+    strategy = _normalize_multi_gpu_strategy(value)
+    if strategy == "auto":
+        return "distributed_data_parallel" if torch.cuda.device_count() > 1 else "none"
+    return strategy
+
+
 def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
-    strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
+    strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     if args.multi_gpu_strategy is not None:
-        strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+        strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
     if strategy != "distributed_data_parallel":
         return
     if int(os.environ.get("WORLD_SIZE", "1")) > 1 or os.environ.get("STOCKAGENT_DDP_LAUNCHED") == "1":
@@ -335,6 +343,7 @@ def _build_panel_kwargs(config) -> dict:
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "panel_start_date": config.data.panel_start_date,
     }
 
 
@@ -521,7 +530,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--multi-gpu-strategy",
-        choices=("none", "distributed_data_parallel", "ddp"),
+        choices=("auto", "none", "distributed_data_parallel", "ddp"),
         default=None,
         help="Override training.multi_gpu_strategy for efficiency A/B runs.",
     )
@@ -760,8 +769,8 @@ def main() -> None:
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
     _maybe_relaunch_for_ddp(config, args)
-    config_strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
-    cli_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
+    config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
+    cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = cli_strategy or config_strategy
     configured_cpu_threads = args.cpu_threads if args.cpu_threads is not None else config.environment.cpu_threads
     compile_threads = (
@@ -785,7 +794,10 @@ def main() -> None:
     if args.seed is not None:
         config.training.seed = int(args.seed)
     if args.multi_gpu_strategy is not None:
-        config.training.multi_gpu_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+        config.training.multi_gpu_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
+    else:
+        # Downstream trainer code consumes the concrete runtime strategy.
+        config.training.multi_gpu_strategy = active_strategy
     if args.cudnn_benchmark is not None:
         config.environment.cudnn_benchmark = bool(args.cudnn_benchmark)
     if args.batch_size_train is not None:

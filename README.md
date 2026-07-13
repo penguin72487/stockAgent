@@ -21,7 +21,7 @@ Multi-asset Taiwan stock trading research workspace.
 - Install dependencies from `requirements.txt` inside the `fintech` environment.
 - Source `scripts/runtime_env.sh` once per shell, then run Python entrypoints with `run_fintech_python`; it discovers the local `fintech` environment without assuming an absolute installation path.
 - Run Taiwan training with `run_fintech_python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
-- Run the independent Taiwan public-data experiment with `run_fintech_python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_all`.
+- Run the independent Taiwan public-data experiment with `run_fintech_python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_official_2005_v1`.
 - `data.use_tw_public_rules` applies official TW execution masks independently from
   model inputs. TW configs enable it by default and fail fast if the configured
   public parquet is missing. `configs/markets/tw_public.yaml` additionally enables
@@ -29,6 +29,52 @@ Multi-asset Taiwan stock trading research workspace.
 - Use `data.feature_include` and `data.feature_exclude` to manually switch panel features by exact name or glob pattern, for example `twpub_*` or `*_logret_1d`; leave both empty to keep all features.
 - Or use the project runner: `./coda_runner.sh`.
 - Runner defaults live in each experiment YAML's `runner` section; runtime discovery is centralized in `scripts/runtime_env.sh`.
+
+### Multi-GPU market job manager
+
+Assign physical GPUs to existing market configs in `configs/gpu_jobs.yaml`, then
+manage all jobs or selected jobs without changing their market/training settings:
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/manage_gpu_jobs.py validate
+run_fintech_python scripts/manage_gpu_jobs.py start
+run_fintech_python scripts/manage_gpu_jobs.py status
+run_fintech_python scripts/manage_gpu_jobs.py restart crypto
+run_fintech_python scripts/manage_gpu_jobs.py stop us crypto
+```
+
+Each job is launched in its own process session with `CUDA_VISIBLE_DEVICES` set
+from its `gpus` list. A multi-GPU job can use `gpus: [2, 3]`; its referenced
+market config must also select the appropriate multi-GPU strategy. Runtime PID
+state and launcher logs are stored under `artifacts/gpu_jobs` by default.
+
+Market configs default to `training.multi_gpu_strategy: auto`: one visible GPU
+uses the canonical single-device executor, while two or more visible GPUs
+automatically relaunch one DDP rank per GPU. The manager controls visibility, so
+`gpus: [0, 1, 2, 3]` makes the same market config use four-way DDP.
+`configs/markets/tw_parallel.yaml` inherits `tw.yaml`, and
+`configs/gpu_jobs_tw_parallel.yaml` exposes GPUs 0 and 1 to that one DDP job:
+
+```bash
+run_fintech_python scripts/manage_gpu_jobs.py validate \
+  --config configs/gpu_jobs_tw_parallel.yaml
+run_fintech_python scripts/manage_gpu_jobs.py start \
+  --config configs/gpu_jobs_tw_parallel.yaml
+```
+
+Two-GPU US DDP is preconfigured in `configs/gpu_jobs_us_ddp.yaml`. Stop any
+existing processes using GPUs 0 and 1, then validate and start the single DDP
+job:
+
+```bash
+run_fintech_python scripts/manage_gpu_jobs.py validate \
+  --config configs/gpu_jobs_us_ddp.yaml
+run_fintech_python scripts/manage_gpu_jobs.py start \
+  --config configs/gpu_jobs_us_ddp.yaml
+run_fintech_python scripts/manage_gpu_jobs.py status \
+  --config configs/gpu_jobs_us_ddp.yaml
+```
 - Outputs include one folder per walk-forward fold and a top-level `summary.json`.
 - Neural models use one lazy-window executor per process: either one device or one
   process per GPU through torchrun DDP. Contiguous fixed-shape batches use the
@@ -88,7 +134,19 @@ Multi-asset Taiwan stock trading research workspace.
 ## Taiwan Public Data Download
 
 - Use `run_fintech_python downloader/download_tw_official_data.py --mode rebuild|repair|daily` as the canonical TWSE/TPEx-first data-layer entry point. `rebuild` stages an atomic replacement, `repair` checks and fills historical gaps, and `daily` requires a verified baseline. From 2000 onward, the default audited Yahoo archive fills only missing stock/ETF OHLCV keys; official rows always win and row-level lineage is retained. Use `--ohlcv-fallback none` to disable it.
+- The source archive retains receipt-backed rows from 2000, but the certified model panel starts at `2005-01-01` (`2005-01-03` is the first session). Official archives and terminal Yahoo receipts prove that 80 companies delisted by `2004-04-28` cannot be reconstructed without fabrication; starting with the first complete calendar year keeps that unavailable cohort outside the model horizon. `configs/markets/tw*.yaml` enforce this with `data.panel_start_date` and a 2005 walk-forward identity.
+- A promoted rebuild is training-eligible only when both the staged and post-promote strict audits report `model_safe: true`. The durable production check is `artifacts/data_rebuild/<run>/audit_post_promote/summary.json`.
 - On a new machine, run `run_fintech_python downloader/download_tw_official_data.py --mode rebuild --stage-root artifacts/data_rebuild/tw_2000_bootstrap --promote`. Reuse the same stage path after a rate-limited retry so completed symbols are skipped. To reuse existing Yahoo TW files, add `--yahoo-fallback-dir data_yahoo/tw_stocks --skip-yahoo-download`.
+- With `--ohlcv-fallback yahoo`, the canonical runner builds
+  `data_tw_public/tw_transfer_adjustment_reference.parquet` before projecting the
+  Yahoo archive. This receipt-verified artifact supplies an adjustment factor
+  only for an exact `date + symbol` match on a canonical Yahoo source's first
+  retained row when its original factor is null. Coverage, input/output
+  receipts, raw official request receipts, candidate keys, and
+  reference-to-applied row counts are fail-closed. Its official requests share
+  the `tw_public` global limiter; when `--request-interval` is omitted the core
+  default is 10 requests/second. The artifact is not built or consulted with
+  `--ohlcv-fallback none`.
 - The high-level daily update also maintains official delisted-company histories in `twse_delisted_company.parquet` and `tpex_delisted_company.parquet`. For source diagnostics only, the low-level `download_tw_public_data.py --mode repair --datasets delisted` command can restrict the request to those tables.
 - Backfill point-in-time delisting and short-sale/cover announcements separately:
   `run_fintech_python downloader/download_tw_short_sale_restrictions.py --output-dir data_tw_public --start-year 1995 --end-year "$(date +%Y)"`.

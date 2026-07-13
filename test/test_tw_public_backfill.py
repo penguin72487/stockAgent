@@ -9,6 +9,7 @@ import polars as pl
 from downloader.backfill_tw_public_to_yahoo import (
     _normalize_delisted_archive_files,
     _official_delisted_symbols,
+    _public_ohlcv_frame,
     _resolve_start_date,
     _update_return_price_provenance,
     _write_symbol,
@@ -78,6 +79,77 @@ def test_official_overlay_preserves_adjusted_close_and_corporate_actions(tmp_pat
     assert row["adjclose"] == 8.0
     assert row["Dividends"] == 1.0
     assert row["Stock Splits"] == 2.0
+
+
+def test_public_ohlcv_frame_rejects_unusable_official_bars(tmp_path: Path) -> None:
+    pl.DataFrame(
+        {
+            "date": [
+                date(2024, 1, 2),
+                date(2024, 1, 3),
+                date(2024, 1, 4),
+                date(2024, 1, 5),
+                date(2024, 1, 8),
+                date(2024, 1, 9),
+            ],
+            "證券代號": ["1234"] * 6,
+            "開盤價": [10.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+            "最高價": [11.0, 0.0, 0.0, 10.5, 11.0, 11.0],
+            "最低價": [9.0, 0.0, 0.0, 9.5, 10.5, 9.0],
+            "收盤價": [10.5, 0.0, 10.0, 11.0, 10.0, 10.5],
+            "成交股數": [1000.0, 100.0, 100.0, 1000.0, 1000.0, -1.0],
+        }
+    ).write_parquet(tmp_path / "twse_daily_ohlcv.parquet")
+    pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 3)],
+            "代號": ["5678", "5678"],
+            "開盤": [20.0, 0.0],
+            "最高": [21.0, 0.0],
+            "最低": [19.0, 0.0],
+            "收盤": [20.5, 0.0],
+            "成交股數": [0.0, 10.0],
+        }
+    ).write_parquet(tmp_path / "tpex_daily_ohlcv.parquet")
+
+    output = _public_ohlcv_frame(
+        tmp_path,
+        {"1234", "5678"},
+        date(2024, 1, 1),
+        date(2024, 1, 31),
+    ).sort(["symbol", "date"])
+
+    assert output.select(
+        "date",
+        "symbol",
+        "open",
+        "max",
+        "min",
+        "close",
+        "adjclose",
+        "Trading_Volume",
+    ).to_dicts() == [
+        {
+            "date": date(2024, 1, 2),
+            "symbol": "1234",
+            "open": 10.0,
+            "max": 11.0,
+            "min": 9.0,
+            "close": 10.5,
+            "adjclose": 10.5,
+            "Trading_Volume": 1000.0,
+        },
+        {
+            "date": date(2024, 1, 2),
+            "symbol": "5678",
+            "open": 20.0,
+            "max": 21.0,
+            "min": 19.0,
+            "close": 20.5,
+            "adjclose": 20.5,
+            "Trading_Volume": 0.0,
+        },
+    ]
 
 
 def test_normalize_delisted_archive_candidates_to_canonical_symbol(tmp_path: Path) -> None:

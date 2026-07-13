@@ -331,6 +331,8 @@ def build_model(
             num_symbols=num_symbols,
             d_model=tbp_cfg.d_model,
             attention_mode=tbp_cfg.attention_mode,
+            use_latent_factors=tbp_cfg.use_latent_factors,
+            use_market_tokens=tbp_cfg.use_market_tokens,
             use_flash_attention=tbp_cfg.use_flash_attention,
             use_time_pos=tbp_cfg.use_time_pos,
             use_symbol_pos=tbp_cfg.use_symbol_pos,

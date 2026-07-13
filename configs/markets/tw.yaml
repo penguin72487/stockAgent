@@ -5,7 +5,8 @@ runner:
   mode: train
   resume: true
   post_train_infer: false
-  start_fold: 25
+  # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
+  start_fold: 18
 environment:
   device: cuda
   use_tensor_cores: true
@@ -13,6 +14,7 @@ environment:
 
 data:
   parquet_root: data_tw_public/stocks
+  panel_start_date: "2005-01-01"
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
@@ -30,6 +32,8 @@ data:
 walk_forward:
   min_train_years: 1
   val_years: 1
+  expected_first_year: 2005
+  require_contiguous_years: true
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
 
@@ -71,8 +75,8 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size_train: 16
-  batch_size_eval: 8
+  batch_size_train: 32
+  batch_size_eval: 32
   epochs: 10000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -265,12 +269,16 @@ training:
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
+    # latent_only: temporal + latent factors without market tokens
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
     attention_mode: market_token
+    # Independent compact-bottleneck switches; null falls back to attention_mode.
+    use_latent_factors: true
+    use_market_tokens: null
     use_flash_attention: true
     use_time_pos: true
-    use_symbol_pos: true
+    use_symbol_pos: false
     input_dropout: 0.0
     sdpa_batch_limit: 16384
     norm_type: rmsnorm
@@ -281,8 +289,8 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: attention
-    temporal_query_mode: full_then_last
+    temporal_pooling: last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2

@@ -28,6 +28,8 @@ from stockagent.data.tw_delisting_rules import (
     is_relevant_announcement_subject,
     split_announcement_symbols,
 )
+from stockagent.data.tw_security import classify_tw_stock_or_etf
+from downloader.common import SharedRateLimiter, describe_rate_limit, resolve_request_interval
 
 
 TWSE_SEARCH = "https://dsp.twse.com.tw/official/search"
@@ -47,6 +49,12 @@ _DATE_TOKEN = (
 _TPEX_ARCHIVE_FIRST_MONTH = (2002, 11)
 _TWSE_ARCHIVE_FIRST_MONTH = (2018, 1)
 _TWSE_CURRENT_FIRST_MONTH = (2020, 10)
+_LABELED_SECURITY_CODE_RE = re.compile(
+    r"(?:上市|上櫃|興櫃)?(?:普通股|股票|證券|公司|有價證券)?\s*"
+    r"(?:股票|證券)?\s*(?:代\s*(?:號|碼)|編\s*號)\s*[：:=#、，\s（(]*"
+    r"(?P<symbol>[0-9]{4,6}[A-Z]?)",
+    re.I,
+)
 
 
 @dataclass(slots=True)
@@ -56,7 +64,15 @@ class _AnnouncementDownloadBatch:
     unparseable: int = 0
     unresolved_records: list[dict] = field(default_factory=list)
     detail_failure_urls: list[str] = field(default_factory=list)
+    detail_subject_backfills: int = 0
+    detail_content_unavailable: int = 0
     retry_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _AnnouncementDetail:
+    subject: str
+    body_text: str
 
 
 class _RetryableArchiveError(RuntimeError):
@@ -67,6 +83,32 @@ _MARKET_REQUEST_LOCKS = {
     "tpex": threading.Lock(),
     "twse": threading.Lock(),
 }
+_RATE_LIMITER: SharedRateLimiter | None = None
+_RATE_LIMITER_LOCK = threading.Lock()
+
+
+def _global_tw_public_rate_limiter() -> SharedRateLimiter:
+    global _RATE_LIMITER
+    if _RATE_LIMITER is None:
+        with _RATE_LIMITER_LOCK:
+            if _RATE_LIMITER is None:
+                interval = resolve_request_interval("tw_public", None)
+                _RATE_LIMITER = SharedRateLimiter(interval, name="tw_public")
+    return _RATE_LIMITER
+
+
+def _rate_limited_call(call, *args, **kwargs) -> requests.Response:
+    limiter = _global_tw_public_rate_limiter()
+    limiter.wait()
+    response = call(*args, **kwargs)
+    if int(getattr(response, "status_code", 200)) in {403, 408, 429, 500, 502, 503, 504}:
+        retry_after = str(getattr(response, "headers", {}).get("Retry-After", "")).strip()
+        try:
+            delay = min(60.0, max(0.0, float(retry_after))) if retry_after else 1.0
+        except ValueError:
+            delay = 1.0
+        limiter.defer(delay)
+    return response
 
 
 def _coerce_announcement_batch(
@@ -101,6 +143,40 @@ def _coerce_announcement_batch(
 CompanySymbolLookup = dict[tuple[str, str], set[str]]
 
 
+def _has_only_explicit_unsupported_security_codes(text: str) -> bool:
+    """Return whether a notice explicitly identifies only excluded products.
+
+    The official archives also contain six-digit historical TDRs, 01-series
+    REIT beneficiary securities, warrants, and other products that are outside
+    the canonical stock/ETF execution universe.  An issuer-name lookup must not
+    silently remap one of those labeled codes to a different four-digit stock.
+    """
+
+    labeled_codes = {
+        match.group("symbol").upper()
+        for match in _LABELED_SECURITY_CODE_RE.finditer(str(text or "").upper())
+    }
+    return bool(
+        labeled_codes
+        and all(classify_tw_stock_or_etf(symbol) is None for symbol in labeled_codes)
+    )
+
+
+def _announcement_report_stub(record: dict) -> dict[str, str]:
+    """Keep unresolved/excluded evidence auditable without copying full bodies."""
+
+    return {
+        name: str(record.get(name, "") or "")
+        for name in (
+            "announcement_date",
+            "market",
+            "document_number",
+            "subject",
+            "source_url",
+        )
+    }
+
+
 def _canonical_company_alias(value: str) -> str:
     alias = str(value or "")
     if "公告有關" in alias:
@@ -108,6 +184,13 @@ def _canonical_company_alias(value: str) -> str:
     alias = re.sub(r"^主旨", "", alias)
     alias = re.sub(r"^(?:以下簡稱|下稱)", "", alias)
     return alias
+
+
+def _has_likely_mojibake(value: str) -> bool:
+    """Reject aliases whose decoded text is not trustworthy identity evidence."""
+
+    normalized = str(value or "")
+    return "\ufffd" in normalized or "嚙" in normalized
 
 
 def _add_company_symbol_aliases(
@@ -121,11 +204,28 @@ def _add_company_symbol_aliases(
     normalized_symbols = {
         symbol.upper()
         for symbol in symbols
-        if re.fullmatch(r"[0-9]{4,6}[A-Z]?", str(symbol).upper())
+        if classify_tw_stock_or_etf(str(symbol).upper()) is not None
     }
     if not normalized_market or not normalized_symbols:
         return
-    for raw_alias in _company_name_keys(str(text or "")):
+    raw_text = str(text or "").strip()
+    if _has_likely_mojibake(raw_text):
+        return
+    raw_aliases = _company_name_keys(raw_text)
+    if not raw_aliases:
+        fallback_alias = re.sub(
+            r"(?:股份有限公司|有限公司|公司)$",
+            "",
+            raw_text,
+        )
+        fallback_alias = re.sub(
+            r"[^A-Z0-9\u3400-\u9fff]",
+            "",
+            fallback_alias.upper(),
+        )
+        if fallback_alias:
+            raw_aliases = [fallback_alias]
+    for raw_alias in raw_aliases:
         alias = _canonical_company_alias(raw_alias)
         if len(alias) >= 2:
             lookup.setdefault((normalized_market, alias), set()).update(normalized_symbols)
@@ -147,12 +247,96 @@ def _load_company_symbol_lookup(output_dir: Path) -> CompanySymbolLookup:
                 text=str(row.get("company_name", "") or ""),
                 symbols=[str(row.get("symbol", "") or "")],
             )
+
+    # Current company tables and historical official quote names close the
+    # identity gap for venue transfers and older issuers that are absent from
+    # the current delisted-company endpoint.  Every mapping remains tied to an
+    # official parquet row and the canonical stock/ETF classifier.
+    source_specs = (
+        (
+            "twse_listed_company_basic.parquet",
+            "twse",
+            "公司代號",
+            ("公司名稱", "公司簡稱"),
+        ),
+        (
+            "tpex_basic_company.parquet",
+            "tpex",
+            "SecuritiesCompanyCode",
+            ("CompanyName", "CompanyAbbreviation"),
+        ),
+        (
+            "twse_daily_ohlcv.parquet",
+            "twse",
+            "證券代號",
+            ("證券名稱",),
+        ),
+        (
+            "tpex_daily_ohlcv.parquet",
+            "tpex",
+            "代號",
+            ("名稱",),
+        ),
+    )
+    for filename, market, symbol_column, name_columns in source_specs:
+        source_path = output_dir / filename
+        if not source_path.is_file():
+            continue
+        schema = set(pl.read_parquet_schema(source_path).names())
+        available_names = [column for column in name_columns if column in schema]
+        if symbol_column not in schema or not available_names:
+            continue
+        name_status_column = (
+            "_name_decode_status"
+            if filename == "tpex_daily_ohlcv.parquet"
+            and "_name_decode_status" in schema
+            else None
+        )
+        scan = pl.scan_parquet(source_path)
+        if name_status_column is not None:
+            scan = scan.filter(
+                pl.col(name_status_column)
+                .cast(pl.String, strict=False)
+                .fill_null("")
+                .str.strip_chars()
+                .eq("")
+            )
+        frame = (
+            scan.select(
+                pl.col(symbol_column).cast(pl.String, strict=False).alias("symbol"),
+                *[
+                    pl.col(column).cast(pl.String, strict=False).alias(column)
+                    for column in available_names
+                ],
+            )
+            .drop_nulls("symbol")
+            .unique()
+            .collect()
+        )
+        for row in frame.iter_rows(named=True):
+            symbol = str(row.get("symbol", "") or "").strip().upper()
+            for name_column in available_names:
+                _add_company_symbol_aliases(
+                    lookup,
+                    market=market,
+                    text=str(row.get(name_column, "") or ""),
+                    symbols=[symbol],
+                )
     existing_path = output_dir / "tw_delisting_short_sale_announcements.parquet"
     if existing_path.exists():
         existing = pl.read_parquet(existing_path)
         required = {"market", "symbols", "subject"}
         if required <= set(existing.columns):
-            for row in existing.select(sorted(required)).iter_rows(named=True):
+            selected = sorted(required | ({"body_text"} & set(existing.columns)))
+            for row in existing.select(selected).iter_rows(named=True):
+                text = " ".join(
+                    (
+                        f"{row.get('subject', '') or ''} "
+                        f"{row.get('body_text', '') or ''}"
+                    ).split()
+                )
+                if _has_only_explicit_unsupported_security_codes(text):
+                    continue
                 _add_company_symbol_aliases(
                     lookup,
                     market=str(row.get("market", "") or ""),
@@ -168,6 +352,9 @@ def _resolve_unparsed_announcement(
 ) -> str:
     market = str(record.get("market", "") or "").strip().lower()
     subject = str(record.get("subject", "") or "")
+    body = str(record.get("body_text", "") or "")
+    if _has_only_explicit_unsupported_security_codes(f"{subject} {body}"):
+        return "out_of_universe"
     if "到期日" in subject and "最後交易日" in subject:
         return "non_equity"
     aliases = [
@@ -177,14 +364,12 @@ def _resolve_unparsed_announcement(
     scores: dict[str, int] = {}
     for alias in aliases:
         for (candidate_market, known_alias), symbols in lookup.items():
-            if candidate_market != market:
-                continue
             if alias == known_alias:
-                score = 2
+                score = 4 if candidate_market == market else 3
             elif len(alias) >= 2 and len(known_alias) >= 2 and (
                 alias in known_alias or known_alias in alias
             ):
-                score = 1
+                score = 2 if candidate_market == market else 1
             else:
                 continue
             for symbol in symbols:
@@ -197,6 +382,12 @@ def _resolve_unparsed_announcement(
         symbol = next(iter(best_symbols))
         record["symbols"] = symbol
         return "resolved"
+    if "興櫃" in subject:
+        # The canonical execution universe starts at TWSE/TPEx listing.  An
+        # unresolved notice that explicitly concerns only emerging-market
+        # trading cannot affect its buy/sell/short masks.  Keep it accounted as
+        # out-of-universe rather than pretending the issuer code was parsed.
+        return "out_of_universe"
     return "unparseable"
 
 
@@ -471,10 +662,29 @@ def _repair_announcement_record(record: dict) -> dict:
         body=body,
         announcement_date=str(record.get("announcement_date", "") or "") or None,
     )
-    # Always replace symbols when the subject is parseable. This repairs old
-    # records that incorrectly included an acquirer mentioned only in the body.
-    if parsed["symbols"] or not str(repaired.get("symbols", "") or "").strip():
+    # Always replace symbols when the subject is parseable.  A symbol-less
+    # correction may retain a previously name-resolved code, but only when all
+    # retained values still belong to the canonical universe.  Explicitly
+    # labeled excluded products must never survive as stale six-digit symbols
+    # or as an issuer-name remap to an unrelated four-digit stock.
+    previous_symbols = split_announcement_symbols(
+        str(repaired.get("symbols", "") or "")
+    )
+    previous_symbols_supported = bool(
+        previous_symbols
+        and all(
+            classify_tw_stock_or_etf(symbol) is not None
+            for symbol in previous_symbols
+        )
+    )
+    if parsed["symbols"]:
         repaired["symbols"] = parsed["symbols"]
+    elif _has_only_explicit_unsupported_security_codes(text):
+        repaired["symbols"] = ""
+    elif previous_symbols_supported:
+        repaired["symbols"] = ",".join(previous_symbols)
+    else:
+        repaired["symbols"] = ""
     for name in (
         "short_open_ban_date",
         "short_open_resume_date",
@@ -508,9 +718,66 @@ def _repair_announcement_record(record: dict) -> dict:
 
 
 def _detail(session: requests.Session, url: str, timeout: int) -> str:
-    response = session.get(url, timeout=timeout)
+    response = _rate_limited_call(session.get, url, timeout=timeout)
     response.raise_for_status()
     return BeautifulSoup(response.content, "html.parser").get_text(" ", strip=True)
+
+
+def _tpex_announcement_detail(content: bytes) -> _AnnouncementDetail:
+    """Extract only the TPEx announcement document, excluding site chrome.
+
+    Older TPEx monthly result tables leave the subject cell empty even though
+    the linked detail page still contains the authoritative subject and rule
+    text.  Parsing the whole HTML page is unsafe because navigation copy also
+    contains lifecycle phrases and can change rule classification.
+    """
+
+    soup = BeautifulSoup(content, "html.parser")
+    wrapper = soup.select_one(".page-wrapper")
+    if wrapper is None:
+        # Test adapters and old provider responses may return the document
+        # fragment without the current page wrapper.  The fragment itself is
+        # still the narrowest available content container.
+        wrapper = soup
+
+    document_tables = wrapper.find_all("table")
+    document_parts: list[str] = []
+    subject_parts: list[str] = []
+    for table in document_tables:
+        table_text = " ".join(table.get_text(" ", strip=True).split())
+        if table_text:
+            document_parts.append(table_text)
+        for row in table.find_all("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            if len(cells) < 2:
+                continue
+            label = re.sub(r"\s+", "", cells[0].get_text(" ", strip=True))
+            if label.rstrip("：:") != "主旨":
+                continue
+            subject_parts.extend(
+                value
+                for value in (
+                    " ".join(cell.get_text(" ", strip=True).split())
+                    for cell in cells[1:]
+                )
+                if value
+            )
+
+    subject = " ".join(subject_parts).strip()
+    body_text = " ".join(document_parts).strip()
+    if not document_tables:
+        body_text = " ".join(wrapper.get_text(" ", strip=True).split())
+    return _AnnouncementDetail(subject=subject, body_text=body_text)
+
+
+def _download_tpex_detail(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+) -> _AnnouncementDetail:
+    response = _rate_limited_call(session.get, url, timeout=timeout)
+    response.raise_for_status()
+    return _tpex_announcement_detail(response.content)
 
 
 def _download_tpex_month(
@@ -520,7 +787,8 @@ def _download_tpex_month(
 ) -> _AnnouncementDownloadBatch:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    response = session.post(
+    response = _rate_limited_call(
+        session.post,
         TPEX_SEARCH,
         data={"inputY": str(year), "inputM": str(month), "inputD": "00", "inputType": "4", "inputKeyword": ""},
         timeout=timeout,
@@ -544,21 +812,37 @@ def _download_tpex_month(
         if not issued or link is None:
             continue
         url = urljoin(TPEX_SEARCH, link["href"])
-        subject = cells[3].get_text(" ", strip=True)
-        if not is_relevant_announcement_subject(subject):
+        listing_subject = cells[3].get_text(" ", strip=True)
+        if listing_subject and not is_relevant_announcement_subject(listing_subject):
             batch.filtered_irrelevant += 1
             continue
         try:
-            body = _detail(session, url, timeout)
+            detail = _download_tpex_detail(session, url, timeout)
         except Exception as exc:
-            body = f"DETAIL_FETCH_ERROR: {exc}"
+            detail = _AnnouncementDetail(
+                subject="",
+                body_text=f"DETAIL_FETCH_ERROR: {exc}",
+            )
             batch.detail_failure_urls.append(url)
+        subject = listing_subject or detail.subject
+        if not listing_subject:
+            if not detail.subject:
+                # Do not label an empty historical detail shell as irrelevant:
+                # it is an unresolved source-coverage fact that strict reports
+                # and audits must retain.
+                batch.unparseable += 1
+                batch.detail_content_unavailable += 1
+                continue
+            batch.detail_subject_backfills += 1
+            if not is_relevant_announcement_subject(subject):
+                batch.filtered_irrelevant += 1
+                continue
         record = _announcement_record(
             market="tpex",
             issued_date=issued,
             number=cells[2].get_text(" ", strip=True),
             subject=subject,
-            body=body,
+            body=detail.body_text,
             url=url,
         )
         if not split_announcement_symbols(record["symbols"]):
@@ -583,7 +867,7 @@ def _twse_current_detail(
             str(item.get("name")): str(item.get("value", ""))
             for item in form.select("input[name]")
         }
-        response = session.post(url, data=data, timeout=timeout)
+        response = _rate_limited_call(session.post, url, data=data, timeout=timeout)
         response.raise_for_status()
         return BeautifulSoup(response.content, "html.parser").get_text(" ", strip=True), url
 
@@ -609,14 +893,15 @@ def _download_twse_current_month(
 ) -> _AnnouncementDownloadBatch:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    search = session.get(TWSE_SEARCH, timeout=timeout)
+    search = _rate_limited_call(session.get, TWSE_SEARCH, timeout=timeout)
     search.raise_for_status()
     soup = BeautifulSoup(search.content, "html.parser")
     form = soup.select_one("#form_category")
     token = None if form is None else form.select_one('input[name="SYNCHRONIZER_TOKEN"]')
     if token is None:
         raise RuntimeError("TWSE category search did not provide SYNCHRONIZER_TOKEN")
-    response = session.post(
+    response = _rate_limited_call(
+        session.post,
         TWSE_RESULT,
         data={
             "SYNCHRONIZER_TOKEN": token.get("value", ""),
@@ -692,14 +977,15 @@ def _download_twse_legacy_month(
 ) -> _AnnouncementDownloadBatch:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    search = session.get(TWSE_LEGACY_SEARCH, timeout=timeout)
+    search = _rate_limited_call(session.get, TWSE_LEGACY_SEARCH, timeout=timeout)
     search.raise_for_status()
     soup = BeautifulSoup(search.content, "html.parser")
     form = soup.select_one("#form_category")
     token = None if form is None else form.select_one('input[name="SYNCHRONIZER_TOKEN"]')
     if token is None:
         raise RuntimeError("TWSE legacy category search did not provide SYNCHRONIZER_TOKEN")
-    response = session.post(
+    response = _rate_limited_call(
+        session.post,
         TWSE_LEGACY_RESULT,
         data={
             "SYNCHRONIZER_TOKEN": token.get("value", ""),
@@ -782,14 +1068,15 @@ def _download_twse_month(
 def _download_twse_keyword(timeout: int) -> _AnnouncementDownloadBatch:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    search = session.get(TWSE_SEARCH, timeout=timeout)
+    search = _rate_limited_call(session.get, TWSE_SEARCH, timeout=timeout)
     search.raise_for_status()
     soup = BeautifulSoup(search.content, "html.parser")
     form = soup.select_one("#form_keyword")
     token = None if form is None else form.select_one('input[name="SYNCHRONIZER_TOKEN"]')
     if token is None:
         raise RuntimeError("TWSE keyword search did not provide SYNCHRONIZER_TOKEN")
-    response = session.post(
+    response = _rate_limited_call(
+        session.post,
         TWSE_RESULT,
         data={
             "SYNCHRONIZER_TOKEN": token.get("value", ""),
@@ -846,7 +1133,12 @@ def _download_twse_keyword(timeout: int) -> _AnnouncementDownloadBatch:
 
 
 def _download_tpex_current_terms(timeout: int) -> pl.DataFrame:
-    response = requests.get(TPEX_SHORT_TERM, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    response = _rate_limited_call(
+        requests.get,
+        TPEX_SHORT_TERM,
+        headers={"User-Agent": USER_AGENT},
+        timeout=timeout,
+    )
     response.raise_for_status()
     rows = response.json()
     if not isinstance(rows, list):
@@ -912,6 +1204,7 @@ def _download_archive_task(
                     file=sys.stderr,
                 )
                 if delay > 0.0:
+                    _global_tw_public_rate_limiter().defer(delay)
                     time.sleep(delay)
     raise AssertionError("archive retry loop exited unexpectedly")
 
@@ -1065,6 +1358,8 @@ def _download_announcement_archive(
                 "unparseable": batch.unparseable,
                 "detail_failures": len(detail_failure_urls),
                 "detail_failure_urls": detail_failure_urls,
+                "detail_subject_backfills": int(batch.detail_subject_backfills),
+                "detail_content_unavailable": int(batch.detail_content_unavailable),
                 "retries": int(batch.retry_count),
             }
             completeness.append(entry)
@@ -1093,6 +1388,21 @@ def _download_announcement_archive(
         elif resolution == "non_equity":
             entry["filtered_irrelevant"] = int(entry.get("filtered_irrelevant", 0) or 0) + 1
             entry["unparseable"] = int(entry.get("unparseable", 0) or 0) - 1
+        elif resolution == "out_of_universe":
+            entry["filtered_irrelevant"] = int(
+                entry.get("filtered_irrelevant", 0) or 0
+            ) + 1
+            entry["out_of_universe"] = int(
+                entry.get("out_of_universe", 0) or 0
+            ) + 1
+            entry.setdefault("out_of_universe_records", []).append(
+                _announcement_report_stub(record)
+            )
+            entry["unparseable"] = int(entry.get("unparseable", 0) or 0) - 1
+        else:
+            entry.setdefault("unresolved_records", []).append(
+                _announcement_report_stub(record)
+            )
     completeness.sort(
         key=lambda item: (
             str(item.get("market", "")),
@@ -1121,6 +1431,15 @@ def _write_completeness_report(
         int(entry.get("filtered_irrelevant", 0) or 0) for entry in entries
     )
     unparseable = sum(int(entry.get("unparseable", 0) or 0) for entry in entries)
+    detail_subject_backfills = sum(
+        int(entry.get("detail_subject_backfills", 0) or 0) for entry in entries
+    )
+    detail_content_unavailable = sum(
+        int(entry.get("detail_content_unavailable", 0) or 0) for entry in entries
+    )
+    out_of_universe = sum(
+        int(entry.get("out_of_universe", 0) or 0) for entry in entries
+    )
     source_unavailable_requests = sum(
         entry.get("status") == "source_unavailable" for entry in entries
     )
@@ -1145,6 +1464,9 @@ def _write_completeness_report(
         "failures": failures,
         "filtered_irrelevant": filtered_irrelevant,
         "unparseable": unparseable,
+        "detail_subject_backfills": detail_subject_backfills,
+        "detail_content_unavailable": detail_content_unavailable,
+        "out_of_universe": out_of_universe,
         "source_unavailable_requests": source_unavailable_requests,
         "requests": entries,
         "data_quality": data_quality,
@@ -1399,12 +1721,22 @@ def _announcement_data_quality(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _RATE_LIMITER
     parser = argparse.ArgumentParser(description="Download official TW delisting/short-sale restriction announcements.")
     parser.add_argument("--output-dir", default="data_tw_public")
     parser.add_argument("--start-year", type=int, default=1995)
     parser.add_argument("--end-year", type=int, default=date.today().year)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help=(
+            "Host-global minimum seconds between TW public HTTP requests. "
+            "Unspecified endpoints default to the stockAgent 10 req/s policy."
+        ),
+    )
     parser.add_argument(
         "--retries",
         type=int,
@@ -1425,6 +1757,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.end_year < args.start_year:
         parser.error("--end-year must be greater than or equal to --start-year")
+    request_interval = resolve_request_interval("tw_public", args.request_interval)
+    _RATE_LIMITER = SharedRateLimiter(request_interval, name="tw_public")
+    print(
+        f"[tw-short-restrictions] {describe_rate_limit('tw_public', request_interval)}",
+        flush=True,
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

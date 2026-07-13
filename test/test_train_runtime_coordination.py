@@ -14,6 +14,16 @@ import torch
 import train as train_entry
 
 
+def test_auto_multi_gpu_strategy_tracks_visible_device_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    assert train_entry._resolve_multi_gpu_strategy("auto") == "none"
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    assert train_entry._resolve_multi_gpu_strategy("auto") == "distributed_data_parallel"
+    assert train_entry._resolve_multi_gpu_strategy("none") == "none"
+
+
 def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

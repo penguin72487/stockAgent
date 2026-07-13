@@ -99,6 +99,97 @@ def test_symbol_less_expiry_correction_is_classified_non_equity() -> None:
     assert downloader._resolve_unparsed_announcement(record, {}) == "non_equity"
 
 
+def test_unresolved_emerging_only_notice_is_explicitly_out_of_universe() -> None:
+    record = _announcement_record(
+        market="tpex",
+        issued_date="2005-04-22",
+        number="emerging-only",
+        subject=(
+            "公告本中心終止與光威電腦股份有限公司簽訂之興櫃股票"
+            "櫃檯買賣契約，並終止該公司普通股在證券商營業處所買賣。"
+        ),
+        body="",
+        url="https://example.test/emerging-only",
+    )
+    assert record["symbols"] == ""
+    assert downloader._resolve_unparsed_announcement(record, {}) == (
+        "out_of_universe"
+    )
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        (
+            "杜康控股有限公司參與發行之臺灣存託憑證"
+            "（公司代號：911616）因終止上市而暫停融資融券交易。"
+        ),
+        (
+            "新光一號不動產投資信託基金受益證券（代號：01003T）"
+            "自112年11月29日起終止上市。"
+        ),
+        (
+            "SGBR2X凱基32購01（代號：035204）到期日及終止上市日更正。"
+        ),
+    ],
+)
+def test_explicit_unsupported_security_cannot_be_remapped_by_company_alias(
+    subject: str,
+) -> None:
+    lookup: downloader.CompanySymbolLookup = {("twse", "杜康控股"): {"9188"}}
+    record = _announcement_record(
+        market="twse",
+        issued_date="2021-07-21",
+        number="unsupported-product",
+        subject=subject,
+        body="",
+        url="https://example.test/unsupported-product",
+    )
+
+    assert record["symbols"] == ""
+    assert downloader._resolve_unparsed_announcement(record, lookup) == (
+        "out_of_universe"
+    )
+    assert record["symbols"] == ""
+
+
+def test_four_digit_tdr_style_equity_remains_in_canonical_universe() -> None:
+    record = _announcement_record(
+        market="twse",
+        issued_date="2021-07-21",
+        number="supported-tdr",
+        subject="某公司臺灣存託憑證（證券代號：9188）終止上市。",
+        body="",
+        url="https://example.test/supported-tdr",
+    )
+
+    assert record["symbols"] == "9188"
+
+
+def test_cached_unsupported_product_mapping_is_removed_and_not_reused(
+    tmp_path: Path,
+) -> None:
+    subject = (
+        "杜康控股有限公司參與發行之臺灣存託憑證"
+        "（公司代號：911616）因終止上市而暫停融資融券交易。"
+    )
+    stale = _announcement_record(
+        market="twse",
+        issued_date="2021-07-21",
+        number="stale-tdr",
+        subject=subject,
+        body="",
+        url="https://example.test/stale-tdr",
+    )
+    stale["symbols"] = "9188"
+    pl.DataFrame([stale], infer_schema_length=None).write_parquet(
+        tmp_path / "tw_delisting_short_sale_announcements.parquet"
+    )
+
+    assert downloader._repair_announcement_record(stale)["symbols"] == ""
+    assert downloader._load_company_symbol_lookup(tmp_path) == {}
+
+
 def test_announcement_parser_extracts_short_sale_resume_date() -> None:
     record = _announcement_record(
         market="tpex",
@@ -342,6 +433,87 @@ def test_unlabeled_parenthesized_etf_code_and_spaced_stock_label_are_extracted()
     assert extract_announcement_symbols(spaced_label, "") == ["1591"]
 
 
+def test_historical_chinese_numeral_stock_code_is_extracted_but_business_id_is_not() -> None:
+    subject = (
+        "公告本中心終止與普羅強生半導體股份有限公司"
+        "（股票代號：三一三三）簽訂之興櫃股票櫃檯買賣契約。"
+    )
+    body = "公司營利事業統一編號：13173433。"
+
+    assert extract_announcement_symbols(subject, body) == ["3133"]
+
+
+def test_official_company_and_historical_quote_names_resolve_symbol_less_notice(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame(
+        {
+            "公司代號": ["6184"],
+            "公司名稱": ["大豐有線電視股份有限公司"],
+            "公司簡稱": ["大豐電"],
+        }
+    ).write_parquet(tmp_path / "twse_listed_company_basic.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2004-06-01"],
+            "代號": ["8010"],
+            "名稱": ["益和"],
+        }
+    ).write_parquet(tmp_path / "tpex_daily_ohlcv.parquet")
+
+    lookup = downloader._load_company_symbol_lookup(tmp_path)
+    transfer = _announcement_record(
+        market="tpex",
+        issued_date="2005-02-04",
+        number="transfer",
+        subject=(
+            "公告大豐有線電視股份有限公司普通股股票，自94年2月15日起，"
+            "終止在證券商營業處所買賣。"
+        ),
+        body="",
+        url="https://example.test/transfer",
+    )
+    historical = _announcement_record(
+        market="tpex",
+        issued_date="2005-05-19",
+        number="historical",
+        subject=(
+            "公告本中心終止與益和股份有限公司簽訂之股票櫃檯買賣契約，"
+            "並終止普通股股票在證券商營業處所買賣。"
+        ),
+        body="",
+        url="https://example.test/historical",
+    )
+
+    assert downloader._resolve_unparsed_announcement(transfer, lookup) == "resolved"
+    assert transfer["symbols"] == "6184"
+    assert downloader._resolve_unparsed_announcement(historical, lookup) == "resolved"
+    assert historical["symbols"] == "8010"
+
+
+def test_historical_quote_mojibake_is_not_identity_evidence(tmp_path: Path) -> None:
+    pl.DataFrame(
+        {
+            "date": ["2004-06-01", "2004-06-01", "2004-06-01", "2004-10-28"],
+            "代號": ["8010", "8925", "5351", "5351"],
+            "名稱": ["益和", "嚙踝蕭嚙踝蕭", "鈺喉蕭", "鈺創"],
+            "_name_decode_status": [
+                "",
+                "official_receipt_name_bytes_unrecoverable",
+                "official_receipt_name_bytes_unrecoverable",
+                "",
+            ],
+        }
+    ).write_parquet(tmp_path / "tpex_daily_ohlcv.parquet")
+
+    lookup = downloader._load_company_symbol_lookup(tmp_path)
+
+    assert lookup[("tpex", "益和")] == {"8010"}
+    assert lookup[("tpex", "鈺創")] == {"5351"}
+    assert ("tpex", "鈺喉蕭") not in lookup
+    assert all("嚙" not in alias for _, alias in lookup)
+
+
 def test_stock_code_label_variant_is_extracted_from_terminal_notice() -> None:
     record = _announcement_record(
         market="tpex",
@@ -357,6 +529,9 @@ def test_stock_code_label_variant_is_extracted_from_terminal_notice() -> None:
 
     assert record["symbols"] == "4762"
     assert record["delisting_date"] == "2017-08-01"
+    assert classify_delisting_notice(
+        "華特電子普通股自94年11月17日起終止於證券商營業處所買賣。"
+    ).is_delisting_notice is True
 
 
 @pytest.mark.parametrize(
@@ -571,6 +746,78 @@ def test_tpex_month_rejects_server_normalized_month(monkeypatch) -> None:
         downloader._download_tpex_month(2002, 12, 5)
 
 
+def test_tpex_blank_subject_fetches_narrow_detail_before_filtering(monkeypatch) -> None:
+    result_html = """
+        <table><tbody>
+          <tr><td>1</td><td>98/10/09</td><td>N1</td><td></td><td><a href="/terminal">detail</a></td></tr>
+          <tr><td>2</td><td>98/10/08</td><td>N2</td><td></td><td><a href="/dividend">detail</a></td></tr>
+          <tr><td>3</td><td>98/10/07</td><td>N3</td><td></td><td><a href="/empty">detail</a></td></tr>
+        </tbody></table>
+    """.encode()
+    terminal_html = """
+        <html><body>
+          <nav>公告股票代號：9999終止上櫃</nav>
+          <div class="page-wrapper">
+            <table><tr><td>發文日期：中華民國98年10月9日</td></tr></table>
+            <table><tr><td>主　旨：</td><td>
+              公告亞智科技股份有限公司（代號：5492）普通股股票，
+              自98年10月30日起終止在證券商營業處所買賣，並自98年10月13日起
+              暫停融資融券交易，且應於98年10月16日前償還或還券了結。
+            </td></tr></table>
+          </div>
+        </body></html>
+    """.encode()
+    dividend_html = """
+        <div class="page-wrapper"><table><tr>
+          <td>主旨：</td><td>董事會決議股利分派</td>
+        </tr></table></div>
+    """.encode()
+    empty_html = """
+        <div class="page-wrapper"><table><tr>
+          <td>主旨：</td><td></td>
+        </tr></table></div>
+    """.encode()
+
+    class Response:
+        def __init__(self, content: bytes):
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.detail_urls: list[str] = []
+
+        def post(self, *_args, **_kwargs):
+            return Response(result_html)
+
+        def get(self, url: str, timeout: int):
+            del timeout
+            self.detail_urls.append(url)
+            if url.endswith("/terminal"):
+                return Response(terminal_html)
+            if url.endswith("/dividend"):
+                return Response(dividend_html)
+            return Response(empty_html)
+
+    session = Session()
+    monkeypatch.setattr(downloader.requests, "Session", lambda: session)
+
+    batch = downloader._download_tpex_month(2009, 10, 5)
+
+    assert [record["symbols"] for record in batch.records] == ["5492"]
+    assert batch.records[0]["short_open_ban_date"] == "2009-10-13"
+    assert batch.records[0]["short_cover_deadline"] == "2009-10-16"
+    assert "9999" not in batch.records[0]["body_text"]
+    assert batch.detail_subject_backfills == 2
+    assert batch.filtered_irrelevant == 1
+    assert batch.detail_content_unavailable == 1
+    assert batch.unparseable == 1
+    assert len(session.detail_urls) == 3
+
+
 def test_archive_marks_known_source_boundaries_without_requesting_them(monkeypatch) -> None:
     tpex_calls: list[tuple[int, int]] = []
     twse_calls: list[tuple[int, int]] = []
@@ -609,6 +856,52 @@ def test_archive_marks_known_source_boundaries_without_requesting_them(monkeypat
     ]
     assert len(tpex_unavailable) == 10
     assert len(twse_unavailable) == 12
+
+
+def test_archive_receipts_explicit_out_of_universe_evidence(monkeypatch) -> None:
+    excluded = _announcement_record(
+        market="twse",
+        issued_date="2021-07-21",
+        number="six-digit-tdr",
+        subject=(
+            "杜康控股有限公司臺灣存託憑證（公司代號：911616）"
+            "因終止上市而暫停融資融券交易。"
+        ),
+        body="",
+        url="https://example.test/six-digit-tdr",
+    )
+    monkeypatch.setattr(downloader, "_download_tpex_month", lambda *_args: [])
+    monkeypatch.setattr(downloader, "_download_twse_month", lambda *_args: [])
+    monkeypatch.setattr(
+        downloader,
+        "_download_twse_keyword",
+        lambda *_args: downloader._AnnouncementDownloadBatch(
+            unparseable=1,
+            unresolved_records=[excluded],
+        ),
+    )
+
+    records, failures, entries = downloader._download_announcement_archive(
+        start_year=2002,
+        end_year=2002,
+        workers=1,
+        timeout=5,
+    )
+
+    assert records == []
+    assert failures == []
+    keyword = next(row for row in entries if row["source"] == "keyword:終止上市")
+    assert keyword["unparseable"] == 0
+    assert keyword["out_of_universe"] == 1
+    assert keyword["out_of_universe_records"] == [
+        {
+            "announcement_date": "2021-07-21",
+            "market": "twse",
+            "document_number": "six-digit-tdr",
+            "subject": excluded["subject"],
+            "source_url": "https://example.test/six-digit-tdr",
+        }
+    ]
 
 
 def test_archive_task_retries_transient_request_failures(monkeypatch) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, get_args, get_type_hints
 
@@ -269,6 +270,10 @@ class EnvironmentConfig:
 class DataConfig:
     parquet_root: str
     benchmark_name: str
+    # Inclusive lower bound for the model panel.  Source archives may retain
+    # older rows for provenance even when that interval cannot support an
+    # unbiased training universe.
+    panel_start_date: str | None = None
     security_filter: str = "none"
     usd_only_trading_pairs: bool = False
     tradable_mode: str = "tradable"
@@ -449,6 +454,8 @@ class LowRankMarketTransformerPortfolioModelConfig:
 class TransformerBasePortfolioModelConfig:
     d_model: int = 64
     attention_mode: str = "latent"
+    use_latent_factors: bool | None = None
+    use_market_tokens: bool | None = None
     use_flash_attention: bool = True
     use_time_pos: bool = True
     use_symbol_pos: bool = True
@@ -637,7 +644,7 @@ class TrainingConfig:
     non_blocking_transfer: bool
     model_name: str = "mlp"
     seed: int = 42
-    multi_gpu_strategy: str = "none"
+    multi_gpu_strategy: str = "auto"
     ddp_bucket_cap_mb: int = 4
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
@@ -978,6 +985,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         "no": "none",
         "single": "none",
         "single_gpu": "none",
+        "auto": "auto",
         "ddp": "distributed_data_parallel",
         "distributed": "distributed_data_parallel",
         "distributed_data_parallel": "distributed_data_parallel",
@@ -989,8 +997,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "use 'distributed_data_parallel' with torchrun"
         )
     multi_gpu_strategy = multi_gpu_aliases.get(multi_gpu_strategy, multi_gpu_strategy)
-    if multi_gpu_strategy not in {"none", "distributed_data_parallel"}:
-        raise ValueError("training.multi_gpu_strategy must be one of: none, distributed_data_parallel")
+    if multi_gpu_strategy not in {"auto", "none", "distributed_data_parallel"}:
+        raise ValueError("training.multi_gpu_strategy must be one of: auto, none, distributed_data_parallel")
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
     training["best_checkpoint_max_epoch"] = max(0, int(training["best_checkpoint_max_epoch"]))
@@ -1337,6 +1345,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data["panel_load_workers"]))
     data["live_tail_panel_rows"] = max(0, int(data["live_tail_panel_rows"]))
+    raw_panel_start_date = data.get("panel_start_date")
+    if raw_panel_start_date is None or not str(raw_panel_start_date).strip():
+        data["panel_start_date"] = None
+    else:
+        panel_start_date = str(raw_panel_start_date).strip()
+        try:
+            parsed_panel_start_date = date.fromisoformat(panel_start_date)
+        except ValueError as exc:
+            raise ValueError(
+                "data.panel_start_date must be an ISO date (YYYY-MM-DD) or null, "
+                f"got {raw_panel_start_date!r}"
+            ) from exc
+        data["panel_start_date"] = parsed_panel_start_date.isoformat()
+        expected_first_year = walk_forward.get("expected_first_year")
+        if (
+            expected_first_year is not None
+            and int(expected_first_year) != parsed_panel_start_date.year
+        ):
+            raise ValueError(
+                "walk_forward.expected_first_year must match the year of "
+                "data.panel_start_date; got "
+                f"{expected_first_year!r} and {data['panel_start_date']!r}"
+            )
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()

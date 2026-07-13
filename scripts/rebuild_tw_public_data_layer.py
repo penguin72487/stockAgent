@@ -12,13 +12,16 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.config import load_config
+from scripts.build_tw_yahoo_fallback_archive import (
+    _load_verified_transfer_adjustments,
+)
 
 
 _DATA_LAYER_LOCK_HANDLE = None
@@ -118,6 +121,45 @@ def _completed_stage(manifest: dict[str, Any], name: str) -> dict[str, Any] | No
     return None
 
 
+def _validate_official_symbol_build_summary(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"official symbol build summary is unreadable: {path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"official symbol build summary is not a JSON object: {path}"
+        )
+    missing_adjustment_rows = payload.get("missing_adjustment_rows")
+    if isinstance(missing_adjustment_rows, bool) or not isinstance(
+        missing_adjustment_rows,
+        int,
+    ):
+        raise RuntimeError(
+            "official symbol build summary has no valid "
+            f"missing_adjustment_rows count: {path}"
+        )
+    if missing_adjustment_rows < 0:
+        raise RuntimeError(
+            "official symbol build summary has a negative "
+            f"missing_adjustment_rows count: {path}"
+        )
+    explicitly_resolved = payload.get("all_adjustments_resolved")
+    if explicitly_resolved is not None and explicitly_resolved is not True:
+        raise RuntimeError(
+            "official symbol build did not certify all adjustments as resolved: "
+            f"all_adjustments_resolved={explicitly_resolved!r} summary={path}"
+        )
+    if missing_adjustment_rows:
+        raise RuntimeError(
+            "official symbol build left unresolved adjustment rows: "
+            f"missing_adjustment_rows={missing_adjustment_rows} summary={path}"
+        )
+
+
 class RebuildRunner:
     def __init__(
         self,
@@ -144,9 +186,10 @@ class RebuildRunner:
         *,
         outputs: list[Path],
         allow_resume: bool = True,
+        validate_outputs: Callable[[], None] | None = None,
     ) -> None:
         previous = _completed_stage(self.manifest, name)
-        if (
+        resume_match = (
             allow_resume
             and self.resume
             and not self.upstream_changed
@@ -154,7 +197,32 @@ class RebuildRunner:
             and previous.get("command") == command
             and _outputs_exist(outputs)
             and _receipts_match(previous, outputs)
-        ):
+        )
+        if resume_match:
+            if validate_outputs is None:
+                print(f"[tw-data-rebuild] stage={name} status=resume-skip", flush=True)
+                return
+            started = _utc_now()
+            started_clock = time.perf_counter()
+            try:
+                validate_outputs()
+            except BaseException as exc:
+                self.upstream_changed = True
+                message = f"{type(exc).__name__}: {exc}"
+                record = StageRecord(
+                    name=name,
+                    status="failed",
+                    command=command,
+                    started_at_utc=started,
+                    finished_at_utc=_utc_now(),
+                    elapsed_seconds=time.perf_counter() - started_clock,
+                    required_outputs=[str(path) for path in outputs],
+                    output_receipts=_output_receipts(outputs),
+                    message=message,
+                )
+                self.manifest.setdefault("stages", []).append(asdict(record))
+                self.update_metadata()
+                raise RuntimeError(f"stage {name} failed: {message}") from exc
             print(f"[tw-data-rebuild] stage={name} status=resume-skip", flush=True)
             return
 
@@ -175,6 +243,8 @@ class RebuildRunner:
             if missing:
                 raise RuntimeError(f"stage completed without required outputs: {missing}")
             receipts = _output_receipts(outputs)
+            if validate_outputs is not None:
+                validate_outputs()
         except BaseException as exc:
             status = "failed"
             message = f"{type(exc).__name__}: {exc}"
@@ -197,6 +267,197 @@ class RebuildRunner:
 
 def _python_command(*args: str) -> list[str]:
     return [sys.executable, *args]
+
+
+def _transfer_adjustment_command(
+    args: argparse.Namespace,
+    *,
+    public_dir: Path,
+    yahoo_source_dir: Path,
+    output_path: Path,
+) -> list[str]:
+    command = _python_command(
+        "downloader/download_tw_transfer_adjustments.py",
+        "--mode",
+        str(args.mode),
+        "--official-input-dir",
+        str(public_dir),
+        "--yahoo-source-dir",
+        str(yahoo_source_dir),
+        "--output-path",
+        str(output_path),
+        "--start-date",
+        str(args.fallback_start_date),
+        "--end-date",
+        str(args.end_date),
+        "--workers",
+        str(args.public_workers),
+        "--timeout",
+        str(args.timeout),
+        "--retries",
+        str(args.retries),
+        "--resume" if args.resume else "--no-resume",
+    )
+    if args.request_interval is not None:
+        command.extend(["--request-interval", str(args.request_interval)])
+    return command
+
+
+def _validate_transfer_adjustment_reference(
+    path: Path,
+    *,
+    start: date,
+    end: date,
+) -> None:
+    _load_verified_transfer_adjustments(path, start=start, end=end)
+
+
+def _taiex_command(args: argparse.Namespace, public_dir: Path) -> list[str]:
+    command = _python_command(
+        "downloader/download_tw_taiex_ohlc.py",
+        "--mode",
+        str(args.mode),
+        "--output-dir",
+        str(public_dir),
+        "--start-date",
+        str(args.taiex_start_date),
+        "--end-date",
+        str(args.end_date),
+        "--workers",
+        str(args.public_workers),
+        "--timeout",
+        str(args.timeout),
+        "--retries",
+        str(args.retries),
+        "--retry-backoff",
+        str(args.retry_backoff),
+        "--daily-overlap-days",
+        str(args.daily_overlap_days),
+        "--resume" if args.resume else "--no-resume",
+    )
+    if args.request_interval is not None:
+        command.extend(["--request-interval", str(args.request_interval)])
+    if args.skip_raw:
+        command.append("--skip-raw")
+    return command
+
+
+def _public_command(args: argparse.Namespace, public_dir: Path) -> list[str]:
+    public_mode = "rebuild" if args.operation == "from-zero" else args.mode
+    command = _python_command(
+        "downloader/download_tw_public_data.py",
+        "--mode",
+        public_mode,
+        "--datasets",
+        "all",
+        "--start-date",
+        args.public_start_date,
+        "--end-date",
+        args.end_date,
+        "--output-dir",
+        str(public_dir),
+        "--workers",
+        str(args.public_workers),
+        "--date-workers",
+        str(args.date_workers),
+        "--timeout",
+        str(args.timeout),
+        "--retries",
+        str(args.retries),
+        "--retry-backoff",
+        str(args.retry_backoff),
+        "--sleep",
+        str(args.sleep),
+        "--flush-every-dates",
+        str(args.flush_every_dates),
+        "--daily-overlap-days",
+        str(args.daily_overlap_days),
+        "--empty-recheck-days",
+        str(args.empty_recheck_days),
+        "--require-taiex-session-calendar",
+        "--resume" if args.resume else "--no-resume",
+    )
+    if args.request_interval is not None:
+        command.extend(["--request-interval", str(args.request_interval)])
+    if args.skip_raw:
+        command.append("--skip-raw")
+    return command
+
+
+def _cleanup_published_partials(
+    partial_dir: Path,
+    *,
+    preserve_prefixes: tuple[str, ...] = (),
+) -> None:
+    """Remove published partials without deleting another stage's resume state."""
+
+    if not partial_dir.is_dir():
+        return
+    for path in partial_dir.iterdir():
+        if any(path.name.startswith(prefix) for prefix in preserve_prefixes):
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    try:
+        partial_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _cleanup_partial_prefix(partial_dir: Path, prefix: str) -> None:
+    if not partial_dir.is_dir():
+        return
+    for path in partial_dir.glob(f"{prefix}*"):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    try:
+        partial_dir.rmdir()
+    except OSError:
+        pass
+
+
+def _run_market_history_stages(
+    args: argparse.Namespace,
+    runner: RebuildRunner,
+    public_dir: Path,
+) -> None:
+    """Build the certified session calendar before any daily public source."""
+
+    if args.skip_public:
+        return
+
+    if not args.skip_taiex_ohlc:
+        taiex_path = public_dir / "twse_taiex_ohlc.parquet"
+        runner.run(
+            "twse_taiex_ohlc",
+            _taiex_command(args, public_dir),
+            outputs=[taiex_path, taiex_path.with_suffix(".summary.json")],
+        )
+        if not args.dry_run:
+            _cleanup_partial_prefix(
+                public_dir / "state" / "partials",
+                "twse_taiex_ohlc.",
+            )
+
+    # Even when an operator explicitly skips the monthly download, the public
+    # child remains strict and will accept only an already complete, receipt-
+    # verified calendar covering the whole requested range.
+    runner.run(
+        "official_public_sources",
+        _public_command(args, public_dir),
+        outputs=[public_dir / "download_summary.json", public_dir / "download_report.csv"],
+    )
+    if not args.dry_run:
+        # Keep a skipped/unfinished monthly stage's source-scoped resume state;
+        # daily public-source partials are redundant after successful publication.
+        _cleanup_published_partials(
+            public_dir / "state" / "partials",
+            preserve_prefixes=("twse_taiex_ohlc.",),
+        )
 
 
 def _production_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
@@ -351,6 +612,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--end-date", default=date.today().isoformat())
     parser.add_argument("--public-start-date", default="earliest")
+    parser.add_argument(
+        "--taiex-start-date",
+        default="1999-01-05",
+        help=(
+            "Official MI_5MINS_HIST archive start. Keep the 1999 history so the "
+            "first 2000 session has a previous official close."
+        ),
+    )
     parser.add_argument("--short-start-year", type=int, default=1995)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--public-workers", type=int, default=2)
@@ -394,6 +663,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-symbol-build", action="store_true")
     parser.add_argument("--skip-feature-build", action="store_true")
     parser.add_argument("--skip-public", action="store_true")
+    parser.add_argument("--skip-taiex-ohlc", action="store_true")
     parser.add_argument("--skip-corporate-actions", action="store_true")
     parser.add_argument("--skip-short-rules", action="store_true")
     parser.add_argument("--skip-raw", action="store_true")
@@ -483,6 +753,9 @@ def main() -> None:
         else public_dir / "fallback" / "yahoo_tw_stocks"
     )
     yahoo_fallback_archive = public_dir / "fallback" / "yahoo_tw_ohlcv.parquet"
+    transfer_adjustment_reference = (
+        public_dir / "tw_transfer_adjustment_reference.parquet"
+    )
     audit_output = Path(args.stage_root) / "audit"
     manifest_path = Path(args.stage_root) / "rebuild_manifest.json"
     runner = RebuildRunner(
@@ -506,6 +779,7 @@ def main() -> None:
         fallback_start_date=fallback_start.isoformat(),
         yahoo_fallback_dir=str(yahoo_fallback_dir),
         yahoo_fallback_archive=str(yahoo_fallback_archive),
+        transfer_adjustment_reference=str(transfer_adjustment_reference),
         yahoo_request_interval=float(args.yahoo_request_interval),
         started_at_utc=runner.manifest.get("started_at_utc", _utc_now()),
     )
@@ -533,49 +807,7 @@ def main() -> None:
         return
 
     public_dir.mkdir(parents=True, exist_ok=True)
-
-    if not args.skip_public:
-        public_mode = "rebuild" if args.operation == "from-zero" else args.mode
-        public_command = _python_command(
-            "downloader/download_tw_public_data.py",
-            "--mode",
-            public_mode,
-            "--datasets",
-            "all",
-            "--start-date",
-            args.public_start_date,
-            "--end-date",
-            args.end_date,
-            "--output-dir",
-            str(public_dir),
-            "--workers",
-            str(args.public_workers),
-            "--date-workers",
-            str(args.date_workers),
-            "--timeout",
-            str(args.timeout),
-            "--retries",
-            str(args.retries),
-            "--retry-backoff",
-            str(args.retry_backoff),
-            "--sleep",
-            str(args.sleep),
-            "--flush-every-dates",
-            str(args.flush_every_dates),
-            "--daily-overlap-days",
-            str(args.daily_overlap_days),
-            "--empty-recheck-days",
-            str(args.empty_recheck_days),
-        )
-        if args.request_interval is not None:
-            public_command.extend(["--request-interval", str(args.request_interval)])
-        if args.skip_raw:
-            public_command.append("--skip-raw")
-        runner.run(
-            "official_public_sources",
-            public_command,
-            outputs=[public_dir / "download_summary.json", public_dir / "download_report.csv"],
-        )
+    _run_market_history_stages(args, runner, public_dir)
 
     if not args.skip_corporate_actions:
         corporate_mode = "rebuild" if args.operation == "from-zero" else args.mode
@@ -596,6 +828,8 @@ def main() -> None:
             "--retries",
             str(args.retries),
         )
+        if args.request_interval is not None:
+            corporate_command.extend(["--request-interval", str(args.request_interval)])
         if args.skip_raw:
             corporate_command.append("--skip-raw")
         runner.run(
@@ -642,6 +876,11 @@ def main() -> None:
                 "--request-interval",
                 str(args.yahoo_request_interval),
                 "--include-tw-delisted",
+                "--tw-delisted-dir",
+                str(public_dir),
+                "--verify-tw-delisted-history",
+                "--retry-blacklisted-repair-symbols",
+                "--fail-on-any-error",
             )
             yahoo_report = (
                 yahoo_fallback_dir / "download_report.csv"
@@ -651,8 +890,35 @@ def main() -> None:
             runner.run(
                 "yahoo_ohlcv_fallback_download",
                 yahoo_command,
-                outputs=[yahoo_fallback_dir / "symbols.csv", yahoo_report],
+                outputs=list(
+                    dict.fromkeys(
+                        [
+                            yahoo_fallback_dir / "symbols.csv",
+                            yahoo_report,
+                            yahoo_fallback_dir / "download_report.csv",
+                            yahoo_fallback_dir / "download_summary.json",
+                        ]
+                    )
+                ),
             )
+        runner.run(
+            "tw_transfer_adjustment_reference",
+            _transfer_adjustment_command(
+                args,
+                public_dir=public_dir,
+                yahoo_source_dir=yahoo_fallback_dir,
+                output_path=transfer_adjustment_reference,
+            ),
+            outputs=[
+                transfer_adjustment_reference,
+                transfer_adjustment_reference.with_suffix(".summary.json"),
+            ],
+            validate_outputs=lambda: _validate_transfer_adjustment_reference(
+                transfer_adjustment_reference,
+                start=fallback_start,
+                end=requested_end,
+            ),
+        )
         runner.run(
             "yahoo_ohlcv_fallback_archive",
             _python_command(
@@ -669,9 +935,12 @@ def main() -> None:
                 args.end_date,
                 "--workers",
                 str(args.workers),
+                "--transfer-adjustment-reference",
+                str(transfer_adjustment_reference),
             ),
             outputs=[
                 yahoo_fallback_archive,
+                yahoo_fallback_archive.with_suffix(".inputs.json"),
                 yahoo_fallback_archive.with_suffix(".summary.json"),
                 yahoo_fallback_archive.with_suffix(".report.csv"),
             ],
@@ -709,31 +978,37 @@ def main() -> None:
                 stock_root / "official_symbol_build_summary.json",
                 stock_root / "return_price_provenance.json",
             ],
+            validate_outputs=lambda: _validate_official_symbol_build_summary(
+                stock_root / "official_symbol_build_summary.json"
+            ),
         )
 
     if not args.skip_short_rules:
         short_start_year = (
             int(args.end_date[:4]) if args.mode == "daily" else int(args.short_start_year)
         )
+        short_rule_command = _python_command(
+            "downloader/download_tw_short_sale_restrictions.py",
+            "--output-dir",
+            str(public_dir),
+            "--start-year",
+            str(short_start_year),
+            "--end-year",
+            str(int(args.end_date[:4])),
+            "--workers",
+            str(args.public_workers),
+            "--timeout",
+            str(args.timeout),
+            "--retries",
+            str(args.retries),
+            "--retry-backoff",
+            str(args.retry_backoff),
+        )
+        if args.request_interval is not None:
+            short_rule_command.extend(["--request-interval", str(args.request_interval)])
         runner.run(
             "short_sale_and_lifecycle_rules",
-            _python_command(
-                "downloader/download_tw_short_sale_restrictions.py",
-                "--output-dir",
-                str(public_dir),
-                "--start-year",
-                str(short_start_year),
-                "--end-year",
-                str(int(args.end_date[:4])),
-                "--workers",
-                str(args.public_workers),
-                "--timeout",
-                str(args.timeout),
-                "--retries",
-                str(args.retries),
-                "--retry-backoff",
-                str(args.retry_backoff),
-            ),
+            short_rule_command,
             outputs=[
                 public_dir / "tw_delisting_short_sale_announcements.parquet",
                 public_dir / "tw_short_sale_download_report.json",

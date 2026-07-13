@@ -145,6 +145,8 @@ training:
   transformer_base_portfolio:
     d_model: 32
     attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true
@@ -185,8 +187,14 @@ training:
 Notes:
 
 - The scalable Transformer can be moved from complete to compact via `attention_mode`.
+- `transformer_base_portfolio.use_latent_factors` and `use_market_tokens` are
+  independent compact-bottleneck switches. `null` preserves the historical
+  `attention_mode` preset; explicit booleans override it. The four supported
+  combinations within the compact attention family are factor+market,
+  factor-only, market-only, and temporal-only.
+  Do not enable either compact bottleneck with `attention_mode: full` or `axial`.
 - Avoid `attention_mode: full` on a full market universe unless symbol count is small enough for the `max_full_tokens` guard.
-- For large universes, prefer `latent` or `market_token`.
+- For large universes, prefer `latent`, `latent_only`, or `market_token`.
 - `return_aux_details` is useful for explainability but can increase memory pressure during training. Prefer `false` for tight VRAM training and enable it for explainability runs when needed.
 - The previous low-rank model remains available as `low_rank_market_transformer_portfolio`.
 - Latest active TW full-universe baseline (`S≈2304`) is `attention_mode: market_token`, `lookback: 32`, `batch_size_train: 32`, `batch_size_eval: 16`, and `temporal_pooling: attention`.
@@ -194,7 +202,7 @@ Notes:
 - `temporal_pooling: attention` is the active user preference when trying to improve convergence; pair it with `temporal_query_mode: full_then_last` because attention pooling needs all temporal steps.
 - `temporal_pooling: last` remains the faster speed ablation. Pair it with `temporal_query_mode: last_only` to shrink the temporal autograd graph when speed is the priority.
 - The active speed ablation sets `qk_norm: false` and `dropout: 0.1` to trim attention/FFN dropout and Q/K RMS-normalization autograd nodes. Treat this as a speed baseline, not proof that the regularized model is worse; re-check validation/test metrics before making investment-quality conclusions.
-- `TransformerBasePortfolioModel.forward_from_panel(features, date_indices, mask, ...)` is the preferred lazy-window path for `WindowedSplitTensors`: it projects each unique panel date once and gathers projected `[B,L,S,D]` windows before running the same downstream temporal/market-token/score path. Preserve old `forward(x, mask, ...)` API compatibility.
+- `TransformerBasePortfolioModel.forward_from_panel(features, date_indices, mask, ...)` is the preferred lazy-window path for `WindowedSplitTensors`: it projects each unique panel date once and gathers projected `[B,L,S,D]` windows before running the same downstream temporal/mode-specific-bottleneck/score path. Preserve old `forward(x, mask, ...)` API compatibility.
 - `TransformerBasePortfolioModel.forward_from_panel_slab(feature_slab, mask, ...)` is the compile-friendly fast path for contiguous lazy-window batches: pass `[B+lookback-1,S,F]` panel slabs and keep `date_indices` / gather metadata outside the compiled model graph. It must remain numerically equivalent to materialized windows and generic `forward_from_panel` for contiguous rows.
 - Keep training `return_aux: false` and `return_aux_details: false` unless the objective explicitly needs aux tensors; enable aux for explainability/inference runs rather than the tight VRAM training path.
 - The active `market_token` architecture should follow this low-complexity flow:
@@ -206,7 +214,11 @@ Notes:
   - long/short logits are masked and optionally de-meaned; the selected output mode
     either returns logits or transforms them through its configured signed action,
     projection, or activation-plus-L1 rule
-- Keep `stock_market_gate`, `z_market_delta`, market tokens, latent factors, and stock embeddings available in aux outputs when detailed explainability is requested.
+- Keep enabled bottleneck tensors available in aux outputs when detailed
+  explainability is requested: latent factors for the factor path, market tokens
+  plus `stock_market_gate`/`z_market_delta` for the market path, and stock
+  embeddings for factor/market bottleneck paths. Do not fabricate disabled-path
+  aux tensors.
 
 Modern Transformer module contract:
 
@@ -234,7 +246,10 @@ Modes:
 
 - `full`: joint attention over all `lookback * stocks` tokens. Most complete, O((L*S)^2), use only for small universes or debug subsets.
 - `axial`: temporal attention per stock, then cross-stock attention per day. O(S*L^2 + L*S^2).
-- `latent`: temporal attention, then latent factors and market tokens. Large-universe friendly default.
+- `latent`: temporal attention, then latent factors and market tokens. This is
+  the historical factor+market preset.
+- `latent_only`: temporal attention and latent factors without market tokens;
+  normally selected with `use_latent_factors: true` and `use_market_tokens: false`.
 - `market_token`: temporal attention, then market-token bottleneck. Smaller than latent.
 - `temporal_only`: no cross-stock attention. Smallest Transformer baseline.
 
@@ -244,7 +259,7 @@ Rules:
 - Keep `sdpa_batch_limit` enabled for large universes. Temporal attention flattens to `batch_size * symbols`; unchunked SDPA can hit CUDA `invalid argument` when that dimension is too large.
 - Do not assume Flash Attention removes full attention compute cost. It reduces memory pressure, but `full` mode is still quadratic in `lookback * stocks`.
 - Use `max_full_tokens` as an OOM guard for `full` mode.
-- Prefer `latent` or `market_token` for full market universes.
+- Prefer `latent`, `latent_only`, or `market_token` for full market universes.
 - Use `d_model`, layer counts, heads, latent factors, market tokens, and `attention_mode` as the main knobs for scaling small to complete.
 
 ## Portfolio Direction Intent
@@ -334,6 +349,11 @@ Rules:
   DataLoader or single-process multi-GPU executor.
 - The loss path is canonical `risk_aware_loss` plus `run_backtest_torch`; compile it
   when useful, but do not add an alternate return formula.
+- Market configs default to `training.multi_gpu_strategy: auto`: use the
+  canonical single-device executor with one visible GPU and automatically
+  relaunch torchrun/DDP with two or more visible GPUs. GPU visibility and
+  assignment belong to `scripts/manage_gpu_jobs.py`; `tw_parallel` means
+  within-fold DDP and should remain semantically aligned with `tw.yaml`.
 
 ## Epoch-Level Timing And Throughput
 
@@ -456,16 +476,190 @@ Rules:
   and retain content receipts. Official OHLCV must remain untouched when only its
   reference/change factor is missing. Yahoo must not fill public features, execution
   rules, valuation, margin, institutional, lifecycle, or corporate-action data.
+- Source retention and the model horizon are separate contracts. The current
+  receipt-certified archive keeps 2000+ rows, but 80 official delisted-company
+  histories ending no later than 2004-04-28 are terminal-unavailable from Yahoo
+  and precede complete free official coverage. Do not fabricate or silently
+  ignore them. Until a provenance-backed backfill is obtained, TW training
+  configs must use `data.panel_start_date: 2005-01-01`, which yields the first
+  session 2005-01-03 and 100% official-delisted coverage inside the model
+  horizon. Audit retained source rows against the full verified TAIEX calendar
+  while auditing panel/universe/walk-forward semantics against the clipped model
+  calendar. A newly proven backfill may reopen the earlier horizon only after a
+  strict re-audit.
+- Changing `data.panel_start_date` changes the experiment and checkpoint
+  identity. With a 2005 first year, validation years 2023/2024/2025 are folds
+  18/19/20, not 23/24/25. Keep `walk_forward.expected_first_year`, runner fold
+  selection, explainability, benchmarks, and cached panel keys aligned.
 - Fresh TW Yahoo fallback downloads default to one worker and a 1.5-second global
   request interval. If the bare chart endpoint is rate-limited, the installed
   yfinance session is the same-provider fallback. Persist
   `stockagent.yahoo_requested_start`; repair must re-query from 2000 when that
   historical coverage receipt is absent. Reusing one fixed rebuild stage must
   skip already-completed atomic symbol files.
+- Direct Yahoo downloader invocations use the same provider-named host-global
+  limiter and default to 10 requests/second when `--request-interval` is omitted;
+  the staged TW bootstrap deliberately overrides that policy with the slower
+  1.5-second interval above. A repair symbol universe must be the stable union of
+  live discovery, cached/repository manifests, locally tracked parquet, and the
+  canonical TWSE/TPEx delisted-company parquets. Do not let a successful current
+  listing query erase historical or delisted symbols.
+- A Yahoo TW source parquet is eligible for the lower-priority archive only when
+  its schema metadata says `stockagent.source=yahoo`,
+  `stockagent.asset_class=tw_stocks`, its `yahoo_requested_start` reaches the
+  requested archive start, and `yahoo_checked_through` reaches the requested end.
+  The archive must account for every manifest symbol as either a verified source
+  file or a terminal unavailable result, write full per-file size/SHA-256 and
+  coverage metadata to the adjacent `.inputs.json`, and receipt that manifest in
+  the summary. Downstream symbol build/audit must fail closed on a missing,
+  stale, or tampered input receipt chain.
+- When Yahoo fallback is enabled, build the receipt-verified
+  `tw_transfer_adjustment_reference.parquet` stage after the per-symbol Yahoo
+  source update and before `build_tw_yahoo_fallback_archive.py`. Its official
+  requests use the `tw_public` provider-global limiter; an omitted interval keeps
+  the project default of 10 requests/second. The archive may fill
+  `source_factor` only when a reference `date + symbol` matches that canonical
+  Yahoo source's first retained row and the original factor is null. Every
+  reference key must be applied exactly once; incomplete coverage, unresolved
+  rows, stale input/output receipts, non-first-row matches, duplicate matches,
+  unmatched keys, or an empty historical candidate set fail closed. Receipt
+  both the reference parquet and its summary in the Yahoo archive input manifest
+  and reconcile required-candidate, reference, and applied counts. Do not run
+  this stage with `--ohlcv-fallback none`.
 - Historical downloader success is coverage-based, not inferred from receiving
   any rows. Persist confirmed no-data weekdays separately from request failures;
   any unresolved date failure must produce a nonzero exit. A failed rebuild must
   leave production parquet files untouched.
+- Historical rebuild request outcomes are append-only per-date JSONL journals
+  under `state/journals`, with successful parsed rows retained in fingerprinted
+  `state/partials` parquet while coverage is incomplete. Default `--resume` must
+  reuse validated partial dates, confirmed-empty journal events, and reparsable
+  atomic raw receipts, then request only unresolved/failed/corrupt/suspicious
+  dates. Partial success remains nonzero and must never weaken the final
+  coverage/audit/promotion gate. `--no-resume` is the explicit fresh-refetch
+  escape hatch. Increment `HISTORICAL_PARSER_CONTRACT_VERSION` whenever raw
+  historical response parsing semantics change so an old parsed partial is not
+  silently reused under a new parser. A parser bump may reparse a prior
+  content-addressed `raw_failures` receipt across old cache keys only when its
+  append-only event is `failed/network/HTTP 200`, its official URL and date
+  match, its path stays under the dataset failure directory, and filename,
+  byte counts, full raw/body SHA-256, nonempty current parse, and current schema
+  all validate. Any mismatch remains unresolved for a network retry. On POSIX,
+  each historical dataset also
+  holds a nonblocking process lock at `state/locks/<dataset>.lock` for the whole
+  mutation; a second writer to the same dataset/stage must fail immediately.
+- Canonical historical runs must use the receipt-verified monthly TAIEX archive
+  as their actual-session calendar. Keep `twse_daily_ohlcv` and
+  `twse_market_index` at parser contract v7. A measured rebuild disproved the
+  old assumption that a selected MI_INDEX table title was authoritative: TWSE
+  returned bodies whose table title was rewritten to the requested day while
+  top-level `payload.date`, `params.date`, and all data rows belonged to another
+  session. This
+  affected 18 real-session OHLCV receipts and 7 TAIEX closes, not only holidays.
+  v7 requires the selected table title, top-level `payload.date`, and any
+  supplied `params.date` to declare the requested date. Never bind a retitled
+  body to `request_date`, and
+  never reuse v6 partials as current parsed data. During a resumed rebuild,
+  reparse raw receipts into the v7 partial, reuse only receipts that pass every
+  date check, and network-refetch the rejected dates; stale receipt bytes
+  cannot be repaired by reparsing. For legacy TPEx rows with the exact official
+  sentinel
+  `open=high=low=0` and a positive close, preserve the raw row; the derived
+  symbol parquet may create a flat bar at that official close only when it also
+  records `ohlc_normalization=official_close_flat_bar`. Yahoo still must not
+  overwrite that official row.
+- Canonical Yahoo OHLCV fallback must be bounded by receipt-verified official
+  security lifecycle episodes. After a terminal TWSE/TPEx delisting, discard
+  fallback rows until a later current-company, new-listing, or official daily
+  listing observation verifies a new episode; reset the derived adjustment
+  index to 10 at that episode boundary. A same-day or next-official-session
+  same-symbol venue migration is a nonterminal continuation, including official
+  `櫃轉市`, and must not be truncated or reset. Persist lifecycle evidence on
+  retained rows and reconcile every lifecycle-filtered fallback row in the
+  symbol-build summary. Never attach a later Yahoo reuse of a code (for example
+  post-2007 `9801`) to the old delisted company without official relisting
+  evidence.
+- A TPEx row's `次日參考價` prices only the immediately following
+  receipt-verified official session. When today's exact adjustment reference is
+  otherwise unavailable, the builder may use
+  `close_today / previous_session.next_reference` only when the previous symbol
+  row is that exact preceding session, both rows remain in the same lifecycle
+  episode, and the reference and close are positive finite values. Record the
+  previous session/date/reference as row provenance and reconcile the candidate
+  and applied counts in the build summary. Never use today's `次日參考價` as
+  today's reference, and never bridge a missing session or lifecycle boundary.
+- Keep the TPEx daily parser at contract v12 for the verified layout sequence:
+  width 27 on 2003-08-01--2004-01-30, width 26 on
+  2004-02-02--2004-10-27, width 18 on 2004-10-28--2004-11-24,
+  width 19 on 2004-11-25--2006-12-29, and width 17 in the legacy JSON `html`
+  on 2007-01-02--2007-06-29. Preserve every available quote/statistics field.
+  Bind archive dates only from a labeled compact ROC date or the exact damaged
+  Oracle header cell (`width=71`, `colspan=5`, `rowspan=2`,
+  `class=table-body-right`, one `<tt>` date), and require it to match the request.
+- TPEx v12 may preserve permanently damaged security names only with
+  `_name_decode_status=official_receipt_name_bytes_unrecoverable`. Receipt-level
+  replacement-byte evidence applies that status to every name row in the
+  receipt, because CP950 can re-pair `EF BF BD` into plausible CJK text. It may recover
+  only the three evidenced CP950 change renderings for `除權`, `除息`, and
+  `除權息`, recording `_change_decode_status`; any unknown damaged symbol,
+  numeric, or change token fails closed. A `均價=註` row is valid only under the
+  exact zero-price/zero-change/zero-volume/zero-amount/zero-trades gate.
+- A TPEx row with all four prices zero but positive, internally consistent
+  volume/amount/average is an official unpriceable observation, not a usable
+  OHLC bar. Preserve it in raw public data; never substitute average for close.
+  A valid Yahoo bar may fill the canonical key with
+  `fallback_reason=official_ohlcv_unusable`. The symbol-build summary must
+  reconcile `official_unusable_ohlcv_rows` as
+  `fallback_replaced_unusable_official_rows + unfilled_unusable_official_rows`.
+- Keep `tpex_margin_balance` at parser contract v8. v8 adds the exact
+  2004-10-19 onward 16-cell generation, preserving the real trailing blank
+  note cell, plus its narrowly styled standalone ROC-date header. Do not accept
+  a 15-cell row: preserving the blank `<td>` is what distinguishes an empty
+  note from a genuinely missing column. The v7 source-gap contract remains:
+  the official backend has a verified 331-open-session archive gap from
+  2007-06-01 through 2008-09-29
+  (data exists through 2007-05-31 and again from 2008-09-30). Never infer the
+  whole gap from its bounds: each session counts for coverage/resume only after
+  an HTTP 200 explicit-no-data body is saved immutably under
+  `raw_empty/tpex_margin_balance`, and its journal URL, byte counts, and body/raw
+  SHA-256 all verify. This receipt is mandatory even with `--skip-raw`; an empty
+  outside the declared range or any receipt mismatch remains a failure, while
+  nonempty official data inside the range remains data.
+- Keep `tpex_daily_valuation` at parser contract v7. The 2004--2006 archive
+  declares its requested day as a labeled ROC date such as
+  `交易日期:94年08月08日`; bind that exact date and still fail on missing or
+  mismatched labels.
+- Public HTTP throttling is provider-named and host-global across stockAgent
+  threads and subprocesses. For an upstream without a documented numeric limit,
+  the project default is 10 requests/second; this is a client-side safety policy,
+  not an official allowance. Explicit slower intervals are valid, and 403/429,
+  `Retry-After`, or transient-server backoff must defer the shared provider
+  schedule. Treat TWSE's HTTP 307 `FOR SECURITY REASONS` page as a provider-wide
+  WAF signal. For `twse_market_index`, cross-check primary `rwd` failures and
+  structured weekday empties through the official
+  `exchangeReport/MI_INDEX?type=IND` route; reliable `IND` coverage starts on
+  2009-01-05. The four other TWSE histories use official legacy fallbacks:
+  `MI_INDEX?type=ALLBUT0999` for daily OHLCV, `exchangeReport/BWIBBU_d` for
+  valuation, `fund/T86` for institutions, and `exchangeReport/MI_MARGN` for
+  margin. Retry a semantically stale fallback with a unique `_` cachebuster.
+  Under the v7 MI_INDEX contract, validate the selected target-table title,
+  top-level `payload.date`, and any supplied `params.date` together; a retitled
+  table never overrides a stale top-level or parameter date.
+  A live WAF recovery recheck used the provider-global
+  `--request-interval 1.0` (one request/second); retain that slower measured
+  setting for WAF-sensitive repair rather than treating 10 req/s as guaranteed.
+  The official findings and URLs live in
+  `docs/tw_public_download_resume_and_rate_limits.md`.
+- For an HTTP 200 body that fails semantic parsing, discard only the current
+  thread-local HTTP session before route/retry/cachebuster handling. Do not add
+  another provider-global defer or sleep for that semantic retry: its next HTTP
+  call still passes through the 10 req/s default limiter, while WAF, 429,
+  transport, and `Retry-After` backoff remain provider-global inside `_http_get`.
+- Strict-calendar state finalization must prune malformed or stale non-session
+  `failed_dates` keys, plus failures resolved by verified data/empty receipts.
+  Keep actual unresolved session failures. Record the last prune count/examples
+  and cumulative `pruned_failed_dates_total` so cleanup can make coverage
+  complete without erasing the audit trail.
 - Canonical TW stock/ETF symbol files live under `data_tw_public/stocks`. Do not
   run the former in-place official-to-Yahoo mutation script; the canonical
   lower-priority archive merge is the only approved Yahoo fallback path.
@@ -541,10 +735,10 @@ Expected explainability workflow:
   - feature-time heatmaps
   - correlations between raw features and scores/weights
   - stock contribution and concentration
-  - aux summaries for latent factors and market tokens
+  - aux summaries for enabled latent factors and/or market tokens
 - Dense explainability plots should use RAPIDS/cuDF/Datashader when available.
 - Dimensionality reduction for transformer aux tensors should use cuML UMAP, not PCA, for the default explainability projection path.
-- Aux UMAP projection outputs live under `aux_projections/*.csv` and `plots/aux_umap/*.png`; use them to inspect stock embeddings, latent factors, market tokens, dynamic token deltas, and token collapse/regime clustering.
+- Aux UMAP projection outputs live under `aux_projections/*.csv` and `plots/aux_umap/*.png`; use them to inspect stock embeddings, enabled latent factors/market tokens, and token collapse/regime clustering.
 - Be cautious with perturbation `score_abs_delta` when masked scores use sentinel values such as `-1e9`; prefer weight deltas, rank changes, gradients, and integrated gradients.
 - Report concentration, turnover, drawdown, and time-attribution issues plainly.
 - Paper outputs should be generated under:
