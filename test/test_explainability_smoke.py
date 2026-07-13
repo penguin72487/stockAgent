@@ -13,6 +13,8 @@ from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import (
     ExplainabilitySettings,
+    _align_panel_to_checkpoint_universe,
+    _daily_weight_symbols,
     _save_matplotlib_figure,
     _with_numeric,
     _feature_correlations,
@@ -21,6 +23,47 @@ from stockagent.explainability import (
     write_fold_stability_outputs,
     write_explanation_outputs,
 )
+
+
+def test_daily_weight_symbols_supports_parquet_and_csv(tmp_path: Path) -> None:
+    import polars as pl
+
+    frame = pl.DataFrame({"date": ["2026-01-02"], "2330": [0.5], "0050": [-0.5]})
+    parquet_path = tmp_path / "daily_weights.parquet"
+    csv_path = tmp_path / "daily_weights.csv"
+    frame.write_parquet(parquet_path)
+    frame.write_csv(csv_path)
+
+    assert _daily_weight_symbols(parquet_path) == ["2330", "0050"]
+    assert _daily_weight_symbols(csv_path) == ["2330", "0050"]
+
+
+def test_explainability_alignment_does_not_treat_position_capacity_as_universe(tmp_path: Path) -> None:
+    import polars as pl
+
+    symbols = ["0050", "2330", "2317"]
+    panel = PanelData(
+        dates=np.asarray(["2026-01-02"], dtype="datetime64[D]"),
+        symbols=symbols,
+        feature_names=["f0"],
+        features=np.zeros((1, 3, 1), dtype=np.float32),
+        returns_1d=np.zeros((1, 3), dtype=np.float32),
+        tradable_mask=np.ones((1, 3), dtype=bool),
+        alive_mask=np.ones((1, 3), dtype=bool),
+        benchmark_returns=np.zeros(1, dtype=np.float32),
+        close_prices=np.ones((1, 3), dtype=np.float32),
+    )
+    fold_dir = tmp_path / "fold_01"
+    fold_dir.mkdir()
+    checkpoint_path = fold_dir / "checkpoint_best.pt"
+    torch.save({"model_state_dict": {"symbol_position": torch.zeros(1, 1, 2, 4)}}, checkpoint_path)
+    pl.DataFrame({"date": ["2026-01-02"], **{symbol: [0.0] for symbol in symbols}}).write_parquet(
+        fold_dir / "daily_weights.parquet"
+    )
+
+    aligned = _align_panel_to_checkpoint_universe(panel, tmp_path, 1, checkpoint_path)
+
+    assert aligned is panel
 
 
 class ToyExplainableModel(torch.nn.Module):

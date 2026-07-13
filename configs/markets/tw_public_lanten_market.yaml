@@ -3,12 +3,12 @@ experiment_name: tw-stock-transformer-market-public-data-all-available
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_official_2005_all_available_v1
+  output_dir: artifacts/markets/tw_public_lanten_market_token_all_available
   mode: train
   resume: true
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 3
+  start_fold: 1
 environment:
   device: cuda
   use_tensor_cores: true
@@ -493,8 +493,8 @@ training:
     # temporal_only: no cross-stock attention
     attention_mode: market_token
     # Independent compact-bottleneck switches; null falls back to attention_mode.
-    use_latent_factors: null
-    use_market_tokens: null
+    use_latent_factors: true
+    use_market_tokens: true
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: false
@@ -535,8 +535,8 @@ training:
     temporal_layers: 2
     temporal_heads: 4
     temporal_ffn_mult: 2
-    temporal_pooling: last
-    temporal_query_mode: last_only
+    temporal_pooling: attention
+    temporal_query_mode: full_then_last
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2
