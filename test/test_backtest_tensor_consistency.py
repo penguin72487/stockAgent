@@ -1189,6 +1189,102 @@ def test_compiled_loss_strict_no_fallback_raises_after_cudagraph_state_overwrite
     assert calls == {"compiled": 1, "eager": 0}
 
 
+def test_compiled_loss_dynamic_symbols_marks_only_asset_axes() -> None:
+    observed: dict[str, set[int]] = {}
+
+    def compiled_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        observed["weights"] = set(getattr(weights, "_dynamo_dynamic_indices", set()))
+        observed["returns"] = set(getattr(returns, "_dynamo_dynamic_indices", set()))
+        observed["tradable"] = set(getattr(tradable, "_dynamo_dynamic_indices", set()))
+        benchmark = kwargs["benchmark_returns"]
+        observed["benchmark"] = set(
+            getattr(benchmark, "_dynamo_dynamic_indices", set())
+        )
+        initial = kwargs["aux_outputs"]["initial_weights"]
+        observed["initial"] = set(getattr(initial, "_dynamo_dynamic_indices", set()))
+        return weights.sum()
+
+    wrapped = _CompiledLossFallback(
+        compiled_fn,
+        lambda *args, **kwargs: args[0].sum(),
+        label="dynamic-symbol-test",
+        dynamic_symbol_axis=True,
+        dynamic_symbol_max=2304,
+    )
+    weights = torch.zeros((8, 13))
+    returns = torch.zeros_like(weights)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros(8)
+    initial = torch.zeros(13)
+
+    wrapped(
+        weights,
+        returns,
+        tradable,
+        benchmark_returns=benchmark,
+        can_buy_mask=tradable.clone(),
+        aux_outputs={"initial_weights": initial},
+    )
+
+    assert observed == {
+        "weights": {1},
+        "returns": {1},
+        "tradable": {1},
+        "benchmark": set(),
+        "initial": {0},
+    }
+
+
+def test_compiled_loss_dynamic_symbols_reuses_one_graph_across_symbol_counts() -> None:
+    compile_calls = 0
+
+    def counting_backend(graph_module, _example_inputs):
+        nonlocal compile_calls
+        compile_calls += 1
+        return graph_module.forward
+
+    def loss_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **_kwargs,
+    ) -> torch.Tensor:
+        return torch.where(tradable, weights * returns, 0.0).sum()
+
+    compiled = torch.compile(
+        loss_fn,
+        backend=counting_backend,
+        fullgraph=True,
+        dynamic=None,
+    )
+    wrapped = _CompiledLossFallback(
+        compiled,
+        loss_fn,
+        label="dynamic-symbol-graph-test",
+        dynamic_symbol_axis=True,
+        dynamic_symbol_max=2304,
+    )
+
+    for symbols in (7, 19):
+        weights = torch.ones((8, symbols))
+        returns = torch.ones_like(weights)
+        tradable = torch.ones_like(weights, dtype=torch.bool)
+        wrapped(
+            weights,
+            returns,
+            tradable,
+            benchmark_returns=torch.zeros(8),
+            aux_outputs={"initial_weights": torch.zeros(symbols)},
+        )
+
+    assert compile_calls == 1
+
+
 def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
     assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048) == 2048
     assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=999999) == 4096
@@ -1928,6 +2024,58 @@ def test_compiled_loss_probe_executes_rules_and_backward_at_fixed_batch_shape() 
     assert captured["weights"].dtype == torch.float64
     assert captured["weights"].grad is not None
     assert bool(captured["force_exit"][0, 0]) is True
+
+
+def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None:
+    panel = _make_panel(rows=9, symbols=4, features=3)
+    dataset = CrossSectionalDataset(panel, np.arange(panel.num_dates), lookback=3)
+    split = _pad_windowed_training_split(dataset_to_windowed_tensors(dataset), batch_size=4)
+    gather_calls = {"autograd": 0, "no_grad": 0}
+    captured: dict[str, torch.Tensor] = {}
+
+    monkeypatch.setattr(trainer_module, "_distributed_is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 2)
+    monkeypatch.setattr(trainer_module, "_distributed_rank", lambda: 0)
+
+    def gather_autograd(value: torch.Tensor) -> torch.Tensor:
+        gather_calls["autograd"] += 1
+        return torch.cat((value, value), dim=0)
+
+    def gather_no_grad(value: torch.Tensor) -> torch.Tensor:
+        gather_calls["no_grad"] += 1
+        return torch.cat((value, value), dim=0)
+
+    monkeypatch.setattr(trainer_module, "_all_gather_autograd", gather_autograd)
+    monkeypatch.setattr(trainer_module, "_all_gather_no_grad", gather_no_grad)
+
+    def loss_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **_kwargs,
+    ) -> torch.Tensor:
+        captured["weights"] = weights
+        captured["returns"] = returns
+        captured["tradable"] = tradable
+        return (weights.square() + weights * returns).mean()
+
+    ok, error = _probe_compiled_loss_forward_backward(
+        loss_fn,
+        split,
+        batch_size=4,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        non_blocking=False,
+        loss_kwargs={},
+        max_volume_participation=0.0,
+        volume_participation_equity=1_000_000.0,
+    )
+
+    assert ok, error
+    assert gather_calls == {"autograd": 1, "no_grad": 9}
+    assert captured["weights"].shape == (4, panel.num_symbols)
+    assert captured["returns"].shape == captured["weights"].shape
+    assert captured["tradable"].shape == captured["weights"].shape
 
 
 def test_portfolio_autoencoder_aux_contract_fails_without_latent() -> None:

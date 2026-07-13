@@ -13,6 +13,10 @@ environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
+  # Host-wide budget: with 2 DDP ranks this becomes 8 Inductor workers per
+  # rank instead of 64. The model probe is rank-serialized; the loss probe is
+  # collective because it must reproduce the actual autograd all-gather input.
+  torch_compile_threads: 16
 
 data:
   # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
@@ -244,6 +248,10 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
+  # Expanding train_union folds change S each year. Keep T=128 fixed and make
+  # only S symbolic, so remaining folds reuse one canonical-loss graph without
+  # padding assets or changing checkpoint/trading semantics.
+  compile_loss_dynamic_symbols: true
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0

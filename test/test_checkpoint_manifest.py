@@ -338,6 +338,11 @@ def test_checkpoint_manifest_records_but_does_not_block_execution_and_inactive_s
         lambda cfg: setattr(cfg.training, "ddp_bucket_cap_mb", cfg.training.ddp_bucket_cap_mb + 4),
         lambda cfg: setattr(cfg.training, "enable_torch_compile", not cfg.training.enable_torch_compile),
         lambda cfg: setattr(cfg.training, "compile_loss", not bool(cfg.training.compile_loss)),
+        lambda cfg: setattr(
+            cfg.training,
+            "compile_loss_dynamic_symbols",
+            not cfg.training.compile_loss_dynamic_symbols,
+        ),
         lambda cfg: setattr(cfg.training, "torchinductor_cache_dir", "/tmp/other-cache"),
         lambda cfg: setattr(cfg.training, "batch_size_eval", cfg.training.batch_size_eval + 1),
         lambda cfg: setattr(cfg.training, "eval_model_chunk_rows", 7),

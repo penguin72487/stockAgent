@@ -653,6 +653,10 @@ class TrainingConfig:
     triton_cache_dir: str = "~/.cache/triton"
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
+    # Executor-only optimization: keep the train batch/time axis static while
+    # allowing one compiled canonical-loss graph to serve changing symbol
+    # counts across expanding walk-forward folds.
+    compile_loss_dynamic_symbols: bool = False
     loss_portfolio_activation: str = "auto"
     loss_min_trade_weight: float | None = None
     warm_start_from_previous_fold: bool = False
@@ -1569,6 +1573,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             triton_cache_dir=training_raw["triton_cache_dir"],
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
+            compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
             loss_min_trade_weight=training_raw["loss_min_trade_weight"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
