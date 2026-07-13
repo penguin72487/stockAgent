@@ -4140,6 +4140,9 @@ def _checkpoint_symbol_count(checkpoint_path: Path) -> int | None:
 
 
 def _daily_weight_symbols(path: Path) -> list[str]:
+    if path.suffix.lower() == ".parquet":
+        columns = pl.read_parquet_schema(path).names()
+        return [str(column) for column in columns if str(column) != "date"]
     with path.open("r", encoding="utf-8", newline="") as handle:
         header = next(csv.reader(handle))
     return [str(column) for column in header if str(column) != "date"]
@@ -4151,7 +4154,7 @@ def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
     if missing:
         preview = ", ".join(missing[:10])
         raise ValueError(
-            f"Cannot align panel to checkpoint universe; {len(missing)} symbols from daily_weights.csv "
+            f"Cannot align panel to checkpoint universe; {len(missing)} symbols from {path.name} "
             f"are missing in the current panel: {preview}"
         )
     indices = np.asarray([index_by_symbol[symbol] for symbol in symbols], dtype=np.int64)
@@ -4185,24 +4188,24 @@ def _align_panel_to_checkpoint_universe(panel: PanelData, output_dir: Path, fold
     expected_symbols = _checkpoint_symbol_count(checkpoint_path)
     if expected_symbols is None:
         return panel
-    weights_path = _fold_dir(output_dir, fold_id) / "daily_weights.csv"
-    if not weights_path.exists():
+    fold_dir = _fold_dir(output_dir, fold_id)
+    weights_path = next(
+        (path for path in (fold_dir / "daily_weights.parquet", fold_dir / "daily_weights.csv") if path.is_file()),
+        None,
+    )
+    if weights_path is None:
         if int(panel.num_symbols) != int(expected_symbols):
             raise ValueError(
                 f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"cannot align because {weights_path} is missing."
+                f"cannot align because neither daily_weights.parquet nor daily_weights.csv exists in {fold_dir}."
             )
         return panel
 
     trained_symbols = _daily_weight_symbols(weights_path)
-    if len(trained_symbols) != int(expected_symbols):
-        if int(panel.num_symbols) != int(expected_symbols):
-            raise ValueError(
-                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"{weights_path} has {len(trained_symbols)} symbols, so it cannot be used for alignment."
-            )
-        return panel
-
+    # ``symbol_position`` is a configurable positional-capacity tensor, not an
+    # authoritative universe manifest.  Full-panel evaluation can therefore
+    # legitimately emit more weight columns than that tensor contains.  The
+    # ordered weight-table columns are authoritative when the table exists.
     if trained_symbols == list(panel.symbols):
         return panel
 
