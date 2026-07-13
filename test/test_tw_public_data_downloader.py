@@ -77,6 +77,38 @@ def test_download_modes_have_stable_legacy_aliases():
     assert twpub._canonical_mode("daily-update") == "daily"
 
 
+def test_historical_date_reuses_valid_raw_receipt(tmp_path: Path, monkeypatch):
+    spec = _historical_spec()
+    day = date(2024, 1, 2)
+    raw_path = tmp_path / "raw" / spec.name / f"{day.isoformat()}.json"
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text(
+        json.dumps(
+            {
+                "stat": "OK",
+                "fields": ["證券代號", "收盤價"],
+                "data": [["0050", "100"]],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_http(*args, **kwargs):
+        raise AssertionError("valid raw receipt must avoid a network request")
+
+    monkeypatch.setattr(twpub, "_http_get", fail_http)
+    result = twpub._download_historical_date(
+        spec,
+        day,
+        _historical_args("rebuild"),
+        tmp_path,
+    )
+
+    assert result.error is None
+    assert result.raw_path == str(raw_path)
+    assert result.frame.get_column("證券代號").to_list() == ["0050"]
+
+
 def test_repair_fetches_only_missing_weekdays(tmp_path: Path, monkeypatch):
     spec = _historical_spec()
     output_path = tmp_path / f"{spec.name}.parquet"
