@@ -2112,6 +2112,109 @@ def test_http_security_block_applies_long_provider_global_cooldown(monkeypatch):
     assert sleeps == [twpub.TW_PUBLIC_WAF_COOLDOWN_SECONDS]
 
 
+def test_http_locationless_307_retries_as_throttling(monkeypatch):
+    class FakeLimiter:
+        def __init__(self):
+            self.waits = 0
+            self.deferrals: list[float] = []
+
+        def wait(self):
+            self.waits += 1
+
+        def defer(self, seconds):
+            self.deferrals.append(seconds)
+
+    class FakeResponse:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+            self.headers: dict[str, str] = {}
+            self.content = b""
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def raise_for_status(self):
+            return None
+
+    throttled = FakeResponse(307)
+    success = FakeResponse(200)
+
+    class FakeSession:
+        responses = [throttled, success]
+
+        def get(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    limiter = FakeLimiter()
+    sleeps: list[float] = []
+    monkeypatch.setattr(twpub, "_global_tw_public_rate_limiter", lambda: limiter)
+    monkeypatch.setattr(twpub, "_http_session", lambda: FakeSession())
+    monkeypatch.setattr(twpub.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    response = twpub._http_get(
+        "https://example.test",
+        timeout=1,
+        verify_ssl=True,
+        retries=1,
+        retry_backoff=1.0,
+    )
+
+    assert response is success
+    assert throttled.closed is True
+    assert limiter.waits == 2
+    assert limiter.deferrals == [30.0]
+    assert sleeps == [30.0]
+
+
+def test_http_stream_enforces_total_wall_timeout(monkeypatch):
+    class FakeLimiter:
+        def wait(self):
+            return None
+
+        def defer(self, _seconds):
+            return None
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+        content = b""
+        url = "https://example.test"
+
+        def __init__(self):
+            self.closed = False
+
+        def iter_content(self, *, chunk_size):
+            assert chunk_size == 1024 * 1024
+            yield b"partial"
+
+        def close(self):
+            self.closed = True
+
+    response = FakeResponse()
+
+    class FakeSession:
+        def get(self, *args, **kwargs):
+            assert kwargs["stream"] is True
+            assert kwargs["timeout"] == (1, 1)
+            return response
+
+    monotonic = iter([0.0, 1.1])
+    monkeypatch.setattr(twpub, "_global_tw_public_rate_limiter", lambda: FakeLimiter())
+    monkeypatch.setattr(twpub, "_http_session", lambda: FakeSession())
+    monkeypatch.setattr(twpub.time, "monotonic", lambda: next(monotonic))
+
+    with pytest.raises(twpub.requests.exceptions.Timeout, match="wall timeout"):
+        twpub._http_get(
+            "https://example.test",
+            timeout=1,
+            verify_ssl=True,
+            retries=0,
+        )
+
+    assert response.closed is True
+
+
 def test_waf_cooldown_honors_retry_after_when_it_is_longer():
     response = twpub.requests.Response()
     response.status_code = 403

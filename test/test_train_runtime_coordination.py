@@ -104,9 +104,11 @@ def test_termination_handlers_use_python_exit_for_atexit_cleanup(monkeypatch) ->
         assert exc_info.value.code == 128 + int(signum)
 
 
-def test_tw_public_caps_ddp_compile_workers_and_reuses_dynamic_loss_graph() -> None:
+def test_tw_public_uses_single_5070ti_runtime_and_dynamic_loss_graph() -> None:
     config = train_entry.load_config("configs/markets/tw_public.yaml")
-    assert config.environment.torch_compile_threads == 16
+    assert config.environment.cpu_threads == 16
+    assert config.environment.torch_compile_threads == 8
+    assert config.training.multi_gpu_strategy == "none"
     assert config.training.compile_loss_dynamic_symbols is True
 
 

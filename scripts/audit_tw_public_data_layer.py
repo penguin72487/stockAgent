@@ -2203,7 +2203,9 @@ def audit_feature_lineage_registry(config: ExperimentConfig) -> list[Finding]:
     unregistered = [
         feature
         for feature in _selected_features(config)
-        if feature.startswith("twpub_") and not _matches(feature, registered_patterns)
+        if feature.startswith("twpub_")
+        and not _is_zero_filled(feature, config)
+        and not _matches(feature, registered_patterns)
     ]
     if not unregistered:
         return []
