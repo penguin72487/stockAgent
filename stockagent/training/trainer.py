@@ -674,17 +674,29 @@ class _CompiledLossFallback:
         *,
         label: str,
         strict_no_fallback: bool | None = None,
+        dynamic_symbol_axis: bool = False,
+        dynamic_symbol_max: int | None = None,
     ) -> None:
         self._compiled_fn = compiled_fn
         self._eager_fn = eager_fn
         self._label = label
         self._strict_no_fallback = _strict_no_fallback_enabled() if strict_no_fallback is None else bool(strict_no_fallback)
+        self._dynamic_symbol_axis = bool(dynamic_symbol_axis)
+        self._dynamic_symbol_max = (
+            None if dynamic_symbol_max is None else max(1, int(dynamic_symbol_max))
+        )
         self._disabled = False
         self._warned = False
 
     def __call__(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self._disabled:
             return self._eager_fn(*args, **kwargs)
+        if self._dynamic_symbol_axis:
+            _mark_compiled_loss_dynamic_symbol_axis(
+                args,
+                kwargs,
+                max_symbols=self._dynamic_symbol_max,
+            )
         try:
             return self._compiled_fn(*args, **kwargs)
         except RuntimeError as exc:
@@ -711,6 +723,61 @@ class _CompiledLossFallback:
     @property
     def disabled(self) -> bool:
         return self._disabled
+
+
+def _mark_compiled_loss_dynamic_symbol_axis(
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+    *,
+    max_symbols: int | None = None,
+) -> None:
+    """Mark only canonical-loss symbol dimensions dynamic before tracing."""
+    weights = args[0] if args else kwargs.get("weights")
+    if not isinstance(weights, torch.Tensor) or weights.dim() != 2:
+        raise ValueError(
+            "compile_loss_dynamic_symbols requires 2D canonical loss weights [T,S]"
+        )
+    mark_dynamic = getattr(getattr(torch, "_dynamo", None), "mark_dynamic", None)
+    if mark_dynamic is None:
+        raise RuntimeError(
+            "compile_loss_dynamic_symbols requires torch._dynamo.mark_dynamic"
+        )
+
+    rows = int(weights.size(0))
+    symbols = int(weights.size(1))
+    symbol_upper_bound = max(symbols, int(max_symbols or 65_536))
+    seen: set[int] = set()
+
+    def visit(value: Any, *, aux_value: bool = False) -> None:
+        if isinstance(value, torch.Tensor):
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            if (
+                value.dim() >= 2
+                and int(value.size(0)) == rows
+                and int(value.size(1)) == symbols
+            ):
+                # PyTorch 2.12.1 requires a concrete upper bound. The caller
+                # supplies the full panel width, which covers every compacted
+                # fold without forcing Inductor to reason about an arbitrary
+                # million-symbol range.
+                mark_dynamic(value, 1, min=1, max=symbol_upper_bound)
+            elif aux_value and value.dim() == 1 and int(value.size(0)) == symbols:
+                mark_dynamic(value, 0, min=1, max=symbol_upper_bound)
+            return
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                visit(nested, aux_value=aux_value)
+        elif isinstance(value, (tuple, list)):
+            for nested in value:
+                visit(nested, aux_value=aux_value)
+
+    for value in args:
+        visit(value)
+    for name, value in kwargs.items():
+        visit(value, aux_value=name == "aux_outputs")
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -1824,6 +1891,57 @@ def _append_group_curve(path: Path, payload: dict[str, float | int | None]) -> N
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+class _PreEpochTimingRecorder:
+    """Persist the wall-clock critical path before the first epoch starts.
+
+    Epoch timing already has a detailed tensor/GPU breakdown.  This recorder
+    covers the formerly opaque setup interval and writes each completed stage
+    immediately, so a crash or interrupted compile still leaves evidence.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        train_years: Sequence[int],
+        fold_ids: Sequence[int],
+        scope: str = "train_group",
+    ) -> None:
+        self.path = path
+        self.train_years = [int(year) for year in train_years]
+        self.fold_ids = [int(fold_id) for fold_id in fold_ids]
+        self.scope = str(scope)
+        self.started = time.perf_counter()
+        self.previous = self.started
+
+    def checkpoint(self, stage: str, **details: Any) -> float:
+        now = time.perf_counter()
+        elapsed = now - self.previous
+        cumulative = now - self.started
+        self.previous = now
+        payload = {
+            "run_id": os.environ.get("STOCKAGENT_RUN_ID", "unknown"),
+            "scope": self.scope,
+            "stage": str(stage),
+            "elapsed_s": float(elapsed),
+            "cumulative_s": float(cumulative),
+            "train_years": self.train_years,
+            "fold_ids": self.fold_ids,
+            "rank": int(_distributed_rank()),
+            "world_size": int(_distributed_world_size()),
+            **details,
+        }
+        if _distributed_should_write():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            print(
+                f"[pre-epoch timing] stage={stage} elapsed={elapsed:.3f}s "
+                f"cumulative={cumulative:.3f}s"
+            )
+        return elapsed
 
 
 def _epoch_curve_plot_script() -> Path:
@@ -3315,6 +3433,16 @@ def _training_checkpoint_contract_schema_3(
 ) -> dict[str, Any]:
     """Exact training contract written by schema 3 before semantic layering."""
     contract = asdict(config.training)
+    transformer_values = contract.get("transformer_base_portfolio")
+    if isinstance(transformer_values, Mapping):
+        projected_transformer_values = dict(transformer_values)
+        projected_transformer_values.pop("use_latent_factors", None)
+        projected_transformer_values.pop("use_market_tokens", None)
+        if _active_model_config(config)["config_name"] == "transformer_base_portfolio":
+            projected_transformer_values = (
+                _legacy_transformer_base_switch_projection(transformer_values)
+            )
+        contract["transformer_base_portfolio"] = projected_transformer_values
     # This storage-precision option was introduced by schema 4.  It must not be
     # synthesized into a historical schema-3 fingerprint; the compatibility
     # constraint below separately prevents unsafe optimizer resume when enabled.
@@ -3398,9 +3526,14 @@ def _legacy_checkpoint_setting_contract(
     *,
     legacy_lr_scheduler_interval: str = "epoch",
 ) -> dict[str, Any]:
+    legacy_model_values = dict(active_model["values"])
+    if str(active_model.get("config_name", "")) == "transformer_base_portfolio":
+        legacy_model_values = _legacy_transformer_base_switch_projection(
+            legacy_model_values
+        )
     return {
         "model_name": str(config.training.model_name),
-        "model": active_model["values"],
+        "model": legacy_model_values,
         "loss_type": str(config.training.loss_type),
         "loss_portfolio_activation": str(config.training.loss_portfolio_activation),
         "trading": _trading_checkpoint_contract_schema_2(config),
@@ -3455,11 +3588,40 @@ _SCHEMA_4_MODEL_RUNTIME_FIELDS = _SCHEMA_3_MODEL_RUNTIME_FIELDS | {
 }
 
 
+def _legacy_transformer_base_switch_projection(
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project new bottleneck switches onto pre-switch checkpoint semantics.
+
+    Omit the new fields and, only when the switches change the requested preset,
+    rewrite it to the effective historical mode. This lets schema 1--3 accept an
+    architecture-identical cross-preset spelling. ``latent_only`` remains a new,
+    unmatchable mode and therefore cannot resume an old optimizer trajectory.
+    """
+    projected = dict(values)
+    use_latent_factors = projected.pop("use_latent_factors", None)
+    use_market_tokens = projected.pop("use_market_tokens", None)
+    requested_mode = TransformerBasePortfolioModel._normalize_attention_mode(
+        str(projected["attention_mode"])
+    )
+    effective_mode = TransformerBasePortfolioModel._resolve_attention_mode(
+        requested_mode,
+        use_latent_factors=use_latent_factors,
+        use_market_tokens=use_market_tokens,
+    )
+    if effective_mode != requested_mode:
+        projected["attention_mode"] = effective_mode
+    return projected
+
+
 def _schema_3_checkpoint_model_values(active_model: Mapping[str, Any]) -> dict[str, Any]:
     """Reproduce schema 3's exact generic model-field filtering."""
+    values = dict(active_model["values"])
+    if str(active_model.get("config_name", "")) == "transformer_base_portfolio":
+        values = _legacy_transformer_base_switch_projection(values)
     return {
         name: value
-        for name, value in dict(active_model["values"]).items()
+        for name, value in values.items()
         if name not in _SCHEMA_3_MODEL_RUNTIME_FIELDS
     }
 
@@ -3488,8 +3650,13 @@ def _transformer_base_checkpoint_model_values(
     feature_names: Sequence[str],
 ) -> dict[str, Any]:
     """Resolve only architecture/behavior fields active in the selected TBP mode."""
-    mode = TransformerBasePortfolioModel._normalize_attention_mode(
+    requested_mode = TransformerBasePortfolioModel._normalize_attention_mode(
         str(values["attention_mode"])
+    )
+    mode = TransformerBasePortfolioModel._resolve_attention_mode(
+        requested_mode,
+        use_latent_factors=values.get("use_latent_factors"),
+        use_market_tokens=values.get("use_market_tokens"),
     )
     pooling = TransformerBasePortfolioModel._normalize_pooling(
         str(values["temporal_pooling"])
@@ -3595,17 +3762,18 @@ def _transformer_base_checkpoint_model_values(
         if layers > 0:
             contract["cross_heads"] = int(values["cross_heads"])
             contract["cross_ffn_mult"] = int(values["cross_ffn_mult"])
-    elif mode == "latent":
+    elif mode in {"latent", "latent_only"}:
         contract.update(
             {
                 "latent_layers": max(1, int(values["latent_layers"])),
                 "num_latent_factors": max(1, int(values["num_latent_factors"])),
-                "num_market_tokens": max(1, int(values["num_market_tokens"])),
                 "market_layers": max(1, int(values["market_layers"])),
                 "cross_heads": int(values["cross_heads"]),
                 "cross_ffn_mult": int(values["cross_ffn_mult"]),
             }
         )
+        if mode == "latent":
+            contract["num_market_tokens"] = max(1, int(values["num_market_tokens"]))
     elif mode == "market_token":
         contract.update(
             {
@@ -5197,14 +5365,12 @@ def _align_panel_to_state_dict_universe(
             )
         return panel
 
-    if len(trained_symbols) != int(expected_symbols):
-        if int(panel.num_symbols) != int(expected_symbols):
-            raise ValueError(
-                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"{weights_path} has {len(trained_symbols)} symbols, so it cannot be used for alignment."
-            )
-        return panel
-
+    # ``symbol_position`` can be a configured positional-capacity tensor rather
+    # than a one-row-per-security universe manifest.  This is the case when a
+    # full panel is trained/evaluated with symbol indices mapped into a bounded
+    # position table.  The emitted weight table is the authoritative ordered
+    # universe whenever it exists, so do not reject it merely because its width
+    # differs from the positional capacity stored in the checkpoint.
     if list(trained_symbols) == list(panel.symbols):
         return panel
 
@@ -8006,6 +8172,50 @@ def _distributed_probe_succeeded(local_success: bool, device: torch.device) -> b
     return bool(int(flag.detach().cpu().item()))
 
 
+def _run_distributed_compile_probe(
+    probe: Callable[[], tuple[bool, str | None]],
+    *,
+    device: torch.device,
+    rank_ordered: bool,
+) -> tuple[bool, str | None]:
+    """Run a compile-triggering probe and return one synchronized decision.
+
+    On homogeneous DDP GPUs, rank-ordered execution lets rank 0 populate the
+    persistent Inductor/Triton cache before peers request the same graph. This
+    avoids duplicate CPU compilation and cache lock contention without skipping
+    validation on any rank.
+    """
+    world_size = _distributed_world_size()
+    if not _distributed_is_initialized() or world_size <= 1:
+        return probe()
+
+    local_success = True
+    local_error: str | None = None
+    if rank_ordered:
+        rank = _distributed_rank()
+        for active_rank in range(world_size):
+            if rank == active_rank:
+                try:
+                    local_success, local_error = probe()
+                except Exception as exc:
+                    local_success = False
+                    local_error = f"{type(exc).__name__}: {exc}"
+            _distributed_barrier()
+    else:
+        try:
+            local_success, local_error = probe()
+        except Exception as exc:
+            local_success = False
+            local_error = f"{type(exc).__name__}: {exc}"
+
+    global_success = _distributed_probe_succeeded(local_success, device)
+    if global_success:
+        return True, None
+    if local_error is None:
+        local_error = "compile probe failed on another distributed rank"
+    return False, local_error
+
+
 def _distributed_min_int(local_value: int, device: torch.device) -> int:
     if not _distributed_is_initialized() or _distributed_world_size() <= 1:
         return int(local_value)
@@ -8043,6 +8253,8 @@ def _probe_compiled_train_forward(
     factor_aug_kwargs: Mapping[str, float] | None,
     direction_weight: float,
     volatility_regime_weight: float,
+    synchronize_distributed: bool = True,
+    observed_output_dtypes: list[torch.dtype] | None = None,
 ) -> tuple[bool, str | None]:
     """Materialize the lazy compiled forward/backward before DDP wraps it.
 
@@ -8124,6 +8336,9 @@ def _probe_compiled_train_forward(
                         symbol_indices=batch.get("symbol_indices"),
                     )
                 weights, aux_outputs = _extract_weights_and_aux(output)
+                if observed_output_dtypes is not None:
+                    observed_output_dtypes.clear()
+                    observed_output_dtypes.append(weights.dtype)
                 aux_outputs = _attach_factor_augmented_scores(
                     model=model,
                     aux_outputs=aux_outputs,
@@ -8165,6 +8380,8 @@ def _probe_compiled_train_forward(
                 module.training = training
 
     local_success = local_error is None
+    if not synchronize_distributed:
+        return local_success, local_error
     global_success = _distributed_probe_succeeded(local_success, device)
     if global_success:
         return True, None
@@ -8184,31 +8401,91 @@ def _probe_compiled_loss_forward_backward(
     loss_kwargs: Mapping[str, Any],
     max_volume_participation: float,
     volume_participation_equity: float,
+    weights_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
-    """Materialize the real fixed-shape canonical loss graph before epoch 1."""
+    """Materialize the exact canonical-loss input path before epoch 1.
+
+    In DDP, the compiled loss receives autograd-aware gathered model weights,
+    not a leaf tensor created directly at global batch size. Reproduce that
+    collective here so AOTAutograd does not compile a second loss graph in the
+    first real train step.
+    """
     local_error: str | None = None
     try:
+        distributed_probe = bool(
+            _distributed_is_initialized() and _distributed_world_size() > 1
+        )
+        world_size = _distributed_world_size() if distributed_probe else 1
+        rank = _distributed_rank() if distributed_probe else 0
+        if int(batch_size) % int(world_size) != 0:
+            raise ValueError(
+                "compiled loss probe batch size must be divisible by DDP world size; "
+                f"batch_size={batch_size}, world_size={world_size}"
+            )
+        local_batch_size = int(batch_size) // int(world_size)
+        row_start = int(rank) * local_batch_size
+        row_end = row_start + local_batch_size
         prepare_device = _windowed_prepare_device(split, device)
         batch = split.batch_metadata_by_rows(
-            0,
-            int(batch_size),
+            row_start,
+            row_end,
             device=prepare_device,
             non_blocking=False,
         )
         batch = _move_windowed_batch_to_device(batch, device, non_blocking)
-        weights_dtype = (
-            amp_dtype
-            if device.type == "cuda" and amp_dtype is not None
-            else torch.float32
-        )
-        weights = torch.zeros_like(
+        probe_weights_dtype = weights_dtype
+        if probe_weights_dtype is None:
+            probe_weights_dtype = (
+                amp_dtype
+                if device.type == "cuda" and amp_dtype is not None
+                else torch.float32
+            )
+        local_weights = torch.zeros_like(
             batch["future_log_returns"],
             device=device,
-            dtype=weights_dtype,
+            dtype=probe_weights_dtype,
             requires_grad=True,
         )
+        if distributed_probe:
+            weights = _all_gather_autograd(local_weights.contiguous())
+            future_log_returns = _all_gather_no_grad(
+                batch["future_log_returns"].contiguous()
+            )
+            tradable_mask = _all_gather_no_grad(batch["tradable_mask"].contiguous())
+            can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
+            can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
+            can_short_open_mask = _all_gather_no_grad(
+                batch["can_short_open_mask"].contiguous()
+            )
+            force_short_cover_mask = _all_gather_no_grad(
+                batch["force_short_cover_mask"].contiguous()
+            )
+            force_exit_mask = _all_gather_no_grad(batch["force_exit_mask"].contiguous())
+            sample_mask = _all_gather_no_grad(batch["sample_mask"].contiguous())
+            benchmark = _all_gather_no_grad(batch["benchmark"].contiguous())
+            volume_notional = (
+                _all_gather_no_grad(batch["volume_notional"].contiguous())
+                if _volume_participation_enabled(
+                    max_volume_participation,
+                    volume_participation_equity,
+                )
+                and "volume_notional" in batch
+                else None
+            )
+        else:
+            weights = local_weights
+            future_log_returns = batch["future_log_returns"]
+            tradable_mask = batch["tradable_mask"]
+            can_buy_mask = batch["can_buy_mask"]
+            can_sell_mask = batch["can_sell_mask"]
+            can_short_open_mask = batch["can_short_open_mask"]
+            force_short_cover_mask = batch["force_short_cover_mask"]
+            force_exit_mask = batch["force_exit_mask"]
+            sample_mask = batch["sample_mask"]
+            benchmark = batch["benchmark"]
+            volume_notional = batch.get("volume_notional")
         volume_limit_weights = _volume_limit_weights_from_notional(
-            batch.get("volume_notional"),
+            volume_notional,
             max_volume_participation=max_volume_participation,
             volume_participation_equity=volume_participation_equity,
             device=device,
@@ -8225,15 +8502,15 @@ def _probe_compiled_loss_forward_backward(
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = loss_fn(
                 weights,
-                batch["future_log_returns"],
-                batch["tradable_mask"],
-                benchmark_returns=batch["benchmark"],
-                can_buy_mask=batch["can_buy_mask"],
-                can_sell_mask=batch["can_sell_mask"],
-                can_short_open_mask=batch["can_short_open_mask"],
-                force_short_cover_mask=batch["force_short_cover_mask"],
-                force_exit_mask=batch["force_exit_mask"],
-                sample_mask=batch["sample_mask"],
+                future_log_returns,
+                tradable_mask,
+                benchmark_returns=benchmark,
+                can_buy_mask=can_buy_mask,
+                can_sell_mask=can_sell_mask,
+                can_short_open_mask=can_short_open_mask,
+                force_short_cover_mask=force_short_cover_mask,
+                force_exit_mask=force_exit_mask,
+                sample_mask=sample_mask,
                 volume_limit_weights=volume_limit_weights,
                 aux_outputs=aux_outputs,
                 **dict(loss_kwargs),
@@ -10730,6 +11007,12 @@ def run_training(
         if deployment_folds is None
         else list(deployment_folds)
     )
+    trainer_startup_timing = _PreEpochTimingRecorder(
+        Path(output_dir) / "trainer_startup_timing.jsonl",
+        train_years=[],
+        fold_ids=[fold.fold_id for fold in fold_list_for_run],
+        scope="trainer_startup",
+    )
     multi_gpu_strategy = str(
         getattr(config.training, "multi_gpu_strategy", "none") or "none"
     ).strip().lower().replace("-", "_")
@@ -10759,6 +11042,12 @@ def run_training(
         torch.cuda.set_device(local_rank)
         if not _distributed_is_initialized():
             dist.init_process_group(backend="nccl")
+    trainer_startup_timing.checkpoint(
+        "fold_materialization_and_strategy_resolution",
+        folds=int(len(fold_list_for_run)),
+        strategy=str(multi_gpu_strategy),
+        resume=bool(resume),
+    )
 
     if resume:
         if _distributed_is_initialized() and _distributed_world_size() > 1:
@@ -10852,6 +11141,10 @@ def run_training(
                 "legacy_fold_artifact_scope_migration",
                 _migrate_legacy_fold_artifacts,
             )
+    trainer_startup_timing.checkpoint(
+        "resume_artifact_scope_migration",
+        resume=bool(resume),
+    )
 
     if _is_tree_model_name(config.training.model_name):
         return _run_training_tree_models(
@@ -10898,6 +11191,10 @@ def run_training(
             f"outputs; objective={loss_objective!r} requires aux tensors. Use multi_gpu_strategy=none "
             "or choose log_utility/sharpe/sortino."
         )
+    trainer_startup_timing.checkpoint(
+        "objective_contract_and_executor_validation",
+        objective=str(loss_objective),
+    )
 
     device = _resolve_device(config)
     if distributed_data_parallel_enabled and not _distributed_is_initialized():
@@ -10955,6 +11252,11 @@ def run_training(
         )
     if profile_timing:
         print("[profile] timing mode enabled")
+    trainer_startup_timing.checkpoint(
+        "device_precision_and_compile_runtime_setup",
+        device=str(device),
+        amp_dtype=str(amp_dtype),
+    )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -10990,6 +11292,10 @@ def run_training(
         "resume_walkforward_artifacts",
         resume_artifact_error,
     )
+    trainer_startup_timing.checkpoint(
+        "manifest_and_completed_fold_scan",
+        completed_folds=int(len(results_by_fold)),
+    )
 
     grouped_folds: dict[tuple[int, ...], list[WalkForwardFold]] = {}
     for fold in fold_list:
@@ -11003,12 +11309,35 @@ def run_training(
             latest_resume_checkpoint, latest_resume_years = latest_candidate
             print(f"[resume] latest group checkpoint: {latest_resume_checkpoint}")
 
+    trainer_startup_timing.checkpoint(
+        "grouping_and_resume_checkpoint_discovery",
+        groups=int(len(grouped_folds)),
+        latest_checkpoint=(
+            None if latest_resume_checkpoint is None else str(latest_resume_checkpoint)
+        ),
+    )
+
     warm_start_checkpoint_path: Path | None = None
+    # Reuse one symbolic-S OptimizedFunction across expanding train groups.
+    # This is executor state only; the canonical loss and checkpoint contract
+    # are unchanged.
+    shared_dynamic_compiled_loss_fn: Callable[..., torch.Tensor] | None = None
+    dynamic_loss_symbol_max = max(1, int(len(panel.symbols)))
 
     for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
         train_years = list(train_years_key)
         group_checkpoint_path = _group_checkpoint_path(output_path, train_years)
         group_curve_path = _group_curve_path(output_path, train_years)
+        pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
+        pre_epoch_timing: _PreEpochTimingRecorder | None = (
+            _PreEpochTimingRecorder(
+                _group_dir(output_path, train_years) / "pre_epoch_timing.jsonl",
+                train_years=train_years,
+                fold_ids=[fold.fold_id for fold in pending_folds],
+            )
+            if pending_folds
+            else None
+        )
         loss_contract_error: BaseException | None = None
         try:
             if _distributed_should_write():
@@ -11026,11 +11355,15 @@ def run_training(
             "loss_contract_metadata",
             loss_contract_error,
         )
-        pending_folds = [fold for fold in group_folds if fold.fold_id not in results_by_fold]
 
         # Ensure each train-group starts from a clean CUDA allocator state.
         if device.type == "cuda":
             _release_cuda_memory(device)
+        if pre_epoch_timing is not None:
+            pre_epoch_timing.checkpoint(
+                "loss_contract_and_cuda_allocator_reset",
+                pending_folds=int(len(pending_folds)),
+            )
 
         if not pending_folds:
             if config.training.warm_start_from_previous_fold and group_checkpoint_path.exists():
@@ -11057,6 +11390,9 @@ def run_training(
         print(f"\n{'='*80}")
         print(f"[Train {train_years}] folds={len(group_folds)} pending={len(pending_folds)}")
         print(f"{'='*80}")
+
+        if pre_epoch_timing is None:
+            raise RuntimeError("pending train group is missing its pre-epoch timing recorder")
 
         train_reference = group_folds[0]
         include_volume_notional = _volume_participation_enabled(
@@ -11151,6 +11487,11 @@ def run_training(
                 )
 
         print(f"[Train {train_years}] using batch_size train={train_batch_size}")
+        pre_epoch_timing.checkpoint(
+            "dataset_and_batch_size",
+            train_rows=int(len(train_ds)),
+            global_batch_size=int(train_batch_size),
+        )
         train_setup_start = time.perf_counter()
         # All neural objectives share one lazy-windowed input executor.
         # Objective-specific behavior belongs in the canonical loss.
@@ -11174,6 +11515,12 @@ def run_training(
                 f"Train {train_years} setup.train_tensors",
                 TimingBreakdown(total_s=time.perf_counter() - train_setup_start),
             )
+        pre_epoch_timing.checkpoint(
+            "train_tensor_preparation",
+            rows=int(len(train_windowed)),
+            symbols=int(train_windowed.features.shape[1]),
+            features=int(train_windowed.features.shape[2]),
+        )
 
         fold_contexts: dict[int, FoldRuntimeContext] = {}
         for fold in pending_folds:
@@ -11235,6 +11582,11 @@ def run_training(
                     checkpoint.get("best_val_loss", float("inf"))
                 )
 
+        pre_epoch_timing.checkpoint(
+            "fold_context_and_resume_metadata",
+            active_folds=int(len(fold_contexts)),
+        )
+
         if not fold_contexts:
             train_windowed = None
             combined_val_windowed = None
@@ -11262,6 +11614,10 @@ def run_training(
                 f"Train {train_years} setup.val_tensors",
                 TimingBreakdown(total_s=time.perf_counter() - val_setup_start),
             )
+        pre_epoch_timing.checkpoint(
+            "validation_tensor_preparation",
+            rows=int(len(combined_val_windowed)),
+        )
 
         curve_test_fold_index = 0
         curve_test_fold_context = list(fold_contexts.values())[curve_test_fold_index]
@@ -11314,6 +11670,10 @@ def run_training(
                 f"Train {train_years} setup.test_tensors",
                 TimingBreakdown(total_s=time.perf_counter() - test_setup_start),
             )
+        pre_epoch_timing.checkpoint(
+            "sampled_test_tensor_preparation",
+            rows=int(len(combined_test_windowed)),
+        )
 
         model_build_start = time.perf_counter()
         _progress(f"[Train {train_years}] build model")
@@ -11359,6 +11719,11 @@ def run_training(
                 f"Train {train_years} setup.model_build",
                 TimingBreakdown(total_s=time.perf_counter() - model_build_start),
             )
+        pre_epoch_timing.checkpoint(
+            "model_build_and_batch_shape",
+            parameters=int(sum(parameter.numel() for parameter in model.parameters())),
+            padded_train_rows=int(len(train_windowed)),
+        )
 
         if config.training.warm_start_from_previous_fold and warm_start_checkpoint_path is not None and warm_start_checkpoint_path.exists():
             warm_start_checkpoint = _load_checkpoint(warm_start_checkpoint_path)
@@ -11524,6 +11889,12 @@ def run_training(
             print(f"[Train {train_years}] epoch-level test curve disabled; final test runs after training")
         if defer_epoch_curve_plot_until_end:
             print(f"[Train {train_years}] epoch curve plotting deferred until training completes")
+        pre_epoch_timing.checkpoint(
+            "optimizer_scheduler_resume_and_curve_state",
+            start_epoch=int(start_epoch),
+            steps_per_epoch=int(train_steps_per_epoch),
+            scheduler=str(scheduler_name),
+        )
 
         def _record_epoch_curve(payload: dict[str, float | int | None], request_plot: bool) -> float:
             if not record_epoch_curve:
@@ -11547,7 +11918,11 @@ def run_training(
         eval_auto_chunk_rows_cap = int(getattr(config.training, "eval_auto_chunk_rows_cap", 16))
         eval_model_chunk_rows_config = getattr(config.training, "eval_model_chunk_rows", "auto")
 
-        if config.training.chunk_rows > 0:
+        explicit_eval_model_chunk_rows = str(eval_model_chunk_rows_config).strip().lower() not in {"", "auto"}
+        if explicit_eval_model_chunk_rows:
+            eval_chunk_rows = max(1, min(int(eval_model_chunk_rows_config), combined_val_rows))
+            print(f"[Train {train_years}] eval model_chunk_rows={eval_chunk_rows} (manual eval_model_chunk_rows)")
+        elif config.training.chunk_rows > 0:
             eval_chunk_rows = min(config.training.chunk_rows, combined_val_rows)
             print(f"[Train {train_years}] eval model_chunk_rows={eval_chunk_rows} (manual chunk_rows)")
         else:
@@ -11590,10 +11965,6 @@ def run_training(
             eval_chunk_rows = max(1, min(eval_chunk_rows, combined_val_rows))
             del probe_batch
             print(f"[Train {train_years}] eval chunk_rows={eval_chunk_rows} (auto)")
-        if str(eval_model_chunk_rows_config).strip().lower() not in {"", "auto"}:
-            eval_chunk_rows = max(1, min(int(eval_model_chunk_rows_config), combined_val_rows))
-            print(f"[Train {train_years}] eval model_chunk_rows={eval_chunk_rows} (manual eval_model_chunk_rows)")
-
         eval_backtest_chunk_rows_config = int(getattr(config.training, "eval_backtest_chunk_rows", 512))
         if bool(getattr(config.training, "eval_backtest_chunk_rows_auto", True)):
             eval_backtest_chunk_rows = _auto_backtest_chunk_rows(
@@ -11607,6 +11978,11 @@ def run_training(
         print(
             f"[Train {train_years}] eval chunks: "
             f"model_chunk_rows={eval_chunk_rows}, backtest_chunk_rows={eval_backtest_chunk_rows}"
+        )
+        pre_epoch_timing.checkpoint(
+            "eval_chunk_probe_and_selection",
+            eval_model_chunk_rows=int(eval_chunk_rows),
+            eval_backtest_chunk_rows=int(eval_backtest_chunk_rows),
         )
 
         config_auto_compile_risk = bool(getattr(config.training, "auto_torch_compile_sharpe", True))
@@ -11625,6 +12001,9 @@ def run_training(
         config_compile_loss = bool(getattr(config.training, "compile_loss", auto_compile_risk))
         default_compile_loss = "1" if config_compile_loss else "0"
         compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
+        compile_loss_dynamic_symbols = bool(
+            getattr(config.training, "compile_loss_dynamic_symbols", False)
+        )
         aux_training_required = _training_needs_aux(
             loss_objective,
             factor_aug_kwargs,
@@ -11717,25 +12096,48 @@ def run_training(
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                             loss_fullgraph = _is_log_utility_objective(loss_objective)
-                            raw_compiled_loss_fn = torch.compile(
-                                eager_loss_fn,
-                                fullgraph=loss_fullgraph,
-                                dynamic=False,
-                                options={"triton.cudagraphs": False},
-                            )
+                            if compile_loss_dynamic_symbols:
+                                if shared_dynamic_compiled_loss_fn is None:
+                                    shared_dynamic_compiled_loss_fn = torch.compile(
+                                        eager_loss_fn,
+                                        fullgraph=loss_fullgraph,
+                                        # mark_dynamic annotates only S before
+                                        # the first call; T remains fixed.
+                                        dynamic=None,
+                                        options={"triton.cudagraphs": False},
+                                    )
+                                raw_compiled_loss_fn = shared_dynamic_compiled_loss_fn
+                            else:
+                                raw_compiled_loss_fn = torch.compile(
+                                    eager_loss_fn,
+                                    fullgraph=loss_fullgraph,
+                                    dynamic=False,
+                                    options={"triton.cudagraphs": False},
+                                )
                             compiled_loss_fn = _CompiledLossFallback(
                                 raw_compiled_loss_fn,
                                 eager_loss_fn,
                                 label=f"Train {train_years}",
+                                dynamic_symbol_axis=compile_loss_dynamic_symbols,
+                                dynamic_symbol_max=(
+                                    dynamic_loss_symbol_max
+                                    if compile_loss_dynamic_symbols
+                                    else None
+                                ),
                             )
                             print(
                                 f"[Train {train_years}] torch.compile loss enabled "
                                 f"(mode=default, fullgraph={loss_fullgraph}, "
-                                "dynamic=False, cudagraphs=False)"
+                                f"dynamic_symbols={compile_loss_dynamic_symbols}, "
+                                "cudagraphs=False)"
                             )
                             loss_compile_status = "enabled:fullgraph" if loss_fullgraph else "enabled"
+                            if compile_loss_dynamic_symbols:
+                                loss_compile_status += ":dynamic_symbols_shared"
                         except Exception as e:
                             compile_setup_error = f"loss compile constructor: {type(e).__name__}: {e}"
+                            if compile_loss_dynamic_symbols:
+                                shared_dynamic_compiled_loss_fn = None
                             if bool(config.training.strict_no_fallback) and not ddp_enabled:
                                 raise RuntimeError(
                                     f"[Train {train_years}] torch.compile loss failed; "
@@ -11753,6 +12155,8 @@ def run_training(
                         )
                 except Exception as e:
                     compile_setup_error = f"model compile constructor: {type(e).__name__}: {e}"
+                    if compile_loss_dynamic_symbols:
+                        shared_dynamic_compiled_loss_fn = None
                     if bool(config.training.strict_no_fallback) and not ddp_enabled:
                         raise RuntimeError(
                             f"[Train {train_years}] torch.compile failed; "
@@ -11787,6 +12191,11 @@ def run_training(
             loss_compile_status = "off:model_compile_disabled"
         else:
             loss_compile_status = "off:eager"
+        pre_epoch_timing.checkpoint(
+            "torch_compile_wrapper_construction",
+            model_compile_status=str(model_compile_status),
+            loss_compile_status=str(loss_compile_status),
+        )
 
         if ddp_enabled and should_enable_compile:
             local_compile_setup_ok = model_compile_status.startswith("enabled") and (
@@ -11879,25 +12288,49 @@ def run_training(
                 "DDP ranks selected inconsistent train feature cache representations: "
                 f"local={effective_train_feature_dtype}@{train_windowed.features.device}"
             )
+        pre_epoch_timing.checkpoint(
+            "train_gpu_cache",
+            dtype=str(effective_train_feature_dtype),
+            device=str(train_windowed.features.device),
+        )
 
+        rank_ordered_compile_probes = bool(
+            ddp_enabled
+            and _distributed_world_size() > 1
+            and _env_truthy("STOCKAGENT_DDP_SERIALIZE_COMPILE_PROBES", "1")
+        )
+        if rank_ordered_compile_probes and _distributed_is_rank0():
+            print(
+                f"[Train {train_years}] DDP model compile probe runs rank-by-rank; "
+                "the loss probe runs collectively to match the train hotpath"
+            )
+
+        model_probe_started = time.perf_counter()
+        model_probe_output_dtypes: list[torch.dtype] = []
         if model_compile_status.startswith("enabled"):
             probe_uses_panel_slab = bool(train_uses_panel_slab and panel_slab_model is not None)
             probe_model = panel_slab_model if probe_uses_panel_slab else compiled_train_model
             if probe_model is None:
                 raise RuntimeError("compiled train probe selected an unavailable model")
-            probe_ok, probe_error = _probe_compiled_train_forward(
-                probe_model,
-                train_windowed,
-                batch_size=train_batch_size,
+            probe_ok, probe_error = _run_distributed_compile_probe(
+                lambda: _probe_compiled_train_forward(
+                    probe_model,
+                    train_windowed,
+                    batch_size=train_batch_size,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    non_blocking=non_blocking,
+                    use_panel_slab=probe_uses_panel_slab,
+                    return_aux=aux_training_required,
+                    objective=loss_objective,
+                    factor_aug_kwargs=factor_aug_kwargs,
+                    direction_weight=config.training.multitask_loss.direction_weight,
+                    volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                    synchronize_distributed=False,
+                    observed_output_dtypes=model_probe_output_dtypes,
+                ),
                 device=device,
-                amp_dtype=amp_dtype,
-                non_blocking=non_blocking,
-                use_panel_slab=probe_uses_panel_slab,
-                return_aux=aux_training_required,
-                objective=loss_objective,
-                factor_aug_kwargs=factor_aug_kwargs,
-                direction_weight=config.training.multitask_loss.direction_weight,
-                volatility_regime_weight=config.training.multitask_loss.volatility_regime_weight,
+                rank_ordered=rank_ordered_compile_probes,
             )
             if probe_ok:
                 model_compile_probe_status = "passed:forward_backward"
@@ -11925,7 +12358,28 @@ def run_training(
                     f"[Train {train_years}] compiled train probe failed on at least one rank; "
                     f"all ranks will use eager before DDP wrap: {probe_error}"
                 )
+        pre_epoch_timing.checkpoint(
+            "compiled_model_forward_backward_probe",
+            active=bool(model_compile_status.startswith("enabled")),
+            status=str(model_compile_probe_status),
+            measured_s=float(time.perf_counter() - model_probe_started),
+            rank_ordered=bool(rank_ordered_compile_probes),
+            global_batch_rows=int(train_batch_size),
+            local_model_rows=int(
+                train_batch_size // max(1, _distributed_world_size())
+            ),
+            output_dtype=(
+                None
+                if not model_probe_output_dtypes
+                else str(model_probe_output_dtypes[-1])
+            ),
+            inductor_compile_threads=int(
+                os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            ),
+        )
 
+        loss_probe_started = time.perf_counter()
+        loss_probe_rank_ordered = rank_ordered_compile_probes
         if loss_compile_status.startswith("enabled") and not aux_training_required:
             loss_probe_kwargs = {
                 "long_only": config.trading.long_only,
@@ -11957,16 +12411,29 @@ def run_training(
                 "regime_up_threshold": config.training.multitask_loss.regime_up_threshold,
                 "regime_down_threshold": config.training.multitask_loss.regime_down_threshold,
             }
-            loss_probe_ok, loss_probe_error = _probe_compiled_loss_forward_backward(
-                compiled_loss_fn,
-                train_windowed,
-                batch_size=train_batch_size,
+            # The exact DDP loss input is produced by autograd all-gather, so
+            # every rank must enter this probe together. Compile concurrency is
+            # bounded by environment.torch_compile_threads.
+            loss_probe_rank_ordered = False if ddp_enabled else rank_ordered_compile_probes
+            loss_probe_ok, loss_probe_error = _run_distributed_compile_probe(
+                lambda: _probe_compiled_loss_forward_backward(
+                    compiled_loss_fn,
+                    train_windowed,
+                    batch_size=train_batch_size,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    non_blocking=non_blocking,
+                    loss_kwargs=loss_probe_kwargs,
+                    max_volume_participation=config.trading.max_volume_participation,
+                    volume_participation_equity=config.trading.volume_participation_equity,
+                    weights_dtype=(
+                        None
+                        if not model_probe_output_dtypes
+                        else model_probe_output_dtypes[-1]
+                    ),
+                ),
                 device=device,
-                amp_dtype=amp_dtype,
-                non_blocking=non_blocking,
-                loss_kwargs=loss_probe_kwargs,
-                max_volume_participation=config.trading.max_volume_participation,
-                volume_participation_equity=config.trading.volume_participation_equity,
+                rank_ordered=loss_probe_rank_ordered,
             )
             loss_still_compiled = not (
                 isinstance(compiled_loss_fn, _CompiledLossFallback)
@@ -11989,11 +12456,35 @@ def run_training(
                         f"{loss_probe_error}. strict_no_fallback=true."
                     )
                 compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
+                if compile_loss_dynamic_symbols:
+                    shared_dynamic_compiled_loss_fn = None
                 loss_compile_status = "fallback:eager_after_probe"
                 print(
                     f"[Train {train_years}] compiled loss probe failed; all ranks use eager loss: "
                     f"{loss_probe_error}"
                 )
+        pre_epoch_timing.checkpoint(
+            "compiled_loss_forward_backward_probe",
+            active=bool(loss_compile_status.startswith("enabled")),
+            status=str(loss_compile_status),
+            measured_s=float(time.perf_counter() - loss_probe_started),
+            rank_ordered=bool(loss_probe_rank_ordered),
+            ddp_collective_input=bool(ddp_enabled),
+            global_loss_rows=int(train_batch_size),
+            weights_dtype=(
+                None
+                if not model_probe_output_dtypes
+                else str(model_probe_output_dtypes[-1])
+            ),
+            dynamic_symbols=bool(compile_loss_dynamic_symbols),
+            shared_across_train_groups=bool(compile_loss_dynamic_symbols),
+            dynamic_symbol_max=(
+                dynamic_loss_symbol_max if compile_loss_dynamic_symbols else None
+            ),
+            inductor_compile_threads=int(
+                os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            ),
+        )
 
         if ddp_enabled:
             if ddp_panel_slab_enabled:
@@ -12006,6 +12497,10 @@ def run_training(
                 config=config,
                 device=device,
             )
+        pre_epoch_timing.checkpoint(
+            "ddp_model_wrap",
+            enabled=bool(ddp_enabled),
+        )
         final_eval_model: nn.Module = (
             _unwrap_distributed_data_parallel(eval_model) if ddp_enabled else eval_model
         )
@@ -12028,6 +12523,7 @@ def run_training(
             f"multi_gpu={'distributed_data_parallel' if ddp_enabled else 'none'}; "
             f"panel_slab_forward={panel_slab_compile_status}; "
             f"loss_compile={loss_compile_status}; "
+            f"loss_compile_dynamic_symbols={compile_loss_dynamic_symbols}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "
@@ -12090,6 +12586,11 @@ def run_training(
                 target_fraction=float(config.training.target_vram_fraction),
                 safety_margin_gb=float(config.training.vram_safety_margin_gb),
             )
+        pre_epoch_timing.checkpoint(
+            "validation_and_test_gpu_cache",
+            validation_device=str(combined_val_windowed.features.device),
+            test_device=str(combined_test_windowed.features.device),
+        )
 
         early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
         early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
@@ -12108,6 +12609,10 @@ def run_training(
                 print(f"[Train {train_years}] restored Python/NumPy/Torch RNG state")
             else:
                 print(f"[Train {train_years}] checkpoint RNG state is incomplete; continuing from configured seed")
+        pre_epoch_timing.checkpoint(
+            "pre_epoch_total",
+            next_epoch=int(start_epoch),
+        )
         epoch_pbar = tqdm(
             range(start_epoch, config.training.epochs + 1),
             desc=" Epochs",

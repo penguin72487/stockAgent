@@ -1243,50 +1243,133 @@ def _build_delisting_announcement_rules(input_dir: Path) -> pl.DataFrame:
 
 
 def _build_twse_market_index_features(input_dir: Path, *, market_symbol: str) -> pl.DataFrame:
-    frame = _read_optional(input_dir, "twse_market_index")
-    if frame.is_empty() or "指數" not in frame.columns:
-        return pl.DataFrame()
-    index_name = pl.col("指數").cast(pl.Utf8, strict=False)
-    taiex = (
-        frame.filter(index_name.str.contains("發行量加權股價指數"))
-        .select(
-            [
-                _date_column_expr("date").alias("date"),
-                _num_expr("收盤指數").alias("_taiex"),
-                (_num_expr("漲跌百分比(%)") / 100.0).alias("twpub_twse_taiex_pct"),
-            ]
+    """Build one PIT TAIEX series from the complete monthly archive plus IND.
+
+    ``MI_5MINS_HIST`` is the complete official base (available from 1999), while
+    the daily ``MI_INDEX?type=IND`` table starts much later.  Same-day IND rows
+    have higher priority, but overlapping closes must agree first so a stale or
+    semantically mismatched TWSE payload cannot silently replace the archive.
+    """
+
+    archive = _read_optional(input_dir, "twse_taiex_ohlc")
+    if not archive.is_empty():
+        required = {"date", "closing_index"}
+        missing = sorted(required - set(archive.columns))
+        if missing:
+            raise ValueError(
+                f"twse_taiex_ohlc.parquet is missing required columns: {missing}"
+            )
+        archive_taiex = (
+            archive.select(
+                [
+                    _date_column_expr("date").alias("date"),
+                    _num_expr("closing_index").alias("_taiex"),
+                ]
+            )
+            .drop_nulls(["date", "_taiex"])
+            .group_by("date")
+            .agg(pl.col("_taiex").last())
+            .sort("date")
+            .with_columns(
+                [
+                    pl.lit(None, dtype=pl.Float64).alias("_reported_pct"),
+                    pl.lit(0, dtype=pl.Int8).alias("_source_priority"),
+                ]
+            )
         )
-        .drop_nulls(["date"])
-        .group_by("date")
+    else:
+        archive_taiex = pl.DataFrame()
+
+    index_frame = _read_optional(input_dir, "twse_market_index")
+    if not index_frame.is_empty() and "指數" in index_frame.columns:
+        index_name = pl.col("指數").cast(pl.Utf8, strict=False)
+        ind_taiex = (
+            index_frame.filter(index_name.str.contains("發行量加權股價指數"))
+            .select(
+                [
+                    _date_column_expr("date").alias("date"),
+                    _num_expr("收盤指數").alias("_taiex"),
+                    (_num_expr("漲跌百分比(%)") / 100.0).alias("_reported_pct"),
+                ]
+            )
+            .drop_nulls(["date", "_taiex"])
+            .group_by("date")
+            .agg(
+                [
+                    pl.col("_taiex").last(),
+                    pl.col("_reported_pct").drop_nulls().last(),
+                ]
+            )
+            .sort("date")
+            .with_columns(pl.lit(1, dtype=pl.Int8).alias("_source_priority"))
+        )
+    else:
+        ind_taiex = pl.DataFrame()
+
+    if not archive_taiex.is_empty() and not ind_taiex.is_empty():
+        overlap = archive_taiex.select(
+            ["date", pl.col("_taiex").alias("_archive_close")]
+        ).join(
+            ind_taiex.select(["date", pl.col("_taiex").alias("_ind_close")]),
+            on="date",
+            how="inner",
+        )
+        mismatched = overlap.filter(
+            (pl.col("_archive_close") - pl.col("_ind_close")).abs() > 0.011
+        )
+        if not mismatched.is_empty():
+            examples = mismatched.head(5).to_dicts()
+            raise ValueError(
+                "TWSE TAIEX close mismatch between MI_5MINS_HIST and "
+                f"MI_INDEX IND; examples={examples}"
+            )
+
+    sources = [
+        frame for frame in (archive_taiex, ind_taiex) if not frame.is_empty()
+    ]
+    if not sources:
+        return pl.DataFrame()
+    taiex = (
+        pl.concat(sources, how="diagonal_relaxed")
+        .sort(["date", "_source_priority"])
+        .group_by("date", maintain_order=True)
         .agg(
             [
                 pl.col("_taiex").drop_nulls().last().alias("_taiex"),
-                pl.col("twpub_twse_taiex_pct").drop_nulls().last().alias("twpub_twse_taiex_pct"),
+                pl.col("_reported_pct").drop_nulls().last().alias("_reported_pct"),
             ]
         )
         .sort("date")
+        .with_columns(pl.col("_taiex").shift(1).alias("_previous_taiex"))
+        .with_columns(
+            pl.coalesce(
+                [
+                    pl.col("_reported_pct"),
+                    pl.when(pl.col("_previous_taiex") > 0.0)
+                    .then(pl.col("_taiex") / pl.col("_previous_taiex") - 1.0)
+                    .otherwise(None),
+                ]
+            ).alias("twpub_twse_taiex_pct")
+        )
     )
-    if taiex.is_empty():
-        return pl.DataFrame()
-    total_ret = (
-        frame.filter(index_name.str.contains("發行量加權報酬指數"))
-        .select([_date_column_expr("date").alias("date"), _num_expr("報酬指數").alias("_return_index")])
-        .drop_nulls(["date"])
-        .group_by("date")
-        .agg(pl.col("_return_index").drop_nulls().last().alias("_return_index"))
-        .sort("date")
-    )
-    output = taiex.join(total_ret, on="date", how="left").sort("date")
-    return output.with_columns(
+    return taiex.with_columns(
         [
             pl.lit(market_symbol).alias("symbol"),
+            # This is the receipt-backed exchange-session marker consumed by
+            # panel construction.  Keep it on the TAIEX market row only: dates
+            # from FX, macro, or futures features are not evidence that the
+            # cash-equity market traded.
+            pl.lit(1.0).alias("_twpub_official_traded"),
             _positive_log(pl.col("_taiex")).alias("twpub_twse_taiex_log"),
-            _safe_log(pl.col("_taiex") / pl.col("_taiex").shift(1)).alias("twpub_twse_taiex_logret_1d"),
+            _safe_log(pl.col("_taiex") / pl.col("_previous_taiex")).alias(
+                "twpub_twse_taiex_logret_1d"
+            ),
         ]
     ).select(
         [
             "date",
             "symbol",
+            "_twpub_official_traded",
             "twpub_twse_taiex_log",
             "twpub_twse_taiex_logret_1d",
             "twpub_twse_taiex_pct",

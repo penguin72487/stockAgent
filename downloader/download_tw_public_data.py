@@ -1,24 +1,32 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 import csv
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import html
 import io
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
 import threading
 import time
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlparse
 import zipfile
 import xml.etree.ElementTree as ET
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 import polars as pl
 import pyarrow.parquet as pq
@@ -27,9 +35,23 @@ from tqdm import tqdm
 from urllib3.exceptions import InsecureRequestWarning
 
 try:
-    from downloader.common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
+    from downloader.common import (
+        SharedRateLimiter,
+        describe_rate_limit,
+        provider_rate_limit,
+        resolve_end_date,
+        resolve_request_interval,
+        run_parallel_tasks,
+    )
 except ImportError:  # pragma: no cover - direct script execution from downloader/
-    from common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
+    from common import (
+        SharedRateLimiter,
+        describe_rate_limit,
+        provider_rate_limit,
+        resolve_end_date,
+        resolve_request_interval,
+        run_parallel_tasks,
+    )
 
 
 DATA_GOV_DATASET_API = "https://data.gov.tw/api/v2/rest/dataset/{dataset_id}"
@@ -42,9 +64,23 @@ ROC_DATE_PATTERN = re.compile(r"^\d{2,3}/\d{1,2}/\d{1,2}$")
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 HTML_ROW_START_PATTERN = re.compile(r"<tr\b[^>]*>", re.IGNORECASE)
 HTML_CELL_START_PATTERN = re.compile(r"<td\b[^>]*>", re.IGNORECASE)
+HTML_ROW_CAPTURE_PATTERN = re.compile(r"<tr\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+HTML_CELL_CAPTURE_PATTERN = re.compile(r"<td\b(?P<attrs>[^>]*)>", re.IGNORECASE)
 SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _HTTP_LOCAL = threading.local()
 _RATE_LIMITER: SharedRateLimiter | None = None
+_RATE_LIMITER_LOCK = threading.Lock()
+_JOURNAL_LOCK = threading.Lock()
+_TPEX_SESSION_CACHE_LOCK = threading.Lock()
+_TPEX_SESSION_CACHE: dict[
+    tuple[str, int, int, int, int],
+    tuple[date, date, frozenset[date], str | None, str | None],
+] = {}
+_TAIEX_SESSION_CACHE_LOCK = threading.Lock()
+_TAIEX_SESSION_CACHE: dict[
+    tuple[str, int, int, str, int, int, str],
+    tuple[date, date, frozenset[date], str],
+] = {}
 
 
 def _http_session() -> requests.Session:
@@ -56,6 +92,16 @@ def _http_session() -> requests.Session:
         session.mount("http://", adapter)
         _HTTP_LOCAL.session = session
     return session
+
+
+def _discard_http_session() -> None:
+    """Drop this worker's keep-alive connection after an unsafe HTTP 200."""
+
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        return
+    delattr(_HTTP_LOCAL, "session")
+    session.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +137,7 @@ class DownloadResult:
     missing_dates_before: int = 0
     missing_dates_after: int = 0
     coverage_complete: bool | None = None
+    source_unavailable_dates: int = 0
 
 
 @dataclass(slots=True)
@@ -100,6 +147,17 @@ class HistoricalDateResult:
     frame: pl.DataFrame
     raw_path: str | None = None
     error: str | None = None
+    http_status: int | None = None
+    content_type: str | None = None
+    content_length: int | None = None
+    body_sha256: str | None = None
+    body_snippet: str | None = None
+    response_attempts: int = 0
+    source_unavailable_reason: str | None = None
+
+
+class HistoricalResponseError(RuntimeError):
+    """An HTTP-success response that is unsafe to accept as historical data."""
 
 
 @dataclass(slots=True)
@@ -116,6 +174,15 @@ class HistoricalDownloadPlan:
     state: dict[str, Any]
 
 
+@dataclass(slots=True)
+class HistoricalResumeCache:
+    cache_key: str
+    journal_path: Path
+    partial_path: Path
+    data_dates: set[date]
+    empty_dates: set[date]
+
+
 MODE_ALIASES = {
     "full": "repair",
     "daily-update": "daily",
@@ -123,6 +190,52 @@ MODE_ALIASES = {
 }
 DOWNLOAD_MODES = ("rebuild", "repair", "daily", "list", *MODE_ALIASES)
 COVERAGE_STATE_SCHEMA_VERSION = 1
+HISTORICAL_JOURNAL_SCHEMA_VERSION = 1
+# Latest parser contract and the safe default for a newly added historical
+# dataset. Bump only the affected entries below when a parser change is scoped
+# to one exchange; otherwise unrelated durable journals would stop resuming.
+HISTORICAL_PARSER_CONTRACT_VERSION = 11
+HISTORICAL_PARSER_CONTRACT_VERSION_BY_DATASET = {
+    # v5 accepted holiday responses whose selected-table title had been
+    # rewritten to the requested date while the rows were stale. v6 bound both
+    # datasets to the verified TAIEX session calendar, but a measured rebuild
+    # still found retitled stale payloads on real sessions: 18 daily-OHLCV
+    # dates and 7 market-index dates. v7 requires the selected-table title,
+    # top-level payload.date, and any supplied params.date to declare the
+    # requested date, so old v6 partials are quarantined and only invalid raw
+    # receipts are refetched.
+    "twse_daily_ohlcv": 7,
+    "twse_market_index": 7,
+    "twse_margin_balance": 5,
+    "twse_institutional_trades": 5,
+    "twse_daily_valuation": 5,
+    # v6 treated two real TPEx OHLCV HTML generations as the same layout and
+    # silently shifted their price/volume columns. v7 separated the layouts,
+    # but missed three corporate-action rows whose split direction cell is
+    # blank. v8 identifies the generation by its close/status cell. v9 retains
+    # every available quote/statistics field and removes historical limit-price
+    # glyphs from numeric price cells. v10 accepts only isolated, permanently
+    # damaged security names (with row provenance), validates every other cell,
+    # and recognizes the official zero-trade average-note sentinel plus the
+    # exact legacy styled ROC-date header. v11 losslessly recovers the three
+    # corporate-action labels whose surviving CP950 byte pattern is unique and
+    # records row-level recovery provenance; every unknown damaged token still
+    # fails closed. v12 propagates receipt-level replacement-byte evidence to
+    # every security name in that receipt.  CP950 can otherwise re-pair the
+    # injected EF BF BD bytes into plausible CJK text that evades a rendered-
+    # character check even though the original name is unrecoverable.
+    "tpex_daily_ohlcv": 12,
+    # v7 records the official 2007-06-01..2008-09-29 backend archive gap
+    # only through per-session immutable explicit-no-data receipts. v8 adds
+    # the 2004-10-19 onward 16-cell archive generation and its exact standalone
+    # styled ROC-date header without weakening response-date binding.
+    "tpex_margin_balance": 8,
+    "tpex_institutional_trades": 6,
+    # v7 recognizes the official labeled ROC date used by the 2004--2006
+    # valuation archive (for example ``交易日期:94年08月08日``).
+    "tpex_daily_valuation": 7,
+}
+TW_PUBLIC_WAF_COOLDOWN_SECONDS = 30.0
 NO_DATA_STATUS_MARKERS = (
     "沒有符合條件",
     "查無資料",
@@ -137,6 +250,117 @@ OHLCV_SYMBOL_COLUMNS = {
     "twse_daily_ohlcv": "證券代號",
     "tpex_daily_ohlcv": "代號",
 }
+TPEX_OFFICIAL_CALENDAR_DATASET = "tpex_daily_ohlcv"
+TAIEX_SESSION_CALENDAR_DATASET = "twse_taiex_ohlc"
+TAIEX_SESSION_CALENDAR_SUMMARY_SCHEMA_VERSION = 1
+TAIEX_SESSION_CALENDAR_REQUIRED_COLUMNS = (
+    "date",
+    "opening_index",
+    "highest_index",
+    "lowest_index",
+    "closing_index",
+    "_dataset",
+    "_source",
+    "_source_product",
+)
+TPEX_SESSION_DEPENDENT_DATASETS = frozenset(
+    {
+        "tpex_margin_balance",
+        "tpex_institutional_trades",
+        "tpex_daily_valuation",
+    }
+)
+TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES: dict[
+    str,
+    tuple[tuple[date, date, str], ...],
+] = {
+    # Live checks against the official endpoint, using the receipt-verified
+    # TAIEX calendar, found data through 2007-05-31 and again from 2008-09-30.
+    # Every intervening open session returns the same explicit structured
+    # no-data response.  These dates are coverage only after their individual
+    # immutable response receipts have been journaled and verified.
+    "tpex_margin_balance": (
+        (
+            date(2007, 6, 1),
+            date(2008, 9, 29),
+            "official_endpoint_archive_gap",
+        ),
+    ),
+}
+TPEX_LEGACY_HTML_RESPONSE_KINDS = frozenset(
+    {
+        "tpex_margin_archive_html",
+        "tpex_institutional_archive_html",
+        "tpex_valuation_archive_html",
+    }
+)
+HISTORICAL_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "tpex_margin_balance": (
+        "代號",
+        "名稱",
+        "前資餘額(張)",
+        "資買",
+        "資賣",
+        "資餘額",
+        "前券餘額(張)",
+        "券賣",
+        "券買",
+        "券餘額",
+    ),
+    "tpex_institutional_trades": (
+        "代號",
+        "名稱",
+        "外資及陸資淨買股數",
+        "投信淨買股數",
+        "自營淨買股數",
+        "三大法人買賣超股數",
+    ),
+    "tpex_daily_valuation": (
+        "股票代號",
+        "公司名稱",
+        "本益比",
+        "殖利率(%)",
+        "股價淨值比",
+    ),
+}
+HISTORICAL_SYMBOL_COLUMNS = {
+    **OHLCV_SYMBOL_COLUMNS,
+    "tpex_margin_balance": "代號",
+    "tpex_institutional_trades": "代號",
+    "tpex_daily_valuation": "股票代號",
+}
+TPEX_INSTITUTIONAL_GROUPED_SOURCE_FIELDS = (
+    "代號",
+    "名稱",
+    *(("買進股數", "賣出股數", "買賣超股數") * 7),
+    "三大法人買賣超股數合計",
+)
+TPEX_INSTITUTIONAL_GROUPED_CANONICAL_FIELDS = (
+    "代號",
+    "名稱",
+    "外資及陸資(不含外資自營商)買股數",
+    "外資及陸資(不含外資自營商)賣股數",
+    "外資及陸資(不含外資自營商)淨買股數",
+    "外資自營商買股數",
+    "外資自營商賣股數",
+    "外資自營商淨買股數",
+    "外資及陸資買股數",
+    "外資及陸資賣股數",
+    "外資及陸資淨買股數",
+    "投信買進股數",
+    "投信賣出股數",
+    "投信淨買股數",
+    "自營商(自行買賣)買股數",
+    "自營商(自行買賣)賣股數",
+    "自營商(自行買賣)淨買股數",
+    "自營商(避險)買股數",
+    "自營商(避險)賣股數",
+    "自營商(避險)淨買股數",
+    "自營商買股數",
+    "自營商賣股數",
+    "自營淨買股數",
+    "三大法人買賣超股數",
+)
 
 
 HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
@@ -162,10 +386,10 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         tags=("twse", "index", "market", "daily", "historical"),
         url_template=(
             "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
-            "?date={date}&type=ALLBUT0999&response=json"
+            "?date={date}&type=IND&response=json"
         ),
         date_format="%Y%m%d",
-        start_date="2004-02-11",
+        start_date="2009-01-05",
         table_mode="title_contains:指數",
     ),
     DatasetSpec(
@@ -206,7 +430,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
             "?date={date}&selectType=ALL&response=json"
         ),
         date_format="%Y%m%d",
-        start_date="2004-02-11",
+        start_date="2005-09-02",
     ),
     DatasetSpec(
         name="tpex_daily_ohlcv",
@@ -232,7 +456,8 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
             "?date={date}&response=json"
         ),
         date_format="%Y/%m/%d",
-        start_date="2007-01-01",
+        start_date="2003-08-01",
+        table_mode="title_contains:上櫃股票融資融券餘額",
     ),
     DatasetSpec(
         name="tpex_institutional_trades",
@@ -245,7 +470,8 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
             "?date={date}&type=Daily&sect=EW&response=json"
         ),
         date_format="%Y/%m/%d",
-        start_date="2007-04-20",
+        start_date="2004-06-01",
+        table_mode="title_contains:三大法人買賣明細資訊",
     ),
     DatasetSpec(
         name="tpex_daily_valuation",
@@ -258,7 +484,7 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
             "?date={date}&response=json"
         ),
         date_format="%Y/%m/%d",
-        start_date="2007-01-01",
+        start_date="2003-08-01",
     ),
 )
 
@@ -692,6 +918,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-dates", type=int, default=None, help="Optional smoke-test cap per historical dataset.")
     parser.add_argument("--refresh", action="store_true", help="Overwrite existing parquet instead of merging.")
     parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse validated per-date JSONL journal, partial parquet, and raw receipts. "
+            "Use --no-resume for a deliberately fresh historical rebuild."
+        ),
+    )
+    parser.add_argument(
         "--daily-overlap-days",
         type=int,
         default=7,
@@ -702,6 +937,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=30,
         help="Repair mode rechecks recently empty weekdays instead of trusting them as holidays.",
+    )
+    parser.add_argument(
+        "--require-taiex-session-calendar",
+        action="store_true",
+        help=(
+            "Require the receipt-verified, coverage-complete twse_taiex_ohlc archive "
+            "as the expected-session calendar for historical TWSE/TPEx sources; "
+            "TPEx feature histories remain downstream of audited TPEx OHLCV sessions. "
+            "The canonical outer TW data-layer workflow enables this fail-closed mode."
+        ),
     )
     parser.add_argument("--skip-raw", action="store_true", help="Do not persist raw response bytes.")
     parser.add_argument(
@@ -733,6 +978,13 @@ def _strip_html(value: Any) -> str:
     text = "" if value is None else str(value)
     text = html.unescape(text)
     text = HTML_TAG_PATTERN.sub("", text)
+    return " ".join(text.replace("\u3000", " ").split())
+
+
+def _strip_html_with_tag_boundaries(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = html.unescape(text)
+    text = HTML_TAG_PATTERN.sub(" ", text)
     return " ".join(text.replace("\u3000", " ").split())
 
 
@@ -769,6 +1021,509 @@ def _canonical_mode(value: str) -> str:
 
 def _coverage_state_path(output_dir: Path, spec: DatasetSpec) -> Path:
     return output_dir / "state" / f"{spec.name}.json"
+
+
+def _historical_resume_cache_key(spec: DatasetSpec) -> str:
+    payload = {
+        "journal_schema_version": HISTORICAL_JOURNAL_SCHEMA_VERSION,
+        "parser_contract_version": _historical_parser_contract_version(spec),
+        "spec": asdict(spec),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _historical_parser_contract_version(spec: DatasetSpec) -> int:
+    return HISTORICAL_PARSER_CONTRACT_VERSION_BY_DATASET.get(
+        spec.name,
+        HISTORICAL_PARSER_CONTRACT_VERSION,
+    )
+
+
+def _historical_journal_path(output_dir: Path, spec: DatasetSpec) -> Path:
+    return output_dir / "state" / "journals" / f"{spec.name}.jsonl"
+
+
+def _historical_partial_path(
+    output_dir: Path,
+    spec: DatasetSpec,
+    cache_key: str,
+) -> Path:
+    return output_dir / "state" / "partials" / f"{spec.name}.{cache_key}.parquet"
+
+
+@contextmanager
+def _historical_dataset_lock(output_dir: Path, spec: DatasetSpec):
+    """Prevent two processes from mutating one dataset stage concurrently."""
+
+    lock_path = output_dir / "state" / "locks" / f"{spec.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    f"another process is already updating {spec.name} in {output_dir}"
+                ) from exc
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    with _JOURNAL_LOCK:
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError(f"short append while writing JSONL journal: {path}")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _append_historical_journal_record(
+    cache: HistoricalResumeCache,
+    spec: DatasetSpec,
+    result: HistoricalDateResult,
+    *,
+    status: str,
+    source: str,
+) -> None:
+    raw_path_value: str | None = None
+    raw_size: int | None = None
+    raw_sha256: str | None = None
+    if result.raw_path:
+        raw_path = Path(result.raw_path)
+        if raw_path.is_file():
+            try:
+                output_dir = cache.journal_path.parents[2]
+                raw_path_value = str(raw_path.resolve().relative_to(output_dir.resolve()))
+            except (OSError, ValueError):
+                raw_path_value = str(raw_path)
+            raw_bytes = raw_path.read_bytes()
+            raw_size = len(raw_bytes)
+            raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        else:
+            raw_path_value = str(raw_path)
+    _append_jsonl(
+        cache.journal_path,
+        {
+            "schema_version": HISTORICAL_JOURNAL_SCHEMA_VERSION,
+            "cache_key": cache.cache_key,
+            "dataset": spec.name,
+            "date": result.day.isoformat(),
+            "recorded_at_utc": _now_utc(),
+            "status": status,
+            "source": source,
+            "url": result.url,
+            "rows": int(result.frame.height),
+            "raw_path": raw_path_value,
+            "raw_size": raw_size,
+            "raw_sha256": raw_sha256,
+            "http_status": result.http_status,
+            "content_type": result.content_type,
+            "content_length": result.content_length,
+            "body_sha256": result.body_sha256,
+            "body_snippet": result.body_snippet,
+            "response_attempts": int(result.response_attempts),
+            "source_unavailable_reason": result.source_unavailable_reason,
+            "error": result.error,
+        },
+    )
+
+
+def _iter_historical_journal_records(
+    path: Path,
+    spec: DatasetSpec,
+):
+    """Yield valid append-only records, tolerating only a torn final write."""
+
+    if not path.exists():
+        return
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+        lines = raw_text.splitlines()
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                if index == len(lines) - 1 and not raw_text.endswith("\n"):
+                    # A killed process may leave one incomplete trailing record.
+                    # Earlier append-only records remain valid and remain usable.
+                    continue
+                raise ValueError(
+                    f"corrupt non-terminal JSONL journal record {index + 1}: {path}"
+                )
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("dataset") != spec.name:
+                continue
+            try:
+                schema_version = int(payload.get("schema_version", -1))
+            except (TypeError, ValueError):
+                continue
+            if schema_version != HISTORICAL_JOURNAL_SCHEMA_VERSION:
+                continue
+            try:
+                day = _parse_date(str(payload.get("date", ""))[:10])
+            except ValueError:
+                continue
+            yield day, payload
+    except OSError:
+        return
+
+
+def _load_historical_journal_latest(
+    path: Path,
+    spec: DatasetSpec,
+    cache_key: str,
+) -> dict[date, dict[str, Any]]:
+    latest: dict[date, dict[str, Any]] = {}
+    for day, payload in _iter_historical_journal_records(path, spec):
+        if payload.get("cache_key") == cache_key:
+            latest[day] = payload
+    return latest
+
+
+def _validated_historical_failed_receipts(
+    output_dir: Path,
+    spec: DatasetSpec,
+    allowed_dates: set[date],
+) -> list[tuple[date, dict[str, Any], Path]]:
+    """Return journal- and content-verified failed receipts for reparsing."""
+
+    expected_parent = (output_dir / "raw_failures" / spec.name).resolve()
+    candidates: dict[date, tuple[dict[str, Any], Path]] = {}
+    journal_path = _historical_journal_path(output_dir, spec)
+    for day, payload in _iter_historical_journal_records(journal_path, spec):
+        if day not in allowed_dates:
+            continue
+        if (
+            payload.get("status") != "failed"
+            or payload.get("source") != "network"
+            or payload.get("source_unavailable_reason") is not None
+            or not str(payload.get("error") or "").strip()
+        ):
+            continue
+        try:
+            if int(payload.get("rows", -1)) != 0 or int(
+                payload.get("http_status", -1)
+            ) != 200:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        expected_url, _response_kind = _historical_request_info(spec, day)
+        allowed_urls = [expected_url]
+        fallback_url = _historical_response_fallback_url(spec, expected_url)
+        if fallback_url is not None:
+            allowed_urls.append(fallback_url)
+        actual_url = str(payload.get("url") or "")
+        if not any(
+            _historical_urls_match_receipt(actual_url, candidate_url)
+            for candidate_url in allowed_urls
+        ):
+            continue
+
+        raw_path_value = payload.get("raw_path")
+        if not raw_path_value:
+            continue
+        raw_path = Path(str(raw_path_value))
+        if not raw_path.is_absolute():
+            raw_path = output_dir / raw_path
+        try:
+            raw_path = raw_path.resolve()
+        except OSError:
+            continue
+        if raw_path.parent != expected_parent or not raw_path.is_file():
+            continue
+        filename_match = re.fullmatch(
+            rf"{re.escape(day.isoformat())}\.([0-9a-f]{{16}})\.(html|json|bin)",
+            raw_path.name,
+        )
+        if filename_match is None:
+            continue
+        try:
+            content = raw_path.read_bytes()
+            raw_size = int(payload.get("raw_size", -1))
+            content_length = int(payload.get("content_length", -1))
+        except (OSError, TypeError, ValueError):
+            continue
+        digest = hashlib.sha256(content).hexdigest()
+        if (
+            raw_size != len(content)
+            or content_length != len(content)
+            or payload.get("raw_sha256") != digest
+            or payload.get("body_sha256") != digest
+            or filename_match.group(1) != digest[:16]
+        ):
+            continue
+        candidates[day] = (payload, raw_path)
+    return [
+        (day, *candidates[day])
+        for day in sorted(candidates)
+    ]
+
+
+def _known_source_unavailable_reason(
+    spec: DatasetSpec,
+    day: date,
+) -> str | None:
+    for range_start, range_end, reason in TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES.get(
+        spec.name,
+        (),
+    ):
+        if range_start <= day <= range_end:
+            return reason
+    return None
+
+
+def _known_source_unavailable_range_summaries(
+    spec: DatasetSpec,
+    start: date,
+    end: date,
+    *,
+    confirmed_dates: set[date] | None = None,
+    expected_dates: set[date] | None = None,
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    confirmed = confirmed_dates or set()
+    expected = expected_dates or set()
+    for range_start, range_end, reason in TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES.get(
+        spec.name,
+        (),
+    ):
+        selected_start = max(start, range_start)
+        selected_end = min(end, range_end)
+        if selected_start > selected_end:
+            continue
+        summaries.append(
+            {
+                "start": selected_start.isoformat(),
+                "end": selected_end.isoformat(),
+                "reason": reason,
+                "confirmed_dates": sum(
+                    selected_start <= day <= selected_end for day in confirmed
+                ),
+                "expected_session_dates": sum(
+                    selected_start <= day <= selected_end for day in expected
+                ),
+            }
+        )
+    return summaries
+
+
+def _historical_urls_match_receipt(actual_url: str, expected_url: str) -> bool:
+    try:
+        actual = urlparse(actual_url)
+        expected = urlparse(expected_url)
+        actual_query = sorted(
+            (key, value)
+            for key, value in parse_qsl(actual.query, keep_blank_values=True)
+            if key != "_"
+        )
+        expected_query = sorted(
+            (key, value)
+            for key, value in parse_qsl(expected.query, keep_blank_values=True)
+            if key != "_"
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        actual.scheme.lower(),
+        actual.netloc.lower(),
+        actual.path,
+        actual_query,
+    ) == (
+        expected.scheme.lower(),
+        expected.netloc.lower(),
+        expected.path,
+        expected_query,
+    )
+
+
+def _source_unavailable_content_is_explicit_no_data(
+    spec: DatasetSpec,
+    day: date,
+    content: bytes,
+) -> bool:
+    if not content:
+        return False
+    try:
+        decoded, _ = _decode_bytes(content)
+        payload = json.loads(decoded)
+        if not isinstance(payload, dict):
+            return False
+        _validate_json_historical_response_date(payload, spec, day)
+        explicit_no_data = _json_payload_explicitly_reports_no_data(
+            payload
+        ) or _json_payload_has_structured_empty_table(payload, spec)
+        if not explicit_no_data or _json_payload_status_error(payload) is not None:
+            return False
+        frame = _normalize_historical_frame(
+            spec,
+            _parse_json_table_payload(payload, spec, day),
+        )
+        return frame.is_empty()
+    except Exception:
+        return False
+
+
+def _source_unavailable_receipt_path(
+    output_dir: Path,
+    spec: DatasetSpec,
+    raw_path_value: Any,
+) -> Path | None:
+    if not raw_path_value:
+        return None
+    candidate = Path(str(raw_path_value))
+    if not candidate.is_absolute():
+        candidate = output_dir / candidate
+    try:
+        resolved = candidate.resolve()
+        expected_parent = (output_dir / "raw_empty" / spec.name).resolve()
+    except OSError:
+        return None
+    if resolved.parent != expected_parent or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _source_unavailable_receipt_payload_is_valid(
+    output_dir: Path,
+    spec: DatasetSpec,
+    day: date,
+    payload: dict[str, Any],
+) -> bool:
+    reason = _known_source_unavailable_reason(spec, day)
+    if reason is None or payload.get("source_unavailable_reason") != reason:
+        return False
+    try:
+        if int(payload.get("http_status", -1)) != 200:
+            return False
+    except (TypeError, ValueError):
+        return False
+    expected_url, response_kind = _historical_request_info(spec, day)
+    if response_kind != "json" or not _historical_urls_match_receipt(
+        str(payload.get("url", "")),
+        expected_url,
+    ):
+        return False
+    raw_path = _source_unavailable_receipt_path(
+        output_dir,
+        spec,
+        payload.get("raw_path"),
+    )
+    if raw_path is None:
+        return False
+    try:
+        content = raw_path.read_bytes()
+        raw_size = int(payload.get("raw_size", -1))
+        content_length = int(payload.get("content_length", -1))
+    except (OSError, TypeError, ValueError):
+        return False
+    digest = hashlib.sha256(content).hexdigest()
+    if (
+        raw_size != len(content)
+        or content_length != len(content)
+        or payload.get("raw_sha256") != digest
+        or payload.get("body_sha256") != digest
+    ):
+        return False
+    return _source_unavailable_content_is_explicit_no_data(
+        spec,
+        day,
+        content,
+    )
+
+
+def _validated_source_unavailable_receipt_dates(
+    output_dir: Path,
+    spec: DatasetSpec,
+    allowed_dates: set[date],
+) -> set[date]:
+    if spec.name not in TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES:
+        return set()
+    latest = _load_historical_journal_latest(
+        _historical_journal_path(output_dir, spec),
+        spec,
+        _historical_resume_cache_key(spec),
+    )
+    return {
+        day
+        for day, payload in latest.items()
+        if day in allowed_dates
+        and payload.get("status") == "empty"
+        and _source_unavailable_receipt_payload_is_valid(
+            output_dir,
+            spec,
+            day,
+            payload,
+        )
+    }
+
+
+def _source_unavailable_result_receipt_is_valid(
+    output_dir: Path,
+    spec: DatasetSpec,
+    result: HistoricalDateResult,
+) -> bool:
+    raw_path = Path(result.raw_path) if result.raw_path else None
+    if raw_path is None:
+        return False
+    # Download commands commonly receive a stage-relative ``--output-dir``.
+    # In that case _write_immutable_raw() returns a cwd-relative path that
+    # already contains the output directory. Treating it as relative to
+    # output_dir a second time would produce ``stage/stage/raw_empty/...`` and
+    # incorrectly journal a verified known-gap receipt as failed. Normalize
+    # the existing path to absolute before the confined receipt validator.
+    if not raw_path.is_absolute():
+        if raw_path.is_file():
+            raw_path = raw_path.resolve()
+        else:
+            candidate = output_dir / raw_path
+            if candidate.is_file():
+                raw_path = candidate.resolve()
+    if not raw_path.is_file():
+        return False
+    try:
+        content = raw_path.read_bytes()
+    except OSError:
+        return False
+    digest = hashlib.sha256(content).hexdigest()
+    return _source_unavailable_receipt_payload_is_valid(
+        output_dir,
+        spec,
+        result.day,
+        {
+            "source_unavailable_reason": result.source_unavailable_reason,
+            "http_status": result.http_status,
+            "url": result.url,
+            "raw_path": str(raw_path),
+            "raw_size": len(content),
+            "content_length": result.content_length,
+            "raw_sha256": digest,
+            "body_sha256": result.body_sha256,
+        },
+    )
 
 
 def _load_coverage_state(path: Path, spec: DatasetSpec) -> dict[str, Any]:
@@ -850,7 +1605,9 @@ def _suspicious_ohlcv_dates(
     spec: DatasetSpec,
     counts: dict[date, int],
 ) -> tuple[set[date], list[str]]:
-    required = OHLCV_REQUIRED_COLUMNS.get(spec.name)
+    required = OHLCV_REQUIRED_COLUMNS.get(spec.name) or HISTORICAL_REQUIRED_COLUMNS.get(
+        spec.name
+    )
     if not required or not path.exists() or not counts:
         return set(), []
     schema = set(pq.read_schema(path).names)
@@ -860,7 +1617,7 @@ def _suspicious_ohlcv_dates(
 
     suspicious: set[date] = set()
     issues: list[str] = []
-    symbol_column = OHLCV_SYMBOL_COLUMNS[spec.name]
+    symbol_column = HISTORICAL_SYMBOL_COLUMNS[spec.name]
     duplicate_dates = (
         pl.scan_parquet(path)
         .select(
@@ -883,6 +1640,9 @@ def _suspicious_ohlcv_dates(
     if suspicious:
         issues.append(f"duplicate_symbol_dates={len(suspicious)}")
 
+    if spec.name not in OHLCV_REQUIRED_COLUMNS:
+        return suspicious, issues
+
     def number(column: str) -> pl.Expr:
         return (
             pl.col(column)
@@ -893,6 +1653,44 @@ def _suspicious_ohlcv_dates(
         )
 
     volume_column, open_column, high_column, low_column, close_column = required[1:]
+    has_tpex_average_evidence = spec.name == "tpex_daily_ohlcv" and {
+        "均價",
+        "成交金額(元)",
+    }.issubset(schema)
+    # Legacy TPEx daily reports use O=H=L=0 as an explicit unavailable K-line
+    # sentinel for a small number of rows that still have an official positive
+    # close and volume.  It is not a corrupt date: the raw archive remains
+    # unchanged, while the downstream per-symbol builder records and converts
+    # this exact sentinel to a flat bar at the same official close.
+    legacy_tpex_zero_ohlc = (
+        (
+            pl.all_horizontal(
+                pl.col("_open") == 0.0,
+                pl.col("_high") == 0.0,
+                pl.col("_low") == 0.0,
+            )
+            & pl.col("_close").is_not_null()
+            & (pl.col("_close") > 0.0)
+        )
+        | (
+            pl.all_horizontal(
+                pl.col("_open") == 0.0,
+                pl.col("_high") == 0.0,
+                pl.col("_low") == 0.0,
+                pl.col("_close") == 0.0,
+            )
+            & (pl.col("_volume") > 0.0)
+            & (pl.col("_average") > 0.0)
+            & (pl.col("_amount") > 0.0)
+            & (
+                ((pl.col("_amount") / pl.col("_volume")) - pl.col("_average"))
+                .abs()
+                <= 0.011
+            )
+        )
+        if spec.name == "tpex_daily_ohlcv"
+        else pl.lit(False)
+    ).fill_null(False)
     invalid_bar_dates = (
         pl.scan_parquet(path)
         .select(
@@ -902,6 +1700,16 @@ def _suspicious_ohlcv_dates(
             number(high_column).alias("_high"),
             number(low_column).alias("_low"),
             number(close_column).alias("_close"),
+            (
+                number("均價")
+                if has_tpex_average_evidence
+                else pl.lit(None, dtype=pl.Float64)
+            ).alias("_average"),
+            (
+                number("成交金額(元)")
+                if has_tpex_average_evidence
+                else pl.lit(None, dtype=pl.Float64)
+            ).alias("_amount"),
         )
         .filter(
             (pl.col("_volume").is_not_null() & (pl.col("_volume") < 0.0))
@@ -913,6 +1721,7 @@ def _suspicious_ohlcv_dates(
                     pl.col("_close").is_not_null(),
                 )
                 & (pl.col("_volume").fill_null(0.0) > 0.0)
+                & ~legacy_tpex_zero_ohlc
                 & (
                     (pl.min_horizontal("_open", "_high", "_low", "_close") <= 0.0)
                     | (pl.col("_high") < pl.max_horizontal("_open", "_low", "_close"))
@@ -954,6 +1763,350 @@ def _historical_bounds(spec: DatasetSpec, args: argparse.Namespace) -> tuple[dat
     return start, end
 
 
+def _tpex_calendar_spec() -> DatasetSpec:
+    return next(
+        spec
+        for spec in HISTORICAL_DAILY_DATASETS
+        if spec.name == TPEX_OFFICIAL_CALENDAR_DATASET
+    )
+
+
+def _requires_strict_session_calendar(spec: DatasetSpec, args: argparse.Namespace) -> bool:
+    return spec.kind == "historical_json_table" and bool(
+        getattr(args, "require_taiex_session_calendar", False)
+    )
+
+
+def _uses_taiex_session_calendar(spec: DatasetSpec, args: argparse.Namespace) -> bool:
+    # TPEx feature histories deliberately remain downstream of the audited TPEx
+    # OHLCV session set. Every other historical source uses the receipt-bound
+    # official TAIEX actual-session archive directly in canonical strict mode.
+    return (
+        _requires_strict_session_calendar(spec, args)
+        and spec.name not in TPEX_SESSION_DEPENDENT_DATASETS
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stable_file_identity(path: Path) -> tuple[int, int, int, int]:
+    """Return mutation-relevant stat fields, deliberately excluding atime."""
+
+    stat = path.stat()
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+    )
+
+
+def _validated_taiex_session_dates(
+    output_dir: Path,
+    start: date,
+    end: date,
+) -> tuple[set[date], str]:
+    """Load a portable, receipt-verified TAIEX session calendar.
+
+    The monthly TAIEX downloader certifies coverage by requested month.  This
+    consumer additionally binds that certification to the exact canonical
+    parquet bytes before using its dates to decide which historical weekdays may
+    be skipped. A copied production tree remains valid because receipt paths are
+    deliberately tree-relative/basename based rather than tied to a stage root.
+    """
+
+    parquet_path = output_dir / f"{TAIEX_SESSION_CALENDAR_DATASET}.parquet"
+    summary_path = output_dir / f"{TAIEX_SESSION_CALENDAR_DATASET}.summary.json"
+    if not parquet_path.is_file() or not summary_path.is_file():
+        raise RuntimeError(
+            "strict historical coverage requires twse_taiex_ohlc.parquet and "
+            "twse_taiex_ohlc.summary.json; run the TAIEX monthly stage first"
+        )
+
+    parquet_stat = parquet_path.stat()
+    summary_stat = summary_path.stat()
+    parquet_identity = _stable_file_identity(parquet_path)
+    summary_identity = _stable_file_identity(summary_path)
+    parquet_sha256 = _file_sha256(parquet_path)
+    summary_sha256 = _file_sha256(summary_path)
+    if (
+        _stable_file_identity(parquet_path) != parquet_identity
+        or _stable_file_identity(summary_path) != summary_identity
+    ):
+        raise RuntimeError("TAIEX session calendar files changed during validation")
+    cache_key = (
+        str(parquet_path.resolve()),
+        int(parquet_stat.st_size),
+        int(parquet_stat.st_mtime_ns),
+        parquet_sha256,
+        int(summary_stat.st_size),
+        int(summary_stat.st_mtime_ns),
+        summary_sha256,
+    )
+    with _TAIEX_SESSION_CACHE_LOCK:
+        cached = _TAIEX_SESSION_CACHE.get(cache_key)
+
+    if cached is None:
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                f"TAIEX session calendar summary is unreadable: {summary_path}"
+            ) from exc
+        if not isinstance(summary, dict):
+            raise RuntimeError("TAIEX session calendar summary must be a JSON object")
+        if int(summary.get("schema_version", -1)) != TAIEX_SESSION_CALENDAR_SUMMARY_SCHEMA_VERSION:
+            raise RuntimeError("TAIEX session calendar summary schema_version is unsupported")
+        if summary.get("dataset") != TAIEX_SESSION_CALENDAR_DATASET:
+            raise RuntimeError("TAIEX session calendar summary names the wrong dataset")
+        if (
+            summary.get("coverage_complete") is not True
+            or summary.get("baseline_established") is not True
+            or summary.get("replacement_promoted") is not True
+            or int(summary.get("unresolved_month_count", -1)) != 0
+            or int(summary.get("failed_count", -1)) != 0
+        ):
+            raise RuntimeError(
+                "TAIEX session calendar requires a promoted, coverage-complete "
+                "baseline with no unresolved or failed months"
+            )
+        try:
+            coverage_start = _parse_date(str(summary.get("effective_start_date", ""))[:10])
+            coverage_end = _parse_date(str(summary.get("effective_end_date", ""))[:10])
+        except ValueError as exc:
+            raise RuntimeError("TAIEX session calendar summary has invalid coverage bounds") from exc
+        if coverage_start > coverage_end:
+            raise RuntimeError("TAIEX session calendar summary has reversed coverage bounds")
+
+        declared_canonical = Path(str(summary.get("canonical_path", "")))
+        if declared_canonical.name != parquet_path.name:
+            raise RuntimeError(
+                "TAIEX session calendar canonical_path does not name the expected parquet"
+            )
+        receipt = summary.get("output_receipt")
+        if not isinstance(receipt, dict):
+            raise RuntimeError("TAIEX session calendar summary has no output receipt")
+        receipt_path = Path(str(receipt.get("path", "")))
+        if receipt_path.name != parquet_path.name:
+            raise RuntimeError(
+                "TAIEX session calendar receipt does not name the expected parquet"
+            )
+        try:
+            receipt_size = int(receipt.get("size", -1))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("TAIEX session calendar receipt has an invalid size") from exc
+        receipt_sha256 = str(receipt.get("sha256", "")).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", receipt_sha256):
+            raise RuntimeError("TAIEX session calendar receipt has an invalid sha256")
+        if receipt_size != int(parquet_stat.st_size):
+            raise RuntimeError("TAIEX session calendar parquet size disagrees with its receipt")
+        if parquet_sha256 != receipt_sha256:
+            raise RuntimeError("TAIEX session calendar parquet sha256 disagrees with its receipt")
+
+        schema = set(pq.read_schema(parquet_path).names)
+        missing_columns = [
+            column
+            for column in TAIEX_SESSION_CALENDAR_REQUIRED_COLUMNS
+            if column not in schema
+        ]
+        if missing_columns:
+            raise RuntimeError(
+                "TAIEX session calendar parquet is missing required columns: "
+                + ", ".join(missing_columns)
+            )
+        calendar = pl.read_parquet(
+            parquet_path,
+            columns=list(TAIEX_SESSION_CALENDAR_REQUIRED_COLUMNS),
+        ).with_columns(pl.col("date").cast(pl.Date, strict=False))
+        if calendar.is_empty():
+            raise RuntimeError("TAIEX session calendar parquet has no rows")
+        if calendar.get_column("date").null_count():
+            raise RuntimeError("TAIEX session calendar parquet has invalid dates")
+        if calendar.get_column("date").n_unique() != calendar.height:
+            raise RuntimeError("TAIEX session calendar parquet has duplicate dates")
+        numeric_columns = [
+            pl.col(column).cast(pl.Float64, strict=False).alias(column)
+            for column in (
+                "opening_index",
+                "highest_index",
+                "lowest_index",
+                "closing_index",
+            )
+        ]
+        calendar = calendar.with_columns(numeric_columns)
+        invalid = calendar.filter(
+            pl.col("_dataset").is_null()
+            | (pl.col("_dataset") != TAIEX_SESSION_CALENDAR_DATASET)
+            | pl.col("_source").is_null()
+            | (pl.col("_source") != "TWSE")
+            | pl.col("_source_product").is_null()
+            | (pl.col("_source_product") != "indicesReport/MI_5MINS_HIST")
+            | pl.any_horizontal(
+                *[
+                    pl.col(column).is_null()
+                    | ~pl.col(column).is_finite()
+                    | (pl.col(column) <= 0.0)
+                    for column in (
+                        "opening_index",
+                        "highest_index",
+                        "lowest_index",
+                        "closing_index",
+                    )
+                ]
+            )
+            | (
+                pl.col("highest_index")
+                < pl.max_horizontal(
+                    "opening_index", "lowest_index", "closing_index"
+                )
+            )
+            | (
+                pl.col("lowest_index")
+                > pl.min_horizontal(
+                    "opening_index", "highest_index", "closing_index"
+                )
+            )
+        )
+        if not invalid.is_empty():
+            raise RuntimeError("TAIEX session calendar parquet has invalid data or provenance")
+        if int(summary.get("output_rows", -1)) != calendar.height:
+            raise RuntimeError("TAIEX session calendar row count disagrees with its summary")
+        cached = (
+            coverage_start,
+            coverage_end,
+            frozenset(calendar.get_column("date").to_list()),
+            receipt_sha256,
+        )
+        with _TAIEX_SESSION_CACHE_LOCK:
+            _TAIEX_SESSION_CACHE.clear()
+            _TAIEX_SESSION_CACHE[cache_key] = cached
+
+    coverage_start, coverage_end, sessions, receipt_sha256 = cached
+    if coverage_start > start or coverage_end < end:
+        raise RuntimeError(
+            "TAIEX session calendar does not cover the complete requested range: "
+            f"calendar={coverage_start.isoformat()}..{coverage_end.isoformat()} "
+            f"requested={start.isoformat()}..{end.isoformat()}"
+        )
+    return {day for day in sessions if start <= day <= end}, receipt_sha256
+
+
+def _validated_tpex_session_dates(
+    output_dir: Path,
+    start: date,
+    end: date,
+    *,
+    expected_taiex_sessions: set[date] | None = None,
+    expected_taiex_receipt: str | None = None,
+) -> set[date]:
+    """Return official TPEx sessions only after the OHLCV baseline passed audit."""
+
+    spec = _tpex_calendar_spec()
+    parquet_path = output_dir / f"{spec.name}.parquet"
+    state_path = _coverage_state_path(output_dir, spec)
+    if not parquet_path.is_file() or not state_path.is_file():
+        raise RuntimeError(
+            "TPEx feature history requires a completed tpex_daily_ohlcv baseline; "
+            "include tpex_daily_ohlcv in this run or rebuild it first"
+        )
+    parquet_stat = parquet_path.stat()
+    state_stat = state_path.stat()
+    cache_key = (
+        str(parquet_path.resolve()),
+        int(parquet_stat.st_size),
+        int(parquet_stat.st_mtime_ns),
+        int(state_stat.st_size),
+        int(state_stat.st_mtime_ns),
+    )
+    with _TPEX_SESSION_CACHE_LOCK:
+        cached = _TPEX_SESSION_CACHE.get(cache_key)
+    if cached is None:
+        state = _load_coverage_state(state_path, spec)
+        if not bool(state.get("baseline_established")) or not bool(
+            state.get("coverage_complete")
+        ):
+            raise RuntimeError(
+                "TPEx feature history requires tpex_daily_ohlcv coverage_complete=true"
+            )
+        try:
+            coverage_start = _parse_date(str(state.get("coverage_start", ""))[:10])
+            checked_through = _parse_date(str(state.get("checked_through", ""))[:10])
+        except ValueError as exc:
+            raise RuntimeError(
+                "tpex_daily_ohlcv coverage state has invalid calendar bounds"
+            ) from exc
+        counts, invalid_date_values = _existing_date_counts(parquet_path)
+        if invalid_date_values:
+            raise RuntimeError(
+                "tpex_daily_ohlcv calendar contains invalid date values: "
+                f"{len(invalid_date_values)}"
+            )
+        suspicious, issues = _suspicious_ohlcv_dates(parquet_path, spec, counts)
+        if suspicious or issues:
+            detail = "; ".join(issues) or f"suspicious_dates={len(suspicious)}"
+            raise RuntimeError(
+                "tpex_daily_ohlcv cannot be trusted as the TPEx calendar: " + detail
+            )
+        cached = (
+            coverage_start,
+            checked_through,
+            frozenset(counts),
+            (
+                str(state.get("coverage_calendar_source"))
+                if state.get("coverage_calendar_source") is not None
+                else None
+            ),
+            (
+                str(state.get("coverage_calendar_sha256"))
+                if state.get("coverage_calendar_sha256") is not None
+                else None
+            ),
+        )
+        with _TPEX_SESSION_CACHE_LOCK:
+            _TPEX_SESSION_CACHE.clear()
+            _TPEX_SESSION_CACHE[cache_key] = cached
+
+    (
+        coverage_start,
+        checked_through,
+        sessions,
+        calendar_source,
+        calendar_sha256,
+    ) = cached
+    if coverage_start > start or checked_through < end:
+        raise RuntimeError(
+            "tpex_daily_ohlcv calendar does not cover requested TPEx feature range: "
+            f"calendar={coverage_start.isoformat()}..{checked_through.isoformat()} "
+            f"requested={start.isoformat()}..{end.isoformat()}"
+        )
+    selected = {day for day in sessions if start <= day <= end}
+    if expected_taiex_sessions is not None:
+        if calendar_source != TAIEX_SESSION_CALENDAR_DATASET:
+            raise RuntimeError(
+                "strict TPEx feature history requires a tpex_daily_ohlcv baseline "
+                "built from the verified TAIEX session calendar"
+            )
+        if not expected_taiex_receipt or calendar_sha256 != expected_taiex_receipt:
+            raise RuntimeError(
+                "tpex_daily_ohlcv session-calendar receipt is stale or disagrees "
+                "with the current TAIEX archive"
+            )
+        if selected != expected_taiex_sessions:
+            missing = expected_taiex_sessions - selected
+            unexpected = selected - expected_taiex_sessions
+            raise RuntimeError(
+                "audited TPEx OHLCV sessions disagree with the verified TAIEX "
+                f"calendar: missing={len(missing)} unexpected={len(unexpected)}"
+            )
+    return selected
+
+
 def _plan_historical_download(
     spec: DatasetSpec,
     args: argparse.Namespace,
@@ -961,11 +2114,47 @@ def _plan_historical_download(
 ) -> HistoricalDownloadPlan:
     mode = _canonical_mode(args.mode)
     start, end = _historical_bounds(spec, args)
-    all_weekdays = set(_iter_dates(start, end, include_weekends=bool(args.include_weekends))
-    )
+    taiex_calendar_receipt: str | None = None
+    if spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
+        expected_taiex_sessions: set[date] | None = None
+        if _requires_strict_session_calendar(spec, args):
+            expected_taiex_sessions, taiex_calendar_receipt = (
+                _validated_taiex_session_dates(output_dir, start, end)
+            )
+        all_weekdays = _validated_tpex_session_dates(
+            output_dir,
+            start,
+            end,
+            expected_taiex_sessions=expected_taiex_sessions,
+            expected_taiex_receipt=taiex_calendar_receipt,
+        )
+    elif _uses_taiex_session_calendar(spec, args):
+        all_weekdays, taiex_calendar_receipt = _validated_taiex_session_dates(
+            output_dir,
+            start,
+            end,
+        )
+    else:
+        all_weekdays = set(
+            _iter_dates(
+                start,
+                end,
+                include_weekends=bool(args.include_weekends),
+            )
+        )
     parquet_path = output_dir / f"{spec.name}.parquet"
     state_path = _coverage_state_path(output_dir, spec)
     state = _load_coverage_state(state_path, spec)
+    if _uses_taiex_session_calendar(spec, args):
+        state["coverage_calendar_source"] = TAIEX_SESSION_CALENDAR_DATASET
+        state["coverage_calendar_kind"] = "receipt_verified_official_open_sessions"
+        state["coverage_calendar_sha256"] = taiex_calendar_receipt
+    elif spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
+        state["coverage_calendar_source"] = TPEX_OFFICIAL_CALENDAR_DATASET
+        state["coverage_calendar_kind"] = "validated_official_open_sessions"
+        if taiex_calendar_receipt is not None:
+            state["root_coverage_calendar_source"] = TAIEX_SESSION_CALENDAR_DATASET
+            state["root_coverage_calendar_sha256"] = taiex_calendar_receipt
     replace_output = mode == "rebuild" or bool(args.refresh)
 
     try:
@@ -977,8 +2166,32 @@ def _plan_historical_download(
             ) from exc
         counts, invalid_date_values = {}, [f"unreadable:{type(exc).__name__}:{exc}"]
         replace_output = True
+    if _requires_strict_session_calendar(spec, args):
+        existing_in_range = {
+            day for day in counts if start <= day <= end
+        }
+        calendar_disagreement = existing_in_range - all_weekdays
+        if calendar_disagreement:
+            examples = ", ".join(
+                day.isoformat() for day in sorted(calendar_disagreement)[:5]
+            )
+            raise RuntimeError(
+                f"{spec.name} canonical dates disagree with its verified "
+                f"session calendar: count={len(calendar_disagreement)} "
+                f"examples={examples}"
+            )
     existing_dates = set(counts) & all_weekdays
     confirmed_empty = _state_date_set(state, "confirmed_empty_dates") & all_weekdays
+    if _requires_strict_session_calendar(spec, args):
+        # A validated session is expected to contain the requested official
+        # report. The only reusable empties are individually receipt-verified
+        # dates inside a declared official endpoint archive gap. Empty outcomes
+        # from older weekday-based runs are never trusted as holidays.
+        confirmed_empty = _validated_source_unavailable_receipt_dates(
+            output_dir,
+            spec,
+            all_weekdays,
+        )
     unresolved_failed = _state_failed_date_set(state) & all_weekdays
     try:
         suspicious_dates, suspicious_issues = _suspicious_ohlcv_dates(
@@ -1025,21 +2238,13 @@ def _plan_historical_download(
         gap_start = max(start, checked_through + timedelta(days=1))
         requested_start = min(overlap_start, gap_start)
         requested = sorted(
-            set(
-                _iter_dates(
-                    requested_start,
-                    end,
-                    include_weekends=bool(args.include_weekends),
-                )
-            )
+            {day for day in all_weekdays if day >= requested_start}
             | unresolved_failed
         )
         missing_before = set(requested) - existing_dates - confirmed_empty
     else:
         raise ValueError(f"unsupported download mode: {mode}")
 
-    if args.max_dates is not None:
-        requested = requested[: max(0, int(args.max_dates))]
     state["last_plan_issues"] = suspicious_issues
     return HistoricalDownloadPlan(
         start=start,
@@ -1080,6 +2285,187 @@ def _json_payload_status_error(payload: Any) -> str | None:
     return status
 
 
+def _text_explicitly_reports_no_data(value: Any) -> bool:
+    lowered = _strip_html(value).strip().lower()
+    return bool(lowered) and any(marker in lowered for marker in NO_DATA_STATUS_MARKERS)
+
+
+def _json_payload_explicitly_reports_no_data(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    raw_status = payload.get("stat", payload.get("status", ""))
+    return _text_explicitly_reports_no_data(raw_status)
+
+
+def _declared_dates_from_text(value: Any) -> set[date]:
+    text = _strip_html(value)
+    declared: set[date] = set()
+    compact = text.strip()
+    if re.fullmatch(r"\d{8}", compact):
+        try:
+            declared.add(datetime.strptime(compact, "%Y%m%d").date())
+        except ValueError:
+            pass
+    for raw_year, raw_month, raw_day in re.findall(
+        r"(?<!\d)(\d{2,4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+        text,
+    ):
+        try:
+            year = int(raw_year)
+            if year < 1911:
+                year += 1911
+            declared.add(date(year, int(raw_month), int(raw_day)))
+        except ValueError:
+            continue
+    return declared
+
+
+def _json_payload_declared_dates(payload: Any) -> set[date]:
+    if not isinstance(payload, dict):
+        return set()
+    declared = _declared_dates_from_text(payload.get("date", ""))
+    declared.update(_declared_dates_from_text(payload.get("title", "")))
+    for table in payload.get("tables") or []:
+        if isinstance(table, dict):
+            declared.update(_declared_dates_from_text(table.get("title", "")))
+    return declared
+
+
+def _validate_json_historical_response_date(
+    payload: Any,
+    spec: DatasetSpec,
+    requested_day: date,
+) -> None:
+    relevant_table_dates: set[date] = set()
+    if isinstance(payload, dict):
+        for table in payload.get("tables") or []:
+            if not isinstance(table, dict):
+                continue
+            title = _strip_html(table.get("title", payload.get("title", "")))
+            if _table_matches(spec.table_mode, title):
+                relevant_table_dates.update(_declared_dates_from_text(title))
+
+    strict_twse_mi_index_binding = spec.name in {
+        "twse_daily_ohlcv",
+        "twse_market_index",
+    }
+    if strict_twse_mi_index_binding:
+        if not relevant_table_dates:
+            raise HistoricalResponseError(
+                f"official response selected table declares no date for {spec.name}"
+            )
+        _validate_historical_response_date(
+            spec,
+            requested_day,
+            relevant_table_dates,
+        )
+
+        # TWSE has returned MI_INDEX bodies whose selected-table title was
+        # rewritten to the request day while payload.date and every data row
+        # came from another session. The top-level date is therefore an
+        # independent mandatory identity check, not a declaration to ignore.
+        top_level_dates = (
+            _declared_dates_from_text(payload.get("date", ""))
+            if isinstance(payload, dict)
+            else set()
+        )
+        if not top_level_dates:
+            raise HistoricalResponseError(
+                f"official response top-level payload.date is missing for {spec.name}"
+            )
+        _validate_historical_response_date(
+            spec,
+            requested_day,
+            top_level_dates,
+        )
+
+        raw_params = payload.get("params") if isinstance(payload, dict) else None
+        if isinstance(raw_params, dict) and "date" in raw_params:
+            parameter_dates = _declared_dates_from_text(raw_params.get("date", ""))
+            if not parameter_dates:
+                raise HistoricalResponseError(
+                    f"official response params.date is invalid for {spec.name}"
+                )
+            _validate_historical_response_date(
+                spec,
+                requested_day,
+                parameter_dates,
+            )
+        return
+
+    if relevant_table_dates:
+        # For other historical products, the selected table is the declaration
+        # actually parsed into the dataset. Keep their contracts scoped until
+        # equivalent independent evidence supports a stricter identity rule.
+        _validate_historical_response_date(
+            spec,
+            requested_day,
+            relevant_table_dates,
+        )
+        return
+
+    _validate_historical_response_date(
+        spec,
+        requested_day,
+        _json_payload_declared_dates(payload),
+    )
+
+
+def _json_payload_has_structured_empty_table(
+    payload: Any,
+    spec: DatasetSpec,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    candidates: list[dict[str, Any]] = [payload]
+    candidates.extend(
+        table for table in (payload.get("tables") or []) if isinstance(table, dict)
+    )
+    for table in candidates:
+        fields = table.get("fields")
+        data = table.get("data")
+        title = _strip_html(table.get("title", payload.get("title", "")))
+        if not isinstance(fields, list) or not fields:
+            continue
+        if not isinstance(data, list) or data:
+            continue
+        if _table_matches(spec.table_mode, title):
+            return True
+    return False
+
+
+def _validate_historical_response_date(
+    spec: DatasetSpec,
+    requested_day: date,
+    declared_dates: set[date],
+) -> None:
+    mismatched = sorted(day for day in declared_dates if day != requested_day)
+    if mismatched:
+        raise HistoricalResponseError(
+            f"official response date mismatch for {spec.name}: "
+            f"requested={requested_day.isoformat()} "
+            f"declared={','.join(day.isoformat() for day in sorted(declared_dates))}"
+        )
+
+
+def _global_tw_public_rate_limiter() -> SharedRateLimiter:
+    global _RATE_LIMITER
+    if _RATE_LIMITER is None:
+        with _RATE_LIMITER_LOCK:
+            if _RATE_LIMITER is None:
+                interval = resolve_request_interval("tw_public", None)
+                _RATE_LIMITER = SharedRateLimiter(interval, name="tw_public")
+    return _RATE_LIMITER
+
+
+def _configure_tw_public_rate_limiter(requested_interval: float | None) -> float:
+    global _RATE_LIMITER
+    interval = resolve_request_interval("tw_public", requested_interval)
+    with _RATE_LIMITER_LOCK:
+        _RATE_LIMITER = SharedRateLimiter(interval, name="tw_public")
+    return interval
+
+
 def _http_get(
     url: str,
     *,
@@ -1088,6 +2474,7 @@ def _http_get(
     params: dict[str, str] | None = None,
     retries: int = 3,
     retry_backoff: float = 1.0,
+    retry_security_blocks: bool = True,
 ) -> requests.Response:
     headers = {
         "User-Agent": USER_AGENT,
@@ -1097,10 +2484,23 @@ def _http_get(
         "X-Requested-With": "XMLHttpRequest",
     }
     retry_count = max(0, int(retries))
-    # TWSE's edge returns a location-less 307 when its request-rate guard trips.
-    # Treat it as throttling rather than a permanent dataset failure.
+    # TWSE's edge can return a location-less 307 when its rate guard trips.
+    # It is a retryable throttle response, not a successful redirect.
     transient_statuses = {307, 403, 408, 429, 500, 502, 503, 504}
     last_error: requests.exceptions.RequestException | None = None
+    network_attempts = 0
+
+    def annotate_attempts(response: requests.Response) -> requests.Response:
+        try:
+            setattr(response, "_stockagent_response_attempts", network_attempts)
+        except Exception:
+            pass
+        return response
+
+    def close_response(response: requests.Response) -> None:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
     def request_once(session: requests.Session, *, verify: bool) -> requests.Response:
         started = time.monotonic()
@@ -1112,62 +2512,111 @@ def _http_get(
             verify=verify,
             stream=True,
         )
+        iter_content = getattr(response, "iter_content", None)
+        if not callable(iter_content):
+            return response
         try:
             chunks: list[bytes] = []
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
+            for chunk in iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     chunks.append(chunk)
                 if time.monotonic() - started > timeout:
                     raise requests.exceptions.Timeout(
-                        f"response exceeded {timeout}s wall timeout: {response.url}"
+                        f"response exceeded {timeout}s wall timeout: "
+                        f"{getattr(response, 'url', url)}"
                     )
             response._content = b"".join(chunks)
             response._content_consumed = True
             return response
         except BaseException:
-            response.close()
+            close_response(response)
             raise
 
     for attempt in range(retry_count + 1):
         try:
-            if _RATE_LIMITER is not None:
-                _RATE_LIMITER.wait()
+            limiter = _global_tw_public_rate_limiter()
+            limiter.wait()
             session = _http_session()
             try:
+                network_attempts += 1
                 response = request_once(session, verify=verify_ssl)
             except requests.exceptions.SSLError:
                 if not verify_ssl:
                     raise
                 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+                limiter.wait()
+                network_attempts += 1
                 response = request_once(session, verify=False)
+            security_block = _response_is_tw_public_security_block(response)
+            if security_block:
+                delay = _retry_delay_seconds(response, attempt, retry_backoff)
+                limiter.defer(delay)
+                time.sleep(delay)
+                if not retry_security_blocks or attempt >= retry_count:
+                    return annotate_attempts(response)
+                close_response(response)
+                continue
             if response.status_code in transient_statuses and attempt < retry_count:
-                response.close()
-                time.sleep(_retry_delay_seconds(response, attempt, retry_backoff))
+                delay = _retry_delay_seconds(response, attempt, retry_backoff)
+                limiter.defer(delay)
+                time.sleep(delay)
+                close_response(response)
                 continue
             response.raise_for_status()
-            return response
+            return annotate_attempts(response)
         except requests.exceptions.RequestException as exc:
             last_error = exc
             if attempt >= retry_count:
+                try:
+                    setattr(exc, "_stockagent_response_attempts", network_attempts)
+                except Exception:
+                    pass
                 raise
-            time.sleep(_retry_delay_seconds(None, attempt, retry_backoff))
+            delay = _retry_delay_seconds(None, attempt, retry_backoff)
+            _global_tw_public_rate_limiter().defer(delay)
+            time.sleep(delay)
 
     if last_error is not None:
+        try:
+            setattr(last_error, "_stockagent_response_attempts", network_attempts)
+        except Exception:
+            pass
         raise last_error
     raise RuntimeError(f"HTTP request failed without response: {url}")
 
 
 def _retry_delay_seconds(response: requests.Response | None, attempt: int, retry_backoff: float) -> float:
+    retry_after_seconds: float | None = None
     if response is not None:
         retry_after = response.headers.get("Retry-After")
         if retry_after:
             try:
-                return min(60.0, max(0.0, float(retry_after)))
+                retry_after_seconds = max(0.0, float(retry_after))
             except ValueError:
                 pass
+        if _response_is_tw_public_security_block(response):
+            return max(
+                TW_PUBLIC_WAF_COOLDOWN_SECONDS,
+                retry_after_seconds or 0.0,
+                max(0.0, float(retry_backoff)) * (2**attempt),
+            )
+        if retry_after_seconds is not None:
+            return min(60.0, retry_after_seconds)
         if response.status_code == 307 and not response.headers.get("Location"):
             return min(120.0, 30.0 * (2**attempt))
     return max(0.0, float(retry_backoff)) * (2**attempt)
+
+
+def _response_is_tw_public_security_block(response: requests.Response) -> bool:
+    if int(response.status_code) not in {307, 403}:
+        return False
+    content = bytes(getattr(response, "content", b""))[:4096]
+    text = content.decode("utf-8", errors="ignore").lower()
+    return (
+        "for security reasons" in text
+        or "page can not be accessed" in text
+        or "安全性考量" in text
+    )
 
 
 def _decode_bytes(raw: bytes) -> tuple[str, str]:
@@ -1177,6 +2626,32 @@ def _decode_bytes(raw: bytes) -> tuple[str, str]:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace"), "utf-8-replace"
+
+
+def _decode_tpex_archive_html(raw: bytes) -> str:
+    # The official archive is Big5/CP950. Mixing an edge-injected UTF-8 script
+    # or replacement bytes into the receipt destroys names and numeric cells;
+    # fail closed so resume refetches the immutable date instead of persisting
+    # mojibake or U+FFFD into a parser-versioned partial.
+    try:
+        return raw.decode("cp950")
+    except UnicodeDecodeError as exc:
+        raise HistoricalResponseError(
+            "official TPEx archive contains lossy Unicode replacement markers"
+        ) from exc
+
+
+def _decode_tpex_daily_archive_html(raw: bytes) -> tuple[str, bool]:
+    """Decode legacy quotes while isolating narrowly evidenced permanent damage."""
+
+    try:
+        return raw.decode("cp950"), b"\xef\xbf\xbd" in raw
+    except UnicodeDecodeError:
+        # A fixed set of official 2004 receipts permanently contains replacement
+        # bytes in security names and a few byte-pattern-recoverable labels.
+        # Symbols, quote values, and every unknown damaged token are validated
+        # separately before acceptance.
+        return raw.decode("cp950", errors="replace"), True
 
 
 def _frame_from_records(records: list[dict[str, Any]]) -> pl.DataFrame:
@@ -1244,7 +2719,7 @@ def _parse_json_table_payload(payload: Any, spec: DatasetSpec, request_date: dat
     data = payload.get("data")
     if isinstance(fields, list) and isinstance(data, list):
         rows = _records_from_fields_data(
-            fields=fields,
+            fields=_normalize_historical_json_fields(spec, fields),
             data=data,
             iso_date=iso_date,
             table_title=title,
@@ -1268,7 +2743,7 @@ def _parse_json_table_payload(payload: Any, spec: DatasetSpec, request_date: dat
             continue
         records.extend(
             _records_from_fields_data(
-                fields=table_fields,
+                fields=_normalize_historical_json_fields(spec, table_fields),
                 data=table_data,
                 iso_date=iso_date,
                 table_title=table_title,
@@ -1278,7 +2753,71 @@ def _parse_json_table_payload(payload: Any, spec: DatasetSpec, request_date: dat
     return _frame_from_records(records)
 
 
-def _parse_tpex_daily_quotes_html(raw_html: str, request_date: date) -> pl.DataFrame:
+def _normalize_historical_json_fields(
+    spec: DatasetSpec,
+    fields: list[Any],
+) -> list[Any]:
+    stripped = tuple(_strip_html(field) for field in fields)
+    if (
+        spec.name == "tpex_institutional_trades"
+        and stripped == TPEX_INSTITUTIONAL_GROUPED_SOURCE_FIELDS
+    ):
+        return list(TPEX_INSTITUTIONAL_GROUPED_CANONICAL_FIELDS)
+    return fields
+
+
+def _normalize_tpex_price_cell(value: str) -> str:
+    # TPEx decorated prices at the upper/lower limit with several generations
+    # of glyphs.  The glyph is metadata, not part of the numeric price.
+    return re.sub(r"^[♁☉⊕⊙]\s*", "", str(value).strip())
+
+
+def _tpex_split_change(direction: str, magnitude: str) -> str:
+    direction = str(direction).strip()
+    magnitude = str(magnitude).strip()
+    if direction in {"▽", "-"}:
+        return f"-{magnitude}"
+    if direction in {"△", "+"}:
+        return f"+{magnitude}"
+    return magnitude
+
+
+def _tpex_quote_row_numeric_cell_count(cells: list[str]) -> int:
+    count = 0
+    for value in cells:
+        normalized = re.sub(r"[\s,]", "", _normalize_tpex_price_cell(value))
+        try:
+            float(normalized)
+        except (TypeError, ValueError):
+            continue
+        count += 1
+    return count
+
+
+def _tpex_name_has_decode_damage(value: str) -> bool:
+    text = str(value)
+    return "\ufffd" in text or "ï¿½" in text or "嚙" in text
+
+
+TPEX_DAMAGED_CHANGE_RECOVERY = {
+    # These exact renderings retain distinct surviving CP950 byte patterns.
+    # In particular, ASCII 0x76 ("v") uniquely distinguishes 權 in the two
+    # affected labels; this is a byte-level recovery, not a price-based guess.
+    "嚙踝蕭嚙緞": "除權",
+    "嚙踝蕭嚙踝蕭": "除息",
+    "嚙踝蕭嚙緞嚙踝蕭": "除權息",
+}
+TPEX_CHANGE_RECOVERY_STATUS = (
+    "official_receipt_change_recovered_from_cp950_byte_pattern"
+)
+
+
+def _parse_tpex_daily_quotes_html(
+    raw_html: str,
+    request_date: date,
+    *,
+    lossy_name_receipt: bool = False,
+) -> pl.DataFrame:
     records: list[dict[str, str]] = []
     for raw_row in HTML_ROW_START_PATTERN.split(raw_html)[1:]:
         raw_row = raw_row.split("</tr>", 1)[0]
@@ -1286,47 +2825,255 @@ def _parse_tpex_daily_quotes_html(raw_html: str, request_date: date) -> pl.DataF
             _strip_html(value)
             for value in HTML_CELL_START_PATTERN.split(raw_row)[1:]
         ]
-        if len(cells) >= 27 and re.fullmatch(r"[0-9A-Z]{4,6}", cells[1].upper()):
+        width = len(cells)
+        expected_code_index = 1 if width == 27 else 0
+        supported_width = width in {17, 18, 19, 26, 27}
+        looks_like_quote = _tpex_quote_row_numeric_cell_count(cells) >= 5
+        if looks_like_quote and not supported_width:
+            raise HistoricalResponseError(
+                f"legacy TPEx daily quote row has unsupported width={width}"
+            )
+        if supported_width and looks_like_quote:
+            candidate_code = cells[expected_code_index].strip().upper()
+            if re.fullmatch(r"[0-9A-Z]{4,6}", candidate_code) is None:
+                raise HistoricalResponseError(
+                    "legacy TPEx daily quote row has a malformed security code: "
+                    f"{candidate_code!r}"
+                )
+
+        if width == 27 and re.fullmatch(r"[0-9A-Z]{4,6}", cells[1].upper()):
             code, name = cells[1], cells[3]
-            close, change, open_price, high, low, volume = (
+            (
+                close,
+                change,
+                open_price,
+                high,
+                low,
+                average,
+                volume,
+                amount,
+                trades,
+                last_bid,
+                last_ask,
+            ) = (
                 cells[5],
                 cells[7],
                 cells[9],
                 cells[11],
                 cells[13],
+                cells[15],
                 cells[17],
+                cells[19],
+                cells[21],
+                cells[23],
+                cells[25],
             )
-        elif len(cells) >= 19:
+            shares = reference = limit_up = limit_down = ""
+        elif width == 26 and re.fullmatch(
+            r"[0-9A-Z]{4,6}", cells[0].upper()
+        ):
+            # The late Oracle report removed the leading spacer but retained
+            # an empty cell after each real value.
+            code, name = cells[0], cells[2]
+            (
+                close,
+                change,
+                open_price,
+                high,
+                low,
+                average,
+                volume,
+                amount,
+                trades,
+                last_bid,
+                last_ask,
+            ) = (
+                cells[4],
+                cells[6],
+                cells[8],
+                cells[10],
+                cells[12],
+                cells[14],
+                cells[16],
+                cells[18],
+                cells[20],
+                cells[22],
+                cells[24],
+            )
+            shares = reference = limit_up = limit_down = ""
+        elif width == 19:
             code, name = cells[0], cells[1]
-            direction = cells[4]
-            magnitude = cells[5]
-            if direction in {"▽", "-"}:
-                change = f"-{magnitude}"
-            elif direction in {"△", "+"}:
-                change = f"+{magnitude}"
-            else:
-                change = magnitude
-            close, open_price, high, low, volume = (
+            change = _tpex_split_change(cells[4], cells[5])
+            (
+                close,
+                open_price,
+                high,
+                low,
+                average,
+                volume,
+                amount,
+                trades,
+                last_bid,
+                last_ask,
+                shares,
+                reference,
+                limit_up,
+                limit_down,
+            ) = (
                 cells[3],
                 cells[6],
                 cells[7],
                 cells[8],
+                cells[9],
                 cells[10],
+                cells[11],
+                cells[12],
+                cells[13],
+                cells[14],
+                cells[15],
+                cells[16],
+                cells[17],
+                cells[18],
             )
-        elif len(cells) >= 17:
+        elif width == 18 and cells[2].strip() not in {
+            "",
+            "⊕",
+            "⊙",
+            "♁",
+            "☉",
+        }:
+            # In the 2004-10-28 generation, the change direction and magnitude
+            # occupy separate cells but the close has no leading spacer.
             code, name = cells[0], cells[1]
-            close, change, open_price, high, low, volume = (
+            change = _tpex_split_change(cells[3], cells[4])
+            (
+                close,
+                open_price,
+                high,
+                low,
+                average,
+                volume,
+                amount,
+                trades,
+                last_bid,
+                last_ask,
+                shares,
+                reference,
+                limit_up,
+                limit_down,
+            ) = (
+                cells[2],
+                cells[5],
+                cells[6],
+                cells[7],
+                cells[8],
+                cells[9],
+                cells[10],
+                cells[11],
+                cells[12],
+                cells[13],
+                cells[14],
+                cells[15],
+                cells[16],
+                cells[17],
+            )
+        elif width == 18:
+            # The following generation restored a status/spacer cell before
+            # close while keeping the change in one cell.  A status glyph can
+            # be present in that spacer, so branch on the change cell rather
+            # than assuming it is empty.
+            code, name = cells[0], cells[1]
+            (
+                close,
+                change,
+                open_price,
+                high,
+                low,
+                average,
+                volume,
+                amount,
+                trades,
+                last_bid,
+                last_ask,
+                shares,
+                reference,
+                limit_up,
+                limit_down,
+            ) = (
+                cells[3],
+                cells[4],
+                cells[5],
+                cells[6],
+                cells[7],
+                cells[8],
+                cells[9],
+                cells[10],
+                cells[11],
+                cells[12],
+                cells[13],
+                cells[14],
+                cells[15],
+                cells[16],
+                cells[17],
+            )
+        elif width == 17:
+            code, name = cells[0], cells[1]
+            (
+                close,
+                change,
+                open_price,
+                high,
+                low,
+                average,
+                volume,
+                amount,
+                trades,
+                last_bid,
+                last_ask,
+                shares,
+                reference,
+                limit_up,
+                limit_down,
+            ) = (
                 cells[2],
                 cells[3],
                 cells[4],
                 cells[5],
                 cells[6],
+                cells[7],
                 cells[8],
+                cells[9],
+                cells[10],
+                cells[11],
+                cells[12],
+                cells[13],
+                cells[14],
+                cells[15],
+                cells[16],
             )
         else:
             continue
         if re.fullmatch(r"[0-9A-Z]{4,6}", code.upper()) is None:
             continue
+        close, open_price, high, low, average, last_bid, last_ask, reference, limit_up, limit_down = (
+            _normalize_tpex_price_cell(value)
+            for value in (
+                close,
+                open_price,
+                high,
+                low,
+                average,
+                last_bid,
+                last_ask,
+                reference,
+                limit_up,
+                limit_down,
+            )
+        )
+        change_decode_status = ""
+        if lossy_name_receipt and change in TPEX_DAMAGED_CHANGE_RECOVERY:
+            change = TPEX_DAMAGED_CHANGE_RECOVERY[change]
+            change_decode_status = TPEX_CHANGE_RECOVERY_STATUS
         records.append(
             {
                 DATE_COLUMN: request_date.isoformat(),
@@ -1337,29 +3084,747 @@ def _parse_tpex_daily_quotes_html(raw_html: str, request_date: date) -> pl.DataF
                 "開盤": open_price,
                 "最高": high,
                 "最低": low,
+                "均價": average,
                 "成交股數": volume,
+                "成交金額(元)": amount,
+                "成交筆數": trades,
+                "最後買價": last_bid,
+                "最後賣價": last_ask,
+                "發行股數": shares,
+                "次日參考價": reference,
+                "次日漲停價": limit_up,
+                "次日跌停價": limit_down,
+                "_change_decode_status": change_decode_status,
+                "_name_decode_status": (
+                    "official_receipt_name_bytes_unrecoverable"
+                    if lossy_name_receipt or _tpex_name_has_decode_damage(name)
+                    else ""
+                ),
                 "_table_title": "上櫃股票每日收盤行情",
             }
         )
     return _frame_from_records(records)
 
 
+def _validate_tpex_daily_numeric_cells(
+    frame: pl.DataFrame,
+    *,
+    lossy_name_receipt: bool = False,
+) -> pl.DataFrame:
+    if frame.is_empty():
+        return frame
+
+    average_sentinels = {"註", "嚙踝蕭"}
+    average_text = pl.col("均價").cast(pl.Utf8, strict=False).str.strip_chars()
+    sentinel_rows = frame.filter(average_text.is_in(sorted(average_sentinels)))
+    for row in sentinel_rows.iter_rows(named=True):
+        average = str(row.get("均價", "")).strip()
+        if average != "註" and not lossy_name_receipt:
+            raise HistoricalResponseError(
+                "official TPEx daily average-note damage is not confined to a lossy receipt"
+            )
+
+        def zero(column: str) -> bool:
+            try:
+                return float(str(row.get(column, "")).replace(",", "").strip()) == 0.0
+            except (TypeError, ValueError):
+                return False
+
+        if not all(
+            zero(column)
+            for column in (
+                "收盤",
+                "開盤",
+                "最高",
+                "最低",
+                "成交股數",
+                "成交金額(元)",
+                "成交筆數",
+                "漲跌",
+            )
+        ):
+            raise HistoricalResponseError(
+                "official TPEx daily average-note sentinel violates the exact zero-trade gate"
+            )
+
+    if sentinel_rows.height:
+        frame = frame.with_columns(
+            pl.when(average_text.is_in(sorted(average_sentinels)))
+            .then(pl.lit("註"))
+            .otherwise(pl.col("均價"))
+            .alias("均價")
+        )
+
+    # Permanently damaged names and the exact v11 recovered change labels have
+    # already been isolated with row provenance. Every remaining parsed cell,
+    # including unknown change tokens and symbols, stays fail-closed.
+    for column in frame.columns:
+        if column in {"名稱", "_name_decode_status"}:
+            continue
+        damaged = [
+            value
+            for value in frame.get_column(column).cast(pl.Utf8, strict=False).to_list()
+            if _tpex_name_has_decode_damage(value)
+        ]
+        if damaged:
+            raise HistoricalResponseError(
+                f"official TPEx daily column {column!r} contains lossy decode damage: "
+                f"{damaged[:3]}"
+            )
+
+    placeholders = ["", "-", "--", "---", "----", "—", "NA", "N/A"]
+    numeric_columns = (
+        "收盤",
+        "開盤",
+        "最高",
+        "最低",
+        "均價",
+        "成交股數",
+        "成交金額(元)",
+        "成交筆數",
+        "最後買價",
+        "最後賣價",
+        "發行股數",
+        "次日參考價",
+        "次日漲停價",
+        "次日跌停價",
+    )
+    for column in numeric_columns:
+        if column not in frame.columns:
+            continue
+        text = pl.col(column).cast(pl.Utf8, strict=False).str.strip_chars()
+        allowed_placeholders = placeholders + (["註"] if column == "均價" else [])
+        invalid = frame.filter(
+            ~text.is_in(allowed_placeholders)
+            & text.str.replace_all(",", "").cast(pl.Float64, strict=False).is_null()
+        )
+        if invalid.height:
+            examples = invalid.get_column(column).head(3).to_list()
+            raise HistoricalResponseError(
+                f"official TPEx daily numeric column {column!r} contains "
+                f"unparseable values: {examples}"
+            )
+
+    change = pl.col("漲跌").cast(pl.Utf8, strict=False).str.strip_chars()
+    numeric_change = (
+        change.str.replace_all(r"\s+", "")
+        .str.replace_all(",", "")
+        .cast(pl.Float64, strict=False)
+    )
+    invalid_change = frame.filter(
+        ~change.is_in(["---", "除權", "除息", "除權息"])
+        & numeric_change.is_null()
+    )
+    if invalid_change.height:
+        examples = invalid_change.get_column("漲跌").head(3).to_list()
+        raise HistoricalResponseError(
+            "official TPEx daily change column contains unparseable values: "
+            f"{examples}"
+        )
+    return frame
+
+
+def _tpex_legacy_html_rows(raw_html: str) -> list[list[str]]:
+    """Extract malformed legacy TPEx table rows without requiring valid HTML."""
+
+    row_starts = list(HTML_ROW_CAPTURE_PATTERN.finditer(raw_html))
+    rows: list[list[str]] = []
+    for row_index, row_match in enumerate(row_starts):
+        row_end = (
+            row_starts[row_index + 1].start()
+            if row_index + 1 < len(row_starts)
+            else len(raw_html)
+        )
+        raw_row = raw_html[row_match.end() : row_end].split("</tr>", 1)[0]
+        cell_starts = list(HTML_CELL_CAPTURE_PATTERN.finditer(raw_row))
+        if not cell_starts:
+            continue
+        cells: list[tuple[str, str]] = []
+        for cell_index, cell_match in enumerate(cell_starts):
+            cell_end = (
+                cell_starts[cell_index + 1].start()
+                if cell_index + 1 < len(cell_starts)
+                else len(raw_row)
+            )
+            cells.append(
+                (
+                    cell_match.group("attrs").lower(),
+                    _strip_html(raw_row[cell_match.end() : cell_end]),
+                )
+            )
+        row_has_body_class = "table-body" in row_match.group("attrs").lower()
+        body_cells = [
+            value for attrs, value in cells if "table-body" in attrs
+        ]
+        width_cells = [
+            value
+            for attrs, value in cells
+            if re.search(r"\bwidth\s*=", attrs, re.IGNORECASE)
+        ]
+        if row_has_body_class:
+            selected = [value for _attrs, value in cells]
+        elif width_cells and re.fullmatch(
+            r"[0-9A-Z]{4,6}",
+            width_cells[0].strip().upper(),
+        ):
+            selected = width_cells
+        elif body_cells:
+            selected = body_cells
+        elif cells and re.fullmatch(
+            r"[0-9A-Z]{4,6}",
+            cells[0][1].strip().upper(),
+        ):
+            # The 2004 margin archive has no row/cell CSS markers and a real
+            # trailing note cell that is usually blank. Preserve every cell so
+            # the note remains in its canonical position.
+            selected = [value for _attrs, value in cells]
+        else:
+            # Some Oracle Report rows omit all CSS classes. Their spacer cells
+            # have no width, while every real data cell has one. Keep width
+            # cells even when their value is blank so column positions survive.
+            selected = width_cells or [value for _attrs, value in cells if value]
+        if selected:
+            rows.append(selected)
+    return rows
+
+
+def _parse_roc_compact_date(value: str) -> date:
+    compact = re.sub(r"\D", "", value)
+    if len(compact) not in {6, 7}:
+        raise ValueError(f"invalid ROC compact date: {value!r}")
+    year = int(compact[:-4]) + 1911
+    return date(year, int(compact[-4:-2]), int(compact[-2:]))
+
+
+def _tpex_archive_declared_dates(raw_html: str, response_kind: str) -> set[date]:
+    text = _strip_html_with_tag_boundaries(raw_html)
+    if response_kind == "tpex_institutional_archive_html":
+        return _declared_dates_from_text(text)
+    declared: set[date] = set()
+    for compact in re.findall(
+        r"(?:資料日期|交易日期)\s*[:：]?\s*(\d{6,7})(?!\d)",
+        text,
+    ):
+        try:
+            declared.add(_parse_roc_compact_date(compact))
+        except ValueError:
+            continue
+    for roc_year, month, day in re.findall(
+        r"(?:資料日期|交易日期)\s*[:：]?\s*(\d{2,3})\s*年\s*"
+        r"(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+        text,
+    ):
+        try:
+            declared.add(date(int(roc_year) + 1911, int(month), int(day)))
+        except ValueError:
+            continue
+    if declared:
+        return declared
+
+    if response_kind == "archive_html":
+        # A fixed set of 2004 daily-quote receipts has permanently damaged
+        # Chinese labels, but repeats the compact ROC date in this exact
+        # official report header cell.  Bind all matching cells to one
+        # consensus date; the caller still requires it to equal the requested
+        # date.  The strict attribute signature prevents six-character stock
+        # codes in data rows from being interpreted as dates.
+        cell_starts = list(HTML_CELL_CAPTURE_PATTERN.finditer(raw_html))
+        for cell_index, cell_match in enumerate(cell_starts):
+            attrs = cell_match.group("attrs")
+
+            def attr_value(name: str) -> str | None:
+                match = re.search(
+                    rf"\b{re.escape(name)}\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+                    attrs,
+                    flags=re.IGNORECASE,
+                )
+                if match is None:
+                    return None
+                return next(
+                    (value for value in match.groups() if value is not None),
+                    None,
+                )
+
+            css_classes = (attr_value("class") or "").lower().split()
+            if not (
+                attr_value("width") == "71"
+                and attr_value("colspan") == "5"
+                and attr_value("rowspan") == "2"
+                and "table-body-right" in css_classes
+            ):
+                continue
+            cell_end = (
+                cell_starts[cell_index + 1].start()
+                if cell_index + 1 < len(cell_starts)
+                else len(raw_html)
+            )
+            body = raw_html[cell_match.end() : cell_end]
+            compact_tokens = re.findall(
+                r"<tt\b[^>]*>\s*(\d{6,7})\s*</tt>",
+                body,
+                flags=re.IGNORECASE,
+            )
+            if len(compact_tokens) != 1:
+                raise HistoricalResponseError(
+                    "official TPEx daily archive has a malformed styled date header"
+                )
+            try:
+                declared.add(_parse_roc_compact_date(compact_tokens[0]))
+            except ValueError as exc:
+                raise HistoricalResponseError(
+                    "official TPEx daily archive has an invalid styled ROC date"
+                ) from exc
+        if declared:
+            return declared
+
+    # The later margin archive renders its ROC date in a standalone header
+    # cell without a preceding label. Limit this fallback to explicitly styled
+    # header/date cells so six-character security codes are never dates.
+    for cell_match in re.finditer(
+        r"<td\b(?P<attrs>[^>]*)>(?P<body>.*?)(?=<td\b|</tr>|<tr\b|$)",
+        raw_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        attrs = cell_match.group("attrs").lower()
+        if "table-head" not in attrs and "table-date" not in attrs:
+            continue
+        compact = _strip_html(cell_match.group("body"))
+        if re.fullmatch(r"\d{6,7}", compact) is None:
+            continue
+        try:
+            declared.add(_parse_roc_compact_date(compact))
+        except ValueError:
+            continue
+    if declared:
+        return declared
+
+    # The first 16-cell margin report generation writes the compact ROC date
+    # in the right-hand cell of its unit/date header. Keep the exact attribute
+    # signature so a six-character symbol in a data row can never satisfy this
+    # fallback.
+    if response_kind == "tpex_margin_archive_html":
+        for cell_match in re.finditer(
+            r"<td\b(?P<attrs>[^>]*)>(?P<body>.*?)(?=<td\b|</tr>|<tr\b|$)",
+            raw_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            attrs = cell_match.group("attrs")
+
+            def has_exact_attr(name: str, expected: str) -> bool:
+                match = re.search(
+                    rf"\b{re.escape(name)}\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+                    attrs,
+                    flags=re.IGNORECASE,
+                )
+                if match is None:
+                    return False
+                value = next(
+                    (item for item in match.groups() if item is not None),
+                    "",
+                )
+                return value.strip().lower() == expected
+
+            if not (
+                has_exact_attr("align", "right")
+                and has_exact_attr("valign", "center")
+                and has_exact_attr("colspan", "14")
+            ):
+                continue
+            compact = _strip_html(cell_match.group("body"))
+            if re.fullmatch(r"\d{6,7}", compact) is None:
+                continue
+            try:
+                declared.add(_parse_roc_compact_date(compact))
+            except ValueError:
+                continue
+    return declared
+
+
+def _require_tpex_archive_identity(
+    spec: DatasetSpec,
+    request_date: date,
+    raw_html: str,
+    response_kind: str,
+    title_markers: tuple[str, ...],
+) -> str:
+    text = _strip_html_with_tag_boundaries(raw_html)
+    matched_title = next((title for title in title_markers if title in text), None)
+    if matched_title is None:
+        raise HistoricalResponseError(
+            f"official TPEx archive title mismatch for {spec.name}"
+        )
+    declared_dates = _tpex_archive_declared_dates(raw_html, response_kind)
+    if not declared_dates:
+        raise HistoricalResponseError(
+            f"official TPEx archive declares no date for {spec.name}"
+        )
+    _validate_historical_response_date(spec, request_date, declared_dates)
+    return matched_title
+
+
+def _legacy_records_from_rows(
+    rows: list[list[str]],
+    *,
+    allowed_widths: set[int],
+) -> list[tuple[str, list[str]]]:
+    output: list[tuple[str, list[str]]] = []
+    seen_symbols: set[str] = set()
+    for cells in rows:
+        if not cells:
+            continue
+        symbol = cells[0].strip().upper()
+        if re.fullmatch(r"[0-9A-Z]{4,6}", symbol) is None:
+            continue
+        if len(cells) not in allowed_widths:
+            raise HistoricalResponseError(
+                f"legacy TPEx data row has {len(cells)} cells; "
+                f"expected one of {sorted(allowed_widths)} for symbol={symbol}"
+            )
+        if symbol in seen_symbols:
+            raise HistoricalResponseError(
+                f"legacy TPEx response contains duplicate symbol={symbol}"
+            )
+        seen_symbols.add(symbol)
+        normalized = list(cells)
+        normalized[0] = symbol
+        output.append((symbol, normalized))
+    return output
+
+
+TPEX_MARGIN_CANONICAL_COLUMNS = (
+    "代號",
+    "名稱",
+    "前資餘額(張)",
+    "資買",
+    "資賣",
+    "現償",
+    "資餘額",
+    "資屬證金",
+    "資使用率(%)",
+    "資限額",
+    "前券餘額(張)",
+    "券賣",
+    "券買",
+    "券償",
+    "券餘額",
+    "券屬證金",
+    "券使用率(%)",
+    "券限額",
+    "資券相抵(張)",
+    "備註",
+)
+TPEX_MARGIN_ARCHIVE_COLUMNS_BY_WIDTH = {
+    13: (
+        "代號",
+        "名稱",
+        "前資餘額(張)",
+        "資買",
+        "資賣",
+        "現償",
+        "資餘額",
+        "資限額",
+        "前券餘額(張)",
+        "券賣",
+        "券買",
+        "券償",
+        "券餘額",
+    ),
+    16: (
+        "代號",
+        "名稱",
+        "前資餘額(張)",
+        "資買",
+        "資賣",
+        "現償",
+        "資餘額",
+        "資屬證金",
+        "資限額",
+        "前券餘額(張)",
+        "券賣",
+        "券買",
+        "券償",
+        "券餘額",
+        "券屬證金",
+        "備註",
+    ),
+    17: (
+        "代號",
+        "名稱",
+        "前資餘額(張)",
+        "資買",
+        "資賣",
+        "現償",
+        "資餘額",
+        "資屬證金",
+        "資限額",
+        "前券餘額(張)",
+        "券賣",
+        "券買",
+        "券償",
+        "券餘額",
+        "券屬證金",
+        "資券相抵(張)",
+        "備註",
+    ),
+}
+
+
+def _strip_archive_component_parentheses(value: str) -> str:
+    stripped = value.strip()
+    match = re.fullmatch(r"\(([^()]*)\)", stripped)
+    return match.group(1).strip() if match else stripped
+
+
+def _parse_tpex_margin_archive_html(
+    raw_html: str,
+    request_date: date,
+    spec: DatasetSpec,
+) -> pl.DataFrame:
+    title = _require_tpex_archive_identity(
+        spec,
+        request_date,
+        raw_html,
+        "tpex_margin_archive_html",
+        ("融資融券餘額彙總表", "上櫃股票融資融券餘額"),
+    )
+    parsed_rows = _legacy_records_from_rows(
+        _tpex_legacy_html_rows(raw_html),
+        allowed_widths=set(TPEX_MARGIN_ARCHIVE_COLUMNS_BY_WIDTH),
+    )
+    records: list[dict[str, Any]] = []
+    for row_index, (_symbol, cells) in enumerate(parsed_rows):
+        source_columns = TPEX_MARGIN_ARCHIVE_COLUMNS_BY_WIDTH[len(cells)]
+        record = {column: "" for column in TPEX_MARGIN_CANONICAL_COLUMNS}
+        record.update(dict(zip(source_columns, cells, strict=True)))
+        for column in ("資屬證金", "券屬證金"):
+            record[column] = _strip_archive_component_parentheses(record[column])
+        record.update(
+            {
+                DATE_COLUMN: request_date.isoformat(),
+                "_table_title": title,
+                "_table_index": 0,
+                "_row_index": row_index,
+            }
+        )
+        records.append(record)
+    return _frame_from_records(records)
+
+
+TPEX_INSTITUTIONAL_ARCHIVE_COLUMNS = (
+    "代號",
+    "名稱",
+    "外資及陸資買股數",
+    "外資及陸資賣股數",
+    "外資及陸資淨買股數",
+    "投信買進股數",
+    "投信賣股數",
+    "投信淨買股數",
+    "自營商買股數",
+    "自營商賣股數",
+    "自營淨買股數",
+    "三大法人買賣超股數",
+)
+
+
+def _parse_tpex_institutional_archive_html(
+    raw_html: str,
+    request_date: date,
+    spec: DatasetSpec,
+) -> pl.DataFrame:
+    title = _require_tpex_archive_identity(
+        spec,
+        request_date,
+        raw_html,
+        "tpex_institutional_archive_html",
+        ("三大法人日交易資訊",),
+    )
+    parsed_rows = _legacy_records_from_rows(
+        _tpex_legacy_html_rows(raw_html),
+        allowed_widths={len(TPEX_INSTITUTIONAL_ARCHIVE_COLUMNS)},
+    )
+    records: list[dict[str, Any]] = []
+    for row_index, (_symbol, cells) in enumerate(parsed_rows):
+        record = dict(zip(TPEX_INSTITUTIONAL_ARCHIVE_COLUMNS, cells, strict=True))
+        record.update(
+            {
+                DATE_COLUMN: request_date.isoformat(),
+                "_table_title": title,
+                "_table_index": 0,
+                "_row_index": row_index,
+            }
+        )
+        records.append(record)
+    return _frame_from_records(records)
+
+
+TPEX_VALUATION_CANONICAL_COLUMNS = (
+    "股票代號",
+    "公司名稱",
+    "本益比",
+    "每股股利",
+    "股利年度",
+    "殖利率(%)",
+    "股價淨值比",
+)
+
+
+def _parse_tpex_valuation_archive_html(
+    raw_html: str,
+    request_date: date,
+    spec: DatasetSpec,
+) -> pl.DataFrame:
+    title = _require_tpex_archive_identity(
+        spec,
+        request_date,
+        raw_html,
+        "tpex_valuation_archive_html",
+        ("上櫃股票個股本益比、股利率、股價淨值比",),
+    )
+    parsed_rows = _legacy_records_from_rows(
+        _tpex_legacy_html_rows(raw_html),
+        allowed_widths={5},
+    )
+    records: list[dict[str, Any]] = []
+    for row_index, (_symbol, cells) in enumerate(parsed_rows):
+        record = {column: "" for column in TPEX_VALUATION_CANONICAL_COLUMNS}
+        record.update(
+            {
+                "股票代號": cells[0],
+                "公司名稱": cells[1],
+                "本益比": cells[2],
+                "殖利率(%)": cells[3],
+                "股價淨值比": cells[4],
+                DATE_COLUMN: request_date.isoformat(),
+                "_table_title": title,
+                "_table_index": 0,
+                "_row_index": row_index,
+            }
+        )
+        records.append(record)
+    return _frame_from_records(records)
+
+
 def _tpex_historical_request(day: date, spec: DatasetSpec) -> tuple[str, str]:
-    if day < date(2007, 1, 1):
-        roc_date = f"{day.year - 1911}{day:%m%d}"
+    roc_date = f"{day.year - 1911}{day:%m%d}"
+    if spec.name == "tpex_daily_ohlcv" and day < date(2007, 1, 1):
         return (
             "https://hist.tpex.org.tw/Hist/STOCK/AFTERTRADING/DAILY_CLOSE_QUOTES/"
             f"RSTA3104_{roc_date}.HTML",
             "archive_html",
         )
-    if day < date(2007, 7, 2):
+    if spec.name == "tpex_daily_ohlcv" and day < date(2007, 7, 2):
         return (
             "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotesHis"
             f"?date={day:%Y/%m/%d}&response=json",
             "legacy_json_html",
         )
+    if spec.name == "tpex_margin_balance" and day < date(2007, 1, 1):
+        return (
+            "https://hist.tpex.org.tw/Hist/STOCK/MARGIN_TRADING/MARGIN_BALANCE/"
+            f"RSTA3106_{roc_date}.html",
+            "tpex_margin_archive_html",
+        )
+    if spec.name == "tpex_daily_valuation" and day < date(2007, 1, 1):
+        return (
+            "https://hist.tpex.org.tw/Hist/STOCK/AFTERTRADING/PERATIO_ANALYSIS/"
+            f"RSTA3103_{roc_date}.HTML",
+            "tpex_valuation_archive_html",
+        )
+    if spec.name == "tpex_institutional_trades":
+        if day < date(2007, 1, 1):
+            return (
+                "https://hist.tpex.org.tw/Hist/STOCK/3INSTI/DAILY_TRADE/"
+                f"BIGD{roc_date}S_N.html",
+                "tpex_institutional_archive_html",
+            )
+        if day <= date(2007, 4, 20):
+            return (
+                "https://hist.tpex.org.tw/hist/stock/3insti/daily_trade/"
+                f"BIGD_{roc_date}S_N.html",
+                "tpex_institutional_archive_html",
+            )
+        if day < date(2014, 12, 1):
+            return (
+                "https://www.tpex.org.tw/www/zh-tw/insti/dailyTradeHis"
+                f"?date={day:%Y/%m/%d}&type=Daily&cate=EW&response=json",
+                "json",
+            )
     assert spec.url_template is not None
     return spec.url_template.format(date=_format_date(day, spec.date_format)), "json"
+
+
+def _normalize_historical_frame(
+    spec: DatasetSpec,
+    frame: pl.DataFrame,
+) -> pl.DataFrame:
+    if frame.is_empty():
+        return frame
+    if spec.name == "tpex_institutional_trades":
+        legacy_net = "自營商淨買股數"
+        canonical_net = "自營淨買股數"
+        columns = set(frame.columns)
+        if legacy_net in columns and canonical_net not in columns:
+            frame = frame.rename({legacy_net: canonical_net})
+        elif legacy_net in columns and canonical_net in columns:
+            frame = frame.with_columns(
+                pl.coalesce(
+                    pl.col(canonical_net),
+                    pl.col(legacy_net),
+                ).alias(canonical_net)
+            ).drop(legacy_net)
+    return frame
+
+
+def _validate_historical_frame(
+    spec: DatasetSpec,
+    request_date: date,
+    frame: pl.DataFrame,
+) -> None:
+    if frame.is_empty():
+        return
+    required = HISTORICAL_REQUIRED_COLUMNS.get(spec.name)
+    if not required:
+        return
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise HistoricalResponseError(
+            f"official response missing required fields for {spec.name}: "
+            + ",".join(missing)
+        )
+    if DATE_COLUMN not in frame.columns:
+        raise HistoricalResponseError(
+            f"official response missing {DATE_COLUMN!r} for {spec.name}"
+        )
+    dates = {
+        str(value)[:10]
+        for value in frame.get_column(DATE_COLUMN).to_list()
+        if value is not None
+    }
+    expected_date = request_date.isoformat()
+    if dates != {expected_date}:
+        raise HistoricalResponseError(
+            f"official parsed rows have wrong dates for {spec.name}: "
+            f"requested={expected_date} parsed={sorted(dates)}"
+        )
+    symbol_column = HISTORICAL_SYMBOL_COLUMNS[spec.name]
+    symbols = [
+        str(value).strip().upper()
+        for value in frame.get_column(symbol_column).to_list()
+    ]
+    invalid_symbols = [
+        symbol
+        for symbol in symbols
+        if re.fullmatch(r"[0-9A-Z]{4,6}", symbol) is None
+    ]
+    if invalid_symbols:
+        raise HistoricalResponseError(
+            f"official response contains invalid symbols for {spec.name}: "
+            + ",".join(invalid_symbols[:5])
+        )
+    if len(symbols) != len(set(symbols)):
+        raise HistoricalResponseError(
+            f"official response contains duplicate symbols for {spec.name}"
+        )
 
 
 def _table_matches(table_mode: str, title: str) -> bool:
@@ -1560,6 +4025,42 @@ def _write_raw(raw: bytes, raw_dir: Path, dataset: str, suffix: str, stem: str |
     return path
 
 
+def _write_immutable_raw(
+    raw: bytes,
+    raw_dir: Path,
+    dataset: str,
+    suffix: str,
+    stem: str | None = None,
+) -> Path:
+    """Atomically create a raw receipt without ever replacing prior bytes."""
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    base = _safe_name(stem or dataset)
+    path = raw_dir / f"{base}{suffix}"
+    if path.exists():
+        if path.read_bytes() != raw:
+            raise HistoricalResponseError(
+                f"immutable raw receipt changed for {dataset} {base}"
+            )
+        return path
+    with tempfile.NamedTemporaryFile(dir=raw_dir, delete=False) as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+        tmp_path = Path(handle.name)
+    try:
+        try:
+            os.link(tmp_path, path)
+        except FileExistsError:
+            if path.read_bytes() != raw:
+                raise HistoricalResponseError(
+                    f"immutable raw receipt changed for {dataset} {base}"
+                )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return path
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -1622,6 +4123,315 @@ def _write_parquet_merged(path: Path, frame: pl.DataFrame, *, refresh: bool) -> 
     return int(merged.height)
 
 
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+        delete=False,
+    ) as handle:
+        tmp_path = Path(handle.name)
+    try:
+        shutil.copyfile(source, tmp_path)
+        os.replace(tmp_path, destination)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _bootstrap_historical_partial_from_raw(
+    spec: DatasetSpec,
+    output_dir: Path,
+    cache: HistoricalResumeCache,
+    allowed_dates: set[date],
+) -> None:
+    raw_dir = output_dir / "raw" / spec.name
+    try:
+        existing_counts, _ = _existing_date_counts(cache.partial_path)
+    except Exception:
+        existing_counts = {}
+    existing_dates = set(existing_counts)
+    pending_frames: list[pl.DataFrame] = []
+    pending_results: list[tuple[HistoricalDateResult, str]] = []
+
+    def flush() -> None:
+        nonlocal pending_frames, pending_results
+        if not pending_frames:
+            return
+        incoming = pl.concat(pending_frames, how="diagonal_relaxed")
+        if DATE_COLUMN in incoming.columns:
+            incoming = incoming.sort(DATE_COLUMN)
+        _write_parquet_merged(cache.partial_path, incoming, refresh=False)
+        for cached_result, source in pending_results:
+            _append_historical_journal_record(
+                cache,
+                spec,
+                cached_result,
+                status="data",
+                source=source,
+            )
+        pending_frames = []
+        pending_results = []
+
+    if raw_dir.is_dir():
+        for raw_path in sorted(raw_dir.iterdir()):
+            if raw_path.suffix.lower() not in {".json", ".html"}:
+                continue
+            try:
+                day = _parse_date(raw_path.stem[:10])
+            except ValueError:
+                continue
+            if day not in allowed_dates or day in existing_dates:
+                continue
+            url, response_kind = _historical_request_info(spec, day)
+            try:
+                frame, _ = _parse_historical_response_content(
+                    spec,
+                    day,
+                    raw_path.read_bytes(),
+                    response_kind,
+                )
+            except Exception:
+                # A corrupt or parser-incompatible receipt is not trusted. The date
+                # remains unresolved and will be fetched again from the official source.
+                continue
+            if frame.is_empty():
+                continue
+            fetched_at = datetime.fromtimestamp(
+                raw_path.stat().st_mtime,
+                tz=timezone.utc,
+            ).isoformat()
+            staged = _append_common_columns(
+                frame,
+                spec,
+                fetched_at=fetched_at,
+                url=url,
+            )
+            result = HistoricalDateResult(
+                day=day,
+                url=url,
+                frame=frame,
+                raw_path=str(raw_path),
+            )
+            pending_frames.append(staged)
+            pending_results.append((result, "raw_bootstrap"))
+            existing_dates.add(day)
+            if len(pending_frames) >= 250:
+                flush()
+    flush()
+
+    # A parser-contract bump can make a previously rejected HTTP-200 receipt
+    # safe to parse. Reuse it only after its append-only journal event, official
+    # URL, content-addressed filename, byte length, and full hashes all agree.
+    for day, payload, raw_path in _validated_historical_failed_receipts(
+        output_dir,
+        spec,
+        allowed_dates,
+    ):
+        if day in existing_dates:
+            continue
+        try:
+            content = raw_path.read_bytes()
+        except OSError:
+            continue
+        digest = hashlib.sha256(content).hexdigest()
+        if (
+            payload.get("raw_sha256") != digest
+            or payload.get("body_sha256") != digest
+            or int(payload.get("raw_size", -1)) != len(content)
+            or int(payload.get("content_length", -1)) != len(content)
+        ):
+            continue
+        url, response_kind = _historical_request_info(spec, day)
+        receipt_url = str(payload.get("url") or url)
+        try:
+            frame, _ = _parse_historical_response_content(
+                spec,
+                day,
+                content,
+                response_kind,
+            )
+            fetched_at = str(payload["recorded_at_utc"])
+            datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            response_attempts = int(payload.get("response_attempts", 0))
+        except Exception:
+            # The receipt remains a failure under this parser contract and its
+            # date stays in the network request plan.
+            continue
+        if frame.is_empty():
+            continue
+        staged = _append_common_columns(
+            frame,
+            spec,
+            fetched_at=fetched_at,
+            url=receipt_url,
+        )
+        result = HistoricalDateResult(
+            day=day,
+            url=receipt_url,
+            frame=frame,
+            raw_path=str(raw_path),
+            http_status=200,
+            content_type=payload.get("content_type"),
+            content_length=len(content),
+            body_sha256=digest,
+            body_snippet=payload.get("body_snippet"),
+            response_attempts=response_attempts,
+        )
+        pending_frames.append(staged)
+        pending_results.append((result, "raw_failure_reparse"))
+        existing_dates.add(day)
+        if len(pending_frames) >= 250:
+            flush()
+    flush()
+
+
+def _prepare_historical_resume_cache(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    output_dir: Path,
+    plan: HistoricalDownloadPlan,
+) -> HistoricalResumeCache:
+    cache_key = _historical_resume_cache_key(spec)
+    resume_enabled = bool(getattr(args, "resume", True))
+    if not resume_enabled:
+        cache_key = f"{cache_key}-fresh-{os.getpid()}-{time.time_ns()}"
+    cache = HistoricalResumeCache(
+        cache_key=cache_key,
+        journal_path=_historical_journal_path(output_dir, spec),
+        partial_path=_historical_partial_path(output_dir, spec, cache_key),
+        data_dates=set(),
+        empty_dates=set(),
+    )
+    plan.state.update(
+        {
+            "resume_enabled": resume_enabled,
+            "resume_cache_key": cache.cache_key,
+            "journal_path": str(cache.journal_path.relative_to(output_dir)),
+            "partial_path": str(cache.partial_path.relative_to(output_dir)),
+        }
+    )
+    if not plan.replace_output:
+        if args.max_dates is not None:
+            plan.dates = plan.dates[: max(0, int(args.max_dates))]
+        return cache
+
+    if not resume_enabled:
+        if args.max_dates is not None:
+            plan.dates = plan.dates[: max(0, int(args.max_dates))]
+        return cache
+
+    _bootstrap_historical_partial_from_raw(
+        spec,
+        output_dir,
+        cache,
+        plan.all_weekdays,
+    )
+    try:
+        partial_counts, _ = _existing_date_counts(cache.partial_path)
+    except Exception:
+        partial_counts = {}
+    if _requires_strict_session_calendar(spec, args):
+        partial_in_range = {
+            day
+            for day in partial_counts
+            if plan.start <= day <= plan.end
+        }
+        calendar_disagreement = partial_in_range - plan.all_weekdays
+        if calendar_disagreement:
+            examples = ", ".join(
+                day.isoformat() for day in sorted(calendar_disagreement)[:5]
+            )
+            raise RuntimeError(
+                f"{spec.name} staged partial dates disagree with its verified "
+                f"session calendar: count={len(calendar_disagreement)} "
+                f"examples={examples}"
+            )
+    latest = _load_historical_journal_latest(
+        cache.journal_path,
+        spec,
+        cache.cache_key,
+    )
+    latest_failed = {
+        day
+        for day, payload in latest.items()
+        if payload.get("status") == "failed"
+    }
+    cached_data = (set(partial_counts) & plan.all_weekdays) - latest_failed
+    cached_empty = {
+        day
+        for day, payload in latest.items()
+        if payload.get("status") == "empty" and day in plan.all_weekdays
+    }
+    if _requires_strict_session_calendar(spec, args):
+        cached_empty &= _validated_source_unavailable_receipt_dates(
+            output_dir,
+            spec,
+            plan.all_weekdays,
+        )
+    cached_empty.difference_update(cached_data)
+
+    try:
+        suspicious_cached, _ = _suspicious_ohlcv_dates(
+            cache.partial_path,
+            spec,
+            partial_counts,
+        )
+    except Exception:
+        suspicious_cached = set(partial_counts)
+    suspicious_cached &= plan.all_weekdays
+    plan.suspicious_dates |= suspicious_cached
+    cached_data.difference_update(suspicious_cached)
+
+    cache.data_dates = cached_data
+    cache.empty_dates = cached_empty
+    plan.state["resumed_data_dates"] = len(cached_data)
+    plan.state["resumed_empty_dates"] = len(cached_empty)
+    resolved = cached_data | cached_empty
+    plan.dates = [
+        day
+        for day in plan.dates
+        if day not in resolved or day in suspicious_cached
+    ]
+    if args.max_dates is not None:
+        plan.dates = plan.dates[: max(0, int(args.max_dates))]
+    return cache
+
+
+def _validate_historical_partial_for_publish(
+    spec: DatasetSpec,
+    partial_path: Path,
+    all_weekdays: set[date],
+    confirmed_empty_dates: set[date],
+) -> None:
+    counts, invalid_date_values = _existing_date_counts(partial_path)
+    partial_dates = set(counts)
+    expected_data_dates = all_weekdays - confirmed_empty_dates
+    missing = expected_data_dates - partial_dates
+    unexpected = partial_dates - all_weekdays
+    issues: list[str] = []
+    if invalid_date_values:
+        issues.append(f"invalid_date_values={len(invalid_date_values)}")
+    if missing:
+        issues.append(f"missing_data_dates={len(missing)}")
+    if unexpected:
+        issues.append(f"unexpected_dates={len(unexpected)}")
+    suspicious, suspicious_issues = _suspicious_ohlcv_dates(
+        partial_path,
+        spec,
+        counts,
+    )
+    suspicious &= all_weekdays
+    if suspicious:
+        issues.append(f"suspicious_dates={len(suspicious)}")
+    issues.extend(suspicious_issues)
+    if issues:
+        raise RuntimeError(
+            f"staged historical partial failed publish validation for {spec.name}: "
+            + "; ".join(issues)
+        )
+
+
 def _latest_existing_date(path: Path) -> date | None:
     if not path.exists():
         return None
@@ -1682,36 +4492,75 @@ def _finish_historical_coverage_state(
 ) -> tuple[bool, int]:
     mode = _canonical_mode(args.mode)
     if plan.replace_output:
-        if replacement_promoted:
-            existing_after = set(data_dates)
-            confirmed_empty = set(empty_dates)
-        else:
-            existing_after = set(plan.existing_dates)
-            confirmed_empty = set(plan.confirmed_empty_dates)
+        # For a failed rebuild, report the durable staged coverage rather than
+        # pretending every successful date was lost. Production remains untouched
+        # until replacement_promoted is true.
+        existing_after = set(data_dates)
+        confirmed_empty = set(empty_dates)
     else:
         existing_after = set(plan.existing_dates) | set(data_dates)
         confirmed_empty = set(plan.confirmed_empty_dates)
         confirmed_empty.update(empty_dates)
-    confirmed_empty.difference_update(data_dates)
+    confirmed_empty.difference_update(existing_after)
     confirmed_empty.difference_update(errors)
+    confirmed_source_unavailable = {
+        day
+        for day in confirmed_empty
+        if _known_source_unavailable_reason(spec, day) is not None
+    }
+    last_source_unavailable = {
+        day
+        for day in empty_dates
+        if _known_source_unavailable_reason(spec, day) is not None
+    }
 
     missing_after = plan.all_weekdays - existing_after - confirmed_empty
     state = dict(plan.state)
-    failed_dates = state.get("failed_dates", {})
-    if not isinstance(failed_dates, dict):
-        failed_dates = {}
+    stored_failed_dates = state.get("failed_dates", {})
+    if not isinstance(stored_failed_dates, dict):
+        stored_failed_dates = {}
+    failed_dates: dict[str, Any] = {}
+    pruned_failed_date_keys: list[str] = []
+    for raw_day, message in stored_failed_dates.items():
+        raw_key = str(raw_day)
+        try:
+            day = _parse_date(raw_key[:10])
+        except ValueError:
+            pruned_failed_date_keys.append(raw_key)
+            continue
+        if day not in plan.all_weekdays:
+            pruned_failed_date_keys.append(raw_key)
+            continue
+        failed_dates[day.isoformat()] = message
     for day in data_dates | empty_dates:
         failed_dates.pop(day.isoformat(), None)
-    failed_dates.update({day.isoformat(): message for day, message in errors.items()})
+    for day, message in errors.items():
+        if day not in plan.all_weekdays:
+            pruned_failed_date_keys.append(day.isoformat())
+            continue
+        failed_dates[day.isoformat()] = message
     unresolved_failed = _state_failed_date_set(
         {"failed_dates": failed_dates}
     ) & plan.all_weekdays
     unresolved_after = missing_after | unresolved_failed
-    full_coverage = not unresolved_after
+    resume_coverage_complete = not unresolved_after
+    full_coverage = resume_coverage_complete and (
+        not plan.replace_output or replacement_promoted
+    )
+    publication_pending = (
+        plan.replace_output and not replacement_promoted and not unresolved_after
+    )
     previous_baseline = bool(state.get("baseline_established"))
     baseline_established = previous_baseline or (
         mode in {"rebuild", "repair"} and full_coverage
     )
+    try:
+        prior_pruned_failed_dates = max(
+            0, int(state.get("pruned_failed_dates_total", 0))
+        )
+    except (TypeError, ValueError):
+        prior_pruned_failed_dates = 0
+    pruned_failed_date_keys = sorted(set(pruned_failed_date_keys))
     state.update(
         {
             "schema_version": COVERAGE_STATE_SCHEMA_VERSION,
@@ -1722,19 +4571,227 @@ def _finish_historical_coverage_state(
             "coverage_end": plan.end.isoformat(),
             "baseline_established": baseline_established,
             "coverage_complete": full_coverage,
+            "resume_coverage_complete": resume_coverage_complete,
+            "replacement_promoted": replacement_promoted,
             "confirmed_empty_dates": sorted(day.isoformat() for day in confirmed_empty),
+            "confirmed_source_unavailable_dates": sorted(
+                day.isoformat() for day in confirmed_source_unavailable
+            ),
+            "confirmed_empty_date_accounting": {
+                "total": len(confirmed_empty),
+                "source_unavailable": len(confirmed_source_unavailable),
+                "other_confirmed_no_data": len(
+                    confirmed_empty - confirmed_source_unavailable
+                ),
+            },
+            "source_unavailable_ranges": (
+                _known_source_unavailable_range_summaries(
+                    spec,
+                    plan.start,
+                    plan.end,
+                    confirmed_dates=confirmed_source_unavailable,
+                    expected_dates=plan.all_weekdays,
+                )
+            ),
             "failed_dates": dict(sorted(failed_dates.items())),
+            "last_pruned_failed_dates": len(pruned_failed_date_keys),
+            "last_pruned_failed_date_examples": pruned_failed_date_keys[:10],
+            "pruned_failed_dates_total": (
+                prior_pruned_failed_dates + len(pruned_failed_date_keys)
+            ),
             "last_requested_dates": len(plan.dates),
             "last_fetched_dates": len(data_dates),
             "last_empty_dates": len(empty_dates),
+            "last_source_unavailable_dates": len(last_source_unavailable),
             "last_failed_dates": len(errors),
-            "missing_dates_after": len(unresolved_after),
+            "missing_dates_after": len(unresolved_after) + int(publication_pending),
+            "staged_dates": len(existing_after),
+            "publication_pending": publication_pending,
         }
     )
     if full_coverage:
         state["checked_through"] = plan.end.isoformat()
     _write_json(_coverage_state_path(output_dir, spec), state)
-    return full_coverage, len(unresolved_after)
+    return full_coverage, len(unresolved_after) + int(publication_pending)
+
+
+def _historical_request_info(spec: DatasetSpec, day: date) -> tuple[str, str]:
+    assert spec.url_template is not None
+    if spec.name == TPEX_OFFICIAL_CALENDAR_DATASET or spec.name in TPEX_SESSION_DEPENDENT_DATASETS:
+        return _tpex_historical_request(day, spec)
+    return (
+        spec.url_template.format(date=_format_date(day, spec.date_format)),
+        "json",
+    )
+
+
+def _historical_response_fallback_url(spec: DatasetSpec, primary_url: str) -> str | None:
+    replacements = {
+        "twse_daily_ohlcv": (
+            "/rwd/zh/afterTrading/MI_INDEX",
+            "/exchangeReport/MI_INDEX",
+        ),
+        "twse_market_index": (
+            "/rwd/zh/afterTrading/MI_INDEX",
+            "/exchangeReport/MI_INDEX",
+        ),
+        "twse_daily_valuation": (
+            "/rwd/zh/afterTrading/BWIBBU_d",
+            "/exchangeReport/BWIBBU_d",
+        ),
+        "twse_institutional_trades": (
+            "/rwd/zh/fund/T86",
+            "/fund/T86",
+        ),
+        "twse_margin_balance": (
+            "/rwd/zh/marginTrading/MI_MARGN",
+            "/exchangeReport/MI_MARGN",
+        ),
+    }
+    replacement = replacements.get(spec.name)
+    if replacement is None:
+        return None
+    fallback_url = primary_url.replace(*replacement, 1)
+    return fallback_url if fallback_url != primary_url else None
+
+
+def _historical_cache_busted_url(url: str) -> str:
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}_={time.time_ns()}"
+
+
+def _parse_historical_response_content(
+    spec: DatasetSpec,
+    day: date,
+    content: bytes,
+    response_kind: str,
+) -> tuple[pl.DataFrame, str]:
+    if not content:
+        raise HistoricalResponseError("official response body is empty")
+    if response_kind in TPEX_LEGACY_HTML_RESPONSE_KINDS:
+        decoded = _decode_tpex_archive_html(content)
+        if response_kind == "tpex_margin_archive_html":
+            frame = _parse_tpex_margin_archive_html(decoded, day, spec)
+        elif response_kind == "tpex_institutional_archive_html":
+            frame = _parse_tpex_institutional_archive_html(decoded, day, spec)
+        else:
+            frame = _parse_tpex_valuation_archive_html(decoded, day, spec)
+        frame = _normalize_historical_frame(spec, frame)
+        if frame.is_empty():
+            raise HistoricalResponseError(
+                "official TPEx archive produced no rows on a validated open session"
+            )
+        _validate_historical_frame(spec, day, frame)
+        return frame, ".html"
+    if response_kind == "archive_html":
+        decoded, lossy_name_receipt = _decode_tpex_daily_archive_html(content)
+        declared_dates = _declared_dates_from_text(decoded) | _tpex_archive_declared_dates(
+            decoded,
+            response_kind,
+        )
+        if not declared_dates:
+            raise HistoricalResponseError(
+                f"official TPEx archive declares no date for {spec.name}"
+            )
+        _validate_historical_response_date(
+            spec,
+            day,
+            declared_dates,
+        )
+        frame = _parse_tpex_daily_quotes_html(
+            decoded,
+            day,
+            lossy_name_receipt=lossy_name_receipt,
+        )
+        if frame.is_empty() and not _text_explicitly_reports_no_data(decoded):
+            raise HistoricalResponseError(
+                "official HTML response did not explicitly report no data but parser produced no rows"
+            )
+        frame = _validate_tpex_daily_numeric_cells(
+            frame,
+            lossy_name_receipt=lossy_name_receipt,
+        )
+        return frame, ".html"
+
+    decoded, _ = _decode_bytes(content)
+    try:
+        payload = json.loads(decoded)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HistoricalResponseError(
+            f"official response is not valid JSON: {exc}"
+        ) from exc
+    _validate_json_historical_response_date(payload, spec, day)
+    explicit_no_data = _json_payload_explicitly_reports_no_data(
+        payload
+    ) or _json_payload_has_structured_empty_table(payload, spec)
+    status_error = _json_payload_status_error(payload)
+    if status_error is not None:
+        raise HistoricalResponseError(
+            f"official response status is not OK: {status_error}"
+        )
+    if response_kind == "legacy_json_html":
+        raw_html = str(payload.get("html", ""))
+        frame = _parse_tpex_daily_quotes_html(raw_html, day)
+        frame = _validate_tpex_daily_numeric_cells(frame)
+        explicit_no_data = explicit_no_data or _text_explicitly_reports_no_data(raw_html)
+    else:
+        frame = _parse_json_table_payload(payload, spec, day)
+    frame = _normalize_historical_frame(spec, frame)
+    if frame.is_empty() and not explicit_no_data:
+        raise HistoricalResponseError(
+            "official JSON response did not explicitly report no data but parser produced no rows"
+        )
+    if (
+        frame.is_empty()
+        and spec.name in TPEX_SESSION_DEPENDENT_DATASETS
+        and _known_source_unavailable_reason(spec, day) is None
+    ):
+        raise HistoricalResponseError(
+            "official TPEx report returned no rows on a validated open session"
+        )
+    _validate_historical_frame(spec, day, frame)
+    return frame, ".json"
+
+
+def _historical_response_audit(
+    response: requests.Response,
+    *,
+    response_attempts: int,
+) -> dict[str, Any]:
+    content = response.content
+    content_type = str(
+        response.headers.get("Content-Type", response.headers.get("content-type", ""))
+    ).strip()
+    decoded, _ = _decode_bytes(content[:1024])
+    snippet = re.sub(r"\s+", " ", decoded).strip()[:256] or None
+    return {
+        "http_status": int(response.status_code),
+        "content_type": content_type or None,
+        "content_length": len(content),
+        "body_sha256": hashlib.sha256(content).hexdigest(),
+        "body_snippet": snippet,
+        "response_attempts": int(response_attempts),
+    }
+
+
+def _historical_failure_raw_suffix(
+    response: requests.Response,
+    response_kind: str,
+) -> str:
+    content_type = str(
+        response.headers.get("Content-Type", response.headers.get("content-type", ""))
+    ).lower()
+    content_start = response.content.lstrip()[:32].lower()
+    if (
+        response_kind == "archive_html"
+        or response_kind in TPEX_LEGACY_HTML_RESPONSE_KINDS
+        or "html" in content_type
+        or content_start.startswith(b"<")
+    ):
+        return ".html"
+    if "json" in content_type or response_kind in {"json", "legacy_json_html"}:
+        return ".json"
+    return ".bin"
 
 
 def _download_historical_date(
@@ -1743,116 +4800,217 @@ def _download_historical_date(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> HistoricalDateResult:
-    assert spec.url_template is not None
-    if spec.name == "tpex_daily_ohlcv":
-        url, response_kind = _tpex_historical_request(day, spec)
-    else:
-        url = spec.url_template.format(date=_format_date(day, spec.date_format))
-        response_kind = "json"
+    primary_url, response_kind = _historical_request_info(spec, day)
+    request_urls = [primary_url]
+    fallback_url = _historical_response_fallback_url(spec, primary_url)
+    if fallback_url is not None:
+        request_urls.append(fallback_url)
+    last_url = primary_url
+    total_response_attempts = 0
+    primary_returned_structured_empty = False
     try:
-        raw_suffix = ".html" if response_kind == "archive_html" else ".json"
-        raw_names = [spec.name]
-        raw_names.extend(
-            candidate.name
-            for candidate in DEFAULT_DATASETS.values()
-            if candidate.name != spec.name
-            and candidate.kind == "historical_json_table"
-            and candidate.url_template == spec.url_template
-            and candidate.date_format == spec.date_format
-        )
-        cached_raw = next(
-            (
-                candidate
-                for name in raw_names
-                if (
-                    candidate := output_dir
-                    / "raw"
-                    / name
-                    / f"{day.isoformat()}{raw_suffix}"
-                ).is_file()
-            ),
-            None,
-        )
-        if cached_raw is not None:
-            raw_content = cached_raw.read_bytes()
-            if response_kind == "archive_html":
-                decoded, _ = _decode_bytes(raw_content)
-                frame = _parse_tpex_daily_quotes_html(decoded, day)
-            else:
-                payload = json.loads(raw_content)
-                status_error = _json_payload_status_error(payload)
-                if status_error is not None:
-                    raise RuntimeError(f"cached official response status is not OK: {status_error}")
-                if response_kind == "legacy_json_html":
-                    frame = _parse_tpex_daily_quotes_html(str(payload.get("html", "")), day)
-                else:
-                    frame = _parse_json_table_payload(payload, spec, day)
-            return HistoricalDateResult(
-                day=day,
-                url=url,
-                frame=frame,
-                raw_path=str(cached_raw),
-            )
+        response_retry_count = max(0, int(args.retries))
+        for request_url_index, base_url in enumerate(request_urls):
+            for response_attempt in range(response_retry_count + 1):
+                url = (
+                    base_url
+                    if response_attempt == 0
+                    else _historical_cache_busted_url(base_url)
+                )
+                last_url = url
+                response = _http_get(
+                    url,
+                    timeout=args.timeout,
+                    verify_ssl=bool(args.verify_ssl),
+                    retries=int(args.retries),
+                    retry_backoff=float(args.retry_backoff),
+                    retry_security_blocks=False,
+                )
+                total_response_attempts += max(
+                    1,
+                    int(getattr(response, "_stockagent_response_attempts", 1)),
+                )
+                audit = _historical_response_audit(
+                    response,
+                    response_attempts=total_response_attempts,
+                )
+                try:
+                    frame, raw_suffix = _parse_historical_response_content(
+                        spec,
+                        day,
+                        response.content,
+                        response_kind,
+                    )
+                except HistoricalResponseError as exc:
+                    # A persistent connection can remain pinned to a poisoned
+                    # historical cache/backend.  Do not let one unsafe HTTP
+                    # 200 contaminate every later date handled by this worker.
+                    _discard_http_session()
+                    try_fallback_url = request_url_index < len(request_urls) - 1
+                    retry_same_url = (
+                        not try_fallback_url
+                        and response_attempt < response_retry_count
+                    )
+                    if retry_same_url or try_fallback_url:
+                        # HTTP status/backoff policy belongs to _http_get.  A
+                        # syntactically successful HTTP 200 can still be a
+                        # cache-poisoned, wrong-date, or lossy receipt; retry it
+                        # without deferring the provider-wide schedule.  The
+                        # next _http_get still calls the host-global limiter's
+                        # wait(), so semantic retries cannot exceed the
+                        # configured request rate.  WAF/429/transport cooldowns
+                        # remain provider-global inside _http_get.
+                        if retry_same_url:
+                            continue
+                        break
+                    raw_path: Path | None = None
+                    if not args.skip_raw:
+                        raw_path = _write_immutable_raw(
+                            response.content,
+                            output_dir / "raw_failures" / spec.name,
+                            spec.name,
+                            _historical_failure_raw_suffix(response, response_kind),
+                            stem=(
+                                f"{day.isoformat()}."
+                                f"{str(audit['body_sha256'])[:16]}"
+                            ),
+                        )
+                    return HistoricalDateResult(
+                        day=day,
+                        url=url,
+                        frame=pl.DataFrame(),
+                        raw_path=str(raw_path) if raw_path else None,
+                        error=str(exc),
+                        **audit,
+                    )
 
-        response = _http_get(
-            url,
-            timeout=args.timeout,
-            verify_ssl=bool(args.verify_ssl),
-            retries=int(args.retries),
-            retry_backoff=float(args.retry_backoff),
+                # The newer TWSE rwd/IND route has at least one known historical
+                # semantic anomaly (2009-02-02). Treat an otherwise valid empty
+                # response conservatively too: confirm it through TWSE's official
+                # exchangeReport/IND route before recording a weekday as empty.
+                if frame.is_empty() and request_url_index < len(request_urls) - 1:
+                    primary_returned_structured_empty = True
+                    break
+
+                final_fallback_empty = (
+                    frame.is_empty()
+                    and len(request_urls) > 1
+                    and request_url_index == len(request_urls) - 1
+                )
+                strict_open_session = _requires_strict_session_calendar(spec, args)
+                retry_cross_checked_empty = final_fallback_empty and (
+                    primary_returned_structured_empty or strict_open_session
+                )
+                if (
+                    retry_cross_checked_empty
+                    and response_attempt < response_retry_count
+                ):
+                    delay = _retry_delay_seconds(
+                        response,
+                        response_attempt,
+                        float(args.retry_backoff),
+                    )
+                    _global_tw_public_rate_limiter().defer(delay)
+                    time.sleep(delay)
+                    continue
+                if final_fallback_empty and strict_open_session:
+                    raw_path: Path | None = None
+                    if not args.skip_raw:
+                        raw_path = _write_immutable_raw(
+                            response.content,
+                            output_dir / "raw_failures" / spec.name,
+                            spec.name,
+                            _historical_failure_raw_suffix(response, response_kind),
+                            stem=(
+                                f"{day.isoformat()}."
+                                f"{str(audit['body_sha256'])[:16]}"
+                            ),
+                        )
+                    return HistoricalDateResult(
+                        day=day,
+                        url=url,
+                        frame=pl.DataFrame(),
+                        raw_path=str(raw_path) if raw_path else None,
+                        error=(
+                            f"official {spec.name} returned no rows on a "
+                            "verified open session"
+                        ),
+                        **audit,
+                    )
+
+                raw_path = None
+                source_unavailable_reason = (
+                    _known_source_unavailable_reason(spec, day)
+                    if frame.is_empty()
+                    else None
+                )
+                if source_unavailable_reason is not None:
+                    # Coverage for a known official archive gap is valid only
+                    # with one immutable, content-addressed journal receipt per
+                    # requested open session. This intentionally overrides
+                    # --skip-raw for the narrowly declared source gap.
+                    raw_path = _write_immutable_raw(
+                        response.content,
+                        output_dir / "raw_empty" / spec.name,
+                        spec.name,
+                        raw_suffix,
+                        stem=day.isoformat(),
+                    )
+                elif not args.skip_raw and not frame.is_empty():
+                    raw_path = _write_raw(
+                        response.content,
+                        output_dir / "raw" / spec.name,
+                        spec.name,
+                        raw_suffix,
+                        stem=day.isoformat(),
+                    )
+                return HistoricalDateResult(
+                    day=day,
+                    url=url,
+                    frame=frame,
+                    raw_path=str(raw_path) if raw_path else None,
+                    source_unavailable_reason=source_unavailable_reason,
+                    **audit,
+                )
+        raise RuntimeError(f"historical response retry loop exhausted: {primary_url}")
+    except Exception as exc:
+        total_response_attempts += max(
+            0,
+            int(getattr(exc, "_stockagent_response_attempts", 0)),
         )
-        if response_kind == "archive_html":
-            decoded, _ = _decode_bytes(response.content)
-            frame = _parse_tpex_daily_quotes_html(decoded, day)
-        else:
-            payload = response.json()
-            status_error = _json_payload_status_error(payload)
-            if status_error is not None:
-                raise RuntimeError(f"official response status is not OK: {status_error}")
-            if response_kind == "legacy_json_html":
-                frame = _parse_tpex_daily_quotes_html(str(payload.get("html", "")), day)
-            else:
-                frame = _parse_json_table_payload(payload, spec, day)
-        raw_path: Path | None = None
-        if not args.skip_raw:
-            raw_path = _write_raw(
-                response.content,
-                output_dir / "raw" / spec.name,
-                spec.name,
-                raw_suffix,
-                stem=day.isoformat(),
-            )
         return HistoricalDateResult(
             day=day,
-            url=url,
-            frame=frame,
-            raw_path=str(raw_path) if raw_path else None,
+            url=last_url,
+            frame=pl.DataFrame(),
+            error=str(exc),
+            response_attempts=total_response_attempts,
         )
-    except Exception as exc:
-        return HistoricalDateResult(day=day, url=url, frame=pl.DataFrame(), error=str(exc))
     finally:
         if args.sleep:
             time.sleep(max(0.0, float(args.sleep)))
 
 
-def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir: Path) -> DownloadResult:
+def _download_historical(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> DownloadResult:
+    with _historical_dataset_lock(output_dir, spec):
+        return _download_historical_unlocked(spec, args, output_dir)
+
+
+def _download_historical_unlocked(
+    spec: DatasetSpec,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> DownloadResult:
     assert spec.url_template is not None
     parquet_path = output_dir / f"{spec.name}.parquet"
     plan = _plan_historical_download(spec, args, output_dir)
+    cache = _prepare_historical_resume_cache(spec, args, output_dir, plan)
     dates = plan.dates
 
-    working_path = parquet_path
-    if plan.replace_output:
-        parquet_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            prefix=f".{parquet_path.name}.",
-            suffix=".rebuild.parquet",
-            dir=parquet_path.parent,
-            delete=False,
-        )
-        working_path = Path(handle.name)
-        handle.close()
-        working_path.unlink(missing_ok=True)
+    working_path = cache.partial_path if plan.replace_output else parquet_path
 
     fetched_at = _now_utc()
     frames: list[pl.DataFrame] = []
@@ -1862,8 +5020,8 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
     data_dates: set[date] = set()
     new_rows = 0
     raw_path: str | None = None
-    rows = _read_existing_row_count(parquet_path)
-    wrote_any = False
+    rows = _read_existing_row_count(working_path)
+    wrote_any = working_path.exists()
     flush_every_dates = max(0, int(getattr(args, "flush_every_dates", 0) or 0))
     date_workers = max(1, int(getattr(args, "date_workers", 1) or 1))
     progress_iter = tqdm(
@@ -1880,10 +5038,12 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
         if not frames:
             return
         incoming = pl.concat(frames, how="diagonal_relaxed")
+        if DATE_COLUMN in incoming.columns:
+            incoming = incoming.sort(DATE_COLUMN)
         rows = _write_parquet_merged(
             working_path,
             incoming,
-            refresh=plan.replace_output and not wrote_any,
+            refresh=False,
         )
         frames = []
         wrote_any = True
@@ -1900,17 +5060,89 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
         nonlocal fetched_dates, new_rows, raw_path
         if result.error is not None:
             errors[result.day] = result.error
+            _append_historical_journal_record(
+                cache,
+                spec,
+                result,
+                status="failed",
+                source="network",
+            )
         elif result.frame.is_empty():
-            if result.day in plan.suspicious_dates:
-                errors[result.day] = "suspicious existing date returned no official rows"
+            valid_source_unavailable = (
+                _source_unavailable_result_receipt_is_valid(
+                    output_dir,
+                    spec,
+                    result,
+                )
+            )
+            if (
+                _requires_strict_session_calendar(spec, args)
+                and not valid_source_unavailable
+            ):
+                message = (
+                    f"official {spec.name} returned no rows on a verified open session"
+                )
+                errors[result.day] = message
+                failed_result = HistoricalDateResult(
+                    day=result.day,
+                    url=result.url,
+                    frame=result.frame,
+                    raw_path=result.raw_path,
+                    error=message,
+                    http_status=result.http_status,
+                    content_type=result.content_type,
+                    content_length=result.content_length,
+                    body_sha256=result.body_sha256,
+                    body_snippet=result.body_snippet,
+                    response_attempts=result.response_attempts,
+                    source_unavailable_reason=result.source_unavailable_reason,
+                )
+                _append_historical_journal_record(
+                    cache,
+                    spec,
+                    failed_result,
+                    status="failed",
+                    source="network",
+                )
+            elif result.day in plan.suspicious_dates and not valid_source_unavailable:
+                message = "suspicious existing date returned no official rows"
+                errors[result.day] = message
+                failed_result = HistoricalDateResult(
+                    day=result.day,
+                    url=result.url,
+                    frame=result.frame,
+                    raw_path=result.raw_path,
+                    error=message,
+                )
+                _append_historical_journal_record(
+                    cache,
+                    spec,
+                    failed_result,
+                    status="failed",
+                    source="network",
+                )
             else:
                 empty_dates.add(result.day)
+                _append_historical_journal_record(
+                    cache,
+                    spec,
+                    result,
+                    status="empty",
+                    source="network",
+                )
         else:
             frames.append(_append_common_columns(result.frame, spec, fetched_at=fetched_at, url=result.url))
             fetched_dates += 1
             new_rows += int(result.frame.height)
             data_dates.add(result.day)
             raw_path = result.raw_path or raw_path
+            _append_historical_journal_record(
+                cache,
+                spec,
+                result,
+                status="data",
+                source="network",
+            )
             if flush_every_dates and len(frames) >= flush_every_dates:
                 flush_frames()
         if bool(getattr(args, "progress", True)):
@@ -1923,18 +5155,33 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
                 date_workers=date_workers,
             )
 
-    completed: dict[date, HistoricalDateResult] = {}
-    next_idx = 0
     replacement_promoted = False
     try:
-        try:
-            with ThreadPoolExecutor(max_workers=date_workers) as executor:
-                futures = {
-                    executor.submit(_download_historical_date, spec, day, args, output_dir): day
-                    for day in dates
-                }
-                for future in as_completed(futures):
-                    day = futures[future]
+        with ThreadPoolExecutor(max_workers=date_workers) as executor:
+            pending_days = iter(dates)
+            max_in_flight = max(date_workers, date_workers * 2)
+            futures: dict[Any, date] = {}
+
+            def fill_in_flight() -> None:
+                while len(futures) < max_in_flight:
+                    try:
+                        day = next(pending_days)
+                    except StopIteration:
+                        return
+                    future = executor.submit(
+                        _download_historical_date,
+                        spec,
+                        day,
+                        args,
+                        output_dir,
+                    )
+                    futures[future] = day
+
+            fill_in_flight()
+            while futures:
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    day = futures.pop(future)
                     try:
                         result = future.result()
                     except Exception as exc:
@@ -1944,35 +5191,65 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
                             frame=pl.DataFrame(),
                             error=f"{type(exc).__name__}: {exc}",
                         )
-                    completed[day] = result
+                    consume(result)
                     progress_iter.update(1)
-                    while next_idx < len(dates) and dates[next_idx] in completed:
-                        consume(completed.pop(dates[next_idx]))
-                        next_idx += 1
-            flush_frames(final=True)
-        finally:
-            progress_iter.close()
-
-        if plan.replace_output and not errors and wrote_any:
-            os.replace(working_path, parquet_path)
-            replacement_promoted = True
-            rows = _read_existing_row_count(parquet_path)
-        elif not plan.replace_output:
-            replacement_promoted = True
-
-        coverage_complete, missing_after = _finish_historical_coverage_state(
-            spec,
-            args,
-            output_dir,
-            plan,
-            data_dates=data_dates,
-            empty_dates=empty_dates,
-            errors=errors,
-            replacement_promoted=replacement_promoted,
-        )
+                fill_in_flight()
+        flush_frames(final=True)
     finally:
-        if plan.replace_output:
-            working_path.unlink(missing_ok=True)
+        progress_iter.close()
+
+    resolved_data_dates = set(cache.data_dates) | data_dates
+    resolved_empty_dates = set(cache.empty_dates) | empty_dates
+    resolved_data_dates.difference_update(errors)
+    resolved_empty_dates.difference_update(errors)
+    confirmed_empty_after = (
+        set(resolved_empty_dates)
+        if plan.replace_output
+        else set(plan.confirmed_empty_dates) | set(empty_dates)
+    )
+    confirmed_empty_after.difference_update(
+        resolved_data_dates | set(plan.existing_dates)
+    )
+    confirmed_empty_after.difference_update(errors)
+    confirmed_source_unavailable_after = {
+        day
+        for day in confirmed_empty_after
+        if _known_source_unavailable_reason(spec, day) is not None
+    }
+    staged_unresolved = (
+        plan.all_weekdays - resolved_data_dates - resolved_empty_dates
+    ) | set(errors)
+
+    if (
+        plan.replace_output
+        and not staged_unresolved
+        and wrote_any
+        and working_path.exists()
+    ):
+        _validate_historical_partial_for_publish(
+            spec,
+            working_path,
+            plan.all_weekdays,
+            resolved_empty_dates,
+        )
+        _copy_file_atomic(working_path, parquet_path)
+        replacement_promoted = True
+        rows = _read_existing_row_count(parquet_path)
+    elif not plan.replace_output:
+        replacement_promoted = True
+
+    coverage_complete, missing_after = _finish_historical_coverage_state(
+        spec,
+        args,
+        output_dir,
+        plan,
+        data_dates=resolved_data_dates if plan.replace_output else data_dates,
+        empty_dates=resolved_empty_dates if plan.replace_output else empty_dates,
+        errors=errors,
+        replacement_promoted=replacement_promoted,
+    )
+    if plan.replace_output and not bool(getattr(args, "resume", True)):
+        working_path.unlink(missing_ok=True)
 
     if errors:
         examples = "; ".join(
@@ -1982,7 +5259,7 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
         message = f"{len(errors)} date request(s) failed: {examples}"
     elif not coverage_complete:
         status = "incomplete"
-        message = f"{missing_after} weekday date(s) remain unchecked"
+        message = f"{missing_after} expected date(s) remain unchecked"
     elif fetched_dates or empty_dates:
         status = "ok"
         message = None
@@ -2005,6 +5282,7 @@ def _download_historical(spec: DatasetSpec, args: argparse.Namespace, output_dir
         missing_dates_before=len(plan.missing_before),
         missing_dates_after=missing_after,
         coverage_complete=coverage_complete,
+        source_unavailable_dates=len(confirmed_source_unavailable_after),
     )
 
 
@@ -2329,8 +5607,59 @@ def _print_dataset_list(specs: list[DatasetSpec]) -> None:
         print(f"{spec.name}\t{spec.kind}\t{spec.source}\t{labels}\t{origin}")
 
 
+def _run_selected_downloads(
+    specs: list[DatasetSpec],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> list[DownloadResult]:
+    dependent = [
+        spec for spec in specs if spec.name in TPEX_SESSION_DEPENDENT_DATASETS
+    ]
+
+    def run_batch(batch: list[DatasetSpec], description: str) -> list[DownloadResult]:
+        if not batch:
+            return []
+        return run_parallel_tasks(
+            batch,
+            lambda spec: download_dataset(spec, args, output_dir),
+            max_workers=args.workers,
+            desc=description,
+            unit="dataset",
+            on_error=lambda spec, exc: DownloadResult(
+                spec.name,
+                "failed",
+                0,
+                None,
+                message=str(exc),
+            ),
+        )
+
+    if not dependent:
+        return run_batch(specs, "download:tw_public")
+
+    # The three TPEx feature histories use validated official OHLCV sessions as
+    # their calendar. Complete every independent historical source first so a
+    # same-run tpex_daily_ohlcv baseline is fully audited before dependents plan
+    # or issue any requests. Snapshot feeds remain parallel in phase two.
+    phase_one = [
+        spec
+        for spec in specs
+        if spec.kind == "historical_json_table"
+        and spec.name not in TPEX_SESSION_DEPENDENT_DATASETS
+    ]
+    phase_one_names = {spec.name for spec in phase_one}
+    phase_two = [
+        spec
+        for spec in specs
+        if spec.name not in phase_one_names
+    ]
+    return run_batch(phase_one, "download:tw_public:calendar") + run_batch(
+        phase_two,
+        "download:tw_public:dependent",
+    )
+
+
 def main() -> None:
-    global _RATE_LIMITER
     args = parse_args()
     requested_mode = args.mode
     args.mode = _canonical_mode(args.mode)
@@ -2338,8 +5667,7 @@ def main() -> None:
         raise ValueError("--daily-overlap-days must be >= 1")
     if args.empty_recheck_days < 0:
         raise ValueError("--empty-recheck-days must be >= 0")
-    request_interval = resolve_request_interval("tw_public", args.request_interval)
-    _RATE_LIMITER = SharedRateLimiter(request_interval, name="tw_public")
+    request_interval = _configure_tw_public_rate_limiter(args.request_interval)
     print(f"[tw-public] {describe_rate_limit('tw_public', request_interval)}", flush=True)
     specs = _select_specs(args.datasets)
     if args.mode == "list":
@@ -2350,14 +5678,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "dataset_manifest.json", [asdict(spec) for spec in specs])
 
-    results = run_parallel_tasks(
-        specs,
-        lambda spec: download_dataset(spec, args, output_dir),
-        max_workers=args.workers,
-        desc="download:tw_public",
-        unit="dataset",
-        on_error=lambda spec, exc: DownloadResult(spec.name, "failed", 0, None, message=str(exc)),
-    )
+    results = _run_selected_downloads(specs, args, output_dir)
     results.sort(key=lambda row: row.dataset)
     _write_csv_report(output_dir / "download_report.csv", results)
 
@@ -2366,14 +5687,38 @@ def main() -> None:
         spec.name for spec in specs if spec.kind == "historical_json_table"
     }
     historical_results = [row for row in results if row.dataset in historical_names]
+    source_unavailable_by_dataset = {
+        row.dataset: {
+            "confirmed_dates": row.source_unavailable_dates,
+            "known_ranges": [
+                {
+                    "start": range_start.isoformat(),
+                    "end": range_end.isoformat(),
+                    "reason": reason,
+                }
+                for range_start, range_end, reason in (
+                    TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES.get(row.dataset, ())
+                )
+            ],
+        }
+        for row in historical_results
+        if row.dataset in TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES
+    }
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at_utc": _now_utc(),
         "mode": args.mode,
         "requested_mode": requested_mode,
         "start_date": args.start_date,
         "end_date": resolve_end_date(args.end_date),
         "output_dir": str(output_dir),
+        "request_interval_seconds": request_interval,
+        "configured_requests_per_second": 1.0 / request_interval if request_interval > 0 else None,
+        "rate_limit_scope": "host-global per provider across threads and subprocesses",
+        "rate_limit_basis": provider_rate_limit("tw_public").basis,
+        "require_taiex_session_calendar": bool(
+            getattr(args, "require_taiex_session_calendar", False)
+        ),
         "dataset_count": len(results),
         "ok_count": sum(row.status == "ok" for row in results),
         "up_to_date_count": sum(row.status == "up_to_date" for row in results),
@@ -2389,6 +5734,10 @@ def main() -> None:
         "requested_dates": sum(row.requested_dates for row in results),
         "fetched_dates": sum(row.fetched_dates for row in results),
         "confirmed_empty_dates": sum(row.empty_dates for row in results),
+        "source_unavailable_dates": sum(
+            row.source_unavailable_dates for row in historical_results
+        ),
+        "source_unavailable_by_dataset": source_unavailable_by_dataset,
         "failed_dates": sum(row.failed_dates for row in results),
         "missing_dates_after": sum(row.missing_dates_after for row in results),
         "rows_total": sum(row.rows for row in results),

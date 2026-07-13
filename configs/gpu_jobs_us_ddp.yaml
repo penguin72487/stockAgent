@@ -1,0 +1,14 @@
+# Two-GPU US training. This is one DDP job, not two independent US jobs.
+# Add more physical indices to `gpus` to scale to more local ranks.
+state_dir: artifacts/gpu_jobs/us_ddp
+allow_gpu_sharing: false
+
+jobs:
+  - name: us_ddp
+    enabled: true
+    config: configs/markets/us.yaml
+    gpus: [0, 1]
+    # Match us.yaml so runner.resume=true continues the existing US checkpoints.
+    output_dir: artifacts/markets/us
+    # Host-wide budgets; train.py divides these across the two local ranks.
+    extra_args: ["--cpu-threads", "128", "--torch-compile-threads", "128"]

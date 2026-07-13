@@ -88,7 +88,10 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
     return TransformerBasePortfolioModel(**params).to(_device())
 
 
-@pytest.mark.parametrize("mode", ["full", "axial", "latent", "market_token", "temporal_only"])
+@pytest.mark.parametrize(
+    "mode",
+    ["full", "axial", "latent", "latent_only", "market_token", "temporal_only"],
+)
 def test_attention_modes_forward(mode: str) -> None:
     device = _device()
     model = _make_model(attention_mode=mode).eval()
@@ -108,6 +111,118 @@ def test_attention_modes_forward(mode: str) -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
     assert bool((weights > 0).any().item())
     assert bool((weights < 0).any().item())
+
+
+@pytest.mark.parametrize(
+    ("use_latent_factors", "use_market_tokens", "expected_mode"),
+    [
+        (True, True, "latent"),
+        (True, False, "latent_only"),
+        (False, True, "market_token"),
+        (False, False, "temporal_only"),
+    ],
+)
+def test_bottleneck_switches_select_all_four_compact_paths(
+    use_latent_factors: bool,
+    use_market_tokens: bool,
+    expected_mode: str,
+) -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        use_latent_factors=use_latent_factors,
+        use_market_tokens=use_market_tokens,
+    ).eval()
+    assert model.requested_attention_mode == "market_token"
+    assert model.attention_mode == expected_mode
+    assert model.use_latent_factors is use_latent_factors
+    assert model.use_market_tokens is use_market_tokens
+    assert (model.latent_queries is not None) is use_latent_factors
+    assert (model.market_queries is not None) is use_market_tokens
+    assert bool(model.latent_blocks) is use_latent_factors
+    assert bool(model.stock_read_latent_blocks) is use_latent_factors
+    assert bool(model.market_blocks) is use_market_tokens
+    assert bool(model.stock_read_market_blocks) is use_market_tokens
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, 9:] = False
+    with torch.no_grad():
+        weights, _, aux = model(x, mask, return_aux=True)
+
+    assert weights.shape == (2, 13)
+    assert torch.isfinite(weights).all()
+    assert weights[1, 9:].abs().max().item() < 1e-6
+    assert ("latent_factors" in aux) is use_latent_factors
+    assert ("factor_tokens" in aux) is use_latent_factors
+    assert ("z_factor_context" in aux) is use_latent_factors
+    assert ("market_tokens" in aux) is use_market_tokens
+    assert ("z_market_context" in aux) is use_market_tokens
+    assert ("stock_market_gate" in aux) is use_market_tokens
+    assert ("z_market_delta" in aux) is use_market_tokens
+
+
+def test_compact_switches_reject_enabling_bottleneck_in_full_attention() -> None:
+    with pytest.raises(ValueError, match="cannot enable compact bottlenecks"):
+        _make_model(
+            attention_mode="full",
+            use_latent_factors=True,
+            use_market_tokens=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "use_latent_factors", "use_market_tokens"),
+    [
+        ("latent", True, True),
+        ("market_token", False, True),
+        ("temporal_only", False, False),
+    ],
+)
+def test_explicit_switches_preserve_legacy_preset_state_and_output(
+    mode: str,
+    use_latent_factors: bool,
+    use_market_tokens: bool,
+) -> None:
+    device = _device()
+    legacy = _make_model(attention_mode=mode).eval()
+    explicit = _make_model(
+        attention_mode=mode,
+        use_latent_factors=use_latent_factors,
+        use_market_tokens=use_market_tokens,
+    ).eval()
+    legacy_state = legacy.state_dict()
+    explicit_state = explicit.state_dict()
+    assert legacy_state.keys() == explicit_state.keys()
+    for name in legacy_state:
+        assert torch.equal(legacy_state[name], explicit_state[name]), name
+
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    with torch.no_grad():
+        legacy_weights = legacy(x, mask, return_aux=False)
+        explicit_weights = explicit(x, mask, return_aux=False)
+    assert torch.allclose(legacy_weights, explicit_weights, atol=0.0, rtol=0.0)
+
+
+def test_latent_only_backward_updates_factors_without_market_parameters() -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode="market_token",
+        use_latent_factors=True,
+        use_market_tokens=False,
+    ).train()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+
+    _, _, aux = model(x, mask, return_aux=True)
+    aux["score_logits"].square().mean().backward()
+
+    assert model.latent_queries is not None
+    assert model.latent_queries.grad is not None
+    assert torch.isfinite(model.latent_queries.grad).all()
+    assert model.market_queries is None
+    assert all(not parameter.requires_grad for parameter in model.stock_market_gate.parameters())
 
 
 def test_full_mode_token_guard() -> None:
@@ -1239,3 +1354,19 @@ def test_factory_builds_transformer_base_portfolio_model() -> None:
     assert model.portfolio_output_mode == cfg.training.transformer_base_portfolio.portfolio_output_mode
     if model.attention_mode == "market_token":
         assert len(model.latent_blocks) == 0
+
+
+def test_factory_passes_independent_latent_and_market_switches() -> None:
+    cfg = load_config(Path("configs/experiment_baseline.yaml"))
+    cfg.training.model_name = "transformer_base_portfolio"
+    cfg.training.transformer_base_portfolio.use_latent_factors = True
+    cfg.training.transformer_base_portfolio.use_market_tokens = False
+
+    model = build_model(config=cfg, lookback=8, num_features=21, num_symbols=37)
+
+    assert isinstance(model, TransformerBasePortfolioModel)
+    assert model.attention_mode == "latent_only"
+    assert model.use_latent_factors is True
+    assert model.use_market_tokens is False
+    assert model.latent_queries is not None
+    assert model.market_queries is None

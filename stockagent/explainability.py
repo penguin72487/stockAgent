@@ -4309,6 +4309,7 @@ def load_explanation_context(
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
         feature_zero_fill=config.data.feature_zero_fill,
+        panel_start_date=config.data.panel_start_date,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,
@@ -4721,6 +4722,7 @@ def _run_explainability_for_config(
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,
+            panel_start_date=config.data.panel_start_date,
         )
         folds = build_expanding_year_folds(
             dates=panel.dates,

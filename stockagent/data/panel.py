@@ -97,7 +97,7 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 37
+PANEL_CACHE_VERSION = 38
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -246,6 +246,61 @@ class PanelData:
     @property
     def num_symbols(self) -> int:
         return int(self.features.shape[1])
+
+
+def _normalize_panel_start_date(value: str | date | np.datetime64 | None) -> np.datetime64 | None:
+    if value is None or not str(value).strip():
+        return None
+    text = str(value).strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            "panel_start_date must be an ISO date (YYYY-MM-DD) or null, "
+            f"got {value!r}"
+        ) from exc
+    return np.datetime64(parsed.isoformat(), "D")
+
+
+def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None) -> PanelData:
+    """Apply the declared inclusive model horizon without deleting source history."""
+    if panel_start_date is None:
+        return panel
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+    start = int(np.searchsorted(panel_dates, panel_start_date, side="left"))
+    if start >= int(panel_dates.size):
+        raise ValueError(
+            f"panel_start_date={panel_start_date} is after the last panel date "
+            f"{panel_dates[-1] if panel_dates.size else 'n/a'}"
+        )
+    if start == 0:
+        return panel
+    slc = slice(start, None)
+
+    def sliced(values: np.ndarray | None) -> np.ndarray | None:
+        return None if values is None else values[slc]
+
+    print(
+        f"[panel] applied inclusive panel_start_date={panel_start_date}; "
+        f"kept {panel.num_dates - start}/{panel.num_dates} dates"
+    )
+    return PanelData(
+        dates=panel.dates[slc],
+        symbols=panel.symbols,
+        feature_names=panel.feature_names,
+        features=panel.features[slc],
+        returns_1d=panel.returns_1d[slc],
+        tradable_mask=panel.tradable_mask[slc],
+        can_buy_mask=sliced(panel.can_buy_mask),
+        can_sell_mask=sliced(panel.can_sell_mask),
+        can_short_open_mask=sliced(panel.can_short_open_mask),
+        force_short_cover_mask=sliced(panel.force_short_cover_mask),
+        force_exit_mask=sliced(panel.force_exit_mask),
+        alive_mask=panel.alive_mask[slc],
+        benchmark_returns=panel.benchmark_returns[slc],
+        close_prices=panel.close_prices[slc],
+        daily_volumes=sliced(panel.daily_volumes),
+    )
 
 
 @dataclass(slots=True)
@@ -407,9 +462,12 @@ def _load_external_feature_arrays(
     by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     stock_frame = frame.filter(pl.col("symbol") != market_key)
     official_session_dates = np.empty((0,), dtype="datetime64[ns]")
-    if "_twpub_official_traded" in rule_names and not stock_frame.is_empty():
+    if "_twpub_official_traded" in rule_names and not market_frame.is_empty():
+        # Only the receipt-derived TAIEX market row defines exchange sessions.
+        # Stock rows are sparse and macro market rows can occur on holidays, so
+        # neither is a safe calendar authority.
         official_frame = (
-            stock_frame.filter(pl.col("_twpub_official_traded").fill_null(0.0) > 0.0)
+            market_frame.filter(pl.col("_twpub_official_traded").fill_null(0.0) > 0.0)
             .select("date")
             .unique()
             .sort("date")
@@ -862,6 +920,21 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
     )
 
     return_price = pl.col(_return_price_column(frame, path))
+    return_1d = _polars_price_log_return(
+        return_price.shift(-1),
+        return_price,
+        max_abs_price_log_return,
+    )
+    if "return_quarantined" in frame.columns:
+        return_1d = (
+            pl.when(
+                pl.col("return_quarantined")
+                .cast(pl.Boolean, strict=False)
+                .fill_null(False)
+            )
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(return_1d)
+        )
     close_valid = _polars_not_nan_or_null(pl.col("close"))
     if "Trading_Volume" in frame.columns:
         volume = num("Trading_Volume")
@@ -880,7 +953,7 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
             *_polars_kbar_ratio_expressions(
                 pl.col("open"), pl.col("max"), pl.col("min"), pl.col("close")
             ),
-            _polars_price_log_return(return_price.shift(-1), return_price, max_abs_price_log_return).alias("return_1d"),
+            return_1d.alias("return_1d"),
             _polars_price_log_return(pl.col("open"), pl.col("open").shift(1), max_abs_price_log_return).alias("open_logret_1d"),
             _polars_price_log_return(pl.col("max"), pl.col("max").shift(1), max_abs_price_log_return).alias("max_logret_1d"),
             _polars_price_log_return(pl.col("min"), pl.col("min").shift(1), max_abs_price_log_return).alias("min_logret_1d"),
@@ -1329,6 +1402,9 @@ def _symbol_arrays_from_arrow_table(
     min_logret_1d = _safe_log_ratio_array(low_px, _shift_array(low_px, 1))
     close_logret_1d = _safe_log_ratio_array(close_px, _shift_array(close_px, 1))
     return_1d = _sanitize_price_log_return_array(return_1d, max_abs_price_log_return)
+    if "return_quarantined" in table.column_names:
+        return_quarantined = col("return_quarantined")
+        return_1d[np.isfinite(return_quarantined) & (return_quarantined != 0.0)] = np.nan
     open_logret_1d = _sanitize_price_log_return_array(open_logret_1d, max_abs_price_log_return)
     max_logret_1d = _sanitize_price_log_return_array(max_logret_1d, max_abs_price_log_return)
     min_logret_1d = _sanitize_price_log_return_array(min_logret_1d, max_abs_price_log_return)
@@ -1446,6 +1522,21 @@ def _load_symbol_arrays_polars_lazy(
         )
     lazy = lazy.with_columns(price_columns)
     return_price = pl.col("_adjclose") if "adjclose" in schema_names else pl.col("_close")
+    return_1d = _polars_price_log_return(
+        return_price.shift(-1),
+        return_price,
+        max_abs_price_log_return,
+    )
+    if "return_quarantined" in schema_names:
+        return_1d = (
+            pl.when(
+                pl.col("return_quarantined")
+                .cast(pl.Boolean, strict=False)
+                .fill_null(False)
+            )
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(return_1d)
+        )
     close_valid = _polars_not_nan_or_null(pl.col("_close"))
     if "Trading_Volume" in schema_names:
         volume_missing = pl.col("_volume").is_null() | pl.col("_volume").is_nan().fill_null(False)
@@ -1461,7 +1552,7 @@ def _load_symbol_arrays_polars_lazy(
             *_polars_kbar_ratio_expressions(
                 pl.col("_open"), pl.col("_max"), pl.col("_min"), pl.col("_close")
             ),
-            _polars_price_log_return(return_price.shift(-1), return_price, max_abs_price_log_return).alias("return_1d"),
+            return_1d.alias("return_1d"),
             _polars_price_log_return(pl.col("_open"), pl.col("_open").shift(1), max_abs_price_log_return).alias("open_logret_1d"),
             _polars_price_log_return(pl.col("_max"), pl.col("_max").shift(1), max_abs_price_log_return).alias("max_logret_1d"),
             _polars_price_log_return(pl.col("_min"), pl.col("_min").shift(1), max_abs_price_log_return).alias("min_logret_1d"),
@@ -1581,20 +1672,22 @@ def _build_panel_from_symbol_arrays(
         # calendar admits vendor outliers on exchange holidays and silently
         # shortens every affected model window. The configured benchmark is the
         # canonical session calendar; symbols observed off-calendar are ignored.
-        canonical_dates = [np.unique(symbol_arrays[benchmark_symbol_index].dates)]
-        if external_features is not None and external_features.official_session_dates.size:
-            official_dates = external_features.official_session_dates
-            observed_official = [
-                np.intersect1d(item.dates, official_dates, assume_unique=False)
-                for item in symbol_arrays
-                if item.dates.size
-            ]
-            observed_official = [dates for dates in observed_official if dates.size]
-            if observed_official:
-                canonical_dates.append(np.unique(np.concatenate(observed_official)))
-        all_dates = np.unique(np.concatenate(canonical_dates))
+        all_dates = np.unique(symbol_arrays[benchmark_symbol_index].dates)
     else:
         all_dates = np.unique(np.concatenate(dated_items))
+    if external_features is not None and external_features.official_session_dates.size:
+        # Preserve receipt-verified sessions even when every symbol quote is
+        # absent (for example historical Saturday sessions).  Limit the marker
+        # to the observed panel span so TAIEX's earlier archive does not extend
+        # the configured universe outside its own data range.
+        official_dates = np.unique(external_features.official_session_dates)
+        observed_start = all_dates.min()
+        observed_end = all_dates.max()
+        official_dates = official_dates[
+            (official_dates >= observed_start) & (official_dates <= observed_end)
+        ]
+        if official_dates.size:
+            all_dates = np.unique(np.concatenate([all_dates, official_dates]))
     all_dates.sort()
     num_dates = int(all_dates.size)
     num_symbols = len(symbol_arrays)
@@ -1782,6 +1875,7 @@ def build_tail_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData:
     """Build a panel from only the last rows of each symbol file for live inference."""
     parquet_root = Path(parquet_root)
@@ -1796,6 +1890,7 @@ def build_tail_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
@@ -1880,6 +1975,7 @@ def build_tail_panel(
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _slice_panel_start(panel, normalized_panel_start_date)
     _print_feature_overview(panel)
     return panel
 
@@ -1904,6 +2000,7 @@ def load_cached_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData | None:
     del panel_load_workers
     parquet_root = Path(parquet_root)
@@ -1918,6 +2015,7 @@ def load_cached_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         return None
@@ -1964,7 +2062,8 @@ def load_cached_panel(
         f"external_rules={bool(external_include_rules)}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
-        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}"
+        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"panel_start_date={normalized_panel_start_date}"
     )
     source_paths = [*parquet_paths, *security_metadata_paths]
     if external_feature_path is not None:
@@ -2661,6 +2760,7 @@ def build_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
     external_feature_path = _resolve_external_data_path(
@@ -2674,6 +2774,7 @@ def build_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
@@ -2747,7 +2848,8 @@ def build_panel(
         f"external_rules={bool(external_include_rules)}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
-        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}"
+        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"panel_start_date={normalized_panel_start_date}"
     )
     source_paths = [*parquet_paths, *security_metadata_paths]
     if external_feature_path is not None:
@@ -2820,6 +2922,7 @@ def build_panel(
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _slice_panel_start(panel, normalized_panel_start_date)
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)

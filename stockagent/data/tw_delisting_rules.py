@@ -3,13 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from stockagent.data.tw_security import classify_tw_stock_or_etf
+
 
 _DELISTING_NOTICE_RE = re.compile(
-    r"終止(?:上市|上櫃|櫃檯買賣|在證券商營業處所買賣)"
+    r"終止(?:上市|上櫃|櫃檯買賣|(?:在|於)證券商營業處所買賣)"
 )
 _DELISTING_CANCEL_RE = re.compile(
     r"(?:免除|取消|撤銷)[^。；;\n]{0,160}"
-    r"終止(?:上市|上櫃|櫃檯買賣|在證券商營業處所買賣)"
+    r"終止(?:上市|上櫃|櫃檯買賣|(?:在|於)證券商營業處所買賣)"
 )
 _CONTINUING_SHORT_RESTRICTION_RE = re.compile(
     r"(?:繼續|仍|仍然|維持)[^。；;\n]{0,16}"
@@ -65,6 +67,29 @@ _SYMBOL_LABEL_RE = re.compile(
     r"(?:股票|證券)?\s*(?:代\s*(?:號|碼)|編\s*號)"
     r")\s*[：:=#、，\s（(]*"
     r"(?P<symbol>[0-9]{4,6}[A-Z]?)"
+)
+_CHINESE_SYMBOL_LABEL_RE = re.compile(
+    r"(?P<label>"
+    r"(?:上市|上櫃|興櫃)?(?:普通股|股票|公司|證券|有價證券)?\s*"
+    r"(?:股票|證券)?\s*(?:代\s*(?:號|碼)|編\s*號)"
+    r")\s*[：:=#、，\s（(]*"
+    r"(?P<symbol>[〇○零一二三四五六七八九]{4,6})"
+)
+_CHINESE_DIGITS = str.maketrans(
+    {
+        "〇": "0",
+        "○": "0",
+        "零": "0",
+        "一": "1",
+        "二": "2",
+        "三": "3",
+        "四": "4",
+        "五": "5",
+        "六": "6",
+        "七": "7",
+        "八": "8",
+        "九": "9",
+    }
 )
 _FUND_SYMBOL_RE = re.compile(r"[（(](?P<symbol>0[0-9]{3,5}[A-Z]?)[）)]")
 _FUND_SECURITY_CUE_RE = re.compile(r"(?:ETF|受益憑證|證券投資信託基金)", re.I)
@@ -184,6 +209,12 @@ def extract_stock_symbols(text: str) -> list[str]:
             if last_non_equity >= last_equity:
                 continue
         values.add(match.group("symbol"))
+    # Some early TPEx archive notices spell a stock code digit-by-digit with
+    # Chinese numerals (for example 「股票代號：三一三三」).  Limit conversion to
+    # an explicit symbol label so dates, share counts, and legal citations can
+    # never become securities.
+    for match in _CHINESE_SYMBOL_LABEL_RE.finditer(normalized):
+        values.add(match.group("symbol").translate(_CHINESE_DIGITS))
     # Fund notices commonly put the ETF code in parentheses after the full
     # fund name without a literal 「證券代號」 label (for example 00925).
     # Leading zero plus an explicit fund/beneficiary-certificate cue keeps this
@@ -191,7 +222,11 @@ def extract_stock_symbols(text: str) -> list[str]:
     if _FUND_SECURITY_CUE_RE.search(normalized):
         for match in _FUND_SYMBOL_RE.finditer(normalized):
             values.add(match.group("symbol"))
-    return sorted(values)
+    return sorted(
+        symbol
+        for symbol in values
+        if classify_tw_stock_or_etf(symbol) is not None
+    )
 
 
 def _event_clauses(text: str, event_pattern: re.Pattern[str]) -> list[str]:
@@ -229,6 +264,8 @@ def _company_name_keys(text: str) -> list[str]:
 def _named_symbol_pairs(text: str) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for match in _NAMED_SYMBOL_PAIR_RE.finditer(str(text or "").upper()):
+        if classify_tw_stock_or_etf(match.group("symbol")) is None:
+            continue
         name = re.sub(r"(?:股份有限公司|有限公司)$", "", match.group("name"))
         name = re.sub(r"(?:-?KY)$", "", name)
         name = re.sub(r"[^A-Z0-9\u3400-\u9fff]", "", name)

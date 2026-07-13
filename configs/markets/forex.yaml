@@ -247,9 +247,13 @@ training:
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
+    # latent_only: temporal + latent factors without market tokens
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
     attention_mode: market_token
+    # Independent compact-bottleneck switches; null falls back to attention_mode.
+    use_latent_factors: null
+    use_market_tokens: null
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true

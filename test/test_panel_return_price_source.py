@@ -312,7 +312,9 @@ def test_official_session_restores_benchmark_missing_market_day(tmp_path: Path) 
     pl.DataFrame(
         {
             "date": ["2024-01-03"],
-            "symbol": ["2317"],
+            # Only the receipt-verified market row is a calendar authority;
+            # sparse per-stock traded markers must not manufacture sessions.
+            "symbol": ["__MARKET__"],
             "_twpub_official_traded": [1.0],
         }
     ).write_parquet(external_path)
