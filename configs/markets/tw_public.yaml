@@ -8,7 +8,7 @@ runner:
   resume: true
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 1
+  start_fold: 3
 environment:
   device: cuda
   use_tensor_cores: true
@@ -213,32 +213,7 @@ data:
     - twpub_taifex_tx_large_oi_log
     - twpub_taifex_tx_final_settlement_logret
   feature_exclude: []
-  # These families do not yet satisfy the point-in-time contract. Keep their
-  # schema slots stable, but quarantine their values until revision-aware or
-  # historical-vintage receipts exist.
-  feature_zero_fill:
-    # Only the latest cumulative-revenue snapshot is currently available.
-    - twpub_cumulative_revenue_yoy
-    # These selected schema slots do not yet have an audit registry entry with
-    # both source receipts and point-in-time availability semantics.
-    - twpub_dividend_per_share_log
-    - twpub_dividend_cash_per_share
-    - twpub_dividend_stock_per_share
-    - twpub_dividend_total_*
-    - twpub_dividend_confirmed
-    - twpub_dividend_board_approved
-    - twpub_exdiv_*
-    - twpub_material_*
-    - twpub_attention_*
-    - twpub_disposal_*
-    - twpub_twse_*
-    - twpub_usdtwd_*
-    - twpub_cbc_*
-    - twpub_taifex_*
-    # Current DGBAS/MOF files are single-vintage archives; a fixed release lag
-    # cannot reconstruct revisions that were knowable in historical folds.
-    - twpub_dgbas_*
-    - twpub_mof_*
+  feature_zero_fill: []
   # tradable_mode: tradable
 
 walk_forward:
