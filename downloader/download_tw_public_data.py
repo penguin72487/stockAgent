@@ -1097,8 +1097,36 @@ def _http_get(
         "X-Requested-With": "XMLHttpRequest",
     }
     retry_count = max(0, int(retries))
-    transient_statuses = {403, 408, 429, 500, 502, 503, 504}
+    # TWSE's edge returns a location-less 307 when its request-rate guard trips.
+    # Treat it as throttling rather than a permanent dataset failure.
+    transient_statuses = {307, 403, 408, 429, 500, 502, 503, 504}
     last_error: requests.exceptions.RequestException | None = None
+
+    def request_once(session: requests.Session, *, verify: bool) -> requests.Response:
+        started = time.monotonic()
+        response = session.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=(timeout, timeout),
+            verify=verify,
+            stream=True,
+        )
+        try:
+            chunks: list[bytes] = []
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    chunks.append(chunk)
+                if time.monotonic() - started > timeout:
+                    raise requests.exceptions.Timeout(
+                        f"response exceeded {timeout}s wall timeout: {response.url}"
+                    )
+            response._content = b"".join(chunks)
+            response._content_consumed = True
+            return response
+        except BaseException:
+            response.close()
+            raise
 
     for attempt in range(retry_count + 1):
         try:
@@ -1106,13 +1134,14 @@ def _http_get(
                 _RATE_LIMITER.wait()
             session = _http_session()
             try:
-                response = session.get(url, params=params, headers=headers, timeout=timeout, verify=verify_ssl)
+                response = request_once(session, verify=verify_ssl)
             except requests.exceptions.SSLError:
                 if not verify_ssl:
                     raise
                 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-                response = session.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+                response = request_once(session, verify=False)
             if response.status_code in transient_statuses and attempt < retry_count:
+                response.close()
                 time.sleep(_retry_delay_seconds(response, attempt, retry_backoff))
                 continue
             response.raise_for_status()
@@ -1136,6 +1165,8 @@ def _retry_delay_seconds(response: requests.Response | None, attempt: int, retry
                 return min(60.0, max(0.0, float(retry_after)))
             except ValueError:
                 pass
+        if response.status_code == 307 and not response.headers.get("Location"):
+            return min(120.0, 30.0 * (2**attempt))
     return max(0.0, float(retry_backoff)) * (2**attempt)
 
 
@@ -1719,6 +1750,50 @@ def _download_historical_date(
         url = spec.url_template.format(date=_format_date(day, spec.date_format))
         response_kind = "json"
     try:
+        raw_suffix = ".html" if response_kind == "archive_html" else ".json"
+        raw_names = [spec.name]
+        raw_names.extend(
+            candidate.name
+            for candidate in DEFAULT_DATASETS.values()
+            if candidate.name != spec.name
+            and candidate.kind == "historical_json_table"
+            and candidate.url_template == spec.url_template
+            and candidate.date_format == spec.date_format
+        )
+        cached_raw = next(
+            (
+                candidate
+                for name in raw_names
+                if (
+                    candidate := output_dir
+                    / "raw"
+                    / name
+                    / f"{day.isoformat()}{raw_suffix}"
+                ).is_file()
+            ),
+            None,
+        )
+        if cached_raw is not None:
+            raw_content = cached_raw.read_bytes()
+            if response_kind == "archive_html":
+                decoded, _ = _decode_bytes(raw_content)
+                frame = _parse_tpex_daily_quotes_html(decoded, day)
+            else:
+                payload = json.loads(raw_content)
+                status_error = _json_payload_status_error(payload)
+                if status_error is not None:
+                    raise RuntimeError(f"cached official response status is not OK: {status_error}")
+                if response_kind == "legacy_json_html":
+                    frame = _parse_tpex_daily_quotes_html(str(payload.get("html", "")), day)
+                else:
+                    frame = _parse_json_table_payload(payload, spec, day)
+            return HistoricalDateResult(
+                day=day,
+                url=url,
+                frame=frame,
+                raw_path=str(cached_raw),
+            )
+
         response = _http_get(
             url,
             timeout=args.timeout,
@@ -1729,7 +1804,6 @@ def _download_historical_date(
         if response_kind == "archive_html":
             decoded, _ = _decode_bytes(response.content)
             frame = _parse_tpex_daily_quotes_html(decoded, day)
-            raw_suffix = ".html"
         else:
             payload = response.json()
             status_error = _json_payload_status_error(payload)
@@ -1739,9 +1813,8 @@ def _download_historical_date(
                 frame = _parse_tpex_daily_quotes_html(str(payload.get("html", "")), day)
             else:
                 frame = _parse_json_table_payload(payload, spec, day)
-            raw_suffix = ".json"
         raw_path: Path | None = None
-        if not frame.is_empty() and not args.skip_raw:
+        if not args.skip_raw:
             raw_path = _write_raw(
                 response.content,
                 output_dir / "raw" / spec.name,

@@ -1,3 +1,7 @@
+
+model_context_window = 272000
+model_auto_compact_token_limit = 240000
+
 sandbox_mode = "danger-full-access"
 approval_policy = "never"
 
@@ -5,7 +9,9 @@ approval_policy = "never"
 trust_level = "trusted"
 
 [network]
-dns_servers = ["8.8.8.8", "8.8.4.4"]
+dns_servers = ["8.8.8.8", "8.8.4.4" , "1.1.1.1"]
 
 [sandbox]
 network_isolation = false
+
+
