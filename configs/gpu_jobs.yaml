@@ -1,0 +1,23 @@
+# This file assigns physical GPU indices to existing market configurations.
+# The market YAML remains the source of truth for model/data/training settings.
+state_dir: artifacts/gpu_jobs
+allow_gpu_sharing: false
+
+defaults:
+  enabled: true
+
+jobs:
+  - name: us
+    config: configs/markets/us.yaml
+    gpus: [0]
+
+  - name: us
+    config: configs/markets/us.yaml
+    gpus: [1]
+
+  # Multi-GPU/DDP example (enable only when the referenced market config uses DDP):
+  # - name: tw_parallel
+  #   config: configs/markets/tw_parallel.yaml
+  #   gpus: [2, 3]
+  #   env:
+  #     OMP_NUM_THREADS: "16"

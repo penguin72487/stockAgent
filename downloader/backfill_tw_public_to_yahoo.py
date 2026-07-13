@@ -238,7 +238,36 @@ def _public_ohlcv_frame(input_dir: Path, symbols: set[str], start: date | None, 
         )
     if not frames:
         return pl.DataFrame()
-    lazy = pl.concat(frames, how="vertical_relaxed").drop_nulls(["date", "symbol", "close"])
+    lazy = pl.concat(frames, how="vertical_relaxed").drop_nulls(["date", "symbol"])
+    positive_finite_ohlc = pl.all_horizontal(
+        *[
+            pl.col(column).is_not_null()
+            & pl.col(column).is_finite()
+            & (pl.col(column) > 0.0)
+            for column in ("open", "max", "min", "close")
+        ]
+    )
+    valid_ohlc_geometry = (
+        pl.col("max") >= pl.max_horizontal("open", "min", "close")
+    ) & (
+        pl.col("min") <= pl.min_horizontal("open", "max", "close")
+    )
+    valid_volume = (
+        pl.col("Trading_Volume").is_not_null()
+        & pl.col("Trading_Volume").is_finite()
+        & (pl.col("Trading_Volume") >= 0.0)
+    )
+    # This legacy overlay has no row-level normalization or provenance fields.
+    # Accept only ordinary, fully usable official bars so a TPEx sentinel such
+    # as O=H=L=0 (with either zero or positive close) cannot overwrite a valid
+    # Yahoo quote.  The canonical official symbol builder handles the approved
+    # positive-close sentinel separately and records that transformation.
+    lazy = lazy.filter(
+        (pl.col("symbol") != "")
+        & positive_finite_ohlc
+        & valid_ohlc_geometry
+        & valid_volume
+    )
     if symbols:
         lazy = lazy.filter(pl.col("symbol").is_in(sorted(symbols)))
     if start is not None:

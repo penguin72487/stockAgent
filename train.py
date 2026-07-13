@@ -5,7 +5,9 @@ import atexit
 import json
 import os
 import random
+import signal
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -23,8 +25,101 @@ from stockagent.config import load_config
 from stockagent.runtime_env import normalize_cuda_env
 
 
+class _StartupTimingRecorder:
+    """Record the launcher-to-trainer critical path on rank 0.
+
+    The root monotonic timestamp is inherited through the torchrun relaunch, so
+    DDP launcher/process startup is visible instead of disappearing at exec().
+    Records are buffered until the configured output directory is known.
+    """
+
+    def __init__(self) -> None:
+        process_started_ns = time.monotonic_ns()
+        root_started_raw = os.environ.get("STOCKAGENT_ROOT_LAUNCH_MONOTONIC_NS")
+        if root_started_raw is None:
+            root_started_ns = process_started_ns
+            os.environ["STOCKAGENT_ROOT_LAUNCH_MONOTONIC_NS"] = str(root_started_ns)
+            os.environ.setdefault(
+                "STOCKAGENT_RUN_ID",
+                f"{int(time.time())}-{os.getpid()}",
+            )
+        else:
+            try:
+                root_started_ns = int(root_started_raw)
+            except ValueError:
+                root_started_ns = process_started_ns
+        self.root_started_ns = root_started_ns
+        self.previous_ns = process_started_ns
+        self.path: Path | None = None
+        self.pending: list[dict[str, object]] = []
+        if process_started_ns > root_started_ns:
+            self._record(
+                "ddp_launcher_and_child_process_start",
+                elapsed_s=(process_started_ns - root_started_ns) / 1e9,
+                cumulative_s=(process_started_ns - root_started_ns) / 1e9,
+            )
+
+    @staticmethod
+    def _is_rank0() -> bool:
+        return int(os.environ.get("RANK", "0")) == 0
+
+    def _record(
+        self,
+        stage: str,
+        *,
+        elapsed_s: float,
+        cumulative_s: float,
+        **details: object,
+    ) -> None:
+        payload: dict[str, object] = {
+            "run_id": os.environ.get("STOCKAGENT_RUN_ID", "unknown"),
+            "stage": str(stage),
+            "elapsed_s": float(elapsed_s),
+            "cumulative_s": float(cumulative_s),
+            "rank": int(os.environ.get("RANK", "0")),
+            "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+            **details,
+        }
+        if self.path is None:
+            self.pending.append(payload)
+            return
+        self._write(payload)
+
+    def _write(self, payload: Mapping[str, object]) -> None:
+        if not self._is_rank0() or self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(payload), ensure_ascii=False, default=str) + "\n")
+        print(
+            f"[startup timing] stage={payload['stage']} "
+            f"elapsed={float(payload['elapsed_s']):.3f}s "
+            f"cumulative={float(payload['cumulative_s']):.3f}s",
+            flush=True,
+        )
+
+    def bind(self, path: Path) -> None:
+        self.path = path
+        pending, self.pending = self.pending, []
+        for payload in pending:
+            self._write(payload)
+
+    def checkpoint(self, stage: str, **details: object) -> float:
+        now_ns = time.monotonic_ns()
+        elapsed_s = (now_ns - self.previous_ns) / 1e9
+        cumulative_s = (now_ns - self.root_started_ns) / 1e9
+        self.previous_ns = now_ns
+        self._record(
+            stage,
+            elapsed_s=elapsed_s,
+            cumulative_s=cumulative_s,
+            **details,
+        )
+        return elapsed_s
+
+
 def _normalize_multi_gpu_strategy(value: object) -> str:
-    strategy = str(value or "none").strip().lower().replace("-", "_")
+    strategy = str(value or "auto").strip().lower().replace("-", "_")
     aliases = {
         "": "none",
         "0": "none",
@@ -40,10 +135,18 @@ def _normalize_multi_gpu_strategy(value: object) -> str:
     return aliases.get(strategy, strategy)
 
 
+def _resolve_multi_gpu_strategy(value: object) -> str:
+    """Resolve auto from the GPUs made visible by the process launcher."""
+    strategy = _normalize_multi_gpu_strategy(value)
+    if strategy == "auto":
+        return "distributed_data_parallel" if torch.cuda.device_count() > 1 else "none"
+    return strategy
+
+
 def _maybe_relaunch_for_ddp(config, args: argparse.Namespace) -> None:
-    strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
+    strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     if args.multi_gpu_strategy is not None:
-        strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+        strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
     if strategy != "distributed_data_parallel":
         return
     if int(os.environ.get("WORLD_SIZE", "1")) > 1 or os.environ.get("STOCKAGENT_DDP_LAUNCHED") == "1":
@@ -246,6 +349,23 @@ def _configure_cpu_parallelism(
     )
 
 
+def _install_graceful_termination_handlers() -> None:
+    """Let Python atexit clean Inductor workers after torchrun termination."""
+
+    def _handle_termination(signum, _frame) -> None:
+        print(
+            f"[runtime] received signal {signum}; exiting through atexit so "
+            "TorchInductor/DDP workers are cleaned up",
+            flush=True,
+        )
+        raise SystemExit(128 + int(signum))
+
+    replaceable = {signal.SIG_DFL, None, signal.default_int_handler}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        if signal.getsignal(signum) in replaceable:
+            signal.signal(signum, _handle_termination)
+
+
 def _configure_cuda_runtime(*, cudnn_benchmark: bool = True) -> None:
     normalize_cuda_env()
     if not torch.cuda.is_available():
@@ -335,6 +455,7 @@ def _build_panel_kwargs(config) -> dict:
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "panel_start_date": config.data.panel_start_date,
     }
 
 
@@ -521,7 +642,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--multi-gpu-strategy",
-        choices=("none", "distributed_data_parallel", "ddp"),
+        choices=("auto", "none", "distributed_data_parallel", "ddp"),
         default=None,
         help="Override training.multi_gpu_strategy for efficiency A/B runs.",
     )
@@ -756,12 +877,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    startup_timing = _StartupTimingRecorder()
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
     _maybe_relaunch_for_ddp(config, args)
-    config_strategy = _normalize_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "none"))
-    cli_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
+    _install_graceful_termination_handlers()
+    config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
+    cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = cli_strategy or config_strategy
     configured_cpu_threads = args.cpu_threads if args.cpu_threads is not None else config.environment.cpu_threads
     compile_threads = (
@@ -782,10 +905,19 @@ def main() -> None:
     )
     from stockagent.training.trainer import run_inference, run_training
 
+    startup_timing.checkpoint(
+        "arguments_config_and_runtime_imports",
+        config_path=str(Path(args.config).resolve()),
+        active_strategy=str(active_strategy),
+    )
+
     if args.seed is not None:
         config.training.seed = int(args.seed)
     if args.multi_gpu_strategy is not None:
-        config.training.multi_gpu_strategy = _normalize_multi_gpu_strategy(args.multi_gpu_strategy)
+        config.training.multi_gpu_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy)
+    else:
+        # Downstream trainer code consumes the concrete runtime strategy.
+        config.training.multi_gpu_strategy = active_strategy
     if args.cudnn_benchmark is not None:
         config.environment.cudnn_benchmark = bool(args.cudnn_benchmark)
     if args.batch_size_train is not None:
@@ -916,6 +1048,12 @@ def main() -> None:
         os.environ["STOCKAGENT_COMPILE_LOSS"] = "1" if config.training.compile_loss else "0"
 
     output_dir = args.output_dir if args.output_dir is not None else config.runner.output_dir
+    startup_timing.bind(Path(output_dir) / "startup_timing.jsonl")
+    startup_timing.checkpoint(
+        "config_overrides_cuda_and_ddp_init",
+        cuda_available=bool(torch.cuda.is_available()),
+        cuda_device_count=int(torch.cuda.device_count()),
+    )
     mode = args.mode if args.mode is not None else config.runner.mode
     resume = args.resume if args.resume is not None else config.runner.resume
     if args.retrain_completed_folds is not None:
@@ -939,6 +1077,12 @@ def main() -> None:
         print("[runner] CUDA unavailable; falling back to CPU because runner.require_cuda=false")
 
     panel = _build_panel_rank_coordinated(build_panel, config, active_strategy)
+    startup_timing.checkpoint(
+        "panel_build_or_cache_load",
+        rows=int(panel.num_dates),
+        symbols=int(panel.num_symbols),
+        features=int(len(panel.feature_names)),
+    )
     validate_walk_forward_year_contract(
         panel.dates,
         expected_first_year=config.walk_forward.expected_first_year,
@@ -949,6 +1093,10 @@ def main() -> None:
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+    )
+    startup_timing.checkpoint(
+        "walk_forward_validation_and_fold_build",
+        folds=int(len(all_folds)),
     )
     folds = list(all_folds)
     if start_fold is not None:
@@ -969,6 +1117,12 @@ def main() -> None:
         original_count = len(folds)
         folds = folds[: int(args.max_folds)]
         print(f"[runner] max_folds={args.max_folds}: selected {len(folds)}/{original_count} folds")
+    startup_timing.checkpoint(
+        "fold_filtering_and_trainer_handoff",
+        selected_folds=int(len(folds)),
+        mode=str(mode),
+        resume=bool(resume),
+    )
     if mode == "infer":
         results = run_inference(
             panel,

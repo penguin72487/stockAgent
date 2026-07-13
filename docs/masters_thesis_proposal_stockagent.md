@@ -375,7 +375,7 @@ $$
 
 ### （十三）消融與穩健性分析
 
-1. 注意力模式：full、axial、latent、market-token、temporal-only。
+1. 注意力模式：full、axial、latent、latent-only、market-token、temporal-only。
 2. 權杖設計：靜態或動態權杖；不同市場權杖數；移除 mean、std 或 dispersion。
 3. 時間設計：不同 lookback；last-only 與完整時間查詢。
 4. 投資目標：Rank IC、log utility、兩階段訓練及多任務組合。
@@ -404,7 +404,8 @@ $$
 2. 完成動態面板、特徵、報酬標籤、漲跌停買賣遮罩與無洩漏測試。
 3. 以現有 `min_trade_weight` 建立權重門檻敏感度實驗。
 4. 建立全市場等權、簡單動能/反轉與樹模型基準。
-5. 訓練 temporal-only、latent、market-token 等 Transformer 模型，完成 walk-forward。
+5. 訓練 temporal-only、latent-only、latent（factor+market）、market-token 等
+   Transformer 模型，完成 walk-forward。
 6. 完成整數股數回測與連續權重回測差異分析。
 7. 蒐集或串接當沖、融資融券、券源、暫停交易類別等公開制度資料。
 8. 實作交易規則層，先採規則式後處理，再評估聯合決策模型。

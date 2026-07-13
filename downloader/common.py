@@ -3,11 +3,19 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+import hashlib
 import os
+from pathlib import Path
 import threading
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import TypeVar
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 
 from tqdm import tqdm
 
@@ -57,7 +65,7 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         provider="frankfurter_public",
         requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
         seconds=1,
-        basis="default policy; no documented special request limit",
+        basis="client-side safety policy; no upstream numeric limit documented",
         source_url="https://frankfurter.dev/",
         note="No daily/monthly caps are published; keep a configurable client-side cap.",
     ),
@@ -65,9 +73,23 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         provider="tw_public",
         requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
         seconds=1,
-        basis="default policy; no documented special request limit",
+        basis="client-side safety policy; no upstream numeric limit documented",
         source_url="https://openapi.twse.com.tw/",
-        note="TWSE/TPEx historical web endpoints do not publish a stable hard rate limit.",
+        note=(
+            "Default 10 req/s is a stockAgent policy, not an official "
+            "TWSE/TPEx/data.gov.tw limit."
+        ),
+    ),
+    "yahoo_finance": ProviderRateLimit(
+        provider="yahoo_finance",
+        requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
+        seconds=1,
+        basis="client-side safety policy; no upstream numeric limit documented",
+        source_url="https://finance.yahoo.com/",
+        note=(
+            "CLI default is 10 req/s when no interval is supplied. Large TW "
+            "fallback bootstraps explicitly use a slower 1.5-second interval."
+        ),
     ),
     "alpaca_market_data_basic": ProviderRateLimit(
         provider="alpaca_market_data_basic",
@@ -81,21 +103,111 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
 
 
 class SharedRateLimiter:
-    def __init__(self, interval_seconds: float, *, name: str = "rate-limit") -> None:
+    def __init__(
+        self,
+        interval_seconds: float,
+        *,
+        name: str = "rate-limit",
+        state_dir: str | Path | None = None,
+    ) -> None:
         self.interval_seconds = max(0.0, float(interval_seconds))
         self.name = str(name)
         self._lock = threading.Lock()
         self._next_time = 0.0
 
+        root_value = state_dir or os.environ.get("STOCKAGENT_RATE_LIMIT_DIR")
+        if root_value is None:
+            uid = getattr(os, "getuid", lambda: "user")()
+            root_value = Path(tempfile.gettempdir()) / f"stockagent-rate-limits-{uid}"
+        root = Path(root_value)
+        digest = hashlib.sha256(self.name.encode("utf-8")).hexdigest()[:20]
+        self._state_path = root / f"{digest}.state"
+
+    def _claim_process_shared(self) -> tuple[bool, float]:
+        """Claim the current slot only when it is ready.
+
+        A caller that is too early gets a delay but does not reserve a future
+        slot.  It must sleep and retry, which lets a concurrent ``defer()``
+        extend the provider-wide cooldown before the request is sent.
+        """
+        if fcntl is None:
+            with self._lock:
+                now = time.monotonic()
+                wait_s = max(0.0, self._next_time - now)
+                if wait_s > 0.0:
+                    return False, wait_s
+                self._next_time = now + self.interval_seconds
+                return True, 0.0
+
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self._state_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                raw = handle.read().strip()
+                try:
+                    next_time = float(raw) if raw else 0.0
+                except ValueError:
+                    next_time = 0.0
+                now = time.monotonic()
+                # /tmp may survive a container or host restart while CLOCK_MONOTONIC
+                # restarts from zero. Ignore an implausibly distant stale reservation.
+                if next_time - now > max(300.0, self.interval_seconds * 100_000.0):
+                    next_time = 0.0
+                wait_s = max(0.0, next_time - now)
+                claimed = wait_s <= 0.0
+                if claimed:
+                    next_time = now + self.interval_seconds
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(f"{next_time:.9f}\n")
+                    handle.flush()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return claimed, wait_s
+
+    def _defer_process_shared(self, seconds: float) -> None:
+        if fcntl is None:
+            with self._lock:
+                now = time.monotonic()
+                self._next_time = max(self._next_time, now + seconds)
+            return
+
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self._state_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                raw = handle.read().strip()
+                try:
+                    next_time = float(raw) if raw else 0.0
+                except ValueError:
+                    next_time = 0.0
+                now = time.monotonic()
+                if next_time - now > max(300.0, self.interval_seconds * 100_000.0):
+                    next_time = 0.0
+                next_time = max(next_time, now + seconds)
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"{next_time:.9f}\n")
+                handle.flush()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def wait(self) -> None:
         if self.interval_seconds <= 0.0:
             return
-        with self._lock:
-            now = time.monotonic()
-            wait_s = max(0.0, self._next_time - now)
-            self._next_time = max(now, self._next_time) + self.interval_seconds
-        if wait_s > 0.0:
-            time.sleep(wait_s)
+        while True:
+            claimed, wait_s = self._claim_process_shared()
+            if claimed:
+                return
+            if wait_s > 0.0:
+                time.sleep(wait_s)
+
+    def defer(self, seconds: float) -> None:
+        delay = max(0.0, float(seconds))
+        if delay > 0.0:
+            self._defer_process_shared(delay)
 
 
 def provider_rate_limit(provider: str) -> ProviderRateLimit:
@@ -106,7 +218,7 @@ def provider_rate_limit(provider: str) -> ProviderRateLimit:
         provider=key or "unspecified",
         requests=DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND,
         seconds=1,
-        basis="default policy; no documented special request limit",
+        basis="client-side safety policy; no upstream numeric limit documented",
         source_url="n/a",
         note="Unregistered providers default to 10 requests per second.",
     )
@@ -134,7 +246,7 @@ def resolve_request_interval(
     if value < floor:
         print(
             f"[rate-limit] provider={profile.provider} requested_interval={value:.6f}s "
-            f"below_limit_interval={floor:.6f}s; clamped basis={profile.basis}",
+            f"below_policy_interval={floor:.6f}s; clamped basis={profile.basis}",
             flush=True,
         )
         return floor
