@@ -15,6 +15,7 @@ from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import load_model_from_checkpoint
 from stockagent.training.trainer import (
+    _align_panel_to_state_dict_universe,
     _checkpoint_manifest,
     _atomic_torch_save,
     _capture_rng_state,
@@ -27,6 +28,31 @@ from stockagent.training.trainer import (
     _validate_checkpoint_effective_train_batch_size,
     _validate_checkpoint_manifest,
 )
+
+
+def test_checkpoint_alignment_treats_weight_table_as_authoritative_universe(tmp_path: Path) -> None:
+    panel = _panel()
+    fold_dir = tmp_path / "fold_00"
+    fold_dir.mkdir()
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table(
+            {
+                "date": ["2024-01-02"],
+                "1101": [0.1],
+                "2330": [0.2],
+                "0050": [0.3],
+            }
+        ),
+        fold_dir / "daily_weights.parquet",
+    )
+    state_dict = {"symbol_position": torch.zeros((1, 1, 2, 8))}
+
+    aligned = _align_panel_to_state_dict_universe(panel, fold_dir, state_dict)
+
+    assert aligned is panel
 
 
 def _panel() -> PanelData:
@@ -185,6 +211,86 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         mutate(changed_config)
         changed = _checkpoint_manifest(panel, changed_config)["fingerprints"]
         assert changed[expected_layer] != baseline[expected_layer]
+
+
+def test_transformer_bottleneck_switches_are_semantic_and_legacy_compatible() -> None:
+    panel = _panel()
+    baseline_config = _config()
+    baseline = _checkpoint_manifest(panel, baseline_config)
+    baseline_model = baseline["contracts"]["model"]["model"]
+    assert baseline_model["attention_mode"] == "market_token"
+
+    explicit_legacy_config = copy.deepcopy(baseline_config)
+    explicit_legacy_config.training.transformer_base_portfolio.use_latent_factors = False
+    explicit_legacy_config.training.transformer_base_portfolio.use_market_tokens = True
+    explicit_legacy = _checkpoint_manifest(panel, explicit_legacy_config)
+    assert explicit_legacy["fingerprints"] == baseline["fingerprints"]
+    assert (
+        explicit_legacy["legacy_fingerprints"]
+        == baseline["legacy_fingerprints"]
+    )
+
+    cross_preset_config = copy.deepcopy(baseline_config)
+    cross_preset_config.training.transformer_base_portfolio.attention_mode = "latent"
+    cross_preset_config.training.transformer_base_portfolio.use_latent_factors = False
+    cross_preset_config.training.transformer_base_portfolio.use_market_tokens = True
+    cross_preset = _checkpoint_manifest(panel, cross_preset_config)
+    assert cross_preset["fingerprints"] == baseline["fingerprints"]
+    assert (
+        cross_preset["compatibility_fingerprints"]
+        == baseline["compatibility_fingerprints"]
+    )
+    assert cross_preset["legacy_fingerprints"] == baseline["legacy_fingerprints"]
+
+    latent_only_config = copy.deepcopy(baseline_config)
+    latent_only_config.training.transformer_base_portfolio.use_latent_factors = True
+    latent_only_config.training.transformer_base_portfolio.use_market_tokens = False
+    latent_only = _checkpoint_manifest(panel, latent_only_config)
+    latent_only_model = latent_only["contracts"]["model"]["model"]
+    assert latent_only_model["attention_mode"] == "latent_only"
+    assert "num_latent_factors" in latent_only_model
+    assert "num_market_tokens" not in latent_only_model
+    assert latent_only["fingerprints"]["model"] != baseline["fingerprints"]["model"]
+    assert latent_only["fingerprints"]["training"] == baseline["fingerprints"]["training"]
+
+    changed_inactive_market_count = copy.deepcopy(latent_only_config)
+    changed_inactive_market_count.training.transformer_base_portfolio.num_market_tokens += 3
+    changed_inactive = _checkpoint_manifest(panel, changed_inactive_market_count)
+    assert (
+        changed_inactive["fingerprints"]["model"]
+        == latent_only["fingerprints"]["model"]
+    )
+
+    schema_3_default = baseline["compatibility_contracts"]["schema_3"]
+    assert "use_latent_factors" not in schema_3_default["model"]["model"]
+    assert "use_market_tokens" not in schema_3_default["model"]["model"]
+    assert (
+        "use_latent_factors"
+        not in schema_3_default["training"]["transformer_base_portfolio"]
+    )
+    schema_3_latent_only = latent_only["compatibility_contracts"]["schema_3"]
+    assert schema_3_latent_only["model"]["model"]["attention_mode"] == "latent_only"
+    assert "use_latent_factors" not in schema_3_latent_only["model"]["model"]
+    assert "use_market_tokens" not in schema_3_latent_only["model"]["model"]
+
+
+def test_inactive_transformer_switches_do_not_poison_legacy_training_contract() -> None:
+    panel = _panel()
+    baseline_config = _config()
+    baseline_config.training.model_name = "mlp"
+    baseline = _checkpoint_manifest(panel, baseline_config)
+
+    changed_config = copy.deepcopy(baseline_config)
+    changed_config.training.transformer_base_portfolio.use_latent_factors = True
+    changed_config.training.transformer_base_portfolio.use_market_tokens = False
+    changed = _checkpoint_manifest(panel, changed_config)
+
+    assert changed["fingerprints"] == baseline["fingerprints"]
+    assert (
+        changed["compatibility_fingerprints"]["schema_3"]["training"]
+        == baseline["compatibility_fingerprints"]["schema_3"]["training"]
+    )
+    assert changed["legacy_fingerprints"] == baseline["legacy_fingerprints"]
 
 
 def test_amp_feature_cache_checkpoint_contract_is_default_compatible_and_opt_in_strict(

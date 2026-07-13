@@ -5,7 +5,10 @@ approval_policy = "never"
 trust_level = "trusted"
 
 [network]
-dns_servers = ["8.8.8.8", "8.8.4.4"]
+dns_servers = ["1.1.1.1", "8.8.8.8", "8.8.4.4"]
 
 [sandbox]
 network_isolation = false
+
+model_context_window = 272000
+model_auto_compact_token_limit = 240000

@@ -181,6 +181,58 @@ def test_pyarrow_panel_backend_builds_synthetic_parquet(tmp_path: Path) -> None:
     assert pyarrow_panel.tradable_mask.all()
 
 
+@pytest.mark.parametrize("panel_backend", ["pyarrow", "polars_lazy"])
+def test_panel_start_date_clips_every_date_indexed_tensor_and_cache(
+    tmp_path: Path,
+    panel_backend: str,
+) -> None:
+    module = _load_benchmark_module()
+    if not module._module_available(panel_backend.split("_")[0]):
+        pytest.skip(f"{panel_backend} is unavailable")
+    _write_symbol(tmp_path / "AAA_features.parquet", 0.0)
+
+    panel = build_panel(
+        tmp_path,
+        panel_backend=panel_backend,
+        panel_load_workers=1,
+        panel_start_date="2024-01-04",
+    )
+
+    assert panel.dates.astype("datetime64[D]").astype(str).tolist() == [
+        "2024-01-04",
+        "2024-01-05",
+        "2024-01-06",
+        "2024-01-07",
+        "2024-01-08",
+    ]
+    for values in (
+        panel.features,
+        panel.returns_1d,
+        panel.tradable_mask,
+        panel.can_buy_mask,
+        panel.can_sell_mask,
+        panel.can_short_open_mask,
+        panel.force_short_cover_mask,
+        panel.force_exit_mask,
+        panel.alive_mask,
+        panel.benchmark_returns,
+        panel.close_prices,
+        panel.daily_volumes,
+    ):
+        assert values is not None
+        assert values.shape[0] == 5
+
+    from stockagent.data.panel import load_cached_panel
+
+    cached = load_cached_panel(
+        tmp_path,
+        panel_backend=panel_backend,
+        panel_start_date="2024-01-04",
+    )
+    assert cached is not None
+    assert np.array_equal(cached.dates, panel.dates)
+
+
 def test_panel_security_filter_excludes_us_special_tools_but_keeps_delisted_common(tmp_path: Path) -> None:
     root = tmp_path / "us_stocks"
     root.mkdir()
