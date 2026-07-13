@@ -79,6 +79,37 @@ def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
     ) == 3
 
 
+def test_termination_handlers_use_python_exit_for_atexit_cleanup(monkeypatch) -> None:
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(
+        train_entry.signal,
+        "getsignal",
+        lambda signum: train_entry.signal.SIG_DFL,
+    )
+    monkeypatch.setattr(
+        train_entry.signal,
+        "signal",
+        lambda signum, handler: installed.update({signum: handler}),
+    )
+
+    train_entry._install_graceful_termination_handlers()
+
+    assert set(installed) == {
+        train_entry.signal.SIGTERM,
+        train_entry.signal.SIGINT,
+    }
+    for signum, handler in installed.items():
+        with pytest.raises(SystemExit) as exc_info:
+            handler(signum, None)
+        assert exc_info.value.code == 128 + int(signum)
+
+
+def test_tw_public_caps_ddp_compile_workers_and_reuses_dynamic_loss_graph() -> None:
+    config = train_entry.load_config("configs/markets/tw_public.yaml")
+    assert config.environment.torch_compile_threads == 16
+    assert config.training.compile_loss_dynamic_symbols is True
+
+
 def test_local_world_size_uses_local_not_global_rank_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

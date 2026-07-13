@@ -674,17 +674,29 @@ class _CompiledLossFallback:
         *,
         label: str,
         strict_no_fallback: bool | None = None,
+        dynamic_symbol_axis: bool = False,
+        dynamic_symbol_max: int | None = None,
     ) -> None:
         self._compiled_fn = compiled_fn
         self._eager_fn = eager_fn
         self._label = label
         self._strict_no_fallback = _strict_no_fallback_enabled() if strict_no_fallback is None else bool(strict_no_fallback)
+        self._dynamic_symbol_axis = bool(dynamic_symbol_axis)
+        self._dynamic_symbol_max = (
+            None if dynamic_symbol_max is None else max(1, int(dynamic_symbol_max))
+        )
         self._disabled = False
         self._warned = False
 
     def __call__(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self._disabled:
             return self._eager_fn(*args, **kwargs)
+        if self._dynamic_symbol_axis:
+            _mark_compiled_loss_dynamic_symbol_axis(
+                args,
+                kwargs,
+                max_symbols=self._dynamic_symbol_max,
+            )
         try:
             return self._compiled_fn(*args, **kwargs)
         except RuntimeError as exc:
@@ -711,6 +723,61 @@ class _CompiledLossFallback:
     @property
     def disabled(self) -> bool:
         return self._disabled
+
+
+def _mark_compiled_loss_dynamic_symbol_axis(
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any],
+    *,
+    max_symbols: int | None = None,
+) -> None:
+    """Mark only canonical-loss symbol dimensions dynamic before tracing."""
+    weights = args[0] if args else kwargs.get("weights")
+    if not isinstance(weights, torch.Tensor) or weights.dim() != 2:
+        raise ValueError(
+            "compile_loss_dynamic_symbols requires 2D canonical loss weights [T,S]"
+        )
+    mark_dynamic = getattr(getattr(torch, "_dynamo", None), "mark_dynamic", None)
+    if mark_dynamic is None:
+        raise RuntimeError(
+            "compile_loss_dynamic_symbols requires torch._dynamo.mark_dynamic"
+        )
+
+    rows = int(weights.size(0))
+    symbols = int(weights.size(1))
+    symbol_upper_bound = max(symbols, int(max_symbols or 65_536))
+    seen: set[int] = set()
+
+    def visit(value: Any, *, aux_value: bool = False) -> None:
+        if isinstance(value, torch.Tensor):
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            if (
+                value.dim() >= 2
+                and int(value.size(0)) == rows
+                and int(value.size(1)) == symbols
+            ):
+                # PyTorch 2.12.1 requires a concrete upper bound. The caller
+                # supplies the full panel width, which covers every compacted
+                # fold without forcing Inductor to reason about an arbitrary
+                # million-symbol range.
+                mark_dynamic(value, 1, min=1, max=symbol_upper_bound)
+            elif aux_value and value.dim() == 1 and int(value.size(0)) == symbols:
+                mark_dynamic(value, 0, min=1, max=symbol_upper_bound)
+            return
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                visit(nested, aux_value=aux_value)
+        elif isinstance(value, (tuple, list)):
+            for nested in value:
+                visit(nested, aux_value=aux_value)
+
+    for value in args:
+        visit(value)
+    for name, value in kwargs.items():
+        visit(value, aux_value=name == "aux_outputs")
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -8336,13 +8403,32 @@ def _probe_compiled_loss_forward_backward(
     volume_participation_equity: float,
     weights_dtype: torch.dtype | None = None,
 ) -> tuple[bool, str | None]:
-    """Materialize the real fixed-shape canonical loss graph before epoch 1."""
+    """Materialize the exact canonical-loss input path before epoch 1.
+
+    In DDP, the compiled loss receives autograd-aware gathered model weights,
+    not a leaf tensor created directly at global batch size. Reproduce that
+    collective here so AOTAutograd does not compile a second loss graph in the
+    first real train step.
+    """
     local_error: str | None = None
     try:
+        distributed_probe = bool(
+            _distributed_is_initialized() and _distributed_world_size() > 1
+        )
+        world_size = _distributed_world_size() if distributed_probe else 1
+        rank = _distributed_rank() if distributed_probe else 0
+        if int(batch_size) % int(world_size) != 0:
+            raise ValueError(
+                "compiled loss probe batch size must be divisible by DDP world size; "
+                f"batch_size={batch_size}, world_size={world_size}"
+            )
+        local_batch_size = int(batch_size) // int(world_size)
+        row_start = int(rank) * local_batch_size
+        row_end = row_start + local_batch_size
         prepare_device = _windowed_prepare_device(split, device)
         batch = split.batch_metadata_by_rows(
-            0,
-            int(batch_size),
+            row_start,
+            row_end,
             device=prepare_device,
             non_blocking=False,
         )
@@ -8354,14 +8440,52 @@ def _probe_compiled_loss_forward_backward(
                 if device.type == "cuda" and amp_dtype is not None
                 else torch.float32
             )
-        weights = torch.zeros_like(
+        local_weights = torch.zeros_like(
             batch["future_log_returns"],
             device=device,
             dtype=probe_weights_dtype,
             requires_grad=True,
         )
+        if distributed_probe:
+            weights = _all_gather_autograd(local_weights.contiguous())
+            future_log_returns = _all_gather_no_grad(
+                batch["future_log_returns"].contiguous()
+            )
+            tradable_mask = _all_gather_no_grad(batch["tradable_mask"].contiguous())
+            can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
+            can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
+            can_short_open_mask = _all_gather_no_grad(
+                batch["can_short_open_mask"].contiguous()
+            )
+            force_short_cover_mask = _all_gather_no_grad(
+                batch["force_short_cover_mask"].contiguous()
+            )
+            force_exit_mask = _all_gather_no_grad(batch["force_exit_mask"].contiguous())
+            sample_mask = _all_gather_no_grad(batch["sample_mask"].contiguous())
+            benchmark = _all_gather_no_grad(batch["benchmark"].contiguous())
+            volume_notional = (
+                _all_gather_no_grad(batch["volume_notional"].contiguous())
+                if _volume_participation_enabled(
+                    max_volume_participation,
+                    volume_participation_equity,
+                )
+                and "volume_notional" in batch
+                else None
+            )
+        else:
+            weights = local_weights
+            future_log_returns = batch["future_log_returns"]
+            tradable_mask = batch["tradable_mask"]
+            can_buy_mask = batch["can_buy_mask"]
+            can_sell_mask = batch["can_sell_mask"]
+            can_short_open_mask = batch["can_short_open_mask"]
+            force_short_cover_mask = batch["force_short_cover_mask"]
+            force_exit_mask = batch["force_exit_mask"]
+            sample_mask = batch["sample_mask"]
+            benchmark = batch["benchmark"]
+            volume_notional = batch.get("volume_notional")
         volume_limit_weights = _volume_limit_weights_from_notional(
-            batch.get("volume_notional"),
+            volume_notional,
             max_volume_participation=max_volume_participation,
             volume_participation_equity=volume_participation_equity,
             device=device,
@@ -8378,15 +8502,15 @@ def _probe_compiled_loss_forward_backward(
         with torch.enable_grad(), _autocast_context(device, amp_dtype):
             loss = loss_fn(
                 weights,
-                batch["future_log_returns"],
-                batch["tradable_mask"],
-                benchmark_returns=batch["benchmark"],
-                can_buy_mask=batch["can_buy_mask"],
-                can_sell_mask=batch["can_sell_mask"],
-                can_short_open_mask=batch["can_short_open_mask"],
-                force_short_cover_mask=batch["force_short_cover_mask"],
-                force_exit_mask=batch["force_exit_mask"],
-                sample_mask=batch["sample_mask"],
+                future_log_returns,
+                tradable_mask,
+                benchmark_returns=benchmark,
+                can_buy_mask=can_buy_mask,
+                can_sell_mask=can_sell_mask,
+                can_short_open_mask=can_short_open_mask,
+                force_short_cover_mask=force_short_cover_mask,
+                force_exit_mask=force_exit_mask,
+                sample_mask=sample_mask,
                 volume_limit_weights=volume_limit_weights,
                 aux_outputs=aux_outputs,
                 **dict(loss_kwargs),
@@ -11194,6 +11318,11 @@ def run_training(
     )
 
     warm_start_checkpoint_path: Path | None = None
+    # Reuse one symbolic-S OptimizedFunction across expanding train groups.
+    # This is executor state only; the canonical loss and checkpoint contract
+    # are unchanged.
+    shared_dynamic_compiled_loss_fn: Callable[..., torch.Tensor] | None = None
+    dynamic_loss_symbol_max = max(1, int(len(panel.symbols)))
 
     for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
         train_years = list(train_years_key)
@@ -11872,6 +12001,9 @@ def run_training(
         config_compile_loss = bool(getattr(config.training, "compile_loss", auto_compile_risk))
         default_compile_loss = "1" if config_compile_loss else "0"
         compile_loss = _env_truthy("STOCKAGENT_COMPILE_LOSS", default_compile_loss)
+        compile_loss_dynamic_symbols = bool(
+            getattr(config.training, "compile_loss_dynamic_symbols", False)
+        )
         aux_training_required = _training_needs_aux(
             loss_objective,
             factor_aug_kwargs,
@@ -11964,25 +12096,48 @@ def run_training(
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                             loss_fullgraph = _is_log_utility_objective(loss_objective)
-                            raw_compiled_loss_fn = torch.compile(
-                                eager_loss_fn,
-                                fullgraph=loss_fullgraph,
-                                dynamic=False,
-                                options={"triton.cudagraphs": False},
-                            )
+                            if compile_loss_dynamic_symbols:
+                                if shared_dynamic_compiled_loss_fn is None:
+                                    shared_dynamic_compiled_loss_fn = torch.compile(
+                                        eager_loss_fn,
+                                        fullgraph=loss_fullgraph,
+                                        # mark_dynamic annotates only S before
+                                        # the first call; T remains fixed.
+                                        dynamic=None,
+                                        options={"triton.cudagraphs": False},
+                                    )
+                                raw_compiled_loss_fn = shared_dynamic_compiled_loss_fn
+                            else:
+                                raw_compiled_loss_fn = torch.compile(
+                                    eager_loss_fn,
+                                    fullgraph=loss_fullgraph,
+                                    dynamic=False,
+                                    options={"triton.cudagraphs": False},
+                                )
                             compiled_loss_fn = _CompiledLossFallback(
                                 raw_compiled_loss_fn,
                                 eager_loss_fn,
                                 label=f"Train {train_years}",
+                                dynamic_symbol_axis=compile_loss_dynamic_symbols,
+                                dynamic_symbol_max=(
+                                    dynamic_loss_symbol_max
+                                    if compile_loss_dynamic_symbols
+                                    else None
+                                ),
                             )
                             print(
                                 f"[Train {train_years}] torch.compile loss enabled "
                                 f"(mode=default, fullgraph={loss_fullgraph}, "
-                                "dynamic=False, cudagraphs=False)"
+                                f"dynamic_symbols={compile_loss_dynamic_symbols}, "
+                                "cudagraphs=False)"
                             )
                             loss_compile_status = "enabled:fullgraph" if loss_fullgraph else "enabled"
+                            if compile_loss_dynamic_symbols:
+                                loss_compile_status += ":dynamic_symbols_shared"
                         except Exception as e:
                             compile_setup_error = f"loss compile constructor: {type(e).__name__}: {e}"
+                            if compile_loss_dynamic_symbols:
+                                shared_dynamic_compiled_loss_fn = None
                             if bool(config.training.strict_no_fallback) and not ddp_enabled:
                                 raise RuntimeError(
                                     f"[Train {train_years}] torch.compile loss failed; "
@@ -12000,6 +12155,8 @@ def run_training(
                         )
                 except Exception as e:
                     compile_setup_error = f"model compile constructor: {type(e).__name__}: {e}"
+                    if compile_loss_dynamic_symbols:
+                        shared_dynamic_compiled_loss_fn = None
                     if bool(config.training.strict_no_fallback) and not ddp_enabled:
                         raise RuntimeError(
                             f"[Train {train_years}] torch.compile failed; "
@@ -12140,12 +12297,12 @@ def run_training(
         rank_ordered_compile_probes = bool(
             ddp_enabled
             and _distributed_world_size() > 1
-            and _env_truthy("STOCKAGENT_DDP_SERIALIZE_COMPILE_PROBES", "0")
+            and _env_truthy("STOCKAGENT_DDP_SERIALIZE_COMPILE_PROBES", "1")
         )
         if rank_ordered_compile_probes and _distributed_is_rank0():
             print(
-                f"[Train {train_years}] DDP compile probes run rank-by-rank; "
-                "later ranks reuse the persistent Inductor/Triton cache"
+                f"[Train {train_years}] DDP model compile probe runs rank-by-rank; "
+                "the loss probe runs collectively to match the train hotpath"
             )
 
         model_probe_started = time.perf_counter()
@@ -12216,9 +12373,13 @@ def run_training(
                 if not model_probe_output_dtypes
                 else str(model_probe_output_dtypes[-1])
             ),
+            inductor_compile_threads=int(
+                os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            ),
         )
 
         loss_probe_started = time.perf_counter()
+        loss_probe_rank_ordered = rank_ordered_compile_probes
         if loss_compile_status.startswith("enabled") and not aux_training_required:
             loss_probe_kwargs = {
                 "long_only": config.trading.long_only,
@@ -12250,6 +12411,10 @@ def run_training(
                 "regime_up_threshold": config.training.multitask_loss.regime_up_threshold,
                 "regime_down_threshold": config.training.multitask_loss.regime_down_threshold,
             }
+            # The exact DDP loss input is produced by autograd all-gather, so
+            # every rank must enter this probe together. Compile concurrency is
+            # bounded by environment.torch_compile_threads.
+            loss_probe_rank_ordered = False if ddp_enabled else rank_ordered_compile_probes
             loss_probe_ok, loss_probe_error = _run_distributed_compile_probe(
                 lambda: _probe_compiled_loss_forward_backward(
                     compiled_loss_fn,
@@ -12268,7 +12433,7 @@ def run_training(
                     ),
                 ),
                 device=device,
-                rank_ordered=rank_ordered_compile_probes,
+                rank_ordered=loss_probe_rank_ordered,
             )
             loss_still_compiled = not (
                 isinstance(compiled_loss_fn, _CompiledLossFallback)
@@ -12291,6 +12456,8 @@ def run_training(
                         f"{loss_probe_error}. strict_no_fallback=true."
                     )
                 compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
+                if compile_loss_dynamic_symbols:
+                    shared_dynamic_compiled_loss_fn = None
                 loss_compile_status = "fallback:eager_after_probe"
                 print(
                     f"[Train {train_years}] compiled loss probe failed; all ranks use eager loss: "
@@ -12301,12 +12468,21 @@ def run_training(
             active=bool(loss_compile_status.startswith("enabled")),
             status=str(loss_compile_status),
             measured_s=float(time.perf_counter() - loss_probe_started),
-            rank_ordered=bool(rank_ordered_compile_probes),
+            rank_ordered=bool(loss_probe_rank_ordered),
+            ddp_collective_input=bool(ddp_enabled),
             global_loss_rows=int(train_batch_size),
             weights_dtype=(
                 None
                 if not model_probe_output_dtypes
                 else str(model_probe_output_dtypes[-1])
+            ),
+            dynamic_symbols=bool(compile_loss_dynamic_symbols),
+            shared_across_train_groups=bool(compile_loss_dynamic_symbols),
+            dynamic_symbol_max=(
+                dynamic_loss_symbol_max if compile_loss_dynamic_symbols else None
+            ),
+            inductor_compile_threads=int(
+                os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
             ),
         )
 
@@ -12347,6 +12523,7 @@ def run_training(
             f"multi_gpu={'distributed_data_parallel' if ddp_enabled else 'none'}; "
             f"panel_slab_forward={panel_slab_compile_status}; "
             f"loss_compile={loss_compile_status}; "
+            f"loss_compile_dynamic_symbols={compile_loss_dynamic_symbols}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "

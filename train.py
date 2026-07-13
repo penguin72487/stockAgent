@@ -5,6 +5,7 @@ import atexit
 import json
 import os
 import random
+import signal
 import sys
 import time
 from dataclasses import asdict
@@ -346,6 +347,23 @@ def _configure_cpu_parallelism(
         f"polars_threads={os.environ.get('POLARS_MAX_THREADS')} "
         f"rayon_threads={os.environ.get('RAYON_NUM_THREADS')}"
     )
+
+
+def _install_graceful_termination_handlers() -> None:
+    """Let Python atexit clean Inductor workers after torchrun termination."""
+
+    def _handle_termination(signum, _frame) -> None:
+        print(
+            f"[runtime] received signal {signum}; exiting through atexit so "
+            "TorchInductor/DDP workers are cleaned up",
+            flush=True,
+        )
+        raise SystemExit(128 + int(signum))
+
+    replaceable = {signal.SIG_DFL, None, signal.default_int_handler}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        if signal.getsignal(signum) in replaceable:
+            signal.signal(signum, _handle_termination)
 
 
 def _configure_cuda_runtime(*, cudnn_benchmark: bool = True) -> None:
@@ -864,6 +882,7 @@ def main() -> None:
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
     _maybe_relaunch_for_ddp(config, args)
+    _install_graceful_termination_handlers()
     config_strategy = _resolve_multi_gpu_strategy(getattr(config.training, "multi_gpu_strategy", "auto"))
     cli_strategy = _resolve_multi_gpu_strategy(args.multi_gpu_strategy) if args.multi_gpu_strategy is not None else None
     active_strategy = cli_strategy or config_strategy

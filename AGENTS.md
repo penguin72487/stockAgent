@@ -369,6 +369,12 @@ Rules:
   model forward. In that case, prioritize guarded GPU train tensor caching over
   test-curve work.
 - Every epoch should account for train, validation, sampled test loss, curve test, curve plot, checkpoint, scheduler/progress, and any reporting work.
+- Expanding `train_union` folds change the symbol dimension even when the global
+  batch dimension is fixed. For compiled canonical loss, mark only the symbol
+  axes dynamic and reuse one compiled loss wrapper across train groups. Bound
+  that dynamic axis by the full panel symbol count; an arbitrary very large
+  upper bound makes Inductor constraint analysis and cold compilation much more
+  expensive and can violate flattened-index guards.
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
 - Keep curve plotting async where possible.
@@ -402,6 +408,21 @@ Compile/runtime rules:
   - `TRITON_CACHE_DIR=~/.cache/triton`
   - `CUDA_CACHE_PATH=~/.cache/nv_cuda`
   - do not delete these caches between repeated same-shape benchmarks unless explicitly testing cold compile behavior
+- On the measured dual-RTX-5090 TW public run, letting each DDP rank inherit 64
+  Inductor compile workers created 128 concurrent workers. After an interrupted
+  compile they became orphaned and remained blocked in XFS
+  `filename_create`/`xfs_buf_lock`, stalling later pre-epoch work. Keep the
+  `tw_public` host-wide `environment.torch_compile_threads` budget at 16 (8 per
+  rank), serialize the independent DDP model probe so the later rank reuses the
+  persistent cache, and preserve graceful SIGTERM-to-atexit cleanup for
+  Inductor workers. The canonical-loss probe is intentionally collective: it
+  must reproduce the real autograd all-gather input on all ranks, otherwise the
+  first train step compiles the same loss again.
+- Expanding `train_union` folds change their symbol count. When
+  `training.compile_loss_dynamic_symbols: true`, keep the time/batch axis static,
+  mark only the canonical loss symbol axis dynamic, and reuse one compiled loss
+  wrapper across train groups. This is an executor optimization: do not pad real
+  assets, fork the loss formula, or add it to the semantic checkpoint contract.
 - Current benchmark result for the active `data_okx` lookback32 run: compare only epoch 2 or later. The fastest measured compile combination was model compile plus the canonical fullgraph log-utility loss:
   - `enable_torch_compile: true`
   - `backtest_compile: true`
