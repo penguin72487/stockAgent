@@ -3,7 +3,7 @@ experiment_name: tw-stock-transformer-market-public-data-all-available
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_official_2005_all_available_v1
+  output_dir: artifacts/markets/tw_public_lantent
   mode: train
   resume: true
   post_train_infer: true
@@ -13,10 +13,10 @@ environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  # Host-wide budget: with 2 DDP ranks this becomes 8 Inductor workers per
-  # rank instead of 64. The model probe is rank-serialized; the loss probe is
-  # collective because it must reproduce the actual autograd all-gather input.
-  torch_compile_threads: 16
+  # Ryzen 7 5800X3D: use all 16 logical CPUs for runtime work, but only the
+  # eight physical cores for Inductor compilation to avoid SMT contention.
+  cpu_threads: 16
+  torch_compile_threads: 8
 
 data:
   # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
@@ -241,6 +241,9 @@ trading:
 training:
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
+  # This profile is measured for one RTX 5070 Ti. Avoid torchrun/DDP launch
+  # logic even if another GPU becomes temporarily visible to WSL.
+  multi_gpu_strategy: none
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
@@ -255,9 +258,8 @@ training:
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  # Measured on the active 2x RTX 5090 setup: auto always selects 64 after a
-  # ~4.9s full-universe VRAM probe. Pin the verified result so 21 train groups
-  # do not repeat the same probe; re-run auto when hardware/model shape changes.
+  # Measured on the local 16GB RTX 5070 Ti at fold 18 / 2735 symbols. Chunk 64
+  # completed full validation and test evaluation without OOM.
   eval_model_chunk_rows: 64
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
@@ -284,11 +286,12 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  # Fold23 RTX 5070 Ti benchmark: 32 reaches about 1.1k samples/s while
-  # retaining ample VRAM headroom; 64 adds only a small steady-state gain and
-  # materially increases cold compile time.
-  batch_size_train: 128
-  batch_size_eval: 128
+  # Local RTX 5070 Ti fold18 benchmark (131 features, 2428 compacted train
+  # symbols, factor+market enabled): batch 32 used about 13.3GB and improved
+  # steady epoch wall time from 29.11s at batch 8 to 9.17s. Persistent compile
+  # caches amortize the larger shape's cold compile cost over long runs.
+  batch_size_train: 32
+  batch_size_eval: 32
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -383,7 +386,9 @@ training:
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  vram_budget_gb: 16
+  # CUDA reports 15.92GiB total on this 16GB card; do not advertise more than
+  # the allocator can actually use.
+  vram_budget_gb: 15
   vram_safety_margin_gb: 1.5
   target_vram_fraction: 0.85
   # Model branches. Only the block named by training.model_name is active.
@@ -493,7 +498,7 @@ training:
     # temporal_only: no cross-stock attention
     attention_mode: market_token
     # Independent compact-bottleneck switches; null falls back to attention_mode.
-    use_latent_factors: null
+    use_latent_factors: true
     use_market_tokens: null
     use_flash_attention: true
     use_time_pos: true
