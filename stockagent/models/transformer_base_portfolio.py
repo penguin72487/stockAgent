@@ -1252,6 +1252,78 @@ class TransformerBasePortfolioModel(nn.Module):
             return_aux=return_aux,
         )
 
+    def _require_compact_explainability_mode(self) -> None:
+        if self.attention_mode in {"full", "axial"}:
+            raise RuntimeError(
+                "temporal stock-embedding reuse is only supported for compact "
+                "attention modes: latent, latent_only, market_token, and temporal_only; "
+                f"got attention_mode={self.attention_mode!r}"
+            )
+
+    def temporal_stock_embeddings_for_explainability(
+        self,
+        embedded: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the separable temporal stage once and return ``[B,S,D]`` stocks.
+
+        Compact attention modes first encode every stock independently over
+        time and only then run their latent/market cross-stock bottleneck.  A
+        source-counterfactual therefore needs to recompute the temporal encoder
+        for the changed stock only; all unchanged stock embeddings can be
+        reused exactly.
+        """
+        self._require_compact_explainability_mode()
+        if embedded.ndim != 4 or int(embedded.size(-1)) != self.d_model:
+            raise ValueError("embedded explainability inputs must have shape [B,L,S,d_model]")
+        if self.training:
+            raise RuntimeError("temporal explainability reuse requires model.eval()")
+        if mask is None:
+            mask_bool = torch.ones(
+                embedded.size(0), embedded.size(2), dtype=torch.bool, device=embedded.device
+            )
+        else:
+            mask_bool = mask.to(device=embedded.device, dtype=torch.bool)
+        if tuple(mask_bool.shape) != (int(embedded.size(0)), int(embedded.size(2))):
+            raise ValueError("embedded explainability mask must have shape [B,S]")
+        safe_mask = _safe_attention_mask(mask_bool)
+        temporal = self._apply_temporal_blocks(embedded, keep_all_steps=False)
+        return self._pool_temporal(temporal, safe_mask)
+
+    def forward_from_stock_embeddings_explainability(
+        self,
+        stock_embeddings: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+    ):
+        """Run the compact cross-stock bottleneck/head from cached ``[B,S,D]`` inputs."""
+        self._require_compact_explainability_mode()
+        if stock_embeddings.ndim != 3 or int(stock_embeddings.size(-1)) != self.d_model:
+            raise ValueError("stock explainability embeddings must have shape [B,S,d_model]")
+        if self.training:
+            raise RuntimeError("stock-embedding explainability reuse requires model.eval()")
+        if mask is None:
+            mask_bool = torch.ones(
+                stock_embeddings.size(0),
+                stock_embeddings.size(1),
+                dtype=torch.bool,
+                device=stock_embeddings.device,
+            )
+        else:
+            mask_bool = mask.to(device=stock_embeddings.device, dtype=torch.bool)
+        if tuple(mask_bool.shape) != (
+            int(stock_embeddings.size(0)),
+            int(stock_embeddings.size(1)),
+        ):
+            raise ValueError("stock explainability mask must have shape [B,S]")
+        return self._forward_stock_embeddings(
+            stock_embeddings,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
+
     def forward_from_embedded_explainability_compiled(
         self,
         embedded: torch.Tensor,
@@ -1261,10 +1333,11 @@ class TransformerBasePortfolioModel(nn.Module):
         compiled = self.__dict__.get("_compiled_explainability_forward")
         if compiled is None:
             def forward_fn(h: torch.Tensor, m: torch.Tensor):
-                return self.forward_from_embedded_explainability(
+                return self._forward_embedded(
                     h,
-                    m,
+                    m.to(device=h.device, dtype=torch.bool),
                     return_aux=False,
+                    return_scores=True,
                 )
 
             compiled = torch.compile(
@@ -1276,6 +1349,33 @@ class TransformerBasePortfolioModel(nn.Module):
             # Avoid registering a self-referential OptimizedModule as a child.
             object.__setattr__(self, "_compiled_explainability_forward", compiled)
         return compiled(embedded, mask)
+
+    def forward_from_stock_embeddings_explainability_compiled(
+        self,
+        stock_embeddings: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """Lazily compile the fixed-shape post-temporal counterfactual hotpath."""
+        self._require_compact_explainability_mode()
+        compiled = self.__dict__.get("_compiled_stock_explainability_forward")
+        if compiled is None:
+            def forward_fn(z: torch.Tensor, m: torch.Tensor):
+                return self._forward_stock_embeddings(
+                    z,
+                    m.to(device=z.device, dtype=torch.bool),
+                    return_aux=False,
+                    return_scores=True,
+                )
+
+            compiled = torch.compile(
+                forward_fn,
+                mode="reduce-overhead",
+                dynamic=False,
+                fullgraph=False,
+            )
+            # Avoid registering a self-referential OptimizedModule as a child.
+            object.__setattr__(self, "_compiled_stock_explainability_forward", compiled)
+        return compiled(stock_embeddings, mask)
 
     def _add_window_positions(
         self,
@@ -1500,7 +1600,26 @@ class TransformerBasePortfolioModel(nn.Module):
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         z_base = self._pool_temporal(h, safe_mask)
-        bsz = int(h.size(0))
+        return self._forward_latent_or_market_from_stock_embeddings(
+            z_base,
+            safe_mask,
+            use_latent=use_latent,
+            collect_aux=collect_aux,
+            use_market=use_market,
+            token_embedding=h,
+        )
+
+    def _forward_latent_or_market_from_stock_embeddings(
+        self,
+        z_base: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        use_latent: bool,
+        collect_aux: bool,
+        use_market: bool = True,
+        token_embedding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz = int(z_base.size(0))
         aux: dict[str, torch.Tensor] = {}
 
         if use_latent:
@@ -1538,15 +1657,14 @@ class TransformerBasePortfolioModel(nn.Module):
             z_stock = self.stock_market_norm(z_factor_context)
             z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
             if collect_aux:
-                aux.update(
-                    {
-                        "token_embedding": h,
-                        "stock_embedding": z_base,
-                        "factor_tokens": factor_tokens,
-                        "latent_factors": factor_tokens,
-                        "z_factor_context": z_factor_context,
-                    }
-                )
+                aux.update({
+                    "stock_embedding": z_base,
+                    "factor_tokens": factor_tokens,
+                    "latent_factors": factor_tokens,
+                    "z_factor_context": z_factor_context,
+                })
+                if token_embedding is not None:
+                    aux["token_embedding"] = token_embedding
             return z_stock, aux
 
         if self.market_queries is None:
@@ -1576,7 +1694,6 @@ class TransformerBasePortfolioModel(nn.Module):
         )
         if collect_aux:
             aux.update({
-                "token_embedding": h,
                 "stock_embedding": z_base,
                 "factor_tokens": factor_tokens,
                 "latent_factors": factor_tokens,
@@ -1586,6 +1703,8 @@ class TransformerBasePortfolioModel(nn.Module):
                 "z_market_delta": z_market_delta,
                 "stock_market_gate": stock_market_gate,
             })
+            if token_embedding is not None:
+                aux["token_embedding"] = token_embedding
         return z_stock, aux
 
     def _forward_market_token_fast(
@@ -1600,7 +1719,22 @@ class TransformerBasePortfolioModel(nn.Module):
             keep_all_steps=(collect_aux and self.temporal_query_mode != "last_only"),
         )
         z_base = self._pool_temporal(h, safe_mask)
-        bsz = int(h.size(0))
+        return self._forward_market_token_from_stock_embeddings(
+            z_base,
+            safe_mask,
+            collect_aux=collect_aux,
+            token_embedding=h,
+        )
+
+    def _forward_market_token_from_stock_embeddings(
+        self,
+        z_base: torch.Tensor,
+        safe_mask: torch.Tensor,
+        *,
+        collect_aux: bool,
+        token_embedding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz = int(z_base.size(0))
         aux: dict[str, torch.Tensor] = {}
 
         if self.market_queries is None:
@@ -1630,17 +1764,64 @@ class TransformerBasePortfolioModel(nn.Module):
             safe_mask,
         )
         if collect_aux:
-            aux.update(
-                {
-                    "token_embedding": h,
-                    "stock_embedding": z_base,
-                    "market_tokens": market_tokens,
-                    "z_market_context": z_market_context,
-                    "z_market_delta": z_market_delta,
-                    "stock_market_gate": stock_market_gate,
-                }
-            )
+            aux.update({
+                "stock_embedding": z_base,
+                "market_tokens": market_tokens,
+                "z_market_context": z_market_context,
+                "z_market_delta": z_market_delta,
+                "stock_market_gate": stock_market_gate,
+            })
+            if token_embedding is not None:
+                aux["token_embedding"] = token_embedding
         return z_stock, aux
+
+    def _forward_stock_embeddings(
+        self,
+        stock_embeddings: torch.Tensor,
+        mask_bool: torch.Tensor,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+        return_scores: bool = False,
+    ):
+        self._require_compact_explainability_mode()
+        safe_mask = _safe_attention_mask(mask_bool)
+        collect_aux = bool(
+            return_aux is True
+            or (return_aux is None and self.return_aux and self.return_aux_details)
+        )
+        if self.attention_mode == "latent":
+            z_stock, aux = self._forward_latent_or_market_from_stock_embeddings(
+                stock_embeddings,
+                safe_mask,
+                use_latent=True,
+                use_market=True,
+                collect_aux=collect_aux,
+            )
+        elif self.attention_mode == "latent_only":
+            z_stock, aux = self._forward_latent_or_market_from_stock_embeddings(
+                stock_embeddings,
+                safe_mask,
+                use_latent=True,
+                use_market=False,
+                collect_aux=collect_aux,
+            )
+        elif self.attention_mode == "market_token":
+            z_stock, aux = self._forward_market_token_from_stock_embeddings(
+                stock_embeddings,
+                safe_mask,
+                collect_aux=collect_aux,
+            )
+        else:
+            z_stock = stock_embeddings.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
+            aux = {"stock_embedding": stock_embeddings} if collect_aux else {}
+        return self._portfolio_outputs_from_stock_embeddings(
+            z_stock,
+            mask_bool,
+            aux,
+            temperature=temperature,
+            return_aux=return_aux,
+            return_scores=return_scores,
+        )
 
     def _forward_embedded(
         self,
@@ -1648,6 +1829,7 @@ class TransformerBasePortfolioModel(nn.Module):
         mask_bool: torch.Tensor,
         temperature: float | torch.Tensor | None = None,
         return_aux: bool | None = None,
+        return_scores: bool = False,
     ):
         safe_mask = _safe_attention_mask(mask_bool)
         collect_aux = bool(return_aux is True or (return_aux is None and self.return_aux and self.return_aux_details))
@@ -1676,6 +1858,26 @@ class TransformerBasePortfolioModel(nn.Module):
             z_stock, aux = self._forward_market_token_fast(h, safe_mask, collect_aux=collect_aux)
         else:
             z_stock, aux = self._forward_temporal_only(h, safe_mask, collect_aux=collect_aux)
+
+        return self._portfolio_outputs_from_stock_embeddings(
+            z_stock,
+            mask_bool,
+            aux,
+            temperature=temperature,
+            return_aux=return_aux,
+            return_scores=return_scores,
+        )
+
+    def _portfolio_outputs_from_stock_embeddings(
+        self,
+        z_stock: torch.Tensor,
+        mask_bool: torch.Tensor,
+        aux: dict[str, torch.Tensor],
+        *,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+        return_scores: bool = False,
+    ):
 
         if PROFILE_RANGES_ENABLED:
             with profile_range("model.portfolio.mask_z_stock"):
@@ -1829,6 +2031,8 @@ class TransformerBasePortfolioModel(nn.Module):
         else:
             weights = weights.masked_fill(~mask_bool, 0.0)
 
+        if return_scores:
+            return weights, masked_scores
         if return_aux is True:
             aux = dict(aux)
             aux.update(

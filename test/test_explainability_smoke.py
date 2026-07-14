@@ -359,7 +359,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
         regime_analysis=False,
         fold_stability=False,
         umap_enabled=False,
-        cross_asset_enabled=False,
     )
 
     output = run_loaded_model_explanation(
@@ -390,3 +389,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
     assert summary["rows"] == 2
     assert timing["loaded_model_reused"] is True
     assert timing["compute_timing"]["total_s"] >= 0
+    assert "cross_asset_s" not in timing
+    assert "cross_asset_summary" not in timing
+    assert not (output / "abstract_cross_asset_transmission").exists()

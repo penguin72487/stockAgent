@@ -144,7 +144,7 @@ def test_strict_no_fallback_raises_on_explainability_cuda_oom(monkeypatch) -> No
         )
 
 
-def test_explain_model_cli_defaults_are_complete_offline_explainability_except_independent_cross_asset() -> None:
+def test_explain_model_cli_has_no_cross_asset_execution_entrypoint() -> None:
     args = parse_args([])
 
     assert args.config is None
@@ -168,16 +168,12 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability_except_i
     assert args.umap_max_points == 0
     assert not hasattr(args, "top_k")
     assert not hasattr(args, "case_study_top_k")
-    assert args.cross_asset is False
-    assert args.cross_asset_max_repeated_rows == 48
-    assert args.cross_asset_max_sources == 0
-    assert args.cross_asset_max_targets == 0
-    assert args.cross_asset_source_chunk_size == 16
-    assert args.cross_asset_attention_capture_rows == 0
-    assert args.cross_asset_role_embedding is True
+    assert not any(name.startswith("cross_asset") for name in vars(args))
     assert args.strict_no_fallback is True
 
     assert parse_args(["--no-progress"]).progress is False
+    with pytest.raises(SystemExit):
+        parse_args(["--cross-asset"])
 
 
 def test_explain_model_cli_discovers_market_artifacts(tmp_path: Path) -> None:
@@ -228,7 +224,14 @@ def test_dynamic_symbol_position_checkpoint_state_is_resized_for_explainability(
 
 
 def test_training_explainability_settings_use_throughput_defaults() -> None:
-    settings = settings_from_training_config(SimpleNamespace())
+    settings = settings_from_training_config(
+        SimpleNamespace(
+            # These legacy TrainingConfig fields remain loadable for checkpoint
+            # compatibility but must no longer create a runtime execution path.
+            explain_cross_asset_enabled=True,
+            explain_cross_asset_max_sources=2,
+        )
+    )
 
     assert settings.ig_steps == 0
     assert settings.ig_batch_size == 1
@@ -242,10 +245,7 @@ def test_training_explainability_settings_use_throughput_defaults() -> None:
     assert settings.regime_analysis is False
     assert settings.fold_stability is False
     assert settings.umap_enabled is False
-    assert settings.cross_asset_enabled is False
-    assert settings.cross_asset_source_chunk_size == 1
-    assert settings.cross_asset_attention_capture_rows == 1
-    assert settings.cross_asset_role_embedding is False
+    assert not any(name.startswith("cross_asset") for name in settings.__slots__)
 
 
 def test_training_fold_explainability_delegates_to_shared_runner(monkeypatch, tmp_path: Path) -> None:
@@ -296,4 +296,3 @@ def test_training_fold_explainability_delegates_to_shared_runner(monkeypatch, tm
     assert isinstance(settings, ExplainabilitySettings)
     assert settings.ig_steps == 0
     assert settings.perturb is False
-    assert settings.cross_asset_enabled is False
