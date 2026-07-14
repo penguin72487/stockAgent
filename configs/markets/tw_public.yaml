@@ -213,7 +213,22 @@ data:
     - twpub_taifex_tx_large_oi_log
     - twpub_taifex_tx_final_settlement_logret
   feature_exclude: []
-  feature_zero_fill: []
+  # These selected families do not yet have a point-in-time vintage archive or
+  # registered historical lineage. Keep their schema slots deterministic while
+  # preventing present-day snapshots from leaking into historical training.
+  feature_zero_fill:
+    - twpub_cumulative_revenue_yoy
+    - twpub_cbc_*
+    - twpub_dgbas_*
+    - twpub_mof_*
+    - twpub_dividend_*
+    - twpub_exdiv_*
+    - twpub_material_*
+    - twpub_attention_*
+    - twpub_disposal_*
+    - twpub_twse_taiex_*
+    - twpub_usdtwd_*
+    - twpub_taifex_*
   # tradable_mode: tradable
 
 walk_forward:

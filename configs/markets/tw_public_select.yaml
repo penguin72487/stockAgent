@@ -8,7 +8,7 @@ runner:
   resume: true
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 1
+  start_fold: 18
 environment:
   device: cuda
   use_tensor_cores: true
@@ -501,7 +501,7 @@ training:
     attention_mode: market_token
     # Independent compact-bottleneck switches; null falls back to attention_mode.
     use_latent_factors: true
-    use_market_tokens: null
+    use_market_tokens: true
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: false
