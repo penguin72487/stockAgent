@@ -202,6 +202,153 @@ def test_preprojected_explainability_forward_matches_raw_counterfactual(feature_
     )
 
 
+@pytest.mark.parametrize("mode", ["latent", "latent_only", "market_token", "temporal_only"])
+def test_temporal_stock_embedding_cache_matches_embedded_forward(mode: str) -> None:
+    device = _device()
+    model = _make_model(attention_mode=mode).eval()
+    x = torch.randn(3, 6, 13, 11, device=device)
+    mask = torch.ones(3, 13, dtype=torch.bool, device=device)
+    mask[1, -4:] = False
+    mask[2] = False
+    mask[2, 0] = True
+
+    with torch.no_grad():
+        projected = model.project_features_for_explainability(x)
+        embedded = model.embed_projected_for_explainability(projected)
+        expected_weights, expected_scores, expected_aux = (
+            model.forward_from_embedded_explainability(
+                embedded,
+                mask,
+                return_aux=True,
+            )
+        )
+        stock_embeddings = model.temporal_stock_embeddings_for_explainability(
+            embedded,
+            mask,
+        )
+        actual_weights, actual_scores, actual_aux = (
+            model.forward_from_stock_embeddings_explainability(
+                stock_embeddings,
+                mask,
+                return_aux=True,
+            )
+        )
+
+    assert stock_embeddings.shape == (3, 13, model.d_model)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(actual_scores, expected_scores, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(
+        actual_aux["score_logits"],
+        expected_aux["score_logits"],
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    assert actual_weights[1, -4:].abs().max().item() == 0.0
+    assert actual_weights[2, 1:].abs().max().item() == 0.0
+
+
+@pytest.mark.parametrize("mode", ["latent", "market_token"])
+def test_temporal_stock_embedding_cache_exactly_patches_one_changed_source(mode: str) -> None:
+    device = _device()
+    model = _make_model(
+        attention_mode=mode,
+        categorical_feature_indices=(2,),
+        categorical_embedding_dim=3,
+        categorical_embedding_cardinality=16,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    x[..., 2] = torch.randint(0, 8, x[..., 2].shape, device=device).float()
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, -3:] = False
+    source = 3
+    changed_x = x.clone()
+    changed_x[:, :, source, 1] = 0.0
+
+    with torch.no_grad():
+        expected_weights, expected_scores, _expected_aux = model(
+            changed_x,
+            mask,
+            return_aux=True,
+        )
+        base_projected = model.project_features_for_explainability(x)
+        base_embedded = model.embed_projected_for_explainability(base_projected)
+        cached_stocks = model.temporal_stock_embeddings_for_explainability(
+            base_embedded,
+            mask,
+        ).clone()
+
+        changed_projected = model.project_features_for_explainability(
+            changed_x[:, :, source : source + 1]
+        )
+        changed_source_embedded = base_embedded[:, :, source : source + 1] + (
+            changed_projected - base_projected[:, :, source : source + 1]
+        )
+        changed_stock = model.temporal_stock_embeddings_for_explainability(
+            changed_source_embedded,
+        )
+        cached_stocks[:, source] = changed_stock[:, 0]
+        actual_weights, actual_scores, _actual_aux = (
+            model.forward_from_stock_embeddings_explainability(
+                cached_stocks,
+                mask,
+                return_aux=True,
+            )
+        )
+
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(actual_scores, expected_scores, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("mode", ["full", "axial"])
+def test_temporal_stock_embedding_cache_rejects_noncompact_modes(mode: str) -> None:
+    device = _device()
+    model = _make_model(attention_mode=mode).eval()
+    embedded = torch.randn(2, 6, 13, model.d_model, device=device)
+    stock_embeddings = torch.randn(2, 13, model.d_model, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+
+    with pytest.raises(RuntimeError, match="only supported for compact attention modes"):
+        model.temporal_stock_embeddings_for_explainability(embedded, mask)
+    with pytest.raises(RuntimeError, match="only supported for compact attention modes"):
+        model.forward_from_stock_embeddings_explainability(stock_embeddings, mask)
+
+
+def test_compiled_stock_embedding_explainability_returns_weights_and_scores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _device()
+    model = _make_model(attention_mode="market_token").eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, -3:] = False
+    monkeypatch.setattr(torch, "compile", lambda fn, **_kwargs: fn)
+
+    with torch.no_grad():
+        embedded = model.embed_projected_for_explainability(
+            model.project_features_for_explainability(x)
+        )
+        stock_embeddings = model.temporal_stock_embeddings_for_explainability(
+            embedded,
+            mask,
+        )
+        expected_weights, expected_scores, _expected_aux = (
+            model.forward_from_stock_embeddings_explainability(
+                stock_embeddings,
+                mask,
+                return_aux=True,
+            )
+        )
+        actual_weights, actual_scores = (
+            model.forward_from_stock_embeddings_explainability_compiled(
+                stock_embeddings,
+                mask,
+            )
+        )
+
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(actual_scores, expected_scores, rtol=2e-5, atol=2e-6)
+
+
 @pytest.mark.parametrize(
     ("use_latent_factors", "use_market_tokens", "expected_mode"),
     [

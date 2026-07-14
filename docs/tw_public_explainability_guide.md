@@ -48,7 +48,7 @@ run_fintech_python explain_model.py \
   --max-rows 0
 ```
 
-若只想快速做完整範圍稽核，不做昂貴的 IG、perturbation、UMAP 與跨資產擾動：
+若只想快速做完整範圍稽核，不做昂貴的 IG、perturbation 與 UMAP：
 
 ```bash
 run_fintech_python explain_model.py \
@@ -58,9 +58,11 @@ run_fintech_python explain_model.py \
   --ig-steps 0 \
   --no-perturb \
   --no-shap \
-  --no-umap \
-  --no-cross-asset
+  --no-umap
 ```
+
+跨資產擾動已由獨立的 `cross_asset_model.py` 負責，不再是
+`explain_model.py` 的切換入口。
 
 這個快速模式仍會保留全部部位清冊、gradient × input、特徵／日期矩陣、曝險曲線與完整性稽核。
 

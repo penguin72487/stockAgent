@@ -11,7 +11,7 @@ import os
 import time
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -223,25 +223,6 @@ class ExplainabilitySettings:
     umap_max_projections: int = 0
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
-    cross_asset_enabled: bool = True
-    cross_asset_max_sources: int = 0
-    cross_asset_max_targets: int = 0
-    cross_asset_source_chunk_size: int = 16
-    cross_asset_row_chunk_size: int = 0
-    cross_asset_max_repeated_rows: int = 48
-    cross_asset_perturb_scale: float = 1.0
-    cross_asset_shocks: tuple[str, ...] = field(
-        default_factory=lambda: ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
-    )
-    cross_asset_attention_flow: bool = True
-    cross_asset_attention_capture_rows: int = 0
-    cross_asset_validated_transmission: bool = True
-    cross_asset_role_embedding: bool = True
-    cross_asset_graph_backend: str = "cugraph"
-    cross_asset_graph_benchmark_min_edges: int = 1_000_000
-    cross_asset_graph_explainability: bool = True
-    cross_asset_graph_betweenness_max_vertices: int = 0
-    cross_asset_graph_plot_max_nodes: int = 80
     strict_no_fallback: bool = False
 
 
@@ -312,33 +293,6 @@ class ExplainDatasetBatchSource:
         return collate_batch(samples)
 
 
-def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
-    from stockagent.explainability_cross_asset import CrossAssetTransmissionSettings
-
-    shocks = tuple(str(value).strip().lower() for value in settings.cross_asset_shocks if str(value).strip())
-    return CrossAssetTransmissionSettings(
-        enabled=bool(settings.cross_asset_enabled),
-        progress_enabled=bool(settings.progress_enabled),
-        max_sources=max(0, int(settings.cross_asset_max_sources)),
-        max_targets=max(0, int(settings.cross_asset_max_targets)),
-        source_chunk_size=max(1, int(settings.cross_asset_source_chunk_size)),
-        row_chunk_size=max(0, int(settings.cross_asset_row_chunk_size)),
-        max_repeated_rows=max(1, int(settings.cross_asset_max_repeated_rows)),
-        counterfactual_compile=bool(settings.counterfactual_compile),
-        perturb_scale=float(settings.cross_asset_perturb_scale),
-        shocks=shocks or ("zero", "momentum", "gap", "volume", "volatility", "liquidity"),
-        attention_flow=bool(settings.cross_asset_attention_flow),
-        attention_capture_rows=max(0, int(settings.cross_asset_attention_capture_rows)),
-        validated_transmission=bool(settings.cross_asset_validated_transmission),
-        role_embedding=bool(settings.cross_asset_role_embedding),
-        graph_backend=str(settings.cross_asset_graph_backend),
-        graph_benchmark_min_edges=max(0, int(settings.cross_asset_graph_benchmark_min_edges)),
-        graph_explainability=bool(settings.cross_asset_graph_explainability),
-        graph_betweenness_max_vertices=max(0, int(settings.cross_asset_graph_betweenness_max_vertices)),
-        graph_plot_max_nodes=max(5, int(settings.cross_asset_graph_plot_max_nodes)),
-    )
-
-
 def settings_from_training_config(training: Any) -> ExplainabilitySettings:
     """Build the post-training explainability settings from TrainingConfig.
 
@@ -371,29 +325,6 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         umap_max_projections=int(getattr(training, "explain_umap_max_projections", 0)),
         umap_n_neighbors=int(getattr(training, "explain_umap_n_neighbors", 15)),
         umap_min_dist=float(getattr(training, "explain_umap_min_dist", 0.1)),
-        cross_asset_enabled=bool(getattr(training, "explain_cross_asset_enabled", False)),
-        cross_asset_max_sources=int(getattr(training, "explain_cross_asset_max_sources", 8)),
-        cross_asset_max_targets=int(getattr(training, "explain_cross_asset_max_targets", 8)),
-        cross_asset_source_chunk_size=int(getattr(training, "explain_cross_asset_source_chunk_size", 1)),
-        cross_asset_row_chunk_size=int(getattr(training, "explain_cross_asset_row_chunk_size", 0)),
-        cross_asset_max_repeated_rows=int(getattr(training, "explain_cross_asset_max_repeated_rows", 48)),
-        cross_asset_perturb_scale=float(getattr(training, "explain_cross_asset_perturb_scale", 1.0)),
-        cross_asset_shocks=tuple(getattr(training, "explain_cross_asset_shocks", ())),
-        cross_asset_attention_flow=bool(getattr(training, "explain_cross_asset_attention_flow", True)),
-        cross_asset_attention_capture_rows=int(getattr(training, "explain_cross_asset_attention_capture_rows", 1)),
-        cross_asset_validated_transmission=bool(
-            getattr(training, "explain_cross_asset_validated_transmission", True)
-        ),
-        cross_asset_role_embedding=bool(getattr(training, "explain_cross_asset_role_embedding", False)),
-        cross_asset_graph_backend=str(getattr(training, "explain_cross_asset_graph_backend", "cugraph")),
-        cross_asset_graph_benchmark_min_edges=int(
-            getattr(training, "explain_cross_asset_graph_benchmark_min_edges", 1_000_000)
-        ),
-        cross_asset_graph_explainability=bool(getattr(training, "explain_cross_asset_graph_explainability", True)),
-        cross_asset_graph_betweenness_max_vertices=int(
-            getattr(training, "explain_cross_asset_graph_betweenness_max_vertices", 512)
-        ),
-        cross_asset_graph_plot_max_nodes=int(getattr(training, "explain_cross_asset_graph_plot_max_nodes", 80)),
     )
 
 
@@ -5387,32 +5318,6 @@ def load_explanation_context(
     )
 
 
-def _write_cross_asset_skip(
-    cross_asset_dir: Path,
-    *,
-    reason: str,
-    message: str,
-    error: str | None = None,
-) -> dict[str, Any]:
-    cross_asset_dir.mkdir(parents=True, exist_ok=True)
-    skipped: dict[str, Any] = {
-        "enabled": False,
-        "module": "abstract_cross_asset_transmission",
-        "skipped_reason": reason,
-    }
-    if error is not None:
-        skipped["error"] = error
-    (cross_asset_dir / "abstract_cross_asset_summary.json").write_text(
-        json.dumps(skipped, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    (cross_asset_dir / "abstract_cross_asset_report.md").write_text(
-        "# Abstract Cross-Asset Transmission\n\n" + message.rstrip() + "\n",
-        encoding="utf-8",
-    )
-    return skipped
-
-
 def run_loaded_model_explanation(
     *,
     config: ExperimentConfig,
@@ -5452,7 +5357,7 @@ def run_loaded_model_explanation(
         "lazy_host_materialization": True,
     }
     runner_progress = tqdm(
-        total=5,
+        total=4,
         desc=f"Fold {int(fold.fold_id):02d} pipeline",
         unit="stage",
         leave=False,
@@ -5559,62 +5464,6 @@ def run_loaded_model_explanation(
     )
     runner_timing["write_s"] = float(time.perf_counter() - write_start)
     runner_progress.update(1)
-    runner_progress.set_postfix(stage="cross_asset", refresh=True)
-    cross_asset_summary: dict[str, Any] = {}
-    if bool(settings.cross_asset_enabled):
-        from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
-
-        row_chunking = result.get("summary", {}).get("row_chunking", {})
-        cross_asset_dir = destination / "abstract_cross_asset_transmission"
-        skip_cross_asset = bool(isinstance(row_chunking, dict) and row_chunking.get("cuda_oom_fallback"))
-        cross_asset_start = time.perf_counter()
-        if skip_cross_asset:
-            if bool(settings.strict_no_fallback):
-                raise RuntimeError(
-                    "Cross-asset explainability would be skipped because main explainability used CUDA OOM fallback; "
-                    "strict_no_fallback=true so skip fallback is disabled."
-                )
-            cross_asset_summary = _write_cross_asset_skip(
-                cross_asset_dir,
-                reason="main_explainability_cuda_oom_fallback",
-                message="Skipped because main explainability already required CUDA OOM fallback.",
-            )
-            print("[explain] cross-asset skipped after CUDA OOM fallback in main explainability")
-        else:
-            try:
-                with _explain_autocast_context(device, resolved_amp_dtype):
-                    cross_asset_summary = abstract_cross_asset_transmission(
-                        execution_model,
-                        batch_source,
-                        feature_names=panel.feature_names,
-                        symbols=panel.symbols,
-                        dates=dates,
-                        output_dir=destination,
-                        settings=_cross_asset_settings_from_explainability(settings),
-                        device=device,
-                    )
-            except RuntimeError as exc:
-                if not _is_cuda_oom(exc):
-                    raise
-                if bool(settings.strict_no_fallback):
-                    raise RuntimeError(
-                        "CUDA OOM during cross-asset explainability; strict_no_fallback=true so "
-                        "skipped-output fallback is disabled."
-                    ) from exc
-                _clear_explainability_runtime_cache()
-                cross_asset_summary = _write_cross_asset_skip(
-                    cross_asset_dir,
-                    reason="cuda_oom",
-                    message="Skipped after CUDA out-of-memory during cross-asset analysis.",
-                    error=str(exc),
-                )
-                print("[explain] cross-asset skipped after CUDA OOM")
-        runner_timing["cross_asset_s"] = float(time.perf_counter() - cross_asset_start)
-        if device.type == "cuda":
-            runner_timing["total_peak_cuda_gb"] = float(torch.cuda.max_memory_allocated(device)) / (1024**3)
-    else:
-        runner_timing["cross_asset_s"] = 0.0
-    runner_progress.update(1)
     runner_progress.set_postfix(stage="fold_stability", refresh=True)
 
     if write_fold_stability and bool(settings.fold_stability):
@@ -5637,7 +5486,6 @@ def run_loaded_model_explanation(
                         **runner_timing,
                         "compute_timing": result.get("summary", {}).get("timing", {}),
                         "write_timing": result.get("summary", {}).get("write_timing", {}),
-                        "cross_asset_summary": cross_asset_summary,
                     }
                 ),
                 indent=2,
@@ -5650,10 +5498,9 @@ def run_loaded_model_explanation(
             f"total={float(runner_timing['total_s']):.3f}s "
             f"compute={float(runner_timing['compute_s']):.3f}s "
             f"write={float(runner_timing['write_s']):.3f}s "
-            f"cross_asset={float(runner_timing['cross_asset_s']):.3f}s "
             f"stability={float(runner_timing['fold_stability_s']):.3f}s "
             f"dates_per_s={float(runner_timing['compute_dates_per_s']):.4f} "
-            f"peak_cuda_gb={float(runner_timing.get('total_peak_cuda_gb', runner_timing.get('main_peak_cuda_gb', 0.0))):.2f} "
+            f"peak_cuda_gb={float(runner_timing.get('main_peak_cuda_gb', 0.0)):.2f} "
             f"json={timing_path}"
         )
 
@@ -6141,7 +5988,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--counterfactual-compile",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Compile the fixed-shape embedded perturb/cross-asset forward hotpath.",
+        help="Compile the fixed-shape embedded perturbation forward hotpath.",
     )
     parser.add_argument(
         "--plots",
@@ -6193,66 +6040,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--umap-max-projections", default=0, type=int, help="Maximum aux tensors to project with UMAP; 0 means no limit.")
     parser.add_argument("--umap-n-neighbors", default=15, type=int)
     parser.add_argument("--umap-min-dist", default=0.1, type=float)
-    parser.add_argument(
-        "--cross-asset",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Compatibility path for writing cross-asset transmission inside the main explainability run. "
-            "Disabled by default; use cross_asset_model.py for independently scheduled GPU work and artifacts."
-        ),
-    )
-    parser.add_argument("--cross-asset-max-sources", default=0, type=int, help="Source cap; 0 means every active symbol.")
-    parser.add_argument("--cross-asset-max-targets", default=0, type=int, help="Target cap; 0 means every active symbol.")
-    parser.add_argument(
-        "--cross-asset-source-chunk-size",
-        default=16,
-        type=int,
-        help="Sources perturbed together; 16 pairs with the repeated-row budget for a 48-row GPU work set.",
-    )
-    parser.add_argument(
-        "--cross-asset-row-chunk-size",
-        default=0,
-        type=int,
-        help="Dates per cross-asset source batch; 0 derives it from the repeated-row budget.",
-    )
-    parser.add_argument(
-        "--cross-asset-max-repeated-rows",
-        default=48,
-        type=int,
-        help="Bound source_chunk_size * row_chunk_size for cross-asset perturbation forwards.",
-    )
-    parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
-    parser.add_argument(
-        "--cross-asset-shocks",
-        default="zero,momentum,gap,volume,volatility,liquidity",
-        help="Comma-separated abstract shocks to run.",
-    )
-    parser.add_argument(
-        "--cross-asset-attention-flow",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use captured attention as transmission evidence when available.",
-    )
-    parser.add_argument("--cross-asset-attention-capture-rows", default=0, type=int, help="Attention row cap; 0 means every explained date.")
-    parser.add_argument(
-        "--cross-asset-validated-transmission",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Multiply perturbation evidence by attention evidence when available.",
-    )
-    parser.add_argument(
-        "--cross-asset-role-embedding",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write latent role embedding table and plot when aux tensors are available.",
-    )
     parser.add_argument("--strict", action="store_true", help="Load checkpoint with strict=True.")
     parser.add_argument(
         "--strict-no-fallback",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Fail instead of using degraded explainability, plotting, or cross-asset fallback paths.",
+        help="Fail instead of using degraded explainability or plotting fallback paths.",
     )
     return parser.parse_args(argv)
 
@@ -6297,20 +6090,6 @@ def main(argv: list[str] | None = None) -> None:
         umap_max_projections=args.umap_max_projections,
         umap_n_neighbors=args.umap_n_neighbors,
         umap_min_dist=args.umap_min_dist,
-        cross_asset_enabled=bool(args.cross_asset),
-        cross_asset_max_sources=max(0, int(args.cross_asset_max_sources)),
-        cross_asset_max_targets=max(0, int(args.cross_asset_max_targets)),
-        cross_asset_source_chunk_size=max(1, int(args.cross_asset_source_chunk_size)),
-        cross_asset_row_chunk_size=max(0, int(args.cross_asset_row_chunk_size)),
-        cross_asset_max_repeated_rows=max(1, int(args.cross_asset_max_repeated_rows)),
-        cross_asset_perturb_scale=float(args.cross_asset_perturb_scale),
-        cross_asset_shocks=tuple(
-            value.strip().lower() for value in str(args.cross_asset_shocks).split(",") if value.strip()
-        ),
-        cross_asset_attention_flow=bool(args.cross_asset_attention_flow),
-        cross_asset_attention_capture_rows=max(0, int(args.cross_asset_attention_capture_rows)),
-        cross_asset_validated_transmission=bool(args.cross_asset_validated_transmission),
-        cross_asset_role_embedding=bool(args.cross_asset_role_embedding),
         strict_no_fallback=bool(args.strict_no_fallback),
     )
     if _distributed_rank() == 0:
@@ -6322,9 +6101,6 @@ def main(argv: list[str] | None = None) -> None:
             f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
             f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
             f"UMAP={'disabled' if not settings.umap_enabled else ('all_points' if settings.umap_max_points <= 0 else settings.umap_max_points)}, "
-            f"cross_asset={settings.cross_asset_enabled}, "
-            f"sources={'all' if settings.cross_asset_max_sources <= 0 else settings.cross_asset_max_sources}, "
-            f"targets={'all' if settings.cross_asset_max_targets <= 0 else settings.cross_asset_max_targets}, "
             f"strict_no_fallback={settings.strict_no_fallback}, "
             f"world_size={_distributed_world_size()}"
         )
