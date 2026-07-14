@@ -129,6 +129,66 @@ class GatedProjection(nn.Module):
         return self.dropout(projected)
 
 
+def _masked_market_summary_parts(z_stock: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_bool = mask.to(device=z_stock.device, dtype=torch.bool)
+    weights = mask_bool.to(dtype=z_stock.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=1).clamp_min(1.0)
+    mean = (z_stock * weights).sum(dim=1) / denom
+    centered = (z_stock - mean.unsqueeze(1)) * weights
+    variance = centered.float().pow(2).sum(dim=1) / denom.float()
+    std = torch.sqrt(variance.clamp_min(0.0) + 1e-6).to(dtype=z_stock.dtype)
+    dispersion = centered.abs().sum(dim=1) / denom
+    return torch.stack([mean, std, dispersion], dim=1)
+
+
+class LegacyDynamicTokenGenerator(nn.Module):
+    """Exact inference compatibility for checkpoints trained before static tokens."""
+
+    def __init__(
+        self,
+        *,
+        dim: int,
+        num_tokens: int,
+        hidden_dim: int,
+        norm_type: str,
+        ffn_type: str,
+    ) -> None:
+        super().__init__()
+        summary_dim = int(dim) * 3
+        self.dim = int(dim)
+        self.num_tokens = int(num_tokens)
+        self.summary_norm = _make_norm(summary_dim, norm_type)
+        self.summary_proj = GatedProjection(summary_dim, int(hidden_dim), 0.0, ffn_type)
+        self.out_proj = nn.Linear(int(hidden_dim), self.num_tokens * self.dim)
+        self.delta_dropout = nn.Dropout(0.0)
+        self.gate_logit = nn.Parameter(torch.zeros((), dtype=torch.float32))
+
+    def forward(
+        self,
+        base_queries: torch.Tensor,
+        z_stock: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        collect_aux: bool = True,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz = int(z_stock.size(0))
+        summary_parts = _masked_market_summary_parts(z_stock, mask)
+        summary = summary_parts.flatten(start_dim=1)
+        hidden = self.summary_proj(self.summary_norm(summary))
+        delta = self.out_proj(hidden).reshape(bsz, self.num_tokens, self.dim)
+        delta = self.delta_dropout(delta)
+        gate = torch.sigmoid(self.gate_logit).to(device=delta.device, dtype=delta.dtype)
+        dynamic = base_queries.expand(bsz, -1, -1) + gate * delta
+        if not collect_aux:
+            return dynamic, {}
+        return dynamic, {
+            "delta": delta,
+            "gate": gate.reshape(1),
+            "summary_parts": summary_parts,
+            "queries": dynamic,
+        }
+
+
 def _apply_rope(x: torch.Tensor, positions: torch.Tensor, base: float = 10000.0) -> torch.Tensor:
     rot_dim = (int(x.size(-1)) // 2) * 2
     if rot_dim <= 0:
@@ -725,6 +785,9 @@ class TransformerBasePortfolioModel(nn.Module):
             if self.use_market_tokens
             else None
         )
+        # Populated only by strict legacy-checkpoint reconstruction.
+        self.dynamic_latent_generator: LegacyDynamicTokenGenerator | None = None
+        self.dynamic_market_generator: LegacyDynamicTokenGenerator | None = None
         self.latent_blocks = nn.ModuleList(
             [
                 make_block(int(cross_heads), int(cross_ffn_mult))
@@ -781,6 +844,75 @@ class TransformerBasePortfolioModel(nn.Module):
             return nn.Sequential(*head)
 
         self.score_head = make_scalar_head()
+
+    def enable_legacy_dynamic_token_checkpoint_compatibility(
+        self,
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        """Reconstruct removed token generators from their complete saved schema."""
+
+        def build(prefix: str, base_queries: torch.Tensor | None) -> LegacyDynamicTokenGenerator | None:
+            keys = {
+                "gate_logit",
+                "summary_norm.weight",
+                "summary_proj.proj.weight",
+                "summary_proj.proj.bias",
+                "out_proj.weight",
+                "out_proj.bias",
+            }
+            present = {key[len(prefix) :] for key in state_dict if key.startswith(prefix)}
+            if not present:
+                return None
+            if present != keys:
+                missing = sorted(keys - present)
+                unexpected = sorted(present - keys)
+                raise RuntimeError(
+                    f"Incomplete legacy dynamic-token checkpoint schema for {prefix}: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            if base_queries is None:
+                raise RuntimeError(f"Legacy dynamic-token checkpoint has {prefix} but no base queries")
+
+            summary_dim = self.d_model * 3
+            norm_weight = state_dict[prefix + "summary_norm.weight"]
+            proj_weight = state_dict[prefix + "summary_proj.proj.weight"]
+            out_weight = state_dict[prefix + "out_proj.weight"]
+            out_bias = state_dict[prefix + "out_proj.bias"]
+            gate = state_dict[prefix + "gate_logit"]
+            num_tokens = int(base_queries.size(1))
+            if tuple(norm_weight.shape) != (summary_dim,) or gate.numel() != 1:
+                raise RuntimeError(f"Invalid legacy dynamic-token norm/gate shape for {prefix}")
+            if int(out_weight.size(0)) != num_tokens * self.d_model:
+                raise RuntimeError(f"Invalid legacy dynamic-token output shape for {prefix}")
+            hidden_dim = int(out_weight.size(1))
+            if tuple(out_bias.shape) != (num_tokens * self.d_model,):
+                raise RuntimeError(f"Invalid legacy dynamic-token output bias shape for {prefix}")
+            if int(proj_weight.size(1)) != summary_dim:
+                raise RuntimeError(f"Invalid legacy dynamic-token projection input shape for {prefix}")
+            if int(proj_weight.size(0)) == hidden_dim * 2:
+                ffn_type = "swiglu"
+            elif int(proj_weight.size(0)) == hidden_dim:
+                ffn_type = "gelu"
+            else:
+                raise RuntimeError(f"Invalid legacy dynamic-token projection output shape for {prefix}")
+            if tuple(state_dict[prefix + "summary_proj.proj.bias"].shape) != (int(proj_weight.size(0)),):
+                raise RuntimeError(f"Invalid legacy dynamic-token projection bias shape for {prefix}")
+
+            module = LegacyDynamicTokenGenerator(
+                dim=self.d_model,
+                num_tokens=num_tokens,
+                hidden_dim=hidden_dim,
+                norm_type=self.norm_type,
+                ffn_type=ffn_type,
+            )
+            return module.to(device=base_queries.device, dtype=base_queries.dtype)
+
+        latent = build("dynamic_latent_generator.", self.latent_queries)
+        market = build("dynamic_market_generator.", self.market_queries)
+        if latent is not None:
+            self.dynamic_latent_generator = latent
+        if market is not None:
+            self.dynamic_market_generator = market
 
     @staticmethod
     def _normalize_attention_mode(attention_mode: str) -> str:
@@ -1374,7 +1506,17 @@ class TransformerBasePortfolioModel(nn.Module):
         if use_latent:
             if self.latent_queries is None:
                 raise RuntimeError("latent_queries are required for attention_mode=latent")
-            factor_tokens = self.latent_queries.expand(bsz, -1, -1)
+            if self.dynamic_latent_generator is not None:
+                factor_tokens, dynamic_aux = self.dynamic_latent_generator(
+                    self.latent_queries,
+                    z_base,
+                    safe_mask,
+                    collect_aux=collect_aux,
+                )
+                if collect_aux:
+                    aux.update(self._prefixed_aux("dynamic_latent", dynamic_aux))
+            else:
+                factor_tokens = self.latent_queries.expand(bsz, -1, -1)
             for block in self.latent_blocks:
                 factor_tokens = self._run_block(block, factor_tokens, z_base, safe_mask)
             market_context = factor_tokens
@@ -1409,7 +1551,17 @@ class TransformerBasePortfolioModel(nn.Module):
 
         if self.market_queries is None:
             raise RuntimeError("market_queries are required for latent/market_token attention")
-        market_tokens = self.market_queries.expand(bsz, -1, -1)
+        if self.dynamic_market_generator is not None:
+            market_tokens, dynamic_aux = self.dynamic_market_generator(
+                self.market_queries,
+                z_base,
+                safe_mask,
+                collect_aux=collect_aux,
+            )
+            if collect_aux:
+                aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
+        else:
+            market_tokens = self.market_queries.expand(bsz, -1, -1)
         for block in self.market_blocks:
             market_tokens = self._run_block(block, market_tokens, market_context, market_key_mask)
 
@@ -1453,7 +1605,17 @@ class TransformerBasePortfolioModel(nn.Module):
 
         if self.market_queries is None:
             raise RuntimeError("market_queries are required for attention_mode=market_token")
-        market_tokens = self.market_queries.expand(bsz, -1, -1)
+        if self.dynamic_market_generator is not None:
+            market_tokens, dynamic_aux = self.dynamic_market_generator(
+                self.market_queries,
+                z_base,
+                safe_mask,
+                collect_aux=collect_aux,
+            )
+            if collect_aux:
+                aux.update(self._prefixed_aux("dynamic_market", dynamic_aux))
+        else:
+            market_tokens = self.market_queries.expand(bsz, -1, -1)
 
         for block in self.market_blocks:
             market_tokens = self._run_block(block, market_tokens, z_base, safe_mask)
