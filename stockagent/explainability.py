@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import gc
 import inspect
@@ -9,6 +10,7 @@ import math
 import os
 import time
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -91,6 +93,20 @@ def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
     return height * _PLOT_ASPECT_RATIO, height
 
 
+def _figsize_for_rows(
+    row_count: int,
+    *,
+    width: float = 20.0,
+    row_height: float = 0.28,
+    overhead: float = 2.5,
+    min_height: float = 6.0,
+    max_height: float = 80.0,
+) -> tuple[float, float]:
+    """Return a readable portrait-capable canvas for dense labelled plots."""
+    height = max(float(min_height), float(overhead) + float(row_height) * max(1, int(row_count)))
+    return max(8.0, float(width)), min(float(max_height), height)
+
+
 def _plot_width_px_17_6(height: int) -> int:
     return max(32, int(round(max(32, int(height)) * _PLOT_ASPECT_RATIO)))
 
@@ -153,6 +169,7 @@ def _safe_matplotlib_tight_layout(fig: Any) -> None:
 
 
 def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
+    pad_to_standard_aspect = bool(kwargs.pop("pad_to_standard_aspect", True))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _sanitize_matplotlib_axis_limits(fig)
     with warnings.catch_warnings():
@@ -162,7 +179,8 @@ def _save_matplotlib_figure(fig: Any, output_path: Path, **kwargs: Any) -> None:
             category=RuntimeWarning,
         )
         fig.savefig(output_path, **kwargs)
-    _pad_saved_image_to_17_6(output_path)
+    if pad_to_standard_aspect:
+        _pad_saved_image_to_17_6(output_path)
 
 FEATURE_GROUP_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Return", ("logret", "return", "ret_", "_ret")),
@@ -177,6 +195,9 @@ FEATURE_GROUP_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 class ExplainabilitySettings:
     progress_enabled: bool = True
     max_rows: int = 0
+    row_chunk_size: int = 0
+    amp_dtype: str = "fp32"
+    compile_model: bool = False
     ig_steps: int = 8
     ig_batch_size: int = 0
     perturb: bool = True
@@ -202,6 +223,8 @@ class ExplainabilitySettings:
     cross_asset_max_sources: int = 0
     cross_asset_max_targets: int = 0
     cross_asset_source_chunk_size: int = 2
+    cross_asset_row_chunk_size: int = 0
+    cross_asset_max_repeated_rows: int = 8
     cross_asset_perturb_scale: float = 1.0
     cross_asset_shocks: tuple[str, ...] = field(
         default_factory=lambda: ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
@@ -236,6 +259,55 @@ class MarketExplainabilityRun:
     output_dir: Path
 
 
+@dataclass(slots=True)
+class ExplainDatasetBatchSource:
+    """Lazily materialize selected explainability dates in bounded host chunks.
+
+    Standalone explainability can cover thousands of dates.  Materializing all
+    overlapping ``[lookback, symbols, features]`` windows first can consume
+    hundreds of GiB even though the GPU path is row-microbatched later.  This
+    source keeps the canonical dataset semantics while deferring window copies
+    until a bounded chunk is actually consumed.
+    """
+
+    dataset: CrossSectionalDataset
+    positions: np.ndarray
+
+    def __post_init__(self) -> None:
+        self.positions = np.asarray(self.positions, dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self.positions.size)
+
+    @property
+    def num_rows(self) -> int:
+        return len(self)
+
+    @property
+    def lookback(self) -> int:
+        return int(self.dataset.lookback)
+
+    @property
+    def num_symbols(self) -> int:
+        return int(self.dataset.features_t.size(1))
+
+    @property
+    def num_features(self) -> int:
+        return int(self.dataset.features_t.size(2))
+
+    @property
+    def date_indices(self) -> np.ndarray:
+        return self.dataset.valid_indices[self.positions]
+
+    def materialize(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        start = max(0, int(start))
+        end = min(len(self), max(start, int(end)))
+        if end <= start:
+            raise ValueError("ExplainDatasetBatchSource cannot materialize an empty row range.")
+        samples = [self.dataset[int(pos)] for pos in self.positions[start:end]]
+        return collate_batch(samples)
+
+
 def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
     from stockagent.explainability_cross_asset import CrossAssetTransmissionSettings
 
@@ -246,6 +318,8 @@ def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
         max_sources=max(0, int(settings.cross_asset_max_sources)),
         max_targets=max(0, int(settings.cross_asset_max_targets)),
         source_chunk_size=max(1, int(settings.cross_asset_source_chunk_size)),
+        row_chunk_size=max(0, int(settings.cross_asset_row_chunk_size)),
+        max_repeated_rows=max(1, int(settings.cross_asset_max_repeated_rows)),
         perturb_scale=float(settings.cross_asset_perturb_scale),
         shocks=shocks or ("zero", "momentum", "gap", "volume", "volatility", "liquidity"),
         attention_flow=bool(settings.cross_asset_attention_flow),
@@ -269,6 +343,7 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
 
     return ExplainabilitySettings(
         max_rows=int(getattr(training, "explain_max_rows", 32)),
+        row_chunk_size=int(getattr(training, "explain_row_chunk_size", 0)),
         ig_steps=int(getattr(training, "explain_ig_steps", 0)),
         ig_batch_size=int(getattr(training, "explain_ig_batch_size", 1)),
         perturb=bool(getattr(training, "explain_perturb", False)),
@@ -294,6 +369,10 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         cross_asset_max_sources=int(getattr(training, "explain_cross_asset_max_sources", 8)),
         cross_asset_max_targets=int(getattr(training, "explain_cross_asset_max_targets", 8)),
         cross_asset_source_chunk_size=int(getattr(training, "explain_cross_asset_source_chunk_size", 1)),
+        cross_asset_row_chunk_size=int(getattr(training, "explain_cross_asset_row_chunk_size", 0)),
+        cross_asset_max_repeated_rows=int(
+            getattr(training, "explain_cross_asset_max_repeated_rows", 8)
+        ),
         cross_asset_perturb_scale=float(getattr(training, "explain_cross_asset_perturb_scale", 1.0)),
         cross_asset_shocks=tuple(getattr(training, "explain_cross_asset_shocks", ())),
         cross_asset_attention_flow=bool(getattr(training, "explain_cross_asset_attention_flow", True)),
@@ -590,9 +669,89 @@ def _use_datashader_for_explainability(plot_backend: str, *, estimated_points: i
 
 def _device_from_config(config: ExperimentConfig, override: str | None = None) -> torch.device:
     requested = (override or config.environment.device or "cpu").strip().lower()
-    if requested == "cuda" and not torch.cuda.is_available():
+    if requested.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for explanation, but torch.cuda.is_available() is False.")
+    if requested == "cuda" and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        requested = f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
     return torch.device(requested)
+
+
+def _distributed_explainability_ready() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _distributed_rank() -> int:
+    if _distributed_explainability_ready():
+        return int(torch.distributed.get_rank())
+    return int(os.environ.get("RANK", "0"))
+
+
+def _distributed_world_size() -> int:
+    if _distributed_explainability_ready():
+        return int(torch.distributed.get_world_size())
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _distributed_barrier() -> None:
+    if not _distributed_explainability_ready():
+        return
+    if torch.distributed.get_backend() == "nccl":
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        torch.distributed.barrier()
+
+
+def _destroy_explainability_process_group() -> None:
+    if _distributed_explainability_ready():
+        torch.distributed.destroy_process_group()
+
+
+def _initialize_explainability_process_group() -> bool:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1 or _distributed_explainability_ready():
+        return False
+    if not torch.distributed.is_available():
+        raise RuntimeError("WORLD_SIZE > 1 but torch.distributed is unavailable.")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        if local_rank < 0 or local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is unavailable; visible CUDA devices={torch.cuda.device_count()}"
+            )
+        torch.cuda.set_device(local_rank)
+        backend = "nccl"
+    else:
+        backend = "gloo"
+    torch.distributed.init_process_group(backend=backend)
+    atexit.register(_destroy_explainability_process_group)
+    return True
+
+
+def _normalize_explain_amp_dtype(value: str | None, config: ExperimentConfig | None = None) -> str:
+    normalized = str(value or "config").strip().lower().replace("torch.", "")
+    if normalized == "config":
+        configured = getattr(getattr(config, "environment", None), "amp_dtype", "bf16")
+        normalized = str(configured or "bf16").strip().lower().replace("torch.", "")
+    aliases = {
+        "bfloat16": "bf16",
+        "float16": "fp16",
+        "half": "fp16",
+        "float32": "fp32",
+        "full": "fp32",
+        "none": "fp32",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"bf16", "fp16", "fp32"}:
+        raise ValueError("amp_dtype must be one of: config, bf16, fp16, fp32")
+    return normalized
+
+
+def _explain_autocast_context(device: torch.device, amp_dtype: str):
+    normalized = _normalize_explain_amp_dtype(amp_dtype)
+    if device.type != "cuda" or normalized == "fp32":
+        return nullcontext()
+    dtype = torch.bfloat16 if normalized == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype)
 
 
 def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -611,6 +770,20 @@ def _slice_batch_rows(batch: dict[str, torch.Tensor], start: int, end: int) -> d
     return sliced
 
 
+def _surrogate_input_summary(x: torch.Tensor) -> torch.Tensor:
+    """Keep the exact first/last/mean surrogate inputs without the full window."""
+    value = x.detach().float()
+    if int(value.size(1)) <= 1:
+        return value[:, :1].cpu()
+    first = value[:, 0]
+    last = value[:, -1]
+    mean = value.mean(dim=1)
+    # A synthetic three-step window preserves the exact first, last, and mean
+    # consumed by _score_head_surrogate_shap/_feature_correlations.
+    middle = 3.0 * mean - first - last
+    return torch.stack((first, middle, last), dim=1).cpu()
+
+
 def _cuda_mem_get_info(device: torch.device) -> tuple[int, int] | None:
     if device.type != "cuda" or not torch.cuda.is_available():
         return None
@@ -620,15 +793,19 @@ def _cuda_mem_get_info(device: torch.device) -> tuple[int, int] | None:
         return torch.cuda.mem_get_info()
 
 
-def _auto_explain_row_chunk_size(
-    batch: dict[str, torch.Tensor],
+def _auto_explain_row_chunk_size_from_shape(
+    *,
+    n_rows: int,
+    lookback: int,
+    n_symbols: int,
+    n_features: int,
     settings: ExplainabilitySettings,
     device: torch.device,
 ) -> tuple[int, dict[str, Any]]:
-    x = batch.get("x")
-    if not torch.is_tensor(x) or x.ndim != 4:
-        return 1, {"reason": "missing_x"}
-    n_rows = int(x.size(0))
+    n_rows = max(1, int(n_rows))
+    lookback = max(1, int(lookback))
+    n_symbols = max(1, int(n_symbols))
+    n_features = max(1, int(n_features))
     if n_rows <= 1:
         return max(1, n_rows), {"reason": "single_row", "rows": n_rows}
     override = os.environ.get("STOCKAGENT_EXPLAIN_ROW_CHUNK_SIZE")
@@ -638,13 +815,24 @@ def _auto_explain_row_chunk_size(
             return value, {"reason": "env_override", "rows": n_rows, "row_chunk_size": value}
         except ValueError:
             pass
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return n_rows, {"reason": "non_cuda", "rows": n_rows, "row_chunk_size": n_rows}
+    requested = int(settings.row_chunk_size)
+    if requested > 0:
+        value = max(1, min(n_rows, requested))
+        return value, {"reason": "settings", "rows": n_rows, "row_chunk_size": value}
 
-    lookback = int(x.size(1))
-    n_symbols = int(x.size(2))
-    n_features = int(x.size(3))
     bytes_per_row = max(1, lookback * n_symbols * n_features * 4)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        # Keep exhaustive CPU runs bounded too.  This is a host materialization
+        # bound, not a date-coverage limit.
+        host_budget = 1 * 1024**3
+        value = max(1, min(n_rows, host_budget // bytes_per_row))
+        return value, {
+            "reason": "host_budget",
+            "rows": n_rows,
+            "row_chunk_size": value,
+            "bytes_per_row": int(bytes_per_row),
+        }
+
     mem_info = _cuda_mem_get_info(device)
     free_bytes, total_bytes = mem_info if mem_info is not None else (0, 0)
     gib = 1024**3
@@ -675,6 +863,24 @@ def _auto_explain_row_chunk_size(
         "total_gb": float(total_bytes) / gib,
         "workspace_reserve_gb": float(workspace_reserve) / gib,
     }
+
+
+def _auto_explain_row_chunk_size(
+    batch: dict[str, torch.Tensor],
+    settings: ExplainabilitySettings,
+    device: torch.device,
+) -> tuple[int, dict[str, Any]]:
+    x = batch.get("x")
+    if not torch.is_tensor(x) or x.ndim != 4:
+        return 1, {"reason": "missing_x"}
+    return _auto_explain_row_chunk_size_from_shape(
+        n_rows=int(x.size(0)),
+        lookback=int(x.size(1)),
+        n_symbols=int(x.size(2)),
+        n_features=int(x.size(3)),
+        settings=settings,
+        device=device,
+    )
 
 
 def _call_model(
@@ -2096,6 +2302,7 @@ def explain_batch(
             "scores": scores.detach().cpu(),
             "returns": returns.detach().cpu(),
             "mask": mask.detach().cpu(),
+            "x_summary": _surrogate_input_summary(x),
             "aux": {
                 str(name): value.detach().float().cpu()
                 for name, value in aux.items()
@@ -2290,7 +2497,7 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
 def _combine_chunked_explainability_results(
     chunk_results: list[tuple[dict[str, Any], int]],
     *,
-    batch: dict[str, torch.Tensor],
+    lookback: int,
     feature_names: list[str],
     symbols: list[str],
     dates: list[str],
@@ -2323,11 +2530,12 @@ def _combine_chunked_explainability_results(
     ig_feature = _feature_summary_frame(ig_ft, "integrated_gradients_abs")
     ig_time = _time_summary_frame(ig_ft, "integrated_gradients_abs")
     perturb_feature = _combine_perturbation_summary(perturb_ft)
-    weights = torch.cat([result["_core"]["weights"] for result, _ in chunk_results], dim=0)
-    scores = torch.cat([result["_core"]["scores"] for result, _ in chunk_results], dim=0)
-    returns = torch.cat([result["_core"]["returns"] for result, _ in chunk_results], dim=0)
-    mask = torch.cat([result["_core"]["mask"] for result, _ in chunk_results], dim=0).bool()
-    x_cpu = torch.nan_to_num(batch["x"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    weights = torch.cat([result["_core"].pop("weights") for result, _ in chunk_results], dim=0)
+    scores = torch.cat([result["_core"].pop("scores") for result, _ in chunk_results], dim=0)
+    returns = torch.cat([result["_core"].pop("returns") for result, _ in chunk_results], dim=0)
+    mask = torch.cat([result["_core"].pop("mask") for result, _ in chunk_results], dim=0).bool()
+    x_cpu = torch.cat([result["_core"].pop("x_summary") for result, _ in chunk_results], dim=0)
+    x_cpu = torch.nan_to_num(x_cpu.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
     shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap(
         x_cpu,
@@ -2369,6 +2577,8 @@ def _combine_chunked_explainability_results(
         ]
         if tensors and all(tensor.ndim == tensors[0].ndim and tensor.shape[1:] == tensors[0].shape[1:] for tensor in tensors):
             combined_aux[name] = torch.cat(tensors, dim=0)
+    for result, _ in chunk_results:
+        result.get("_core", {}).pop("aux", None)
     aux_projection_frames, aux_projection_summary, aux_projection_warnings, aux_projection_timing = (
         _aux_umap_projection_frames(
             combined_aux,
@@ -2402,7 +2612,7 @@ def _combine_chunked_explainability_results(
         mask=mask,
         selected=selected,
         inventory=decision_inventory,
-        lookback=int(batch["x"].size(1)),
+        lookback=int(lookback),
         feature_count=len(feature_names),
         grad_ft=grad_ft,
         ig_ft=ig_ft,
@@ -2548,7 +2758,7 @@ def explain_batch_row_chunked(
             diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
             combined = _combine_chunked_explainability_results(
                 chunk_results,
-                batch=batch,
+                lookback=int(batch["x"].size(1)),
                 feature_names=feature_names,
                 symbols=symbols,
                 dates=dates,
@@ -2579,6 +2789,121 @@ def explain_batch_row_chunked(
             )
             _clear_explainability_runtime_cache()
             print(f"[explain] {fallback_warning}")
+
+
+def _compact_explain_chunk_result(result: dict[str, Any]) -> None:
+    required_frames = {
+        "feature_time_gradient",
+        "feature_time_integrated_gradients",
+        "feature_time_perturbation",
+        "aux_summary",
+    }
+    frames = result.get("frames", {})
+    result["frames"] = {
+        name: frame
+        for name, frame in frames.items()
+        if name in required_frames
+    }
+    result["aux_projection_frames"] = {}
+
+
+def explain_batch_source_chunked(
+    model: nn.Module,
+    source: ExplainDatasetBatchSource,
+    *,
+    feature_names: list[str],
+    symbols: list[str],
+    dates: list[str],
+    settings: ExplainabilitySettings,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Explain a lazy date source without ever collating the full host batch."""
+    n_rows = len(source)
+    if n_rows <= 0:
+        raise ValueError("Explainability source has no rows.")
+    row_chunk_size, diagnostics = _auto_explain_row_chunk_size_from_shape(
+        n_rows=n_rows,
+        lookback=source.lookback,
+        n_symbols=source.num_symbols,
+        n_features=source.num_features,
+        settings=settings,
+        device=device,
+    )
+    diagnostics = {**diagnostics, "lazy_host_materialization": True}
+    print(
+        "[explain] lazy date streaming enabled: "
+        f"rows={n_rows}, row_chunk_size={row_chunk_size}, symbols={source.num_symbols}, "
+        f"features={source.num_features}"
+    )
+
+    total_start = time.perf_counter()
+    chunk_results: list[tuple[dict[str, Any], int]] = []
+    start = 0
+    progress = tqdm(
+        total=n_rows,
+        desc="Explain date chunks",
+        unit="date",
+        disable=not bool(settings.progress_enabled),
+    )
+    while start < n_rows:
+        end = min(n_rows, start + row_chunk_size)
+        batch = source.materialize(start, end)
+        chunk_settings = replace(
+            settings,
+            umap_enabled=False,
+            shap_enabled=False,
+            regime_analysis=False,
+        )
+        try:
+            result = explain_batch(
+                model,
+                batch,
+                feature_names=feature_names,
+                symbols=symbols,
+                dates=dates[start:end],
+                settings=chunk_settings,
+                device=device,
+            )
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or row_chunk_size <= 1:
+                raise
+            # Reducing execution shape preserves every method and every date;
+            # it is therefore safe even under strict_no_fallback.
+            row_chunk_size = max(1, row_chunk_size // 2)
+            diagnostics = {
+                **diagnostics,
+                "oom_retries": int(diagnostics.get("oom_retries", 0)) + 1,
+                "final_row_chunk_size": row_chunk_size,
+            }
+            del batch
+            _clear_explainability_runtime_cache()
+            print(f"[explain] CUDA OOM; retrying the same dates with row_chunk_size={row_chunk_size}")
+            continue
+        _compact_explain_chunk_result(result)
+        chunk_results.append((result, end - start))
+        del batch, result
+        start = end
+        _clear_explainability_runtime_cache()
+        progress.update(end - progress.n)
+        progress.set_postfix(chunk=row_chunk_size, refresh=False)
+    progress.close()
+
+    diagnostics = {
+        **diagnostics,
+        "chunk_count": len(chunk_results),
+        "final_row_chunk_size": row_chunk_size,
+    }
+    return _combine_chunked_explainability_results(
+        chunk_results,
+        lookback=source.lookback,
+        feature_names=feature_names,
+        symbols=symbols,
+        dates=dates,
+        settings=settings,
+        device=device,
+        row_chunk_diagnostics=diagnostics,
+        total_elapsed_s=float(time.perf_counter() - total_start),
+    )
 
 
 def _write_markdown_report(
@@ -2722,10 +3047,19 @@ def _add_paper_header(fig: Any, ax: Any, title: str, subtitle: str) -> None:
     subtitle_wrapped = textwrap.fill(str(subtitle).strip(), width=124, break_long_words=False)
     title_lines = title_wrapped.count("\n") + 1
     subtitle_lines = subtitle_wrapped.count("\n") + 1
-    fig.subplots_adjust(top=max(0.58, 0.84 - 0.035 * max(0, title_lines - 1) - 0.025 * max(0, subtitle_lines - 1)))
+    # Reserve a fixed physical header height. A fixed fractional top margin
+    # wastes many inches on portrait plots whose height grows with row count.
+    fig_height = max(1.0, float(fig.get_size_inches()[1]))
+    title_top_in = 0.22
+    subtitle_top_in = title_top_in + 0.34 * title_lines + 0.18
+    header_height_in = subtitle_top_in + 0.23 * subtitle_lines + 0.35
+    top = max(0.45, min(0.94, 1.0 - header_height_in / fig_height))
+    title_y = max(top + 0.08, 1.0 - title_top_in / fig_height)
+    subtitle_y = max(top + 0.03, 1.0 - subtitle_top_in / fig_height)
+    fig.subplots_adjust(top=top)
     left = ax.get_position().x0
-    fig.text(left, 0.975, title_wrapped, ha="left", va="top", fontsize=15, fontweight="bold", color=PAPER_TOKENS["ink"])
-    fig.text(left, 0.925, subtitle_wrapped, ha="left", va="top", fontsize=10.5, color=PAPER_TOKENS["muted"])
+    fig.text(left, title_y, title_wrapped, ha="left", va="top", fontsize=15, fontweight="bold", color=PAPER_TOKENS["ink"])
+    fig.text(left, subtitle_y, subtitle_wrapped, ha="left", va="top", fontsize=10.5, color=PAPER_TOKENS["muted"])
 
 
 def _finish_paper_axes(ax: Any) -> None:
@@ -2906,8 +3240,10 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
         return
     plt, sns = _setup_paper_plotting()
     feature_count = int(data.select(pl.col("feature_label").n_unique()).item())
-    fig_height = min(12.0, max(5.2, 0.42 * feature_count + 2.1))
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
+    fig, ax = plt.subplots(
+        figsize=_figsize_for_rows(feature_count, width=22.0, row_height=0.30, overhead=2.8),
+        dpi=160,
+    )
     palette = {
         "Grad x input": PAPER_TOKENS["blue_mid"],
         "Integrated gradients": PAPER_TOKENS["gold_mid"],
@@ -2938,7 +3274,7 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
     )
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _save_matplotlib_figure(fig, output_path)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
 
 
@@ -2978,8 +3314,10 @@ def _plot_paper_feature_time_heatmap(
     plt, sns = _setup_paper_plotting()
     from matplotlib.colors import LinearSegmentedColormap
 
-    fig_height = min(12.0, max(5.0, 0.38 * len(labels) + 2.0))
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=170)
+    fig, ax = plt.subplots(
+        figsize=_figsize_for_rows(len(labels), width=24.0, row_height=0.25, overhead=3.0),
+        dpi=170,
+    )
     cmap = LinearSegmentedColormap.from_list(
         "paper_blue_gold",
         [PAPER_TOKENS["blue_xlight"], PAPER_TOKENS["blue_base"], PAPER_TOKENS["blue_dark"], PAPER_TOKENS["gold_mid"]],
@@ -3005,7 +3343,7 @@ def _plot_paper_feature_time_heatmap(
     ax.tick_params(axis="y", labelsize=8)
     _add_paper_header(fig, ax, title, subtitle)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _save_matplotlib_figure(fig, output_path)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
 
 
@@ -3053,8 +3391,10 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
         index=["label"], on=["score_corr", "weight_corr"], variable_name="target", value_name="corr"
     )
     plt, sns = _setup_paper_plotting()
-    fig_height = min(12.0, max(5.2, 0.36 * data.height + 2.0))
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
+    fig, ax = plt.subplots(
+        figsize=_figsize_for_rows(data.height, width=22.0, row_height=0.24, overhead=2.8),
+        dpi=160,
+    )
     sns.barplot(
         data=_to_plot_data(plot),
         y="label",
@@ -3071,7 +3411,7 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
     _add_paper_header(fig, ax, "Simple feature correlations test for shortcut rules", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _save_matplotlib_figure(fig, output_path)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
 
 
@@ -3613,8 +3953,10 @@ def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallbac
     plt, sns = _setup_paper_plotting()
     data = summary
     if not data.is_empty():
-        fig_height = min(12.0, max(5.0, 0.36 * data.height + 2.0))
-        fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
+        fig, ax = plt.subplots(
+            figsize=_figsize_for_rows(data.height, width=22.0, row_height=0.30, overhead=2.8),
+            dpi=160,
+        )
         sns.barplot(data=_frame_to_dict(data), y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
         ax.set_xlabel("Mean attribution share across folds")
         ax.set_ylabel("")
@@ -3622,7 +3964,11 @@ def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallbac
         fold_count = int(combined.select(pl.col("fold_id").n_unique()).item())
         _add_paper_header(fig, ax, "Fold stability shows whether the same features remain important", f"Computed across {fold_count} fold explainability outputs.")
         _finish_paper_axes(ax)
-        _save_matplotlib_figure(fig, plot_dir / "fold_stability_feature_share.png")
+        _save_matplotlib_figure(
+            fig,
+            plot_dir / "fold_stability_feature_share.png",
+            pad_to_standard_aspect=False,
+        )
         plt.close(fig)
     report = [
         "# Paper Fold Stability Summary",
@@ -3660,17 +4006,19 @@ def _plot_barh(
         return
     labels = _string_list(data, label_col)
     values = _numeric_numpy(data, value_col)
-    fig_height = min(12.0, max(4.0, 0.28 * data.height + 1.5))
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
+    fig, ax = plt.subplots(
+        figsize=_figsize_for_rows(data.height, width=20.0, row_height=0.26, overhead=2.0),
+        dpi=130,
+    )
     ax.barh(labels[::-1], values[::-1])
     ax.set_title(title)
     ax.set_xlabel(value_col)
     ax.grid(True, axis="x", alpha=0.25)
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _save_matplotlib_figure(fig, output_path)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
 
 
@@ -3731,8 +4079,10 @@ def _plot_feature_time_heatmap(
         return
     import matplotlib.pyplot as plt
 
-    fig_height = min(12.0, max(4.0, 0.30 * len(labels) + 1.5))
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
+    fig, ax = plt.subplots(
+        figsize=_figsize_for_rows(len(labels), width=22.0, row_height=0.24, overhead=2.2),
+        dpi=130,
+    )
     image = ax.imshow(matrix, aspect="auto", interpolation="nearest")
     ax.set_title(title)
     ax.set_xlabel("lookback_from_end (0 = latest)")
@@ -3744,7 +4094,7 @@ def _plot_feature_time_heatmap(
     fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _save_matplotlib_figure(fig, output_path)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
 
 
@@ -3805,8 +4155,10 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
         "__label",
     )
     y = np.arange(data.height)
-    fig_height = min(12.0, max(4.0, 0.28 * data.height + 1.5))
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
+    fig, ax = plt.subplots(
+        figsize=_figsize_for_rows(data.height, width=22.0, row_height=0.22, overhead=2.2),
+        dpi=130,
+    )
     ax.barh(y - 0.18, _numeric_numpy(data, "score_corr"), height=0.35, label="score_corr")
     if "weight_corr" in data.columns:
         ax.barh(y + 0.18, _numeric_numpy(data, "weight_corr"), height=0.35, label="weight_corr")
@@ -3820,7 +4172,7 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     ax.legend()
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _save_matplotlib_figure(fig, output_path)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
 
 
@@ -4609,13 +4961,11 @@ def _dataset_for_split(
     return CrossSectionalDataset(panel, indices, lookback)
 
 
-def _sample_dataset(
+def _sample_dataset_positions(
     dataset: CrossSectionalDataset,
     max_rows: int,
     method: str,
-    *,
-    progress_enabled: bool = False,
-) -> tuple[dict[str, torch.Tensor], np.ndarray]:
+) -> np.ndarray:
     n_rows = len(dataset)
     # Non-positive is the exhaustive standalone default. A positive value is an
     # explicit reduced run requested by the caller.
@@ -4627,10 +4977,32 @@ def _sample_dataset(
         positions = np.arange(0, n_take, dtype=np.int64)
     else:
         positions = np.linspace(0, n_rows - 1, n_take, dtype=np.int64)
+    return positions
+
+
+def _sample_dataset_source(
+    dataset: CrossSectionalDataset,
+    max_rows: int,
+    method: str,
+) -> ExplainDatasetBatchSource:
+    return ExplainDatasetBatchSource(
+        dataset=dataset,
+        positions=_sample_dataset_positions(dataset, max_rows, method),
+    )
+
+
+def _sample_dataset(
+    dataset: CrossSectionalDataset,
+    max_rows: int,
+    method: str,
+    *,
+    progress_enabled: bool = False,
+) -> tuple[dict[str, torch.Tensor], np.ndarray]:
+    source = _sample_dataset_source(dataset, max_rows, method)
     samples = [
         dataset[int(pos)]
         for pos in tqdm(
-            positions,
+            source.positions,
             desc="Materialize explain dates",
             unit="date",
             leave=False,
@@ -4638,7 +5010,7 @@ def _sample_dataset(
         )
     ]
     batch = collate_batch(samples)
-    return batch, dataset.valid_indices[positions]
+    return batch, source.date_indices
 
 
 def load_explanation_context(
@@ -4745,12 +5117,16 @@ def run_loaded_model_explanation(
     if config_strict_no_fallback and not bool(settings.strict_no_fallback):
         settings = replace(settings, strict_no_fallback=True)
     device = device or next(model.parameters()).device
+    resolved_amp_dtype = _normalize_explain_amp_dtype(settings.amp_dtype, config)
+    settings = replace(settings, amp_dtype=resolved_amp_dtype)
     split_norm = split.strip().lower()
     runner_timing: dict[str, float | str | int | bool] = {
         "fold_id": int(fold.fold_id),
         "split": split_norm,
         "enabled": True,
         "loaded_model_reused": True,
+        "amp_dtype": resolved_amp_dtype,
+        "lazy_host_materialization": True,
     }
     runner_progress = tqdm(
         total=5,
@@ -4768,12 +5144,12 @@ def run_loaded_model_explanation(
         config.training.lookback,
         first_test_year_only=settings.first_test_year_only,
     )
-    batch, date_indices = _sample_dataset(
+    batch_source = _sample_dataset_source(
         dataset,
         settings.max_rows,
         settings.sample_method,
-        progress_enabled=bool(settings.progress_enabled),
     )
+    date_indices = batch_source.date_indices
     dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
     runner_timing["sample_s"] = float(time.perf_counter() - sample_start)
     runner_timing["sample_rows"] = int(len(dates))
@@ -4786,19 +5162,32 @@ def run_loaded_model_explanation(
 
     was_training = model.training
     model.eval()
+    execution_model = model
+    compile_start = time.perf_counter()
+    if bool(settings.compile_model):
+        if device.type != "cuda":
+            raise RuntimeError("--compile-model requires a CUDA explainability device.")
+        execution_model = torch.compile(
+            model,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+    runner_timing["compile_wrapper_s"] = float(time.perf_counter() - compile_start)
+    runner_timing["compile_model"] = bool(settings.compile_model)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     compute_start = time.perf_counter()
     try:
-        result = explain_batch_row_chunked(
-            model,
-            batch,
-            feature_names=panel.feature_names,
-            symbols=panel.symbols,
-            dates=dates,
-            settings=settings,
-            device=device,
-        )
+        with _explain_autocast_context(device, resolved_amp_dtype):
+            result = explain_batch_source_chunked(
+                execution_model,
+                batch_source,
+                feature_names=panel.feature_names,
+                symbols=panel.symbols,
+                dates=dates,
+                settings=settings,
+                device=device,
+            )
     finally:
         if was_training:
             model.train()
@@ -4820,6 +5209,8 @@ def run_loaded_model_explanation(
         "split": split_norm,
         "checkpoint": str(checkpoint_path),
         "device": str(device),
+        "amp_dtype": resolved_amp_dtype,
+        "compile_model": bool(settings.compile_model),
         "sample_rows": int(len(dates)),
         "split_rows": int(len(dataset)),
         "sampled_date_coverage": float(len(dates)) / max(1, int(len(dataset))),
@@ -4868,16 +5259,17 @@ def run_loaded_model_explanation(
             print("[explain] cross-asset skipped after CUDA OOM fallback in main explainability")
         else:
             try:
-                cross_asset_summary = abstract_cross_asset_transmission(
-                    model,
-                    batch,
-                    feature_names=panel.feature_names,
-                    symbols=panel.symbols,
-                    dates=dates,
-                    output_dir=destination,
-                    settings=_cross_asset_settings_from_explainability(settings),
-                    device=device,
-                )
+                with _explain_autocast_context(device, resolved_amp_dtype):
+                    cross_asset_summary = abstract_cross_asset_transmission(
+                        execution_model,
+                        batch_source,
+                        feature_names=panel.feature_names,
+                        symbols=panel.symbols,
+                        dates=dates,
+                        output_dir=destination,
+                        settings=_cross_asset_settings_from_explainability(settings),
+                        device=device,
+                    )
             except RuntimeError as exc:
                 if not _is_cuda_oom(exc):
                     raise
@@ -4943,7 +5335,7 @@ def run_loaded_model_explanation(
         )
 
     destination_out = destination
-    del result, batch, dataset, model
+    del result, batch_source, dataset, execution_model, model
     _clear_explainability_runtime_cache()
     return destination_out
 
@@ -5087,6 +5479,67 @@ def _discover_market_runs(
     return runs
 
 
+def _estimated_fold_explain_rows(
+    fold: WalkForwardFold,
+    panel: PanelData,
+    *,
+    split: str,
+    lookback: int,
+    first_test_year_only: bool,
+    max_rows: int,
+) -> int:
+    split_norm = split.strip().lower()
+    if split_norm == "train":
+        indices = fold.train_indices
+    elif split_norm == "val":
+        indices = fold.val_indices
+    else:
+        indices = fold.test_indices
+        if first_test_year_only:
+            indices = _first_year_indices(panel, indices)
+    rows = max(0, int(len(indices)) - max(1, int(lookback)) + 1)
+    if int(max_rows) > 0:
+        rows = min(rows, int(max_rows))
+    return rows
+
+
+def _balanced_fold_assignments(
+    fold_ids: list[int],
+    folds_by_id: dict[int, WalkForwardFold],
+    panel: PanelData,
+    *,
+    world_size: int,
+    split: str,
+    lookback: int,
+    first_test_year_only: bool,
+    max_rows: int,
+) -> tuple[list[list[int]], list[int]]:
+    world_size = max(1, int(world_size))
+    assignments: list[list[int]] = [[] for _ in range(world_size)]
+    loads = [0 for _ in range(world_size)]
+    weighted = [
+        (
+            int(fold_id),
+            _estimated_fold_explain_rows(
+                folds_by_id[int(fold_id)],
+                panel,
+                split=split,
+                lookback=lookback,
+                first_test_year_only=first_test_year_only,
+                max_rows=max_rows,
+            ),
+        )
+        for fold_id in fold_ids
+    ]
+    for fold_id, rows in sorted(weighted, key=lambda item: (-item[1], item[0])):
+        rank = min(range(world_size), key=lambda candidate: (loads[candidate], candidate))
+        assignments[rank].append(fold_id)
+        loads[rank] += int(rows)
+    for rank_folds in assignments:
+        rank_folds.sort()
+    return assignments, loads
+
+
 def _run_explainability_for_config(
     args: argparse.Namespace,
     settings: ExplainabilitySettings,
@@ -5095,6 +5548,12 @@ def _run_explainability_for_config(
     output_dir: Path | None = None,
     explain_output_dir: Path | None = None,
 ) -> None:
+    rank = _distributed_rank()
+    world_size = _distributed_world_size()
+    rank_settings = replace(
+        settings,
+        progress_enabled=bool(settings.progress_enabled and rank == 0),
+    )
     # Default behavior: if neither --fold nor --checkpoint is provided,
     # run explainability for all folds that have checkpoint_best.pt.
     run_all_folds = args.fold is None and args.checkpoint is None
@@ -5103,7 +5562,7 @@ def _run_explainability_for_config(
             total=3,
             desc="Explain setup",
             unit="stage",
-            disable=not bool(settings.progress_enabled),
+            disable=not bool(rank_settings.progress_enabled),
         )
         setup_progress.set_postfix(stage="load_config", refresh=True)
         config = load_config(config_path)
@@ -5156,19 +5615,35 @@ def _run_explainability_for_config(
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         folds_by_id = {int(fold.fold_id): fold for fold in folds}
-        print(f"explaining folds: {fold_ids}")
-        for fold_id in tqdm(
+        assignments, estimated_loads = _balanced_fold_assignments(
             fold_ids,
-            desc="Explain folds",
+            folds_by_id,
+            panel,
+            world_size=world_size,
+            split=args.split,
+            lookback=config.training.lookback,
+            first_test_year_only=bool(settings.first_test_year_only),
+            max_rows=int(settings.max_rows),
+        )
+        local_fold_ids = assignments[rank]
+        if rank == 0:
+            print(
+                f"distributed explainability: world_size={world_size}, "
+                f"assignments={assignments}, estimated_rows={estimated_loads}"
+            )
+        print(f"[rank {rank}] explaining folds: {local_fold_ids} on {device}")
+        for fold_id in tqdm(
+            local_fold_ids,
+            desc=f"Rank {rank} explain folds",
             unit="fold",
-            disable=not bool(settings.progress_enabled),
+            disable=not bool(rank_settings.progress_enabled),
         ):
             fold_stage = tqdm(
                 total=3,
                 desc=f"Fold {int(fold_id):02d} stages",
                 unit="stage",
                 leave=False,
-                disable=not bool(settings.progress_enabled),
+                disable=not bool(rank_settings.progress_enabled),
             )
             fold_stage.set_postfix(stage="load_checkpoint", refresh=True)
             fold_output_dir = explain_output_dir
@@ -5188,7 +5663,7 @@ def _run_explainability_for_config(
                     fold_panel,
                     checkpoint_path,
                     device,
-                    strict=args.strict,
+                    strict=bool(args.strict or args.strict_no_fallback),
                 )
                 fold_stage.update(1)
                 fold_stage.set_postfix(stage="explain_all_modules", refresh=True)
@@ -5201,7 +5676,7 @@ def _run_explainability_for_config(
                     output_dir=resolved_output_dir,
                     split=args.split,
                     explain_output_dir=fold_output_dir,
-                    settings=settings,
+                    settings=rank_settings,
                     write_plots=bool(args.plots),
                     plot_backend=args.plot_backend,
                     device=device,
@@ -5215,8 +5690,9 @@ def _run_explainability_for_config(
                 _clear_explainability_runtime_cache()
                 fold_stage.update(1)
                 fold_stage.close()
-            print(f"explainability output (fold {fold_id}): {out_dir}")
-        if settings.fold_stability:
+            print(f"[rank {rank}] explainability output (fold {fold_id}): {out_dir}")
+        _distributed_barrier()
+        if rank == 0 and settings.fold_stability:
             stability_dir = write_fold_stability_outputs(
                 resolved_output_dir / "explainability",
                 strict_no_fallback=bool(settings.strict_no_fallback),
@@ -5225,20 +5701,22 @@ def _run_explainability_for_config(
                 print(f"fold stability output: {stability_dir}")
         return
 
-    out_dir = run_checkpoint_explanation(
-        config_path=config_path,
-        output_dir=output_dir,
-        fold_id=args.fold,
-        checkpoint=args.checkpoint,
-        split=args.split,
-        explain_output_dir=explain_output_dir,
-        settings=settings,
-        device_override=args.device,
-        strict=bool(args.strict or args.strict_no_fallback),
-        write_plots=bool(args.plots),
-        plot_backend=args.plot_backend,
-    )
-    print(f"explainability output: {out_dir}")
+    if rank == 0:
+        out_dir = run_checkpoint_explanation(
+            config_path=config_path,
+            output_dir=output_dir,
+            fold_id=args.fold,
+            checkpoint=args.checkpoint,
+            split=args.split,
+            explain_output_dir=explain_output_dir,
+            settings=rank_settings,
+            device_override=args.device,
+            strict=bool(args.strict or args.strict_no_fallback),
+            write_plots=bool(args.plots),
+            plot_backend=args.plot_backend,
+        )
+        print(f"explainability output: {out_dir}")
+    _distributed_barrier()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -5261,6 +5739,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--explain-output-dir", default=None, type=Path)
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
     parser.add_argument(
+        "--cpu-threads",
+        default=0,
+        type=int,
+        help="PyTorch intra/inter-op threads per rank; 0 keeps the runtime/environment default.",
+    )
+    parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -5271,6 +5755,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         type=int,
         help="Dates per fold; 0 (default) processes every date. Positive values are explicit reduced runs.",
+    )
+    parser.add_argument(
+        "--row-chunk-size",
+        default=0,
+        type=int,
+        help="Dates per GPU attribution chunk; 0 selects a VRAM-aware size without reducing date coverage.",
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        default="config",
+        choices=("config", "bf16", "fp16", "fp32"),
+        help="Explainability compute precision. config uses environment.amp_dtype from the experiment config.",
+    )
+    parser.add_argument(
+        "--compile-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile repeated model forwards with CUDA graphs disabled. Off by default until the target shape is profiled.",
     )
     parser.add_argument("--ig-steps", default=8, type=int)
     parser.add_argument("--ig-batch-size", default=0, type=int, help="Batch IG alpha steps together; 0 selects an automatic safe chunk size.")
@@ -5355,6 +5857,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cross-asset-max-sources", default=0, type=int, help="Source cap; 0 means every active symbol.")
     parser.add_argument("--cross-asset-max-targets", default=0, type=int, help="Target cap; 0 means every active symbol.")
     parser.add_argument("--cross-asset-source-chunk-size", default=2, type=int)
+    parser.add_argument(
+        "--cross-asset-row-chunk-size",
+        default=0,
+        type=int,
+        help="Dates per cross-asset source batch; 0 derives it from the repeated-row budget.",
+    )
+    parser.add_argument(
+        "--cross-asset-max-repeated-rows",
+        default=8,
+        type=int,
+        help="Bound source_chunk_size * row_chunk_size for cross-asset perturbation forwards.",
+    )
     parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
     parser.add_argument(
         "--cross-asset-shocks",
@@ -5392,9 +5906,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    initialized_here = _initialize_explainability_process_group()
+    if int(args.cpu_threads) > 0:
+        cpu_threads = max(1, int(args.cpu_threads))
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(cpu_threads)
+        except RuntimeError:
+            # PyTorch only allows setting inter-op threads before parallel work
+            # starts; intra-op still honors the explicit per-rank budget.
+            pass
     settings = ExplainabilitySettings(
         progress_enabled=bool(args.progress),
         max_rows=args.max_rows,
+        row_chunk_size=max(0, int(args.row_chunk_size)),
+        amp_dtype=str(args.amp_dtype),
+        compile_model=bool(args.compile_model),
         ig_steps=args.ig_steps,
         ig_batch_size=args.ig_batch_size,
         perturb=bool(args.perturb),
@@ -5420,6 +5947,8 @@ def main(argv: list[str] | None = None) -> None:
         cross_asset_max_sources=max(0, int(args.cross_asset_max_sources)),
         cross_asset_max_targets=max(0, int(args.cross_asset_max_targets)),
         cross_asset_source_chunk_size=max(1, int(args.cross_asset_source_chunk_size)),
+        cross_asset_row_chunk_size=max(0, int(args.cross_asset_row_chunk_size)),
+        cross_asset_max_repeated_rows=max(1, int(args.cross_asset_max_repeated_rows)),
         cross_asset_perturb_scale=float(args.cross_asset_perturb_scale),
         cross_asset_shocks=tuple(
             value.strip().lower() for value in str(args.cross_asset_shocks).split(",") if value.strip()
@@ -5430,17 +5959,21 @@ def main(argv: list[str] | None = None) -> None:
         cross_asset_role_embedding=bool(args.cross_asset_role_embedding),
         strict_no_fallback=bool(args.strict_no_fallback),
     )
-    print(
-        "[explain] standalone profile: "
-        f"dates={'all' if settings.max_rows <= 0 else settings.max_rows}, "
-        f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
-        f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
-        f"UMAP={'all_points' if settings.umap_max_points <= 0 else settings.umap_max_points}, "
-        f"cross_asset={settings.cross_asset_enabled}, "
-        f"sources={'all' if settings.cross_asset_max_sources <= 0 else settings.cross_asset_max_sources}, "
-        f"targets={'all' if settings.cross_asset_max_targets <= 0 else settings.cross_asset_max_targets}, "
-        f"strict_no_fallback={settings.strict_no_fallback}"
-    )
+    if _distributed_rank() == 0:
+        print(
+            "[explain] standalone profile: "
+            f"dates={'all' if settings.max_rows <= 0 else settings.max_rows}, "
+            f"row_chunk={'auto' if settings.row_chunk_size <= 0 else settings.row_chunk_size}, "
+            f"amp={settings.amp_dtype}, compile_model={settings.compile_model}, "
+            f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
+            f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
+            f"UMAP={'all_points' if settings.umap_max_points <= 0 else settings.umap_max_points}, "
+            f"cross_asset={settings.cross_asset_enabled}, "
+            f"sources={'all' if settings.cross_asset_max_sources <= 0 else settings.cross_asset_max_sources}, "
+            f"targets={'all' if settings.cross_asset_max_targets <= 0 else settings.cross_asset_max_targets}, "
+            f"strict_no_fallback={settings.strict_no_fallback}, "
+            f"world_size={_distributed_world_size()}"
+        )
 
     if args.config is None:
         market_runs = _discover_market_runs(
@@ -5464,6 +5997,8 @@ def main(argv: list[str] | None = None) -> None:
                 output_dir=run.output_dir,
                 explain_output_dir=explain_output_dir,
             )
+        if initialized_here:
+            _destroy_explainability_process_group()
         return
 
     _run_explainability_for_config(
@@ -5473,6 +6008,8 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir,
         explain_output_dir=args.explain_output_dir,
     )
+    if initialized_here:
+        _destroy_explainability_process_group()
 
 
 if __name__ == "__main__":
