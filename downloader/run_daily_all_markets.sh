@@ -41,7 +41,6 @@ YAHOO_RATE_LIMIT_ABORT_AFTER="${YAHOO_RATE_LIMIT_ABORT_AFTER:-20}"
 YAHOO_DAILY_DISCOVER_SYMBOLS="${YAHOO_DAILY_DISCOVER_SYMBOLS:-1}"
 YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS="${YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS:-0}"
 YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS="${YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS:-0}"
-YAHOO_INCLUDE_TW_DELISTED="${YAHOO_INCLUDE_TW_DELISTED:-1}"
 YAHOO_INCLUDE_US_DELISTED="${YAHOO_INCLUDE_US_DELISTED:-1}"
 FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
 FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_yahoo/forex}"
@@ -339,11 +338,11 @@ run_yahoo_incremental() {
   else
     yahoo_flags+=(--no-retry-blacklisted-repair-symbols)
   fi
-  if [[ "$YAHOO_INCLUDE_TW_DELISTED" == "1" ]]; then
-    yahoo_flags+=(--include-tw-delisted)
-  else
-    yahoo_flags+=(--no-include-tw-delisted)
-  fi
+  # The canonical TW data layer lives entirely below data_tw_public.  Keep the
+  # generic Yahoo updater from recreating the retired data_yahoo/tw_stocks tree;
+  # the official updater manages its audited Yahoo fallback inside
+  # data_tw_public/fallback instead.
+  yahoo_flags+=(--no-include-tw-delisted)
   if [[ "$YAHOO_INCLUDE_US_DELISTED" == "1" ]]; then
     yahoo_flags+=(--include-us-delisted)
   else
@@ -760,10 +759,6 @@ validate_settings() {
     echo "[daily] YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS must be 0 or 1" >&2
     exit 2
   fi
-  if [[ "$YAHOO_INCLUDE_TW_DELISTED" != "0" && "$YAHOO_INCLUDE_TW_DELISTED" != "1" ]]; then
-    echo "[daily] YAHOO_INCLUDE_TW_DELISTED must be 0 or 1" >&2
-    exit 2
-  fi
   if [[ "$YAHOO_INCLUDE_US_DELISTED" != "0" && "$YAHOO_INCLUDE_US_DELISTED" != "1" ]]; then
     echo "[daily] YAHOO_INCLUDE_US_DELISTED must be 0 or 1" >&2
     exit 2
@@ -782,6 +777,10 @@ validate_settings() {
   fi
   if [[ "$RUN_YAHOO" != "0" && "$RUN_YAHOO" != "1" ]]; then
     echo "[daily] RUN_YAHOO must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ " $YAHOO_ASSETS " == *" tw_stocks "* ]]; then
+    echo "[daily] tw_stocks is managed only by downloader/download_tw_official_data.py under data_tw_public; remove it from YAHOO_ASSETS" >&2
     exit 2
   fi
   if [[ "$FRANKFURTER_SKIP_MANIFEST" != "0" && "$FRANKFURTER_SKIP_MANIFEST" != "1" ]]; then

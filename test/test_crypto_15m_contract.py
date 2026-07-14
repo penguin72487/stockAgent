@@ -43,6 +43,15 @@ def test_discord_tw_market_uses_canonical_official_data_layer() -> None:
     assert "audit_ohlcv_data.py" not in command
 
 
+def test_daily_downloader_keeps_tw_out_of_legacy_yahoo_tree() -> None:
+    script = Path("downloader/run_daily_all_markets.sh").read_text(encoding="utf-8")
+
+    assert 'TW_PUBLIC_OUTPUT_DIR="${TW_PUBLIC_OUTPUT_DIR:-data_tw_public}"' in script
+    assert 'TW_PUBLIC_STOCKS_ROOT="${TW_PUBLIC_STOCKS_ROOT:-data_tw_public/stocks}"' in script
+    assert 'if [[ " $YAHOO_ASSETS " == *" tw_stocks "* ]]; then' in script
+    assert "--no-include-tw-delisted" in script
+
+
 def test_discord_daily_markets_use_canonical_downloaders_without_audit() -> None:
     expected_downloaders = {
         "us": "downloader/download_cboe_us_ohlcv.py",
