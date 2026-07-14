@@ -3,7 +3,7 @@ experiment_name: tw-stock-transformer-market-public-data-all-available
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_lanten_market_token_all_available
+  output_dir: artifacts/markets/tw_public_latent_all_available
   mode: train
   resume: true
   post_train_infer: true
@@ -494,7 +494,7 @@ training:
     attention_mode: market_token
     # Independent compact-bottleneck switches; null falls back to attention_mode.
     use_latent_factors: true
-    use_market_tokens: true
+    use_market_tokens: false
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: false
