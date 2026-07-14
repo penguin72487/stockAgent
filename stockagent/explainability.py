@@ -18,6 +18,7 @@ import numpy as np
 import polars as pl
 import torch
 from torch import nn
+from tqdm.auto import tqdm
 
 from stockagent.config import ExperimentConfig, load_config
 from stockagent.backtest.gpu_plot import (
@@ -174,8 +175,8 @@ FEATURE_GROUP_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 @dataclass(slots=True)
 class ExplainabilitySettings:
-    top_k: int = 20
-    max_rows: int = 32
+    progress_enabled: bool = True
+    max_rows: int = 0
     ig_steps: int = 8
     ig_batch_size: int = 0
     perturb: bool = True
@@ -183,38 +184,36 @@ class ExplainabilitySettings:
     perturb_max_auto_batch_size: int = 5
     perturb_max_input_elements: int = 32_000_000
     sample_method: str = "even"
-    first_test_year_only: bool = True
+    first_test_year_only: bool = False
     report_style: str = "paper"
     plot_theme: str = "paper"
     standard_plots: bool = True
     interactive_plots: bool = False
     shap_enabled: bool = True
     shap_mode: str = "score_head_surrogate"
-    case_study_top_k: int = 5
     regime_analysis: bool = True
     fold_stability: bool = True
     umap_enabled: bool = True
-    umap_max_points: int = 10000
+    umap_max_points: int = 0
     umap_max_projections: int = 0
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
     cross_asset_enabled: bool = True
-    cross_asset_max_sources: int = 24
-    cross_asset_max_targets: int = 24
-    cross_asset_top_edges: int = 150
+    cross_asset_max_sources: int = 0
+    cross_asset_max_targets: int = 0
     cross_asset_source_chunk_size: int = 2
     cross_asset_perturb_scale: float = 1.0
     cross_asset_shocks: tuple[str, ...] = field(
         default_factory=lambda: ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
     )
     cross_asset_attention_flow: bool = True
-    cross_asset_attention_capture_rows: int = 4
+    cross_asset_attention_capture_rows: int = 0
     cross_asset_validated_transmission: bool = True
     cross_asset_role_embedding: bool = True
     cross_asset_graph_backend: str = "cugraph"
     cross_asset_graph_benchmark_min_edges: int = 1_000_000
     cross_asset_graph_explainability: bool = True
-    cross_asset_graph_betweenness_max_vertices: int = 512
+    cross_asset_graph_betweenness_max_vertices: int = 0
     cross_asset_graph_plot_max_nodes: int = 80
     strict_no_fallback: bool = False
 
@@ -243,14 +242,14 @@ def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
     shocks = tuple(str(value).strip().lower() for value in settings.cross_asset_shocks if str(value).strip())
     return CrossAssetTransmissionSettings(
         enabled=bool(settings.cross_asset_enabled),
-        max_sources=max(1, int(settings.cross_asset_max_sources)),
-        max_targets=max(1, int(settings.cross_asset_max_targets)),
-        top_edges=max(1, int(settings.cross_asset_top_edges)),
+        progress_enabled=bool(settings.progress_enabled),
+        max_sources=max(0, int(settings.cross_asset_max_sources)),
+        max_targets=max(0, int(settings.cross_asset_max_targets)),
         source_chunk_size=max(1, int(settings.cross_asset_source_chunk_size)),
         perturb_scale=float(settings.cross_asset_perturb_scale),
         shocks=shocks or ("zero", "momentum", "gap", "volume", "volatility", "liquidity"),
         attention_flow=bool(settings.cross_asset_attention_flow),
-        attention_capture_rows=max(1, int(settings.cross_asset_attention_capture_rows)),
+        attention_capture_rows=max(0, int(settings.cross_asset_attention_capture_rows)),
         validated_transmission=bool(settings.cross_asset_validated_transmission),
         role_embedding=bool(settings.cross_asset_role_embedding),
         graph_backend=str(settings.cross_asset_graph_backend),
@@ -269,7 +268,6 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
     """
 
     return ExplainabilitySettings(
-        top_k=int(getattr(training, "explain_top_k", 20)),
         max_rows=int(getattr(training, "explain_max_rows", 32)),
         ig_steps=int(getattr(training, "explain_ig_steps", 0)),
         ig_batch_size=int(getattr(training, "explain_ig_batch_size", 1)),
@@ -285,7 +283,6 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         interactive_plots=bool(getattr(training, "explain_interactive_plots", False)),
         shap_enabled=bool(getattr(training, "explain_shap_enabled", False)),
         shap_mode=str(getattr(training, "explain_shap_mode", "score_head_surrogate")),
-        case_study_top_k=int(getattr(training, "explain_case_study_top_k", 5)),
         regime_analysis=bool(getattr(training, "explain_regime_analysis", False)),
         fold_stability=bool(getattr(training, "explain_fold_stability", False)),
         umap_enabled=bool(getattr(training, "explain_umap_enabled", False)),
@@ -296,7 +293,6 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         cross_asset_enabled=bool(getattr(training, "explain_cross_asset_enabled", False)),
         cross_asset_max_sources=int(getattr(training, "explain_cross_asset_max_sources", 8)),
         cross_asset_max_targets=int(getattr(training, "explain_cross_asset_max_targets", 8)),
-        cross_asset_top_edges=int(getattr(training, "explain_cross_asset_top_edges", 150)),
         cross_asset_source_chunk_size=int(getattr(training, "explain_cross_asset_source_chunk_size", 1)),
         cross_asset_perturb_scale=float(getattr(training, "explain_cross_asset_perturb_scale", 1.0)),
         cross_asset_shocks=tuple(getattr(training, "explain_cross_asset_shocks", ())),
@@ -511,7 +507,7 @@ def _string_list(frame: pl.DataFrame, column: str) -> list[str]:
     return [str(value) for value in frame.get_column(column).to_list()]
 
 
-def _top_values_by_sum(frame: pl.DataFrame, group_col: str, value_col: str, limit: int) -> list[Any]:
+def _values_by_sum(frame: pl.DataFrame, group_col: str, value_col: str) -> list[Any]:
     if _is_empty_frame(frame) or group_col not in frame.columns or value_col not in frame.columns:
         return []
     grouped = (
@@ -520,15 +516,14 @@ def _top_values_by_sum(frame: pl.DataFrame, group_col: str, value_col: str, limi
         .group_by(group_col)
         .agg(pl.col(value_col).sum().alias("__sum"))
         .sort("__sum", descending=True)
-        .head(limit)
     )
     return grouped.get_column(group_col).to_list() if not grouped.is_empty() else []
 
 
-def _render_table_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
+def _render_table_markdown(frame: pl.DataFrame, limit: int | None = 20) -> str:
     if _is_empty_frame(frame):
         return "_No rows._"
-    data = frame.head(limit)
+    data = frame if limit is None else frame.head(limit)
     columns = [str(column) for column in data.columns]
     if not columns:
         return "_No rows._"
@@ -741,20 +736,32 @@ def _forward_outputs(
     )
 
 
-def _selection_from_weights(weights: torch.Tensor, mask: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    top_k = max(1, min(int(top_k), int(weights.size(1))))
+def _selection_from_weights(
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select the attribution target without silently dropping small positions.
+
+    Every finite, tradable, non-zero position is included and weighted by its
+    share of gross exposure.
+    """
     valid_weights = weights.masked_fill(~mask, 0.0)
-    values, indices = valid_weights.abs().topk(k=top_k, dim=1)
-    selected = torch.zeros_like(weights, dtype=torch.bool)
-    selected.scatter_(1, indices, values > 0.0)
+    finite_nonzero = mask & torch.isfinite(valid_weights) & (valid_weights != 0.0)
+    selected = finite_nonzero
     direction = torch.sign(valid_weights).masked_fill(~selected, 0.0)
-    return selected, direction
+    gross_weight = valid_weights.abs().masked_fill(~selected, 0.0)
+    return selected, direction, gross_weight
 
 
-def _decision_target(scores: torch.Tensor, selected: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
-    selected_f = selected.to(dtype=scores.dtype)
-    denom = selected_f.sum().clamp_min(1.0)
-    return (scores * direction.to(dtype=scores.dtype) * selected_f).sum() / denom
+def _decision_target(
+    scores: torch.Tensor,
+    selected: torch.Tensor,
+    direction: torch.Tensor,
+    gross_weight: torch.Tensor,
+) -> torch.Tensor:
+    target_weight = gross_weight.to(dtype=scores.dtype).masked_fill(~selected, 0.0)
+    denom = target_weight.sum().clamp_min(torch.finfo(scores.dtype).eps)
+    return (scores * direction.to(dtype=scores.dtype) * target_weight).sum() / denom
 
 
 def _gradient_x_input_attribution(
@@ -763,11 +770,12 @@ def _gradient_x_input_attribution(
     mask: torch.Tensor,
     selected: torch.Tensor,
     direction: torch.Tensor,
+    gross_weight: torch.Tensor,
 ) -> torch.Tensor:
     model.zero_grad(set_to_none=True)
     x_grad = x.detach().clone().requires_grad_(True)
     _, scores, _ = _forward_outputs(model, x_grad, mask, return_aux=False)
-    target = _decision_target(scores, selected, direction)
+    target = _decision_target(scores, selected, direction, gross_weight)
     grad = torch.autograd.grad(target, x_grad, retain_graph=False, create_graph=False)[0]
     return torch.nan_to_num((grad * x_grad).detach(), nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -837,8 +845,11 @@ def _integrated_gradients_attribution(
     mask: torch.Tensor,
     selected: torch.Tensor,
     direction: torch.Tensor,
+    gross_weight: torch.Tensor,
     steps: int,
     batch_size: int = 0,
+    *,
+    progress_enabled: bool = True,
 ) -> torch.Tensor:
     steps = max(0, int(steps))
     if steps <= 0:
@@ -851,7 +862,15 @@ def _integrated_gradients_attribution(
         max_input_elements=16_000_000,
     )
     total_grad = torch.zeros_like(x)
-    for start in range(1, steps + 1, chunk_size):
+    starts = range(1, steps + 1, chunk_size)
+    for start in tqdm(
+        starts,
+        total=math.ceil(steps / chunk_size),
+        desc="Integrated Gradients",
+        unit="batch",
+        leave=False,
+        disable=not progress_enabled,
+    ):
         end = min(steps, start + chunk_size - 1)
         alpha = torch.arange(start, end + 1, device=x.device, dtype=x.dtype) / float(steps)
         repeats = int(alpha.numel())
@@ -864,8 +883,9 @@ def _integrated_gradients_attribution(
         mask_step = _repeat_first_dim(mask, repeats)
         selected_step = _repeat_first_dim(selected, repeats)
         direction_step = _repeat_first_dim(direction, repeats)
+        gross_weight_step = _repeat_first_dim(gross_weight, repeats)
         _, scores, _ = _forward_outputs(model, x_step, mask_step, return_aux=False)
-        target = _decision_target(scores, selected_step, direction_step) * float(repeats)
+        target = _decision_target(scores, selected_step, direction_step, gross_weight_step) * float(repeats)
         grad = torch.autograd.grad(target, x_step, retain_graph=False, create_graph=False)[0]
         grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
         total_grad = total_grad + grad.reshape(repeats, *tuple(x.shape)).sum(dim=0)
@@ -931,7 +951,9 @@ def _perturbation_importance(
     *,
     max_auto_batch_size: int = 16,
     max_input_elements: int = 96_000_000,
+    progress_enabled: bool = True,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any]]:
+    stage_start = time.perf_counter()
     rows: list[dict[str, Any]] = []
     perturbations = [
         (time_idx, feat_idx, feature)
@@ -949,6 +971,8 @@ def _perturbation_importance(
         "attempted_forward_batches": 0,
         "oom_retries": 0,
         "oom_chunk_sizes": [],
+        "elapsed_s": 0.0,
+        "perturbations_per_s": 0.0,
     }
     if not perturbations:
         frame = pl.DataFrame(rows)
@@ -963,6 +987,13 @@ def _perturbation_importance(
     diagnostics["chunk_size"] = int(chunk_size)
     base_weights = base_weights.detach()
     base_scores = base_scores.detach()
+    progress = tqdm(
+        total=len(perturbations),
+        desc="Feature-time perturbation",
+        unit="cell",
+        leave=False,
+        disable=not progress_enabled,
+    )
     with torch.no_grad():
         start = 0
         while start < len(perturbations):
@@ -1005,6 +1036,12 @@ def _perturbation_importance(
                     }
                 )
             start += repeats
+            progress.update(repeats)
+            progress.set_postfix(forwards=diagnostics["forward_batches"], batch=chunk_size, refresh=False)
+    progress.close()
+    elapsed_s = float(time.perf_counter() - stage_start)
+    diagnostics["elapsed_s"] = elapsed_s
+    diagnostics["perturbations_per_s"] = float(len(perturbations)) / max(elapsed_s, 1e-9)
     frame = pl.DataFrame(rows)
     if frame.is_empty():
         return frame, pl.DataFrame(), diagnostics
@@ -1061,42 +1098,129 @@ def _feature_correlations(
 
 
 
-def _decision_rows(
+def _decision_inventory(
     weights: torch.Tensor,
     scores: torch.Tensor,
     returns: torch.Tensor,
     mask: torch.Tensor,
     dates: list[str],
     symbols: list[str],
-    top_k: int,
+    selected: torch.Tensor | None = None,
 ) -> pl.DataFrame:
-    top_k = max(1, min(int(top_k), int(weights.size(1))))
+    """Return every explained date-symbol decision, including flat/masked rows."""
+    weights_cpu = torch.nan_to_num(weights.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    scores_cpu = torch.nan_to_num(scores.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    returns_cpu = torch.nan_to_num(returns.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    mask_cpu = mask.detach().bool().cpu()
+    selected_cpu = (
+        (mask_cpu & (weights_cpu != 0.0))
+        if selected is None
+        else selected.detach().bool().cpu()
+    )
+    rows, n_symbols = int(weights_cpu.size(0)), int(weights_cpu.size(1))
+    order = weights_cpu.abs().argsort(dim=1, descending=True)
+    ranks = torch.empty_like(order)
+    rank_values = torch.arange(1, n_symbols + 1, dtype=order.dtype).view(1, -1).expand(rows, -1)
+    ranks.scatter_(1, order, rank_values)
+    weight_np = weights_cpu.numpy().reshape(-1)
+    return_np = returns_cpu.numpy().reshape(-1)
+    return pl.DataFrame(
+        {
+            "date": np.repeat(np.asarray(dates, dtype=object), n_symbols),
+            "symbol": np.tile(np.asarray(symbols, dtype=object), rows),
+            "rank_abs_weight": ranks.numpy().reshape(-1),
+            "side": np.where(weight_np > 0.0, "long", np.where(weight_np < 0.0, "short", "flat")),
+            "weight": weight_np,
+            "abs_weight": np.abs(weight_np),
+            "score": scores_cpu.numpy().reshape(-1),
+            "future_log_return": return_np,
+            "gross_contribution": weight_np * return_np,
+            "tradable": mask_cpu.numpy().reshape(-1),
+            "nonzero_position": weight_np != 0.0,
+            "selected_for_attribution": selected_cpu.numpy().reshape(-1),
+        }
+    )
+
+
+def _exposure_coverage_curve(weights: torch.Tensor, mask: torch.Tensor, points: int = 101) -> pl.DataFrame:
+    """Average cumulative gross-exposure coverage using every valid position."""
+    weights_np = torch.nan_to_num(weights.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).abs().cpu().numpy()
+    mask_np = mask.detach().bool().cpu().numpy()
+    grid = np.linspace(0.0, 1.0, max(2, int(points)), dtype=np.float64)
+    curves: list[np.ndarray] = []
+    for row_weights, row_mask in zip(weights_np, mask_np, strict=True):
+        valid = np.sort(row_weights[row_mask])[::-1]
+        total = float(valid.sum())
+        if valid.size == 0 or total <= 0.0:
+            curves.append(np.zeros_like(grid))
+            continue
+        cumulative = np.concatenate(([0.0], np.cumsum(valid, dtype=np.float64) / total))
+        fractions = np.linspace(0.0, 1.0, valid.size + 1, dtype=np.float64)
+        curves.append(np.interp(grid, fractions, cumulative))
+    mean_curve = np.mean(np.stack(curves), axis=0) if curves else np.zeros_like(grid)
+    return pl.DataFrame(
+        {
+            "fraction_of_tradable_names": grid,
+            "mean_cumulative_gross_exposure": mean_curve,
+        }
+    )
+
+
+def _position_distribution_frame(inventory: pl.DataFrame) -> pl.DataFrame:
+    if _is_empty_frame(inventory):
+        return pl.DataFrame()
     rows: list[dict[str, Any]] = []
-    weights_cpu = weights.detach().cpu()
-    scores_cpu = scores.detach().cpu()
-    returns_cpu = returns.detach().cpu()
-    mask_cpu = mask.detach().cpu()
-    for row_idx, date in enumerate(dates):
-        row_weights = weights_cpu[row_idx]
-        candidate_idx = torch.topk(row_weights.abs(), k=top_k).indices.tolist()
-        for rank, sym_idx in enumerate(candidate_idx, start=1):
-            weight = float(row_weights[sym_idx])
-            future_return = float(returns_cpu[row_idx, sym_idx])
-            side = "long" if weight > 0 else ("short" if weight < 0 else "flat")
-            rows.append(
-                {
-                    "date": date,
-                    "rank_abs_weight": rank,
-                    "symbol": symbols[int(sym_idx)],
-                    "side": side,
-                    "weight": weight,
-                    "score": float(scores_cpu[row_idx, sym_idx]),
-                    "future_log_return": future_return,
-                    "gross_contribution": weight * future_return,
-                    "tradable": bool(mask_cpu[row_idx, sym_idx]),
-                }
-            )
+    for side in ("all_nonzero", "long", "short"):
+        data = inventory.filter(pl.col("nonzero_position") & pl.col("tradable"))
+        if side != "all_nonzero":
+            data = data.filter(pl.col("side") == side)
+        values = _numeric_numpy(data, "abs_weight", default=0.0)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            continue
+        row: dict[str, Any] = {"side": side, "count": int(values.size), "mean_abs_weight": float(values.mean())}
+        for quantile in (0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0):
+            row[f"q{int(quantile * 100):02d}"] = float(np.quantile(values, quantile))
+        rows.append(row)
     return pl.DataFrame(rows)
+
+
+def _completeness_frame(
+    *,
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+    selected: torch.Tensor,
+    inventory: pl.DataFrame,
+    lookback: int,
+    feature_count: int,
+    grad_ft: pl.DataFrame,
+    ig_ft: pl.DataFrame,
+    perturb_ft: pl.DataFrame,
+) -> pl.DataFrame:
+    safe_weights = torch.nan_to_num(weights.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    eligible = mask.detach().bool() & (safe_weights != 0.0)
+    selected = selected.detach().bool() & eligible
+    total_gross = safe_weights.abs().masked_fill(~eligible, 0.0).sum()
+    selected_gross = safe_weights.abs().masked_fill(~selected, 0.0).sum()
+    expected_feature_time = max(0, int(lookback) * int(feature_count))
+    return pl.DataFrame(
+        [
+            {
+                "sample_rows": int(weights.size(0)),
+                "symbols_per_row": int(weights.size(1)),
+                "decision_inventory_rows": int(len(inventory)),
+                "expected_decision_inventory_rows": int(weights.numel()),
+                "eligible_nonzero_positions": int(eligible.sum().cpu()),
+                "attributed_positions": int(selected.sum().cpu()),
+                "position_count_coverage": float(selected.sum().cpu()) / max(1, int(eligible.sum().cpu())),
+                "gross_exposure_coverage": float((selected_gross / total_gross.clamp_min(1e-12)).cpu()),
+                "expected_feature_time_cells": expected_feature_time,
+                "gradient_feature_time_cells": int(len(grad_ft)),
+                "integrated_gradients_feature_time_cells": int(len(ig_ft)),
+                "perturbation_feature_time_cells": int(len(perturb_ft)),
+            }
+        ]
+    )
 
 
 
@@ -1240,8 +1364,6 @@ def _aux_umap_projection_frames(
 
     max_points = max(0, int(settings.umap_max_points))
     timing["max_points"] = int(max_points)
-    if max_points < 4:
-        return {}, [], ["cuML UMAP projections skipped because explain_umap_max_points < 4."], timing
 
     projection_frames: dict[str, pl.DataFrame] = {}
     summaries: list[dict[str, Any]] = []
@@ -1282,7 +1404,14 @@ def _aux_umap_projection_frames(
             + ("..." if len(skipped_names) > 8 else "")
         )
         eligible = eligible[:max_projections]
-    for name, value in eligible:
+    for name, value in tqdm(
+        eligible,
+        total=len(eligible),
+        desc="Aux UMAP",
+        unit="tensor",
+        leave=False,
+        disable=not bool(settings.progress_enabled),
+    ):
         projection_start = time.perf_counter()
         tensor = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
         original_shape = tuple(int(dim) for dim in tensor.shape)
@@ -1291,7 +1420,7 @@ def _aux_umap_projection_frames(
         if n_points < 4:
             warnings.append(f"{name}: fewer than 4 vectors; cuML UMAP skipped.")
             continue
-        if n_points > max_points:
+        if max_points > 0 and n_points > max_points:
             sample_idx = torch.linspace(0, n_points - 1, max_points, device=flat.device).round().to(torch.long)
             flat_sample = flat.index_select(0, sample_idx)
         else:
@@ -1534,10 +1663,9 @@ def _regime_analysis_frame(daily: pl.DataFrame) -> pl.DataFrame:
 
 
 
-def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame, top_k: int) -> pl.DataFrame:
+def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame) -> pl.DataFrame:
     if _is_empty_frame(decisions) or _is_empty_frame(daily) or "date" not in decisions.columns:
         return pl.DataFrame()
-    top_k = max(1, int(top_k))
     selected: list[tuple[str, str]] = []
 
     def add_selected(case_type: str, column: str, *, descending: bool) -> None:
@@ -1565,7 +1693,7 @@ def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame, top_k: int) 
         if chunk.is_empty():
             continue
         chunk = _with_numeric(chunk, "weight")
-        chunk = chunk.with_columns(pl.col("weight").abs().alias("abs_weight")).sort("abs_weight", descending=True).head(top_k)
+        chunk = chunk.with_columns(pl.col("weight").abs().alias("abs_weight")).sort("abs_weight", descending=True)
         chunk = chunk.with_columns(pl.lit(case_type).alias("case_type")).select(["case_type", *[col for col in chunk.columns if col != "case_type"]])
         daily_row = daily_rows.get(date)
         if daily_row is not None:
@@ -1573,24 +1701,6 @@ def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame, top_k: int) 
                 chunk = chunk.with_columns(pl.lit(daily_row.get(col)).alias(f"case_{col}"))
         pieces.append(chunk)
     return _concat_frames(pieces)
-
-
-
-def _feature_time_top_cells(frame: pl.DataFrame, metric_name: str, top_n: int = 20) -> pl.DataFrame:
-    required = {"feature", "lookback_from_end", metric_name}
-    if _is_empty_frame(frame) or not required.issubset(frame.columns):
-        return pl.DataFrame()
-    data = _with_numeric(frame, metric_name).drop_nulls(subset=[metric_name]).sort(metric_name, descending=True).head(top_n)
-    if data.is_empty():
-        return data
-    total = _numeric_sum(frame, metric_name)
-    data = data.with_columns(
-        [
-            ((pl.col(metric_name) / total) if total > 0.0 else pl.lit(0.0)).alias("share"),
-            pl.col("lookback_from_end").map_elements(_lookback_label, return_dtype=pl.String).alias("lookback_label"),
-        ]
-    )
-    return _with_feature_labels(data)
 
 
 
@@ -1668,14 +1778,8 @@ def _score_head_surrogate_shap(
     if design.shape[0] < max(20, 2 * design.shape[1]):
         message = "SHAP skipped because there are too few valid stock-date observations for a surrogate model."
         return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
-    max_fit_rows = min(20000, int(design.shape[0]))
-    if design.shape[0] > max_fit_rows:
-        idx = np.linspace(0, design.shape[0] - 1, max_fit_rows).round().astype(np.int64)
-        design_fit = design[idx]
-        target_fit = target[idx]
-    else:
-        design_fit = design
-        target_fit = target
+    design_fit = design
+    target_fit = target
     mean = design_fit.mean(axis=0, keepdims=True)
     std = design_fit.std(axis=0, keepdims=True)
     std = np.where(std < 1e-8, 1.0, std)
@@ -1697,12 +1801,13 @@ def _score_head_surrogate_shap(
     ss_res = float(np.sum((target_fit - pred) ** 2))
     ss_tot = float(np.sum((target_fit - target_mean) ** 2))
     r2 = _safe_float(1.0 - ss_res / ss_tot if ss_tot > 1e-20 else 0.0)
-    sample_rows = min(5000, int(design_z.shape[0]))
-    sample_idx = np.linspace(0, design_z.shape[0] - 1, sample_rows).round().astype(np.int64)
-    sample_z = design_z[sample_idx]
-    background = design_z[np.linspace(0, design_z.shape[0] - 1, min(1024, int(design_z.shape[0]))).round().astype(np.int64)]
+    sample_rows = int(design_z.shape[0])
+    sample_z = design_z
+    # The standardized fit design has zero mean by construction, so the exact
+    # full-data background is the origin without retaining a sampled background.
+    background_mean = design_z.mean(axis=0, keepdims=True)
     method = "linear_surrogate_closed_form"
-    shap_values = (sample_z - background.mean(axis=0, keepdims=True)) * coef.reshape(1, -1)
+    shap_values = (sample_z - background_mean) * coef.reshape(1, -1)
     component_rows: list[dict[str, Any]] = []
     abs_values = np.nan_to_num(np.abs(shap_values), nan=0.0, posinf=0.0, neginf=0.0).mean(axis=0)
     for idx, (source, feature) in enumerate(component_meta):
@@ -1763,25 +1868,56 @@ def explain_batch(
     settings = settings or ExplainabilitySettings()
     device = device or next(model.parameters()).device
     model.eval()
+    stage_progress = tqdm(
+        total=9,
+        desc="Explain methods",
+        unit="stage",
+        leave=False,
+        disable=not bool(settings.progress_enabled),
+    )
+
+    def complete_stage(name: str, elapsed_key: str) -> None:
+        stage_progress.update(1)
+        stage_progress.set_postfix(
+            stage=name,
+            last_s=f"{timing.get(elapsed_key, 0.0):.2f}",
+            refresh=True,
+        )
+
+    stage_progress.set_postfix(stage="prepare_batch", refresh=True)
     stage_start = time.perf_counter()
     batch = _move_batch(batch, device)
     x = torch.nan_to_num(batch["x"].float(), nan=0.0, posinf=0.0, neginf=0.0)
     returns = torch.nan_to_num(batch["future_log_returns"].float(), nan=0.0, posinf=0.0, neginf=0.0)
     mask = batch["tradable_mask"].to(device=device, dtype=torch.bool)
     _mark_elapsed(timing, "prepare_batch_s", stage_start)
+    complete_stage("base_forward", "prepare_batch_s")
 
     stage_start = time.perf_counter()
     with torch.no_grad():
         weights, scores, aux = _forward_outputs(model, x, mask, return_aux=True)
-    selected, direction = _selection_from_weights(weights.detach(), mask, settings.top_k)
+    selected, direction, attribution_gross_weight = _selection_from_weights(
+        weights.detach(),
+        mask,
+    )
     _mark_elapsed(timing, "base_forward_s", stage_start)
+    complete_stage("gradient", "base_forward_s")
 
     stage_start = time.perf_counter()
-    grad_attr = _gradient_x_input_attribution(model, x, mask, selected, direction)
+    grad_attr = _gradient_x_input_attribution(
+        model,
+        x,
+        mask,
+        selected,
+        direction,
+        attribution_gross_weight,
+    )
     grad_ft = _feature_time_frame(grad_attr, feature_names, "grad_x_input_abs")
+    del grad_attr
     grad_feature = _feature_summary_frame(grad_ft, "grad_x_input_abs")
     grad_time = _time_summary_frame(grad_ft, "grad_x_input_abs")
     _mark_elapsed(timing, "gradient_s", stage_start)
+    complete_stage("integrated_gradients", "gradient_s")
 
     stage_start = time.perf_counter()
     if int(settings.ig_steps) > 0:
@@ -1791,17 +1927,21 @@ def explain_batch(
             mask,
             selected,
             direction,
+            attribution_gross_weight,
             settings.ig_steps,
             settings.ig_batch_size,
+            progress_enabled=bool(settings.progress_enabled),
         )
         ig_ft = _feature_time_frame(ig_attr, feature_names, "integrated_gradients_abs")
         ig_feature = _feature_summary_frame(ig_ft, "integrated_gradients_abs")
         ig_time = _time_summary_frame(ig_ft, "integrated_gradients_abs")
+        del ig_attr
     else:
         ig_ft = pl.DataFrame()
         ig_feature = pl.DataFrame()
         ig_time = pl.DataFrame()
     _mark_elapsed(timing, "integrated_gradients_s", stage_start)
+    complete_stage("perturbation", "integrated_gradients_s")
 
     stage_start = time.perf_counter()
     if settings.perturb:
@@ -1815,6 +1955,7 @@ def explain_batch(
             settings.perturb_batch_size,
             max_auto_batch_size=settings.perturb_max_auto_batch_size,
             max_input_elements=settings.perturb_max_input_elements,
+            progress_enabled=bool(settings.progress_enabled),
         )
     else:
         perturb_ft = pl.DataFrame()
@@ -1832,6 +1973,7 @@ def explain_batch(
             "oom_chunk_sizes": [],
         }
     _mark_elapsed(timing, "perturbation_s", stage_start)
+    complete_stage("surrogate_shap", "perturbation_s")
 
     stage_start = time.perf_counter()
     shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap(
@@ -1843,16 +1985,20 @@ def explain_batch(
         mode=str(settings.shap_mode),
     )
     _mark_elapsed(timing, "surrogate_shap_s", stage_start)
+    complete_stage("tabular_diagnostics", "surrogate_shap_s")
 
     stage_start = time.perf_counter()
     corr = _feature_correlations(x, scores, weights, mask, feature_names)
-    decisions = _decision_rows(weights, scores, returns, mask, dates, symbols, settings.top_k)
+    decision_inventory = _decision_inventory(weights, scores, returns, mask, dates, symbols, selected)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
+    exposure_coverage = _exposure_coverage_curve(weights, mask)
+    position_distribution = _position_distribution_frame(decision_inventory)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
-    case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
+    case_studies = _case_study_frame(decision_inventory, daily)
     _mark_elapsed(timing, "tabular_diagnostics_s", stage_start)
+    complete_stage("aux_diagnostics", "tabular_diagnostics_s")
 
     stage_start = time.perf_counter()
     aux_frame, aux_dim_frames = _aux_summary(aux)
@@ -1864,26 +2010,37 @@ def explain_batch(
         device=device,
     )
     _mark_elapsed(timing, "aux_diagnostics_s", stage_start)
+    complete_stage("postprocess", "aux_diagnostics_s")
 
     stage_start = time.perf_counter()
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
     warnings.extend(aux_projection_warnings)
     warnings.extend(shap_warnings)
     trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
-    grad_top_cells = _feature_time_top_cells(grad_ft, "grad_x_input_abs")
-    ig_top_cells = _feature_time_top_cells(ig_ft, "integrated_gradients_abs")
-    perturb_top_cells = _feature_time_top_cells(perturb_ft, "weight_abs_delta")
     attribution_lookback = 0
     if not _is_empty_frame(grad_ft) and "lookback_from_end" in grad_ft.columns:
         attribution_lookback = int(_numeric_max(grad_ft, "lookback_from_end") + 1)
+    completeness = _completeness_frame(
+        weights=weights,
+        mask=mask,
+        selected=selected,
+        inventory=decision_inventory,
+        lookback=int(x.size(1)),
+        feature_count=len(feature_names),
+        grad_ft=grad_ft,
+        ig_ft=ig_ft,
+        perturb_ft=perturb_ft,
+    )
     _mark_elapsed(timing, "postprocess_s", stage_start)
+    complete_stage("complete", "postprocess_s")
+    stage_progress.close()
     timing["total_s"] = float(time.perf_counter() - total_start)
 
     return {
         "summary": {
             "portfolio": portfolio,
             "rows": len(dates),
-            "top_k": int(settings.top_k),
+            "attribution_scope": "all_tradable_nonzero_positions_gross_weighted",
             "ig_steps": int(settings.ig_steps),
             "ig_batch_size": int(settings.ig_batch_size),
             "report_style": _normalize_report_style(settings.report_style),
@@ -1897,7 +2054,6 @@ def explain_batch(
             "perturb_diagnostics": perturb_diagnostics,
             "shap_mode": _normalize_shap_mode(settings.shap_mode),
             "shap_info": shap_info,
-            "case_study_top_k": int(settings.case_study_top_k),
             "regime_analysis": bool(settings.regime_analysis),
             "fold_stability": bool(settings.fold_stability),
             "attribution_lookback": attribution_lookback,
@@ -1921,11 +2077,11 @@ def explain_batch(
             "feature_importance_perturbation": perturb_feature,
             "feature_importance_shap": shap_feature,
             "shap_components": shap_components,
-            "top_feature_time_gradient_cells": grad_top_cells,
-            "top_feature_time_integrated_gradients_cells": ig_top_cells,
-            "top_feature_time_perturbation_cells": perturb_top_cells,
             "feature_correlations": corr,
-            "top_decisions": decisions,
+            "decision_inventory": decision_inventory,
+            "explainability_completeness": completeness,
+            "exposure_coverage_curve": exposure_coverage,
+            "position_distribution": position_distribution,
             "daily_portfolio": daily,
             "regime_analysis": regime,
             "decision_case_studies": case_studies,
@@ -1940,6 +2096,11 @@ def explain_batch(
             "scores": scores.detach().cpu(),
             "returns": returns.detach().cpu(),
             "mask": mask.detach().cpu(),
+            "aux": {
+                str(name): value.detach().float().cpu()
+                for name, value in aux.items()
+                if torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[-1]) >= 2
+            },
         },
     }
 
@@ -2109,6 +2270,8 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
         "attempted_forward_batches": 0,
         "oom_retries": 0,
         "oom_chunk_sizes": [],
+        "elapsed_s": 0.0,
+        "perturbations_per_s": 0.0,
     }
     for result, _ in chunk_results:
         diag = result.get("summary", {}).get("perturb_diagnostics", {})
@@ -2117,7 +2280,10 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
             merged[key] = max(int(merged[key]), int(diag.get(key, 0) or 0))
         for key in ("forward_batches", "attempted_forward_batches", "oom_retries"):
             merged[key] = int(merged[key]) + int(diag.get(key, 0) or 0)
+        merged["elapsed_s"] = float(merged["elapsed_s"]) + float(diag.get("elapsed_s", 0.0) or 0.0)
         merged["oom_chunk_sizes"].extend(int(v) for v in diag.get("oom_chunk_sizes", []) or [])
+    total_perturbations = int(merged["num_perturbations"]) * max(1, len(chunk_results))
+    merged["perturbations_per_s"] = total_perturbations / max(float(merged["elapsed_s"]), 1e-9)
     return merged
 
 
@@ -2129,6 +2295,7 @@ def _combine_chunked_explainability_results(
     symbols: list[str],
     dates: list[str],
     settings: ExplainabilitySettings,
+    device: torch.device,
     row_chunk_diagnostics: dict[str, Any],
     total_elapsed_s: float,
 ) -> dict[str, Any]:
@@ -2156,56 +2323,103 @@ def _combine_chunked_explainability_results(
     ig_feature = _feature_summary_frame(ig_ft, "integrated_gradients_abs")
     ig_time = _time_summary_frame(ig_ft, "integrated_gradients_abs")
     perturb_feature = _combine_perturbation_summary(perturb_ft)
-    shap_feature = _combine_shap_feature_from_chunks(chunk_results, total_rows)
-
     weights = torch.cat([result["_core"]["weights"] for result, _ in chunk_results], dim=0)
     scores = torch.cat([result["_core"]["scores"] for result, _ in chunk_results], dim=0)
     returns = torch.cat([result["_core"]["returns"] for result, _ in chunk_results], dim=0)
     mask = torch.cat([result["_core"]["mask"] for result, _ in chunk_results], dim=0).bool()
     x_cpu = torch.nan_to_num(batch["x"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
 
+    shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap(
+        x_cpu,
+        scores,
+        mask,
+        feature_names,
+        enabled=bool(settings.shap_enabled),
+        mode=str(settings.shap_mode),
+    )
+
     corr = _feature_correlations(x_cpu, scores, weights, mask, feature_names)
-    decisions = _decision_rows(weights, scores, returns, mask, dates, symbols, settings.top_k)
+    selected, _, _ = _selection_from_weights(
+        weights,
+        mask,
+    )
+    decision_inventory = _decision_inventory(weights, scores, returns, mask, dates, symbols, selected)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
+    exposure_coverage = _exposure_coverage_curve(weights, mask)
+    position_distribution = _position_distribution_frame(decision_inventory)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
-    case_studies = _case_study_frame(decisions, daily, int(settings.case_study_top_k))
+    case_studies = _case_study_frame(decision_inventory, daily)
     aux_frame = _combine_aux_summary_from_chunks(chunk_results)
     aux_dim_frames = _combine_aux_dim_frames_from_chunks(chunk_results)
-    first_result = chunk_results[0][0]
-    aux_projection_frames = {
-        name: frame
-        for name, frame in first_result.get("aux_projection_frames", {}).items()
-        if not _is_empty_frame(frame)
-    }
+    combined_aux: dict[str, torch.Tensor] = {}
+    aux_names = sorted(
+        {
+            name
+            for result, _ in chunk_results
+            for name in result.get("_core", {}).get("aux", {})
+        }
+    )
+    for name in aux_names:
+        tensors = [
+            result["_core"]["aux"][name]
+            for result, _ in chunk_results
+            if name in result.get("_core", {}).get("aux", {})
+        ]
+        if tensors and all(tensor.ndim == tensors[0].ndim and tensor.shape[1:] == tensors[0].shape[1:] for tensor in tensors):
+            combined_aux[name] = torch.cat(tensors, dim=0)
+    aux_projection_frames, aux_projection_summary, aux_projection_warnings, aux_projection_timing = (
+        _aux_umap_projection_frames(
+            combined_aux,
+            symbols=symbols,
+            dates=dates,
+            settings=settings,
+            device=device,
+        )
+    )
 
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
     warnings.append(
-        "Explainability ran with row microbatching to fit the full stock universe in GPU memory; aux UMAP projections use the first row chunk because UMAP coordinates are not additive across chunks."
+        "Explainability used row microbatching to fit the full stock universe in GPU memory; all row chunks were aggregated before global SHAP and aux UMAP output."
     )
+    warnings.extend(shap_warnings)
+    warnings.extend(aux_projection_warnings)
     for result, _ in chunk_results:
-        warnings.extend(str(item) for item in result.get("summary", {}).get("warnings", []) if str(item) not in warnings)
+        for item in result.get("summary", {}).get("warnings", []):
+            warning = str(item)
+            if warning == "cuML UMAP projections disabled by settings.":
+                continue
+            if warning not in warnings:
+                warnings.append(warning)
 
     trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
     attribution_lookback = 0
     if not _is_empty_frame(grad_ft) and "lookback_from_end" in grad_ft.columns:
         attribution_lookback = int(_numeric_max(grad_ft, "lookback_from_end") + 1)
+    completeness = _completeness_frame(
+        weights=weights,
+        mask=mask,
+        selected=selected,
+        inventory=decision_inventory,
+        lookback=int(batch["x"].size(1)),
+        feature_count=len(feature_names),
+        grad_ft=grad_ft,
+        ig_ft=ig_ft,
+        perturb_ft=perturb_ft,
+    )
 
     timing = _sum_chunk_timings(chunk_results)
     timing["total_s"] = float(total_elapsed_s)
     timing["row_microbatch_chunks"] = float(len(chunk_results))
 
-    shap_components = _concat_chunk_frame(chunk_results, "shap_components", add_chunk_id=True)
-    aux_projection_summary = first_result.get("summary", {}).get("aux_projection_summary", [])
-    aux_projection_timing = first_result.get("summary", {}).get("aux_projection_timing", {})
     perturb_diagnostics = _merge_perturb_diagnostics(chunk_results)
 
     return {
         "summary": {
             "portfolio": portfolio,
             "rows": len(dates),
-            "top_k": int(settings.top_k),
+            "attribution_scope": "all_tradable_nonzero_positions_gross_weighted",
             "ig_steps": int(settings.ig_steps),
             "ig_batch_size": int(settings.ig_batch_size),
             "report_style": _normalize_report_style(settings.report_style),
@@ -2218,8 +2432,7 @@ def _combine_chunked_explainability_results(
             "perturb_max_input_elements": int(settings.perturb_max_input_elements),
             "perturb_diagnostics": perturb_diagnostics,
             "shap_mode": _normalize_shap_mode(settings.shap_mode),
-            "shap_info": {"mode": "row_microbatch_combined", "chunks": int(len(chunk_results))},
-            "case_study_top_k": int(settings.case_study_top_k),
+            "shap_info": shap_info,
             "regime_analysis": bool(settings.regime_analysis),
             "fold_stability": bool(settings.fold_stability),
             "attribution_lookback": attribution_lookback,
@@ -2244,11 +2457,11 @@ def _combine_chunked_explainability_results(
             "feature_importance_perturbation": perturb_feature,
             "feature_importance_shap": shap_feature,
             "shap_components": shap_components,
-            "top_feature_time_gradient_cells": _feature_time_top_cells(grad_ft, "grad_x_input_abs"),
-            "top_feature_time_integrated_gradients_cells": _feature_time_top_cells(ig_ft, "integrated_gradients_abs"),
-            "top_feature_time_perturbation_cells": _feature_time_top_cells(perturb_ft, "weight_abs_delta"),
             "feature_correlations": corr,
-            "top_decisions": decisions,
+            "decision_inventory": decision_inventory,
+            "explainability_completeness": completeness,
+            "exposure_coverage_curve": exposure_coverage,
+            "position_distribution": position_distribution,
             "daily_portfolio": daily,
             "regime_analysis": regime,
             "decision_case_studies": case_studies,
@@ -2303,9 +2516,19 @@ def explain_batch_row_chunked(
                 f"free_gb={diagnostics.get('free_gb', 0.0):.2f}"
             )
             chunk_results: list[tuple[dict[str, Any], int]] = []
-            for chunk_id, start in enumerate(range(0, n_rows, row_chunk_size), start=1):
+            row_starts = range(0, n_rows, row_chunk_size)
+            row_progress = tqdm(
+                row_starts,
+                total=math.ceil(n_rows / row_chunk_size),
+                desc="Explain date chunks",
+                unit="chunk",
+                disable=not bool(effective_settings.progress_enabled),
+            )
+            for chunk_id, start in enumerate(row_progress, start=1):
                 end = min(n_rows, start + row_chunk_size)
-                chunk_settings = effective_settings if chunk_id == 1 else replace(effective_settings, umap_enabled=False)
+                # UMAP is run once after all aux tensors are concatenated, so its
+                # coordinate system covers every row instead of one microbatch.
+                chunk_settings = replace(effective_settings, umap_enabled=False)
                 chunk = _slice_batch_rows(batch, start, end)
                 chunk_dates = dates[start:end]
                 result = explain_batch(
@@ -2320,7 +2543,7 @@ def explain_batch_row_chunked(
                 chunk_results.append((result, end - start))
                 del chunk, result
                 _clear_explainability_runtime_cache()
-                print(f"[explain] completed row chunk {chunk_id}: rows {start}:{end}")
+                row_progress.set_postfix(rows=f"{end}/{n_rows}", refresh=False)
 
             diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
             combined = _combine_chunked_explainability_results(
@@ -2330,6 +2553,7 @@ def explain_batch_row_chunked(
                 symbols=symbols,
                 dates=dates,
                 settings=effective_settings,
+                device=device,
                 row_chunk_diagnostics=diagnostics,
                 total_elapsed_s=float(time.perf_counter() - total_start),
             )
@@ -2365,7 +2589,7 @@ def _write_markdown_report(
     frames: dict[str, pl.DataFrame],
 ) -> None:
     def _render_frame(frame: pl.DataFrame) -> str:
-        return _render_table_markdown(frame, limit=20)
+        return _render_table_markdown(frame, limit=None)
 
     warnings = summary.get("warnings", [])
     portfolio = summary.get("portfolio", {})
@@ -2382,7 +2606,8 @@ def _write_markdown_report(
     lines.append("")
     lines.extend(
         [
-            "- Portfolio decisions: weights, scores, long/short side, future return contribution.",
+            "- Portfolio decisions: decision_inventory.csv contains every explained date-symbol row, including flat and masked names.",
+            "- Attribution target: every tradable non-zero position, gross-exposure weighted; no rank-based truncation is used.",
             "- Feature and lookback-day attribution: gradient x input and Integrated Gradients.",
             "- Perturbation sensitivity: score/weight changes when each feature-day slice is zeroed.",
             "- Auxiliary representations: branch/latent tensor norms and collapse checks.",
@@ -2395,12 +2620,14 @@ def _write_markdown_report(
     lines.append("")
     lines.extend(
         [
-            "- `gradient x input`: fast local sensitivity around the sampled decisions; useful for spotting dominant features or single-day dependence.",
+            "- `gradient x input`: fast local sensitivity around the explained decisions; useful for spotting dominant features or single-day dependence.",
             "- `integrated gradients`: smoother attribution from a zero baseline to the actual window; usually more stable than raw gradients but costs multiple forward/backward passes.",
             "- `perturbation weight_abs_delta`: decision-level sensitivity after zeroing one feature-day slice; prefer this over score delta when masked scores use sentinel values.",
             "- `feature_correlations`: simple linear checks between raw feature values and score/weight; high values can reveal price-level or liquidity shortcuts.",
             "- `aux_summary` and `aux_dims`: tensor norm and dimension usage checks; very high zero fraction or one dominant dimension can indicate collapsed representations.",
             "- `aux_projections`: cuML UMAP maps of high-dimensional transformer states; collapsed clouds, isolated single-token islands, or date-only bands deserve manual inspection.",
+            "- `explainability_completeness`: verify position/gross coverage is 100%, inventory row counts match, and enabled feature-time methods contain lookback × feature cells.",
+            "- `exposure_coverage_curve`: uses all names; a steep curve means the strategy is concentrated.",
         ]
     )
     lines.append("")
@@ -2438,11 +2665,12 @@ def _write_markdown_report(
             lines.append(f"- `{plot}`")
         lines.append("")
     for name in (
+        "explainability_completeness",
+        "position_distribution",
         "feature_importance_gradient",
         "feature_importance_integrated_gradients",
         "feature_importance_perturbation",
         "feature_correlations",
-        "top_decisions",
         "stock_contributions",
         "aux_summary",
     ):
@@ -2566,6 +2794,24 @@ def _global_attribution_table(frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
     return out.sort("mean_available_share", descending=True)
 
 
+def _feature_attribution_coverage_curve(table: pl.DataFrame) -> pl.DataFrame:
+    """Cumulative curve over all features, never a Top-N truncation."""
+    if _is_empty_frame(table) or "mean_available_share" not in table.columns:
+        return pl.DataFrame()
+    values = _numeric_numpy(table, "mean_available_share", default=0.0)
+    values = np.clip(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+    total = float(values.sum())
+    cumulative = np.cumsum(values) / total if total > 0.0 else np.zeros_like(values)
+    count = max(1, values.size)
+    return table.select(["feature", "feature_group", "feature_label", "mean_available_share"]).with_columns(
+        [
+            pl.Series("feature_rank", np.arange(1, values.size + 1, dtype=np.int64)),
+            pl.Series("fraction_of_features", np.arange(1, values.size + 1, dtype=np.float64) / count),
+            pl.Series("cumulative_mean_attribution_share", cumulative),
+        ]
+    )
+
+
 
 def _write_paper_tables(
     output_dir: Path,
@@ -2578,17 +2824,13 @@ def _write_paper_tables(
     table_dir.mkdir(parents=True, exist_ok=True)
     tables: dict[str, pl.DataFrame] = {}
     tables["global_feature_attribution"] = _global_attribution_table(frames)
-    top_cell_frames: list[pl.DataFrame] = []
-    for name, method in (
-        ("top_feature_time_gradient_cells", "gradient_x_input"),
-        ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
-        ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
-    ):
-        frame = frames.get(name, pl.DataFrame())
-        if not _is_empty_frame(frame):
-            top_cell_frames.append(frame.with_columns(pl.lit(method).alias("method")).select(["method", *frame.columns]))
-    tables["feature_time_top_cells"] = _concat_frames(top_cell_frames)
+    tables["feature_attribution_coverage_curve"] = _feature_attribution_coverage_curve(
+        tables["global_feature_attribution"]
+    )
     for name in (
+        "explainability_completeness",
+        "exposure_coverage_curve",
+        "position_distribution",
         "daily_portfolio",
         "regime_analysis",
         "decision_case_studies",
@@ -2599,6 +2841,18 @@ def _write_paper_tables(
         "aux_summary",
     ):
         tables[name] = frames.get(name, pl.DataFrame())
+    completeness = tables.get("explainability_completeness", pl.DataFrame())
+    if not _is_empty_frame(completeness):
+        split_rows = int(metadata.get("split_rows", metadata.get("sample_rows", 0)) or 0)
+        sample_rows = int(metadata.get("sample_rows", 0) or 0)
+        completeness = completeness.with_columns(
+            [
+                pl.lit(split_rows).alias("split_rows"),
+                pl.lit(sample_rows / max(1, split_rows)).alias("sampled_date_coverage"),
+                pl.lit(str(summary.get("attribution_scope", "unknown"))).alias("attribution_scope"),
+            ]
+        )
+        tables["explainability_completeness"] = completeness
     lookback_expected = metadata.get("config_lookback")
     lookback_observed = summary.get("attribution_lookback")
     tables["lookback_consistency"] = pl.DataFrame(
@@ -2634,7 +2888,7 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
     available = [(col, label) for col, label in share_cols if col in table.columns]
     if not available:
         return
-    data = table.head(14)
+    data = table
     melted: list[pl.DataFrame] = []
     for col, label in available:
         melted.append(
@@ -2652,7 +2906,7 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
         return
     plt, sns = _setup_paper_plotting()
     feature_count = int(data.select(pl.col("feature_label").n_unique()).item())
-    fig_height = max(5.2, 0.42 * feature_count + 2.1)
+    fig_height = min(12.0, max(5.2, 0.42 * feature_count + 2.1))
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     palette = {
         "Grad x input": PAPER_TOKENS["blue_mid"],
@@ -2695,7 +2949,6 @@ def _plot_paper_feature_time_heatmap(
     value_col: str,
     title: str,
     subtitle: str,
-    top_features: int = 24,
 ) -> None:
     required = {"feature", "lookback_from_end", value_col}
     if _is_empty_frame(frame) or not required.issubset(frame.columns):
@@ -2704,13 +2957,13 @@ def _plot_paper_feature_time_heatmap(
     data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
     if data.is_empty():
         return
-    top = _top_values_by_sum(data, "feature", value_col, top_features)
-    if not top:
+    features = _values_by_sum(data, "feature", value_col)
+    if not features:
         return
-    data = data.filter(pl.col("feature").is_in(top)).with_columns(
+    data = data.with_columns(
         pl.col("feature").cast(pl.String).map_elements(_feature_label, return_dtype=pl.String).alias("feature_label")
     )
-    ordered_labels = [_feature_label(str(feature)) for feature in top]
+    ordered_labels = [_feature_label(str(feature)) for feature in features]
     column_order = sorted(data.get_column("lookback_from_end").unique().to_list())
     labels, columns, matrix = _pivot_sum_matrix(
         data,
@@ -2725,7 +2978,7 @@ def _plot_paper_feature_time_heatmap(
     plt, sns = _setup_paper_plotting()
     from matplotlib.colors import LinearSegmentedColormap
 
-    fig_height = max(5.0, 0.38 * len(labels) + 2.0)
+    fig_height = min(12.0, max(5.0, 0.38 * len(labels) + 2.0))
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=170)
     cmap = LinearSegmentedColormap.from_list(
         "paper_blue_gold",
@@ -2790,7 +3043,7 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
     data = _with_numeric(frame, "score_corr", "weight_corr").with_columns(
         pl.max_horizontal(pl.col("score_corr").abs(), pl.col("weight_corr").abs()).alias("max_abs_corr")
     )
-    data = data.drop_nulls(subset=["max_abs_corr"]).sort("max_abs_corr", descending=True).head(18)
+    data = data.drop_nulls(subset=["max_abs_corr"]).sort("max_abs_corr", descending=True)
     if data.is_empty():
         return
     data = data.with_columns(
@@ -2800,7 +3053,7 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
         index=["label"], on=["score_corr", "weight_corr"], variable_name="target", value_name="corr"
     )
     plt, sns = _setup_paper_plotting()
-    fig_height = max(5.2, 0.36 * data.height + 2.0)
+    fig_height = min(12.0, max(5.2, 0.36 * data.height + 2.0))
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
     sns.barplot(
         data=_to_plot_data(plot),
@@ -2875,18 +3128,26 @@ def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle
     data = _with_numeric(frame, "gross_contribution").drop_nulls(subset=["gross_contribution"])
     if data.is_empty():
         return
-    data = data.with_columns(
-        pl.concat_str([pl.col("case_type").cast(pl.String), pl.lit(" / "), pl.col("symbol").cast(pl.String)]).alias("label")
-    ).sort("gross_contribution")
-    plt, sns = _setup_paper_plotting()
-    fig_height = max(5.2, 0.28 * data.height + 2.0)
-    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
-    colors = [PAPER_TOKENS["blue_mid"] if value >= 0 else PAPER_TOKENS["orange_mid"] for value in _numeric_numpy(data, "gross_contribution")]
-    sns.barplot(data=_to_plot_data(data), y="label", x="gross_contribution", palette=colors, hue="label", legend=False, ax=ax)
+    data = data.sort(["case_type", "abs_weight"], descending=[False, True]).with_columns(
+        pl.int_range(pl.len()).over("case_type").alias("position_rank")
+    )
+    plt, _ = _setup_paper_plotting()
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=160)
+    for case_type, group in data.partition_by("case_type", as_dict=True).items():
+        label = str(case_type[0] if isinstance(case_type, tuple) else case_type)
+        ax.scatter(
+            _numeric_numpy(group, "position_rank"),
+            _numeric_numpy(group, "gross_contribution"),
+            s=8,
+            alpha=0.45,
+            label=label,
+        )
     ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
-    ax.set_xlabel("Weight × future log return")
-    ax.set_ylabel("")
-    _add_paper_header(fig, ax, "Case-study trades show which names drove wins and losses", subtitle)
+    ax.axhline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
+    ax.set_xlabel("All positions ordered by absolute weight within case day")
+    ax.set_ylabel("Weight × future log return")
+    ax.legend(loc="best", fontsize=8)
+    _add_paper_header(fig, ax, "Complete case-day contribution distributions", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path)
@@ -2896,7 +3157,7 @@ def _plot_paper_case_studies(frame: pl.DataFrame, *, output_path: Path, subtitle
 def _plot_paper_aux_summary(frame: pl.DataFrame, *, output_path: Path, subtitle: str) -> None:
     if _is_empty_frame(frame) or not {"name", "mean_abs"}.issubset(frame.columns):
         return
-    data = _with_numeric(frame, "mean_abs").drop_nulls(subset=["mean_abs"]).sort("mean_abs", descending=True).head(24)
+    data = _with_numeric(frame, "mean_abs").drop_nulls(subset=["mean_abs"]).sort("mean_abs", descending=True)
     if data.is_empty():
         return
     plt, sns = _setup_paper_plotting()
@@ -2908,6 +3169,43 @@ def _plot_paper_aux_summary(frame: pl.DataFrame, *, output_path: Path, subtitle:
     _add_paper_header(fig, ax, "Latent and market-token diagnostics check whether representations collapse", subtitle)
     _finish_paper_axes(ax)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_matplotlib_figure(fig, output_path)
+    plt.close(fig)
+
+
+def _plot_paper_coverage_curve(
+    frame: pl.DataFrame,
+    *,
+    output_path: Path,
+    x_col: str,
+    y_col: str,
+    title: str,
+    subtitle: str,
+    x_label: str,
+) -> None:
+    if _is_empty_frame(frame) or not {x_col, y_col}.issubset(frame.columns):
+        return
+    data = _with_numeric(frame, x_col, y_col).drop_nulls(subset=[x_col, y_col]).sort(x_col)
+    if data.is_empty():
+        return
+    plt, _ = _setup_paper_plotting()
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=160)
+    ax.plot(
+        _numeric_numpy(data, x_col),
+        _numeric_numpy(data, y_col),
+        color=PAPER_TOKENS["blue_mid"],
+        linewidth=2.2,
+    )
+    ax.plot([0.0, 1.0], [0.0, 1.0], color=PAPER_TOKENS["neutral_mid"], linestyle="--", linewidth=1.0)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.02)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Cumulative share")
+    ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
+    ax.yaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
+    ax.grid(True, color=PAPER_TOKENS["grid"], linewidth=0.8)
+    _add_paper_header(fig, ax, title, subtitle)
+    _finish_paper_axes(ax)
     _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
@@ -2941,12 +3239,40 @@ def _plot_all_paper_figures(
         lambda: _plot_paper_global_attribution(global_table, out, subtitle=f"Share of total attribution by method; {scope}"),
         out,
     )
+    out = plot_dir / "feature_attribution_coverage_curve.png"
+    _time_plot(
+        "feature_attribution_coverage_curve_s",
+        lambda: _plot_paper_coverage_curve(
+            _feature_attribution_coverage_curve(global_table),
+            output_path=out,
+            x_col="fraction_of_features",
+            y_col="cumulative_mean_attribution_share",
+            title="All-feature cumulative attribution coverage",
+            subtitle=f"Every feature is included; {scope}",
+            x_label="Fraction of all features",
+        ),
+        out,
+    )
+    out = plot_dir / "portfolio_exposure_coverage_curve.png"
+    _time_plot(
+        "portfolio_exposure_coverage_curve_s",
+        lambda: _plot_paper_coverage_curve(
+            frames.get("exposure_coverage_curve", pl.DataFrame()),
+            output_path=out,
+            x_col="fraction_of_tradable_names",
+            y_col="mean_cumulative_gross_exposure",
+            title="All-position cumulative gross-exposure coverage",
+            subtitle=f"Every tradable name is included before aggregation; {scope}",
+            x_label="Fraction of tradable names, largest positions first",
+        ),
+        out,
+    )
     heatmap_specs = [
         (
             "feature_time_gradient",
             "grad_x_input_abs",
             "Feature-time heatmap shows where local gradient sensitivity concentrates",
-            "Mean absolute gradient × input across selected top-weight decisions; t-0 is the latest input day.",
+            "Mean absolute gradient × input for the full gross-weighted explained portfolio; t-0 is the latest input day.",
         ),
         (
             "feature_time_integrated_gradients",
@@ -3021,11 +3347,21 @@ def _plot_all_paper_figures(
 PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
     "global_feature_attribution.png": (
         "Compares global feature importance across gradient x input, Integrated Gradients, perturbation, and surrogate SHAP.",
-        "Features that stay near the top across methods are more credible than features that appear in only one diagnostic.",
+        "The bars are a compact reading index; use global_feature_attribution.csv and the cumulative curve for the complete feature set.",
         "One feature taking more than half of total attribution, or SHAP disagreeing completely with perturbation, suggests a narrow or unstable rule.",
     ),
+    "feature_attribution_coverage_curve.png": (
+        "Accumulates attribution across every feature, sorted from strongest to weakest.",
+        "A steep early rise means a few features explain most decisions; a gradual curve means information is distributed broadly.",
+        "Near-total attribution from only a tiny fraction of features can indicate a brittle shortcut and should be checked across folds.",
+    ),
+    "portfolio_exposure_coverage_curve.png": (
+        "Accumulates gross exposure across every tradable name, largest position first.",
+        "Compare the blue curve with the diagonal: the farther above it, the more concentrated the portfolio.",
+        "If a very small fraction of names carries nearly all gross exposure, Top-N examples are not representative enough for trust decisions.",
+    ),
     "feature_time_gradient_grad_x_input_abs_heatmap.png": (
-        "Measures local sensitivity by feature and lookback day for the selected top-weight decisions.",
+        "Measures local sensitivity by feature and lookback day for all tradable non-zero positions, weighted by gross exposure.",
         "Read rows as feature families and columns as days before the decision; brighter cells mean stronger local influence.",
         "A blank-looking chart, one isolated column, or one isolated feature row means the model may be ignoring most of the lookback window.",
     ),
@@ -3055,7 +3391,7 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
         "Warnings in mask leakage, concentration, or turnover can invalidate backtest conclusions even if returns look good.",
     ),
     "regime_analysis.png": (
-        "Splits sampled decisions by market direction and volatility regime.",
+        "Splits explained decisions by market direction and volatility regime.",
         "The strategy is more credible if the rule has understandable behavior in up/down and high/low volatility states.",
         "Performance that only appears in one tiny regime bucket may be overfit.",
     ),
@@ -3072,7 +3408,7 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _render_frame_markdown(frame: pl.DataFrame, limit: int = 20) -> str:
+def _render_frame_markdown(frame: pl.DataFrame, limit: int | None = 20) -> str:
     return _render_table_markdown(frame, limit=limit)
 
 
@@ -3167,22 +3503,13 @@ def _write_paper_report(
     lines.append("")
     lines.append(_render_frame_markdown(frames.get("trust_checks", pl.DataFrame()), limit=30))
     lines.append("")
+    lines.append("## Completeness Audit")
+    lines.append("")
+    lines.append(_render_frame_markdown(frames.get("explainability_completeness", pl.DataFrame()), limit=30))
+    lines.append("")
     lines.append("## Global Attribution Table")
     lines.append("")
-    lines.append(_render_frame_markdown(_global_attribution_table(frames), limit=20))
-    lines.append("")
-    lines.append("## Top Feature-Time Cells")
-    lines.append("")
-    feature_time_tables: list[pl.DataFrame] = []
-    for key, method in (
-        ("top_feature_time_gradient_cells", "gradient_x_input"),
-        ("top_feature_time_integrated_gradients_cells", "integrated_gradients"),
-        ("top_feature_time_perturbation_cells", "perturbation_weight_delta"),
-    ):
-        frame = frames.get(key, pl.DataFrame())
-        if not _is_empty_frame(frame):
-            feature_time_tables.append(frame.with_columns(pl.lit(method).alias("method")).select(["method", *frame.columns]))
-    lines.append(_render_frame_markdown(_concat_frames(feature_time_tables), limit=30))
+    lines.append(_render_frame_markdown(_global_attribution_table(frames), limit=None))
     lines.append("")
     lines.append("## Regime Analysis")
     lines.append("")
@@ -3190,7 +3517,7 @@ def _write_paper_report(
     lines.append("")
     lines.append("## Decision Case Studies")
     lines.append("")
-    lines.append(_render_frame_markdown(frames.get("decision_case_studies", pl.DataFrame()), limit=30))
+    lines.append("Complete rows are stored in `paper_tables/decision_case_studies.csv`; the report does not duplicate the full table.")
     lines.append("")
     lines.append("## Output Files")
     lines.append("")
@@ -3284,9 +3611,9 @@ def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallbac
     _write_csv(combined, table_dir / "fold_feature_attribution_long.csv")
     _write_csv(summary, table_dir / "fold_feature_stability.csv")
     plt, sns = _setup_paper_plotting()
-    data = summary.head(20)
+    data = summary
     if not data.is_empty():
-        fig_height = max(5.0, 0.36 * data.height + 2.0)
+        fig_height = min(12.0, max(5.0, 0.36 * data.height + 2.0))
         fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=160)
         sns.barplot(data=_frame_to_dict(data), y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
         ax.set_xlabel("Mean attribution share across folds")
@@ -3305,7 +3632,7 @@ def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallbac
         "",
         "## Most Stable Features",
         "",
-        _render_frame_markdown(summary, limit=30),
+        _render_frame_markdown(summary, limit=None),
         "",
     ]
     (output_dir / "paper_fold_stability_report.md").write_text("\n".join(report), encoding="utf-8")
@@ -3324,17 +3651,16 @@ def _plot_barh(
     label_col: str,
     value_col: str,
     title: str,
-    top_n: int = 30,
 ) -> None:
     if _is_empty_frame(frame) or label_col not in frame.columns or value_col not in frame.columns:
         return
     data = _with_numeric(frame.select([label_col, value_col]), value_col)
-    data = data.drop_nulls(subset=[label_col, value_col]).sort(value_col, descending=True).head(top_n)
+    data = data.drop_nulls(subset=[label_col, value_col]).sort(value_col, descending=True)
     if data.is_empty():
         return
     labels = _string_list(data, label_col)
     values = _numeric_numpy(data, value_col)
-    fig_height = max(4.0, 0.28 * data.height + 1.5)
+    fig_height = min(12.0, max(4.0, 0.28 * data.height + 1.5))
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
@@ -3381,7 +3707,6 @@ def _plot_feature_time_heatmap(
     output_path: Path,
     value_col: str,
     title: str,
-    top_features: int = 30,
 ) -> None:
     required = {"feature", "lookback_from_end", value_col}
     if _is_empty_frame(frame) or not required.issubset(frame.columns):
@@ -3390,24 +3715,23 @@ def _plot_feature_time_heatmap(
     data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
     if data.is_empty():
         return
-    top = _top_values_by_sum(data, "feature", value_col, top_features)
-    if not top:
+    features = _values_by_sum(data, "feature", value_col)
+    if not features:
         return
-    data = data.filter(pl.col("feature").is_in(top))
     column_order = sorted(data.get_column("lookback_from_end").unique().to_list())
     labels, columns, matrix = _pivot_sum_matrix(
         data,
         index_col="feature",
         column_col="lookback_from_end",
         value_col=value_col,
-        index_order=top,
+        index_order=features,
         column_order=column_order,
     )
     if matrix.size == 0:
         return
     import matplotlib.pyplot as plt
 
-    fig_height = max(4.0, 0.30 * len(labels) + 1.5)
+    fig_height = min(12.0, max(4.0, 0.30 * len(labels) + 1.5))
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
     image = ax.imshow(matrix, aspect="auto", interpolation="nearest")
     ax.set_title(title)
@@ -3430,7 +3754,6 @@ def _plot_feature_time_heatmap_datashader(
     output_path: Path,
     value_col: str,
     title: str,
-    top_features: int = 40,
 ) -> None:
     required = {"feature", "lookback_from_end", value_col}
     if _is_empty_frame(frame) or not required.issubset(frame.columns):
@@ -3439,11 +3762,11 @@ def _plot_feature_time_heatmap_datashader(
     data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
     if data.is_empty():
         return
-    top = [str(value) for value in _top_values_by_sum(data, "feature", value_col, top_features)]
-    if not top:
+    features = [str(value) for value in _values_by_sum(data, "feature", value_col)]
+    if not features:
         return
-    data = data.with_columns(pl.col("feature").cast(pl.String).alias("feature")).filter(pl.col("feature").is_in(top))
-    feature_to_y = {feature: len(top) - 1 - idx for idx, feature in enumerate(top)}
+    data = data.with_columns(pl.col("feature").cast(pl.String).alias("feature"))
+    feature_to_y = {feature: len(features) - 1 - idx for idx, feature in enumerate(features)}
     data = data.with_columns(
         pl.col("feature")
         .map_elements(lambda value: feature_to_y.get(str(value)), return_dtype=pl.Int64)
@@ -3451,7 +3774,7 @@ def _plot_feature_time_heatmap_datashader(
     ).drop_nulls(subset=["feature_y"])
     if data.is_empty():
         return
-    plot_height = max(520, min(1400, 24 * len(top) + 180))
+    plot_height = max(520, min(3200, 24 * len(features) + 180))
     save_heatmap_points_datashader(
         _numeric_numpy(data, "lookback_from_end"),
         _numeric_numpy(data, "feature_y"),
@@ -3460,7 +3783,7 @@ def _plot_feature_time_heatmap_datashader(
         title=title,
         x_label="lookback_from_end (0 = latest)",
         y_label=value_col,
-        y_labels=[(feature_to_y[feature], feature) for feature in top],
+        y_labels=[(feature_to_y[feature], feature) for feature in features],
         width=_plot_width_px_17_6(plot_height),
         height=plot_height,
     )
@@ -3472,7 +3795,7 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     data = frame
     if "abs_score_corr" not in data.columns:
         return
-    data = _with_numeric(data, "abs_score_corr", "score_corr", "weight_corr").sort("abs_score_corr", descending=True).head(30)
+    data = _with_numeric(data, "abs_score_corr", "score_corr", "weight_corr").sort("abs_score_corr", descending=True)
     if data.is_empty():
         return
     import matplotlib.pyplot as plt
@@ -3482,7 +3805,7 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
         "__label",
     )
     y = np.arange(data.height)
-    fig_height = max(4.0, 0.28 * data.height + 1.5)
+    fig_height = min(12.0, max(4.0, 0.28 * data.height + 1.5))
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=130)
     ax.barh(y - 0.18, _numeric_numpy(data, "score_corr"), height=0.35, label="score_corr")
     if "weight_corr" in data.columns:
@@ -3491,7 +3814,7 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     ax.set_yticklabels(labels)
     ax.invert_yaxis()
     ax.axvline(0.0, color="black", linewidth=0.8)
-    ax.set_title("Top Simple Feature Correlations")
+    ax.set_title("Complete Simple Feature Correlations")
     ax.set_xlabel("correlation")
     ax.grid(True, axis="x", alpha=0.25)
     ax.legend()
@@ -3526,8 +3849,8 @@ def _plot_decision_exposure(frame: pl.DataFrame, output_path: Path) -> None:
         values = matrix[:, columns.index(side)]
         ax.bar(np.arange(len(rows)), values, bottom=bottom, label=side)
         bottom = bottom + values
-    ax.set_title("Top Decision Absolute Exposure By Side")
-    ax.set_xlabel("sampled date index")
+    ax.set_title("Complete Decision Absolute Exposure By Side")
+    ax.set_xlabel("explained date index")
     ax.set_ylabel("sum abs(weight)")
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend()
@@ -3564,7 +3887,7 @@ def _plot_decision_exposure_datashader(frame: pl.DataFrame, output_path: Path) -
     save_line_series_datashader(
         series,
         output_path=output_path,
-        title="Top Decision Absolute Exposure By Side",
+        title="Complete Decision Absolute Exposure By Side",
         y_label="sum abs(weight)",
         width=_plot_width_px_17_6(520),
         height=520,
@@ -3664,8 +3987,6 @@ def _plot_all_explanation_figures(
         ("feature_importance_integrated_gradients", "feature", "integrated_gradients_abs", "Integrated Gradients Feature Importance"),
         ("feature_importance_perturbation", "feature", "weight_abs_delta", "Perturbation Feature Importance (Weight Delta)"),
         ("feature_importance_perturbation", "feature", "score_abs_delta", "Perturbation Feature Importance (Score Delta)"),
-        ("stock_contributions", "symbol", "mean_abs_weight", "Top Stocks By Mean Absolute Weight"),
-        ("stock_contributions", "symbol", "total_gross_contribution", "Top Stocks By Total Gross Contribution"),
         ("aux_summary", "name", "mean_abs", "Auxiliary Representation Mean Abs"),
     ]
     for frame_name, label_col, value_col, title in specs:
@@ -3730,8 +4051,8 @@ def _plot_all_explanation_figures(
         plot_timing["feature_correlations_s"] = float(time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
-    out = plot_dir / "top_decisions_exposure_by_side.png"
-    decision_frame = frames.get("top_decisions", pl.DataFrame())
+    out = plot_dir / "decision_inventory_exposure_by_side.png"
+    decision_frame = frames.get("decision_inventory", pl.DataFrame())
     if use_datashader:
         try:
             _plot_decision_exposure_datashader(decision_frame, out)
@@ -3775,8 +4096,7 @@ def _plot_all_explanation_figures(
                     output_path=out,
                     label_col="dim",
                     value_col="mean_abs",
-                    title=f"Aux Dimension Importance: {name}",
-                    top_n=32,
+                    title=f"Complete Aux Dimension Profile: {name}",
                 )
         else:
             _plot_barh(
@@ -3784,8 +4104,7 @@ def _plot_all_explanation_figures(
                 output_path=out,
                 label_col="dim",
                 value_col="mean_abs",
-                title=f"Aux Dimension Importance: {name}",
-                top_n=32,
+                title=f"Complete Aux Dimension Profile: {name}",
             )
         if out.exists():
             generated.append(out)
@@ -3865,9 +4184,21 @@ def write_explanation_outputs(
     report_style: str | None = None,
     plot_theme: str | None = None,
     strict_no_fallback: bool = False,
+    progress_enabled: bool = False,
 ) -> None:
     write_start = time.perf_counter()
     write_timing: dict[str, Any] = {}
+    write_progress = tqdm(
+        total=6,
+        desc="Write explainability",
+        unit="stage",
+        leave=False,
+        disable=not progress_enabled,
+    )
+
+    def complete_write_stage(name: str) -> None:
+        write_progress.update(1)
+        write_progress.set_postfix(stage=name, refresh=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = metadata or {}
     frames: dict[str, pl.DataFrame] = result["frames"]
@@ -3889,6 +4220,7 @@ def write_explanation_outputs(
             safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
             _write_csv(frame, projection_dir / f"{safe_name}.csv")
     _mark_elapsed(write_timing, "csv_s", stage_start)
+    complete_write_stage("standard_plots")
     stage_start = time.perf_counter()
     standard_plot_details: dict[str, Any] = {}
     plots_generated = (
@@ -3905,6 +4237,7 @@ def write_explanation_outputs(
         else []
     )
     _mark_elapsed(write_timing, "plots_s", stage_start)
+    complete_write_stage("paper_artifacts")
     write_timing["standard_plot_details"] = standard_plot_details
     resolved_report_style = _normalize_report_style(report_style or result["summary"].get("report_style", "paper"))
     resolved_plot_theme = _normalize_plot_theme(plot_theme or result["summary"].get("plot_theme", "paper"))
@@ -3950,6 +4283,7 @@ def write_explanation_outputs(
         write_timing["paper_tables_s"] = 0.0
         write_timing["paper_plots_s"] = 0.0
         write_timing["paper_plot_details"] = {}
+    complete_write_stage("reports")
     stage_start = time.perf_counter()
     _write_markdown_report(
         output_dir / "report.md",
@@ -3958,6 +4292,7 @@ def write_explanation_outputs(
         frames=frames,
     )
     _mark_elapsed(write_timing, "report_md_s", stage_start)
+    complete_write_stage("paper_report")
     if resolved_report_style == "paper":
         stage_start = time.perf_counter()
         _write_paper_report(
@@ -3981,6 +4316,7 @@ def write_explanation_outputs(
     else:
         write_timing["paper_report_md_s"] = 0.0
         write_timing["paper_summary_json_s"] = 0.0
+    complete_write_stage("summary_json")
     write_timing["total_s"] = float(time.perf_counter() - write_start)
     stage_start = time.perf_counter()
     (output_dir / "summary.json").write_text(
@@ -3994,6 +4330,8 @@ def write_explanation_outputs(
         json.dumps(_to_builtin({"compute_timing": result["summary"].get("timing", {}), "write_timing": write_timing}), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    complete_write_stage("complete")
+    write_progress.close()
 
 
 def _strip_orig_mod_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -4140,9 +4478,20 @@ def _checkpoint_symbol_count(checkpoint_path: Path) -> int | None:
 
 
 def _daily_weight_symbols(path: Path) -> list[str]:
+    if path.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+
+        return [str(column) for column in pq.read_schema(path).names if str(column) != "date"]
     with path.open("r", encoding="utf-8", newline="") as handle:
         header = next(csv.reader(handle))
     return [str(column) for column in header if str(column) != "date"]
+
+
+def _daily_weight_table_path(fold_dir: Path) -> Path | None:
+    for candidate in (fold_dir / "daily_weights.parquet", fold_dir / "daily_weights.csv"):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
@@ -4151,7 +4500,7 @@ def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
     if missing:
         preview = ", ".join(missing[:10])
         raise ValueError(
-            f"Cannot align panel to checkpoint universe; {len(missing)} symbols from daily_weights.csv "
+            f"Cannot align panel to checkpoint universe; {len(missing)} symbols from the daily_weights table "
             f"are missing in the current panel: {preview}"
         )
     indices = np.asarray([index_by_symbol[symbol] for symbol in symbols], dtype=np.int64)
@@ -4185,24 +4534,21 @@ def _align_panel_to_checkpoint_universe(panel: PanelData, output_dir: Path, fold
     expected_symbols = _checkpoint_symbol_count(checkpoint_path)
     if expected_symbols is None:
         return panel
-    weights_path = _fold_dir(output_dir, fold_id) / "daily_weights.csv"
-    if not weights_path.exists():
+    fold_dir = _fold_dir(output_dir, fold_id)
+    weights_path = _daily_weight_table_path(fold_dir)
+    if weights_path is None:
         if int(panel.num_symbols) != int(expected_symbols):
             raise ValueError(
                 f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"cannot align because {weights_path} is missing."
+                f"cannot align because daily_weights.parquet/csv is missing in {fold_dir}."
             )
         return panel
 
     trained_symbols = _daily_weight_symbols(weights_path)
-    if len(trained_symbols) != int(expected_symbols):
-        if int(panel.num_symbols) != int(expected_symbols):
-            raise ValueError(
-                f"Checkpoint expects {expected_symbols} symbols but current panel has {panel.num_symbols}; "
-                f"{weights_path} has {len(trained_symbols)} symbols, so it cannot be used for alignment."
-            )
-        return panel
-
+    # symbol_position can be the compact train-union capacity while the saved
+    # daily weight table is the authoritative full evaluation universe.  This
+    # mirrors inference alignment: never reject a valid ordered weight schema
+    # merely because its width differs from the positional tensor checkpoint.
     if trained_symbols == list(panel.symbols):
         return panel
 
@@ -4260,9 +4606,17 @@ def _dataset_for_split(
     return CrossSectionalDataset(panel, indices, lookback)
 
 
-def _sample_dataset(dataset: CrossSectionalDataset, max_rows: int, method: str) -> tuple[dict[str, torch.Tensor], np.ndarray]:
+def _sample_dataset(
+    dataset: CrossSectionalDataset,
+    max_rows: int,
+    method: str,
+    *,
+    progress_enabled: bool = False,
+) -> tuple[dict[str, torch.Tensor], np.ndarray]:
     n_rows = len(dataset)
-    n_take = max(1, min(int(max_rows), n_rows))
+    # Non-positive is the exhaustive standalone default. A positive value is an
+    # explicit reduced run requested by the caller.
+    n_take = n_rows if int(max_rows) <= 0 else max(1, min(int(max_rows), n_rows))
     method = method.strip().lower()
     if method == "last":
         positions = np.arange(n_rows - n_take, n_rows, dtype=np.int64)
@@ -4270,7 +4624,16 @@ def _sample_dataset(dataset: CrossSectionalDataset, max_rows: int, method: str) 
         positions = np.arange(0, n_take, dtype=np.int64)
     else:
         positions = np.linspace(0, n_rows - 1, n_take, dtype=np.int64)
-    samples = [dataset[int(pos)] for pos in positions]
+    samples = [
+        dataset[int(pos)]
+        for pos in tqdm(
+            positions,
+            desc="Materialize explain dates",
+            unit="date",
+            leave=False,
+            disable=not progress_enabled,
+        )
+    ]
     batch = collate_batch(samples)
     return batch, dataset.valid_indices[positions]
 
@@ -4371,7 +4734,7 @@ def run_loaded_model_explanation(
     plot_backend: str | None = None,
     device: torch.device | None = None,
     checkpoint_info: dict[str, Any] | None = None,
-    timing_file_name: str | None = None,
+    timing_file_name: str | None = "explainability_runner_timing.json",
     write_fold_stability: bool = False,
 ) -> Path:
     total_start = time.perf_counter()
@@ -4386,6 +4749,14 @@ def run_loaded_model_explanation(
         "enabled": True,
         "loaded_model_reused": True,
     }
+    runner_progress = tqdm(
+        total=5,
+        desc=f"Fold {int(fold.fold_id):02d} pipeline",
+        unit="stage",
+        leave=False,
+        disable=not bool(settings.progress_enabled),
+    )
+    runner_progress.set_postfix(stage="dataset", refresh=True)
     sample_start = time.perf_counter()
     dataset = _dataset_for_split(
         panel,
@@ -4394,16 +4765,26 @@ def run_loaded_model_explanation(
         config.training.lookback,
         first_test_year_only=settings.first_test_year_only,
     )
-    batch, date_indices = _sample_dataset(dataset, settings.max_rows, settings.sample_method)
+    batch, date_indices = _sample_dataset(
+        dataset,
+        settings.max_rows,
+        settings.sample_method,
+        progress_enabled=bool(settings.progress_enabled),
+    )
     dates = [str(np.datetime_as_string(panel.dates[int(idx)], unit="D")) for idx in date_indices]
     runner_timing["sample_s"] = float(time.perf_counter() - sample_start)
     runner_timing["sample_rows"] = int(len(dates))
+    runner_timing["split_rows"] = int(len(dataset))
     runner_timing["ig_steps"] = int(settings.ig_steps)
     runner_timing["perturb"] = bool(settings.perturb)
     runner_timing["write_plots"] = bool(write_plots)
+    runner_progress.update(1)
+    runner_progress.set_postfix(stage="model_explanations", refresh=True)
 
     was_training = model.training
     model.eval()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     compute_start = time.perf_counter()
     try:
         result = explain_batch_row_chunked(
@@ -4419,6 +4800,11 @@ def run_loaded_model_explanation(
         if was_training:
             model.train()
     runner_timing["compute_s"] = float(time.perf_counter() - compute_start)
+    runner_timing["compute_dates_per_s"] = float(len(dates)) / max(float(runner_timing["compute_s"]), 1e-9)
+    if device.type == "cuda":
+        runner_timing["main_peak_cuda_gb"] = float(torch.cuda.max_memory_allocated(device)) / (1024**3)
+    runner_progress.update(1)
+    runner_progress.set_postfix(stage="write_outputs", refresh=True)
 
     destination = explain_output_dir or (
         output_dir
@@ -4432,6 +4818,8 @@ def run_loaded_model_explanation(
         "checkpoint": str(checkpoint_path),
         "device": str(device),
         "sample_rows": int(len(dates)),
+        "split_rows": int(len(dataset)),
+        "sampled_date_coverage": float(len(dates)) / max(1, int(len(dataset))),
         "first_test_year_only": bool(settings.first_test_year_only),
         "config_lookback": int(config.training.lookback),
         "date_start": dates[0] if dates else None,
@@ -4449,8 +4837,12 @@ def run_loaded_model_explanation(
         plot_backend=resolved_plot_backend,
         report_style=settings.report_style,
         plot_theme=settings.plot_theme,
+        strict_no_fallback=bool(settings.strict_no_fallback),
+        progress_enabled=bool(settings.progress_enabled),
     )
     runner_timing["write_s"] = float(time.perf_counter() - write_start)
+    runner_progress.update(1)
+    runner_progress.set_postfix(stage="cross_asset", refresh=True)
     cross_asset_summary: dict[str, Any] = {}
     if bool(settings.cross_asset_enabled):
         from stockagent.explainability_cross_asset import abstract_cross_asset_transmission
@@ -4500,8 +4892,12 @@ def run_loaded_model_explanation(
                 )
                 print("[explain] cross-asset skipped after CUDA OOM")
         runner_timing["cross_asset_s"] = float(time.perf_counter() - cross_asset_start)
+        if device.type == "cuda":
+            runner_timing["total_peak_cuda_gb"] = float(torch.cuda.max_memory_allocated(device)) / (1024**3)
     else:
         runner_timing["cross_asset_s"] = 0.0
+    runner_progress.update(1)
+    runner_progress.set_postfix(stage="fold_stability", refresh=True)
 
     if write_fold_stability and bool(settings.fold_stability):
         stability_start = time.perf_counter()
@@ -4510,6 +4906,8 @@ def run_loaded_model_explanation(
         runner_timing["fold_stability_output"] = str(stability_dir) if stability_dir is not None else ""
     else:
         runner_timing["fold_stability_s"] = 0.0
+    runner_progress.update(1)
+    runner_progress.close()
 
     runner_timing["total_s"] = float(time.perf_counter() - total_start)
     if timing_file_name:
@@ -4536,6 +4934,8 @@ def run_loaded_model_explanation(
             f"write={float(runner_timing['write_s']):.3f}s "
             f"cross_asset={float(runner_timing['cross_asset_s']):.3f}s "
             f"stability={float(runner_timing['fold_stability_s']):.3f}s "
+            f"dates_per_s={float(runner_timing['compute_dates_per_s']):.4f} "
+            f"peak_cuda_gb={float(runner_timing.get('total_peak_cuda_gb', runner_timing.get('main_peak_cuda_gb', 0.0))):.2f} "
             f"json={timing_path}"
         )
 
@@ -4696,7 +5096,16 @@ def _run_explainability_for_config(
     # run explainability for all folds that have checkpoint_best.pt.
     run_all_folds = args.fold is None and args.checkpoint is None
     if run_all_folds:
+        setup_progress = tqdm(
+            total=3,
+            desc="Explain setup",
+            unit="stage",
+            disable=not bool(settings.progress_enabled),
+        )
+        setup_progress.set_postfix(stage="load_config", refresh=True)
         config = load_config(config_path)
+        setup_progress.update(1)
+        setup_progress.set_postfix(stage="build_panel", refresh=True)
         resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
         panel = build_panel(
             config.data.parquet_root,
@@ -4724,6 +5133,8 @@ def _run_explainability_for_config(
             feature_zero_fill=config.data.feature_zero_fill,
             panel_start_date=config.data.panel_start_date,
         )
+        setup_progress.update(1)
+        setup_progress.set_postfix(stage="build_folds", refresh=True)
         folds = build_expanding_year_folds(
             dates=panel.dates,
             min_train_years=config.walk_forward.min_train_years,
@@ -4733,6 +5144,8 @@ def _run_explainability_for_config(
         fold_ids = _available_checkpoint_folds(folds, resolved_output_dir)
         if not fold_ids:
             raise FileNotFoundError(f"No fold checkpoint_best.pt found under {resolved_output_dir}")
+        setup_progress.update(1)
+        setup_progress.close()
 
         device = _device_from_config(config, args.device)
         if device.type == "cuda":
@@ -4741,7 +5154,20 @@ def _run_explainability_for_config(
             torch.backends.cudnn.allow_tf32 = True
         folds_by_id = {int(fold.fold_id): fold for fold in folds}
         print(f"explaining folds: {fold_ids}")
-        for fold_id in fold_ids:
+        for fold_id in tqdm(
+            fold_ids,
+            desc="Explain folds",
+            unit="fold",
+            disable=not bool(settings.progress_enabled),
+        ):
+            fold_stage = tqdm(
+                total=3,
+                desc=f"Fold {int(fold_id):02d} stages",
+                unit="stage",
+                leave=False,
+                disable=not bool(settings.progress_enabled),
+            )
+            fold_stage.set_postfix(stage="load_checkpoint", refresh=True)
             fold_output_dir = explain_output_dir
             if fold_output_dir is not None:
                 fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
@@ -4761,6 +5187,8 @@ def _run_explainability_for_config(
                     device,
                     strict=args.strict,
                 )
+                fold_stage.update(1)
+                fold_stage.set_postfix(stage="explain_all_modules", refresh=True)
                 out_dir = run_loaded_model_explanation(
                     config=config,
                     panel=fold_panel,
@@ -4776,10 +5204,14 @@ def _run_explainability_for_config(
                     device=device,
                     checkpoint_info=checkpoint_info,
                 )
+                fold_stage.update(1)
+                fold_stage.set_postfix(stage="cleanup", refresh=True)
             finally:
                 if model is not None:
                     del model
                 _clear_explainability_runtime_cache()
+                fold_stage.update(1)
+                fold_stage.close()
             print(f"explainability output (fold {fold_id}): {out_dir}")
         if settings.fold_stability:
             stability_dir = write_fold_stability_outputs(
@@ -4825,12 +5257,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--explain-output-dir", default=None, type=Path)
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
-    parser.add_argument("--top-k", default=20, type=int)
-    parser.add_argument("--max-rows", default=32, type=int)
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show ETA/throughput progress bars for every long-running explainability stage.",
+    )
+    parser.add_argument(
+        "--max-rows",
+        default=0,
+        type=int,
+        help="Dates per fold; 0 (default) processes every date. Positive values are explicit reduced runs.",
+    )
     parser.add_argument("--ig-steps", default=8, type=int)
     parser.add_argument("--ig-batch-size", default=0, type=int, help="Batch IG alpha steps together; 0 selects an automatic safe chunk size.")
     parser.add_argument("--sample-method", default="even", choices=("even", "first", "last"))
-    parser.add_argument("--all-test-years", action="store_true", help="For --split test, explain all test years instead of only the first test year.")
+    parser.add_argument(
+        "--first-test-year-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Restrict test explanation to its first year; disabled by default so all configured test years are covered.",
+    )
+    parser.add_argument(
+        "--all-test-years",
+        dest="first_test_year_only",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--perturb",
         action=argparse.BooleanOptionalAction,
@@ -4862,7 +5315,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run score-head surrogate SHAP; on by default for complete offline explainability.",
     )
     parser.add_argument("--shap-mode", default="score_head_surrogate", choices=("score_head_surrogate", "off", "none"))
-    parser.add_argument("--case-study-top-k", default=5, type=int)
     parser.add_argument(
         "--regime-analysis",
         action=argparse.BooleanOptionalAction,
@@ -4887,7 +5339,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Run cuML UMAP aux projections; on by default for complete offline explainability.",
     )
-    parser.add_argument("--umap-max-points", default=10000, type=int)
+    parser.add_argument("--umap-max-points", default=0, type=int, help="Points per aux projection; 0 means all points.")
     parser.add_argument("--umap-max-projections", default=0, type=int, help="Maximum aux tensors to project with UMAP; 0 means no limit.")
     parser.add_argument("--umap-n-neighbors", default=15, type=int)
     parser.add_argument("--umap-min-dist", default=0.1, type=float)
@@ -4895,11 +5347,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cross-asset",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Write abstract_cross_asset_transmission outputs; on by default for complete offline explainability.",
+        help="Write cross-asset transmission outputs; enabled by default for complete offline explainability.",
     )
-    parser.add_argument("--cross-asset-max-sources", default=24, type=int)
-    parser.add_argument("--cross-asset-max-targets", default=24, type=int)
-    parser.add_argument("--cross-asset-top-edges", default=150, type=int)
+    parser.add_argument("--cross-asset-max-sources", default=0, type=int, help="Source cap; 0 means every active symbol.")
+    parser.add_argument("--cross-asset-max-targets", default=0, type=int, help="Target cap; 0 means every active symbol.")
     parser.add_argument("--cross-asset-source-chunk-size", default=2, type=int)
     parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
     parser.add_argument(
@@ -4913,7 +5364,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Use captured attention as transmission evidence when available.",
     )
-    parser.add_argument("--cross-asset-attention-capture-rows", default=4, type=int)
+    parser.add_argument("--cross-asset-attention-capture-rows", default=0, type=int, help="Attention row cap; 0 means every explained date.")
     parser.add_argument(
         "--cross-asset-validated-transmission",
         action=argparse.BooleanOptionalAction,
@@ -4930,7 +5381,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--strict-no-fallback",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Fail instead of using degraded explainability, plotting, or cross-asset fallback paths.",
     )
     return parser.parse_args(argv)
@@ -4939,7 +5390,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     settings = ExplainabilitySettings(
-        top_k=args.top_k,
+        progress_enabled=bool(args.progress),
         max_rows=args.max_rows,
         ig_steps=args.ig_steps,
         ig_batch_size=args.ig_batch_size,
@@ -4948,14 +5399,13 @@ def main(argv: list[str] | None = None) -> None:
         perturb_max_auto_batch_size=args.perturb_max_auto_batch_size,
         perturb_max_input_elements=args.perturb_max_input_elements,
         sample_method=args.sample_method,
-        first_test_year_only=not args.all_test_years,
+        first_test_year_only=bool(args.first_test_year_only),
         report_style=args.report_style,
         plot_theme=args.plot_theme,
         standard_plots=bool(args.standard_plots),
         interactive_plots=not args.no_interactive_plots,
         shap_enabled=bool(args.shap),
         shap_mode=args.shap_mode,
-        case_study_top_k=args.case_study_top_k,
         regime_analysis=bool(args.regime_analysis),
         fold_stability=bool(args.fold_stability),
         umap_enabled=bool(args.umap),
@@ -4964,19 +5414,29 @@ def main(argv: list[str] | None = None) -> None:
         umap_n_neighbors=args.umap_n_neighbors,
         umap_min_dist=args.umap_min_dist,
         cross_asset_enabled=bool(args.cross_asset),
-        cross_asset_max_sources=max(1, int(args.cross_asset_max_sources)),
-        cross_asset_max_targets=max(1, int(args.cross_asset_max_targets)),
-        cross_asset_top_edges=max(1, int(args.cross_asset_top_edges)),
+        cross_asset_max_sources=max(0, int(args.cross_asset_max_sources)),
+        cross_asset_max_targets=max(0, int(args.cross_asset_max_targets)),
         cross_asset_source_chunk_size=max(1, int(args.cross_asset_source_chunk_size)),
         cross_asset_perturb_scale=float(args.cross_asset_perturb_scale),
         cross_asset_shocks=tuple(
             value.strip().lower() for value in str(args.cross_asset_shocks).split(",") if value.strip()
         ),
         cross_asset_attention_flow=bool(args.cross_asset_attention_flow),
-        cross_asset_attention_capture_rows=max(1, int(args.cross_asset_attention_capture_rows)),
+        cross_asset_attention_capture_rows=max(0, int(args.cross_asset_attention_capture_rows)),
         cross_asset_validated_transmission=bool(args.cross_asset_validated_transmission),
         cross_asset_role_embedding=bool(args.cross_asset_role_embedding),
         strict_no_fallback=bool(args.strict_no_fallback),
+    )
+    print(
+        "[explain] standalone profile: "
+        f"dates={'all' if settings.max_rows <= 0 else settings.max_rows}, "
+        f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
+        f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
+        f"UMAP={'all_points' if settings.umap_max_points <= 0 else settings.umap_max_points}, "
+        f"cross_asset={settings.cross_asset_enabled}, "
+        f"sources={'all' if settings.cross_asset_max_sources <= 0 else settings.cross_asset_max_sources}, "
+        f"targets={'all' if settings.cross_asset_max_targets <= 0 else settings.cross_asset_max_targets}, "
+        f"strict_no_fallback={settings.strict_no_fallback}"
     )
 
     if args.config is None:
