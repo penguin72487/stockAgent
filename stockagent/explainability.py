@@ -181,8 +181,12 @@ class ExplainabilitySettings:
     ig_batch_size: int = 0
     perturb: bool = True
     perturb_batch_size: int = 0
-    perturb_max_auto_batch_size: int = 5
-    perturb_max_input_elements: int = 32_000_000
+    # Measured RTX 5070 Ti fold-21 throughput optimum.  These are aggregate
+    # work-set budgets: _auto_repeat_chunk_size divides them by the current
+    # date microbatch, preserving the same safe/fast total repeated rows.
+    perturb_max_auto_batch_size: int = 48
+    perturb_max_input_elements: int = 576_000_000
+    counterfactual_compile: bool = True
     sample_method: str = "even"
     first_test_year_only: bool = False
     report_style: str = "paper"
@@ -201,7 +205,8 @@ class ExplainabilitySettings:
     cross_asset_enabled: bool = True
     cross_asset_max_sources: int = 0
     cross_asset_max_targets: int = 0
-    cross_asset_source_chunk_size: int = 2
+    cross_asset_source_chunk_size: int = 16
+    cross_asset_max_repeated_rows: int = 48
     cross_asset_perturb_scale: float = 1.0
     cross_asset_shocks: tuple[str, ...] = field(
         default_factory=lambda: ("zero", "momentum", "gap", "volume", "volatility", "liquidity")
@@ -246,6 +251,8 @@ def _cross_asset_settings_from_explainability(settings: ExplainabilitySettings):
         max_sources=max(0, int(settings.cross_asset_max_sources)),
         max_targets=max(0, int(settings.cross_asset_max_targets)),
         source_chunk_size=max(1, int(settings.cross_asset_source_chunk_size)),
+        max_repeated_rows=max(1, int(settings.cross_asset_max_repeated_rows)),
+        counterfactual_compile=bool(settings.counterfactual_compile),
         perturb_scale=float(settings.cross_asset_perturb_scale),
         shocks=shocks or ("zero", "momentum", "gap", "volume", "volatility", "liquidity"),
         attention_flow=bool(settings.cross_asset_attention_flow),
@@ -275,6 +282,7 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         perturb_batch_size=int(getattr(training, "explain_perturb_batch_size", 1)),
         perturb_max_auto_batch_size=int(getattr(training, "explain_perturb_max_auto_batch_size", 1)),
         perturb_max_input_elements=int(getattr(training, "explain_perturb_max_input_elements", 8_000_000)),
+        counterfactual_compile=bool(getattr(training, "explain_counterfactual_compile", False)),
         sample_method=str(getattr(training, "explain_sample_method", "even")),
         first_test_year_only=bool(getattr(training, "explain_first_test_year_only", True)),
         report_style=str(getattr(training, "explain_report_style", "none")),
@@ -294,6 +302,7 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         cross_asset_max_sources=int(getattr(training, "explain_cross_asset_max_sources", 8)),
         cross_asset_max_targets=int(getattr(training, "explain_cross_asset_max_targets", 8)),
         cross_asset_source_chunk_size=int(getattr(training, "explain_cross_asset_source_chunk_size", 1)),
+        cross_asset_max_repeated_rows=int(getattr(training, "explain_cross_asset_max_repeated_rows", 48)),
         cross_asset_perturb_scale=float(getattr(training, "explain_cross_asset_perturb_scale", 1.0)),
         cross_asset_shocks=tuple(getattr(training, "explain_cross_asset_shocks", ())),
         cross_asset_attention_flow=bool(getattr(training, "explain_cross_asset_attention_flow", True)),
@@ -736,6 +745,43 @@ def _forward_outputs(
     )
 
 
+def _embedded_explainability_api(model: nn.Module) -> nn.Module | None:
+    """Return the underlying model when exact preprojected forward is supported."""
+    candidates = (model, getattr(model, "module", None), getattr(model, "_orig_mod", None))
+    required = (
+        "project_features_for_explainability",
+        "embed_projected_for_explainability",
+        "forward_from_embedded_explainability",
+    )
+    for candidate in candidates:
+        if candidate is not None and all(callable(getattr(candidate, name, None)) for name in required):
+            return candidate
+    return None
+
+
+def _forward_embedded_outputs(
+    model: nn.Module,
+    embedded: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    compile_forward: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    if compile_forward and callable(getattr(model, "forward_from_embedded_explainability_compiled", None)):
+        output = model.forward_from_embedded_explainability_compiled(embedded, mask)
+    else:
+        output = model.forward_from_embedded_explainability(
+            embedded,
+            mask,
+            return_aux=False,
+        )
+    weights, scores, aux = _normalize_model_output(output)
+    return (
+        torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0),
+        aux,
+    )
+
+
 def _selection_from_weights(
     weights: torch.Tensor,
     mask: torch.Tensor,
@@ -858,8 +904,11 @@ def _integrated_gradients_attribution(
         x,
         steps,
         int(batch_size),
-        max_auto=4,
-        max_input_elements=16_000_000,
+        # Fold-21 profiling peaks at eight alpha rows for one explained date.
+        # The element budget automatically scales that to two alpha rows for
+        # the normal three-date VRAM microbatch.
+        max_auto=8,
+        max_input_elements=96_000_000,
     )
     total_grad = torch.zeros_like(x)
     starts = range(1, steps + 1, chunk_size)
@@ -952,6 +1001,7 @@ def _perturbation_importance(
     max_auto_batch_size: int = 16,
     max_input_elements: int = 96_000_000,
     progress_enabled: bool = True,
+    compile_forward: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any]]:
     stage_start = time.perf_counter()
     rows: list[dict[str, Any]] = []
@@ -973,6 +1023,8 @@ def _perturbation_importance(
         "oom_chunk_sizes": [],
         "elapsed_s": 0.0,
         "perturbations_per_s": 0.0,
+        "embedded_fast_path": False,
+        "compiled_forward": False,
     }
     if not perturbations:
         frame = pl.DataFrame(rows)
@@ -984,9 +1036,28 @@ def _perturbation_importance(
         max_auto=max(1, int(max_auto_batch_size)),
         max_input_elements=max(1, int(max_input_elements)),
     )
+    # Treat max_auto_batch_size as an aggregate repeated-row budget, not a
+    # per-date repeat count.  This keeps the compiled Transformer batch fixed
+    # at 48 for B=1/2/3 date chunks (48/24/16 counterfactuals respectively).
+    chunk_size = min(
+        chunk_size,
+        max(1, int(max_auto_batch_size) // max(1, int(x.size(0)))),
+    )
     diagnostics["chunk_size"] = int(chunk_size)
     base_weights = base_weights.detach()
     base_scores = base_scores.detach()
+    embedded_api = _embedded_explainability_api(model)
+    base_projected: torch.Tensor | None = None
+    base_embedded: torch.Tensor | None = None
+    if embedded_api is not None:
+        with torch.no_grad():
+            base_projected = embedded_api.project_features_for_explainability(x.detach())
+            base_embedded = embedded_api.embed_projected_for_explainability(base_projected)
+        diagnostics["embedded_fast_path"] = True
+        diagnostics["compiled_forward"] = bool(
+            compile_forward
+            and callable(getattr(embedded_api, "forward_from_embedded_explainability_compiled", None))
+        )
     progress = tqdm(
         total=len(perturbations),
         desc="Feature-time perturbation",
@@ -999,16 +1070,53 @@ def _perturbation_importance(
         while start < len(perturbations):
             chunk = perturbations[start : start + chunk_size]
             repeats = len(chunk)
+            work_chunk = chunk + ([chunk[-1]] * (chunk_size - repeats) if repeats < chunk_size else [])
+            work_repeats = len(work_chunk)
             try:
                 diagnostics["attempted_forward_batches"] = int(diagnostics["attempted_forward_batches"]) + 1
-                x_perturbed = x.detach().unsqueeze(0).expand((repeats,) + tuple(x.shape)).clone()
-                for local_idx, (time_idx, feat_idx, _) in enumerate(chunk):
-                    x_perturbed[local_idx, :, time_idx, :, feat_idx] = 0.0
-                x_perturbed = x_perturbed.reshape(repeats * int(x.size(0)), *tuple(x.shape[1:]))
-                mask_perturbed = _repeat_first_dim(mask, repeats)
-                weights_p, scores_p, _ = _forward_outputs(model, x_perturbed, mask_perturbed, return_aux=False)
-                weights_p = weights_p.reshape(repeats, *tuple(base_weights.shape))
-                scores_p = scores_p.reshape(repeats, *tuple(base_scores.shape))
+                mask_perturbed = _repeat_first_dim(mask, work_repeats)
+                if embedded_api is not None and base_projected is not None and base_embedded is not None:
+                    # Reproject only the R changed [B,S,F] time slices, then
+                    # reuse the base [B,L,S,D] embedding for the unchanged
+                    # market.  This replaces O(R*B*L*S*F) copying/projection
+                    # with O(B*L*S*F + R*B*S*F + R*B*L*S*D).
+                    time_indices = torch.as_tensor(
+                        [item[0] for item in work_chunk], device=x.device, dtype=torch.long
+                    )
+                    changed_slices = x.detach().index_select(1, time_indices).permute(1, 0, 2, 3).contiguous()
+                    for local_idx, (_, feat_idx, _) in enumerate(work_chunk):
+                        changed_slices[local_idx, :, :, feat_idx] = 0.0
+                    changed_projected = embedded_api.project_features_for_explainability(changed_slices)
+                    base_projected_slices = base_projected.index_select(1, time_indices).permute(1, 0, 2, 3)
+                    embedded_perturbed = base_embedded.unsqueeze(0).expand(
+                        (work_repeats,) + tuple(base_embedded.shape)
+                    ).clone()
+                    for local_idx, (time_idx, _, _) in enumerate(work_chunk):
+                        embedded_perturbed[local_idx, :, time_idx] += (
+                            changed_projected[local_idx] - base_projected_slices[local_idx]
+                        )
+                    embedded_perturbed = embedded_perturbed.reshape(
+                        work_repeats * int(x.size(0)), *tuple(base_embedded.shape[1:])
+                    )
+                    weights_p, scores_p, _ = _forward_embedded_outputs(
+                        embedded_api,
+                        embedded_perturbed,
+                        mask_perturbed,
+                        compile_forward=bool(compile_forward),
+                    )
+                else:
+                    x_perturbed = x.detach().unsqueeze(0).expand((work_repeats,) + tuple(x.shape)).clone()
+                    for local_idx, (time_idx, feat_idx, _) in enumerate(work_chunk):
+                        x_perturbed[local_idx, :, time_idx, :, feat_idx] = 0.0
+                    x_perturbed = x_perturbed.reshape(work_repeats * int(x.size(0)), *tuple(x.shape[1:]))
+                    weights_p, scores_p, _ = _forward_outputs(
+                        model,
+                        x_perturbed,
+                        mask_perturbed,
+                        return_aux=False,
+                    )
+                weights_p = weights_p.reshape(work_repeats, *tuple(base_weights.shape))[:repeats]
+                scores_p = scores_p.reshape(work_repeats, *tuple(base_scores.shape))[:repeats]
                 weight_deltas = (weights_p - base_weights.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
                 score_deltas = (scores_p - base_scores.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
             except RuntimeError as exc:
@@ -1065,6 +1173,8 @@ def _feature_correlations(
     weights: torch.Tensor,
     mask: torch.Tensor,
     feature_names: list[str],
+    *,
+    progress_enabled: bool = False,
 ) -> pl.DataFrame:
     x_last = x[:, -1].detach().float()
     x_mean = x.detach().float().mean(dim=1)
@@ -1074,7 +1184,14 @@ def _feature_correlations(
     rows: list[dict[str, Any]] = []
     for source_name, values in (("last", x_last), ("lookback_mean", x_mean)):
         values_np = values.reshape(-1, values.size(-1)).cpu().numpy()
-        for feat_idx, feature in enumerate(feature_names):
+        for feat_idx, feature in tqdm(
+            enumerate(feature_names),
+            total=len(feature_names),
+            desc=f"Feature correlations: {source_name}",
+            unit="feature",
+            leave=False,
+            disable=not progress_enabled,
+        ):
             feat = values_np[:, feat_idx]
             valid = mask_flat & np.isfinite(feat) & np.isfinite(score_np) & np.isfinite(weight_np)
             if valid.sum() < 3:
@@ -1142,13 +1259,27 @@ def _decision_inventory(
     )
 
 
-def _exposure_coverage_curve(weights: torch.Tensor, mask: torch.Tensor, points: int = 101) -> pl.DataFrame:
+def _exposure_coverage_curve(
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+    points: int = 101,
+    *,
+    progress_enabled: bool = False,
+) -> pl.DataFrame:
     """Average cumulative gross-exposure coverage using every valid position."""
     weights_np = torch.nan_to_num(weights.detach().float(), nan=0.0, posinf=0.0, neginf=0.0).abs().cpu().numpy()
     mask_np = mask.detach().bool().cpu().numpy()
     grid = np.linspace(0.0, 1.0, max(2, int(points)), dtype=np.float64)
     curves: list[np.ndarray] = []
-    for row_weights, row_mask in zip(weights_np, mask_np, strict=True):
+    row_progress = tqdm(
+        zip(weights_np, mask_np, strict=True),
+        total=int(weights_np.shape[0]),
+        desc="Exposure coverage: dates",
+        unit="date",
+        leave=False,
+        disable=not progress_enabled,
+    )
+    for row_weights, row_mask in row_progress:
         valid = np.sort(row_weights[row_mask])[::-1]
         total = float(valid.sum())
         if valid.size == 0 or total <= 0.0:
@@ -1157,6 +1288,7 @@ def _exposure_coverage_curve(weights: torch.Tensor, mask: torch.Tensor, points: 
         cumulative = np.concatenate(([0.0], np.cumsum(valid, dtype=np.float64) / total))
         fractions = np.linspace(0.0, 1.0, valid.size + 1, dtype=np.float64)
         curves.append(np.interp(grid, fractions, cumulative))
+    row_progress.close()
     mean_curve = np.mean(np.stack(curves), axis=0) if curves else np.zeros_like(grid)
     return pl.DataFrame(
         {
@@ -1253,10 +1385,24 @@ def _portfolio_summary(weights: torch.Tensor, returns: torch.Tensor, mask: torch
     }
 
 
-def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pl.DataFrame, dict[str, pl.DataFrame]]:
+def _aux_summary(
+    aux: dict[str, torch.Tensor],
+    *,
+    progress_enabled: bool = False,
+) -> tuple[pl.DataFrame, dict[str, pl.DataFrame]]:
     rows: list[dict[str, Any]] = []
     dim_frames: dict[str, pl.DataFrame] = {}
-    for name, value in sorted(aux.items()):
+    aux_items = sorted(aux.items())
+    aux_progress = tqdm(
+        aux_items,
+        total=len(aux_items),
+        desc="Aux tensor statistics",
+        unit="tensor",
+        leave=False,
+        disable=not progress_enabled,
+    )
+    for name, value in aux_progress:
+        aux_progress.set_postfix(tensor=name, refresh=False)
         if not torch.is_tensor(value) or value.numel() == 0:
             continue
         tensor = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1285,6 +1431,7 @@ def _aux_summary(aux: dict[str, torch.Tensor]) -> tuple[pl.DataFrame, dict[str, 
                 }
             )
             dim_frames[name] = dim_frame.sort("mean_abs", descending=True)
+    aux_progress.close()
     summary = pl.DataFrame(rows)
     if not summary.is_empty() and "mean_abs" in summary.columns:
         summary = summary.sort("mean_abs", descending=True)
@@ -1435,6 +1582,7 @@ def _aux_umap_projection_frames(
                 n_neighbors=int(settings.umap_n_neighbors),
                 min_dist=float(settings.umap_min_dist),
                 random_state=42,
+                verbose=bool(settings.progress_enabled),
             )
         except Exception as exc:
             warnings.append(f"{name}: cuML UMAP failed: {type(exc).__name__}: {exc}")
@@ -1752,6 +1900,7 @@ def _score_head_surrogate_shap(
     *,
     enabled: bool,
     mode: str,
+    progress_enabled: bool = True,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any], list[str]]:
     mode = _normalize_shap_mode(mode)
     if not enabled or mode in {"off", "none"}:
@@ -1780,10 +1929,26 @@ def _score_head_surrogate_shap(
         return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": int(design.shape[0])}, [message]
     design_fit = design
     target_fit = target
-    mean = design_fit.mean(axis=0, keepdims=True)
-    std = design_fit.std(axis=0, keepdims=True)
+    row_count, component_count = design_fit.shape
+    block_size = min(65_536, max(1, row_count))
+    block_starts = range(0, row_count, block_size)
+    feature_sum = np.zeros(component_count, dtype=np.float64)
+    feature_sum_sq = np.zeros(component_count, dtype=np.float64)
+    for start in tqdm(
+        block_starts,
+        total=math.ceil(row_count / block_size),
+        desc="SHAP feature statistics",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        block = design_fit[start : start + block_size]
+        feature_sum += block.sum(axis=0, dtype=np.float64)
+        feature_sum_sq += np.square(block).sum(axis=0, dtype=np.float64)
+    mean = (feature_sum / float(row_count)).reshape(1, -1)
+    variance = np.maximum(feature_sum_sq / float(row_count) - np.square(mean.reshape(-1)), 0.0)
+    std = np.sqrt(variance).reshape(1, -1)
     std = np.where(std < 1e-8, 1.0, std)
-    design_z = (design_fit - mean) / std
     target_std = float(np.std(target_fit))
     if target_std < 1e-10:
         message = "SHAP skipped because score targets are nearly constant."
@@ -1791,25 +1956,58 @@ def _score_head_surrogate_shap(
     target_mean = float(np.mean(target_fit))
     target_centered = target_fit - target_mean
     alpha = 1e-3
-    xtx = design_z.T @ design_z
-    rhs = design_z.T @ target_centered
+    xtx = np.zeros((component_count, component_count), dtype=np.float64)
+    rhs = np.zeros(component_count, dtype=np.float64)
+    for start in tqdm(
+        range(0, row_count, block_size),
+        total=math.ceil(row_count / block_size),
+        desc="SHAP ridge fit",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        end = min(row_count, start + block_size)
+        z_block = (design_fit[start:end] - mean) / std
+        xtx += z_block.T @ z_block
+        rhs += z_block.T @ target_centered[start:end]
     try:
         coef = np.linalg.solve(xtx + alpha * np.eye(xtx.shape[0], dtype=np.float64), rhs)
     except np.linalg.LinAlgError:
         coef = np.linalg.lstsq(xtx + alpha * np.eye(xtx.shape[0], dtype=np.float64), rhs, rcond=None)[0]
-    pred = design_z @ coef + target_mean
-    ss_res = float(np.sum((target_fit - pred) ** 2))
+    ss_res = 0.0
+    for start in tqdm(
+        range(0, row_count, block_size),
+        total=math.ceil(row_count / block_size),
+        desc="SHAP surrogate validation",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        end = min(row_count, start + block_size)
+        z_block = (design_fit[start:end] - mean) / std
+        pred_block = z_block @ coef + target_mean
+        ss_res += float(np.sum((target_fit[start:end] - pred_block) ** 2))
     ss_tot = float(np.sum((target_fit - target_mean) ** 2))
     r2 = _safe_float(1.0 - ss_res / ss_tot if ss_tot > 1e-20 else 0.0)
-    sample_rows = int(design_z.shape[0])
-    sample_z = design_z
+    sample_rows = int(row_count)
     # The standardized fit design has zero mean by construction, so the exact
     # full-data background is the origin without retaining a sampled background.
-    background_mean = design_z.mean(axis=0, keepdims=True)
+    background_mean = np.zeros((1, component_count), dtype=np.float64)
     method = "linear_surrogate_closed_form"
-    shap_values = (sample_z - background_mean) * coef.reshape(1, -1)
     component_rows: list[dict[str, Any]] = []
-    abs_values = np.nan_to_num(np.abs(shap_values), nan=0.0, posinf=0.0, neginf=0.0).mean(axis=0)
+    abs_sum = np.zeros(component_count, dtype=np.float64)
+    for start in tqdm(
+        range(0, row_count, block_size),
+        total=math.ceil(row_count / block_size),
+        desc="SHAP attribution rows",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        z_block = (design_fit[start : start + block_size] - mean) / std
+        shap_block = (z_block - background_mean) * coef.reshape(1, -1)
+        abs_sum += np.nan_to_num(np.abs(shap_block), nan=0.0, posinf=0.0, neginf=0.0).sum(axis=0)
+    abs_values = abs_sum / float(row_count)
     for idx, (source, feature) in enumerate(component_meta):
         component_rows.append(
             {
@@ -1956,6 +2154,7 @@ def explain_batch(
             max_auto_batch_size=settings.perturb_max_auto_batch_size,
             max_input_elements=settings.perturb_max_input_elements,
             progress_enabled=bool(settings.progress_enabled),
+            compile_forward=bool(settings.counterfactual_compile),
         )
     else:
         perturb_ft = pl.DataFrame()
@@ -1983,17 +2182,29 @@ def explain_batch(
         feature_names,
         enabled=bool(settings.shap_enabled),
         mode=str(settings.shap_mode),
+        progress_enabled=bool(settings.progress_enabled),
     )
     _mark_elapsed(timing, "surrogate_shap_s", stage_start)
     complete_stage("tabular_diagnostics", "surrogate_shap_s")
 
     stage_start = time.perf_counter()
-    corr = _feature_correlations(x, scores, weights, mask, feature_names)
+    corr = _feature_correlations(
+        x,
+        scores,
+        weights,
+        mask,
+        feature_names,
+        progress_enabled=bool(settings.progress_enabled),
+    )
     decision_inventory = _decision_inventory(weights, scores, returns, mask, dates, symbols, selected)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
-    exposure_coverage = _exposure_coverage_curve(weights, mask)
+    exposure_coverage = _exposure_coverage_curve(
+        weights,
+        mask,
+        progress_enabled=bool(settings.progress_enabled),
+    )
     position_distribution = _position_distribution_frame(decision_inventory)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
     case_studies = _case_study_frame(decision_inventory, daily)
@@ -2001,7 +2212,10 @@ def explain_batch(
     complete_stage("aux_diagnostics", "tabular_diagnostics_s")
 
     stage_start = time.perf_counter()
-    aux_frame, aux_dim_frames = _aux_summary(aux)
+    aux_frame, aux_dim_frames = _aux_summary(
+        aux,
+        progress_enabled=bool(settings.progress_enabled),
+    )
     aux_projection_frames, aux_projection_summary, aux_projection_warnings, aux_projection_timing = _aux_umap_projection_frames(
         aux,
         symbols=symbols,
@@ -2336,9 +2550,17 @@ def _combine_chunked_explainability_results(
         feature_names,
         enabled=bool(settings.shap_enabled),
         mode=str(settings.shap_mode),
+        progress_enabled=bool(settings.progress_enabled),
     )
 
-    corr = _feature_correlations(x_cpu, scores, weights, mask, feature_names)
+    corr = _feature_correlations(
+        x_cpu,
+        scores,
+        weights,
+        mask,
+        feature_names,
+        progress_enabled=bool(settings.progress_enabled),
+    )
     selected, _, _ = _selection_from_weights(
         weights,
         mask,
@@ -2347,7 +2569,11 @@ def _combine_chunked_explainability_results(
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
-    exposure_coverage = _exposure_coverage_curve(weights, mask)
+    exposure_coverage = _exposure_coverage_curve(
+        weights,
+        mask,
+        progress_enabled=bool(settings.progress_enabled),
+    )
     position_distribution = _position_distribution_frame(decision_inventory)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
     case_studies = _case_study_frame(decision_inventory, daily)
@@ -2361,7 +2587,16 @@ def _combine_chunked_explainability_results(
             for name in result.get("_core", {}).get("aux", {})
         }
     )
-    for name in aux_names:
+    aux_combine_progress = tqdm(
+        aux_names,
+        total=len(aux_names),
+        desc="Combine aux tensors",
+        unit="tensor",
+        leave=False,
+        disable=not bool(settings.progress_enabled),
+    )
+    for name in aux_combine_progress:
+        aux_combine_progress.set_postfix(tensor=name, refresh=False)
         tensors = [
             result["_core"]["aux"][name]
             for result, _ in chunk_results
@@ -2369,6 +2604,7 @@ def _combine_chunked_explainability_results(
         ]
         if tensors and all(tensor.ndim == tensors[0].ndim and tensor.shape[1:] == tensors[0].shape[1:] for tensor in tensors):
             combined_aux[name] = torch.cat(tensors, dim=0)
+    aux_combine_progress.close()
     aux_projection_frames, aux_projection_summary, aux_projection_warnings, aux_projection_timing = (
         _aux_umap_projection_frames(
             combined_aux,
@@ -2542,7 +2778,9 @@ def explain_batch_row_chunked(
                 )
                 chunk_results.append((result, end - start))
                 del chunk, result
-                _clear_explainability_runtime_cache()
+                # Results are already detached to CPU.  Keep CUDA's allocator
+                # cache warm across equal-shaped date chunks; empty_cache/ipc_collect
+                # here forced a device sync and reallocation every microbatch.
                 row_progress.set_postfix(rows=f"{end}/{n_rows}", refresh=False)
 
             diagnostics = {**diagnostics, "chunk_count": len(chunk_results)}
@@ -2819,6 +3057,7 @@ def _write_paper_tables(
     frames: dict[str, pl.DataFrame],
     summary: dict[str, Any],
     metadata: dict[str, Any],
+    progress_enabled: bool = False,
 ) -> dict[str, str]:
     table_dir = output_dir / "paper_tables"
     table_dir.mkdir(parents=True, exist_ok=True)
@@ -2866,12 +3105,23 @@ def _write_paper_tables(
         ]
     )
     written: dict[str, str] = {}
+    table_progress = tqdm(
+        total=len(tables),
+        desc="Paper tables",
+        unit="table",
+        leave=False,
+        disable=not progress_enabled,
+    )
     for name, table in tables.items():
+        table_progress.set_postfix(table=name, rows=len(table), refresh=False)
         if _is_empty_frame(table):
+            table_progress.update(1)
             continue
         path = table_dir / f"{name}.csv"
         _write_csv(table, path)
         written[name] = str(path.relative_to(output_dir))
+        table_progress.update(1)
+    table_progress.close()
     return written
 
 
@@ -3218,11 +3468,19 @@ def _plot_all_paper_figures(
     metadata: dict[str, Any],
     paper_tables: dict[str, str],
     plot_timing: dict[str, float] | None = None,
+    progress_enabled: bool = False,
 ) -> list[str]:
     plot_dir = output_dir / "plots_paper"
     plot_dir.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
     scope = _paper_scope(metadata, summary)
+    paper_progress = tqdm(
+        total=12,
+        desc="Paper plots",
+        unit="plot",
+        leave=False,
+        disable=not progress_enabled,
+    )
 
     def _time_plot(name: str, fn: Callable[[], None], out_path: Path) -> None:
         item_start = time.perf_counter()
@@ -3231,6 +3489,8 @@ def _plot_all_paper_figures(
             plot_timing[name] = float(time.perf_counter() - item_start)
         if out_path.exists():
             generated.append(out_path)
+        paper_progress.update(1)
+        paper_progress.set_postfix(plot=out_path.name, refresh=False)
 
     global_table = _global_attribution_table(frames)
     out = plot_dir / "global_feature_attribution.png"
@@ -3341,6 +3601,7 @@ def _plot_all_paper_figures(
         lambda: _plot_paper_aux_summary(frames.get("aux_summary", pl.DataFrame()), output_path=out, subtitle=scope),
         out,
     )
+    paper_progress.close()
     return [str(path.relative_to(output_dir)) for path in generated]
 
 
@@ -3550,11 +3811,25 @@ def _write_paper_summary(
     path.write_text(json.dumps(_to_builtin(payload), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallback: bool = False) -> Path | None:
+def write_fold_stability_outputs(
+    explainability_root: Path,
+    *,
+    strict_no_fallback: bool = False,
+    progress_enabled: bool = False,
+) -> Path | None:
     root = Path(explainability_root)
     fold_dirs = sorted(path for path in root.glob("fold_*_test") if path.is_dir())
     rows: list[pl.DataFrame] = []
-    for fold_dir in fold_dirs:
+    fold_progress = tqdm(
+        fold_dirs,
+        total=len(fold_dirs),
+        desc="Fold stability: read folds",
+        unit="fold",
+        leave=False,
+        disable=not progress_enabled,
+    )
+    for fold_dir in fold_progress:
+        fold_progress.set_postfix(fold=fold_dir.name, refresh=False)
         path = fold_dir / "paper_tables" / "global_feature_attribution.csv"
         if not path.exists():
             if strict_no_fallback:
@@ -3586,6 +3861,7 @@ def write_fold_stability_outputs(explainability_root: Path, *, strict_no_fallbac
         else:
             table = table.with_row_index("rank", offset=1)
         rows.append(table)
+    fold_progress.close()
     if not rows:
         return None
     combined = _concat_frames(rows)
@@ -3958,6 +4234,7 @@ def _plot_all_explanation_figures(
     plot_backend: str = "auto",
     plot_timing: dict[str, Any] | None = None,
     strict_no_fallback: bool = False,
+    progress_enabled: bool = False,
 ) -> list[str]:
     normalized_backend = _normalize_plot_backend(plot_backend)
     estimated_points = sum(len(frame) for frame in frames.values() if frame is not None)
@@ -3989,12 +4266,21 @@ def _plot_all_explanation_figures(
         ("feature_importance_perturbation", "feature", "score_abs_delta", "Perturbation Feature Importance (Score Delta)"),
         ("aux_summary", "name", "mean_abs", "Auxiliary Representation Mean Abs"),
     ]
+    plot_progress = tqdm(
+        total=len(specs) + 2 + 4 + 2 + len(aux_dim_frames) + len(aux_projection_frames or {}),
+        desc="Standard plots",
+        unit="plot",
+        leave=False,
+        disable=not progress_enabled,
+    )
     for frame_name, label_col, value_col, title in specs:
         frame = frames.get(frame_name, pl.DataFrame())
         out = plot_dir / f"{frame_name}_{value_col}.png"
         _plot_barh(frame, output_path=out, label_col=label_col, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
+        plot_progress.update(1)
+        plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["bar_specs_s"] = float(time.perf_counter() - stage_start)
 
@@ -4008,6 +4294,8 @@ def _plot_all_explanation_figures(
         _plot_time_importance(frames.get(frame_name, pl.DataFrame()), output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
+        plot_progress.update(1)
+        plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["time_specs_s"] = float(time.perf_counter() - stage_start)
 
@@ -4039,6 +4327,8 @@ def _plot_all_explanation_figures(
             _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
+        plot_progress.update(1)
+        plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["heatmap_specs_s"] = float(time.perf_counter() - stage_start)
 
@@ -4047,6 +4337,8 @@ def _plot_all_explanation_figures(
     _plot_feature_correlations(frames.get("feature_correlations", pl.DataFrame()), out)
     if out.exists():
         generated.append(out)
+    plot_progress.update(1)
+    plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["feature_correlations_s"] = float(time.perf_counter() - stage_start)
 
@@ -4071,6 +4363,8 @@ def _plot_all_explanation_figures(
         _plot_decision_exposure(decision_frame, out)
     if out.exists():
         generated.append(out)
+    plot_progress.update(1)
+    plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["decision_exposure_s"] = float(time.perf_counter() - stage_start)
 
@@ -4108,6 +4402,8 @@ def _plot_all_explanation_figures(
             )
         if out.exists():
             generated.append(out)
+        plot_progress.update(1)
+        plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["aux_dims_s"] = float(time.perf_counter() - stage_start)
 
@@ -4133,11 +4429,15 @@ def _plot_all_explanation_figures(
                         {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
                     )
                 if _is_empty_frame(frame) or not {"umap_x", "umap_y"}.issubset(frame.columns):
+                    plot_progress.update(1)
+                    plot_progress.set_postfix(plot=out.name, skipped=True, refresh=False)
                     continue
                 import matplotlib.pyplot as plt
 
                 data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
                 if data.is_empty():
+                    plot_progress.update(1)
+                    plot_progress.set_postfix(plot=out.name, skipped=True, refresh=False)
                     continue
                 fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
                 ax.scatter(_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), s=4, alpha=0.5)
@@ -4150,11 +4450,15 @@ def _plot_all_explanation_figures(
                 plt.close(fig)
         else:
             if _is_empty_frame(frame) or not {"umap_x", "umap_y"}.issubset(frame.columns):
+                plot_progress.update(1)
+                plot_progress.set_postfix(plot=out.name, skipped=True, refresh=False)
                 continue
             import matplotlib.pyplot as plt
 
             data = _with_numeric(frame, "umap_x", "umap_y").drop_nulls(subset=["umap_x", "umap_y"])
             if data.is_empty():
+                plot_progress.update(1)
+                plot_progress.set_postfix(plot=out.name, skipped=True, refresh=False)
                 continue
             fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
             ax.scatter(_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y"), s=4, alpha=0.5)
@@ -4167,9 +4471,12 @@ def _plot_all_explanation_figures(
             plt.close(fig)
         if out.exists():
             generated.append(out)
+        plot_progress.update(1)
+        plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["aux_umap_s"] = float(time.perf_counter() - stage_start)
 
+    plot_progress.close()
     return [str(path.relative_to(output_dir)) for path in generated]
 
 
@@ -4204,21 +4511,35 @@ def write_explanation_outputs(
     frames: dict[str, pl.DataFrame] = result["frames"]
     aux_dim_frames: dict[str, pl.DataFrame] = result.get("aux_dim_frames", {})
     aux_projection_frames: dict[str, pl.DataFrame] = result.get("aux_projection_frames", {})
+    table_progress = tqdm(
+        total=len(frames) + len(aux_dim_frames) + len(aux_projection_frames),
+        desc="Write tables",
+        unit="table",
+        leave=False,
+        disable=not progress_enabled,
+    )
     stage_start = time.perf_counter()
     for name, frame in frames.items():
         if not _is_empty_frame(frame):
             _write_csv(frame, output_dir / f"{name}.csv")
+        table_progress.update(1)
+        table_progress.set_postfix(table=name, rows=len(frame), refresh=False)
     aux_dir = output_dir / "aux_dims"
     for name, frame in aux_dim_frames.items():
         aux_dir.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
         _write_csv(frame, aux_dir / f"{safe_name}.csv")
+        table_progress.update(1)
+        table_progress.set_postfix(table=f"aux:{name}", rows=len(frame), refresh=False)
     projection_dir = output_dir / "aux_projections"
     for name, frame in aux_projection_frames.items():
         if not _is_empty_frame(frame):
             projection_dir.mkdir(parents=True, exist_ok=True)
             safe_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name)
             _write_csv(frame, projection_dir / f"{safe_name}.csv")
+        table_progress.update(1)
+        table_progress.set_postfix(table=f"umap:{name}", rows=len(frame), refresh=False)
+    table_progress.close()
     _mark_elapsed(write_timing, "csv_s", stage_start)
     complete_write_stage("standard_plots")
     stage_start = time.perf_counter()
@@ -4232,6 +4553,7 @@ def write_explanation_outputs(
             plot_backend=plot_backend,
             plot_timing=standard_plot_details,
             strict_no_fallback=bool(strict_no_fallback),
+            progress_enabled=progress_enabled,
         )
         if write_plots and write_standard_plots
         else []
@@ -4260,6 +4582,7 @@ def write_explanation_outputs(
             frames=frames,
             summary=summary,
             metadata=metadata,
+            progress_enabled=progress_enabled,
         )
         _mark_elapsed(write_timing, "paper_tables_s", stage_start)
         if write_plots:
@@ -4272,6 +4595,7 @@ def write_explanation_outputs(
                 metadata=metadata,
                 paper_tables=paper_tables,
                 plot_timing=paper_plot_details,
+                progress_enabled=progress_enabled,
             )
             _mark_elapsed(write_timing, "paper_plots_s", stage_start)
             write_timing["paper_plot_details"] = paper_plot_details
@@ -4745,6 +5069,10 @@ def run_loaded_model_explanation(
     if config_strict_no_fallback and not bool(settings.strict_no_fallback):
         settings = replace(settings, strict_no_fallback=True)
     device = device or next(model.parameters()).device
+    if device.type == "cuda" and bool(getattr(config.environment, "use_tensor_cores", False)):
+        # Match the training runtime and let Blackwell tensor cores accelerate
+        # the repeated FP32 explainability matmuls without changing storage.
+        torch.set_float32_matmul_precision("high")
     split_norm = split.strip().lower()
     runner_timing: dict[str, float | str | int | bool] = {
         "fold_id": int(fold.fold_id),
@@ -5217,9 +5545,15 @@ def _run_explainability_for_config(
                 fold_stage.close()
             print(f"explainability output (fold {fold_id}): {out_dir}")
         if settings.fold_stability:
+            stability_root = (
+                Path(explain_output_dir)
+                if explain_output_dir is not None
+                else resolved_output_dir / "explainability"
+            )
             stability_dir = write_fold_stability_outputs(
-                resolved_output_dir / "explainability",
+                stability_root,
                 strict_no_fallback=bool(settings.strict_no_fallback),
+                progress_enabled=bool(settings.progress_enabled),
             )
             if stability_dir is not None:
                 print(f"fold stability output: {stability_dir}")
@@ -5294,8 +5628,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run feature perturbation sensitivity; on by default for complete offline explainability.",
     )
     parser.add_argument("--perturb-batch-size", default=0, type=int, help="Batch feature-day perturbations together; 0 selects an automatic safe chunk size.")
-    parser.add_argument("--perturb-max-auto-batch-size", default=5, type=int)
-    parser.add_argument("--perturb-max-input-elements", default=32_000_000, type=int)
+    parser.add_argument(
+        "--perturb-max-auto-batch-size",
+        default=48,
+        type=int,
+        help="Maximum automatic perturbation batch; tuned for the RTX 5070 Ti work-set plateau.",
+    )
+    parser.add_argument(
+        "--perturb-max-input-elements",
+        default=576_000_000,
+        type=int,
+        help="Aggregate perturbation input-element budget across the current date microbatch.",
+    )
+    parser.add_argument(
+        "--counterfactual-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile the fixed-shape embedded perturb/cross-asset forward hotpath.",
+    )
     parser.add_argument(
         "--plots",
         action=argparse.BooleanOptionalAction,
@@ -5349,12 +5699,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cross-asset",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write cross-asset transmission outputs; enabled by default for complete offline explainability.",
+        default=False,
+        help=(
+            "Compatibility path for writing cross-asset transmission inside the main explainability run. "
+            "Disabled by default; use cross_asset_model.py for independently scheduled GPU work and artifacts."
+        ),
     )
     parser.add_argument("--cross-asset-max-sources", default=0, type=int, help="Source cap; 0 means every active symbol.")
     parser.add_argument("--cross-asset-max-targets", default=0, type=int, help="Target cap; 0 means every active symbol.")
-    parser.add_argument("--cross-asset-source-chunk-size", default=2, type=int)
+    parser.add_argument(
+        "--cross-asset-source-chunk-size",
+        default=16,
+        type=int,
+        help="Sources perturbed together; 16 pairs with the repeated-row budget for a 48-row GPU work set.",
+    )
+    parser.add_argument(
+        "--cross-asset-max-repeated-rows",
+        default=48,
+        type=int,
+        help="Maximum source x date rows per cross-asset forward batch.",
+    )
     parser.add_argument("--cross-asset-perturb-scale", default=1.0, type=float)
     parser.add_argument(
         "--cross-asset-shocks",
@@ -5401,6 +5765,7 @@ def main(argv: list[str] | None = None) -> None:
         perturb_batch_size=args.perturb_batch_size,
         perturb_max_auto_batch_size=args.perturb_max_auto_batch_size,
         perturb_max_input_elements=args.perturb_max_input_elements,
+        counterfactual_compile=bool(args.counterfactual_compile),
         sample_method=args.sample_method,
         first_test_year_only=bool(args.first_test_year_only),
         report_style=args.report_style,
@@ -5420,6 +5785,7 @@ def main(argv: list[str] | None = None) -> None:
         cross_asset_max_sources=max(0, int(args.cross_asset_max_sources)),
         cross_asset_max_targets=max(0, int(args.cross_asset_max_targets)),
         cross_asset_source_chunk_size=max(1, int(args.cross_asset_source_chunk_size)),
+        cross_asset_max_repeated_rows=max(1, int(args.cross_asset_max_repeated_rows)),
         cross_asset_perturb_scale=float(args.cross_asset_perturb_scale),
         cross_asset_shocks=tuple(
             value.strip().lower() for value in str(args.cross_asset_shocks).split(",") if value.strip()
@@ -5435,7 +5801,7 @@ def main(argv: list[str] | None = None) -> None:
         f"dates={'all' if settings.max_rows <= 0 else settings.max_rows}, "
         f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
         f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
-        f"UMAP={'all_points' if settings.umap_max_points <= 0 else settings.umap_max_points}, "
+        f"UMAP={'disabled' if not settings.umap_enabled else ('all_points' if settings.umap_max_points <= 0 else settings.umap_max_points)}, "
         f"cross_asset={settings.cross_asset_enabled}, "
         f"sources={'all' if settings.cross_asset_max_sources <= 0 else settings.cross_asset_max_sources}, "
         f"targets={'all' if settings.cross_asset_max_targets <= 0 else settings.cross_asset_max_targets}, "

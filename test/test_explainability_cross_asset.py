@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from stockagent.cross_asset_runner import _default_output_root, parse_args as parse_cross_asset_args
 from stockagent.explainability_cross_asset import (
     MODULE_NAME,
     CrossAssetTransmissionSettings,
@@ -17,6 +18,20 @@ from stockagent.explainability_cross_asset import (
     _process_cross_asset_graph_edges,
 )
 from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
+
+
+def test_standalone_cross_asset_cli_uses_independent_complete_first_year_defaults() -> None:
+    args = parse_cross_asset_args(["--config", "configs/markets/tw_public.yaml"])
+
+    assert args.first_test_year_only is True
+    assert args.max_rows == 0
+    assert args.max_sources == 0
+    assert args.max_targets == 0
+    assert args.progress is True
+    assert args.strict is True
+    assert _default_output_root(Path("artifacts/markets/tw_public_lantent")) == Path(
+        "artifacts/cross_asset/tw_public_lantent"
+    )
 
 
 class IndependentScoringModel(nn.Module):
@@ -280,6 +295,39 @@ def test_cross_asset_shape_nan_safety_and_missing_shocks(tmp_path: Path) -> None
     assert any("not_a_feature" in warning for warning in summary["warnings"])
     _, _, values = _matrix_csv(tmp_path / MODULE_NAME / "matrices" / "zero_weight_residual_abs.csv")
     assert np.isfinite(values).all()
+
+
+def test_cross_asset_streams_complete_raw_edges_and_reuses_online_graph_reduction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_CROSS_ASSET_STREAM_EDGE_THRESHOLD", "1")
+    batch = _batch(rows=3, lookback=2, symbols=4, features=4)
+    summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        batch,
+        feature_names=_feature_names(),
+        symbols=_symbols(4),
+        dates=_dates(3),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=4,
+            max_targets=4,
+            source_chunk_size=2,
+            shocks=("zero", "liquidity"),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+        ),
+        device=torch.device("cpu"),
+    )
+
+    base = tmp_path / MODULE_NAME / "tables"
+    raw_edges = pl.read_parquet(base / "edge_metrics.parquet")
+    graph_edges = pl.read_csv(base / "graph_edges.csv")
+    assert raw_edges.height == 2 * 4 * 4
+    assert graph_edges.height == 4 * 4
+    assert summary["graph_benchmark"]["selection_reason"] == "streamed_raw_edges_and_online_graph_reduction"
 
 
 def _tiny_transformer() -> TransformerBasePortfolioModel:

@@ -756,11 +756,17 @@ Expected explainability workflow:
   date/source/target/UMAP limits are explicit reduced runs only. Training-time
   `explain_after_each_fold` settings may remain lightweight because that is a
   separate opt-in workflow.
-- Standalone explainability must enable gradient × input, Integrated Gradients,
-  feature-time perturbation, surrogate SHAP, regime analysis, fold stability,
-  aux diagnostics, all eligible cuML UMAP projections, cross-asset shocks,
-  attention flow, validated transmission, role embeddings, and graph
-  explainability. Chunking may change execution shape but must not omit outputs.
+- Standalone `explain_model.py` must enable gradient × input, Integrated
+  Gradients, feature-time perturbation, surrogate SHAP, regime analysis, fold
+  stability, aux diagnostics, and all eligible cuML UMAP projections. Cross-asset
+  GPU work is an independently scheduled project: run `cross_asset_model.py`,
+  which owns cross-asset shocks, attention flow, validated transmission, role
+  embeddings, and graph explainability. Its default artifacts live under
+  `artifacts/cross_asset/<training-run>/`, never inside the primary
+  explainability artifact tree. The compatibility `explain_model.py
+  --cross-asset` flag may remain available, but must be disabled by default.
+  Chunking may change execution shape but must not omit outputs within the
+  selected project.
 - Long standalone explainability stages should expose tqdm progress with ETA and
   throughput. Persist per-stage compute/write/cross-asset timings plus CUDA peak
   memory in the fold explainability timing artifacts; `--no-progress` may hide

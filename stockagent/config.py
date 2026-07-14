@@ -711,6 +711,7 @@ class TrainingConfig:
     explain_perturb_batch_size: int = 1
     explain_perturb_max_auto_batch_size: int = 1
     explain_perturb_max_input_elements: int = 8_000_000
+    explain_counterfactual_compile: bool = False
     explain_write_plots: bool = False
     explain_report_style: str = "none"
     explain_plot_theme: str = "paper"
@@ -731,6 +732,7 @@ class TrainingConfig:
     explain_cross_asset_max_targets: int = 8
     explain_cross_asset_top_edges: int = 150
     explain_cross_asset_source_chunk_size: int = 1
+    explain_cross_asset_max_repeated_rows: int = 48
     explain_cross_asset_perturb_scale: float = 1.0
     explain_cross_asset_shocks: list[str] = field(
         default_factory=lambda: ["zero", "momentum", "gap", "volume", "volatility", "liquidity"]
@@ -1429,6 +1431,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_cross_asset_source_chunk_size"] = max(
         1, int(training["explain_cross_asset_source_chunk_size"])
     )
+    training["explain_cross_asset_max_repeated_rows"] = max(
+        1, int(training["explain_cross_asset_max_repeated_rows"])
+    )
     training["explain_cross_asset_perturb_scale"] = float(training["explain_cross_asset_perturb_scale"])
     raw_cross_shocks = training["explain_cross_asset_shocks"]
     if isinstance(raw_cross_shocks, str):
@@ -1628,6 +1633,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_perturb_batch_size=training_raw["explain_perturb_batch_size"],
             explain_perturb_max_auto_batch_size=training_raw["explain_perturb_max_auto_batch_size"],
             explain_perturb_max_input_elements=training_raw["explain_perturb_max_input_elements"],
+            explain_counterfactual_compile=training_raw["explain_counterfactual_compile"],
             explain_write_plots=training_raw["explain_write_plots"],
             explain_report_style=training_raw["explain_report_style"],
             explain_plot_theme=training_raw["explain_plot_theme"],
@@ -1648,6 +1654,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_cross_asset_max_targets=training_raw["explain_cross_asset_max_targets"],
             explain_cross_asset_top_edges=training_raw["explain_cross_asset_top_edges"],
             explain_cross_asset_source_chunk_size=training_raw["explain_cross_asset_source_chunk_size"],
+            explain_cross_asset_max_repeated_rows=training_raw["explain_cross_asset_max_repeated_rows"],
             explain_cross_asset_perturb_scale=training_raw["explain_cross_asset_perturb_scale"],
             explain_cross_asset_shocks=training_raw["explain_cross_asset_shocks"],
             explain_cross_asset_attention_flow=training_raw["explain_cross_asset_attention_flow"],

@@ -306,12 +306,17 @@ training:
   explain_first_test_year_only: true
   explain_max_rows: 32
   explain_ig_steps: 0
-  explain_ig_batch_size: 1
+  # 5070 Ti fold21: keep this automatic so one date uses 8 IG alphas while the
+  # normal three-date explain microbatch uses 2 (same aggregate work set).
+  explain_ig_batch_size: 0
   explain_sample_method: even
   explain_perturb: false
-  explain_perturb_batch_size: 1
-  explain_perturb_max_auto_batch_size: 1
-  explain_perturb_max_input_elements: 8000000
+  # Complete feature-time perturbation, throughput-tuned without dropping any
+  # cells: one date uses 48 repeats; three dates automatically use 16.
+  explain_perturb_batch_size: 0
+  explain_perturb_max_auto_batch_size: 48
+  explain_perturb_max_input_elements: 576000000
+  explain_counterfactual_compile: true
   explain_write_plots: false
   explain_report_style: none
   explain_plot_theme: paper
@@ -329,7 +334,10 @@ training:
   explain_cross_asset_enabled: false
   explain_cross_asset_max_sources: 8
   explain_cross_asset_max_targets: 8
-  explain_cross_asset_source_chunk_size: 1
+  # 16 sources x 3 dates keeps each no-grad cross-asset forward near the
+  # measured 48-row throughput plateau.
+  explain_cross_asset_source_chunk_size: 16
+  explain_cross_asset_max_repeated_rows: 48
   explain_cross_asset_perturb_scale: 1.0
   explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
   explain_cross_asset_attention_flow: true

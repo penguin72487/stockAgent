@@ -1073,6 +1073,78 @@ class TransformerBasePortfolioModel(nn.Module):
             h = h + symbol_position
         return self.input_dropout(h)
 
+    def project_features_for_explainability(self, x: torch.Tensor) -> torch.Tensor:
+        """Project features once for exact counterfactual embedding reuse.
+
+        Explainability evaluates thousands of inputs that differ in only one
+        feature/time cell.  Exposing the canonical projector lets that path
+        recompute only the changed slice while preserving categorical embedding
+        and input-sanitization semantics.
+        """
+        return self._project_features(x)
+
+    def embed_projected_for_explainability(
+        self,
+        projected: torch.Tensor,
+        symbol_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Add the canonical position/dropout layers to preprojected inputs."""
+        if projected.ndim != 4 or int(projected.size(-1)) != self.d_model:
+            raise ValueError("projected explainability inputs must have shape [B,L,S,d_model]")
+        if self.training:
+            raise RuntimeError("embedded explainability reuse requires model.eval() for deterministic dropout")
+        return self._add_window_positions(projected, int(projected.size(2)), symbol_indices)
+
+    def forward_from_embedded_explainability(
+        self,
+        embedded: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+    ):
+        """Run the unchanged Transformer/head from canonical input embeddings."""
+        if embedded.ndim != 4 or int(embedded.size(-1)) != self.d_model:
+            raise ValueError("embedded explainability inputs must have shape [B,L,S,d_model]")
+        if mask is None:
+            mask_bool = torch.ones(
+                embedded.size(0), embedded.size(2), dtype=torch.bool, device=embedded.device
+            )
+        else:
+            mask_bool = mask.to(device=embedded.device, dtype=torch.bool)
+        if tuple(mask_bool.shape) != (int(embedded.size(0)), int(embedded.size(2))):
+            raise ValueError("embedded explainability mask must have shape [B,S]")
+        return self._forward_embedded(
+            embedded,
+            mask_bool,
+            temperature=temperature,
+            return_aux=return_aux,
+        )
+
+    def forward_from_embedded_explainability_compiled(
+        self,
+        embedded: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """Lazily compile the fixed-shape no-aux counterfactual hotpath."""
+        compiled = self.__dict__.get("_compiled_explainability_forward")
+        if compiled is None:
+            def forward_fn(h: torch.Tensor, m: torch.Tensor):
+                return self.forward_from_embedded_explainability(
+                    h,
+                    m,
+                    return_aux=False,
+                )
+
+            compiled = torch.compile(
+                forward_fn,
+                mode="reduce-overhead",
+                dynamic=False,
+                fullgraph=False,
+            )
+            # Avoid registering a self-referential OptimizedModule as a child.
+            object.__setattr__(self, "_compiled_explainability_forward", compiled)
+        return compiled(embedded, mask)
+
     def _add_window_positions(
         self,
         h: torch.Tensor,

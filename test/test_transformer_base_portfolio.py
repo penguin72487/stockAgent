@@ -113,6 +113,45 @@ def test_attention_modes_forward(mode: str) -> None:
     assert bool((weights < 0).any().item())
 
 
+@pytest.mark.parametrize("feature_idx", [1, 2])
+def test_preprojected_explainability_forward_matches_raw_counterfactual(feature_idx: int) -> None:
+    device = _device()
+    model = _make_model(
+        categorical_feature_indices=(2,),
+        categorical_embedding_dim=3,
+        categorical_embedding_cardinality=16,
+    ).eval()
+    x = torch.randn(2, 6, 13, 11, device=device)
+    x[..., 2] = torch.randint(0, 8, x[..., 2].shape, device=device).float()
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    mask[1, -2:] = False
+    time_idx = 3
+    raw_changed = x.clone()
+    raw_changed[:, time_idx, :, feature_idx] = 0.0
+
+    with torch.no_grad():
+        raw_output = model(raw_changed, mask)
+        base_projected = model.project_features_for_explainability(x)
+        base_embedded = model.embed_projected_for_explainability(base_projected)
+        changed_slice = x[:, time_idx].clone()
+        changed_slice[..., feature_idx] = 0.0
+        changed_projected = model.project_features_for_explainability(changed_slice)
+        embedded_changed = base_embedded.clone()
+        embedded_changed[:, time_idx] += changed_projected - base_projected[:, time_idx]
+        embedded_output = model.forward_from_embedded_explainability(embedded_changed, mask)
+
+    raw_weights, raw_aux = _extract_weights_and_aux(raw_output)
+    embedded_weights, embedded_aux = _extract_weights_and_aux(embedded_output)
+    torch.testing.assert_close(embedded_weights, raw_weights, rtol=2e-5, atol=2e-6)
+    assert raw_aux is not None and embedded_aux is not None
+    torch.testing.assert_close(
+        embedded_aux["score_logits"],
+        raw_aux["score_logits"],
+        rtol=2e-5,
+        atol=2e-6,
+    )
+
+
 @pytest.mark.parametrize(
     ("use_latent_factors", "use_market_tokens", "expected_mode"),
     [

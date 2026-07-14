@@ -378,6 +378,7 @@ def run_cuml_umap(
     n_neighbors: int = 15,
     min_dist: float = 0.1,
     random_state: int = 42,
+    verbose: bool = False,
 ):
     cp, _cudf, _ds, _tf = _import_rapids_stack()
     matrix = to_cupy_2d(values, dtype="float32")
@@ -392,5 +393,6 @@ def run_cuml_umap(
         min_dist=float(min_dist),
         random_state=int(random_state),
         output_type="cupy",
+        verbose=bool(verbose),
     )
     return reducer.fit_transform(matrix)

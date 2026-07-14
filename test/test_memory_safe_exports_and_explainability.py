@@ -144,7 +144,7 @@ def test_strict_no_fallback_raises_on_explainability_cuda_oom(monkeypatch) -> No
         )
 
 
-def test_explain_model_cli_defaults_are_complete_offline_explainability() -> None:
+def test_explain_model_cli_defaults_are_complete_offline_explainability_except_independent_cross_asset() -> None:
     args = parse_args([])
 
     assert args.config is None
@@ -153,8 +153,9 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.market_config_root == Path("configs/markets")
     assert args.ig_steps == 8
     assert args.perturb is True
-    assert args.perturb_max_auto_batch_size == 5
-    assert args.perturb_max_input_elements == 32_000_000
+    assert args.perturb_max_auto_batch_size == 48
+    assert args.perturb_max_input_elements == 576_000_000
+    assert args.counterfactual_compile is True
     assert args.plots is True
     assert args.report_style == "paper"
     assert args.standard_plots is True
@@ -167,10 +168,11 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.umap_max_points == 0
     assert not hasattr(args, "top_k")
     assert not hasattr(args, "case_study_top_k")
-    assert args.cross_asset is True
+    assert args.cross_asset is False
+    assert args.cross_asset_max_repeated_rows == 48
     assert args.cross_asset_max_sources == 0
     assert args.cross_asset_max_targets == 0
-    assert args.cross_asset_source_chunk_size == 2
+    assert args.cross_asset_source_chunk_size == 16
     assert args.cross_asset_attention_capture_rows == 0
     assert args.cross_asset_role_embedding is True
     assert args.strict_no_fallback is True
