@@ -5104,6 +5104,8 @@ RELOAD_CHILD_ENV = "STOCKAGENT_DISCORD_BOT_CHILD"
 WATCH_ROOTS_DEFAULT = (
     "services/discord_bot",
     "stockagent/live",
+    "stockagent/models",
+    "stockagent/training/trainer.py",
     "configs/markets",
     "scripts/live_signal.py",
 )

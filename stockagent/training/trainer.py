@@ -2891,6 +2891,22 @@ def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
         _strip_wrapper_prefixes(key): value for key, value in state_dict.items()
     }
     target = _unwrap_model(model)
+    legacy_dynamic_keys = any(
+        key.startswith(("dynamic_latent_generator.", "dynamic_market_generator."))
+        for key in cleaned_state_dict
+    )
+    if legacy_dynamic_keys:
+        compatibility_loader = getattr(
+            target,
+            "enable_legacy_dynamic_token_checkpoint_compatibility",
+            None,
+        )
+        if compatibility_loader is None:
+            raise RuntimeError(
+                "Checkpoint contains legacy dynamic-token weights, but the target model "
+                "does not support their strict inference reconstruction."
+            )
+        compatibility_loader(cleaned_state_dict)
     try:
         target.load_state_dict(cleaned_state_dict)
         return
