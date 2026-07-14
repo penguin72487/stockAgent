@@ -14,6 +14,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import torch
 from torch import nn
+from tqdm.auto import tqdm
 
 from stockagent.models.normalization import (
     dual_branch_softmax,
@@ -69,24 +70,23 @@ def _pad_saved_image_to_17_6(path: Path) -> None:
 @dataclass(slots=True)
 class CrossAssetTransmissionSettings:
     enabled: bool = True
-    max_sources: int = 32
-    max_targets: int = 32
-    top_edges: int = 200
+    progress_enabled: bool = True
+    max_sources: int = 0
+    max_targets: int = 0
     source_chunk_size: int = 4
     row_chunk_size: int = 0
     max_repeated_rows: int = 8
     perturb_scale: float = 1.0
     shocks: tuple[str, ...] = DEFAULT_SHOCKS
     attention_flow: bool = True
-    attention_capture_rows: int = 4
+    attention_capture_rows: int = 0
     attention_capture_max_elements: int = 2_000_000
     validated_transmission: bool = True
     role_embedding: bool = True
-    plot_top_k: int = 30
     graph_backend: str = "cugraph"
     graph_benchmark_min_edges: int = 1_000_000
     graph_explainability: bool = True
-    graph_betweenness_max_vertices: int = 512
+    graph_betweenness_max_vertices: int = 0
     graph_plot_max_nodes: int = 80
 
 
@@ -94,7 +94,6 @@ class CrossAssetTransmissionSettings:
 class _GraphProcessingResult:
     backend: str
     edges: pl.DataFrame
-    top_edges: pl.DataFrame
     source_summary: pl.DataFrame
     target_summary: pl.DataFrame
     node_metrics: pl.DataFrame
@@ -339,8 +338,10 @@ def _select_symbols(
     n_active = int(active.sum().detach().cpu().item())
     if n_active <= 0:
         return [], [], np.zeros(int(weights.size(1)), dtype=np.float32)
-    n_sources = min(max(1, int(max_sources)), n_active)
-    n_targets = min(max(1, int(max_targets)), n_active)
+    requested_sources = int(max_sources)
+    requested_targets = int(max_targets)
+    n_sources = n_active if requested_sources <= 0 else min(requested_sources, n_active)
+    n_targets = n_active if requested_targets <= 0 else min(requested_targets, n_active)
     source_idx = torch.topk(score, k=n_sources).indices.detach().cpu().tolist()
     target_idx = torch.topk(score, k=n_targets).indices.detach().cpu().tolist()
     return [int(i) for i in source_idx], [int(i) for i in target_idx], _to_numpy(score)
@@ -473,6 +474,14 @@ def _role_embedding_frame(
 
 def _write_frame_csv_or_parquet(path: Path, frame: pl.DataFrame) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Large complete S² tables are dramatically faster and smaller in Parquet;
+    # small human-inspection tables keep their CSV form.
+    if int(frame.height) * max(1, int(frame.width)) >= 5_000_000:
+        parquet_path = path.with_suffix(".parquet")
+        pq.write_table(frame.to_arrow(), parquet_path, compression="zstd")
+        if path.exists():
+            path.unlink()
+        return parquet_path
     try:
         frame.write_csv(path)
         parquet_path = path.with_suffix(".parquet")
@@ -514,10 +523,10 @@ def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: li
         import matplotlib.pyplot as plt
     except Exception:
         return
-    max_rows = min(30, matrix.shape[0])
-    max_cols = min(30, matrix.shape[1])
-    data = matrix[:max_rows, :max_cols]
-    fig_h = max(5.5, 0.30 * max_rows + 2.0, (0.32 * max_cols + 3.0) / _PLOT_ASPECT_RATIO)
+    row_count = matrix.shape[0]
+    column_count = matrix.shape[1]
+    data = matrix
+    fig_h = min(12.0, max(5.5, 0.30 * row_count + 2.0, (0.32 * column_count + 3.0) / _PLOT_ASPECT_RATIO))
     fig, ax = plt.subplots(figsize=_figsize_17_6(fig_h), dpi=140)
     vmax = float(np.nanpercentile(np.abs(data), 98)) if data.size else 1.0
     if vmax <= 0:
@@ -526,32 +535,9 @@ def _plot_heatmap(path: Path, matrix: np.ndarray, title: str, source_symbols: li
     ax.set_title(title)
     ax.set_xlabel("target stock j")
     ax.set_ylabel("source stock i")
-    ax.set_xticks(range(max_cols), [str(v) for v in target_symbols[:max_cols]], rotation=90, fontsize=7)
-    ax.set_yticks(range(max_rows), [str(v) for v in source_symbols[:max_rows]], fontsize=7)
+    ax.set_xticks(range(column_count), [str(v) for v in target_symbols], rotation=90, fontsize=7)
+    ax.set_yticks(range(row_count), [str(v) for v in source_symbols], fontsize=7)
     fig.colorbar(image, ax=ax, shrink=0.8)
-    _safe_matplotlib_tight_layout(fig)
-    _save_matplotlib_figure(fig, path)
-    plt.close(fig)
-
-
-def _plot_top_edges(path: Path, edges: pl.DataFrame) -> None:
-    if edges.is_empty():
-        return
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        return
-    data = edges.head(30)
-    labels = [
-        f"{row['shock']} {row['source_symbol']} -> {row['target_symbol']}"
-        for row in data.select(["shock", "source_symbol", "target_symbol"]).to_dicts()
-    ]
-    fig, ax = plt.subplots(figsize=_figsize_17_6(max(5, 0.28 * data.height + 1.5)), dpi=140)
-    ax.barh(np.arange(data.height), data["validated_transmission"].to_numpy().astype(np.float64, copy=False))
-    ax.set_yticks(np.arange(data.height), labels, fontsize=7)
-    ax.invert_yaxis()
-    ax.set_xlabel("validated transmission")
-    ax.set_title("Top Abstract Cross-Asset Transmission Edges")
     _safe_matplotlib_tight_layout(fig)
     _save_matplotlib_figure(fig, path)
     plt.close(fig)
@@ -564,7 +550,7 @@ def _plot_graph_node_importance(path: Path, node_metrics: pl.DataFrame) -> None:
         import matplotlib.pyplot as plt
     except Exception:
         return
-    data = node_metrics.sort("pagerank", descending=True).head(25)
+    data = node_metrics.sort("pagerank", descending=True)
     labels = data["symbol"].cast(pl.String).to_list() if "symbol" in data.columns else data["symbol_index"].cast(pl.String).to_list()
     pagerank = data["pagerank"].fill_null(0.0).to_numpy().astype(np.float64, copy=False)
     hub = data["hub_score"].fill_null(0.0).to_numpy().astype(np.float64, copy=False) if "hub_score" in data.columns else np.zeros_like(pagerank)
@@ -574,7 +560,8 @@ def _plot_graph_node_importance(path: Path, node_metrics: pl.DataFrame) -> None:
         else np.zeros_like(pagerank)
     )
     y = np.arange(data.height)
-    fig, ax = plt.subplots(figsize=_figsize_17_6(max(6, 0.28 * data.height + 2.0)), dpi=140)
+    fig_height = min(12.0, max(6.0, 0.28 * data.height + 2.0))
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=140)
     ax.barh(y - 0.23, pagerank, height=0.22, label="PageRank")
     ax.barh(y, hub, height=0.22, label="Hub")
     ax.barh(y + 0.23, authority, height=0.22, label="Authority")
@@ -634,39 +621,12 @@ def _plot_graph_community_flow(path: Path, community_edges: pl.DataFrame) -> Non
 
 
 def _select_graph_backbone_edges(graph_edges: pl.DataFrame, *, max_edges: int, per_node: int = 2) -> pl.DataFrame:
-    if graph_edges.is_empty():
-        return pl.DataFrame()
-    data = graph_edges.filter(pl.col("source_index") != pl.col("target_index")).sort(
+    """Compatibility helper returning every inter-symbol edge without rank truncation."""
+    del max_edges, per_node
+    return graph_edges.filter(pl.col("source_index") != pl.col("target_index")).sort(
         ["edge_weight", "source_index", "target_index"],
         descending=[True, False, False],
     )
-    if data.is_empty():
-        return data
-
-    rows: list[dict[str, Any]] = []
-    rows.extend(data.head(max(1, max_edges // 3)).to_dicts())
-    for column in ("source_index", "target_index"):
-        for node_id in sorted(int(value) for value in data[column].unique().to_list()):
-            rows.extend(
-                data.filter(pl.col(column) == node_id)
-                .sort(["edge_weight", "source_index", "target_index"], descending=[True, False, False])
-                .head(max(1, int(per_node)))
-                .to_dicts()
-            )
-
-    deduped: dict[tuple[int, int], dict[str, Any]] = {}
-    for row in rows:
-        key = (int(row["source_index"]), int(row["target_index"]))
-        if key not in deduped or float(row.get("edge_weight", 0.0) or 0.0) > float(
-            deduped[key].get("edge_weight", 0.0) or 0.0
-        ):
-            deduped[key] = row
-    if not deduped:
-        return pl.DataFrame()
-    return pl.DataFrame(list(deduped.values())).sort(
-        ["edge_weight", "source_index", "target_index"],
-        descending=[True, False, False],
-    ).head(max_edges)
 
 
 def _plot_graph_topology(path: Path, graph_edges: pl.DataFrame, node_metrics: pl.DataFrame, *, max_nodes: int) -> None:
@@ -677,9 +637,9 @@ def _plot_graph_topology(path: Path, graph_edges: pl.DataFrame, node_metrics: pl
         from matplotlib.patches import FancyArrowPatch
     except Exception:
         return
-    max_nodes = max(5, int(max_nodes))
+    del max_nodes
     rank_column = "pagerank" if "pagerank" in node_metrics.columns else "weighted_out_degree"
-    data = _select_graph_backbone_edges(graph_edges, max_edges=max(12, min(max_nodes + 8, 40)), per_node=1)
+    data = _select_graph_backbone_edges(graph_edges, max_edges=0, per_node=0)
     if data.is_empty():
         return
     selected_ids = sorted(
@@ -689,15 +649,6 @@ def _plot_graph_topology(path: Path, graph_edges: pl.DataFrame, node_metrics: pl
             for value in data[column].drop_nulls().to_list()
         }
     )
-    if len(selected_ids) > max_nodes:
-        ranked_ids = (
-            node_metrics.filter(pl.col("symbol_index").is_in(selected_ids))
-            .sort(rank_column, descending=True)
-            .head(max_nodes)["symbol_index"]
-            .to_list()
-        )
-        selected_ids = sorted(int(value) for value in ranked_ids)
-        data = data.filter(pl.col("source_index").is_in(selected_ids) & pl.col("target_index").is_in(selected_ids))
     selected = node_metrics.filter(pl.col("symbol_index").is_in(selected_ids)).select(
         ["symbol_index", "symbol", rank_column]
         + (["community_id"] if "community_id" in node_metrics.columns else [])
@@ -778,11 +729,11 @@ def _plot_graph_topology(path: Path, graph_edges: pl.DataFrame, node_metrics: pl
 
     ax.text(0.04, 1.025, "Source / transmitter", ha="center", va="bottom", fontsize=9, weight="bold")
     ax.text(0.96, 1.025, "Target / receiver", ha="center", va="bottom", fontsize=9, weight="bold")
-    ax.set_title("Cross-Asset Transmission Backbone Flow")
+    ax.set_title("Complete In-Scope Cross-Asset Transmission Flow")
     ax.text(
         0.01,
         0.01,
-        "Backbone flow only: strongest inter-symbol paths. Full dense graph remains in graph_edges.csv and graph_transmission_matrix.png.",
+        "All in-scope inter-symbol paths are shown; use graph_transmission_matrix.png for a less cluttered view.",
         transform=ax.transAxes,
         fontsize=8,
         color="#4b5563",
@@ -795,7 +746,7 @@ def _plot_graph_topology(path: Path, graph_edges: pl.DataFrame, node_metrics: pl
     plt.close(fig)
 
 
-def _plot_graph_transmission_matrix(path: Path, graph_edges: pl.DataFrame, node_metrics: pl.DataFrame, *, max_nodes: int) -> None:
+def _plot_graph_transmission_matrix(path: Path, graph_edges: pl.DataFrame, node_metrics: pl.DataFrame) -> None:
     if graph_edges.is_empty() or node_metrics.is_empty():
         return
     try:
@@ -805,7 +756,7 @@ def _plot_graph_transmission_matrix(path: Path, graph_edges: pl.DataFrame, node_
     rank_column = "pagerank" if "pagerank" in node_metrics.columns else "weighted_in_degree"
     sort_columns = ["community_id", rank_column] if "community_id" in node_metrics.columns else [rank_column]
     descending = [False, True] if "community_id" in node_metrics.columns else [True]
-    ordered = node_metrics.sort(sort_columns, descending=descending).head(max(5, int(max_nodes)))
+    ordered = node_metrics.sort(sort_columns, descending=descending)
     ids = [int(value) for value in ordered["symbol_index"].to_list()]
     if not ids:
         return
@@ -862,11 +813,12 @@ def _plot_graph_self_influence(path: Path, graph_edges: pl.DataFrame) -> None:
         import matplotlib.pyplot as plt
     except Exception:
         return
-    data = self_edges.head(30)
+    data = self_edges
     labels = data["source_symbol"].cast(pl.String).to_list()
     weights = data["edge_weight"].fill_null(0.0).to_numpy().astype(np.float64, copy=False)
     y = np.arange(data.height)
-    fig, ax = plt.subplots(figsize=_figsize_17_6(max(5.5, 0.28 * data.height + 1.8)), dpi=140)
+    fig_height = min(12.0, max(5.5, 0.28 * data.height + 1.8))
+    fig, ax = plt.subplots(figsize=_figsize_17_6(fig_height), dpi=140)
     ax.barh(y, weights, color="#4777b3")
     ax.set_yticks(y, labels, fontsize=7)
     ax.invert_yaxis()
@@ -926,17 +878,15 @@ def _summary_by_polars(edges: pl.DataFrame, key: str) -> pl.DataFrame:
     return edges.group_by(key).agg(pl.col("validated_transmission").sum()).sort(key)
 
 
-def _process_edges_polars(edges: pl.DataFrame, *, top_n: int) -> _GraphProcessingResult:
+def _process_edges_polars(edges: pl.DataFrame) -> _GraphProcessingResult:
     start = time.perf_counter()
     sorted_edges = _sort_edges_polars(edges)
-    top_edges = sorted_edges.head(top_n) if not sorted_edges.is_empty() else pl.DataFrame()
     source_summary = _summary_by_polars(sorted_edges, "source_symbol")
     target_summary = _summary_by_polars(sorted_edges, "target_symbol")
     elapsed_s = float(time.perf_counter() - start)
     return _GraphProcessingResult(
         backend="polars",
         edges=sorted_edges,
-        top_edges=top_edges,
         source_summary=source_summary,
         target_summary=target_summary,
         node_metrics=pl.DataFrame(),
@@ -965,13 +915,12 @@ def _cugraph_metric_to_polars(metric: Any, *, rename: dict[str, str]) -> pl.Data
     return frame.rename({source: target for source, target in rename.items() if source in frame.columns})
 
 
-def _process_edges_cugraph(edges: pl.DataFrame, *, top_n: int) -> _GraphProcessingResult:
+def _process_edges_cugraph(edges: pl.DataFrame) -> _GraphProcessingResult:
     start = time.perf_counter()
     import cugraph  # type: ignore[import-not-found]
 
     gdf = _polars_to_cudf(edges)
     sorted_gdf = gdf.sort_values(_GRAPH_EDGE_SORT_COLUMNS, ascending=[False, True, True, True])
-    top_gdf = sorted_gdf.head(top_n)
     source_summary_gdf = (
         gdf.groupby("source_symbol")["validated_transmission"]
         .sum()
@@ -1060,7 +1009,6 @@ def _process_edges_cugraph(edges: pl.DataFrame, *, top_n: int) -> _GraphProcessi
     return _GraphProcessingResult(
         backend="cugraph",
         edges=_cudf_to_polars(sorted_gdf),
-        top_edges=_cudf_to_polars(top_gdf),
         source_summary=_cudf_to_polars(source_summary_gdf),
         target_summary=_cudf_to_polars(target_summary_gdf),
         node_metrics=node_metrics,
@@ -1124,8 +1072,7 @@ def _process_cross_asset_graph_edges(
     edges: pl.DataFrame,
     settings: CrossAssetTransmissionSettings,
 ) -> _GraphProcessingResult:
-    top_n = max(1, int(settings.top_edges))
-    polars_result = _process_edges_polars(edges, top_n=top_n)
+    polars_result = _process_edges_polars(edges)
     backend, backend_warnings = _resolve_graph_backend(settings)
     min_edges = _resolve_graph_min_edges(settings)
     benchmark: dict[str, Any] = {
@@ -1153,7 +1100,7 @@ def _process_cross_asset_graph_edges(
         return selected
 
     try:
-        cugraph_result = _process_edges_cugraph(edges, top_n=top_n)
+        cugraph_result = _process_edges_cugraph(edges)
     except Exception as exc:
         benchmark["selection_reason"] = "cugraph_failed"
         benchmark["backends"]["cugraph"] = {
@@ -1332,7 +1279,7 @@ def _build_polars_graph_explainability(edges: pl.DataFrame, *, reason: str = "po
                 "total_authority_score": float(node_metrics["authority_score"].sum()),
                 "weighted_out_degree": float(node_metrics["weighted_out_degree"].sum()),
                 "weighted_in_degree": float(node_metrics["weighted_in_degree"].sum()),
-                "top_symbols": ", ".join(node_metrics.head(8)["symbol"].cast(pl.String).to_list()),
+                "symbols": ", ".join(node_metrics["symbol"].cast(pl.String).to_list()),
             }
         ]
     )
@@ -1465,7 +1412,7 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
     max_betweenness_vertices = max(0, int(settings.graph_betweenness_max_vertices))
     graph_vertex_count = int(nodes.height)
     graph_edge_count = int(graph_edges.height)
-    if graph_vertex_count <= max_betweenness_vertices:
+    if max_betweenness_vertices <= 0 or graph_vertex_count <= max_betweenness_vertices:
         add_metric(
             "betweenness_centrality",
             lambda: cugraph.betweenness_centrality(directed),
@@ -1553,7 +1500,7 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
                 "external_out_weight": float(outgoing.filter(pl.col("target_community") != community_id)["edge_weight"].sum()),
                 "external_in_weight": float(incoming.filter(pl.col("source_community") != community_id)["edge_weight"].sum()),
                 "internal_weight": float(internal["edge_weight"].sum()) if not internal.is_empty() else 0.0,
-                "top_symbols": ", ".join(members.sort("pagerank", descending=True).head(8)["symbol"].cast(pl.String).to_list()),
+                "symbols": ", ".join(members.sort("pagerank", descending=True)["symbol"].cast(pl.String).to_list()),
             }
         )
     community_summary = pl.DataFrame(community_rows).sort("total_pagerank", descending=True) if community_rows else pl.DataFrame()
@@ -1618,6 +1565,14 @@ def abstract_cross_asset_transmission(
         return summary
 
     total_start = time.perf_counter()
+    timing: dict[str, Any] = {"per_shock_s": {}}
+    pipeline_progress = tqdm(
+        total=5,
+        desc="Cross-asset pipeline",
+        unit="stage",
+        disable=not bool(settings.progress_enabled),
+    )
+    pipeline_progress.set_postfix(stage="base_forward", refresh=True)
     device = device or next(model.parameters()).device
     x_cpu = torch.nan_to_num(batch["x"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
     mask_cpu = batch["tradable_mask"].detach().to(dtype=torch.bool)
@@ -1647,9 +1602,17 @@ def abstract_cross_asset_transmission(
     weight_parts: list[torch.Tensor] = []
     score_parts: list[torch.Tensor] = []
     rank_parts: list[torch.Tensor] = []
-    aux: dict[str, torch.Tensor] = {}
+    aux_parts: dict[str, list[torch.Tensor]] = {}
+    base_forward_start = time.perf_counter()
     with torch.no_grad():
-        for row_start in range(0, n_rows, row_chunk_size):
+        for row_start in tqdm(
+            range(0, n_rows, row_chunk_size),
+            total=math.ceil(n_rows / row_chunk_size),
+            desc="Cross-asset base forward",
+            unit="chunk",
+            leave=False,
+            disable=not bool(settings.progress_enabled),
+        ):
             row_end = min(n_rows, row_start + row_chunk_size)
             x_row = x_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
             mask_row = mask_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
@@ -1657,22 +1620,34 @@ def abstract_cross_asset_transmission(
                 model,
                 x_row,
                 mask_row,
-                return_aux=not bool(aux),
+                return_aux=bool(settings.role_embedding),
             )
             weight_parts.append(weights_row.detach().cpu())
             score_parts.append(scores_row.detach().cpu())
             rank_parts.append(rank_row.detach().cpu())
-            if not aux:
-                aux = {str(key): value.detach().cpu() for key, value in aux_row.items() if torch.is_tensor(value)}
+            if bool(settings.role_embedding):
+                for key, value in aux_row.items():
+                    if torch.is_tensor(value):
+                        aux_parts.setdefault(str(key), []).append(value.detach().cpu())
             del x_row, mask_row, weights_row, scores_row, rank_row, aux_row
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     if was_training:
         model.train()
+    aux: dict[str, torch.Tensor] = {}
+    for name, tensors in aux_parts.items():
+        if tensors and all(
+            tensor.ndim == tensors[0].ndim and tensor.shape[1:] == tensors[0].shape[1:]
+            for tensor in tensors
+        ):
+            aux[name] = torch.cat(tensors, dim=0)
     base_weights = torch.cat(weight_parts, dim=0).masked_fill(~mask_cpu, 0.0)
     base_scores = torch.cat(score_parts, dim=0).masked_fill(~mask_cpu, 0.0)
     base_rank = torch.cat(rank_parts, dim=0)
     base_rank_pos = _rank_positions(base_rank, mask_cpu)
+    timing["base_forward_s"] = float(time.perf_counter() - base_forward_start)
+    pipeline_progress.update(1)
+    pipeline_progress.set_postfix(stage="attention", refresh=True)
     source_idx, target_idx, importance = _select_symbols(
         base_weights,
         base_scores,
@@ -1688,22 +1663,56 @@ def abstract_cross_asset_transmission(
     feature_std = x_cpu.detach().float().std(dim=(0, 1, 2)).clamp_min(1e-6)
     attention_flow = None
     attention_rows: list[dict[str, Any]] = []
+    attention_start_time = time.perf_counter()
     if bool(settings.attention_flow):
-        attention_rows_n = max(1, min(n_rows, int(settings.attention_capture_rows), row_chunk_size))
-        x_attention = x_cpu[:attention_rows_n].to(device=device, non_blocking=(device.type == "cuda"))
-        mask_attention = mask_cpu[:attention_rows_n].to(device=device, non_blocking=(device.type == "cuda"))
-        attention_flow, attention_rows, attention_warnings = _capture_attention_flow(
-            model,
-            x_attention,
-            mask_attention,
-            n_symbols=n_symbols,
-            rows=attention_rows_n,
-            max_elements=settings.attention_capture_max_elements,
-        )
-        del x_attention, mask_attention
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        warnings.extend(attention_warnings)
+        requested_attention_rows = int(settings.attention_capture_rows)
+        attention_total_rows = n_rows if requested_attention_rows <= 0 else min(n_rows, requested_attention_rows)
+        attention_flow_sum: np.ndarray | None = None
+        attention_rows_seen = 0
+        for attention_chunk_id, attention_start in enumerate(
+            tqdm(
+                range(0, attention_total_rows, row_chunk_size),
+                total=math.ceil(attention_total_rows / row_chunk_size),
+                desc="Cross-asset attention",
+                unit="chunk",
+                leave=False,
+                disable=not bool(settings.progress_enabled),
+            ),
+            start=1,
+        ):
+            attention_end = min(attention_total_rows, attention_start + row_chunk_size)
+            attention_chunk_rows = attention_end - attention_start
+            x_attention = x_cpu[attention_start:attention_end].to(
+                device=device, non_blocking=(device.type == "cuda")
+            )
+            mask_attention = mask_cpu[attention_start:attention_end].to(
+                device=device, non_blocking=(device.type == "cuda")
+            )
+            chunk_flow, chunk_rows, attention_warnings = _capture_attention_flow(
+                model,
+                x_attention,
+                mask_attention,
+                n_symbols=n_symbols,
+                rows=attention_chunk_rows,
+                max_elements=settings.attention_capture_max_elements,
+            )
+            for row in chunk_rows:
+                attention_rows.append(
+                    {**row, "chunk_id": attention_chunk_id, "rows": attention_chunk_rows}
+                )
+            if chunk_flow is not None:
+                weighted = chunk_flow.astype(np.float64, copy=False) * float(attention_chunk_rows)
+                attention_flow_sum = weighted if attention_flow_sum is None else attention_flow_sum + weighted
+                attention_rows_seen += attention_chunk_rows
+            warnings.extend(attention_warnings)
+            del x_attention, mask_attention
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        if attention_flow_sum is not None and attention_rows_seen > 0:
+            attention_flow = (attention_flow_sum / float(attention_rows_seen)).astype(np.float32, copy=False)
+    timing["attention_s"] = float(time.perf_counter() - attention_start_time)
+    pipeline_progress.update(1)
+    pipeline_progress.set_postfix(stage="shocks", refresh=True)
     if attention_flow is None:
         attention_selected = np.zeros((len(source_idx), len(target_idx)), dtype=np.float32)
     else:
@@ -1715,7 +1724,12 @@ def abstract_cross_asset_transmission(
     all_edges: list[pl.DataFrame] = []
     shock_summaries: list[dict[str, Any]] = []
     requested_shocks = tuple(str(shock).strip().lower() for shock in settings.shocks if str(shock).strip())
-    for shock in requested_shocks:
+    for shock in tqdm(
+        requested_shocks,
+        desc="Cross-asset shocks",
+        unit="shock",
+        disable=not bool(settings.progress_enabled),
+    ):
         shock_start = time.perf_counter()
         feature_idx = _feature_indices_for_shock(feature_names, shock)
         if not feature_idx:
@@ -1726,6 +1740,13 @@ def abstract_cross_asset_transmission(
         source_pos = 0
         forward_batches = 0
         oom_retries = 0
+        source_progress = tqdm(
+            total=len(source_idx),
+            desc=f"Shock {shock}: sources",
+            unit="source",
+            leave=False,
+            disable=not bool(settings.progress_enabled),
+        )
         while source_pos < len(source_idx):
             chunk_sources = source_idx[source_pos : source_pos + chunk_size]
             repeats = len(chunk_sources)
@@ -1844,6 +1865,14 @@ def abstract_cross_asset_transmission(
             for metric_name, values in accum.items():
                 buffers[metric_name][sl, :] = (values / denom).astype(np.float32, copy=False)
             source_pos += repeats
+            source_progress.update(repeats)
+            source_progress.set_postfix(
+                forwards=forward_batches,
+                chunk=chunk_size,
+                oom=oom_retries,
+                refresh=False,
+            )
+        source_progress.close()
 
         perturbation_evidence = _normalize_matrix(buffers["weight_residual_abs"])
         if bool(settings.validated_transmission) and attention_flow is not None:
@@ -1856,21 +1885,25 @@ def abstract_cross_asset_transmission(
         _plot_heatmap(plots_dir / f"{shock}_validated_transmission.png", validated, f"{shock} validated transmission", source_symbols, target_symbols)
         _plot_heatmap(plots_dir / f"{shock}_weight_residual_abs.png", buffers["weight_residual_abs"], f"{shock} residual cross-stock influence", source_symbols, target_symbols)
 
-        edge_rows: list[dict[str, Any]] = []
-        for i, source_symbol in enumerate(source_symbols):
-            for j, target_symbol in enumerate(target_symbols):
-                row = {
-                    "shock": shock,
-                    "source_symbol": source_symbol,
-                    "target_symbol": target_symbol,
-                    "source_index": int(source_idx[i]),
-                    "target_index": int(target_idx[j]),
-                    "attention_flow": float(attention_selected[i, j]) if attention_selected.size else 0.0,
-                    "validated_transmission": float(validated[i, j]),
-                }
-                row.update({name: float(matrix[i, j]) for name, matrix in buffers.items()})
-                edge_rows.append(row)
-        edge_frame = pl.DataFrame(edge_rows)
+        # Build the complete Cartesian edge table with columnar NumPy arrays.
+        # Avoiding millions of Python dictionaries materially reduces both wall
+        # time and peak host memory for full-universe S² output.
+        source_count = len(source_idx)
+        target_count = len(target_idx)
+        edge_count = source_count * target_count
+        edge_columns: dict[str, Any] = {
+            "shock": np.full(edge_count, shock, dtype=object),
+            "source_symbol": np.repeat(np.asarray(source_symbols, dtype=object), target_count),
+            "target_symbol": np.tile(np.asarray(target_symbols, dtype=object), source_count),
+            "source_index": np.repeat(np.asarray(source_idx, dtype=np.int32), target_count),
+            "target_index": np.tile(np.asarray(target_idx, dtype=np.int32), source_count),
+            "attention_flow": attention_selected.reshape(-1).astype(np.float32, copy=False),
+            "validated_transmission": validated.reshape(-1).astype(np.float32, copy=False),
+        }
+        edge_columns.update(
+            {name: matrix.reshape(-1).astype(np.float32, copy=False) for name, matrix in buffers.items()}
+        )
+        edge_frame = pl.DataFrame(edge_columns)
         all_edges.append(edge_frame)
         shock_summaries.append(
             {
@@ -1885,20 +1918,33 @@ def abstract_cross_asset_transmission(
                 "elapsed_s": float(time.perf_counter() - shock_start),
             }
         )
+        timing["per_shock_s"][shock] = float(time.perf_counter() - shock_start)
 
     raw_edges = pl.concat(all_edges, how="diagonal_relaxed") if all_edges else pl.DataFrame()
+    pipeline_progress.update(1)
+    pipeline_progress.set_postfix(stage="graph", refresh=True)
+    graph_start = time.perf_counter()
+    graph_progress = tqdm(
+        total=2,
+        desc="Cross-asset graph",
+        unit="stage",
+        disable=not bool(settings.progress_enabled),
+    )
     graph_result = _process_cross_asset_graph_edges(raw_edges, settings)
+    graph_progress.update(1)
+    graph_progress.set_postfix(stage="metrics", refresh=False)
     edges = graph_result.edges
-    top_edges = graph_result.top_edges
     warnings.extend(str(warning) for warning in graph_result.benchmark.get("warnings", ()))
     _write_frame_csv_or_parquet(tables_dir / "edge_metrics.csv", edges)
-    _write_frame_csv_or_parquet(tables_dir / "top_edges.csv", top_edges)
-    if not top_edges.is_empty():
-        _plot_top_edges(plots_dir / "top_edges.png", top_edges)
 
     _write_frame_csv_or_parquet(tables_dir / "source_summary.csv", graph_result.source_summary)
     _write_frame_csv_or_parquet(tables_dir / "target_summary.csv", graph_result.target_summary)
     graph_explainability = _build_graph_explainability(edges, settings)
+    graph_progress.update(1)
+    graph_progress.close()
+    timing["graph_s"] = float(time.perf_counter() - graph_start)
+    pipeline_progress.update(1)
+    pipeline_progress.set_postfix(stage="write_reports", refresh=True)
     for warning in graph_explainability.summary.get("warnings", ()):
         warnings.append(str(warning))
     if not graph_explainability.graph_edges.is_empty():
@@ -1912,24 +1958,10 @@ def abstract_cross_asset_transmission(
         _write_frame_csv_or_parquet(tables_dir / "graph_community_edges.csv", graph_explainability.community_edges)
         _plot_graph_community_flow(plots_dir / "graph_community_flow.png", graph_explainability.community_edges)
     if not graph_explainability.graph_edges.is_empty() and not graph_explainability.node_metrics.is_empty():
-        graph_backbone_edges = _select_graph_backbone_edges(
-            graph_explainability.graph_edges,
-            max_edges=max(12, min(int(settings.graph_plot_max_nodes) + 8, 40)),
-            per_node=1,
-        )
-        if not graph_backbone_edges.is_empty():
-            _write_frame_csv_or_parquet(tables_dir / "graph_backbone_edges.csv", graph_backbone_edges)
-        _plot_graph_topology(
-            plots_dir / "graph_topology.png",
-            graph_explainability.graph_edges,
-            graph_explainability.node_metrics,
-            max_nodes=int(settings.graph_plot_max_nodes),
-        )
         _plot_graph_transmission_matrix(
             plots_dir / "graph_transmission_matrix.png",
             graph_explainability.graph_edges,
             graph_explainability.node_metrics,
-            max_nodes=int(settings.graph_plot_max_nodes),
         )
         _plot_graph_self_influence(plots_dir / "graph_self_influence.png", graph_explainability.graph_edges)
     _write_frame_csv_or_parquet(tables_dir / "shock_summary.csv", _shock_summary_csv_frame(shock_summaries))
@@ -1948,8 +1980,6 @@ def abstract_cross_asset_transmission(
                     s=16,
                     alpha=0.75,
                 )
-                for row in role_frame.sort("selection_importance", descending=True).head(20).to_dicts():
-                    ax.text(float(row["role_x"]), float(row["role_y"]), str(row["symbol"]), fontsize=7)
                 ax.set_title("Latent Stock Role Embedding")
                 ax.set_xlabel("role_x")
                 ax.set_ylabel("role_y")
@@ -1960,7 +1990,11 @@ def abstract_cross_asset_transmission(
                 role_warnings.append(f"Role embedding plot failed: {type(exc).__name__}: {exc}")
     warnings.extend(role_warnings)
 
-    top_preview = top_edges.head(20).to_dicts() if not top_edges.is_empty() else []
+    timing["total_s"] = float(time.perf_counter() - total_start)
+    timing["sources_per_s"] = (
+        float(len(source_idx) * max(1, len(timing["per_shock_s"])))
+        / max(sum(float(value) for value in timing["per_shock_s"].values()), 1e-9)
+    )
     summary = {
         "enabled": True,
         "module": MODULE_NAME,
@@ -1979,9 +2013,9 @@ def abstract_cross_asset_transmission(
         "graph_backend": graph_result.backend,
         "graph_benchmark": graph_result.benchmark,
         "graph_explainability": graph_explainability.summary,
-        "top_edges": top_preview,
+        "timing": timing,
         "warnings": warnings,
-        "elapsed_s": float(time.perf_counter() - total_start),
+        "elapsed_s": float(timing["total_s"]),
     }
     (destination / "abstract_cross_asset_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),
@@ -2018,14 +2052,13 @@ def abstract_cross_asset_transmission(
         "- `betweenness_centrality`: bridge stocks that sit on shortest transmission paths when the graph is small enough for exact computation.",
         "- `community_id`: Louvain/Leiden-style transmission community from the full weighted graph.",
         "- `primary_role`: rule-based label derived from the graph metrics: transmitter, receiver, bridge, systemic receiver, net source, net sink, or balanced.",
-        "- `graph_topology.png`: readable source-to-target backbone flow; the complete dense graph remains in `graph_edges.csv`.",
-        "- `graph_transmission_matrix.png`: full selected asset-level graph as a matrix, avoiding node-link edge crossings.",
+        "- `graph_transmission_matrix.png`: complete in-scope asset-level graph as a matrix, avoiding node-link edge crossings.",
         "- `graph_self_influence.png`: self-loop influence separated from the topology so cross-symbol flow remains legible.",
         "",
     ]
     if not graph_explainability.node_metrics.is_empty():
-        report_lines.extend(["## Top Graph Nodes", ""])
-        for row in graph_explainability.node_metrics.sort("pagerank", descending=True).head(10).to_dicts():
+        report_lines.extend(["## Complete Graph Nodes", ""])
+        for row in graph_explainability.node_metrics.sort("pagerank", descending=True).to_dicts():
             report_lines.append(
                 f"- `{row.get('symbol', row.get('symbol_index'))}` role={row.get('primary_role', 'n/a')}, "
                 f"pagerank={float(row.get('pagerank', 0.0) or 0.0):.4f}, "
@@ -2036,25 +2069,18 @@ def abstract_cross_asset_transmission(
         report_lines.append("")
     if not graph_explainability.community_summary.is_empty():
         report_lines.extend(["## Graph Communities", ""])
-        for row in graph_explainability.community_summary.head(10).to_dicts():
+        for row in graph_explainability.community_summary.to_dicts():
             report_lines.append(
                 f"- community `{int(row.get('community_id', 0) or 0)}` nodes={int(row.get('node_count', 0) or 0)}, "
                 f"pagerank={float(row.get('total_pagerank', 0.0) or 0.0):.4f}, "
                 f"internal={float(row.get('internal_weight', 0.0) or 0.0):.4g}, "
-                f"top={row.get('top_symbols', '')}"
-            )
-        report_lines.append("")
-    if top_preview:
-        report_lines.extend(["## Top Edges", ""])
-        for row in top_preview[:10]:
-            report_lines.append(
-                f"- `{row['shock']}` {row['source_symbol']} -> {row['target_symbol']}: "
-                f"validated={float(row['validated_transmission']):.4f}, "
-                f"residual={float(row['weight_residual_abs']):.4g}, pnl={float(row['transmission_pnl']):.4g}"
+                f"symbols={row.get('symbols', '')}"
             )
         report_lines.append("")
     if warnings:
         report_lines.extend(["## Warnings", ""])
         report_lines.extend([f"- {warning}" for warning in warnings])
     (destination / "abstract_cross_asset_report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    pipeline_progress.update(1)
+    pipeline_progress.close()
     return summary

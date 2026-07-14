@@ -8,7 +8,7 @@ runner:
   resume: true
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 3
+  start_fold: 1
 environment:
   device: cuda
   use_tensor_cores: true
@@ -304,7 +304,6 @@ training:
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
   explain_first_test_year_only: true
-  explain_top_k: 20
   explain_max_rows: 32
   explain_ig_steps: 0
   explain_ig_batch_size: 1
@@ -320,7 +319,6 @@ training:
   explain_interactive_plots: false
   explain_shap_enabled: false
   explain_shap_mode: score_head_surrogate
-  explain_case_study_top_k: 5
   explain_regime_analysis: false
   explain_fold_stability: false
   explain_umap_enabled: false
@@ -331,7 +329,6 @@ training:
   explain_cross_asset_enabled: false
   explain_cross_asset_max_sources: 8
   explain_cross_asset_max_targets: 8
-  explain_cross_asset_top_edges: 150
   explain_cross_asset_source_chunk_size: 1
   explain_cross_asset_perturb_scale: 1.0
   explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]

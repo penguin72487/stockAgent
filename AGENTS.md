@@ -737,11 +737,34 @@ The user wants detailed model explainability to detect strange rules and judge s
 Expected explainability workflow:
 
 - `run_fintech_python explain_model.py` should default to drawing the full explainability set unless the user asks for a smaller run.
+- Do not generate Top-K/Top-N explainability tables or charts. Default portfolio
+  attribution must cover every tradable non-zero position and report both
+  position-count and gross-exposure coverage. Persist the complete sampled
+  date-symbol inventory, including flat and masked rows, so omissions are auditable.
+  Present high-dimensional results as complete matrices, distributions, cumulative
+  coverage curves, or full machine-readable tables rather than rank truncation.
+- Persist an explainability completeness table that reconciles decision-inventory
+  rows, attributed positions, gross exposure, and enabled lookback-by-feature
+  cells. Distinguish completeness within sampled dates from date coverage; an
+  explicit exhaustive-date run must remain available without changing model semantics.
 - Analyze all folds when making model-level claims.
 - Keep `training.explain_after_each_fold: false` by default so training VRAM/time stays focused on train/eval/test artifacts.
 - Generate explainability after training with `run_fintech_python explain_model.py`, which defaults to scanning all folds that have `checkpoint_best.pt`.
 - Only enable `training.explain_after_each_fold: true` for deliberate smoke/debug runs, because paper explainability can be slow and VRAM-heavy.
-- Default test explainability should use only each fold's first test year unless the user explicitly asks for all test years.
+- Standalone `run_fintech_python explain_model.py` is the exhaustive offline path:
+  by default it covers all configured test years and every valid date. Positive
+  date/source/target/UMAP limits are explicit reduced runs only. Training-time
+  `explain_after_each_fold` settings may remain lightweight because that is a
+  separate opt-in workflow.
+- Standalone explainability must enable gradient × input, Integrated Gradients,
+  feature-time perturbation, surrogate SHAP, regime analysis, fold stability,
+  aux diagnostics, all eligible cuML UMAP projections, cross-asset shocks,
+  attention flow, validated transmission, role embeddings, and graph
+  explainability. Chunking may change execution shape but must not omit outputs.
+- Long standalone explainability stages should expose tqdm progress with ETA and
+  throughput. Persist per-stage compute/write/cross-asset timings plus CUDA peak
+  memory in the fold explainability timing artifacts; `--no-progress` may hide
+  terminal bars but must not disable timing collection.
 - Paper-grade explainability is the default report style:
   - `explain_report_style: paper`
   - `explain_plot_theme: paper`
