@@ -73,9 +73,10 @@ class CrossAssetTransmissionSettings:
     progress_enabled: bool = True
     max_sources: int = 0
     max_targets: int = 0
-    source_chunk_size: int = 4
+    source_chunk_size: int = 16
     row_chunk_size: int = 0
-    max_repeated_rows: int = 8
+    max_repeated_rows: int = 48
+    counterfactual_compile: bool = False
     perturb_scale: float = 1.0
     shocks: tuple[str, ...] = DEFAULT_SHOCKS
     attention_flow: bool = True
@@ -239,6 +240,37 @@ def _forward_outputs(
     return _normalize_output(output)
 
 
+def _embedded_explainability_api(model: nn.Module) -> nn.Module | None:
+    candidates = (model, getattr(model, "module", None), getattr(model, "_orig_mod", None))
+    required = (
+        "project_features_for_explainability",
+        "embed_projected_for_explainability",
+        "forward_from_embedded_explainability",
+    )
+    for candidate in candidates:
+        if candidate is not None and all(callable(getattr(candidate, name, None)) for name in required):
+            return candidate
+    return None
+
+
+def _forward_embedded_outputs(
+    model: nn.Module,
+    embedded: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    compile_forward: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    if compile_forward and callable(getattr(model, "forward_from_embedded_explainability_compiled", None)):
+        output = model.forward_from_embedded_explainability_compiled(embedded, mask)
+    else:
+        output = model.forward_from_embedded_explainability(
+            embedded,
+            mask,
+            return_aux=False,
+        )
+    return _normalize_output(output)
+
+
 def _portfolio_weights_from_scores(model: nn.Module, scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     scores = _sanitize_tensor(scores)
     mask = mask.to(device=scores.device, dtype=torch.bool)
@@ -322,6 +354,33 @@ def _apply_shock(
     std = feature_std[feature_indices].to(device=x.device, dtype=x.dtype).reshape(1, 1, -1)
     signed_scale = -float(scale) if shock == "liquidity" else float(scale)
     view.index_copy_(2, idx, view.index_select(2, idx) + signed_scale * std)
+
+
+def _apply_shock_to_source_features(
+    source_features: torch.Tensor,
+    feature_indices: list[int],
+    *,
+    shock: str,
+    scale: float,
+    feature_std: torch.Tensor,
+) -> None:
+    """Apply the canonical shock to [source,row,lookback,feature] slices."""
+    if not feature_indices:
+        return
+    idx = torch.as_tensor(feature_indices, device=source_features.device, dtype=torch.long)
+    if str(shock).strip().lower() == "zero":
+        source_features.index_fill_(-1, idx, 0.0)
+        return
+    std = feature_std[feature_indices].to(
+        device=source_features.device,
+        dtype=source_features.dtype,
+    ).reshape(1, 1, 1, -1)
+    signed_scale = -float(scale) if str(shock).strip().lower() == "liquidity" else float(scale)
+    source_features.index_copy_(
+        -1,
+        idx,
+        source_features.index_select(-1, idx) + signed_scale * std,
+    )
 
 
 def _select_symbols(
@@ -760,13 +819,43 @@ def _plot_graph_transmission_matrix(path: Path, graph_edges: pl.DataFrame, node_
     ids = [int(value) for value in ordered["symbol_index"].to_list()]
     if not ids:
         return
-    index = {node_id: pos for pos, node_id in enumerate(ids)}
     labels = ordered["symbol"].cast(pl.String).to_list() if "symbol" in ordered.columns else [str(value) for value in ids]
     matrix = np.zeros((len(ids), len(ids)), dtype=np.float64)
-    for row in graph_edges.filter(pl.col("source_index").is_in(ids) & pl.col("target_index").is_in(ids)).to_dicts():
-        src = int(row["source_index"])
-        dst = int(row["target_index"])
-        matrix[index[src], index[dst]] += float(row.get("edge_weight", 0.0) or 0.0)
+    # Map and accumulate the complete edge set with native columnar joins.  The
+    # previous Python ``to_dicts`` loop could spend minutes iterating millions of
+    # edges without yielding progress and duplicated the edge table as objects.
+    positions = pl.DataFrame(
+        {
+            "symbol_index": np.asarray(ids, dtype=np.int64),
+            "matrix_position": np.arange(len(ids), dtype=np.int64),
+        }
+    )
+    mapped_edges = (
+        graph_edges.select(
+            pl.col("source_index").cast(pl.Int64),
+            pl.col("target_index").cast(pl.Int64),
+            pl.col("edge_weight").cast(pl.Float64).fill_null(0.0),
+        )
+        .join(
+            positions.rename({"symbol_index": "source_index", "matrix_position": "source_position"}),
+            on="source_index",
+            how="inner",
+        )
+        .join(
+            positions.rename({"symbol_index": "target_index", "matrix_position": "target_position"}),
+            on="target_index",
+            how="inner",
+        )
+    )
+    if not mapped_edges.is_empty():
+        np.add.at(
+            matrix,
+            (
+                mapped_edges["source_position"].to_numpy(),
+                mapped_edges["target_position"].to_numpy(),
+            ),
+            mapped_edges["edge_weight"].to_numpy(),
+        )
     if not np.any(matrix):
         return
     vmax = float(np.nanpercentile(matrix[matrix > 0.0], 97)) if np.any(matrix > 0.0) else 1.0
@@ -1225,9 +1314,14 @@ def _assign_graph_roles(node_metrics: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(pl.Series("primary_role", roles))
 
 
-def _build_polars_graph_explainability(edges: pl.DataFrame, *, reason: str = "polars_fallback") -> _GraphExplainabilityResult:
+def _build_polars_graph_explainability(
+    edges: pl.DataFrame,
+    *,
+    reason: str = "polars_fallback",
+    preaggregated: bool = False,
+) -> _GraphExplainabilityResult:
     start = time.perf_counter()
-    graph_edges = _aggregate_graph_edges(edges)
+    graph_edges = edges if preaggregated else _aggregate_graph_edges(edges)
     nodes = _graph_base_node_frame(graph_edges)
     if graph_edges.is_empty() or nodes.is_empty():
         summary = {
@@ -1317,11 +1411,16 @@ def _merge_metric_frame(base: pl.DataFrame, metric: Any, *, rename: dict[str, st
     return base.join(metric_frame, on="symbol_index", how="left")
 
 
-def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAssetTransmissionSettings) -> _GraphExplainabilityResult:
+def _build_cugraph_graph_explainability(
+    edges: pl.DataFrame,
+    settings: CrossAssetTransmissionSettings,
+    *,
+    preaggregated: bool = False,
+) -> _GraphExplainabilityResult:
     start = time.perf_counter()
     import cugraph  # type: ignore[import-not-found]
 
-    graph_edges = _aggregate_graph_edges(edges)
+    graph_edges = edges if preaggregated else _aggregate_graph_edges(edges)
     nodes = _graph_base_node_frame(graph_edges)
     if graph_edges.is_empty() or nodes.is_empty():
         summary = {
@@ -1351,12 +1450,27 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
         .rename({"target_index": "symbol_index"})
     )
     node_metrics = nodes.join(source_degree, on="symbol_index", how="left").join(target_degree, on="symbol_index", how="left")
+    source_vertices = set(int(value) for value in graph_edges["source_index"].unique().to_list())
+    target_vertices = set(int(value) for value in graph_edges["target_index"].unique().to_list())
+    complete_cartesian_graph = (
+        source_vertices == target_vertices
+        and len(source_vertices) == int(nodes.height)
+        and int(graph_edges.height) == int(nodes.height) * int(nodes.height)
+    )
 
     algorithms: list[str] = []
     skipped: list[dict[str, str]] = []
+    algorithm_progress = tqdm(
+        total=9,
+        desc="cuGraph algorithms",
+        unit="algorithm",
+        leave=False,
+        disable=not bool(settings.progress_enabled),
+    )
 
     def add_metric(name: str, fn: Any, rename: dict[str, str]) -> None:
         nonlocal node_metrics
+        algorithm_progress.set_postfix(algorithm=name, refresh=True)
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r".*expects the 'store_transposed'.*", category=UserWarning)
@@ -1366,6 +1480,8 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
             algorithms.append(name)
         except Exception as exc:
             skipped.append({"algorithm": name, "reason": f"{type(exc).__name__}: {exc}"})
+        finally:
+            algorithm_progress.update(1)
 
     add_metric("pagerank", lambda: cugraph.pagerank(directed), {"vertex": "symbol_index"})
     add_metric("hits", lambda: cugraph.hits(directed), {"vertex": "symbol_index", "hubs": "hub_score", "authorities": "authority_score"})
@@ -1374,20 +1490,45 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
         lambda: cugraph.eigenvector_centrality(directed),
         {"vertex": "symbol_index"},
     )
-    add_metric(
-        "strongly_connected_components",
-        lambda: cugraph.strongly_connected_components(directed),
-        {"vertex": "symbol_index", "labels": "strong_component_id"},
-    )
-    add_metric(
-        "weakly_connected_components",
-        lambda: cugraph.weakly_connected_components(undirected),
-        {"vertex": "symbol_index", "labels": "weak_component_id"},
-    )
-    add_metric("core_number", lambda: cugraph.core_number(undirected), {"vertex": "symbol_index"})
-    add_metric("triangle_count", lambda: cugraph.triangle_count(undirected), {"vertex": "symbol_index", "counts": "triangle_count"})
+    if complete_cartesian_graph:
+        # The exhaustive all-source/all-target contract produces a complete
+        # directed topology.  Several unweighted graph algorithms then have
+        # exact closed forms; launching O(V+E) / O(VE) kernels cannot add
+        # information.  Weighted PageRank/HITS/eigenvector/Louvain still run.
+        component_label = min(source_vertices) if source_vertices else 0
+        vertex_count = int(nodes.height)
+        triangle_count = max(0, (vertex_count - 1) * (vertex_count - 2) // 2)
+        node_metrics = node_metrics.with_columns(
+            pl.lit(component_label).alias("strong_component_id"),
+            pl.lit(component_label).alias("weak_component_id"),
+            pl.lit(max(0, vertex_count - 1)).alias("core_number"),
+            pl.lit(triangle_count).alias("triangle_count"),
+        )
+        for name in (
+            "strongly_connected_components_closed_form",
+            "weakly_connected_components_closed_form",
+            "core_number_closed_form",
+            "triangle_count_closed_form",
+        ):
+            algorithms.append(name)
+            algorithm_progress.set_postfix(algorithm=name, refresh=False)
+            algorithm_progress.update(1)
+    else:
+        add_metric(
+            "strongly_connected_components",
+            lambda: cugraph.strongly_connected_components(directed),
+            {"vertex": "symbol_index", "labels": "strong_component_id"},
+        )
+        add_metric(
+            "weakly_connected_components",
+            lambda: cugraph.weakly_connected_components(undirected),
+            {"vertex": "symbol_index", "labels": "weak_component_id"},
+        )
+        add_metric("core_number", lambda: cugraph.core_number(undirected), {"vertex": "symbol_index"})
+        add_metric("triangle_count", lambda: cugraph.triangle_count(undirected), {"vertex": "symbol_index", "counts": "triangle_count"})
 
     modularity: float | None = None
+    algorithm_progress.set_postfix(algorithm="louvain_or_leiden", refresh=True)
     try:
         community_frame, modularity = cugraph.louvain(undirected)
         node_metrics = _merge_metric_frame(
@@ -1408,11 +1549,17 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
             algorithms.append("leiden")
         except Exception as leiden_exc:
             skipped.append({"algorithm": "leiden", "reason": f"{type(leiden_exc).__name__}: {leiden_exc}"})
+    algorithm_progress.update(1)
 
     max_betweenness_vertices = max(0, int(settings.graph_betweenness_max_vertices))
     graph_vertex_count = int(nodes.height)
     graph_edge_count = int(graph_edges.height)
-    if max_betweenness_vertices <= 0 or graph_vertex_count <= max_betweenness_vertices:
+    if complete_cartesian_graph:
+        node_metrics = node_metrics.with_columns(pl.lit(0.0).alias("betweenness_centrality"))
+        algorithms.append("betweenness_centrality_closed_form")
+        algorithm_progress.set_postfix(algorithm="betweenness_centrality_closed_form", refresh=False)
+        algorithm_progress.update(1)
+    elif max_betweenness_vertices <= 0 or graph_vertex_count <= max_betweenness_vertices:
         add_metric(
             "betweenness_centrality",
             lambda: cugraph.betweenness_centrality(directed),
@@ -1425,6 +1572,8 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
                 "reason": f"graph_vertices>{max_betweenness_vertices}",
             }
         )
+        algorithm_progress.update(1)
+    algorithm_progress.close()
 
     for column in (
         "weighted_out_degree",
@@ -1509,6 +1658,7 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
         "backend": "cugraph",
         "graph_vertices": graph_vertex_count,
         "graph_edges": graph_edge_count,
+        "complete_cartesian_graph": bool(complete_cartesian_graph),
         "algorithms": algorithms,
         "skipped_algorithms": skipped,
         "modularity": float(modularity) if modularity is not None else None,
@@ -1520,23 +1670,37 @@ def _build_cugraph_graph_explainability(edges: pl.DataFrame, settings: CrossAsse
 def _build_graph_explainability(
     edges: pl.DataFrame,
     settings: CrossAssetTransmissionSettings,
+    *,
+    preaggregated: bool = False,
 ) -> _GraphExplainabilityResult:
     if not bool(settings.graph_explainability):
         summary = {"enabled": False, "backend": "disabled", "reason": "settings"}
         return _GraphExplainabilityResult("disabled", pl.DataFrame(), pl.DataFrame(), pl.DataFrame(), pl.DataFrame(), summary)
     backend, backend_warnings = _resolve_graph_backend(settings)
     if backend == "polars":
-        result = _build_polars_graph_explainability(edges, reason="backend_polars")
+        result = _build_polars_graph_explainability(
+            edges,
+            reason="backend_polars",
+            preaggregated=preaggregated,
+        )
         result.summary["warnings"] = backend_warnings
         return result
     try:
-        result = _build_cugraph_graph_explainability(edges, settings)
+        result = _build_cugraph_graph_explainability(
+            edges,
+            settings,
+            preaggregated=preaggregated,
+        )
         result.summary["warnings"] = backend_warnings
         return result
     except Exception as exc:
         if backend == "cugraph":
             raise RuntimeError(f"cuGraph graph explainability was requested but failed: {type(exc).__name__}: {exc}") from exc
-        result = _build_polars_graph_explainability(edges, reason="cugraph_failed")
+        result = _build_polars_graph_explainability(
+            edges,
+            reason="cugraph_failed",
+            preaggregated=preaggregated,
+        )
         result.summary["warnings"] = backend_warnings + [f"cuGraph graph explainability failed: {type(exc).__name__}: {exc}"]
         return result
 
@@ -1599,6 +1763,7 @@ def abstract_cross_asset_transmission(
 
     was_training = model.training
     model.eval()
+    embedded_api = _embedded_explainability_api(model)
     weight_parts: list[torch.Tensor] = []
     score_parts: list[torch.Tensor] = []
     rank_parts: list[torch.Tensor] = []
@@ -1630,8 +1795,6 @@ def abstract_cross_asset_transmission(
                     if torch.is_tensor(value):
                         aux_parts.setdefault(str(key), []).append(value.detach().cpu())
             del x_row, mask_row, weights_row, scores_row, rank_row, aux_row
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
     if was_training:
         model.train()
     aux: dict[str, torch.Tensor] = {}
@@ -1706,8 +1869,6 @@ def abstract_cross_asset_transmission(
                 attention_rows_seen += attention_chunk_rows
             warnings.extend(attention_warnings)
             del x_attention, mask_attention
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         if attention_flow_sum is not None and attention_rows_seen > 0:
             attention_flow = (attention_flow_sum / float(attention_rows_seen)).astype(np.float32, copy=False)
     timing["attention_s"] = float(time.perf_counter() - attention_start_time)
@@ -1724,6 +1885,34 @@ def abstract_cross_asset_transmission(
     all_edges: list[pl.DataFrame] = []
     shock_summaries: list[dict[str, Any]] = []
     requested_shocks = tuple(str(shock).strip().lower() for shock in settings.shocks if str(shock).strip())
+    source_count = len(source_idx)
+    target_count = len(target_idx)
+    edge_count_per_shock = source_count * target_count
+    # At formal TW scale, retaining shocks*S² rows and globally sorting them is
+    # both superlinear and unnecessary.  Stream every complete raw edge row to
+    # Parquet while maintaining the exact S² graph reduction online.
+    try:
+        stream_edge_threshold = max(
+            1,
+            int(os.environ.get("STOCKAGENT_CROSS_ASSET_STREAM_EDGE_THRESHOLD", "5000000")),
+        )
+    except ValueError:
+        stream_edge_threshold = 5_000_000
+    stream_raw_edges = (
+        edge_count_per_shock * max(1, len(requested_shocks)) * 16
+        >= stream_edge_threshold
+    )
+    edge_writer: pq.ParquetWriter | None = None
+    edge_metrics_parquet = tables_dir / "edge_metrics.parquet"
+    graph_weight_sum = np.zeros((source_count, target_count), dtype=np.float32)
+    graph_weight_max = np.full((source_count, target_count), -np.inf, dtype=np.float32)
+    graph_dominant_index = np.full((source_count, target_count), -1, dtype=np.int16)
+    processed_shocks: list[str] = []
+    edge_source_symbols = np.repeat(np.asarray(source_symbols, dtype=object), target_count)
+    edge_target_symbols = np.tile(np.asarray(target_symbols, dtype=object), source_count)
+    edge_source_indices = np.repeat(np.asarray(source_idx, dtype=np.int32), target_count)
+    edge_target_indices = np.tile(np.asarray(target_idx, dtype=np.int32), source_count)
+    edge_attention_flow = attention_selected.reshape(-1).astype(np.float32, copy=False)
     for shock in tqdm(
         requested_shocks,
         desc="Cross-asset shocks",
@@ -1736,75 +1925,165 @@ def abstract_cross_asset_transmission(
             warnings.append(f"{shock}: no matching features; skipped.")
             continue
         buffers = _empty_metric_buffers(len(source_idx), len(target_idx))
+        # Accumulate every source directly across row chunks.  Keeping this in
+        # float64 preserves the previous source-major reduction precision while
+        # allowing the expensive tensor loop to be row-major.
+        accum_buffers = {
+            name: np.zeros((len(source_idx), len(target_idx)), dtype=np.float64)
+            for name in buffers
+        }
         chunk_size = 1 if force_single_source_chunk else max(1, int(settings.source_chunk_size))
-        source_pos = 0
         forward_batches = 0
         oom_retries = 0
-        source_progress = tqdm(
-            total=len(source_idx),
-            desc=f"Shock {shock}: sources",
-            unit="source",
+        compile_forward_enabled = bool(settings.counterfactual_compile)
+        forward_pair_progress = tqdm(
+            total=len(source_idx) * n_rows,
+            desc=f"Shock {shock}: source-date pairs",
+            unit="pair",
             leave=False,
             disable=not bool(settings.progress_enabled),
         )
-        while source_pos < len(source_idx):
-            chunk_sources = source_idx[source_pos : source_pos + chunk_size]
-            repeats = len(chunk_sources)
-            sl = slice(source_pos, source_pos + repeats)
-            selected_targets = torch.as_tensor(target_idx, device=device, dtype=torch.long)
-            accum = {name: np.zeros((repeats, len(target_idx)), dtype=np.float64) for name in buffers}
-            row_weight_total = 0.0
-            retry_source_chunk = False
-            for row_start in range(0, n_rows, row_chunk_size):
-                row_end = min(n_rows, row_start + row_chunk_size)
-                row_count = row_end - row_start
+        selected_targets = torch.as_tensor(target_idx, device=device, dtype=torch.long)
+        feature_std_device = feature_std.to(device=device, non_blocking=(device.type == "cuda"))
+        row_progress = tqdm(
+            range(0, n_rows, row_chunk_size),
+            total=math.ceil(n_rows / row_chunk_size),
+            desc=f"Shock {shock}: date chunks",
+            unit="chunk",
+            leave=False,
+            disable=not bool(settings.progress_enabled),
+        )
+        # First-principles dataflow: transfer each date chunk to CUDA once, then
+        # evaluate every source shock against that resident chunk.  The old
+        # source-major loop retransferred the same ~[R,L,S,F] slab once per
+        # source chunk (O(source_chunks * rows) PCIe traffic).  This row-major
+        # loop reaches O(rows) transfers without changing any model evaluation.
+        for row_start in row_progress:
+            row_end = min(n_rows, row_start + row_chunk_size)
+            row_count = row_end - row_start
+            with torch.no_grad():
+                x_row = x_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                mask_row = mask_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                returns_row = returns_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                base_weights_row = base_weights[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                base_scores_row = base_scores[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                base_rank_pos_row = base_rank_pos[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
+                if embedded_api is not None:
+                    base_projected_row = embedded_api.project_features_for_explainability(x_row)
+                    base_embedded_row = embedded_api.embed_projected_for_explainability(base_projected_row)
+                else:
+                    base_projected_row = None
+                    base_embedded_row = None
+            source_pos = 0
+            while source_pos < len(source_idx):
+                chunk_sources = source_idx[source_pos : source_pos + chunk_size]
+                repeats = len(chunk_sources)
+                padded_source_count = chunk_size
+                if compile_forward_enabled:
+                    padded_source_count = max(
+                        padded_source_count,
+                        math.ceil(max(1, int(settings.max_repeated_rows)) / max(1, row_count)),
+                    )
+                work_sources = chunk_sources + (
+                    [chunk_sources[-1]] * (padded_source_count - repeats)
+                    if repeats < padded_source_count
+                    else []
+                )
+                work_repeats = len(work_sources)
+                sl = slice(source_pos, source_pos + repeats)
                 try:
                     with torch.no_grad():
-                        x_row = x_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
-                        mask_row = mask_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
-                        returns_row = returns_cpu[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
-                        base_weights_row = base_weights[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
-                        base_scores_row = base_scores[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
-                        base_rank_pos_row = base_rank_pos[row_start:row_end].to(device=device, non_blocking=(device.type == "cuda"))
-                        feature_std_row = feature_std.to(device=device, non_blocking=(device.type == "cuda"))
-                        x_rep = x_row.detach().unsqueeze(0).expand((repeats,) + tuple(x_row.shape)).clone()
-                        for local_idx, source_symbol_idx in enumerate(chunk_sources):
-                            _apply_shock(
-                                x_rep,
-                                local_idx,
-                                source_symbol_idx,
+                        mask_rep = mask_row.unsqueeze(0).expand(work_repeats, *tuple(mask_row.shape)).reshape(
+                            work_repeats * row_count,
+                            n_symbols,
+                        )
+                        if embedded_api is not None and base_projected_row is not None and base_embedded_row is not None:
+                            source_tensor = torch.as_tensor(
+                                work_sources,
+                                device=device,
+                                dtype=torch.long,
+                            )
+                            changed_sources = x_row.index_select(2, source_tensor).permute(2, 0, 1, 3).contiguous()
+                            _apply_shock_to_source_features(
+                                changed_sources,
                                 feature_idx,
                                 shock=shock,
                                 scale=float(settings.perturb_scale),
-                                feature_std=feature_std_row,
+                                feature_std=feature_std_device,
                             )
-                        x_rep = x_rep.reshape(repeats * row_count, lookback, n_symbols, n_features)
-                        mask_rep = mask_row.unsqueeze(0).expand(repeats, *tuple(mask_row.shape)).reshape(
+                            changed_projected = embedded_api.project_features_for_explainability(changed_sources)
+                            base_source_projected = base_projected_row.index_select(2, source_tensor).permute(2, 0, 1, 3)
+                            embedded_rep = base_embedded_row.unsqueeze(0).expand(
+                                (work_repeats,) + tuple(base_embedded_row.shape)
+                            ).clone()
+                            for local_idx, source_symbol_idx in enumerate(work_sources):
+                                embedded_rep[local_idx, :, :, source_symbol_idx] += (
+                                    changed_projected[local_idx] - base_source_projected[local_idx]
+                                )
+                            embedded_rep = embedded_rep.reshape(
+                                work_repeats * row_count,
+                                lookback,
+                                n_symbols,
+                                int(base_embedded_row.size(-1)),
+                            )
+                            weights_p, scores_p, rank_p, _centered_p, _aux_p = _forward_embedded_outputs(
+                                embedded_api,
+                                embedded_rep,
+                                mask_rep,
+                                compile_forward=compile_forward_enabled,
+                            )
+                            del (
+                                source_tensor,
+                                changed_sources,
+                                changed_projected,
+                                base_source_projected,
+                                embedded_rep,
+                            )
+                        else:
+                            x_rep = x_row.detach().unsqueeze(0).expand((work_repeats,) + tuple(x_row.shape)).clone()
+                            for local_idx, source_symbol_idx in enumerate(work_sources):
+                                _apply_shock(
+                                    x_rep,
+                                    local_idx,
+                                    source_symbol_idx,
+                                    feature_idx,
+                                    shock=shock,
+                                    scale=float(settings.perturb_scale),
+                                    feature_std=feature_std_device,
+                                )
+                            x_rep = x_rep.reshape(work_repeats * row_count, lookback, n_symbols, n_features)
+                            weights_p, scores_p, rank_p, _centered_p, _aux_p = _forward_outputs(
+                                model,
+                                x_rep,
+                                mask_rep,
+                                return_aux=False,
+                            )
+                            del x_rep
+                        weights_p = weights_p.reshape(work_repeats, row_count, n_symbols)[:repeats]
+                        scores_p = scores_p.reshape(work_repeats, row_count, n_symbols)[:repeats]
+                        rank_p = rank_p.reshape(work_repeats, row_count, n_symbols)[:repeats]
+                        mask_rep_metrics = mask_rep.reshape(work_repeats, row_count, n_symbols)[:repeats].reshape(
                             repeats * row_count,
                             n_symbols,
                         )
-                        weights_p, scores_p, rank_p, _centered_p, _aux_p = _forward_outputs(
-                            model,
-                            x_rep,
-                            mask_rep,
-                            return_aux=False,
-                        )
-                        weights_p = weights_p.reshape(repeats, row_count, n_symbols)
-                        scores_p = scores_p.reshape(repeats, row_count, n_symbols)
-                        rank_p = rank_p.reshape(repeats, row_count, n_symbols)
                 except RuntimeError as exc:
                     if not _is_cuda_oom(exc) or chunk_size <= 1:
                         raise
                     oom_retries += 1
                     chunk_size = max(1, chunk_size // 2)
+                    # A failed B=48 workspace must genuinely shrink on retry;
+                    # disable compile padding for this shock after the OOM.
+                    compile_forward_enabled = False
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    retry_source_chunk = True
-                    break
+                    continue
                 forward_batches += 1
                 score_delta = scores_p - base_scores_row.unsqueeze(0)
                 weight_delta = weights_p - base_weights_row.unsqueeze(0)
-                pert_rank_pos = _rank_positions(rank_p.reshape(repeats * row_count, n_symbols), mask_rep).reshape(
+                pert_rank_pos = _rank_positions(
+                    rank_p.reshape(repeats * row_count, n_symbols),
+                    mask_rep_metrics,
+                ).reshape(
                     repeats,
                     row_count,
                     n_symbols,
@@ -1817,69 +2096,82 @@ def abstract_cross_asset_transmission(
                 norm_weights = _portfolio_weights_from_scores(
                     model,
                     norm_scores.reshape(repeats * row_count, n_symbols),
-                    mask_rep,
+                    mask_rep_metrics,
                 ).reshape(repeats, row_count, n_symbols)
                 realloc_delta = norm_weights - base_weights_row.unsqueeze(0)
                 residual_delta = weight_delta - realloc_delta
                 row_weight = float(row_count)
-                accum["score_abs"] += row_weight * _mean_over_batch(score_delta.index_select(2, selected_targets).abs())
-                accum["score_signed"] += row_weight * _mean_over_batch(score_delta.index_select(2, selected_targets))
-                accum["weight_total_abs"] += row_weight * _mean_over_batch(
+                accum_buffers["score_abs"][sl] += row_weight * _mean_over_batch(score_delta.index_select(2, selected_targets).abs())
+                accum_buffers["score_signed"][sl] += row_weight * _mean_over_batch(score_delta.index_select(2, selected_targets))
+                accum_buffers["weight_total_abs"][sl] += row_weight * _mean_over_batch(
                     weight_delta.index_select(2, selected_targets).abs()
                 )
-                accum["weight_total_signed"] += row_weight * _mean_over_batch(weight_delta.index_select(2, selected_targets))
-                accum["weight_reallocation_abs"] += row_weight * _mean_over_batch(
+                accum_buffers["weight_total_signed"][sl] += row_weight * _mean_over_batch(weight_delta.index_select(2, selected_targets))
+                accum_buffers["weight_reallocation_abs"][sl] += row_weight * _mean_over_batch(
                     realloc_delta.index_select(2, selected_targets).abs()
                 )
-                accum["weight_residual_abs"] += row_weight * _mean_over_batch(
+                accum_buffers["weight_residual_abs"][sl] += row_weight * _mean_over_batch(
                     residual_delta.index_select(2, selected_targets).abs()
                 )
-                accum["rank_abs"] += row_weight * _mean_over_batch(rank_delta.index_select(2, selected_targets).abs())
+                accum_buffers["rank_abs"][sl] += row_weight * _mean_over_batch(rank_delta.index_select(2, selected_targets).abs())
                 base_target_weight = base_weights_row.index_select(1, selected_targets).unsqueeze(0)
                 pert_target_weight = weights_p.index_select(2, selected_targets)
-                accum["flip_prob"] += row_weight * _mean_over_batch((base_target_weight * pert_target_weight < 0).float())
+                accum_buffers["flip_prob"][sl] += row_weight * _mean_over_batch((base_target_weight * pert_target_weight < 0).float())
                 target_returns = returns_row.index_select(1, selected_targets).unsqueeze(0)
-                accum["transmission_pnl"] += row_weight * _mean_over_batch(
+                accum_buffers["transmission_pnl"][sl] += row_weight * _mean_over_batch(
                     weight_delta.index_select(2, selected_targets) * target_returns
                 )
-                row_weight_total += row_weight
+                completed_pairs = repeats * row_count
+                forward_pair_progress.update(completed_pairs)
+                forward_pair_progress.set_postfix(
+                    forwards=forward_batches,
+                    rows=f"{row_end}/{n_rows}",
+                    refresh=False,
+                )
                 del (
-                    x_row,
-                    mask_row,
-                    returns_row,
-                    base_weights_row,
-                    base_scores_row,
-                    base_rank_pos_row,
-                    feature_std_row,
-                    x_rep,
                     mask_rep,
+                    mask_rep_metrics,
                     weights_p,
                     scores_p,
                     rank_p,
                 )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            if retry_source_chunk:
-                continue
-            denom = max(1.0, row_weight_total)
-            for metric_name, values in accum.items():
-                buffers[metric_name][sl, :] = (values / denom).astype(np.float32, copy=False)
-            source_pos += repeats
-            source_progress.update(repeats)
-            source_progress.set_postfix(
+                source_pos += repeats
+            del (
+                x_row,
+                mask_row,
+                returns_row,
+                base_weights_row,
+                base_scores_row,
+                base_rank_pos_row,
+                base_projected_row,
+                base_embedded_row,
+            )
+            row_progress.set_postfix(
                 forwards=forward_batches,
                 chunk=chunk_size,
                 oom=oom_retries,
                 refresh=False,
             )
-        source_progress.close()
+        row_progress.close()
+        forward_pair_progress.close()
+        denom = max(1.0, float(n_rows))
+        for metric_name, values in accum_buffers.items():
+            buffers[metric_name] = (values / denom).astype(np.float32, copy=False)
+        del accum_buffers, selected_targets, feature_std_device
 
         perturbation_evidence = _normalize_matrix(buffers["weight_residual_abs"])
         if bool(settings.validated_transmission) and attention_flow is not None:
             validated = perturbation_evidence * _normalize_matrix(attention_selected)
         else:
             validated = perturbation_evidence
-        for metric_name, matrix in buffers.items():
+        for metric_name, matrix in tqdm(
+            buffers.items(),
+            total=len(buffers),
+            desc=f"Shock {shock}: write matrices",
+            unit="matrix",
+            leave=False,
+            disable=not bool(settings.progress_enabled),
+        ):
             _write_matrix_csv(matrices_dir / f"{shock}_{metric_name}.csv", matrix, source_symbols, target_symbols)
         _write_matrix_csv(matrices_dir / f"{shock}_validated_transmission.csv", validated, source_symbols, target_symbols)
         _plot_heatmap(plots_dir / f"{shock}_validated_transmission.png", validated, f"{shock} validated transmission", source_symbols, target_symbols)
@@ -1888,23 +2180,41 @@ def abstract_cross_asset_transmission(
         # Build the complete Cartesian edge table with columnar NumPy arrays.
         # Avoiding millions of Python dictionaries materially reduces both wall
         # time and peak host memory for full-universe S² output.
-        source_count = len(source_idx)
-        target_count = len(target_idx)
         edge_count = source_count * target_count
         edge_columns: dict[str, Any] = {
             "shock": np.full(edge_count, shock, dtype=object),
-            "source_symbol": np.repeat(np.asarray(source_symbols, dtype=object), target_count),
-            "target_symbol": np.tile(np.asarray(target_symbols, dtype=object), source_count),
-            "source_index": np.repeat(np.asarray(source_idx, dtype=np.int32), target_count),
-            "target_index": np.tile(np.asarray(target_idx, dtype=np.int32), source_count),
-            "attention_flow": attention_selected.reshape(-1).astype(np.float32, copy=False),
+            "source_symbol": edge_source_symbols,
+            "target_symbol": edge_target_symbols,
+            "source_index": edge_source_indices,
+            "target_index": edge_target_indices,
+            "attention_flow": edge_attention_flow,
             "validated_transmission": validated.reshape(-1).astype(np.float32, copy=False),
         }
         edge_columns.update(
             {name: matrix.reshape(-1).astype(np.float32, copy=False) for name, matrix in buffers.items()}
         )
         edge_frame = pl.DataFrame(edge_columns)
-        all_edges.append(edge_frame)
+        if stream_raw_edges:
+            arrow_table = edge_frame.to_arrow()
+            if edge_writer is None:
+                edge_metrics_parquet.parent.mkdir(parents=True, exist_ok=True)
+                edge_writer = pq.ParquetWriter(
+                    edge_metrics_parquet,
+                    arrow_table.schema,
+                    compression="zstd",
+                )
+                csv_path = tables_dir / "edge_metrics.csv"
+                if csv_path.exists():
+                    csv_path.unlink()
+            edge_writer.write_table(arrow_table)
+        else:
+            all_edges.append(edge_frame)
+        shock_position = len(processed_shocks)
+        better = validated > graph_weight_max
+        graph_dominant_index[better] = shock_position
+        graph_weight_max = np.maximum(graph_weight_max, validated)
+        graph_weight_sum += validated
+        processed_shocks.append(shock)
         shock_summaries.append(
             {
                 "shock": shock,
@@ -1920,7 +2230,27 @@ def abstract_cross_asset_transmission(
         )
         timing["per_shock_s"][shock] = float(time.perf_counter() - shock_start)
 
+    if edge_writer is not None:
+        edge_writer.close()
     raw_edges = pl.concat(all_edges, how="diagonal_relaxed") if all_edges else pl.DataFrame()
+    if processed_shocks:
+        graph_edge_count = source_count * target_count
+        dominant_names = np.asarray(processed_shocks, dtype=object)[graph_dominant_index.reshape(-1)]
+        graph_edges_preaggregated = pl.DataFrame(
+            {
+                "source_index": edge_source_indices,
+                "target_index": edge_target_indices,
+                "source_symbol": edge_source_symbols,
+                "target_symbol": edge_target_symbols,
+                "edge_weight": graph_weight_sum.reshape(-1),
+                "edge_weight_mean": (graph_weight_sum / float(len(processed_shocks))).reshape(-1),
+                "edge_weight_max": graph_weight_max.reshape(-1),
+                "shock_count": np.full(graph_edge_count, len(processed_shocks), dtype=np.int16),
+                "dominant_shock": dominant_names,
+            }
+        )
+    else:
+        graph_edges_preaggregated = pl.DataFrame()
     pipeline_progress.update(1)
     pipeline_progress.set_postfix(stage="graph", refresh=True)
     graph_start = time.perf_counter()
@@ -1930,16 +2260,53 @@ def abstract_cross_asset_transmission(
         unit="stage",
         disable=not bool(settings.progress_enabled),
     )
-    graph_result = _process_cross_asset_graph_edges(raw_edges, settings)
+    if stream_raw_edges:
+        requested_backend, backend_warnings = _resolve_graph_backend(settings)
+        selected_backend = "cugraph" if requested_backend in {"auto", "cugraph"} else "polars"
+        source_summary = pl.DataFrame(
+            {
+                "source_symbol": source_symbols,
+                "validated_transmission": graph_weight_sum.sum(axis=1),
+            }
+        ).sort("source_symbol")
+        target_summary = pl.DataFrame(
+            {
+                "target_symbol": target_symbols,
+                "validated_transmission": graph_weight_sum.sum(axis=0),
+            }
+        ).sort("target_symbol")
+        graph_result = _GraphProcessingResult(
+            backend=selected_backend,
+            edges=pl.DataFrame(),
+            source_summary=source_summary,
+            target_summary=target_summary,
+            node_metrics=pl.DataFrame(),
+            benchmark={
+                "requested_backend": requested_backend,
+                "selected_backend": selected_backend,
+                "selection_reason": "streamed_raw_edges_and_online_graph_reduction",
+                "edge_count": int(edge_count_per_shock * len(processed_shocks)),
+                "graph_edge_count": int(graph_edges_preaggregated.height),
+                "raw_edge_storage": str(edge_metrics_parquet),
+                "warnings": backend_warnings,
+            },
+        )
+    else:
+        graph_result = _process_cross_asset_graph_edges(raw_edges, settings)
     graph_progress.update(1)
     graph_progress.set_postfix(stage="metrics", refresh=False)
     edges = graph_result.edges
     warnings.extend(str(warning) for warning in graph_result.benchmark.get("warnings", ()))
-    _write_frame_csv_or_parquet(tables_dir / "edge_metrics.csv", edges)
+    if not stream_raw_edges:
+        _write_frame_csv_or_parquet(tables_dir / "edge_metrics.csv", edges)
 
     _write_frame_csv_or_parquet(tables_dir / "source_summary.csv", graph_result.source_summary)
     _write_frame_csv_or_parquet(tables_dir / "target_summary.csv", graph_result.target_summary)
-    graph_explainability = _build_graph_explainability(edges, settings)
+    graph_explainability = _build_graph_explainability(
+        graph_edges_preaggregated,
+        settings,
+        preaggregated=True,
+    )
     graph_progress.update(1)
     graph_progress.close()
     timing["graph_s"] = float(time.perf_counter() - graph_start)
