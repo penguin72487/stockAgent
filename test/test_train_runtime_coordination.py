@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import json
 import multiprocessing as mp
 from pathlib import Path
 import queue
@@ -12,6 +13,38 @@ import pytest
 import torch
 
 import train as train_entry
+
+
+def test_startup_timing_buffers_until_output_path_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("STOCKAGENT_ROOT_LAUNCH_MONOTONIC_NS", raising=False)
+    monkeypatch.delenv("STOCKAGENT_RUN_ID", raising=False)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    recorder = train_entry._StartupTimingRecorder()
+    recorder.checkpoint("config", config="tw_public")
+    path = tmp_path / "startup_timing.jsonl"
+
+    recorder.bind(path)
+    recorder.checkpoint("panel", rows=123)
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["stage"] for record in records] == ["config", "panel"]
+    assert records[0]["world_size"] == 2
+    assert records[1]["rows"] == 123
+    assert records[1]["cumulative_s"] >= records[0]["cumulative_s"]
+
+
+def test_auto_multi_gpu_strategy_tracks_visible_device_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    assert train_entry._resolve_multi_gpu_strategy("auto") == "none"
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    assert train_entry._resolve_multi_gpu_strategy("auto") == "distributed_data_parallel"
+    assert train_entry._resolve_multi_gpu_strategy("none") == "none"
 
 
 def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
@@ -44,6 +77,39 @@ def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
         environ={},
         fallback=3,
     ) == 3
+
+
+def test_termination_handlers_use_python_exit_for_atexit_cleanup(monkeypatch) -> None:
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(
+        train_entry.signal,
+        "getsignal",
+        lambda signum: train_entry.signal.SIG_DFL,
+    )
+    monkeypatch.setattr(
+        train_entry.signal,
+        "signal",
+        lambda signum, handler: installed.update({signum: handler}),
+    )
+
+    train_entry._install_graceful_termination_handlers()
+
+    assert set(installed) == {
+        train_entry.signal.SIGTERM,
+        train_entry.signal.SIGINT,
+    }
+    for signum, handler in installed.items():
+        with pytest.raises(SystemExit) as exc_info:
+            handler(signum, None)
+        assert exc_info.value.code == 128 + int(signum)
+
+
+def test_tw_public_uses_single_5070ti_runtime_and_dynamic_loss_graph() -> None:
+    config = train_entry.load_config("configs/markets/tw_public.yaml")
+    assert config.environment.cpu_threads == 16
+    assert config.environment.torch_compile_threads == 8
+    assert config.training.multi_gpu_strategy == "none"
+    assert config.training.compile_loss_dynamic_symbols is True
 
 
 def test_local_world_size_uses_local_not_global_rank_count(

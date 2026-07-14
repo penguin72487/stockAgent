@@ -16,7 +16,14 @@ def _config(*, long_only: bool) -> SimpleNamespace:
             sell_fee_rate=0.002,
             long_only=long_only,
             max_turnover_ratio=0.35,
-        )
+        ),
+        training=SimpleNamespace(
+            chunk_rows=0,
+            eval_model_chunk_rows="auto",
+            eval_auto_chunk_rows_cap=16,
+            eval_backtest_chunk_rows=512,
+            eval_backtest_chunk_rows_auto=True,
+        ),
     )
 
 
@@ -32,6 +39,23 @@ def _buffers() -> dict[str, torch.Tensor]:
         "can_sell_mask": torch.ones((t_len, symbols), dtype=torch.bool),
         "benchmark": torch.randn((t_len,), generator=generator, dtype=torch.float32) * 0.01,
     }
+
+
+def test_chunk_resolution_passes_total_rows_to_backtest_policy() -> None:
+    config = _config(long_only=False)
+
+    assert bp._resolve_benchmark_chunk_rows(
+        config,
+        total_rows=211,
+        model_chunk_rows=None,
+        scan_chunk_size=None,
+    ) == (16, 256)
+    assert bp._resolve_benchmark_chunk_rows(
+        config,
+        total_rows=211,
+        model_chunk_rows=7,
+        scan_chunk_size=9,
+    ) == (7, 9)
 
 
 @pytest.mark.parametrize("long_only", [False, True])

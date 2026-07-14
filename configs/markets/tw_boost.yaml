@@ -5,19 +5,21 @@ runner:
   mode: train
   resume: false
   post_train_infer: false
-  start_fold: 11
+  # In the 2005 model horizon, fold6 preserves the prior 2011 validation year.
+  start_fold: 6
 environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
 
 data:
-  parquet_root: data_yahoo/tw_stocks
+  parquet_root: data_tw_public/stocks
+  panel_start_date: "2005-01-01"
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
-  trading_volume_policy: auto
+  trading_volume_policy: required
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
   use_tw_public_rules: true
@@ -212,6 +214,8 @@ data:
 walk_forward:
   min_train_years: 1
   val_years: 1
+  expected_first_year: 2005
+  require_contiguous_years: true
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
 
@@ -448,9 +452,13 @@ training:
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
+    # latent_only: temporal + latent factors without market tokens
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
     attention_mode: market_token
+    # Independent compact-bottleneck switches; null falls back to attention_mode.
+    use_latent_factors: null
+    use_market_tokens: null
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: true

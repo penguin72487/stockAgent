@@ -119,7 +119,6 @@ def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None
     result = _process_cross_asset_graph_edges(
         edges,
         CrossAssetTransmissionSettings(
-            top_edges=3,
             graph_backend="auto",
             graph_benchmark_min_edges=edges.height + 1,
         ),
@@ -128,9 +127,9 @@ def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None
     assert result.backend == "polars"
     assert result.benchmark["selection_reason"] == "below_min_edges"
     assert result.benchmark["backends"]["polars"]["elapsed_s"] >= 0
-    assert result.top_edges.height == 3
-    assert result.top_edges["validated_transmission"].to_list() == sorted(
-        result.top_edges["validated_transmission"].to_list(),
+    assert result.edges.height == edges.height
+    assert result.edges["validated_transmission"].to_list() == sorted(
+        result.edges["validated_transmission"].to_list(),
         reverse=True,
     )
 
@@ -145,7 +144,6 @@ def test_cross_asset_graph_cugraph_matches_polars_when_available() -> None:
     result = _process_cross_asset_graph_edges(
         edges,
         CrossAssetTransmissionSettings(
-            top_edges=5,
             graph_backend="cugraph",
             graph_benchmark_min_edges=0,
         ),
@@ -360,7 +358,6 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
         settings=CrossAssetTransmissionSettings(
             max_sources=3,
             max_targets=3,
-            top_edges=4,
             source_chunk_size=1,
             graph_backend="polars",
             shocks=("zero",),
@@ -377,8 +374,11 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
     assert summary["graph_benchmark"]["selection_reason"] == "backend_polars"
     assert summary["graph_explainability"]["enabled"] is True
     assert summary["graph_explainability"]["backend"] in {"cugraph", "polars"}
+    assert summary["timing"]["total_s"] > 0.0
+    assert summary["timing"]["sources_per_s"] > 0.0
     assert (base / "abstract_cross_asset_report.md").exists()
-    assert (base / "tables" / "top_edges.csv").exists()
+    assert (base / "tables" / "edge_metrics.csv").exists()
+    assert not (base / "tables" / "top_edges.csv").exists()
     assert (base / "tables" / "graph_edges.csv").exists()
     assert (base / "tables" / "graph_node_metrics.csv").exists()
     assert (base / "tables" / "graph_community_summary.csv").exists()

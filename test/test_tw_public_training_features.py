@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,11 +11,14 @@ import polars as pl
 import pytest
 
 import stockagent.data.panel as panel_module
+from scripts.audit_tw_public_data_layer import audit_feature_build_receipt
 from stockagent.data.panel import build_panel, build_tail_panel
 from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
     FEATURE_COLUMNS,
     RULE_COLUMNS,
+    _build_official_ohlcv_features,
+    _build_twse_market_index_features,
     build_tw_public_training_features,
 )
 
@@ -101,6 +105,204 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     market = out.filter(pl.col("symbol") == DEFAULT_MARKET_SYMBOL).sort("date")
     assert market.height == 2
     assert market["twpub_usdtwd_logret_1d"][1] is not None
+    summary = json.loads(output_path.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    assert summary["source_receipts"]
+    assert summary["output_receipt"]["sha256"]
+    assert summary["symbol_universe_receipt"]["file_count"] == 1
+    receipt, findings = audit_feature_build_receipt(output_path, input_dir, symbols_root)
+    assert receipt["valid"] is True
+    assert findings == []
+
+    with (input_dir / "twse_daily_valuation.parquet").open("ab") as handle:
+        handle.write(b"changed")
+    receipt, findings = audit_feature_build_receipt(output_path, input_dir, symbols_root)
+    assert receipt["valid"] is False
+    assert [item.code for item in findings] == ["stale_feature_build_receipt"]
+
+
+def test_legacy_tpex_quote_statistics_feed_public_features_without_fabricating_price(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame(
+        {
+            "date": ["2007-01-02", "2007-01-03"],
+            "代號": ["4801", "4801"],
+            "收盤": ["0.00", "26.80"],
+            "最高": ["0.00", "27.00"],
+            "最低": ["0.00", "26.50"],
+            "成交股數": ["240", "1,000"],
+            "成交金額(元)": ["6,408", "26,800"],
+            "成交筆數": ["1", "10"],
+            "發行股數": ["46,347,952", "46,347,952"],
+            "次日漲停價": ["30.70", "30.80"],
+            "次日跌停價": ["26.70", "24.80"],
+        }
+    ).write_parquet(tmp_path / "tpex_daily_ohlcv.parquet")
+
+    output = _build_official_ohlcv_features(tmp_path).sort("date")
+
+    first = output.row(0, named=True)
+    assert first["_twpub_official_traded"] == 1.0
+    assert first["twpub_official_trading_volume_log"] == pytest.approx(np.log1p(240))
+    assert first["twpub_official_trading_value_log"] == pytest.approx(np.log1p(6408))
+    assert first["twpub_official_trades_log"] == pytest.approx(np.log1p(1))
+    assert first["twpub_official_intraday_range"] is None
+    assert first["twpub_official_close_to_high"] is None
+    assert first["twpub_official_close_to_low"] is None
+
+
+def test_taiex_monthly_archive_is_complete_base_and_ind_has_same_day_priority(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame(
+        {
+            "date": [date(2000, 1, 4), date(2000, 1, 5), date(2000, 1, 6)],
+            "opening_index": [100.0, 100.5, 101.5],
+            "highest_index": [100.5, 101.5, 102.5],
+            "lowest_index": [99.5, 100.0, 101.0],
+            "closing_index": [100.0, 101.0, 102.0],
+        }
+    ).write_parquet(tmp_path / "twse_taiex_ohlc.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2000-01-05", "2000-01-06"],
+            "指數": ["發行量加權股價指數", "發行量加權股價指數"],
+            "收盤指數": ["101.00", "102.00"],
+            # Deliberately differs from close-to-close on 01-05 so the test
+            # proves that a valid same-day IND percentage has priority.
+            "漲跌百分比(%)": ["1.50", "0.99"],
+        }
+    ).write_parquet(tmp_path / "twse_market_index.parquet")
+
+    output = _build_twse_market_index_features(
+        tmp_path,
+        market_symbol=DEFAULT_MARKET_SYMBOL,
+    ).sort("date")
+
+    assert output.get_column("date").to_list() == [
+        date(2000, 1, 4),
+        date(2000, 1, 5),
+        date(2000, 1, 6),
+    ]
+    assert output.get_column("symbol").unique().to_list() == [DEFAULT_MARKET_SYMBOL]
+    assert output.get_column("_twpub_official_traded").to_list() == [1.0, 1.0, 1.0]
+    assert output.get_column("twpub_twse_taiex_pct").to_list()[1:] == pytest.approx(
+        [0.015, 0.0099]
+    )
+    assert output.get_column("twpub_twse_taiex_logret_1d").to_list()[1:] == pytest.approx(
+        [np.log(1.01), np.log(102.0 / 101.0)]
+    )
+
+
+def test_taiex_session_marker_keeps_quote_missing_session_fail_closed(
+    tmp_path: Path,
+) -> None:
+    symbol_path = tmp_path / "2330_features.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 4)],
+            "open": [100.0, 101.0],
+            "max": [101.0, 102.0],
+            "min": [99.0, 100.0],
+            "close": [100.0, 101.0],
+            "adjclose": [10.0, 10.1],
+            "Trading_Volume": [1000.0, 1100.0],
+        }
+    ).write_parquet(symbol_path)
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": [
+                date(2024, 1, 2),
+                date(2024, 1, 3),
+                date(2024, 1, 4),
+            ],
+            "symbol": [DEFAULT_MARKET_SYMBOL] * 3,
+            "_twpub_official_traded": [1.0, 1.0, 1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="2330",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+
+    missing_idx = int(np.flatnonzero(panel.dates == np.datetime64("2024-01-03"))[0])
+    symbol_idx = panel.symbols.index("2330")
+    assert np.isnan(panel.close_prices[missing_idx, symbol_idx])
+    assert np.isnan(panel.daily_volumes[missing_idx, symbol_idx])
+    assert np.isnan(panel.returns_1d[missing_idx, symbol_idx])
+    assert bool(panel.tradable_mask[missing_idx, symbol_idx]) is False
+    assert bool(panel.can_buy_mask[missing_idx, symbol_idx]) is False
+    assert bool(panel.can_sell_mask[missing_idx, symbol_idx]) is False
+
+
+@pytest.mark.parametrize("panel_backend", ["pyarrow", "polars_lazy"])
+def test_explicit_return_quarantine_masks_only_the_forward_label(
+    tmp_path: Path,
+    panel_backend: str,
+) -> None:
+    symbol_path = tmp_path / "2330_features.parquet"
+    pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 3)],
+            "open": [10.0, 40.0],
+            "max": [10.0, 40.0],
+            "min": [10.0, 40.0],
+            "close": [10.0, 40.0],
+            "adjclose": [10.0, 40.0],
+            "Trading_Volume": [1000.0, 1000.0],
+            "return_quarantined": [True, False],
+            "return_quarantine_reason": [
+                "unverified_extreme_adjusted_return",
+                None,
+            ],
+        }
+    ).write_parquet(symbol_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="2330",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend=panel_backend,
+        panel_load_workers=0,
+    )
+
+    symbol_idx = panel.symbols.index("2330")
+    assert panel.close_prices[:, symbol_idx].tolist() == [10.0, 40.0]
+    assert np.isnan(panel.returns_1d[0, symbol_idx])
+
+
+def test_taiex_archive_and_ind_overlap_mismatch_fails_closed(tmp_path: Path) -> None:
+    pl.DataFrame(
+        {
+            "date": [date(2009, 1, 5)],
+            "opening_index": [4_600.0],
+            "highest_index": [4_710.0],
+            "lowest_index": [4_590.0],
+            "closing_index": [4_698.31],
+        }
+    ).write_parquet(tmp_path / "twse_taiex_ohlc.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2009-01-05"],
+            "指數": ["發行量加權股價指數"],
+            "收盤指數": ["4,698.33"],
+            "漲跌百分比(%)": ["2.33"],
+        }
+    ).write_parquet(tmp_path / "twse_market_index.parquet")
+
+    with pytest.raises(ValueError, match="TAIEX close mismatch"):
+        _build_twse_market_index_features(
+            tmp_path,
+            market_symbol=DEFAULT_MARKET_SYMBOL,
+        )
 
 
 def test_build_panel_aligns_external_stock_and_market_features(tmp_path: Path) -> None:
@@ -166,6 +368,67 @@ def test_build_panel_manual_feature_switch_supports_glob_include_and_exclude(tmp
 
     assert panel.feature_names == ["close_logret_1d", "twpub_usdtwd_logret_1d"]
     assert panel.features.shape[-1] == 2
+
+
+def test_build_panel_zero_fill_keeps_feature_slots_and_zeros_matching_values(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "symbol": [DEFAULT_MARKET_SYMBOL, "2330"],
+            "twpub_usdtwd_logret_1d": [0.01, None],
+            "twpub_pe_log": [None, 3.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["close_logret_1d", "twpub_*"],
+        feature_zero_fill=["twpub_*"],
+    )
+
+    assert panel.feature_names == [
+        "close_logret_1d",
+        "twpub_usdtwd_logret_1d",
+        "twpub_pe_log",
+    ]
+    assert panel.features.shape[-1] == 3
+    assert np.count_nonzero(panel.features[:, :, 1:]) == 0
+
+
+def test_market_point_in_time_state_is_forward_filled_after_release(tmp_path: Path) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    _write_symbol(tmp_path / "2317_features.parquet", [50.0, 51.0, 52.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04"],
+            "symbol": [DEFAULT_MARKET_SYMBOL, DEFAULT_MARKET_SYMBOL],
+            "twpub_dgbas_cpi_log": [4.5, 4.6],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="2330",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["twpub_dgbas_cpi_log"],
+    )
+
+    feature_idx = panel.feature_names.index("twpub_dgbas_cpi_log")
+    date_0103 = int(np.flatnonzero(panel.dates == np.datetime64("2024-01-03"))[0])
+    assert np.allclose(panel.features[date_0103, :, feature_idx], 4.5)
 
 
 def test_external_tpex_limit_rule_columns_update_masks_without_becoming_features(tmp_path: Path) -> None:

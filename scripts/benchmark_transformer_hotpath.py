@@ -27,6 +27,7 @@ from stockagent.training.trainer import (
     _call_model,
     _configure_backtest_runtime_from_config,
     _detach_portfolio_state,
+    _densify_windowed_training_split_for_panel_slab,
     _extract_weights_and_aux,
     _is_log_utility_objective,
     _maybe_compact_train_windowed_symbols,
@@ -34,6 +35,7 @@ from stockagent.training.trainer import (
     _normalize_risk_objective,
     _pad_windowed_training_split,
     _resolve_amp_dtype,
+    _training_loss_min_trade_weight,
     _training_loss_portfolio_activation,
     _training_needs_aux,
     _torch_compile_options,
@@ -67,7 +69,7 @@ def _loss_kwargs(config) -> dict:
         "sell_fee_rate": float(config.trading.sell_fee_rate),
         "max_turnover_ratio": float(config.trading.max_turnover_ratio),
         "gross_leverage": 1.0,
-        "min_trade_weight": float(config.trading.min_trade_weight),
+        "min_trade_weight": _training_loss_min_trade_weight(config),
         "portfolio_activation": _training_loss_portfolio_activation(config),
         "gamma_sharpe": float(config.evaluation.gamma_sharpe),
         "gamma_excess": float(config.evaluation.gamma_excess),
@@ -144,6 +146,7 @@ def _run_case(
         config,
         label="hotpath benchmark",
     )
+    split = _densify_windowed_training_split_for_panel_slab(split, fold.train_indices)
     split = _pad_windowed_training_split(split, batch_size)
     rows = len(split)
     amp_dtype = _resolve_amp_dtype(config.environment.amp_dtype)
@@ -162,6 +165,12 @@ def _run_case(
         num_symbols=panel.num_symbols,
         feature_names=panel.feature_names,
     ).to(device)
+    parameter_count = sum(int(parameter.numel()) for parameter in model.parameters())
+    trainable_parameter_count = sum(
+        int(parameter.numel())
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
     if compile_model or compile_loss:
         can_compile, reason = _can_enable_torch_compile(device)
         if not can_compile:
@@ -304,8 +313,25 @@ def _run_case(
         "cache_on_device": bool(cache_on_device and device.type != "cpu"),
         "compile_model": bool(compile_model),
         "compile_loss": bool(compile_loss),
+        "torch_compile_mode": str(config.training.torch_compile_mode),
         "attention_mode": str(config.training.transformer_base_portfolio.attention_mode),
         "temporal_pooling": str(config.training.transformer_base_portfolio.temporal_pooling),
+        "temporal_query_mode": str(config.training.transformer_base_portfolio.temporal_query_mode),
+        "sanitize_inputs": bool(config.training.transformer_base_portfolio.sanitize_inputs),
+        "amp_native_position_add": bool(
+            config.training.transformer_base_portfolio.amp_native_position_add
+        ),
+        "temporal_self_attention_fast_path": bool(
+            config.training.transformer_base_portfolio.temporal_self_attention_fast_path
+        ),
+        "compiled_cross_attention_backend": str(
+            config.training.transformer_base_portfolio.compiled_cross_attention_backend
+        ),
+        "cache_train_features_in_amp_dtype": bool(
+            config.training.cache_train_features_in_amp_dtype
+        ),
+        "parameter_count": int(parameter_count),
+        "trainable_parameter_count": int(trainable_parameter_count),
         "loss_type": str(config.training.loss_type),
         "elapsed_s": round(float(elapsed), 6),
         "s_per_batch": round(float(elapsed) / max(1, int(batches)), 6),
@@ -318,6 +344,8 @@ def _run_case(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark real transformer train hotpath on panel/windowed tensors.")
     parser.add_argument("--config", default="configs/experiment_baseline.yaml")
+    parser.add_argument("--parquet-root", type=Path, default=None)
+    parser.add_argument("--public-feature-path", type=Path, default=None)
     parser.add_argument("--fold-index", type=int, default=0)
     parser.add_argument("--lookbacks", default="8,32")
     parser.add_argument("--batch-sizes", default=None)
@@ -329,12 +357,63 @@ def main() -> None:
     parser.add_argument("--compile-loss", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--attention-mode", default=None)
     parser.add_argument("--temporal-pooling", default=None)
+    parser.add_argument(
+        "--temporal-query-mode",
+        choices=("full_then_last", "last_only"),
+        default=None,
+    )
+    parser.add_argument("--torch-compile-mode", default=None)
+    parser.add_argument(
+        "--cache-train-features-in-amp-dtype",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--sanitize-inputs", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--amp-native-position-add", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--temporal-self-attention-fast-path",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--compiled-cross-attention-backend",
+        choices=("auto", "manual", "sdpa"),
+        default=None,
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.parquet_root is not None:
+        config.data.parquet_root = str(args.parquet_root)
+    if args.public_feature_path is not None:
+        config.data.tw_public_feature_path = str(args.public_feature_path)
+    if args.torch_compile_mode is not None:
+        config.training.torch_compile_mode = str(args.torch_compile_mode)
+    if args.cache_train_features_in_amp_dtype is not None:
+        config.training.cache_train_features_in_amp_dtype = bool(
+            args.cache_train_features_in_amp_dtype
+        )
+    transformer_config = config.training.transformer_base_portfolio
+    if args.temporal_query_mode is not None:
+        transformer_config.temporal_query_mode = str(args.temporal_query_mode)
+    if args.sanitize_inputs is not None:
+        transformer_config.sanitize_inputs = bool(args.sanitize_inputs)
+    if args.amp_native_position_add is not None:
+        transformer_config.amp_native_position_add = bool(args.amp_native_position_add)
+    if args.temporal_self_attention_fast_path is not None:
+        transformer_config.temporal_self_attention_fast_path = bool(
+            args.temporal_self_attention_fast_path
+        )
+    if args.compiled_cross_attention_backend is not None:
+        transformer_config.compiled_cross_attention_backend = str(
+            args.compiled_cross_attention_backend
+        )
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
+    torch.manual_seed(int(config.training.seed))
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(int(config.training.seed))
 
     panel = build_panel(
         config.data.parquet_root,
@@ -357,6 +436,8 @@ def main() -> None:
         external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
+        panel_start_date=config.data.panel_start_date,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

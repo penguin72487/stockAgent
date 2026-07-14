@@ -42,6 +42,7 @@ from stockagent.training.trainer import (
     _load_state_dict,
     _resolve_amp_dtype,
     _resolve_device,
+    _training_loss_min_trade_weight,
     _training_loss_portfolio_activation,
     _volume_limit_weights_from_notional,
 )
@@ -163,7 +164,7 @@ def _loss_kwargs(config: Any, *, loss_portfolio_activation: str) -> dict[str, An
         "sell_fee_rate": float(config.trading.sell_fee_rate),
         "max_turnover_ratio": float(config.trading.max_turnover_ratio),
         "gross_leverage": 1.0,
-        "min_trade_weight": float(config.trading.min_trade_weight),
+        "min_trade_weight": _training_loss_min_trade_weight(config),
         "portfolio_activation": loss_portfolio_activation,
         "gamma_sharpe": float(ev.gamma_sharpe),
         "gamma_excess": float(ev.gamma_excess),
@@ -1031,6 +1032,8 @@ def main() -> None:
         external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
         feature_include=config.data.feature_include,
         feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
+        panel_start_date=config.data.panel_start_date,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

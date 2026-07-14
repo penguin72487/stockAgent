@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, get_args, get_type_hints
 
@@ -260,6 +261,7 @@ class EnvironmentConfig:
     device: str
     use_tensor_cores: bool
     amp_dtype: str
+    cudnn_benchmark: bool = True
     cpu_threads: int | None = None
     torch_compile_threads: int | None = None
 
@@ -268,6 +270,10 @@ class EnvironmentConfig:
 class DataConfig:
     parquet_root: str
     benchmark_name: str
+    # Inclusive lower bound for the model panel.  Source archives may retain
+    # older rows for provenance even when that interval cannot support an
+    # unbiased training universe.
+    panel_start_date: str | None = None
     security_filter: str = "none"
     usd_only_trading_pairs: bool = False
     tradable_mode: str = "tradable"
@@ -281,6 +287,7 @@ class DataConfig:
     tw_public_market_symbol: str = "__MARKET__"
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
+    feature_zero_fill: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -288,6 +295,8 @@ class WalkForwardConfig:
     min_train_years: int = 1
     val_years: int = 1
     require_future_test_year: bool = True
+    expected_first_year: int | None = None
+    require_contiguous_years: bool = False
 
 
 @dataclass(slots=True)
@@ -445,9 +454,12 @@ class LowRankMarketTransformerPortfolioModelConfig:
 class TransformerBasePortfolioModelConfig:
     d_model: int = 64
     attention_mode: str = "latent"
+    use_latent_factors: bool | None = None
+    use_market_tokens: bool | None = None
     use_flash_attention: bool = True
     use_time_pos: bool = True
     use_symbol_pos: bool = True
+    symbol_position_capacity: int | None = None
     input_dropout: float = 0.0
     sanitize_inputs: bool = True
     amp_native_position_add: bool = False
@@ -632,7 +644,7 @@ class TrainingConfig:
     non_blocking_transfer: bool
     model_name: str = "mlp"
     seed: int = 42
-    multi_gpu_strategy: str = "none"
+    multi_gpu_strategy: str = "auto"
     ddp_bucket_cap_mb: int = 4
     enable_torch_compile: bool = True
     auto_torch_compile_sharpe: bool = False
@@ -641,7 +653,12 @@ class TrainingConfig:
     triton_cache_dir: str = "~/.cache/triton"
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
+    # Executor-only optimization: keep the train batch/time axis static while
+    # allowing one compiled canonical-loss graph to serve changing symbol
+    # counts across expanding walk-forward folds.
+    compile_loss_dynamic_symbols: bool = False
     loss_portfolio_activation: str = "auto"
+    loss_min_trade_weight: float | None = None
     warm_start_from_previous_fold: bool = False
     chunk_rows: int = 0
     eval_model_chunk_rows: int | str = "auto"
@@ -972,6 +989,7 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         "no": "none",
         "single": "none",
         "single_gpu": "none",
+        "auto": "auto",
         "ddp": "distributed_data_parallel",
         "distributed": "distributed_data_parallel",
         "distributed_data_parallel": "distributed_data_parallel",
@@ -983,8 +1001,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "use 'distributed_data_parallel' with torchrun"
         )
     multi_gpu_strategy = multi_gpu_aliases.get(multi_gpu_strategy, multi_gpu_strategy)
-    if multi_gpu_strategy not in {"none", "distributed_data_parallel"}:
-        raise ValueError("training.multi_gpu_strategy must be one of: none, distributed_data_parallel")
+    if multi_gpu_strategy not in {"auto", "none", "distributed_data_parallel"}:
+        raise ValueError("training.multi_gpu_strategy must be one of: auto, none, distributed_data_parallel")
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
     training["best_checkpoint_max_epoch"] = max(0, int(training["best_checkpoint_max_epoch"]))
@@ -1331,6 +1349,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["panel_backend"] = panel_backend
     data["panel_load_workers"] = max(0, int(data["panel_load_workers"]))
     data["live_tail_panel_rows"] = max(0, int(data["live_tail_panel_rows"]))
+    raw_panel_start_date = data.get("panel_start_date")
+    if raw_panel_start_date is None or not str(raw_panel_start_date).strip():
+        data["panel_start_date"] = None
+    else:
+        panel_start_date = str(raw_panel_start_date).strip()
+        try:
+            parsed_panel_start_date = date.fromisoformat(panel_start_date)
+        except ValueError as exc:
+            raise ValueError(
+                "data.panel_start_date must be an ISO date (YYYY-MM-DD) or null, "
+                f"got {raw_panel_start_date!r}"
+            ) from exc
+        data["panel_start_date"] = parsed_panel_start_date.isoformat()
+        expected_first_year = walk_forward.get("expected_first_year")
+        if (
+            expected_first_year is not None
+            and int(expected_first_year) != parsed_panel_start_date.year
+        ):
+            raise ValueError(
+                "walk_forward.expected_first_year must match the year of "
+                "data.panel_start_date; got "
+                f"{expected_first_year!r} and {data['panel_start_date']!r}"
+            )
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])
     data["tw_public_feature_path"] = str(data["tw_public_feature_path"] or "").strip()
@@ -1341,6 +1382,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     data["feature_include"] = _normalize_string_list(data["feature_include"], field_name="data.feature_include")
     data["feature_exclude"] = _normalize_string_list(data["feature_exclude"], field_name="data.feature_exclude")
+    data["feature_zero_fill"] = _normalize_string_list(
+        data["feature_zero_fill"], field_name="data.feature_zero_fill"
+    )
     plot_backend = str(training["plot_backend"]).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}
     if plot_backend not in valid_plot_backends:
@@ -1461,6 +1505,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         training["loss_portfolio_activation"] = "auto"
     else:
         training["loss_portfolio_activation"] = normalize_portfolio_activation(loss_activation)
+    loss_min_trade_weight = training["loss_min_trade_weight"]
+    if loss_min_trade_weight is None or str(loss_min_trade_weight).strip().lower() in {
+        "",
+        "auto",
+        "trading",
+        "same",
+        "same_as_trading",
+    }:
+        training["loss_min_trade_weight"] = None
+    else:
+        training["loss_min_trade_weight"] = max(0.0, float(loss_min_trade_weight))
     fee_per_side_raw = trading.get("fee_per_side", None)
     buy_fee_raw = trading.get("buy_fee_rate", None)
     sell_fee_raw = trading.get("sell_fee_rate", None)
@@ -1518,7 +1573,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             triton_cache_dir=training_raw["triton_cache_dir"],
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
+            compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
+            loss_min_trade_weight=training_raw["loss_min_trade_weight"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],
             chunk_rows=training_raw["chunk_rows"],
             eval_model_chunk_rows=training_raw["eval_model_chunk_rows"],

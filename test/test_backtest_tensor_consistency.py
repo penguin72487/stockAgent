@@ -1189,6 +1189,102 @@ def test_compiled_loss_strict_no_fallback_raises_after_cudagraph_state_overwrite
     assert calls == {"compiled": 1, "eager": 0}
 
 
+def test_compiled_loss_dynamic_symbols_marks_only_asset_axes() -> None:
+    observed: dict[str, set[int]] = {}
+
+    def compiled_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        observed["weights"] = set(getattr(weights, "_dynamo_dynamic_indices", set()))
+        observed["returns"] = set(getattr(returns, "_dynamo_dynamic_indices", set()))
+        observed["tradable"] = set(getattr(tradable, "_dynamo_dynamic_indices", set()))
+        benchmark = kwargs["benchmark_returns"]
+        observed["benchmark"] = set(
+            getattr(benchmark, "_dynamo_dynamic_indices", set())
+        )
+        initial = kwargs["aux_outputs"]["initial_weights"]
+        observed["initial"] = set(getattr(initial, "_dynamo_dynamic_indices", set()))
+        return weights.sum()
+
+    wrapped = _CompiledLossFallback(
+        compiled_fn,
+        lambda *args, **kwargs: args[0].sum(),
+        label="dynamic-symbol-test",
+        dynamic_symbol_axis=True,
+        dynamic_symbol_max=2304,
+    )
+    weights = torch.zeros((8, 13))
+    returns = torch.zeros_like(weights)
+    tradable = torch.ones_like(weights, dtype=torch.bool)
+    benchmark = torch.zeros(8)
+    initial = torch.zeros(13)
+
+    wrapped(
+        weights,
+        returns,
+        tradable,
+        benchmark_returns=benchmark,
+        can_buy_mask=tradable.clone(),
+        aux_outputs={"initial_weights": initial},
+    )
+
+    assert observed == {
+        "weights": {1},
+        "returns": {1},
+        "tradable": {1},
+        "benchmark": set(),
+        "initial": {0},
+    }
+
+
+def test_compiled_loss_dynamic_symbols_reuses_one_graph_across_symbol_counts() -> None:
+    compile_calls = 0
+
+    def counting_backend(graph_module, _example_inputs):
+        nonlocal compile_calls
+        compile_calls += 1
+        return graph_module.forward
+
+    def loss_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **_kwargs,
+    ) -> torch.Tensor:
+        return torch.where(tradable, weights * returns, 0.0).sum()
+
+    compiled = torch.compile(
+        loss_fn,
+        backend=counting_backend,
+        fullgraph=True,
+        dynamic=None,
+    )
+    wrapped = _CompiledLossFallback(
+        compiled,
+        loss_fn,
+        label="dynamic-symbol-graph-test",
+        dynamic_symbol_axis=True,
+        dynamic_symbol_max=2304,
+    )
+
+    for symbols in (7, 19):
+        weights = torch.ones((8, symbols))
+        returns = torch.ones_like(weights)
+        tradable = torch.ones_like(weights, dtype=torch.bool)
+        wrapped(
+            weights,
+            returns,
+            tradable,
+            benchmark_returns=torch.zeros(8),
+            aux_outputs={"initial_weights": torch.zeros(symbols)},
+        )
+
+    assert compile_calls == 1
+
+
 def test_eval_chunk_estimate_uses_full_eval_rows_not_probe_rows() -> None:
     assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=2048) == 2048
     assert _estimate_eval_chunk_rows(total_rows=4096, estimated_rows=999999) == 4096
@@ -1774,6 +1870,7 @@ def test_compile_probe_uses_fixed_aux_shape_and_restores_rng_and_gradients() -> 
     model = _RequiredAuxTrainModel()
     torch.manual_seed(1234)
     rng_before = torch.get_rng_state().clone()
+    observed_output_dtypes: list[torch.dtype] = []
 
     ok, error = _probe_compiled_train_forward(
         model,
@@ -1788,11 +1885,13 @@ def test_compile_probe_uses_fixed_aux_shape_and_restores_rng_and_gradients() -> 
         factor_aug_kwargs=None,
         direction_weight=0.0,
         volatility_regime_weight=0.0,
+        observed_output_dtypes=observed_output_dtypes,
     )
 
     assert ok, error
     assert torch.equal(torch.get_rng_state(), rng_before)
     assert model.return_aux_requests == [True]
+    assert observed_output_dtypes == [torch.float32]
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
@@ -1917,12 +2016,66 @@ def test_compiled_loss_probe_executes_rules_and_backward_at_fixed_batch_shape() 
         loss_kwargs={},
         max_volume_participation=0.0,
         volume_participation_equity=1_000_000.0,
+        weights_dtype=torch.float64,
     )
 
     assert ok, error
     assert captured["weights"].shape == (4, panel.num_symbols)
+    assert captured["weights"].dtype == torch.float64
     assert captured["weights"].grad is not None
     assert bool(captured["force_exit"][0, 0]) is True
+
+
+def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None:
+    panel = _make_panel(rows=9, symbols=4, features=3)
+    dataset = CrossSectionalDataset(panel, np.arange(panel.num_dates), lookback=3)
+    split = _pad_windowed_training_split(dataset_to_windowed_tensors(dataset), batch_size=4)
+    gather_calls = {"autograd": 0, "no_grad": 0}
+    captured: dict[str, torch.Tensor] = {}
+
+    monkeypatch.setattr(trainer_module, "_distributed_is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 2)
+    monkeypatch.setattr(trainer_module, "_distributed_rank", lambda: 0)
+
+    def gather_autograd(value: torch.Tensor) -> torch.Tensor:
+        gather_calls["autograd"] += 1
+        return torch.cat((value, value), dim=0)
+
+    def gather_no_grad(value: torch.Tensor) -> torch.Tensor:
+        gather_calls["no_grad"] += 1
+        return torch.cat((value, value), dim=0)
+
+    monkeypatch.setattr(trainer_module, "_all_gather_autograd", gather_autograd)
+    monkeypatch.setattr(trainer_module, "_all_gather_no_grad", gather_no_grad)
+
+    def loss_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **_kwargs,
+    ) -> torch.Tensor:
+        captured["weights"] = weights
+        captured["returns"] = returns
+        captured["tradable"] = tradable
+        return (weights.square() + weights * returns).mean()
+
+    ok, error = _probe_compiled_loss_forward_backward(
+        loss_fn,
+        split,
+        batch_size=4,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        non_blocking=False,
+        loss_kwargs={},
+        max_volume_participation=0.0,
+        volume_participation_equity=1_000_000.0,
+    )
+
+    assert ok, error
+    assert gather_calls == {"autograd": 1, "no_grad": 9}
+    assert captured["weights"].shape == (4, panel.num_symbols)
+    assert captured["returns"].shape == captured["weights"].shape
+    assert captured["tradable"].shape == captured["weights"].shape
 
 
 def test_portfolio_autoencoder_aux_contract_fails_without_latent() -> None:
@@ -3117,6 +3270,28 @@ def test_run_training_restores_strict_backtest_runtime_after_empty_fold(tmp_path
     assert torch.isfinite(result.strategy_returns).all()
 
 
+def test_train_group_recompile_budget_scales_and_restores() -> None:
+    import torch._dynamo.config as dynamo_config
+
+    original = int(dynamo_config.recompile_limit)
+    group_count = original + 4
+    with trainer_module._dynamo_recompile_budget_for_train_groups(group_count) as limit:
+        assert limit == group_count + 1
+        assert int(dynamo_config.recompile_limit) == group_count + 1
+    assert int(dynamo_config.recompile_limit) == original
+    with pytest.raises(RuntimeError, match="probe failure"):
+        with trainer_module._dynamo_recompile_budget_for_train_groups(group_count):
+            raise RuntimeError("probe failure")
+    assert int(dynamo_config.recompile_limit) == original
+
+
+def test_compiled_panel_slab_eval_uses_separate_eager_wrapper() -> None:
+    source = inspect.getsource(trainer_module.run_training)
+    assert "eval_panel_slab_model = _PanelSlabForwardWrapper(model)" in source
+    assert "eager_panel_slab_separate_from_compiled_train" in source
+    assert "eval_model,\n                    panel_slab_model," not in source
+
+
 def test_ddp_batch_size_contract_only_rounds_automatic_candidates() -> None:
     assert _normalize_ddp_global_batch_size(32, 2, auto_selected=False) == 32
     assert _normalize_ddp_global_batch_size(31, 2, auto_selected=True) == 30
@@ -3143,6 +3318,32 @@ def test_distributed_compile_and_auto_batch_consensus_observe_remote_minimum(mon
     # failure and take the same fallback/strict branch on every rank.
     assert not _distributed_probe_succeeded(True, torch.device("cpu"))
     assert _distributed_min_int(32, torch.device("cpu")) == 24
+
+
+def test_rank_ordered_compile_probe_runs_once_on_each_rank_turn(monkeypatch) -> None:
+    monkeypatch.setattr(trainer_module, "_distributed_is_initialized", lambda: True)
+    monkeypatch.setattr(trainer_module, "_distributed_world_size", lambda: 3)
+    monkeypatch.setattr(trainer_module, "_distributed_rank", lambda: 1)
+    events: list[str] = []
+    monkeypatch.setattr(
+        trainer_module,
+        "_distributed_barrier",
+        lambda: events.append("barrier"),
+    )
+    monkeypatch.setattr(
+        trainer_module,
+        "_distributed_probe_succeeded",
+        lambda local_success, device: bool(local_success),
+    )
+
+    ok, error = trainer_module._run_distributed_compile_probe(
+        lambda: (events.append("probe") or True, None),
+        device=torch.device("cpu"),
+        rank_ordered=True,
+    )
+
+    assert ok and error is None
+    assert events == ["barrier", "probe", "barrier", "barrier"]
 
 
 def test_rank0_final_artifact_failure_is_raised_on_waiting_worker(monkeypatch) -> None:
@@ -3299,6 +3500,44 @@ def test_prepare_windowed_split_reuses_prepared_shared_base() -> None:
     actual = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
     for key in expected:
         assert torch.equal(actual[key], expected[key]), key
+
+
+def test_full_eval_splits_share_base_when_train_symbols_are_compacted() -> None:
+    panel = _make_panel(rows=14, symbols=5, features=3)
+    train_raw = dataset_to_windowed_tensors(
+        CrossSectionalDataset(panel, torch.arange(0, 8).numpy(), lookback=3)
+    )
+    train = _prepare_windowed_split(
+        train_raw.subset_symbols(torch.tensor([0, 2, 4])),
+        torch.device("cpu"),
+        non_blocking=False,
+        name="compacted train",
+    )
+    validation = _prepare_windowed_split(
+        dataset_to_windowed_tensors(
+            CrossSectionalDataset(panel, torch.arange(4, 11).numpy(), lookback=3)
+        ),
+        torch.device("cpu"),
+        non_blocking=False,
+        shared_base=train,
+        name="validation",
+    )
+    test = _prepare_windowed_split(
+        dataset_to_windowed_tensors(
+            CrossSectionalDataset(panel, torch.arange(7, 14).numpy(), lookback=3)
+        ),
+        torch.device("cpu"),
+        non_blocking=False,
+        shared_base=validation,
+        name="test",
+    )
+
+    assert validation.num_symbols == panel.num_symbols
+    assert validation.features.data_ptr() != train.features.data_ptr()
+    assert test.features.data_ptr() == validation.features.data_ptr()
+    assert test.future_log_returns.data_ptr() == validation.future_log_returns.data_ptr()
+    assert test.tradable_mask.data_ptr() == validation.tradable_mask.data_ptr()
+    assert test.valid_indices.data_ptr() != validation.valid_indices.data_ptr()
 
 
 def test_short_open_fallback_does_not_alias_sell_mask_storage() -> None:
