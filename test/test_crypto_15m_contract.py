@@ -30,13 +30,16 @@ def test_discord_crypto_market_uses_15m_incremental_updater() -> None:
     assert "incremental" in cfg.pre_signal_command
 
 
-def test_discord_tw_market_uses_official_ohlcv_without_audit() -> None:
+def test_discord_tw_market_uses_canonical_official_data_layer() -> None:
     cfg = load_market_config("services/discord_bot/markets/tw.yaml")
     command = " ".join(cfg.pre_signal_command)
 
-    assert "downloader/update_tw_official_ohlcv.py" in command
-    assert "--public-output-dir data_tw_public" in command
-    assert "--symbols-root data_yahoo/tw_stocks" in command
+    assert "downloader/download_tw_official_data.py" in command
+    assert "--mode daily" in command
+    assert "--public-dir data_tw_public" in command
+    assert "--stock-root data_tw_public/stocks" in command
+    assert "--ohlcv-fallback yahoo" in command
+    assert "--fallback-start-date 2000-01-01" in command
     assert "audit_ohlcv_data.py" not in command
 
 

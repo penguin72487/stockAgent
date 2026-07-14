@@ -569,9 +569,14 @@ class TransformerBasePortfolioModel(nn.Module):
 
     - full:       O((L*S)^2), most complete, for small universes.
     - axial:      O(S*L^2 + L*S^2), temporal then cross-stock attention.
-    - latent:     O(S*L^2 + S*K + K*M + S*(K+M)), low-rank bottleneck.
+    - latent:     O(S*L^2 + S*K + K*M + S*(K+M)), factor + market bottlenecks.
+    - latent_only: O(S*L^2 + S*K), latent-factor bottleneck without market tokens.
     - market_token: O(S*L^2 + S*M), market-token bottleneck.
     - temporal_only: O(S*L^2), no cross-stock attention.
+
+    ``use_latent_factors`` and ``use_market_tokens`` independently select the
+    compact bottlenecks.  When omitted, ``attention_mode`` keeps its historical
+    preset semantics so existing configs and checkpoints remain compatible.
     """
 
     def __init__(
@@ -584,6 +589,7 @@ class TransformerBasePortfolioModel(nn.Module):
         use_flash_attention: bool = True,
         use_time_pos: bool = True,
         use_symbol_pos: bool = True,
+        symbol_position_capacity: int | None = None,
         input_dropout: float = 0.0,
         sanitize_inputs: bool = True,
         amp_native_position_add: bool = False,
@@ -627,13 +633,28 @@ class TransformerBasePortfolioModel(nn.Module):
         categorical_feature_indices: Sequence[int] | None = None,
         categorical_embedding_dim: int = 4,
         categorical_embedding_cardinality: int = 512,
+        use_latent_factors: bool | None = None,
+        use_market_tokens: bool | None = None,
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.d_model = int(d_model)
-        self.attention_mode = self._normalize_attention_mode(attention_mode)
+        resolved_symbol_capacity = (
+            self.num_symbols if symbol_position_capacity is None else int(symbol_position_capacity)
+        )
+        if resolved_symbol_capacity <= 0:
+            raise ValueError("symbol_position_capacity must be positive")
+        self.symbol_position_capacity = resolved_symbol_capacity
+        self.requested_attention_mode = self._normalize_attention_mode(attention_mode)
+        self.attention_mode = self._resolve_attention_mode(
+            self.requested_attention_mode,
+            use_latent_factors=use_latent_factors,
+            use_market_tokens=use_market_tokens,
+        )
+        self.use_latent_factors = self.attention_mode in {"latent", "latent_only"}
+        self.use_market_tokens = self.attention_mode in {"latent", "market_token"}
         self.temporal_pooling = self._normalize_pooling(temporal_pooling)
         self.temporal_query_mode = self._normalize_temporal_query_mode(temporal_query_mode)
         self.default_temperature = float(default_temperature)
@@ -703,7 +724,9 @@ class TransformerBasePortfolioModel(nn.Module):
             self.categorical_proj = None
         self.input_dropout = nn.Dropout(float(input_dropout))
         self.time_position = nn.Parameter(torch.randn(1, self.lookback, 1, self.d_model) * 0.02)
-        self.symbol_position = nn.Parameter(torch.randn(1, 1, self.num_symbols, self.d_model) * 0.02)
+        self.symbol_position = nn.Parameter(
+            torch.randn(1, 1, self.symbol_position_capacity, self.d_model) * 0.02
+        )
         self.register_buffer(
             "temporal_rope_positions",
             torch.arange(self.lookback, dtype=torch.float32),
@@ -754,12 +777,12 @@ class TransformerBasePortfolioModel(nn.Module):
         market_count = max(1, int(num_market_tokens))
         self.latent_queries = (
             nn.Parameter(torch.randn(1, latent_count, self.d_model) * 0.02)
-            if self.attention_mode == "latent"
+            if self.use_latent_factors
             else None
         )
         self.market_queries = (
             nn.Parameter(torch.randn(1, market_count, self.d_model) * 0.02)
-            if self.attention_mode in {"latent", "market_token"}
+            if self.use_market_tokens
             else None
         )
         # Populated only by strict legacy-checkpoint reconstruction.
@@ -770,7 +793,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(latent_layers)))
             ]
-            if self.attention_mode == "latent"
+            if self.use_latent_factors
             else []
         )
         self.market_blocks = nn.ModuleList(
@@ -778,7 +801,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
-            if self.attention_mode in {"latent", "market_token"}
+            if self.use_market_tokens
             else []
         )
         self.stock_read_latent_blocks = nn.ModuleList(
@@ -786,7 +809,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
-            if self.attention_mode == "latent"
+            if self.use_latent_factors
             else []
         )
         self.stock_read_market_blocks = nn.ModuleList(
@@ -794,7 +817,7 @@ class TransformerBasePortfolioModel(nn.Module):
                 make_block(int(cross_heads), int(cross_ffn_mult))
                 for _ in range(max(1, int(market_layers)))
             ]
-            if self.attention_mode in {"latent", "market_token"}
+            if self.use_market_tokens
             else []
         )
 
@@ -805,6 +828,11 @@ class TransformerBasePortfolioModel(nn.Module):
             nn.Linear(self.d_model, 1),
         )
         self.stock_market_norm = _make_norm(self.d_model, self.norm_type)
+        if self.attention_mode == "latent_only":
+            # The new factor-only path deliberately bypasses the market gate.
+            # Freeze only this new mode so every historical preset retains its
+            # exact trainable-parameter contract.
+            self.stock_market_gate.requires_grad_(False)
 
         def make_scalar_head() -> nn.Sequential:
             head: list[nn.Module] = []
@@ -897,17 +925,65 @@ class TransformerBasePortfolioModel(nn.Module):
             "axis": "axial",
             "low_rank": "latent",
             "latent_factor": "latent",
+            "factor_only": "latent_only",
+            "latent_factor_only": "latent_only",
             "market": "market_token",
             "market_tokens": "market_token",
             "none": "temporal_only",
             "temporal": "temporal_only",
         }
         normalized = aliases.get(normalized, normalized)
-        if normalized in {"full", "axial", "latent", "market_token", "temporal_only"}:
+        if normalized in {
+            "full",
+            "axial",
+            "latent",
+            "latent_only",
+            "market_token",
+            "temporal_only",
+        }:
             return normalized
         raise ValueError(
-            "attention_mode must be one of: full, axial, latent, market_token, temporal_only"
+            "attention_mode must be one of: full, axial, latent, latent_only, "
+            "market_token, temporal_only"
         )
+
+    @classmethod
+    def _resolve_attention_mode(
+        cls,
+        attention_mode: str,
+        *,
+        use_latent_factors: bool | None,
+        use_market_tokens: bool | None,
+    ) -> str:
+        """Resolve legacy presets plus the two independent bottleneck switches."""
+        requested = cls._normalize_attention_mode(attention_mode)
+        for name, value in (
+            ("use_latent_factors", use_latent_factors),
+            ("use_market_tokens", use_market_tokens),
+        ):
+            if value is not None and type(value) is not bool:
+                raise TypeError(f"{name} must be bool or None, got {type(value).__name__}")
+
+        preset_latent = requested in {"latent", "latent_only"}
+        preset_market = requested in {"latent", "market_token"}
+        resolved_latent = preset_latent if use_latent_factors is None else use_latent_factors
+        resolved_market = preset_market if use_market_tokens is None else use_market_tokens
+
+        if requested in {"full", "axial"}:
+            if resolved_latent or resolved_market:
+                raise ValueError(
+                    "use_latent_factors/use_market_tokens cannot enable compact bottlenecks "
+                    f"with attention_mode={requested}; set both to false/null or choose a "
+                    "compact attention_mode"
+                )
+            return requested
+        if resolved_latent and resolved_market:
+            return "latent"
+        if resolved_latent:
+            return "latent_only"
+        if resolved_market:
+            return "market_token"
+        return "temporal_only"
 
     @staticmethod
     def _normalize_pooling(pooling: str) -> str:
@@ -1068,8 +1144,11 @@ class TransformerBasePortfolioModel(nn.Module):
     def _symbol_position(self, n_symbols: int, symbol_indices: torch.Tensor | None = None) -> torch.Tensor:
         if symbol_indices is not None:
             indices = symbol_indices.to(device=self.symbol_position.device, dtype=torch.long)
-            indices = indices.clamp(0, int(self.symbol_position.size(2)) - 1)
-            return self.symbol_position.index_select(2, indices)
+            capacity = int(self.symbol_position.size(2))
+            valid = indices.ge(0) & indices.lt(capacity)
+            safe_indices = indices.clamp(0, capacity - 1)
+            positions = self.symbol_position.index_select(2, safe_indices)
+            return positions * valid.view(1, 1, -1, 1).to(dtype=positions.dtype)
         if n_symbols <= int(self.symbol_position.size(2)):
             return self.symbol_position[:, :, :n_symbols, :]
         extra = self.symbol_position.new_zeros(
@@ -1342,6 +1421,7 @@ class TransformerBasePortfolioModel(nn.Module):
         *,
         use_latent: bool,
         collect_aux: bool,
+        use_market: bool = True,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         h = self._apply_temporal_blocks(
             h,
@@ -1379,6 +1459,23 @@ class TransformerBasePortfolioModel(nn.Module):
             market_key_mask = safe_mask
             z_factor_context = z_base
             z_gate_base = z_base
+
+        if not use_market:
+            if not use_latent:
+                raise RuntimeError("latent/market forward requires at least one enabled bottleneck")
+            z_stock = self.stock_market_norm(z_factor_context)
+            z_stock = z_stock.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
+            if collect_aux:
+                aux.update(
+                    {
+                        "token_embedding": h,
+                        "stock_embedding": z_base,
+                        "factor_tokens": factor_tokens,
+                        "latent_factors": factor_tokens,
+                        "z_factor_context": z_factor_context,
+                    }
+                )
+            return z_stock, aux
 
         if self.market_queries is None:
             raise RuntimeError("market_queries are required for latent/market_token attention")
@@ -1488,7 +1585,21 @@ class TransformerBasePortfolioModel(nn.Module):
         elif self.attention_mode == "axial":
             z_stock, aux = self._forward_axial(h, safe_mask, collect_aux=collect_aux)
         elif self.attention_mode == "latent":
-            z_stock, aux = self._forward_latent_or_market(h, safe_mask, use_latent=True, collect_aux=collect_aux)
+            z_stock, aux = self._forward_latent_or_market(
+                h,
+                safe_mask,
+                use_latent=True,
+                use_market=True,
+                collect_aux=collect_aux,
+            )
+        elif self.attention_mode == "latent_only":
+            z_stock, aux = self._forward_latent_or_market(
+                h,
+                safe_mask,
+                use_latent=True,
+                use_market=False,
+                collect_aux=collect_aux,
+            )
         elif self.attention_mode == "market_token":
             z_stock, aux = self._forward_market_token_fast(h, safe_mask, collect_aux=collect_aux)
         else:

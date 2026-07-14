@@ -155,9 +155,17 @@ feature projection
 
 - `full`: `O((L*S)^2)`，最完整，只適合小 universe 或 debug。
 - `axial`: `O(S*L^2 + L*S^2)`，時間和股票分解。
-- `latent`: `O(S*L^2 + S*K + K*M + S*(K+M))`，大型 universe 預設友善。
+- `latent`: `O(S*L^2 + S*K + K*M + S*(K+M))`，latent factors 加
+  market tokens 的歷史 preset。
+- `latent_only`: `O(S*L^2 + S*K)`，只保留 latent-factor bottleneck。
 - `market_token`: `O(S*L^2 + S*M)`，更小的 cross-stock bottleneck。
 - `temporal_only`: 只看個股時間序列，不做 cross-stock mixing。
+
+`use_latent_factors` 與 `use_market_tokens` 可獨立覆寫 compact preset；設為
+`null` 時沿用 `attention_mode` 的歷史語意。在 compact attention modes 中，
+兩者分別為 `true/false` 即 factor-only，`false/true` 即 market-only，皆為
+`false` 即 temporal-only。`full`/`axial` 不可同時啟用這兩個 compact
+bottleneck；兩者皆關閉時仍保留原本的 full/axial 路徑。
 
 目前 modern transformer 元件:
 
@@ -167,7 +175,7 @@ feature projection
 - QK-Norm
 - temporal RoPE
 - PyTorch SDPA/FlashAttention path
-- dynamic latent/market token generator
+- learned static latent/market query anchors
 
 2026-06-09 熱路徑更新:
 
@@ -354,6 +362,8 @@ training:
   explain_umap_enabled: true
   transformer_base_portfolio:
     attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
     use_flash_attention: true
     sdpa_batch_limit: 16384
     return_aux_details: false

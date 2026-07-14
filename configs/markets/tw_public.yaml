@@ -1,98 +1,145 @@
-experiment_name: tw-stock-transformer-market-public-data-all
+experiment_name: tw-stock-transformer-market-public-data-all-available
 
 runner:
-  output_dir: artifacts/markets/tw_public_all
+  # The all-available feature schema is checkpoint-incompatible with the old
+  # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
+  output_dir: artifacts/markets/tw_public_lantent
   mode: train
   resume: true
-  post_train_infer: false
-  start_fold: 25
+  post_train_infer: true
+  # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
+  start_fold: 1
 environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
+  # Ryzen 7 5800X3D: use all 16 logical CPUs for runtime work, but only the
+  # eight physical cores for Inductor compilation to avoid SMT contention.
+  cpu_threads: 16
+  torch_compile_threads: 8
 
 data:
-  parquet_root: data_yahoo/tw_stocks
+  # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
+  # Run downloader/download_tw_official_data.py before training.
+  parquet_root: data_tw_public/stocks
+  # Official archives plus terminal Yahoo receipts prove that 80 disappeared
+  # securities cannot be reconstructed before 2004-04-29.  Keep those source
+  # rows for provenance, but train only on the first complete calendar year.
+  panel_start_date: "2005-01-01"
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
   panel_load_workers: 16
-  trading_volume_policy: auto
+  trading_volume_policy: required
   tradable_mode: tw_limit_guard
   use_tw_public_features: true
   use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
-  # Manual feature switch.
-  # Default below keeps every current panel feature enabled.
-  # To disable one feature, add "#" before that feature line.
-  # Changing this list changes model input_dim; use a fresh output_dir or resume=false.
-  # Exact feature names and glob patterns are both supported.
+  # Use every engineered base and TW-public feature. Each external value is
+  # overlaid only on its point-in-time availability date; state-like features
+  # are forward-filled from their first known observation. Before first
+  # availability (and for unresolved missing cells), panel construction fills
+  # the value with 0 instead of deleting the entire feature family.
   feature_include:
     # Base price log returns
-    # - open_logret_1d
-    # - max_logret_1d
-    # - min_logret_1d
-    # - close_logret_1d
+    - open_logret_1d
+    - max_logret_1d
+    - min_logret_1d
+    - close_logret_1d
 
-    # Base volume
+    # Base volume and signed volume
     - trading_volume_logret_1d
     - signed_vol
 
-    # Base K-bar body
+    # Base candlestick body, close location, and shadows
     - body_ratio
     - signed_body_ratio
     - delta_body_ratio
-
-    # Base close location value
     - clv
     - clv_centered
     - delta_clv
-
-    # Base shadows
     - upper_shadow
     - lower_shadow
     - shadow_imbalance
 
-    # TW public official daily price/volume
-    # - twpub_official_close_logret_1d
-    # - twpub_official_trading_volume_log
-    # - twpub_official_trading_value_log
-    # - twpub_official_trades_log
-    # - twpub_official_turnover_ratio
-    # - twpub_official_intraday_range
-    # - twpub_official_close_to_high
-    # - twpub_official_close_to_low
-    # - twpub_tpex_next_limit_up_ret
-    # - twpub_tpex_next_limit_down_ret
+    # Official TWSE/TPEx daily price and liquidity
+    - twpub_official_close_logret_1d
+    - twpub_official_trading_volume_log
+    - twpub_official_trading_value_log
+    - twpub_official_trades_log
+    - twpub_official_turnover_ratio
+    - twpub_official_intraday_range
+    - twpub_official_close_to_high
+    - twpub_official_close_to_low
 
-    # TW public valuation
+    # Valuation and dividend yield
     - twpub_pe_log
     - twpub_pb_log
-    # - twpub_dividend_yield
-    # - twpub_dividend_per_share_log
+    - twpub_dividend_yield
+    - twpub_dividend_per_share_log
 
-    # TW public margin / short balance
+    # Margin financing and short balances/flows
     - twpub_margin_balance_log
     - twpub_margin_balance_chg
-    # - twpub_short_balance_log
+    - twpub_short_balance_log
     - twpub_short_balance_chg
     - twpub_margin_buy_flow
     - twpub_margin_sell_flow
     - twpub_short_sell_flow
     - twpub_short_buy_flow
 
-    # TW public institutional flow
+    # Institutional trading flows
     - twpub_foreign_net_buy_flow
     - twpub_investment_trust_net_buy_flow
     - twpub_dealer_net_buy_flow
     - twpub_institutional_net_buy_flow
 
-    # Point-in-time monthly revenue / financial statements
+    # TDCC shareholding distribution
+    - twpub_tdcc_retail_holder_ratio
+    - twpub_tdcc_large_holder_ratio
+    - twpub_tdcc_holder_count_log
+
+    # Company profile and categorical identity
+    - twpub_company_paidin_capital_log
+    - twpub_company_issued_shares_log
+    - twpub_company_private_shares_log
+    - twpub_company_age_years
+    - twpub_company_listed_age_years
+    - twpub_company_par_value_log
+    - twpub_company_industry_code
+    - twpub_company_is_foreign
+    - twpub_company_has_preferred_stock
+
+    # Dividend announcements and ex-dividend information
+    - twpub_dividend_cash_per_share
+    - twpub_dividend_stock_per_share
+    - twpub_dividend_total_cash_log
+    - twpub_dividend_total_stock_log
+    - twpub_dividend_confirmed
+    - twpub_dividend_board_approved
+    - twpub_exdiv_known
+    - twpub_exdiv_cash_dividend
+    - twpub_exdiv_stock_dividend_ratio
+    - twpub_exdiv_subscription_ratio
+    - twpub_exdiv_subscription_price_log
+
+    # Material events, attention stocks, and disposal stocks
+    - twpub_material_event_count_log
+    - twpub_material_clause_log
+    - twpub_material_fact_lag_days
+    - twpub_attention_count_log
+    - twpub_attention_close_log
+    - twpub_attention_pe_log
+    - twpub_disposal_count_log
+
+    # Point-in-time monthly revenue
     - twpub_monthly_revenue_log
     - twpub_monthly_revenue_mom
     - twpub_monthly_revenue_yoy
     - twpub_cumulative_revenue_yoy
+
+    # Point-in-time income statement and balance sheet
     - twpub_financial_eps
     - twpub_financial_revenue_log
     - twpub_financial_net_income_asinh
@@ -105,78 +152,41 @@ data:
     - twpub_financial_equity_ratio
     - twpub_financial_book_value_per_share_log
 
-    # Point-in-time ownership / securities lending
+    # Insider ownership and announced transfers
     - twpub_insider_holdings_log
     - twpub_insider_pledge_ratio
     - twpub_insider_transfer_shares_log
+
+    # Securities borrowing and short-sale availability
     - twpub_borrow_available_log
     - twpub_sbl_balance_log
     - twpub_short_sale_available_log
 
-    # TW public TDCC holders
-    - twpub_tdcc_retail_holder_ratio
-    - twpub_tdcc_large_holder_ratio
-    - twpub_tdcc_holder_count_log
+    # TAIEX and USD/TWD market state
+    - twpub_twse_taiex_log
+    - twpub_twse_taiex_logret_1d
+    - twpub_twse_taiex_pct
+    - twpub_usdtwd_log
+    - twpub_usdtwd_logret_1d
 
-    # TW public company profile
-    - twpub_company_paidin_capital_log
-    - twpub_company_issued_shares_log
-    - twpub_company_private_shares_log
-    - twpub_company_age_years
-    - twpub_company_listed_age_years
-    - twpub_company_par_value_log
-    # - twpub_company_industry_code
-    # - twpub_company_is_foreign
-    # - twpub_company_has_preferred_stock
+    # Central Bank of Taiwan monetary data
+    - twpub_cbc_overnight_rate
+    - twpub_cbc_overnight_rate_chg
+    - twpub_cbc_fx_reserves_log
+    - twpub_cbc_fx_reserves_chg
+    - twpub_cbc_m1b_log
+    - twpub_cbc_m1b_yoy
+    - twpub_cbc_m2_log
+    - twpub_cbc_m2_yoy
 
-    # TW public dividend / ex-dividend
-    # - twpub_dividend_cash_per_share
-    # - twpub_dividend_stock_per_share
-    # - twpub_dividend_total_cash_log
-    # - twpub_dividend_total_stock_log
-    # - twpub_dividend_confirmed
-    # - twpub_dividend_board_approved
-    # - twpub_dividend_year
-    # - twpub_exdiv_known
-    # - twpub_exdiv_cash_dividend
-    # - twpub_exdiv_stock_dividend_ratio
-    # - twpub_exdiv_subscription_ratio
-    # - twpub_exdiv_subscription_price_log
-
-    # TW public material events / attention / disposal
-    # - twpub_material_event_count_log
-    # - twpub_material_clause_log
-    # - twpub_material_fact_lag_days
-    # - twpub_attention_flag
-    # - twpub_attention_count_log
-    # - twpub_attention_close_log
-    # - twpub_attention_pe_log
-    # - twpub_disposal_flag
-    # - twpub_disposal_count_log
-
-    # TW public market index / FX
-    # - twpub_twse_taiex_log
-    # - twpub_twse_taiex_logret_1d
-    # - twpub_twse_taiex_pct
-    # - twpub_usdtwd_log
-    # - twpub_usdtwd_logret_1d
-
-    # TW public CBC monetary data
-    # - twpub_cbc_overnight_rate
-    # - twpub_cbc_overnight_rate_chg
-    # - twpub_cbc_fx_reserves_log
-    # - twpub_cbc_fx_reserves_chg
-    # - twpub_cbc_m1b_log
-    # - twpub_cbc_m1b_yoy
-    # - twpub_cbc_m2_log
-    # - twpub_cbc_m2_yoy
-
-    # TW public macro / MOF
+    # DGBAS macroeconomic data
     - twpub_dgbas_cpi_log
     - twpub_dgbas_cpi_yoy
     - twpub_dgbas_unemployment_rate
-    # - twpub_dgbas_gdp_log
-    # - twpub_dgbas_gdp_yoy
+    - twpub_dgbas_gdp_log
+    - twpub_dgbas_gdp_yoy
+
+    # Ministry of Finance trade and tax data
     - twpub_mof_export_log
     - twpub_mof_import_log
     - twpub_mof_trade_balance_asinh
@@ -185,33 +195,34 @@ data:
     - twpub_mof_futures_tax_log
     - twpub_mof_business_tax_log
 
-    # TW public TAIFEX futures / options
-    # - twpub_taifex_tx_volume_log
-    # - twpub_taifex_tx_open_interest_log
-    # - twpub_taifex_tx_settlement_logret_1d
-    # - twpub_taifex_txo_call_volume_log
-    # - twpub_taifex_txo_put_volume_log
-    # - twpub_taifex_txo_put_call_volume_ratio
-    # - twpub_taifex_txo_call_oi_log
-    # - twpub_taifex_txo_put_oi_log
-    # - twpub_taifex_txo_put_call_oi_ratio
-    # - twpub_taifex_dealer_net_oi_asinh
-    # - twpub_taifex_foreign_net_oi_asinh
-    # - twpub_taifex_trust_net_oi_asinh
-    # - twpub_taifex_tx_top5_long_ratio
-    # - twpub_taifex_tx_top10_long_ratio
-    # - twpub_taifex_tx_large_oi_log
-    # - twpub_taifex_tx_final_settlement_logret
-
-  # Optional bulk deny-list. Usually keep this empty when using feature_include above.
-  feature_exclude:
-    # - twpub_company_*
-    # - twpub_dividend_*
+    # TAIFEX futures and options market activity
+    - twpub_taifex_tx_volume_log
+    - twpub_taifex_tx_open_interest_log
+    - twpub_taifex_tx_settlement_logret_1d
+    - twpub_taifex_txo_call_volume_log
+    - twpub_taifex_txo_put_volume_log
+    - twpub_taifex_txo_put_call_volume_ratio
+    - twpub_taifex_txo_call_oi_log
+    - twpub_taifex_txo_put_oi_log
+    - twpub_taifex_txo_put_call_oi_ratio
+    - twpub_taifex_dealer_net_oi_asinh
+    - twpub_taifex_foreign_net_oi_asinh
+    - twpub_taifex_trust_net_oi_asinh
+    - twpub_taifex_tx_top5_long_ratio
+    - twpub_taifex_tx_top10_long_ratio
+    - twpub_taifex_tx_large_oi_log
+    - twpub_taifex_tx_final_settlement_logret
+  feature_exclude: []
+  feature_zero_fill: []
   # tradable_mode: tradable
 
 walk_forward:
   min_train_years: 1
   val_years: 1
+  # Fold IDs are part of the experiment identity: fold18/19/20 mean validation
+  # years 2023/2024/2025 when the model panel begins in 2005.
+  expected_first_year: 2005
+  require_contiguous_years: true
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
 
@@ -230,6 +241,9 @@ trading:
 training:
   non_blocking_transfer: true
   model_name: transformer_base_portfolio
+  # This profile is measured for one RTX 5070 Ti. Avoid torchrun/DDP launch
+  # logic even if another GPU becomes temporarily visible to WSL.
+  multi_gpu_strategy: none
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
@@ -237,10 +251,16 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
+  # Expanding train_union folds change S each year. Keep T=128 fixed and make
+  # only S symbolic, so remaining folds reuse one canonical-loss graph without
+  # padding assets or changing checkpoint/trading semantics.
+  compile_loss_dynamic_symbols: true
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  eval_model_chunk_rows: auto
+  # Measured on the local 16GB RTX 5070 Ti at fold 18 / 2735 symbols. Chunk 64
+  # completed full validation and test evaluation without OOM.
+  eval_model_chunk_rows: 64
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
   # Keep train model/loss compile on. Eval backtest scan compile stalls in
@@ -250,6 +270,10 @@ training:
   # Explicit comparison knob: train_union changes the training symbol universe
   # to the fold's active-symbol union; set none for full-symbol parity runs.
   train_symbol_compaction: train_union
+  # Keep 0 to resume the existing all-available checkpoints exactly. For a new
+  # artifact root trained from scratch, 512 reduces 21 symbol shapes
+  # (1237..2658) to 1536/2048/2560/2735 at about 10.4% extra masked-token work.
+  train_symbol_compaction_bucket_size: 0
   backtest_autotune: true
   backtest_compile: true
   backtest_compile_stateful: true
@@ -262,8 +286,12 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  batch_size_train: 64
-  batch_size_eval: 64
+  # Local RTX 5070 Ti fold18 benchmark (131 features, 2428 compacted train
+  # symbols, factor+market enabled): batch 32 used about 13.3GB and improved
+  # steady epoch wall time from 29.11s at batch 8 to 9.17s. Persistent compile
+  # caches amortize the larger shape's cold compile cost over long runs.
+  batch_size_train: 32
+  batch_size_eval: 32
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -276,7 +304,6 @@ training:
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
   explain_first_test_year_only: true
-  explain_top_k: 20
   explain_max_rows: 32
   explain_ig_steps: 0
   explain_ig_batch_size: 1
@@ -292,7 +319,6 @@ training:
   explain_interactive_plots: false
   explain_shap_enabled: false
   explain_shap_mode: score_head_surrogate
-  explain_case_study_top_k: 5
   explain_regime_analysis: false
   explain_fold_stability: false
   explain_umap_enabled: false
@@ -303,7 +329,6 @@ training:
   explain_cross_asset_enabled: false
   explain_cross_asset_max_sources: 8
   explain_cross_asset_max_targets: 8
-  explain_cross_asset_top_edges: 150
   explain_cross_asset_source_chunk_size: 1
   explain_cross_asset_perturb_scale: 1.0
   explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
@@ -324,7 +349,9 @@ training:
   save_best_val_artifacts: false
   postprocess_benchmark_after_fold: true
   postprocess_benchmark_after_best_val: true
-  postprocess_benchmark_split: test
+  # Hyperparameter selection belongs to validation. Test-only sweeps may be
+  # run as diagnostics, but must never choose deployment settings.
+  postprocess_benchmark_split: val
   postprocess_benchmark_activations: identity,softsign,tanh,isru,erf,atan,gd
   postprocess_benchmark_thresholds: 0,0.0001,0.00025,0.0005,0.001,0.0025,0.005,0.01,0.02
   postprocess_benchmark_rank_metric: cumulative_return
@@ -335,8 +362,12 @@ training:
   postprocess_benchmark_strict: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
+  # Keep cached feature storage FP32 because the enabled company categorical
+  # columns must be converted to exact embedding indices. Model compute still
+  # uses BF16 AMP; only the pre-forward cache remains FP32.
+  cache_train_features_in_amp_dtype: false
   learning_rate: 0.0003
-  enable_lr_scheduler: true
+  enable_lr_scheduler: false
   lr_scheduler: warmup_cosine
   lr_scheduler_t_max: 0
   lr_scheduler_eta_min: 0.00001
@@ -352,7 +383,9 @@ training:
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  vram_budget_gb: 16
+  # CUDA reports 15.92GiB total on this 16GB card; do not advertise more than
+  # the allocator can actually use.
+  vram_budget_gb: 15
   vram_safety_margin_gb: 1.5
   target_vram_fraction: 0.85
   # Model branches. Only the block named by training.model_name is active.
@@ -457,13 +490,30 @@ training:
     # full: most complete O((lookback*stocks)^2), small universes only
     # axial: temporal + cross-stock attention O(S*L^2 + L*S^2)
     # latent: temporal + latent factors + market tokens, large universe friendly
+    # latent_only: temporal + latent factors without market tokens
     # market_token: temporal + market tokens, smallest cross-stock transformer
     # temporal_only: no cross-stock attention
     attention_mode: market_token
+    # Independent compact-bottleneck switches; null falls back to attention_mode.
+    use_latent_factors: true
+    use_market_tokens: null
     use_flash_attention: true
     use_time_pos: true
-    use_symbol_pos: true
+    use_symbol_pos: false
+    # Keep the trainable symbol-position table at the original fold23 universe
+    # size. Official TWSE/TPEx coverage may add symbols without expanding this
+    # table; symbols beyond its capacity receive a neutral zero position vector
+    # instead of sharing the last learned slot. The all-available feature input
+    # projection deliberately changes the total model size to 129,486 params.
+    symbol_position_capacity: 2330
     input_dropout: 0.0
+    # build_panel guarantees finite feature storage. Keep position addition in
+    # FP32 for numerical parity, and make the stable Blackwell attention
+    # backend explicit; these switches do not change model parameters.
+    sanitize_inputs: false
+    amp_native_position_add: false
+    temporal_self_attention_fast_path: false
+    compiled_cross_attention_backend: manual
     # Fold18 full-TW benchmark: 65535 is the largest stable SDPA chunk in the
     # current CUDA/PyTorch environment. 65536 and 131071 both failed in SDPA
     # forward with CUDA invalid argument, so this is a kernel shape boundary,
@@ -477,7 +527,8 @@ training:
     # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
     # two-epoch benchmark, using epoch 2 only: temporal_layers=1,
     # temporal_heads=1, temporal_ffn_mult=1, d_model=16, cross_heads=2, and
-    # eval_model_chunk_rows=auto reduced epoch wall from 20.16s to 4.93s while
+    # eval_model_chunk_rows=64 (originally selected by auto) reduced epoch wall
+    # from 20.16s to 4.93s while
     # preserving attention pooling semantics. Adding train_symbol_compaction:
     # train_union then reduced epoch-2 wall to 3.72s and train time to
     # 175.1ms/batch on fold18 by training only the fold's active symbol union.
@@ -487,7 +538,7 @@ training:
     temporal_heads: 4
     temporal_ffn_mult: 2
     temporal_pooling: last
-    temporal_query_mode: full_then_last
+    temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
     cross_ffn_mult: 2

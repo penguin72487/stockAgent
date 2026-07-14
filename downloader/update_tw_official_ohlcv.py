@@ -12,10 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Refresh official TWSE/TPEx OHLCV data and backfill data_yahoo/tw_stocks parquet files."
+        description="Refresh official TWSE/TPEx OHLCV data and rebuild canonical TW stock/ETF parquet files."
     )
     parser.add_argument("--public-output-dir", default="data_tw_public")
-    parser.add_argument("--symbols-root", default="data_yahoo/tw_stocks")
+    parser.add_argument("--symbols-root", default="data_tw_public/stocks")
     parser.add_argument("--end-date", default=date.today().isoformat())
     parser.add_argument("--public-workers", type=int, default=2)
     parser.add_argument("--date-workers", type=int, default=4)
@@ -41,20 +41,21 @@ def main() -> None:
     if not args.skip_public_download:
         command = [
             sys.executable,
-            "downloader/download_tw_public_data.py",
+            "downloader/download_tw_official_data.py",
             "--mode",
-            "daily-update",
-            "--datasets",
-            "twse_daily_ohlcv",
-            "tpex_daily_ohlcv",
-            "--output-dir",
+            "daily",
+            "--public-dir",
             args.public_output_dir,
+            "--stock-root",
+            args.symbols_root,
             "--end-date",
             args.end_date,
-            "--workers",
+            "--public-workers",
             str(args.public_workers),
             "--date-workers",
             str(args.date_workers),
+            "--workers",
+            str(args.backfill_workers),
             "--timeout",
             str(args.timeout),
             "--retries",
@@ -69,20 +70,20 @@ def main() -> None:
         if args.skip_raw:
             command.append("--skip-raw")
         _run(command)
+        return
 
-    command = [
-        sys.executable,
-        "downloader/backfill_tw_public_to_yahoo.py",
-        "--input-dir",
-        args.public_output_dir,
-        "--symbols-root",
-        args.symbols_root,
-        "--workers",
-        str(args.backfill_workers),
-    ]
-    if args.start_date:
-        command.extend(["--start-date", args.start_date])
-    _run(command)
+    _run(
+        [
+            sys.executable,
+            "scripts/build_tw_official_symbol_parquets.py",
+            "--input-dir",
+            args.public_output_dir,
+            "--output-dir",
+            args.symbols_root,
+            "--workers",
+            str(args.backfill_workers),
+        ]
+    )
 
 
 if __name__ == "__main__":

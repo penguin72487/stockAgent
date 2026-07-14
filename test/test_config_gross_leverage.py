@@ -74,6 +74,29 @@ def test_load_config_migrates_legacy_gross_leverage_to_reporting_leverage(tmp_pa
     assert not hasattr(config.trading, "gross_leverage")
 
 
+def test_panel_start_date_is_normalized_and_matches_walk_forward_year(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["panel_start_date"] = "2005-01-01"
+    payload["walk_forward"]["expected_first_year"] = 2005
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.data.panel_start_date == "2005-01-01"
+
+
+def test_panel_start_date_rejects_mismatched_walk_forward_year(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["panel_start_date"] = "2005-01-01"
+    payload["walk_forward"]["expected_first_year"] = 2000
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected_first_year must match"):
+        load_config(config_path)
+
+
 def test_load_config_migrates_legacy_leverage_to_reporting_leverage(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -148,6 +171,25 @@ def test_one_model_block_cannot_change_another_model_blocks_defaults(tmp_path: P
     assert config.training.gradient_boosted_portfolio_transformer.d_model == (
         _dataclass_default_values(GradientBoostedPortfolioTransformerConfig)["d_model"]
     )
+
+
+def test_load_config_accepts_independent_transformer_bottleneck_switches(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        _write_minimal_config(
+            tmp_path,
+            training_overrides={
+                "transformer_base_portfolio": {
+                    "use_latent_factors": True,
+                    "use_market_tokens": False,
+                }
+            },
+        )
+    )
+
+    assert config.training.transformer_base_portfolio.use_latent_factors is True
+    assert config.training.transformer_base_portfolio.use_market_tokens is False
 
 
 def test_load_config_rejects_duplicate_yaml_keys(tmp_path: Path) -> None:
@@ -239,6 +281,8 @@ def test_unimplemented_symbol_subsample_value_is_rejected(tmp_path: Path) -> Non
         ("training", "enable_torch_compile"),
         ("training", "compile_loss"),
         ("training", "transformer_base_portfolio", "return_aux"),
+        ("training", "transformer_base_portfolio", "use_latent_factors"),
+        ("training", "transformer_base_portfolio", "use_market_tokens"),
     ],
 )
 def test_load_config_rejects_string_booleans(tmp_path: Path, key_path: tuple[str, ...]) -> None:
