@@ -1,14 +1,14 @@
-experiment_name: tw-stock-transformer-market-public-data-all-available
+experiment_name: tw-stock-transformer-market-public-data-compact-55
 
 runner:
-  # The all-available feature schema is checkpoint-incompatible with the old
-  # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_lantent
+  # The compact feature schema is checkpoint-incompatible with both the old
+  # 64-slot experiment and the 131-feature all-available experiment.
+  output_dir: artifacts/markets/tw_public_latent_select
   mode: train
   resume: true
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 1
+  start_fold: 18
 environment:
   device: cuda
   use_tensor_cores: true
@@ -36,11 +36,12 @@ data:
   use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
-  # Use every engineered base and TW-public feature. Each external value is
-  # overlaid only on its point-in-time availability date; state-like features
-  # are forward-filled from their first known observation. Before first
-  # availability (and for unresolved missing cells), panel construction fills
-  # the value with 0 instead of deleting the entire feature family.
+  # Compact 55-feature retraining candidate selected from the 21-fold
+  # gradient-x-input stability report. Keep robust relative/flow features and
+  # categorical embeddings; remove raw liquidity levels, redundant macro
+  # levels, and families with zero attribution across all sampled folds.
+  # This is a fresh feature schema and is not checkpoint-compatible with the
+  # 131-feature all-available experiment.
   feature_include:
     # Base price log returns
     - open_logret_1d
@@ -63,11 +64,13 @@ data:
     - lower_shadow
     - shadow_imbalance
 
-    # Official TWSE/TPEx daily price and liquidity
+    # Official TWSE/TPEx relative price and turnover features. Raw volume,
+    # trading-value, and trade-count levels are intentionally excluded because
+    # the report flagged strong simple-feature correlations/shortcut risk.
     - twpub_official_close_logret_1d
-    - twpub_official_trading_volume_log
-    - twpub_official_trading_value_log
-    - twpub_official_trades_log
+    # - twpub_official_trading_volume_log
+    # - twpub_official_trading_value_log
+    # - twpub_official_trades_log
     - twpub_official_turnover_ratio
     - twpub_official_intraday_range
     - twpub_official_close_to_high
@@ -95,140 +98,127 @@ data:
     - twpub_dealer_net_buy_flow
     - twpub_institutional_net_buy_flow
 
-    # TDCC shareholding distribution
-    - twpub_tdcc_retail_holder_ratio
-    - twpub_tdcc_large_holder_ratio
-    - twpub_tdcc_holder_count_log
+    # TDCC shareholding distribution (disabled: zero sampled-fold attribution)
+    # - twpub_tdcc_retail_holder_ratio
+    # - twpub_tdcc_large_holder_ratio
+    # - twpub_tdcc_holder_count_log
 
-    # Company profile and categorical identity
-    - twpub_company_paidin_capital_log
-    - twpub_company_issued_shares_log
-    - twpub_company_private_shares_log
-    - twpub_company_age_years
-    - twpub_company_listed_age_years
-    - twpub_company_par_value_log
+    # Company categorical identity remains enabled even though raw-input
+    # gradients are zero: these fields enter the model through embeddings.
+    # - twpub_company_paidin_capital_log
+    # - twpub_company_issued_shares_log
+    # - twpub_company_private_shares_log
+    # - twpub_company_age_years
+    # - twpub_company_listed_age_years
+    # - twpub_company_par_value_log
     - twpub_company_industry_code
     - twpub_company_is_foreign
     - twpub_company_has_preferred_stock
 
-    # Dividend announcements and ex-dividend information
-    - twpub_dividend_cash_per_share
-    - twpub_dividend_stock_per_share
-    - twpub_dividend_total_cash_log
-    - twpub_dividend_total_stock_log
-    - twpub_dividend_confirmed
-    - twpub_dividend_board_approved
-    - twpub_exdiv_known
-    - twpub_exdiv_cash_dividend
-    - twpub_exdiv_stock_dividend_ratio
-    - twpub_exdiv_subscription_ratio
-    - twpub_exdiv_subscription_price_log
+    # Dividend announcements and ex-dividend information (disabled)
+    # - twpub_dividend_cash_per_share
+    # - twpub_dividend_stock_per_share
+    # - twpub_dividend_total_cash_log
+    # - twpub_dividend_total_stock_log
+    # - twpub_dividend_confirmed
+    # - twpub_dividend_board_approved
+    # - twpub_exdiv_known
+    # - twpub_exdiv_cash_dividend
+    # - twpub_exdiv_stock_dividend_ratio
+    # - twpub_exdiv_subscription_ratio
+    # - twpub_exdiv_subscription_price_log
 
-    # Material events, attention stocks, and disposal stocks
-    - twpub_material_event_count_log
-    - twpub_material_clause_log
-    - twpub_material_fact_lag_days
-    - twpub_attention_count_log
-    - twpub_attention_close_log
-    - twpub_attention_pe_log
-    - twpub_disposal_count_log
+    # Material events, attention stocks, and disposal stocks (disabled)
+    # - twpub_material_event_count_log
+    # - twpub_material_clause_log
+    # - twpub_material_fact_lag_days
+    # - twpub_attention_count_log
+    # - twpub_attention_close_log
+    # - twpub_attention_pe_log
+    # - twpub_disposal_count_log
 
-    # Point-in-time monthly revenue
-    - twpub_monthly_revenue_log
-    - twpub_monthly_revenue_mom
-    - twpub_monthly_revenue_yoy
-    - twpub_cumulative_revenue_yoy
+    # Point-in-time monthly revenue (disabled)
+    # - twpub_monthly_revenue_log
+    # - twpub_monthly_revenue_mom
+    # - twpub_monthly_revenue_yoy
+    # - twpub_cumulative_revenue_yoy
 
-    # Point-in-time income statement and balance sheet
-    - twpub_financial_eps
-    - twpub_financial_revenue_log
-    - twpub_financial_net_income_asinh
-    - twpub_financial_gross_margin
-    - twpub_financial_operating_margin
-    - twpub_financial_net_margin
-    - twpub_financial_assets_log
-    - twpub_financial_debt_ratio
-    - twpub_financial_current_ratio
-    - twpub_financial_equity_ratio
-    - twpub_financial_book_value_per_share_log
+    # Point-in-time income statement and balance sheet (disabled)
+    # - twpub_financial_eps
+    # - twpub_financial_revenue_log
+    # - twpub_financial_net_income_asinh
+    # - twpub_financial_gross_margin
+    # - twpub_financial_operating_margin
+    # - twpub_financial_net_margin
+    # - twpub_financial_assets_log
+    # - twpub_financial_debt_ratio
+    # - twpub_financial_current_ratio
+    # - twpub_financial_equity_ratio
+    # - twpub_financial_book_value_per_share_log
 
-    # Insider ownership and announced transfers
+    # Insider ownership
     - twpub_insider_holdings_log
     - twpub_insider_pledge_ratio
-    - twpub_insider_transfer_shares_log
+    # - twpub_insider_transfer_shares_log
 
-    # Securities borrowing and short-sale availability
-    - twpub_borrow_available_log
-    - twpub_sbl_balance_log
-    - twpub_short_sale_available_log
+    # Securities borrowing and short-sale availability (disabled)
+    # - twpub_borrow_available_log
+    # - twpub_sbl_balance_log
+    # - twpub_short_sale_available_log
 
-    # TAIEX and USD/TWD market state
-    - twpub_twse_taiex_log
+    # Market changes; omit absolute index and FX levels.
+    # - twpub_twse_taiex_log
     - twpub_twse_taiex_logret_1d
-    - twpub_twse_taiex_pct
-    - twpub_usdtwd_log
+    # - twpub_twse_taiex_pct
+    # - twpub_usdtwd_log
     - twpub_usdtwd_logret_1d
 
-    # Central Bank of Taiwan monetary data
+    # Central-bank changes/rates; omit trending money-supply and reserve levels.
     - twpub_cbc_overnight_rate
     - twpub_cbc_overnight_rate_chg
-    - twpub_cbc_fx_reserves_log
+    # - twpub_cbc_fx_reserves_log
     - twpub_cbc_fx_reserves_chg
-    - twpub_cbc_m1b_log
+    # - twpub_cbc_m1b_log
     - twpub_cbc_m1b_yoy
-    - twpub_cbc_m2_log
+    # - twpub_cbc_m2_log
     - twpub_cbc_m2_yoy
 
-    # DGBAS macroeconomic data
-    - twpub_dgbas_cpi_log
+    # DGBAS rates/changes; omit CPI and GDP levels.
+    # - twpub_dgbas_cpi_log
     - twpub_dgbas_cpi_yoy
     - twpub_dgbas_unemployment_rate
-    - twpub_dgbas_gdp_log
+    # - twpub_dgbas_gdp_log
     - twpub_dgbas_gdp_yoy
 
-    # Ministry of Finance trade and tax data
-    - twpub_mof_export_log
-    - twpub_mof_import_log
+    # MOF activity features retained because they were stable across folds.
+    # Treat these four as ablation-sensitive because three remain log levels.
+    # - twpub_mof_export_log
+    # - twpub_mof_import_log
     - twpub_mof_trade_balance_asinh
-    - twpub_mof_tax_total_log
+    # - twpub_mof_tax_total_log
     - twpub_mof_securities_tax_log
     - twpub_mof_futures_tax_log
     - twpub_mof_business_tax_log
 
-    # TAIFEX futures and options market activity
-    - twpub_taifex_tx_volume_log
-    - twpub_taifex_tx_open_interest_log
-    - twpub_taifex_tx_settlement_logret_1d
-    - twpub_taifex_txo_call_volume_log
-    - twpub_taifex_txo_put_volume_log
-    - twpub_taifex_txo_put_call_volume_ratio
-    - twpub_taifex_txo_call_oi_log
-    - twpub_taifex_txo_put_oi_log
-    - twpub_taifex_txo_put_call_oi_ratio
-    - twpub_taifex_dealer_net_oi_asinh
-    - twpub_taifex_foreign_net_oi_asinh
-    - twpub_taifex_trust_net_oi_asinh
-    - twpub_taifex_tx_top5_long_ratio
-    - twpub_taifex_tx_top10_long_ratio
-    - twpub_taifex_tx_large_oi_log
-    - twpub_taifex_tx_final_settlement_logret
+    # TAIFEX futures and options market activity (disabled: zero attribution)
+    # - twpub_taifex_tx_volume_log
+    # - twpub_taifex_tx_open_interest_log
+    # - twpub_taifex_tx_settlement_logret_1d
+    # - twpub_taifex_txo_call_volume_log
+    # - twpub_taifex_txo_put_volume_log
+    # - twpub_taifex_txo_put_call_volume_ratio
+    # - twpub_taifex_txo_call_oi_log
+    # - twpub_taifex_txo_put_oi_log
+    # - twpub_taifex_txo_put_call_oi_ratio
+    # - twpub_taifex_dealer_net_oi_asinh
+    # - twpub_taifex_foreign_net_oi_asinh
+    # - twpub_taifex_trust_net_oi_asinh
+    # - twpub_taifex_tx_top5_long_ratio
+    # - twpub_taifex_tx_top10_long_ratio
+    # - twpub_taifex_tx_large_oi_log
+    # - twpub_taifex_tx_final_settlement_logret
   feature_exclude: []
-  # These selected families do not yet have a point-in-time vintage archive or
-  # registered historical lineage. Keep their schema slots deterministic while
-  # preventing present-day snapshots from leaking into historical training.
-  feature_zero_fill:
-    - twpub_cumulative_revenue_yoy
-    - twpub_cbc_*
-    - twpub_dgbas_*
-    - twpub_mof_*
-    - twpub_dividend_*
-    - twpub_exdiv_*
-    - twpub_material_*
-    - twpub_attention_*
-    - twpub_disposal_*
-    - twpub_twse_taiex_*
-    - twpub_usdtwd_*
-    - twpub_taifex_*
+  feature_zero_fill: []
   # tradable_mode: tradable
 
 walk_forward:
@@ -321,17 +311,12 @@ training:
   explain_first_test_year_only: true
   explain_max_rows: 32
   explain_ig_steps: 0
-  # 5070 Ti fold21: keep this automatic so one date uses 8 IG alphas while the
-  # normal three-date explain microbatch uses 2 (same aggregate work set).
-  explain_ig_batch_size: 0
+  explain_ig_batch_size: 1
   explain_sample_method: even
   explain_perturb: false
-  # Complete feature-time perturbation, throughput-tuned without dropping any
-  # cells: one date uses 48 repeats; three dates automatically use 16.
-  explain_perturb_batch_size: 0
-  explain_perturb_max_auto_batch_size: 48
-  explain_perturb_max_input_elements: 576000000
-  explain_counterfactual_compile: true
+  explain_perturb_batch_size: 1
+  explain_perturb_max_auto_batch_size: 1
+  explain_perturb_max_input_elements: 8000000
   explain_write_plots: false
   explain_report_style: none
   explain_plot_theme: paper
@@ -349,10 +334,7 @@ training:
   explain_cross_asset_enabled: false
   explain_cross_asset_max_sources: 8
   explain_cross_asset_max_targets: 8
-  # 16 sources x 3 dates keeps each no-grad cross-asset forward near the
-  # measured 48-row throughput plateau.
-  explain_cross_asset_source_chunk_size: 16
-  explain_cross_asset_max_repeated_rows: 48
+  explain_cross_asset_source_chunk_size: 1
   explain_cross_asset_perturb_scale: 1.0
   explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
   explain_cross_asset_attention_flow: true
@@ -519,7 +501,7 @@ training:
     attention_mode: market_token
     # Independent compact-bottleneck switches; null falls back to attention_mode.
     use_latent_factors: true
-    use_market_tokens: null
+    use_market_tokens: true
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: false

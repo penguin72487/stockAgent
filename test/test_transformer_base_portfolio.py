@@ -13,6 +13,7 @@ from stockagent.config import load_config
 from stockagent.models.factory import build_model, model_hidden_dim_hint
 from stockagent.models.transformer_base_portfolio import (
     FlashSDPAAttention,
+    LegacyDynamicTokenGenerator,
     PortfolioRMSNorm,
     SwiGLUFeedForward,
     TransformerBasePortfolioModel,
@@ -27,6 +28,7 @@ from stockagent.models.normalization import (
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import (
     _extract_weights_and_aux,
+    _load_state_dict,
     _maybe_compact_train_windowed_symbols,
     _PanelSlabForwardWrapper,
 )
@@ -88,10 +90,58 @@ def _make_model(**overrides) -> TransformerBasePortfolioModel:
     return TransformerBasePortfolioModel(**params).to(_device())
 
 
-@pytest.mark.parametrize(
-    "mode",
-    ["full", "axial", "latent", "latent_only", "market_token", "temporal_only"],
-)
+def test_legacy_dynamic_market_checkpoint_is_reconstructed_strictly() -> None:
+    device = _device()
+    source = _make_model(
+        attention_mode="market_token",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    assert source.market_queries is not None
+    source.dynamic_market_generator = LegacyDynamicTokenGenerator(
+        dim=source.d_model,
+        num_tokens=int(source.market_queries.size(1)),
+        hidden_dim=source.d_model * 2,
+        norm_type=source.norm_type,
+        ffn_type=source.ffn_type,
+    ).to(device=device)
+    with torch.no_grad():
+        source.dynamic_market_generator.gate_logit.fill_(2.0)
+
+    target = _make_model(
+        attention_mode="market_token",
+        return_aux=False,
+        return_aux_details=False,
+    ).eval()
+    _load_state_dict(target, source.state_dict())
+
+    assert target.dynamic_market_generator is not None
+    x = torch.randn(2, 6, 13, 11, device=device)
+    mask = torch.ones(2, 13, dtype=torch.bool, device=device)
+    with torch.no_grad():
+        expected = source(x, mask)
+        actual = target(x, mask)
+    assert torch.equal(actual, expected)
+
+
+def test_incomplete_legacy_dynamic_market_checkpoint_is_rejected() -> None:
+    source = _make_model(attention_mode="market_token").eval()
+    assert source.market_queries is not None
+    source.dynamic_market_generator = LegacyDynamicTokenGenerator(
+        dim=source.d_model,
+        num_tokens=int(source.market_queries.size(1)),
+        hidden_dim=source.d_model * 2,
+        norm_type=source.norm_type,
+        ffn_type=source.ffn_type,
+    ).to(device=_device())
+    state = source.state_dict()
+    del state["dynamic_market_generator.out_proj.bias"]
+
+    with pytest.raises(RuntimeError, match="Incomplete legacy dynamic-token checkpoint schema"):
+        _load_state_dict(_make_model(attention_mode="market_token"), state)
+
+
+@pytest.mark.parametrize("mode", ["full", "axial", "latent", "market_token", "temporal_only"])
 def test_attention_modes_forward(mode: str) -> None:
     device = _device()
     model = _make_model(attention_mode=mode).eval()
