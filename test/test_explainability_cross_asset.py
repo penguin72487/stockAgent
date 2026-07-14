@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from stockagent import explainability_cross_asset as cross_asset_module
 from stockagent.explainability_cross_asset import (
     MODULE_NAME,
     CrossAssetTransmissionSettings,
@@ -67,6 +68,23 @@ def _batch(rows: int = 4, lookback: int = 3, symbols: int = 5, features: int = 4
         "future_log_returns": torch.randn(rows, symbols) * 0.01,
         "tradable_mask": torch.ones(rows, symbols, dtype=torch.bool),
     }
+
+
+class LazyBatchSource:
+    def __init__(self, batch: dict[str, torch.Tensor]) -> None:
+        self._batch = batch
+        self.num_rows = int(batch["x"].size(0))
+        self.lookback = int(batch["x"].size(1))
+        self.num_symbols = int(batch["x"].size(2))
+        self.num_features = int(batch["x"].size(3))
+        self.materialize_calls: list[tuple[int, int]] = []
+
+    def materialize(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        self.materialize_calls.append((int(start), int(end)))
+        return {
+            key: value[int(start) : int(end)]
+            for key, value in self._batch.items()
+        }
 
 
 def _feature_names(features: int = 4) -> list[str]:
@@ -280,6 +298,103 @@ def test_cross_asset_shape_nan_safety_and_missing_shocks(tmp_path: Path) -> None
     assert any("not_a_feature" in warning for warning in summary["warnings"])
     _, _, values = _matrix_csv(tmp_path / MODULE_NAME / "matrices" / "zero_weight_residual_abs.csv")
     assert np.isfinite(values).all()
+
+
+def test_lazy_batch_source_matches_eager_and_materializes_once_per_row_stage(tmp_path: Path) -> None:
+    batch = _batch(rows=4, lookback=3, symbols=5, features=4)
+    settings = CrossAssetTransmissionSettings(
+        max_sources=5,
+        max_targets=5,
+        source_chunk_size=2,
+        row_chunk_size=2,
+        shocks=("zero", "volume"),
+        attention_flow=False,
+        role_embedding=False,
+        graph_backend="polars",
+        graph_explainability=False,
+        progress_enabled=False,
+    )
+    eager_dir = tmp_path / "eager"
+    lazy_dir = tmp_path / "lazy"
+    eager_summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        batch,
+        feature_names=_feature_names(),
+        symbols=_symbols(),
+        dates=_dates(),
+        output_dir=eager_dir,
+        settings=settings,
+        device=torch.device("cpu"),
+    )
+    lazy = LazyBatchSource(batch)
+    lazy_summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        lazy,
+        feature_names=_feature_names(),
+        symbols=_symbols(),
+        dates=_dates(),
+        output_dir=lazy_dir,
+        settings=settings,
+        device=torch.device("cpu"),
+    )
+
+    assert eager_summary["sources"] == lazy_summary["sources"] == 5
+    assert eager_summary["targets"] == lazy_summary["targets"] == 5
+    # One base pass and one row-major shock pass. The number of shocks and
+    # source chunks must not cause additional lazy row materialization.
+    assert lazy.materialize_calls == [(0, 2), (2, 4), (0, 2), (2, 4)]
+    assert all(end - start <= 2 for start, end in lazy.materialize_calls)
+    for name in ("zero_score_abs.csv", "volume_score_abs.csv", "volume_weight_residual_abs.csv"):
+        eager_matrix = _matrix_csv(eager_dir / MODULE_NAME / "matrices" / name)[2]
+        lazy_matrix = _matrix_csv(lazy_dir / MODULE_NAME / "matrices" / name)[2]
+        np.testing.assert_allclose(lazy_matrix, eager_matrix, rtol=1e-6, atol=1e-7)
+
+
+def test_lazy_row_major_oom_halves_source_chunk_without_rematerializing_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    batch = _batch(rows=4, lookback=3, symbols=5, features=4)
+    lazy = LazyBatchSource(batch)
+    real_metrics = cross_asset_module._shock_source_chunk_metrics
+    raised = False
+
+    def fail_first_large_chunk(*args, **kwargs):
+        nonlocal raised
+        chunk_sources = args[9]
+        if not raised and len(chunk_sources) > 1:
+            raised = True
+            raise RuntimeError("CUDA out of memory")
+        return real_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(cross_asset_module, "_shock_source_chunk_metrics", fail_first_large_chunk)
+    summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        lazy,
+        feature_names=_feature_names(),
+        symbols=_symbols(),
+        dates=_dates(),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=5,
+            max_targets=5,
+            source_chunk_size=4,
+            row_chunk_size=2,
+            shocks=("zero",),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+            graph_explainability=False,
+            progress_enabled=False,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    assert raised is True
+    shock = summary["shock_summaries"][0]
+    assert shock["oom_retries"] == 1
+    assert shock["source_chunk_size_final"] == 2
+    assert lazy.materialize_calls == [(0, 2), (2, 4), (0, 2), (2, 4)]
 
 
 def _tiny_transformer() -> TransformerBasePortfolioModel:
