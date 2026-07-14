@@ -4482,6 +4482,9 @@ def _daily_weight_symbols(path: Path) -> list[str]:
         import pyarrow.parquet as pq
 
         return [str(column) for column in pq.read_schema(path).names if str(column) != "date"]
+    if path.suffix.lower() == ".parquet":
+        columns = pl.read_parquet_schema(path).names()
+        return [str(column) for column in columns if str(column) != "date"]
     with path.open("r", encoding="utf-8", newline="") as handle:
         header = next(csv.reader(handle))
     return [str(column) for column in header if str(column) != "date"]
