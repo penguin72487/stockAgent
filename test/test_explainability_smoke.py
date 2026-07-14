@@ -7,6 +7,7 @@ import warnings
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from stockagent.data.panel import PanelData
@@ -135,13 +136,20 @@ def test_explainability_smoke(tmp_path: Path) -> None:
         feature_names=[f"f{i}" for i in range(features)],
         symbols=[f"S{i}" for i in range(symbols)],
         dates=[f"2026-01-0{i + 1}" for i in range(rows)],
-        settings=ExplainabilitySettings(top_k=2, max_rows=rows, ig_steps=2, perturb=True),
+        settings=ExplainabilitySettings(max_rows=rows, ig_steps=2, perturb=True),
         device=torch.device("cpu"),
     )
 
     assert output["summary"]["warnings"]
+    assert output["summary"]["attribution_scope"] == "all_tradable_nonzero_positions_gross_weighted"
     assert not output["frames"]["feature_importance_gradient"].is_empty()
-    assert not output["frames"]["top_decisions"].is_empty()
+    assert "top_decisions" not in output["frames"]
+    assert len(output["frames"]["decision_inventory"]) == rows * symbols
+    completeness = output["frames"]["explainability_completeness"].row(0, named=True)
+    assert completeness["decision_inventory_rows"] == rows * symbols
+    assert completeness["position_count_coverage"] == pytest.approx(1.0)
+    assert completeness["gross_exposure_coverage"] == pytest.approx(1.0)
+    assert completeness["gradient_feature_time_cells"] == lookback * features
 
     out_dir = tmp_path / "explain"
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -151,10 +159,15 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert (out_dir / "paper_explainability_report.md").exists()
     assert (out_dir / "paper_explainability_summary.json").exists()
     assert (out_dir / "feature_importance_gradient.csv").exists()
+    assert (out_dir / "decision_inventory.csv").exists()
     assert (out_dir / "paper_tables" / "global_feature_attribution.csv").exists()
+    assert (out_dir / "paper_tables" / "feature_attribution_coverage_curve.csv").exists()
+    assert (out_dir / "paper_tables" / "explainability_completeness.csv").exists()
     assert (out_dir / "paper_tables" / "trust_checks.csv").exists()
     assert (out_dir / "paper_tables" / "lookback_consistency.csv").exists()
     assert (out_dir / "plots_paper" / "feature_time_gradient_grad_x_input_abs_heatmap.png").exists()
+    assert (out_dir / "plots_paper" / "feature_attribution_coverage_curve.png").exists()
+    assert (out_dir / "plots_paper" / "portfolio_exposure_coverage_curve.png").exists()
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["plots_generated"]
     assert summary["paper_plots"]
@@ -186,7 +199,6 @@ def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards()
         "tradable_mask": torch.ones(rows, symbols, dtype=torch.bool),
     }
     common = dict(
-        top_k=2,
         max_rows=rows,
         ig_steps=4,
         perturb=True,
@@ -227,6 +239,9 @@ def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards()
         np.testing.assert_allclose(left.get_column(value_col).to_numpy(), right.get_column(value_col).to_numpy(), rtol=1e-5, atol=1e-7)
 
     assert chunked_model.forward_calls < serial_model.forward_calls
+    diagnostics = chunked["summary"]["perturb_diagnostics"]
+    assert diagnostics["elapsed_s"] >= 0.0
+    assert diagnostics["perturbations_per_s"] > 0.0
 
 
 def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path: Path) -> None:
@@ -244,7 +259,6 @@ def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path:
         symbols=[f"S{i}" for i in range(symbols)],
         dates=[f"2026-02-{i + 1:02d}" for i in range(rows)],
         settings=ExplainabilitySettings(
-            top_k=2,
             max_rows=rows,
             ig_steps=1,
             perturb=True,
@@ -336,7 +350,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
     )
     config = SimpleNamespace(training=SimpleNamespace(model_name="toy", lookback=lookback))
     settings = ExplainabilitySettings(
-        top_k=2,
         max_rows=2,
         ig_steps=0,
         perturb=False,

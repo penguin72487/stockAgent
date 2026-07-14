@@ -56,6 +56,16 @@ def test_export_report_csvs_uses_same_name_outputs(tmp_path: Path) -> None:
     assert (fold_dir / "daily_weights.csv").exists()
 
 
+def test_explainability_reads_compacted_universe_from_parquet_weight_schema(tmp_path: Path) -> None:
+    fold_dir = tmp_path / "fold_21"
+    fold_dir.mkdir()
+    path = fold_dir / "daily_weights.parquet"
+    pq.write_table(pa.table({"date": ["2026-01-01"], "2330": [0.1], "0050": [-0.1]}), path)
+
+    assert explainability_module._daily_weight_table_path(fold_dir) == path
+    assert explainability_module._daily_weight_symbols(path) == ["2330", "0050"]
+
+
 def test_cross_asset_full_universe_row_chunk_is_single_row() -> None:
     row_chunk, info = _auto_row_chunk_size(
         n_rows=32,
@@ -138,6 +148,7 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     args = parse_args([])
 
     assert args.config is None
+    assert args.progress is True
     assert args.market_artifacts_root == Path("artifacts/markets")
     assert args.market_config_root == Path("configs/markets")
     assert args.ig_steps == 8
@@ -151,13 +162,20 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.regime_analysis is True
     assert args.fold_stability is True
     assert args.umap is True
-    assert args.umap_max_points == 10000
+    assert args.max_rows == 0
+    assert args.first_test_year_only is False
+    assert args.umap_max_points == 0
+    assert not hasattr(args, "top_k")
+    assert not hasattr(args, "case_study_top_k")
     assert args.cross_asset is True
-    assert args.cross_asset_max_sources == 24
-    assert args.cross_asset_max_targets == 24
+    assert args.cross_asset_max_sources == 0
+    assert args.cross_asset_max_targets == 0
     assert args.cross_asset_source_chunk_size == 2
-    assert args.cross_asset_attention_capture_rows == 4
+    assert args.cross_asset_attention_capture_rows == 0
     assert args.cross_asset_role_embedding is True
+    assert args.strict_no_fallback is True
+
+    assert parse_args(["--no-progress"]).progress is False
 
 
 def test_explain_model_cli_discovers_market_artifacts(tmp_path: Path) -> None:
