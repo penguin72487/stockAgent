@@ -1823,8 +1823,9 @@ def _make_warnings(
                 f"Strong simple correlation detected: {row.get('source')}:{row.get('feature')} "
                 f"(score_corr={_safe_float(row.get('score_corr')):.3f}, weight_corr={_safe_float(row.get('weight_corr')):.3f})."
             )
-    if not _is_empty_frame(aux_summary) and "zero_fraction" in aux_summary.columns:
-        collapsed = aux_summary.filter(_numeric_expr("zero_fraction") > 0.95)
+    representation_aux = _representation_aux_summary(aux_summary)
+    if not _is_empty_frame(representation_aux) and "zero_fraction" in representation_aux.columns:
+        collapsed = representation_aux.filter(_numeric_expr("zero_fraction") > 0.95)
         if not collapsed.is_empty() and "name" in collapsed.columns:
             warnings.append(
                 "Some auxiliary representations are near-zero/collapsed: "
@@ -1833,6 +1834,18 @@ def _make_warnings(
     if not warnings:
         warnings.append("No rule-of-thumb anomaly was triggered; inspect tables before trusting the strategy.")
     return warnings
+
+
+def _representation_aux_summary(aux_summary: pl.DataFrame) -> pl.DataFrame:
+    """Keep learned representations; exclude logits and portfolio accounting outputs."""
+    if _is_empty_frame(aux_summary) or "name" not in aux_summary.columns:
+        return pl.DataFrame()
+    patterns = ("embedding", "token", "factor", "context", "delta", "gate", "z_stock")
+    names = pl.col("name").cast(pl.String)
+    predicate = pl.lit(False)
+    for pattern in patterns:
+        predicate = predicate | names.str.contains(pattern, literal=True)
+    return aux_summary.filter(predicate)
 
 
 
@@ -2018,8 +2031,9 @@ def _trust_check_frame(
         corr_values = corr.select([_numeric_expr("abs_score_corr"), _numeric_expr("abs_weight_corr")]).to_numpy()
         corr_max = float(np.nanmax(corr_values)) if corr_values.size else 0.0
         add_check("max_simple_feature_score_weight_corr", corr_max, 0.75, "<=", "High raw correlation can reveal price-level, liquidity, or other simple shortcut rules.")
-    if not _is_empty_frame(aux_summary) and "zero_fraction" in aux_summary.columns:
-        add_check("max_aux_zero_fraction", _numeric_max(aux_summary, "zero_fraction"), 0.95, "<=", "Near-zero aux tensors can indicate collapsed latent/market token representations.")
+    representation_aux = _representation_aux_summary(aux_summary)
+    if not _is_empty_frame(representation_aux) and "zero_fraction" in representation_aux.columns:
+        add_check("max_aux_zero_fraction", _numeric_max(representation_aux, "zero_fraction"), 0.95, "<=", "Near-zero learned representations can indicate collapsed latent/market token pathways; portfolio accounting outputs are excluded.")
     return pl.DataFrame(rows)
 
 
@@ -2760,9 +2774,11 @@ def _combine_chunked_explainability_results(
     for result, _ in chunk_results:
         for item in result.get("summary", {}).get("warnings", []):
             warning = str(item)
-            if warning == "cuML UMAP projections disabled by settings.":
-                continue
-            if warning not in warnings:
+            # Semantic warnings from a date microbatch are not valid Fold-level
+            # conclusions.  Concentration, turnover, correlation and collapse
+            # are recomputed above from the fully combined tensors/tables.
+            # Preserve only an operational degraded-mode warning.
+            if warning.startswith("CUDA OOM during explainability;") and warning not in warnings:
                 warnings.append(warning)
 
     trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
@@ -3084,71 +3100,75 @@ def _write_markdown_report(
     portfolio = summary.get("portfolio", {})
     aux_projection_summary = summary.get("aux_projection_summary", [])
     lines: list[str] = []
-    lines.append("# Model Explainability Report")
+    lines.append("# 模型可解釋性報告")
     lines.append("")
-    lines.append("## Scope")
+    lines.append(
+        "> 本檔是完整機器表格索引；含逐圖 QA、語意狀態、方法一致性與限制的 canonical 閱讀入口是 `comprehensive_explainability_report.md`。"
+    )
+    lines.append("")
+    lines.append("## 範圍")
     lines.append("")
     for key, value in metadata.items():
         lines.append(f"- **{key}**: `{value}`")
     lines.append("")
-    lines.append("## What This Explains")
+    lines.append("## 本報告解釋的內容")
     lines.append("")
     lines.extend(
         [
-            "- Portfolio decisions: decision_inventory.csv contains every explained date-symbol row, including flat and masked names.",
-            "- Attribution target: every tradable non-zero position, gross-exposure weighted; no rank-based truncation is used.",
-            "- Feature and lookback-day attribution: gradient x input and Integrated Gradients.",
-            "- Perturbation sensitivity: score/weight changes when each feature-day slice is zeroed.",
-            "- Auxiliary representations: branch/latent tensor norms and collapse checks.",
-            "- cuML UMAP projections: 2D maps of transformer aux tensors such as stock embeddings, latent factors, market tokens, and dynamic token deltas.",
-            "- Plausibility warnings: concentration, exposure, turnover proxy, single-feature dominance, simple feature correlations.",
+            "- 投資組合決策：`decision_inventory.csv` 包含每個解釋日期–股票資料列，包括零部位與 masked 標的。",
+            "- 歸因目標：所有可交易非零部位，依總曝險加權；不做基於排名的截斷。",
+            "- 特徵與 lookback 日歸因：Gradient × Input 與 Integrated Gradients。",
+            "- Perturbation 敏感度：每個特徵–日期切片歸零後的分數／權重變化。",
+            "- 輔助表示：branch／latent 張量 norm 與崩塌檢查。",
+            "- cuML UMAP 投影：stock embeddings、latent factors、market tokens 等 Transformer aux 張量的二維圖。",
+            "- 合理性警告：集中度、曝險、換手代理、單一特徵主導與簡單特徵相關。",
         ]
     )
     lines.append("")
-    lines.append("## How To Read The Diagnostics")
+    lines.append("## 診斷解讀方式")
     lines.append("")
     lines.extend(
         [
-            "- `gradient x input`: fast local sensitivity around the explained decisions; useful for spotting dominant features or single-day dependence.",
-            "- `integrated gradients`: smoother attribution from a zero baseline to the actual window; usually more stable than raw gradients but costs multiple forward/backward passes.",
-            "- `perturbation weight_abs_delta`: decision-level sensitivity after zeroing one feature-day slice; prefer this over score delta when masked scores use sentinel values.",
-            "- `feature_correlations`: simple linear checks between raw feature values and score/weight; high values can reveal price-level or liquidity shortcuts.",
-            "- `aux_summary` and `aux_dims`: tensor norm and dimension usage checks; very high zero fraction or one dominant dimension can indicate collapsed representations.",
-            "- `aux_projections`: cuML UMAP maps of high-dimensional transformer states; collapsed clouds, isolated single-token islands, or date-only bands deserve manual inspection.",
-            "- `explainability_completeness`: verify position/gross coverage is 100%, inventory row counts match, and enabled feature-time methods contain lookback × feature cells.",
-            "- `exposure_coverage_curve`: uses all names; a steep curve means the strategy is concentrated.",
+            "- `gradient x input`：決策附近的快速局部敏感度，用來找主導特徵或單日依賴。",
+            "- `integrated gradients`：從零基準走到實際輸入窗的平滑歸因；通常比原始梯度穩定，但需要多次 forward／backward。",
+            "- `perturbation weight_abs_delta`：特徵–日期切片歸零後的決策層敏感度；masked score 使用 sentinel 時，優先看它而非 score delta。",
+            "- `feature_correlations`：原始特徵和 score／weight 的簡單線性檢查；高值可能揭露價格水準或流動性捷徑。",
+            "- `aux_summary` 與 `aux_dims`：張量 norm 與維度使用檢查；高零值比例或單一維度主導可能代表表示崩塌。",
+            "- `aux_projections`：高維 Transformer state 的 cuML UMAP；縮成一團、單 token 孤島或只按日期分帶都要人工檢查。",
+            "- `explainability_completeness`：確認部位／總曝險覆蓋率為 100%、inventory 列數一致，且啟用方法包含 lookback × feature 格。",
+            "- `exposure_coverage_curve`：使用全部標的；曲線越陡代表策略越集中。",
         ]
     )
     lines.append("")
-    lines.append("## Backend Notes")
+    lines.append("## 後端說明")
     lines.append("")
     lines.extend(
         [
-            "- Batch artifacts are static PNG/CSV. Datashader is used for dense explainability visuals when available.",
-            "- cuML UMAP is the dimensionality-reduction method for aux projections. If CUDA/cuML is unavailable, projection tables are not fabricated.",
-            "- Plotly is best reserved for interactive dashboards. PyQtGraph is best for live training curves from scalar streams, not fold artifact generation.",
-            "- Surrogate SHAP is computed from a fitted score-head linear surrogate; exact model SHAP is avoided because full-market tensor windows make it expensive.",
+            "- 批次 artifacts 為靜態 PNG／CSV；可用時，密集圖採用 Datashader。",
+            "- Aux 投影使用 cuML UMAP；CUDA／cuML 不可用時不會偽造投影表格。",
+            "- Plotly 適合互動 dashboard；PyQtGraph 適合 scalar stream 的即時訓練曲線，不適合 fold artifact 產生。",
+            "- 代理 SHAP 來自擬合的 score-head 線性 surrogate；完整市場 tensor window 的精確模型 SHAP 成本過高。",
         ]
     )
     lines.append("")
-    lines.append("## Warnings")
+    lines.append("## 警告")
     lines.append("")
     for warning in warnings:
-        lines.append(f"- {warning}")
+        lines.append(f"- {_report_warning_zh(warning)}")
     lines.append("")
-    lines.append("## Portfolio Summary")
+    lines.append("## 投資組合摘要")
     lines.append("")
     for key, value in portfolio.items():
         lines.append(f"- `{key}`: {value:.6g}" if isinstance(value, float) else f"- `{key}`: {value}")
     lines.append("")
     if aux_projection_summary:
-        lines.append("## cuML UMAP Aux Projections")
+        lines.append("## cuML UMAP 輔助張量投影")
         lines.append("")
         lines.append(_render_frame(pl.DataFrame(aux_projection_summary)))
         lines.append("")
     plots = summary.get("plots_generated", [])
     if plots:
-        lines.append("## Plots")
+        lines.append("## 圖表")
         lines.append("")
         for plot in plots:
             lines.append(f"- `{plot}`")
@@ -3285,7 +3305,7 @@ def _global_attribution_table(frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
     out = _with_feature_labels(out)
     share_cols = [col for col in out.columns if col.endswith("_share")]
     if share_cols:
-        out = out.with_columns([pl.col(col).fill_null(0.0).alias(col) for col in share_cols])
+        out = out.with_columns([_numeric_expr(col).fill_null(0.0).alias(col) for col in share_cols])
         out = out.with_columns(pl.mean_horizontal([pl.col(col) for col in share_cols]).alias("mean_available_share"))
     else:
         out = out.with_columns(pl.lit(0.0).alias("mean_available_share"))
@@ -3310,6 +3330,108 @@ def _feature_attribution_coverage_curve(table: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _method_agreement_table(global_table: pl.DataFrame) -> pl.DataFrame:
+    """Pairwise Spearman agreement across complete feature rankings."""
+    if _is_empty_frame(global_table) or "feature" not in global_table.columns:
+        return pl.DataFrame()
+    methods = [
+        ("gradient", "gradient_share"),
+        ("integrated_gradients", "integrated_gradients_share"),
+        ("perturbation_weight", "perturbation_weight_share"),
+        ("surrogate_shap", "shap_share"),
+    ]
+    available = [(name, column) for name, column in methods if column in global_table.columns]
+    rows: list[dict[str, Any]] = []
+    for left_idx, (left_name, left_col) in enumerate(available):
+        for right_name, right_col in available[left_idx + 1 :]:
+            pair = global_table.select(
+                [
+                    _numeric_expr(left_col).fill_null(0.0).alias("left"),
+                    _numeric_expr(right_col).fill_null(0.0).alias("right"),
+                ]
+            )
+            zero_ties = int(pair.select(((pl.col("left") == 0.0) & (pl.col("right") == 0.0)).sum()).item())
+            for scope, scoped in (
+                ("all_features_including_zero_ties", pair),
+                ("active_union", pair.filter((pl.col("left") > 0.0) | (pl.col("right") > 0.0))),
+            ):
+                left_rank = scoped.get_column("left").rank(method="average", descending=True).to_numpy()
+                right_rank = scoped.get_column("right").rank(method="average", descending=True).to_numpy()
+                correlation = _safe_corrcoef(left_rank, right_rank) if scoped.height >= 3 else 0.0
+                rows.append(
+                    {
+                        "method_a": left_name,
+                        "method_b": right_name,
+                        "comparison_scope": scope,
+                        "features_compared": int(scoped.height),
+                        "shared_zero_ties_in_full_set": zero_ties,
+                        "spearman_rank_correlation": float(correlation),
+                        "interpretation": (
+                            "strong" if correlation >= 0.7 else "moderate" if correlation >= 0.4 else "weak"
+                        ),
+                    }
+                )
+    return (
+        pl.DataFrame(rows).sort(["comparison_scope", "spearman_rank_correlation"], descending=[False, True])
+        if rows
+        else pl.DataFrame()
+    )
+
+
+def _diagnostic_risk_table(daily: pl.DataFrame) -> pl.DataFrame:
+    """Describe the gross, pre-fee decision path without calling it a backtest."""
+    if _is_empty_frame(daily) or "strategy_log_return" not in daily.columns:
+        return pl.DataFrame()
+    values = _numeric_numpy(daily, "strategy_log_return", default=0.0)
+    values = np.nan_to_num(values.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    if values.size == 0:
+        return pl.DataFrame()
+    cumulative_log = np.cumsum(values)
+    wealth = np.exp(np.clip(cumulative_log, -50.0, 50.0))
+    peak = np.maximum.accumulate(wealth)
+    drawdown = wealth / np.maximum(peak, 1e-12) - 1.0
+    return pl.DataFrame(
+        [
+            {
+                "scope": "gross_pre_fee_diagnostic_only",
+                "rows": int(values.size),
+                "total_log_return": float(values.sum()),
+                "total_simple_return": float(np.expm1(np.clip(values.sum(), -50.0, 50.0))),
+                "annualized_mean_log_return": float(values.mean() * 252.0),
+                "annualized_volatility": float(values.std(ddof=1) * math.sqrt(252.0)) if values.size > 1 else 0.0,
+                "maximum_drawdown": float(drawdown.min(initial=0.0)),
+                "daily_hit_rate": float((values > 0.0).mean()),
+                "best_day_log_return": float(values.max(initial=0.0)),
+                "worst_day_log_return": float(values.min(initial=0.0)),
+                "canonical_fee_adjusted_backtest": False,
+            }
+        ]
+    )
+
+
+def _semantic_plot_quality(
+    frames: dict[str, pl.DataFrame],
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Annotate technically valid but analytically empty figures."""
+    perturb = frames.get("feature_time_perturbation", pl.DataFrame())
+    score_delta_zero = (
+        not _is_empty_frame(perturb)
+        and "score_abs_delta" in perturb.columns
+        and _numeric_max(perturb, "score_abs_delta") <= 0.0
+    )
+    for entry in entries:
+        path = str(entry.get("path", ""))
+        entry["semantic_status"] = "informative"
+        if score_delta_zero and "perturbation_score_abs_delta" in path:
+            entry["semantic_status"] = "uninformative"
+            entry["semantic_note"] = (
+                "所有 score_abs_delta 都是 0；BF16 下沒有可辨識的 raw-score 變化。"
+                "此圖不能支持特徵重要性結論，應改看 weight_abs_delta。"
+            )
+    return entries
+
+
 
 def _write_paper_tables(
     output_dir: Path,
@@ -3323,6 +3445,10 @@ def _write_paper_tables(
     table_dir.mkdir(parents=True, exist_ok=True)
     tables: dict[str, pl.DataFrame] = {}
     tables["global_feature_attribution"] = _global_attribution_table(frames)
+    tables["method_agreement"] = _method_agreement_table(tables["global_feature_attribution"])
+    tables["gross_pre_fee_risk_diagnostic"] = _diagnostic_risk_table(
+        frames.get("daily_portfolio", pl.DataFrame())
+    )
     tables["feature_attribution_coverage_curve"] = _feature_attribution_coverage_curve(
         tables["global_feature_attribution"]
     )
@@ -3935,8 +4061,902 @@ PAPER_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
 }
 
 
+STANDARD_FIGURE_GUIDE: dict[str, tuple[str, str, str]] = {
+    "feature_importance_gradient_grad_x_input_abs.png": (
+        "Ranks every input feature by mean absolute gradient × input attribution.",
+        "Longer bars mean the current portfolio decisions are locally more sensitive to that feature; compare the full distribution rather than only the first row.",
+        "One dominant bar, especially for a raw level or liquidity proxy, can indicate a brittle shortcut.",
+    ),
+    "feature_importance_integrated_gradients_integrated_gradients_abs.png": (
+        "Ranks every input feature by attribution integrated from the zero baseline to the observed input.",
+        "Compare its ordering with gradient × input and perturbation; agreement across methods is stronger evidence than any single method.",
+        "Large rank reversals versus perturbation or a nearly all-zero profile suggest baseline or local-gradient instability.",
+    ),
+    "feature_importance_perturbation_weight_abs_delta.png": (
+        "Ranks every feature by the absolute portfolio-weight change after its feature-day values are zeroed.",
+        "This is the most decision-proximate feature ranking: larger values mean removing the feature changes actual allocations more.",
+        "Large sensitivity isolated to a raw level feature, or complete disagreement with gradient methods, needs leakage and scaling checks.",
+    ),
+    "feature_importance_perturbation_score_abs_delta.png": (
+        "Ranks every feature by the absolute model-score change after zeroing it.",
+        "Use it to separate score sensitivity from portfolio-normalization effects by comparing it with the weight-delta chart.",
+        "Huge score changes with negligible weight changes mean the score movement may not matter economically.",
+    ),
+    "aux_summary_mean_abs.png": (
+        "Compares mean absolute activation magnitude across all available auxiliary tensors.",
+        "Use relative magnitudes to see which latent, market-token, gate, or stock representations are active; units are tensor-specific.",
+        "Near-zero tensors, extreme scale gaps, or one tensor overwhelming all others may indicate a disabled or collapsed branch.",
+    ),
+    "time_importance_gradient.png": (
+        "Aggregates gradient × input attribution over all features for every lookback day.",
+        "Read from older lags toward t-0 and look for whether influence is distributed or concentrated near the decision date.",
+        "A single-day spike can mean the temporal model effectively ignores most of its configured lookback.",
+    ),
+    "time_importance_integrated_gradients.png": (
+        "Aggregates Integrated Gradients attribution over all features for every lookback day.",
+        "Compare the temporal shape with gradient × input; stable peaks appearing in both methods are more credible.",
+        "A flat zero profile or peaks that move completely between methods suggest unstable attribution.",
+    ),
+    "feature_time_gradient_grad_x_input_abs_heatmap.png": PAPER_FIGURE_GUIDE[
+        "feature_time_gradient_grad_x_input_abs_heatmap.png"
+    ],
+    "feature_time_integrated_gradients_integrated_gradients_abs_heatmap.png": PAPER_FIGURE_GUIDE[
+        "feature_time_integrated_gradients_integrated_gradients_abs_heatmap.png"
+    ],
+    "feature_time_perturbation_weight_abs_delta_heatmap.png": PAPER_FIGURE_GUIDE[
+        "feature_time_perturbation_weight_abs_delta_heatmap.png"
+    ],
+    "feature_time_perturbation_score_abs_delta_heatmap.png": (
+        "Shows model-score sensitivity for every feature and every lookback day after zeroing that cell.",
+        "Compare bright cells with the weight-delta heatmap to identify score movements that survive portfolio normalization.",
+        "Bright score-only regions with no weight effect may be mathematically real but economically irrelevant.",
+    ),
+    "feature_correlations.png": PAPER_FIGURE_GUIDE["feature_correlations_shortcut_checks.png"],
+    "decision_inventory_exposure_by_side.png": (
+        "Shows the complete distribution of long, short, flat, and masked decision exposures across dates and symbols.",
+        "Inspect symmetry, tails, and dense bands around zero; the plot covers the full inventory rather than selected examples.",
+        "A few extreme positions, one-sided collapse, or non-zero masked names can invalidate aggregate attribution conclusions.",
+    ),
+}
+
+
+FIGURE_GUIDE_ZH: dict[str, tuple[str, str, str]] = {
+    "global_feature_attribution.png": (
+        "比較 Gradient × Input、Integrated Gradients、Perturbation 與代理 SHAP 的全域特徵重要性。",
+        "比較各方法的完整長條分布；多種方法都靠前的特徵，比只在單一方法突出的特徵更可信。",
+        "單一特徵占比過半，或 SHAP 與 Perturbation 完全相反，可能代表規則過窄或解釋不穩定。",
+    ),
+    "feature_attribution_coverage_curve.png": (
+        "將所有特徵依重要性排序後，累積其歸因占比。",
+        "曲線很早急升代表少數特徵控制大多數決策；緩慢上升代表資訊較分散。",
+        "極少數特徵幾乎解釋全部結果，可能是脆弱捷徑，必須比較其他 folds。",
+    ),
+    "portfolio_exposure_coverage_curve.png": (
+        "將所有可交易標的依部位絕對值排序後，累積總曝險。",
+        "藍線比對角線高得越多，投資組合越集中；此圖包含全部標的，不是 Top-N。",
+        "極少數標的承擔幾乎全部總曝險時，模型風險可能由個別股票主導。",
+    ),
+    "feature_importance_gradient_grad_x_input_abs.png": (
+        "依平均絕對 Gradient × Input 歸因排列所有輸入特徵。",
+        "長條越長，當前投資組合決策對該特徵的局部敏感度越高；應看完整分布，不只第一名。",
+        "原始價格或流動性欄位單獨壓倒其他特徵，可能是無法泛化的捷徑。",
+    ),
+    "feature_importance_integrated_gradients_integrated_gradients_abs.png": (
+        "依從零基準到實際輸入路徑的 Integrated Gradients 歸因排列所有特徵。",
+        "與 Gradient × Input、Perturbation 的排序交叉比較；跨方法一致比單一方法更有力。",
+        "與 Perturbation 大幅反轉或幾乎全為零，可能代表基準值或局部梯度不穩定。",
+    ),
+    "feature_importance_perturbation_weight_abs_delta.png": (
+        "將每個特徵歸零後，依投資組合權重的絕對變化排列所有特徵。",
+        "這是最接近交易決策的排序；數值越大，移除該特徵越會改變實際配置。",
+        "敏感度只集中在原始水準欄位，或與梯度方法完全不一致時，應檢查洩漏與尺度。",
+    ),
+    "feature_importance_perturbation_score_abs_delta.png": (
+        "將每個特徵歸零後，依模型分數的絕對變化排列所有特徵。",
+        "和權重變化圖並看，可分離分數敏感度與投資組合正規化造成的效果。",
+        "分數變化很大但權重幾乎不動，代表數學上的敏感度可能沒有經濟意義。",
+    ),
+    "aux_summary_mean_abs.png": (
+        "比較所有可用輔助張量的平均絕對激活幅度。",
+        "看 latent、market token、gate 與 stock representation 是否都有被使用；不同張量單位不宜直接當成重要性。",
+        "接近零、尺度差距極端，或單一張量完全主導，可能代表分支未使用或表示崩塌。",
+    ),
+    "time_importance_gradient.png": (
+        "將所有特徵的 Gradient × Input 歸因依 lookback 日期彙總。",
+        "從較舊 lag 讀到 t-0，觀察影響力是分散在多天，還是只集中決策日前。",
+        "單一天尖峰可能代表時間模型實際忽略大部分 lookback。",
+    ),
+    "time_importance_integrated_gradients.png": (
+        "將所有特徵的 Integrated Gradients 歸因依 lookback 日期彙總。",
+        "與 Gradient × Input 的時間形狀比較；兩者重複出現的峰值較可信。",
+        "全為零或峰值在不同方法間完全移動，代表時間歸因可能不穩定。",
+    ),
+    "feature_time_gradient_grad_x_input_abs_heatmap.png": (
+        "衡量完整非零可交易部位在每個特徵、每個 lookback 日的局部敏感度。",
+        "列是特徵，欄是決策前日期；顏色越亮，局部影響越強。",
+        "整張近乎空白、只剩單一欄或單一特徵列，表示模型可能忽略大部分時間窗。",
+    ),
+    "feature_time_integrated_gradients_integrated_gradients_abs_heatmap.png": (
+        "衡量從零基準走到實際輸入時，每個特徵與 lookback 日的路徑積分歸因。",
+        "把它視為 Gradient heatmap 的平滑確認；兩張圖重複亮起的區域較可靠。",
+        "與 Gradient、Perturbation 大幅不一致，代表局部解釋不穩定。",
+    ),
+    "feature_time_perturbation_weight_abs_delta_heatmap.png": (
+        "將每個特徵–日期格歸零後，衡量投資組合權重改變幅度。",
+        "這張圖最接近交易行為；亮格表示該特徵在該日期會實際改變部位。",
+        "只對原始價格／流動性欄位敏感，或分數大變但權重不動，都值得懷疑。",
+    ),
+    "feature_time_perturbation_score_abs_delta_heatmap.png": (
+        "將每個特徵–日期格歸零後，衡量模型分數改變幅度。",
+        "與權重變化 heatmap 對照，辨認哪些分數變化能穿過投資組合正規化。",
+        "只有分數圖很亮、權重圖卻沒有影響的區域，可能沒有實際交易意義。",
+    ),
+    "feature_correlations_shortcut_checks.png": (
+        "檢查原始特徵值與模型分數／權重之間的簡單線性相關。",
+        "高絕對相關不是洩漏證明，但可快速找出模型可能依賴的捷徑。",
+        "與原始價格、成交量或流動性代理高度相關，可能削弱跨股票泛化能力。",
+    ),
+    "feature_correlations.png": (
+        "檢查原始特徵值與模型分數／權重之間的簡單線性相關。",
+        "高絕對相關不是洩漏證明，但可快速找出模型可能依賴的捷徑。",
+        "與原始價格、成交量或流動性代理高度相關，可能削弱跨股票泛化能力。",
+    ),
+    "trust_checks.png": (
+        "彙整集中度、換手、mask 洩漏、歸因主導度與 aux 崩塌檢查。",
+        "`pass` 代表通過經驗規則；`warn` 需要人工檢查後才能信任策略。",
+        "mask 洩漏、極端集中或異常換手可能讓回測結論失效。",
+    ),
+    "regime_analysis.png": (
+        "依市場方向與波動 regime 拆解模型決策與報酬。",
+        "檢查模型在上漲／下跌、高波動／低波動環境是否呈現可理解且有足夠樣本的行為。",
+        "績效只存在於樣本很少的單一 regime，可能是過度擬合。",
+    ),
+    "decision_case_studies.png": (
+        "顯示最佳、最差與高換手日期中，各股票如何貢獻決策結果。",
+        "檢查獲利與虧損交易是否符合模型宣稱的訊號邏輯。",
+        "相似股票反覆造成虧損，或結果由單一標的主導，代表決策規則可能不穩定。",
+    ),
+    "aux_token_diagnostics.png": (
+        "檢查 latent factors、market tokens 與其他 Transformer 輔助張量的激活幅度。",
+        "多個非零且不被單一維度壟斷的表示，較像是 token 確實被模型使用。",
+        "接近零或單一維度完全主導，可能表示 latent／market token 已崩塌。",
+    ),
+    "decision_inventory_exposure_by_side.png": (
+        "呈現所有日期與股票的多單、空單、零部位與 masked 曝險分布。",
+        "觀察多空對稱性、尾部與零附近密度；此圖涵蓋完整 inventory，不是案例抽樣。",
+        "少數極端部位、單邊崩塌或 masked 標的出現非零權重，都可能使整體歸因失真。",
+    ),
+}
+
+
+def _figure_reading_guide(relative_path: str) -> tuple[str, str, str]:
+    path = Path(relative_path)
+    if path.parent.name == "aux_dims":
+        tensor_name = path.stem
+        return (
+            f"顯示 `{tensor_name}` 輔助張量每個維度的平均絕對激活值。",
+            "觀察是否有多個維度承載有意義的幅度；維度編號本身沒有獨立金融意義，應跨 folds 比較。",
+            "幾乎全空或單一維度承載全部幅度，可能代表表示崩塌。",
+        )
+    if path.parent.name == "aux_umap":
+        tensor_name = path.stem
+        return (
+            f"使用 cuML UMAP 將所有可用的 `{tensor_name}` 表示點投影到二維。",
+            "觀察局部鄰域、群集、橋接與孤島；UMAP 軸值與全域距離不能直接解讀為金融量。",
+            "縮成單點／單雲、只按日期形成條帶，或出現極小孤島，可能代表崩塌、regime 洩漏或罕見不穩定狀態。",
+        )
+    return FIGURE_GUIDE_ZH.get(
+        path.name,
+        (
+            "呈現完整解釋樣本產生的可解釋性診斷。",
+            "將標題、座標軸、單位與對應表格一起閱讀；先跨 folds 比較，再形成交易結論。",
+            "空白、截斷、非有限值或只在單一 fold 出現的圖形，都需要回查原始表格。",
+        ),
+    )
+
+
+def _expected_explainability_plot_paths(
+    frames: dict[str, pl.DataFrame],
+    aux_dim_frames: dict[str, pl.DataFrame],
+    aux_projection_frames: dict[str, pl.DataFrame],
+    *,
+    write_standard_plots: bool,
+    write_paper_plots: bool,
+) -> set[str]:
+    expected: set[str] = set()
+
+    def add_if(frame_name: str, relative_path: str, required: tuple[str, ...]) -> None:
+        frame = frames.get(frame_name, pl.DataFrame())
+        if not _is_empty_frame(frame) and set(required).issubset(frame.columns):
+            expected.add(relative_path)
+
+    if write_standard_plots:
+        for frame_name, value_col in (
+            ("feature_importance_gradient", "grad_x_input_abs"),
+            ("feature_importance_integrated_gradients", "integrated_gradients_abs"),
+            ("feature_importance_perturbation", "weight_abs_delta"),
+            ("feature_importance_perturbation", "score_abs_delta"),
+            ("aux_summary", "mean_abs"),
+        ):
+            label_col = "name" if frame_name == "aux_summary" else "feature"
+            add_if(frame_name, f"plots/{frame_name}_{value_col}.png", (label_col, value_col))
+        for frame_name, value_col in (
+            ("time_importance_gradient", "grad_x_input_abs"),
+            ("time_importance_integrated_gradients", "integrated_gradients_abs"),
+        ):
+            add_if(frame_name, f"plots/{frame_name}.png", ("lookback_from_end", value_col))
+        for frame_name, value_col in (
+            ("feature_time_gradient", "grad_x_input_abs"),
+            ("feature_time_integrated_gradients", "integrated_gradients_abs"),
+            ("feature_time_perturbation", "weight_abs_delta"),
+            ("feature_time_perturbation", "score_abs_delta"),
+        ):
+            add_if(
+                frame_name,
+                f"plots/{frame_name}_{value_col}_heatmap.png",
+                ("feature", "lookback_from_end", value_col),
+            )
+        add_if("feature_correlations", "plots/feature_correlations.png", ("feature", "score_corr", "weight_corr"))
+        add_if(
+            "decision_inventory",
+            "plots/decision_inventory_exposure_by_side.png",
+            ("weight", "side"),
+        )
+        for name, frame in aux_dim_frames.items():
+            if not _is_empty_frame(frame) and {"dim", "mean_abs"}.issubset(frame.columns):
+                expected.add(f"plots/aux_dims/{_safe_plot_filename(name)}.png")
+        for name, frame in aux_projection_frames.items():
+            if not _is_empty_frame(frame) and {"umap_x", "umap_y"}.issubset(frame.columns):
+                expected.add(f"plots/aux_umap/{_safe_plot_filename(name)}.png")
+
+    if write_paper_plots:
+        global_table = _global_attribution_table(frames)
+        if not _is_empty_frame(global_table):
+            expected.update(
+                {
+                    "plots_paper/global_feature_attribution.png",
+                    "plots_paper/feature_attribution_coverage_curve.png",
+                }
+            )
+        paper_specs = (
+            ("exposure_coverage_curve", "portfolio_exposure_coverage_curve.png", ("fraction_of_tradable_names", "mean_cumulative_gross_exposure")),
+            ("feature_time_gradient", "feature_time_gradient_grad_x_input_abs_heatmap.png", ("feature", "lookback_from_end", "grad_x_input_abs")),
+            ("feature_time_integrated_gradients", "feature_time_integrated_gradients_integrated_gradients_abs_heatmap.png", ("feature", "lookback_from_end", "integrated_gradients_abs")),
+            ("feature_time_perturbation", "feature_time_perturbation_weight_abs_delta_heatmap.png", ("feature", "lookback_from_end", "weight_abs_delta")),
+            ("time_importance_gradient", "time_importance_gradient.png", ("lookback_from_end", "grad_x_input_abs")),
+            ("feature_correlations", "feature_correlations_shortcut_checks.png", ("feature", "source", "score_corr", "weight_corr")),
+            ("trust_checks", "trust_checks.png", ("check", "value", "status")),
+            ("regime_analysis", "regime_analysis.png", ("regime",)),
+            ("decision_case_studies", "decision_case_studies.png", ("date",)),
+            ("aux_summary", "aux_token_diagnostics.png", ("name", "mean_abs")),
+        )
+        for frame_name, filename, required in paper_specs:
+            add_if(frame_name, f"plots_paper/{filename}", required)
+    return expected
+
+
+def _validate_explainability_plots(
+    output_dir: Path,
+    expected_paths: set[str],
+) -> list[dict[str, Any]]:
+    discovered = {
+        str(path.relative_to(output_dir))
+        for directory in (output_dir / "plots", output_dir / "plots_paper")
+        if directory.exists()
+        for path in directory.rglob("*.png")
+    }
+    def reading_order(relative_path: str) -> tuple[int, str]:
+        path = Path(relative_path)
+        if path.parts and path.parts[0] == "plots_paper":
+            return (0, relative_path)
+        if path.parent.name not in {"aux_dims", "aux_umap"}:
+            return (1, relative_path)
+        if path.parent.name == "aux_dims":
+            return (2, relative_path)
+        return (3, relative_path)
+
+    entries: list[dict[str, Any]] = []
+    for relative_path in sorted(expected_paths | discovered, key=reading_order):
+        path = output_dir / relative_path
+        entry: dict[str, Any] = {
+            "path": relative_path,
+            "expected": relative_path in expected_paths,
+            "status": "missing",
+            "bytes": 0,
+            "width": 0,
+            "height": 0,
+        }
+        guide = _figure_reading_guide(relative_path)
+        entry.update({"what_it_measures": guide[0], "how_to_read": guide[1], "suspicious_signals": guide[2]})
+        if path.exists():
+            try:
+                from PIL import Image
+
+                size_bytes = int(path.stat().st_size)
+                with Image.open(path) as image:
+                    image.verify()
+                with Image.open(path) as image:
+                    width, height = image.size
+                    image_format = str(image.format or "").upper()
+                    image.load()
+                if size_bytes <= 0 or width <= 0 or height <= 0 or image_format != "PNG":
+                    raise ValueError(
+                        f"invalid PNG metadata: bytes={size_bytes}, size={width}x{height}, format={image_format}"
+                    )
+                entry.update(
+                    {
+                        "status": "ok",
+                        "bytes": size_bytes,
+                        "width": int(width),
+                        "height": int(height),
+                        "format": image_format,
+                    }
+                )
+            except Exception as exc:
+                entry.update({"status": "invalid", "error": f"{type(exc).__name__}: {exc}"})
+        entries.append(entry)
+    return entries
+
+
+def _figure_title(relative_path: str) -> str:
+    path = Path(relative_path)
+    prefix = "輔助張量 UMAP" if path.parent.name == "aux_umap" else "輔助張量維度" if path.parent.name == "aux_dims" else "圖表"
+    label = path.stem.replace("_", " ").strip().title()
+    return f"{prefix}：{label}" if prefix != "圖表" else label
+
+
+def _write_comprehensive_explainability_report(
+    path: Path,
+    *,
+    metadata: dict[str, Any],
+    summary: dict[str, Any],
+    frames: dict[str, pl.DataFrame],
+    plot_validation: list[dict[str, Any]],
+) -> None:
+    ok_count = sum(entry.get("status") == "ok" for entry in plot_validation)
+    failed = [entry for entry in plot_validation if entry.get("status") != "ok"]
+    semantic_issues = [entry for entry in plot_validation if entry.get("semantic_status") == "uninformative"]
+    expected_count = sum(bool(entry.get("expected")) for entry in plot_validation)
+    completeness = frames.get("explainability_completeness", pl.DataFrame())
+    global_attribution = _global_attribution_table(frames)
+    method_agreement = _method_agreement_table(global_attribution)
+    risk_diagnostic = _diagnostic_risk_table(frames.get("daily_portfolio", pl.DataFrame()))
+    lines: list[str] = ["# 完整模型可解釋性報告", ""]
+    lines.extend(
+        [
+            "## 技術摘要",
+            "",
+            f"- 圖表 QA 已驗證 **{ok_count}/{len(plot_validation)}** 個預期或實際發現的 PNG；"
+            f"其中 **{expected_count}** 個是依啟用方法與可用表格推導出的預期圖檔。",
+        ]
+    )
+    lines.extend(_paper_executive_summary(frames=frames, summary=summary, metadata=metadata))
+    if failed:
+        lines.append(
+            f"- **有 {len(failed)} 個圖檔未通過完整性檢查。** 在缺失或損壞圖片重新產生前，不應把此 fold 視為完整。"
+        )
+    else:
+        lines.append("- **所有預期與實際發現的圖表都通過 PNG 解碼、非空檔案與正尺寸檢查。**")
+    if semantic_issues:
+        lines.append(
+            f"- **另有 {len(semantic_issues)} 張圖技術上有效、但資料沒有可辨識變化；"
+            "它們已標成 `uninformative`，不可作為模型規則證據。**"
+        )
+    if bool(metadata.get("validation_test_overlap", False)):
+        lines.append(
+            "- **此 Fold 的 validation 與 test 年度重疊，屬於 latest-year experimentation；"
+            "不可視為獨立、無偏的樣本外模型選擇證據。**"
+        )
+    lines.extend(["", "## 主要發現與完整視覺證據", ""])
+    if not plot_validation:
+        lines.append("沒有預期或找到任何圖表。請確認已啟用 `--plots`，且至少一個可解釋性表格不是空表。")
+        lines.append("")
+    for entry in plot_validation:
+        relative_path = str(entry["path"])
+        status = str(entry.get("status", "unknown"))
+        lines.extend(
+            [
+                f"### {_figure_title(relative_path)}",
+                "",
+                f"- **圖檔**：`{relative_path}`",
+                f"- **QA 狀態**：`{status}`"
+                + (
+                    f" — {entry.get('width', 0)}×{entry.get('height', 0)} px, {entry.get('bytes', 0):,} bytes"
+                    if status == "ok"
+                    else f" — {entry.get('error', '找不到檔案')}"
+                ),
+                f"- **語意狀態**：`{entry.get('semantic_status', 'unknown')}`"
+                + (f" — {entry.get('semantic_note')}" if entry.get("semantic_note") else ""),
+                f"- **衡量內容**：{entry['what_it_measures']}",
+                f"- **解讀方式**：{entry['how_to_read']}",
+                f"- **可疑訊號**：{entry['suspicious_signals']}",
+                "",
+            ]
+        )
+        if status == "ok":
+            title = _figure_title(relative_path)
+            lines.extend([f"[![{title}]({relative_path})]({relative_path})", "", "_點擊圖片可開啟完整解析度版本。_", ""])
+
+    lines.extend(
+        [
+            "## 完整性、方法一致性與風險量化",
+            "",
+            "### Coverage reconciliation",
+            "",
+            "下表核對完整日期–股票 inventory、所有非零可交易部位的歸因覆蓋，以及完整 feature × lookback cells。",
+            "",
+            _render_frame_markdown(completeness, limit=None),
+            "",
+            "### 不同解釋方法的一致性",
+            "",
+            "Spearman 同時提供完整特徵（含共同零值 ties）與 active union（任一方法非零）兩種口徑，不做 Top-K。主要解讀 active union，避免大量共同零值把一致性人為拉高。",
+            "",
+            _render_frame_markdown(method_agreement, limit=None),
+            "",
+            "### 報酬與回撤診斷的適用範圍",
+            "",
+            "以下只由解釋資料中的目標權重 × 下一期 log return 計算，**未納入 canonical backtest 的費用、成交限制與持倉漂移**；"
+            "它只能協助檢查決策路徑與 gross drawdown，不能引用為正式樣本外績效。",
+            "",
+            _render_frame_markdown(risk_diagnostic, limit=None),
+            "",
+        ]
+    )
+    lines.extend(["## 範圍、資料與指標定義", ""])
+    for key, value in metadata.items():
+        lines.append(f"- **{key}**: `{value}`")
+    lines.extend(
+        [
+            f"- **attribution_scope**: `{summary.get('attribution_scope', 'unknown')}`",
+            f"- **attribution_lookback**: `{summary.get('attribution_lookback', 'unknown')}`",
+            f"- **SHAP method**: `{summary.get('shap_info', {}).get('method', 'not produced')}`",
+            "- 歸因摘要涵蓋完整的解釋 inventory；`max_rows=0` 代表所選 split／年度的所有有效日期。",
+            "- 絕對歸因衡量影響幅度，不代表特徵方向是看多或看空。方向性交易解讀必須回查 scores、weights 與案例資料列。",
+            "- 股票貢獻同時提供 `stock_contributions.csv` 與具固定 schema 的 `stock_contributions.parquet`；股票代碼含純數字與英數混合時，優先讀 Parquet，避免 CSV 自動型別推斷錯誤。",
+            "",
+            "## 方法與驗證",
+            "",
+            "- Gradient × Input 衡量觀測輸入窗附近的局部敏感度。",
+            "- Integrated Gradients 從零基準積分敏感度，因此結論會受到基準值選擇影響。",
+            f"- Integrated Gradients 使用 `{summary.get('ig_steps', 'unknown')}` 個積分 steps；目前 artifact **沒有保存 completeness residual**（歸因總和對輸出差值），因此只能確認 cell coverage，不能證明數值積分已收斂。",
+            "- Perturbation 將每個特徵–日期格歸零後，衡量分數與配置變化。",
+            "- 若 `score_abs_delta` 全為 0，代表目前 BF16 執行沒有可辨識的 raw-score 差；此時只採用非零的 `weight_abs_delta`，不解讀空白 score 圖。",
+            "- 代理 SHAP 解釋的是擬合後的 score-head surrogate，不是端到端 Transformer 的精確 Shapley 分解。",
+            "- Aux 維度圖檢查激活使用情況；UMAP 只近似保留局部鄰域，不提供具語意的座標軸。",
+            "- 圖片 QA 會開啟並解碼每個預期／找到的 PNG，驗證格式、非零檔案大小與正尺寸；這不等於證明金融結論正確。",
+            "",
+            "## 限制、不確定性與穩健性檢查",
+            "",
+        ]
+    )
+    warnings_list = list(summary.get("warnings", []))
+    if warnings_list:
+        lines.extend(f"- {_report_warning_zh(warning)}" for warning in warnings_list)
+    else:
+        lines.append("- 此 fold 沒有記錄到執行期可解釋性警告。")
+    lines.extend(
+        [
+            "- 必須跨 folds 比較特徵排序與 heatmap 結構，才能把它視為穩定模型行為。",
+            "- 高歸因是診斷證據，不是因果關係或未來投資績效的證明。",
+            "- UMAP 是隨機、非線性局部投影；沒有跨 seed／參數穩健性檢查，群集不能直接命名為金融 regime。",
+            "- 圖形若過度集中或彼此矛盾，應回查 `trust_checks.csv`、`explainability_completeness.csv` 與完整 CSV。",
+            "",
+            "## 建議下一步",
+            "",
+            "1. 只有在所有圖表 QA 都是 `ok` 時，才將該 fold 納入模型審查。",
+            "2. 比較 Gradient × Input、Integrated Gradients、Perturbation 與代理 SHAP；調查只被單一方法支持的特徵。",
+            "3. 使用 fold stability 區分持續重要的特徵與單一 fold 偶發結果。",
+            "4. 對可疑的原始價格／流動性依賴，回查 point-in-time 特徵定義與洩漏控制。",
+            "",
+            "## 後續問題",
+            "",
+            "- 相同特徵群是否能跨市場 regimes 與 folds 維持重要性？",
+            "- 高歸因特徵是否改善扣除費用後的樣本外報酬，還是只改變內部分數？",
+            "- UMAP 群集對應的是合理 regime，還是可能形成捷徑的日期／股票識別資訊？",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], stability_output: Path) -> Path:
+    """Write a synthesized cross-fold report, not a concatenation of fold reports."""
+
+    table_dir = root / "tables_cross_fold"
+    plot_dir = root / "plots_cross_fold"
+    table_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    metric_rows: list[dict[str, Any]] = []
+    top_feature_rows: list[dict[str, Any]] = []
+    method_agreement_rows: list[dict[str, Any]] = []
+    warning_folds: dict[str, set[int]] = {}
+    warning_labels = {
+        "strong_simple_correlation": "強烈簡單相關",
+        "low_shap_r2": "代理 SHAP R2 偏低",
+        "aux_collapse": "輔助表示接近零／崩塌",
+        "single_symbol_concentration": "單一股票權重過度集中",
+        "high_abs_net": "Long/short 絕對淨曝險偏高",
+        "high_turnover": "換手率代理偏高",
+        "row_microbatch": "使用 row microbatch（資訊）",
+        "no_rule_anomaly": "未觸發經驗規則異常（資訊）",
+        "other": "其他警告",
+    }
+    warning_plot_labels = {
+        "strong_simple_correlation": "Strong simple correlation",
+        "low_shap_r2": "Low surrogate SHAP R2",
+        "aux_collapse": "Aux representation collapse",
+        "single_symbol_concentration": "Single-name concentration",
+        "high_abs_net": "High absolute net exposure",
+        "high_turnover": "High turnover proxy",
+        "row_microbatch": "Row microbatching (info)",
+        "no_rule_anomaly": "No heuristic anomaly (info)",
+        "other": "Other warning",
+    }
+
+    def warning_category(message: Any) -> str:
+        text = str(message)
+        if text.startswith("Strong simple correlation detected:"):
+            return "strong_simple_correlation"
+        if text.startswith("Score-head surrogate SHAP has low R2"):
+            return "low_shap_r2"
+        if text.startswith("Some auxiliary representations are near-zero/collapsed:"):
+            return "aux_collapse"
+        exact = {
+            "At least one day has a very concentrated single-symbol weight.": "single_symbol_concentration",
+            "Average absolute net exposure is high for a long/short portfolio.": "high_abs_net",
+            "Turnover proxy is high; strategy may be relying on unstable daily flips.": "high_turnover",
+            "Explainability used row microbatching to fit the full stock universe in GPU memory; all row chunks were aggregated before global SHAP and aux UMAP output.": "row_microbatch",
+            "No rule-of-thumb anomaly was triggered; inspect tables before trusting the strategy.": "no_rule_anomaly",
+        }
+        return exact.get(text, "other")
+
+    for fold_dir in fold_dirs:
+        fold_id = int(fold_dir.name.removeprefix("fold_").removesuffix("_test"))
+        summary_path = fold_dir / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+        portfolio = summary.get("portfolio", {})
+        metadata = summary.get("metadata", {})
+        shap_info = summary.get("shap_info", {})
+        validation_path = fold_dir / "plot_validation.json"
+        validation = json.loads(validation_path.read_text(encoding="utf-8")) if validation_path.exists() else []
+        metric_rows.append(
+            {
+                "fold_id": fold_id,
+                "date_start": metadata.get("date_start"),
+                "date_end": metadata.get("date_end"),
+                "sample_rows": metadata.get("sample_rows", summary.get("rows")),
+                "sampled_date_coverage": metadata.get("sampled_date_coverage"),
+                "validation_test_overlap": bool(metadata.get("validation_test_overlap", False)),
+                "latest_year_experiment": bool(metadata.get("latest_year_experiment", False)),
+                "mean_gross": portfolio.get("mean_gross"),
+                "mean_abs_net": portfolio.get("mean_abs_net"),
+                "mean_long_gross": portfolio.get("mean_long_gross"),
+                "mean_short_gross": portfolio.get("mean_short_gross"),
+                "mean_turnover_proxy": portfolio.get("mean_turnover_proxy"),
+                "max_abs_weight_mean": portfolio.get("max_abs_weight_mean"),
+                "max_abs_weight_max": portfolio.get("max_abs_weight_max"),
+                "mean_daily_log_return": portfolio.get("mean_daily_log_return"),
+                "shap_surrogate_r2": shap_info.get("surrogate_r2"),
+                "shap_valid_rows": shap_info.get("valid_rows"),
+                "plot_qa_ok": sum(item.get("status") == "ok" for item in validation),
+                "plot_qa_total": len(validation),
+            }
+        )
+        attribution_path = fold_dir / "paper_tables" / "global_feature_attribution.csv"
+        if attribution_path.exists():
+            attribution = pl.read_csv(attribution_path)
+            if not attribution.is_empty() and {"feature", "mean_available_share"}.issubset(attribution.columns):
+                top = attribution.sort("mean_available_share", descending=True).row(0, named=True)
+                top_feature_rows.append(
+                    {
+                        "fold_id": fold_id,
+                        "feature": top.get("feature"),
+                        "feature_label": top.get("feature_label", top.get("feature")),
+                        "mean_available_share": top.get("mean_available_share"),
+                    }
+                )
+                for row in _method_agreement_table(attribution).iter_rows(named=True):
+                    method_agreement_rows.append({"fold_id": fold_id, **row})
+        for warning in summary.get("warnings", []):
+            warning_folds.setdefault(warning_category(warning), set()).add(fold_id)
+
+    metrics = pl.DataFrame(metric_rows).sort("fold_id") if metric_rows else pl.DataFrame()
+    top_features = pl.DataFrame(top_feature_rows).sort("fold_id") if top_feature_rows else pl.DataFrame()
+    method_agreement = (
+        pl.DataFrame(method_agreement_rows).sort(["method_a", "method_b", "fold_id"])
+        if method_agreement_rows
+        else pl.DataFrame()
+    )
+    warning_rows = [
+        {
+            "warning_category": category,
+            "warning_label": warning_labels[category],
+            "folds_affected": len(fold_ids),
+            "fold_share": len(fold_ids) / max(len(fold_dirs), 1),
+            "fold_ids": ",".join(str(value) for value in sorted(fold_ids)),
+        }
+        for category, fold_ids in warning_folds.items()
+    ]
+    warnings_frame = (
+        pl.DataFrame(warning_rows).sort("folds_affected", descending=True) if warning_rows else pl.DataFrame()
+    )
+    _write_csv(metrics, table_dir / "cross_fold_portfolio_and_shap.csv")
+    _write_csv(top_features, table_dir / "cross_fold_top_feature_by_fold.csv")
+    _write_csv(method_agreement, table_dir / "cross_fold_method_agreement.csv")
+    _write_csv(warnings_frame, table_dir / "cross_fold_warning_summary.csv")
+
+    expected_plots: set[str] = set()
+    plt, _ = _setup_paper_plotting()
+    if not metrics.is_empty() and "mean_abs_net" in metrics.columns:
+        x = metrics.get_column("fold_id").to_numpy()
+        fig, axes = plt.subplots(3, 1, figsize=(16, 13), dpi=160, sharex=True)
+        for column, label, color in (
+            ("mean_abs_net", "Absolute net", PAPER_TOKENS["orange_mid"]),
+            ("mean_long_gross", "Long gross", PAPER_TOKENS["blue_mid"]),
+            ("mean_short_gross", "Short gross", PAPER_TOKENS["pink_mid"]),
+        ):
+            if column in metrics.columns:
+                axes[0].plot(x, metrics.get_column(column).to_numpy(), marker="o", label=label, color=color)
+        axes[0].set_ylabel("Exposure")
+        axes[0].legend(frameon=False, ncol=3)
+        axes[0].set_title("Exposure drift across test folds")
+        for column, label, color in (
+            ("max_abs_weight_mean", "Mean daily maximum", PAPER_TOKENS["blue_mid"]),
+            ("max_abs_weight_max", "Maximum observed", PAPER_TOKENS["orange_mid"]),
+        ):
+            if column in metrics.columns:
+                axes[1].plot(x, metrics.get_column(column).to_numpy(), marker="o", label=label, color=color)
+        axes[1].set_ylabel("Absolute weight")
+        axes[1].legend(frameon=False, ncol=2)
+        axes[1].set_title("Single-name concentration across test folds")
+        if "mean_turnover_proxy" in metrics.columns:
+            axes[2].bar(x, metrics.get_column("mean_turnover_proxy").to_numpy(), color=PAPER_TOKENS["blue_mid"])
+        axes[2].set_ylabel("Turnover proxy")
+        axes[2].set_xlabel("Fold")
+        axes[2].set_title("Turnover across test folds")
+        for ax in axes:
+            ax.grid(True, axis="y", alpha=0.25)
+        _safe_matplotlib_tight_layout(fig)
+        path = plot_dir / "cross_fold_portfolio_diagnostics.png"
+        _save_matplotlib_figure(fig, path, pad_to_standard_aspect=False)
+        plt.close(fig)
+        expected_plots.add(str(path.relative_to(root)))
+
+    if not metrics.is_empty() and "shap_surrogate_r2" in metrics.columns:
+        shap_plot = metrics.drop_nulls("shap_surrogate_r2")
+        if not shap_plot.is_empty():
+            fig, ax = plt.subplots(figsize=(16, 6), dpi=160)
+            ax.bar(
+                shap_plot.get_column("fold_id").to_numpy(),
+                shap_plot.get_column("shap_surrogate_r2").to_numpy(),
+                color=PAPER_TOKENS["blue_mid"],
+            )
+            ax.axhline(0.8, color=PAPER_TOKENS["orange_mid"], linestyle="--", label="R2 = 0.8 reference")
+            ax.set(xlabel="Fold", ylabel="Surrogate R2", title="Score-head surrogate SHAP quality across test folds")
+            ax.legend(frameon=False)
+            ax.grid(True, axis="y", alpha=0.25)
+            _safe_matplotlib_tight_layout(fig)
+            path = plot_dir / "cross_fold_shap_quality.png"
+            _save_matplotlib_figure(fig, path, pad_to_standard_aspect=False)
+            plt.close(fig)
+            expected_plots.add(str(path.relative_to(root)))
+
+    if not method_agreement.is_empty():
+        method_plot = (
+            method_agreement.filter(pl.col("comparison_scope") == "active_union")
+            if "comparison_scope" in method_agreement.columns
+            else method_agreement
+        )
+        pairs = (
+            method_plot.select(
+                pl.concat_str([pl.col("method_a"), pl.lit(" vs "), pl.col("method_b")]).alias("pair")
+            )
+            .get_column("pair")
+            .unique(maintain_order=True)
+            .to_list()
+        )
+        values = []
+        for pair in pairs:
+            left, right = str(pair).split(" vs ", 1)
+            values.append(
+                method_plot.filter((pl.col("method_a") == left) & (pl.col("method_b") == right))
+                .get_column("spearman_rank_correlation")
+                .to_numpy()
+            )
+        fig, ax = plt.subplots(figsize=(16, 7), dpi=160)
+        ax.boxplot(values, tick_labels=pairs, vert=False, showmeans=True)
+        ax.axvline(0.4, color=PAPER_TOKENS["orange_mid"], linestyle="--", label="moderate = 0.4")
+        ax.set(xlabel="Spearman rank correlation", ylabel="", title="Feature-ranking agreement across test folds")
+        ax.grid(True, axis="x", alpha=0.25)
+        ax.legend(frameon=False)
+        _safe_matplotlib_tight_layout(fig)
+        path = plot_dir / "cross_fold_method_agreement.png"
+        _save_matplotlib_figure(fig, path, pad_to_standard_aspect=False)
+        plt.close(fig)
+        expected_plots.add(str(path.relative_to(root)))
+
+    if not warnings_frame.is_empty():
+        ordered = warnings_frame.sort("folds_affected")
+        fig, ax = plt.subplots(
+            figsize=_figsize_for_rows(ordered.height, width=16.0, row_height=0.55, overhead=2.5), dpi=160
+        )
+        ax.barh(
+            [warning_plot_labels[value] for value in ordered.get_column("warning_category").to_list()],
+            ordered.get_column("folds_affected").to_numpy(),
+            color=PAPER_TOKENS["orange_mid"],
+        )
+        ax.set(xlabel="Number of affected folds", ylabel="", title="Recurring diagnostics across test folds")
+        ax.set_xlim(0, max(len(fold_dirs), 1))
+        ax.grid(True, axis="x", alpha=0.25)
+        _safe_matplotlib_tight_layout(fig)
+        path = plot_dir / "cross_fold_warning_prevalence.png"
+        _save_matplotlib_figure(fig, path, pad_to_standard_aspect=False)
+        plt.close(fig)
+        expected_plots.add(str(path.relative_to(root)))
+
+    stability_plot = stability_output / "plots_paper" / "fold_stability_feature_share.png"
+    if stability_plot.exists():
+        expected_plots.add(str(stability_plot.relative_to(root)))
+    plot_validation = _validate_explainability_plots(root, expected_plots)
+    (root / "plot_validation_all_folds.json").write_text(
+        json.dumps(_to_builtin(plot_validation), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    stability_path = stability_output / "paper_tables" / "fold_feature_stability.csv"
+    stability = pl.read_csv(stability_path) if stability_path.exists() else pl.DataFrame()
+    complete_stability = stability
+    if not stability.is_empty() and "folds_present" in stability.columns:
+        complete_stability = stability.filter(pl.col("folds_present") == len(fold_dirs))
+
+    def count_at_least(column: str, threshold: float) -> int:
+        if metrics.is_empty() or column not in metrics.columns:
+            return 0
+        return int(metrics.select((pl.col(column).cast(pl.Float64, strict=False) >= threshold).sum()).item() or 0)
+
+    def count_at_most(column: str, threshold: float) -> int:
+        if metrics.is_empty() or column not in metrics.columns:
+            return 0
+        return int(metrics.select((pl.col(column).cast(pl.Float64, strict=False) <= threshold).sum()).item() or 0)
+
+    mean_shap = float("nan")
+    if not metrics.is_empty() and "shap_surrogate_r2" in metrics.columns:
+        value = metrics.select(pl.col("shap_surrogate_r2").cast(pl.Float64, strict=False).mean()).item()
+        mean_shap = float(value) if value is not None else float("nan")
+    duplicate_windows = pl.DataFrame()
+    if not metrics.is_empty() and {"date_start", "date_end"}.issubset(metrics.columns):
+        duplicate_windows = (
+            metrics.group_by(["date_start", "date_end"])
+            .agg([pl.len().alias("fold_count"), pl.col("fold_id").sort().alias("fold_ids")])
+            .filter(pl.col("fold_count") > 1)
+        )
+    top_feature_summary = pl.DataFrame()
+    if not top_features.is_empty():
+        top_feature_summary = (
+            top_features.group_by(["feature", "feature_label"])
+            .agg(pl.len().alias("folds_as_top_feature"))
+            .sort("folds_as_top_feature", descending=True)
+        )
+
+    report_path = root / "comprehensive_all_folds_report.md"
+    lines = [
+        "# 跨 Fold 模型可解釋性綜合分析",
+        "",
+        "## 技術摘要",
+        "",
+        f"- 本報告組合 **{len(fold_dirs)} 個 test folds** 的統計後重新分析；不是將各 Fold 報告或圖片串接。",
+        f"- 絕對淨曝險 ≥ 0.8：**{count_at_least('mean_abs_net', 0.8)}/{len(fold_dirs)} folds**；幾乎沒有空方曝險（short gross ≤ 0.01）：**{count_at_most('mean_short_gross', 0.01)}/{len(fold_dirs)} folds**。",
+        f"- 單一股票最大權重曾達 0.5 以上：**{count_at_least('max_abs_weight_max', 0.5)}/{len(fold_dirs)} folds**；換手代理 ≥ 1：**{count_at_least('mean_turnover_proxy', 1.0)}/{len(fold_dirs)} folds**。",
+        f"- 代理 SHAP 平均 R2：**{mean_shap:.3f}**；低於 0.8：**{count_at_most('shap_surrogate_r2', 0.799999)}/{len(fold_dirs)} folds**。",
+        f"- 跨 Fold 聚合圖表 QA：**{sum(item.get('status') == 'ok' for item in plot_validation)}/{len(plot_validation)}**。",
+        "- Cross-asset 刻意排除；它由獨立流程計算。",
+        "",
+        "## 1. 特徵重要性是否跨 Fold 穩定",
+        "",
+        "下圖使用每個 Fold 的完整特徵歸因表重新聚合。報告內只預覽穩定性最高的 15 列，完整特徵沒有做 Top-K 刪除，全部保存在 `paper_fold_stability/paper_tables/fold_feature_stability.csv`。",
+        "",
+    ]
+    if not duplicate_windows.is_empty():
+        lines[10:10] = [
+            "- **Fold 並非全部獨立時間窗。** 下列日期區間被多個 Fold 共用；其中 validation/test overlap 的 latest-year Fold 只能當實驗性證據。",
+            "",
+            _render_frame_markdown(duplicate_windows, limit=None),
+            "",
+        ]
+    if stability_plot.exists():
+        stability_relative = str(stability_plot.relative_to(root))
+        lines.extend([f"[![跨 Fold 特徵穩定性]({stability_relative})]({stability_relative})", ""])
+    lines.extend([_render_frame_markdown(complete_stability, limit=15), ""])
+    if not top_feature_summary.is_empty():
+        lines.extend(["### 各 Fold 第一名特徵的重複性", "", _render_frame_markdown(top_feature_summary, limit=None), ""])
+    lines.extend(
+        [
+            "## 2. 曝險、集中度與換手是否隨 Fold 漂移",
+            "",
+            "這張圖不是重畫單一 Fold，而是把每個測試年的投資組合摘要排成時間序列。若後期 Fold 趨向單邊、單一股票集中或換手突然升高，代表模型行為未跨時期保持一致。",
+            "",
+            "[![跨 Fold 投資組合診斷](plots_cross_fold/cross_fold_portfolio_diagnostics.png)](plots_cross_fold/cross_fold_portfolio_diagnostics.png)",
+            "",
+            "完整逐 Fold 數值：`tables_cross_fold/cross_fold_portfolio_and_shap.csv`。",
+            "",
+            "## 3. 代理 SHAP 品質是否一致",
+            "",
+            "R2 衡量線性 score-head 代理模型對原模型分數的貼合程度。低 R2 的 Fold 中，SHAP 只能當粗略全域診斷，不能當忠實局部解釋；虛線 0.8 是檢視門檻，不是統計定律。",
+            "",
+            "[![跨 Fold SHAP 品質](plots_cross_fold/cross_fold_shap_quality.png)](plots_cross_fold/cross_fold_shap_quality.png)",
+            "",
+            "## 4. 不同解釋方法是否彼此支持",
+            "",
+            "箱型圖使用每個 Fold 中任一方法非零的完整 active feature union 計算 Spearman 相關，不做 Top-K；完整 131 特徵（含零值 ties）的結果仍保存在 CSV。低相關不是自動判錯，但表示 Gradient、IG、權重 Perturbation 與代理 SHAP 不能互相替代。",
+            "",
+            "[![跨 Fold 方法一致性](plots_cross_fold/cross_fold_method_agreement.png)](plots_cross_fold/cross_fold_method_agreement.png)",
+            "",
+            "完整數值：`tables_cross_fold/cross_fold_method_agreement.csv`。",
+            "",
+            "## 5. 哪些警告跨 Fold 重複出現",
+            "",
+            "警告按『受影響 Fold 數』計算，同一 Fold 內同類訊息重複多次仍只計一次，避免相關性警告因特徵數較多而灌水。",
+            "",
+            "[![跨 Fold 警告盛行率](plots_cross_fold/cross_fold_warning_prevalence.png)](plots_cross_fold/cross_fold_warning_prevalence.png)",
+            "",
+            _render_frame_markdown(warnings_frame, limit=None),
+            "",
+            "## 範圍、方法與限制",
+            "",
+            "- 每個 Fold 只使用其 `fold_*_test` 的測試集第一年成果；本報告不重新混合原始樣本，也不將 Fold 圖片視為獨立的新證據。",
+            "- 特徵穩定性由完整 feature × fold 長表計算；表格預覽不會改變完整 CSV。",
+            "- PNG 解碼成功只代表輸出技術正常，不代表歸因有因果性，也不代表未來績效。",
+            "- Cross-asset 不在此報告範圍；跨資產結果應由獨立專案產生後另行比較。",
+            "- Integrated Gradients artifact 沒有保存 completeness residual；目前只能確認所有 feature-time cells 都有輸出，不能證明 8-step 數值積分已收斂。",
+            "",
+            "## 建議下一步",
+            "",
+            "1. 優先調查同時出現單邊曝險、單名集中與高換手的 Fold。",
+            "2. 只把跨多數 Fold 維持前段排名，且 Gradient × Input、IG、Perturbation 方向一致的特徵視為穩健候選。",
+            "3. 對 SHAP R2 偏低的 Fold，回到完整模型歸因與 perturbation 圖，不做局部 SHAP 敘事。",
+            "",
+            "## 各 Fold 詳細報告索引",
+            "",
+        ]
+    )
+    for fold_dir in fold_dirs:
+        relative = fold_dir.relative_to(root) / "comprehensive_explainability_report.md"
+        lines.append(f"- [{fold_dir.name}]({relative})")
+    lines.append("")
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
+
+
 def _render_frame_markdown(frame: pl.DataFrame, limit: int | None = 20) -> str:
     return _render_table_markdown(frame, limit=limit)
+
+
+def _report_warning_zh(value: Any) -> str:
+    text = str(value)
+    exact = {
+        "At least one day has a very concentrated single-symbol weight.": "至少有一天的權重高度集中於單一股票。",
+        "Average absolute net exposure is high for a long/short portfolio.": "對 long/short 投資組合而言，平均絕對淨曝險偏高。",
+        "Explainability used row microbatching to fit the full stock universe in GPU memory; all row chunks were aggregated before global SHAP and aux UMAP output.": "為讓完整股票 universe 放入 GPU，解釋流程使用 row microbatch；所有 row chunks 都已在全域 SHAP 與 aux UMAP 輸出前完整彙總。",
+        "No rule-of-thumb anomaly was triggered; inspect tables before trusting the strategy.": "沒有觸發經驗規則異常；信任策略前仍須檢查完整表格。",
+        "Turnover proxy is high; strategy may be relying on unstable daily flips.": "換手代理偏高；策略可能依賴不穩定的每日方向翻轉。",
+    }
+    if text in exact:
+        return exact[text]
+    if text.startswith("Strong simple correlation detected: "):
+        return "偵測到強烈簡單相關：" + text.removeprefix("Strong simple correlation detected: ")
+    if text.startswith("Score-head surrogate SHAP has low R2"):
+        return text.replace(
+            "Score-head surrogate SHAP has low R2",
+            "Score-head 代理 SHAP 的 R2 偏低",
+        ).replace(
+            "use it as a rough global diagnostic, not a faithful local explanation",
+            "只能作為粗略全域診斷，不應視為忠實的局部解釋",
+        )
+    if text.startswith("Some auxiliary representations are near-zero/collapsed: "):
+        return "部分輔助表示接近零或已崩塌：" + text.removeprefix(
+            "Some auxiliary representations are near-zero/collapsed: "
+        )
+    return text
 
 
 
@@ -3952,40 +4972,40 @@ def _paper_executive_summary(
     if not _is_empty_frame(global_table):
         top = _first_row(global_table)
         lines.append(
-            f"- The strongest global signal is `{top.get('feature')}` ({top.get('feature_group')}); "
-            f"mean available attribution share is {_format_share(top.get('mean_available_share', 0.0))}."
+            f"- 最強的全域訊號是 `{top.get('feature')}`（{top.get('feature_group')}）；"
+            f"平均可用歸因占比為 {_format_share(top.get('mean_available_share', 0.0))}。"
         )
     shap = frames.get("feature_importance_shap", pl.DataFrame())
     if not _is_empty_frame(shap):
         row = _first_row(shap)
         r2 = _safe_float(row.get("surrogate_r2", summary.get("shap_info", {}).get("surrogate_r2", 0.0)))
         lines.append(
-            f"- Score-head surrogate SHAP top feature is `{row.get('feature')}` with surrogate R2={r2:.3f}; "
-            "treat it as global evidence, not exact full-Transformer SHAP."
+            f"- Score-head 代理 SHAP 的第一特徵是 `{row.get('feature')}`，surrogate R2={r2:.3f}；"
+            "它是全域證據，不是完整 Transformer 的精確 SHAP。"
         )
     else:
         shap_info = summary.get("shap_info", {})
-        lines.append(f"- Surrogate SHAP was not produced: `{shap_info.get('error', shap_info.get('method', 'skipped'))}`.")
+        lines.append(f"- 未產生代理 SHAP：`{shap_info.get('error', shap_info.get('method', 'skipped'))}`。")
     if portfolio:
         lines.append(
-            "- Portfolio behavior: "
-            f"gross={_safe_float(portfolio.get('mean_gross')):.3f}, "
-            f"abs net={_safe_float(portfolio.get('mean_abs_net')):.3f}, "
-            f"turnover proxy={_safe_float(portfolio.get('mean_turnover_proxy')):.3f}, "
-            f"max single-name weight={_safe_float(portfolio.get('max_abs_weight_max')):.3f}."
+            "- 投資組合行為："
+            f"總曝險={_safe_float(portfolio.get('mean_gross')):.3f}、"
+            f"絕對淨曝險={_safe_float(portfolio.get('mean_abs_net')):.3f}、"
+            f"換手代理={_safe_float(portfolio.get('mean_turnover_proxy')):.3f}、"
+            f"最大單一標的權重={_safe_float(portfolio.get('max_abs_weight_max')):.3f}。"
         )
     config_lookback = metadata.get("config_lookback")
     attribution_lookback = summary.get("attribution_lookback")
     if config_lookback is not None and attribution_lookback is not None and int(config_lookback) != int(attribution_lookback):
         lines.append(
-            f"- Lookback warning: config lookback is {config_lookback}, but this artifact only contains "
-            f"{attribution_lookback} attribution days. Do not cite it as a complete lookback-{config_lookback} explanation."
+            f"- Lookback 警告：設定值為 {config_lookback}，但此 artifact 只有 "
+            f"{attribution_lookback} 個歸因日；不可把它引用為完整 lookback-{config_lookback} 解釋。"
         )
     warnings = summary.get("warnings", [])
     if warnings:
-        lines.append(f"- Main warning: {warnings[0]}")
+        lines.append(f"- 主要警告：{_report_warning_zh(warnings[0])}")
     if not lines:
-        lines.append("- No explainability rows were available; inspect data loading and model output hooks.")
+        lines.append("- 沒有可用的可解釋性資料列；請檢查資料載入與模型輸出 hooks。")
     return lines
 
 
@@ -4000,58 +5020,74 @@ def _write_paper_report(
     paper_plots: list[str],
 ) -> None:
     lines: list[str] = []
-    lines.append("# Paper-Grade Model Explainability Report")
+    lines.append("# 論文等級模型可解釋性報告")
     lines.append("")
-    lines.append("## Executive Summary")
+    lines.append(
+        "> 本檔聚焦 paper tables／plots；完整逐圖 QA 與語意有效性請以 `comprehensive_explainability_report.md` 為 canonical 報告。"
+    )
+    lines.append("")
+    lines.append("## 技術摘要")
     lines.append("")
     lines.extend(_paper_executive_summary(frames=frames, summary=summary, metadata=metadata))
     lines.append("")
-    lines.append("## Scope")
+    lines.append("## 範圍")
     lines.append("")
     for key, value in metadata.items():
         lines.append(f"- **{key}**: `{value}`")
     lines.append(f"- **attribution_lookback**: `{summary.get('attribution_lookback')}`")
     lines.append(f"- **shap_method**: `{summary.get('shap_info', {}).get('method', 'unknown')}`")
     lines.append("")
-    lines.append("## Figure Reading Guide")
+    lines.append("## 圖表解讀指引")
     lines.append("")
     for plot in paper_plots:
         name = Path(plot).name
-        guide = PAPER_FIGURE_GUIDE.get(name)
-        if guide is None:
-            continue
+        guide = _figure_reading_guide(plot)
         lines.append(f"### {name}")
         lines.append("")
-        lines.append(f"- **What it measures**: {guide[0]}")
-        lines.append(f"- **How to read it**: {guide[1]}")
-        lines.append(f"- **What would be suspicious**: {guide[2]}")
+        lines.append(f"- **衡量內容**：{guide[0]}")
+        lines.append(f"- **解讀方式**：{guide[1]}")
+        lines.append(f"- **可疑訊號**：{guide[2]}")
         lines.append("")
-    lines.append("## Trust And Sanity Checks")
+    lines.append("## 信任與合理性檢查")
     lines.append("")
     lines.append(_render_frame_markdown(frames.get("trust_checks", pl.DataFrame()), limit=30))
     lines.append("")
-    lines.append("## Completeness Audit")
+    lines.append("## 完整性稽核")
     lines.append("")
     lines.append(_render_frame_markdown(frames.get("explainability_completeness", pl.DataFrame()), limit=30))
     lines.append("")
-    lines.append("## Global Attribution Table")
+    lines.append("## 方法一致性")
+    lines.append("")
+    lines.append("以下同時保存完整特徵與 active union 的 Spearman 相關；主要解讀 active union，避免共同零值 ties 人為拉高一致性，且不是 Top-K 比較。")
+    lines.append("")
+    lines.append(_render_frame_markdown(_method_agreement_table(_global_attribution_table(frames)), limit=None))
+    lines.append("")
+    lines.append("## Gross、未扣費風險診斷")
+    lines.append("")
+    lines.append(
+        "此表未納入 canonical backtest 的費用、成交限制與持倉漂移，只能用於解釋決策路徑，不能引用為正式績效。"
+    )
+    lines.append("")
+    lines.append(_render_frame_markdown(_diagnostic_risk_table(frames.get("daily_portfolio", pl.DataFrame())), limit=None))
+    lines.append("")
+    lines.append("## 全域歸因表")
     lines.append("")
     lines.append(_render_frame_markdown(_global_attribution_table(frames), limit=None))
     lines.append("")
-    lines.append("## Regime Analysis")
+    lines.append("## 市場 Regime 分析")
     lines.append("")
     lines.append(_render_frame_markdown(frames.get("regime_analysis", pl.DataFrame()), limit=30))
     lines.append("")
-    lines.append("## Decision Case Studies")
+    lines.append("## 決策案例研究")
     lines.append("")
-    lines.append("Complete rows are stored in `paper_tables/decision_case_studies.csv`; the report does not duplicate the full table.")
+    lines.append("完整資料列存放於 `paper_tables/decision_case_studies.csv`；報告不重複貼上完整表格。")
     lines.append("")
-    lines.append("## Output Files")
+    lines.append("## 輸出檔案")
     lines.append("")
-    lines.append("### Paper Plots")
+    lines.append("### Paper 圖表")
     lines.extend(f"- `{plot}`" for plot in paper_plots)
     lines.append("")
-    lines.append("### Paper Tables")
+    lines.append("### Paper 表格")
     lines.extend(f"- `{path}`" for path in paper_tables.values())
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -4138,6 +5174,11 @@ def write_fold_stability_outputs(
                 pl.col("fold_id").n_unique().alias("folds_present"),
                 pl.col("rank").mean().alias("mean_rank"),
                 pl.col("rank").std().alias("std_rank"),
+                pl.col("rank").min().alias("min_rank"),
+                pl.col("rank").quantile(0.25, interpolation="linear").alias("rank_q25"),
+                pl.col("rank").median().alias("median_rank"),
+                pl.col("rank").quantile(0.75, interpolation="linear").alias("rank_q75"),
+                pl.col("rank").max().alias("max_rank"),
                 _numeric_expr("mean_available_share").mean().alias("mean_share"),
                 _numeric_expr("mean_available_share").std().alias("std_share"),
             ]
@@ -4173,17 +5214,18 @@ def write_fold_stability_outputs(
         )
         plt.close(fig)
     report = [
-        "# Paper Fold Stability Summary",
+        "# Paper Fold 穩定性摘要",
         "",
         f"- folds: `{int(combined.select(pl.col('fold_id').n_unique()).item())}`",
         f"- features: `{int(summary.select(pl.col('feature').n_unique()).item())}`",
         "",
-        "## Most Stable Features",
+        "## 最穩定的特徵",
         "",
         _render_frame_markdown(summary, limit=None),
         "",
     ]
     (output_dir / "paper_fold_stability_report.md").write_text("\n".join(report), encoding="utf-8")
+    _write_all_folds_comprehensive_report(root, fold_dirs, output_dir)
     return output_dir
 
 
@@ -4206,6 +5248,13 @@ def _plot_barh(
     data = data.drop_nulls(subset=[label_col, value_col]).sort(value_col, descending=True)
     if data.is_empty():
         return
+    if _numeric_max(data, value_col) <= 0.0:
+        _plot_no_signal_figure(
+            output_path,
+            title=title,
+            message=f"All {value_col} values are zero; no measurable signal.",
+        )
+        return
     labels = _string_list(data, label_col)
     values = _numeric_numpy(data, value_col)
     import matplotlib.pyplot as plt
@@ -4221,6 +5270,20 @@ def _plot_barh(
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_no_signal_figure(output_path: Path, *, title: str, message: str) -> None:
+    """Render an explicit diagnostic instead of shipping a blank chart."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=_figsize_17_6(), dpi=130)
+    ax.set_title(title)
+    ax.text(0.5, 0.52, "NO MEASURABLE VARIATION", ha="center", va="center", fontsize=17, fontweight="bold")
+    ax.text(0.5, 0.42, message, ha="center", va="center", fontsize=11, color=PAPER_TOKENS["muted"])
+    ax.set_axis_off()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_matplotlib_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -4264,6 +5327,13 @@ def _plot_feature_time_heatmap(
     data = _with_numeric(frame.select(["feature", "lookback_from_end", value_col]), "lookback_from_end", value_col)
     data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
     if data.is_empty():
+        return
+    if _numeric_max(data, value_col) <= 0.0:
+        _plot_no_signal_figure(
+            output_path,
+            title=title,
+            message=f"All {value_col} cells are zero; use the weight-delta diagnostic.",
+        )
         return
     features = _values_by_sum(data, "feature", value_col)
     if not features:
@@ -4313,6 +5383,13 @@ def _plot_feature_time_heatmap_datashader(
     data = _with_numeric(frame.select(["feature", "lookback_from_end", value_col]), "lookback_from_end", value_col)
     data = data.drop_nulls(subset=["feature", "lookback_from_end", value_col])
     if data.is_empty():
+        return
+    if _numeric_max(data, value_col) <= 0.0:
+        _plot_no_signal_figure(
+            output_path,
+            title=title,
+            message=f"All {value_col} cells are zero; use the weight-delta diagnostic.",
+        )
         return
     features = [str(value) for value in _values_by_sum(data, "feature", value_col)]
     if not features:
@@ -4454,6 +5531,15 @@ def _plot_aux_dim_datashader(frame: pl.DataFrame, *, output_path: Path, title: s
     data = _with_numeric(frame.select(["dim", "mean_abs"]), "dim", "mean_abs")
     data = data.drop_nulls(subset=["dim", "mean_abs"]).sort("dim")
     if data.is_empty():
+        return
+    if data.height == 1:
+        _plot_barh(
+            data,
+            output_path=output_path,
+            label_col="dim",
+            value_col="mean_abs",
+            title=title,
+        )
         return
     save_line_series_datashader(
         [("mean_abs", _numeric_numpy(data, "dim"), _numeric_numpy(data, "mean_abs"), "#2171b5")],
@@ -4800,6 +5886,12 @@ def write_explanation_outputs(
     for name, frame in frames.items():
         if not _is_empty_frame(frame):
             _write_csv(frame, output_dir / f"{name}.csv")
+            # TW symbols can be numeric-looking or alphanumeric. CSV readers
+            # that infer from the first rows may choose an integer dtype and
+            # then fail later. Keep the human-readable CSV and add a typed,
+            # lossless table for this mixed-identifier artifact.
+            if name == "stock_contributions":
+                frame.write_parquet(output_dir / "stock_contributions.parquet")
         table_progress.update(1)
         table_progress.set_postfix(table=name, rows=len(frame), refresh=False)
     aux_dir = output_dir / "aux_dims"
@@ -4918,6 +6010,39 @@ def write_explanation_outputs(
     else:
         write_timing["paper_report_md_s"] = 0.0
         write_timing["paper_summary_json_s"] = 0.0
+    stage_start = time.perf_counter()
+    expected_plot_paths = _expected_explainability_plot_paths(
+        frames,
+        aux_dim_frames,
+        aux_projection_frames,
+        write_standard_plots=bool(write_plots and write_standard_plots),
+        write_paper_plots=bool(write_plots and resolved_report_style == "paper"),
+    )
+    plot_validation = _semantic_plot_quality(
+        frames,
+        _validate_explainability_plots(output_dir, expected_plot_paths),
+    )
+    (output_dir / "plot_validation.json").write_text(
+        json.dumps(_to_builtin(plot_validation), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    _write_comprehensive_explainability_report(
+        output_dir / "comprehensive_explainability_report.md",
+        metadata=metadata,
+        summary=summary,
+        frames=frames,
+        plot_validation=plot_validation,
+    )
+    plot_validation_failures = [entry for entry in plot_validation if entry.get("status") != "ok"]
+    summary["plot_validation"] = {
+        "expected": int(len(expected_plot_paths)),
+        "checked": int(len(plot_validation)),
+        "passed": int(len(plot_validation) - len(plot_validation_failures)),
+        "failed": int(len(plot_validation_failures)),
+        "manifest": "plot_validation.json",
+        "report": "comprehensive_explainability_report.md",
+    }
+    _mark_elapsed(write_timing, "comprehensive_report_s", stage_start)
     complete_write_stage("summary_json")
     write_timing["total_s"] = float(time.perf_counter() - write_start)
     stage_start = time.perf_counter()
@@ -4934,6 +6059,12 @@ def write_explanation_outputs(
     )
     complete_write_stage("complete")
     write_progress.close()
+    if strict_no_fallback and plot_validation_failures:
+        failed_paths = ", ".join(str(entry.get("path")) for entry in plot_validation_failures[:10])
+        raise RuntimeError(
+            "Explainability plot validation failed with strict_no_fallback=true: "
+            f"{len(plot_validation_failures)} artifact(s): {failed_paths}"
+        )
 
 
 def _strip_orig_mod_prefix(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -5443,6 +6574,11 @@ def run_loaded_model_explanation(
         "split_rows": int(len(dataset)),
         "sampled_date_coverage": float(len(dates)) / max(1, int(len(dataset))),
         "first_test_year_only": bool(settings.first_test_year_only),
+        "train_years": list(fold.train_years),
+        "validation_years": list(fold.val_years),
+        "test_years": list(fold.test_years),
+        "validation_test_overlap": bool(set(fold.val_years) & set(fold.test_years)),
+        "latest_year_experiment": bool(set(fold.val_years) & set(fold.test_years)),
         "config_lookback": int(config.training.lookback),
         "date_start": dates[0] if dates else None,
         "date_end": dates[-1] if dates else None,
