@@ -16,6 +16,8 @@ from stockagent.explainability import (
     ExplainabilitySettings,
     _align_panel_to_checkpoint_universe,
     _daily_weight_symbols,
+    _method_agreement_table,
+    _representation_aux_summary,
     _save_matplotlib_figure,
     _with_numeric,
     _feature_correlations,
@@ -157,6 +159,8 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert (out_dir / "summary.json").exists()
     assert (out_dir / "report.md").exists()
     assert (out_dir / "paper_explainability_report.md").exists()
+    assert (out_dir / "comprehensive_explainability_report.md").exists()
+    assert (out_dir / "plot_validation.json").exists()
     assert (out_dir / "paper_explainability_summary.json").exists()
     assert (out_dir / "feature_importance_gradient.csv").exists()
     assert (out_dir / "decision_inventory.csv").exists()
@@ -165,13 +169,26 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert (out_dir / "paper_tables" / "explainability_completeness.csv").exists()
     assert (out_dir / "paper_tables" / "trust_checks.csv").exists()
     assert (out_dir / "paper_tables" / "lookback_consistency.csv").exists()
+    assert (out_dir / "paper_tables" / "method_agreement.csv").exists()
+    assert (out_dir / "paper_tables" / "gross_pre_fee_risk_diagnostic.csv").exists()
+    assert (out_dir / "stock_contributions.parquet").exists()
     assert (out_dir / "plots_paper" / "feature_time_gradient_grad_x_input_abs_heatmap.png").exists()
     assert (out_dir / "plots_paper" / "feature_attribution_coverage_curve.png").exists()
     assert (out_dir / "plots_paper" / "portfolio_exposure_coverage_curve.png").exists()
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["plots_generated"]
     assert summary["paper_plots"]
+    assert summary["plot_validation"]["failed"] == 0
     assert list((out_dir / "plots").glob("*.png"))
+    validation = json.loads((out_dir / "plot_validation.json").read_text(encoding="utf-8"))
+    assert validation
+    assert all(entry["status"] == "ok" for entry in validation)
+    comprehensive_report = (out_dir / "comprehensive_explainability_report.md").read_text(encoding="utf-8")
+    assert "完整視覺證據" in comprehensive_report
+    assert "衡量內容" in comprehensive_report
+    assert "解讀方式" in comprehensive_report
+    assert "可疑訊號" in comprehensive_report
+    assert "![" in comprehensive_report
 
 
 def test_feature_correlations_zero_variance_without_runtime_warning() -> None:
@@ -283,10 +300,10 @@ def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path:
     consistency = (out_dir / "paper_tables" / "lookback_consistency.csv").read_text(encoding="utf-8")
     assert "warn" in consistency
     report = (out_dir / "paper_explainability_report.md").read_text(encoding="utf-8")
-    assert "Lookback warning" in report
-    assert "What it measures" in report
-    assert "How to read it" in report
-    assert "What would be suspicious" in report
+    assert "Lookback 警告" in report
+    assert "衡量內容" in report
+    assert "解讀方式" in report
+    assert "可疑訊號" in report
 
     image_path = out_dir / "plots_paper" / "feature_time_gradient_grad_x_input_abs_heatmap.png"
     assert image_path.exists()
@@ -315,12 +332,78 @@ def test_paper_fold_stability_outputs(tmp_path: Path) -> None:
         import polars as pl
 
         pl.DataFrame(rows).write_csv(table_dir / "global_feature_attribution.csv")
+        fold_dir = table_dir.parent
+        (fold_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "portfolio": {
+                        "mean_gross": 1.0,
+                        "mean_abs_net": 0.4 + shift,
+                        "mean_long_gross": 0.7 + shift / 2,
+                        "mean_short_gross": 0.3 - shift / 2,
+                        "mean_turnover_proxy": 1.1 + shift,
+                        "max_abs_weight_mean": 0.2 + shift,
+                        "max_abs_weight_max": 0.5 + shift,
+                        "mean_daily_log_return": 0.001,
+                    },
+                    "metadata": {
+                        "date_start": f"202{fold_id}-01-01",
+                        "date_end": f"202{fold_id}-12-31",
+                        "sample_rows": 200,
+                        "sampled_date_coverage": 1.0,
+                    },
+                    "shap_info": {"surrogate_r2": 0.85 - shift, "valid_rows": 1000},
+                    "warnings": ["Turnover proxy is high; strategy may be relying on unstable daily flips."],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (fold_dir / "plot_validation.json").write_text("[]", encoding="utf-8")
 
     output = write_fold_stability_outputs(root)
     assert output is not None
     assert (output / "paper_tables" / "fold_feature_stability.csv").exists()
     assert (output / "plots_paper" / "fold_stability_feature_share.png").exists()
     assert (output / "paper_fold_stability_report.md").exists()
+    assert (root / "comprehensive_all_folds_report.md").exists()
+    assert (root / "plot_validation_all_folds.json").exists()
+    report = (root / "comprehensive_all_folds_report.md").read_text(encoding="utf-8")
+    assert "不是將各 Fold 報告或圖片串接" in report
+    assert "fold_01_test/plots/" not in report
+    assert report.count("comprehensive_explainability_report.md") == 2
+    assert (root / "tables_cross_fold" / "cross_fold_portfolio_and_shap.csv").exists()
+    assert (root / "plots_cross_fold" / "cross_fold_portfolio_diagnostics.png").exists()
+
+
+def test_method_agreement_active_union_avoids_shared_zero_tie_inflation() -> None:
+    import polars as pl
+
+    table = pl.DataFrame(
+        {
+            "feature": ["a", "b", "c", "d", "e", "f"],
+            "gradient_share": [0.6, 0.3, 0.1, 0.0, 0.0, 0.0],
+            "integrated_gradients_share": [0.1, 0.3, 0.6, 0.0, 0.0, 0.0],
+        }
+    )
+    agreement = _method_agreement_table(table)
+    active = agreement.filter(pl.col("comparison_scope") == "active_union").row(0, named=True)
+    full = agreement.filter(pl.col("comparison_scope") == "all_features_including_zero_ties").row(0, named=True)
+    assert active["features_compared"] == 3
+    assert full["features_compared"] == 6
+    assert active["spearman_rank_correlation"] < full["spearman_rank_correlation"]
+
+
+def test_aux_collapse_scope_excludes_portfolio_accounting_outputs() -> None:
+    import polars as pl
+
+    frame = pl.DataFrame(
+        {
+            "name": ["implicit_cash_weight", "market_tokens", "stock_embedding"],
+            "zero_fraction": [1.0, 0.1, 0.2],
+        }
+    )
+    scoped = _representation_aux_summary(frame)
+    assert scoped.get_column("name").to_list() == ["market_tokens", "stock_embedding"]
 
 
 def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path) -> None:
