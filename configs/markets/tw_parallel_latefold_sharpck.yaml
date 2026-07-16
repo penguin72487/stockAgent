@@ -6,6 +6,8 @@ runner:
   output_dir: artifacts/markets/tw_parallel_latefold_sharpck
 
 training:
+  financial_transformer:
+    candle_dropout: 0.0
   loss_type: sharpck
   early_stopping_min_delta: 0.005
   compile_loss: false

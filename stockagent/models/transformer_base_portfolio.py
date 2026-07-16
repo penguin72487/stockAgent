@@ -1418,7 +1418,7 @@ class TransformerBasePortfolioModel(nn.Module):
         date_indices_source = date_indices.to(device=features.device, dtype=torch.long)
         batch_rows = int(date_indices_source.numel())
         if batch_rows <= 0:
-            h = self.feature_proj.weight.new_empty(
+            h = self.time_position.new_empty(
                 (0, self.lookback, int(features.size(1)), self.d_model)
             )
         else:
