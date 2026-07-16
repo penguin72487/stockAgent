@@ -10,6 +10,7 @@ from stockagent.models.bottleneck_portfolio_autoencoder import BottleneckPortfol
 from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSectionalTemporalPortfolioModel
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
+from stockagent.models.financial_transformer import FinancialTransformerModel
 from stockagent.models.gradient_boosted_portfolio_transformer import GradientBoostedPortfolioTransformer
 from stockagent.models.latent_factor_market_token_portfolio import LatentFactorMarketTokenPortfolioModel
 from stockagent.models.low_rank_market_transformer_portfolio import LowRankMarketTransformerPortfolioModel
@@ -90,6 +91,13 @@ _TRANSFORMER_BASE_PORTFOLIO_NAMES = {
     "tbp",
 }
 
+_FINANCIAL_TRANSFORMER_NAMES = {
+    "financial_transformer",
+    "financial_transformer_model",
+    "financial_token_transformer",
+    "financial_tokenized_transformer",
+}
+
 _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES = {
     "gradient_boosted_portfolio_transformer",
     "gradient_boosted_portfolio_transformer_model",
@@ -119,6 +127,8 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.low_rank_market_transformer_portfolio.stock_embedding_dim)
     if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
         return int(config.training.transformer_base_portfolio.d_model)
+    if model_name in _FINANCIAL_TRANSFORMER_NAMES:
+        return int(config.training.financial_transformer.d_model)
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
         return int(config.training.gradient_boosted_portfolio_transformer.d_model)
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:
@@ -385,6 +395,72 @@ def build_model(
             categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
         )
 
+    if model_name in _FINANCIAL_TRANSFORMER_NAMES:
+        fin_cfg = config.training.financial_transformer
+        portfolio_mode = str(fin_cfg.portfolio_mode).strip().lower().replace("-", "_")
+        if portfolio_mode in {"", "auto"}:
+            portfolio_mode = "long_only" if config.trading.long_only else "long_short"
+        return FinancialTransformerModel(
+            lookback=lookback,
+            num_features=num_features,
+            num_symbols=num_symbols,
+            d_model=fin_cfg.d_model,
+            attention_mode=fin_cfg.attention_mode,
+            use_latent_factors=fin_cfg.use_latent_factors,
+            use_market_tokens=fin_cfg.use_market_tokens,
+            use_flash_attention=fin_cfg.use_flash_attention,
+            use_time_pos=fin_cfg.use_time_pos,
+            use_symbol_pos=fin_cfg.use_symbol_pos,
+            symbol_position_capacity=fin_cfg.symbol_position_capacity,
+            input_dropout=fin_cfg.input_dropout,
+            sanitize_inputs=fin_cfg.sanitize_inputs,
+            amp_native_position_add=fin_cfg.amp_native_position_add,
+            temporal_self_attention_fast_path=fin_cfg.temporal_self_attention_fast_path,
+            compiled_cross_attention_backend=fin_cfg.compiled_cross_attention_backend,
+            sdpa_batch_limit=fin_cfg.sdpa_batch_limit,
+            norm_type=fin_cfg.norm_type,
+            ffn_type=fin_cfg.ffn_type,
+            qk_norm=fin_cfg.qk_norm,
+            rope_temporal=fin_cfg.rope_temporal,
+            rope_base=fin_cfg.rope_base,
+            temporal_layers=fin_cfg.temporal_layers,
+            temporal_heads=fin_cfg.temporal_heads,
+            temporal_ffn_mult=fin_cfg.temporal_ffn_mult,
+            temporal_pooling=fin_cfg.temporal_pooling,
+            temporal_query_mode=fin_cfg.temporal_query_mode,
+            cross_layers=fin_cfg.cross_layers,
+            cross_heads=fin_cfg.cross_heads,
+            cross_ffn_mult=fin_cfg.cross_ffn_mult,
+            joint_layers=fin_cfg.joint_layers,
+            joint_heads=fin_cfg.joint_heads,
+            joint_ffn_mult=fin_cfg.joint_ffn_mult,
+            latent_layers=fin_cfg.latent_layers,
+            num_latent_factors=fin_cfg.num_latent_factors,
+            num_market_tokens=fin_cfg.num_market_tokens,
+            market_layers=fin_cfg.market_layers,
+            head_hidden_dim=fin_cfg.head_hidden_dim,
+            head_layers=fin_cfg.head_layers,
+            dropout=fin_cfg.dropout,
+            default_temperature=fin_cfg.default_temperature,
+            portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
+            portfolio_output_mode=fin_cfg.portfolio_output_mode,
+            center_long_short_logits=fin_cfg.center_long_short_logits,
+            max_full_tokens=fin_cfg.max_full_tokens,
+            checkpoint_blocks=fin_cfg.checkpoint_blocks,
+            return_aux=fin_cfg.return_aux,
+            return_aux_details=fin_cfg.return_aux_details,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+            categorical_feature_indices=_feature_indices_from_patterns(
+                feature_names,
+                fin_cfg.categorical_feature_names,
+            ),
+            categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
+            categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
+            candle_dropout=fin_cfg.candle_dropout,
+        )
+
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
         gbpt_cfg = config.training.gradient_boosted_portfolio_transformer
         portfolio_mode = str(gbpt_cfg.portfolio_mode).strip().lower().replace("-", "_")
@@ -556,7 +632,7 @@ def build_model(
         "Supported values: mlp, ft_transformer, tabular_resnet, multi_stock_tcn, "
         "efficient_tcn_tabular_set_portfolio, tcn_hybrid_tabular_resnet, "
         "latent_factor_market_token_portfolio, low_rank_market_transformer_portfolio, "
-        "transformer_base_portfolio, gradient_boosted_portfolio_transformer, "
+        "transformer_base_portfolio, financial_transformer, gradient_boosted_portfolio_transformer, "
         "bottleneck_portfolio_autoencoder, temporal_tabular_resnet, "
         "cross_sectional_temporal_portfolio_model, lightgbm, xgboost"
     )

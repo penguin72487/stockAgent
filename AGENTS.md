@@ -756,11 +756,40 @@ Expected explainability workflow:
   date/source/target/UMAP limits are explicit reduced runs only. Training-time
   `explain_after_each_fold` settings may remain lightweight because that is a
   separate opt-in workflow.
-- Standalone explainability must enable gradient × input, Integrated Gradients,
-  feature-time perturbation, surrogate SHAP, regime analysis, fold stability,
-  aux diagnostics, all eligible cuML UMAP projections, cross-asset shocks,
-  attention flow, validated transmission, role embeddings, and graph
-  explainability. Chunking may change execution shape but must not omit outputs.
+- Standalone `explain_model.py` must enable gradient × input, Integrated
+  Gradients, feature-time perturbation, surrogate SHAP, regime analysis, fold
+  stability, aux diagnostics, and all eligible cuML UMAP projections. Cross-asset
+  GPU work is an independently scheduled project: run `cross_asset_model.py`,
+  which owns cross-asset shocks, attention flow, validated transmission, role
+  embeddings, and graph explainability. Its default artifacts live under the
+  explicitly selected training root at `explainability/fold_XX_test/`, alongside
+  the other fold explainability products. Do not add a compatibility cross-asset switch
+  back to `explain_model.py` or the training CLI; the standalone runner is the
+  only execution entry point.
+  Chunking may change execution shape but must not omit outputs within the
+  selected project.
+- `cross_asset_model.py` has a fixed coverage contract: all configured folds,
+  canonical `checkpoint_best.pt`, the first calendar year of each test split,
+  and every valid date after the in-split lookback. Do not reintroduce
+  fold/checkpoint/split/date-sampling/all-test-years CLI paths. Torchrun ranks
+  independently own whole folds; do not wrap the model in gradient DDP.
+- On the measured dual-RTX-5090 TW public shape (`L=32`, `S=2735`, `F=131`),
+  use BF16, temporal-stock embedding reuse, compiled post-temporal forward,
+  `source_chunk_size: 128`, automatic `row_chunk_size: 32`, and
+  `max_repeated_rows: 4096`. The 4K scenario batch measured about 45.4k
+  scenarios/s/GPU before source-score scatter vectorization and about 47.2k
+  afterward, with 96.8% average SM utilization and roughly 99% of the measured
+  required-kernel roof. An 8K batch reserved about 28.9GiB without material
+  throughput gain and 16K OOMed; re-profile before changing the 4K default.
+- Accumulate cross-asset metrics on GPU and transfer once per shock. Production
+  output stores the complete numeric metrics once in compact edge Parquet plus
+  source/target/shock lookup tables; do not duplicate the same full-universe
+  values into dozens of dense matrix files.
+- Cross-asset graph figures must not use Top-K/Top-N node or edge selection.
+  Render every inter-symbol edge in the directed topology adjacency map and
+  every graph node in importance/self-influence figures. Sparse tick labels are
+  a layout choice only and must not omit matrix cells, graph metrics, or
+  betweenness computation.
 - Long standalone explainability stages should expose tqdm progress with ETA and
   throughput. Persist per-stage compute/write/cross-asset timings plus CUDA peak
   memory in the fold explainability timing artifacts; `--no-progress` may hide

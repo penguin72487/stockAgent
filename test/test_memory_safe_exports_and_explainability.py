@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from plot_epoch_curves import _write_parquet_table_as_csv, export_report_csvs
+from plot_epoch_curves import _load_curve, _write_parquet_table_as_csv, export_report_csvs
 from stockagent import explainability as explainability_module
 from stockagent.explainability import (
     ExplainabilitySettings,
@@ -54,6 +54,31 @@ def test_export_report_csvs_uses_same_name_outputs(tmp_path: Path) -> None:
     assert result["candidates"] == 1
     assert result["written"] == 1
     assert (fold_dir / "daily_weights.csv").exists()
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".parquet"])
+def test_load_curve_replaces_float_nan_without_touching_strings(
+    tmp_path: Path, suffix: str
+) -> None:
+    curve_path = tmp_path / f"epoch_curve{suffix}"
+    table = pa.table(
+        {
+            "epoch": [1, 2],
+            "phase": ["train", "validation"],
+            "loss": [1.0, float("nan")],
+        }
+    )
+    if suffix == ".csv":
+        import pyarrow.csv as pacsv
+
+        pacsv.write_csv(table, curve_path)
+    else:
+        pq.write_table(table, curve_path)
+
+    rows = _load_curve(curve_path)
+
+    assert [row["phase"] for row in rows] == ["train", "validation"]
+    assert rows[1]["loss"] is None
 
 
 def test_explainability_reads_compacted_universe_from_parquet_weight_schema(tmp_path: Path) -> None:
@@ -144,7 +169,7 @@ def test_strict_no_fallback_raises_on_explainability_cuda_oom(monkeypatch) -> No
         )
 
 
-def test_explain_model_cli_defaults_are_complete_offline_explainability() -> None:
+def test_explain_model_cli_has_no_cross_asset_execution_entrypoint() -> None:
     args = parse_args([])
 
     assert args.config is None
@@ -153,8 +178,9 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.market_config_root == Path("configs/markets")
     assert args.ig_steps == 8
     assert args.perturb is True
-    assert args.perturb_max_auto_batch_size == 5
-    assert args.perturb_max_input_elements == 32_000_000
+    assert args.perturb_max_auto_batch_size == 48
+    assert args.perturb_max_input_elements == 576_000_000
+    assert args.counterfactual_compile is True
     assert args.plots is True
     assert args.report_style == "paper"
     assert args.standard_plots is True
@@ -167,15 +193,12 @@ def test_explain_model_cli_defaults_are_complete_offline_explainability() -> Non
     assert args.umap_max_points == 0
     assert not hasattr(args, "top_k")
     assert not hasattr(args, "case_study_top_k")
-    assert args.cross_asset is True
-    assert args.cross_asset_max_sources == 0
-    assert args.cross_asset_max_targets == 0
-    assert args.cross_asset_source_chunk_size == 2
-    assert args.cross_asset_attention_capture_rows == 0
-    assert args.cross_asset_role_embedding is True
+    assert not any(name.startswith("cross_asset") for name in vars(args))
     assert args.strict_no_fallback is True
 
     assert parse_args(["--no-progress"]).progress is False
+    with pytest.raises(SystemExit):
+        parse_args(["--cross-asset"])
 
 
 def test_explain_model_cli_discovers_market_artifacts(tmp_path: Path) -> None:
@@ -226,7 +249,14 @@ def test_dynamic_symbol_position_checkpoint_state_is_resized_for_explainability(
 
 
 def test_training_explainability_settings_use_throughput_defaults() -> None:
-    settings = settings_from_training_config(SimpleNamespace())
+    settings = settings_from_training_config(
+        SimpleNamespace(
+            # These legacy TrainingConfig fields remain loadable for checkpoint
+            # compatibility but must no longer create a runtime execution path.
+            explain_cross_asset_enabled=True,
+            explain_cross_asset_max_sources=2,
+        )
+    )
 
     assert settings.ig_steps == 0
     assert settings.ig_batch_size == 1
@@ -240,10 +270,7 @@ def test_training_explainability_settings_use_throughput_defaults() -> None:
     assert settings.regime_analysis is False
     assert settings.fold_stability is False
     assert settings.umap_enabled is False
-    assert settings.cross_asset_enabled is False
-    assert settings.cross_asset_source_chunk_size == 1
-    assert settings.cross_asset_attention_capture_rows == 1
-    assert settings.cross_asset_role_embedding is False
+    assert not any(name.startswith("cross_asset") for name in settings.__slots__)
 
 
 def test_training_fold_explainability_delegates_to_shared_runner(monkeypatch, tmp_path: Path) -> None:
@@ -294,4 +321,3 @@ def test_training_fold_explainability_delegates_to_shared_runner(monkeypatch, tm
     assert isinstance(settings, ExplainabilitySettings)
     assert settings.ig_steps == 0
     assert settings.perturb is False
-    assert settings.cross_asset_enabled is False

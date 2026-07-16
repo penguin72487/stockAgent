@@ -6,6 +6,7 @@ import multiprocessing as mp
 from pathlib import Path
 import queue
 import random
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -45,6 +46,14 @@ def test_auto_multi_gpu_strategy_tracks_visible_device_count(
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     assert train_entry._resolve_multi_gpu_strategy("auto") == "distributed_data_parallel"
     assert train_entry._resolve_multi_gpu_strategy("none") == "none"
+
+
+def test_training_cli_has_no_cross_asset_execution_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["train.py", "--explain-cross-asset"])
+    with pytest.raises(SystemExit):
+        train_entry.parse_args()
 
 
 def test_process_thread_budget_prefers_config_then_inherited_then_affinity(
@@ -110,6 +119,10 @@ def test_tw_public_uses_single_5070ti_runtime_and_dynamic_loss_graph() -> None:
     assert config.environment.torch_compile_threads == 8
     assert config.training.multi_gpu_strategy == "none"
     assert config.training.compile_loss_dynamic_symbols is True
+    # Preserve old config/checkpoint schema while removing every training-time
+    # execution path for the standalone cross-asset project.
+    assert hasattr(config.training, "explain_cross_asset_enabled")
+    assert hasattr(config.training, "explain_cross_asset_shocks")
 
 
 def test_local_world_size_uses_local_not_global_rank_count(

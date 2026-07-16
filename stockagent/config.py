@@ -509,6 +509,11 @@ class TransformerBasePortfolioModelConfig:
 
 
 @dataclass(slots=True)
+class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
+    candle_dropout: float = 0.0
+
+
+@dataclass(slots=True)
 class GradientBoostedPortfolioTransformerConfig:
     d_model: int = 64
     temporal_layers: int = 2
@@ -711,6 +716,7 @@ class TrainingConfig:
     explain_perturb_batch_size: int = 1
     explain_perturb_max_auto_batch_size: int = 1
     explain_perturb_max_input_elements: int = 8_000_000
+    explain_counterfactual_compile: bool = False
     explain_write_plots: bool = False
     explain_report_style: str = "none"
     explain_plot_theme: str = "paper"
@@ -731,6 +737,7 @@ class TrainingConfig:
     explain_cross_asset_max_targets: int = 8
     explain_cross_asset_top_edges: int = 150
     explain_cross_asset_source_chunk_size: int = 1
+    explain_cross_asset_max_repeated_rows: int = 48
     explain_cross_asset_perturb_scale: float = 1.0
     explain_cross_asset_shocks: list[str] = field(
         default_factory=lambda: ["zero", "momentum", "gap", "volume", "volatility", "liquidity"]
@@ -797,6 +804,9 @@ class TrainingConfig:
     transformer_base_portfolio: TransformerBasePortfolioModelConfig = field(
         default_factory=TransformerBasePortfolioModelConfig
     )
+    financial_transformer: FinancialTransformerModelConfig = field(
+        default_factory=FinancialTransformerModelConfig
+    )
     gradient_boosted_portfolio_transformer: GradientBoostedPortfolioTransformerConfig = field(
         default_factory=GradientBoostedPortfolioTransformerConfig
     )
@@ -855,6 +865,7 @@ def _nested_training_schemas() -> dict[str, type[Any]]:
         "latent_factor_market_token_portfolio": LatentFactorMarketTokenPortfolioModelConfig,
         "low_rank_market_transformer_portfolio": LowRankMarketTransformerPortfolioModelConfig,
         "transformer_base_portfolio": TransformerBasePortfolioModelConfig,
+        "financial_transformer": FinancialTransformerModelConfig,
         "gradient_boosted_portfolio_transformer": GradientBoostedPortfolioTransformerConfig,
         "bottleneck_portfolio_autoencoder": BottleneckPortfolioAutoencoderConfig,
         "tcn_hybrid_tabular_resnet": TCNHybridTabularResNetModelConfig,
@@ -1165,6 +1176,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         LowRankMarketTransformerPortfolioModelConfig,
     )
 
+    financial_transformer_overrides = deepcopy(training.get("financial_transformer", {}))
+
     transformer_base_portfolio = training.setdefault("transformer_base_portfolio", {})
     _set_legacy_alias_defaults(transformer_base_portfolio, {"dropout": legacy_dropout})
     _set_dataclass_defaults(transformer_base_portfolio, TransformerBasePortfolioModelConfig)
@@ -1180,6 +1193,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     transformer_base_portfolio["categorical_embedding_cardinality"] = max(
         2, int(transformer_base_portfolio["categorical_embedding_cardinality"])
+    )
+
+    # Financial Transformer extends the market-specific Transformer Base
+    # settings. Its YAML section only needs to declare Candle Encoder overrides.
+    financial_transformer = _deep_merge_config(
+        deepcopy(transformer_base_portfolio),
+        financial_transformer_overrides,
+    )
+    training["financial_transformer"] = financial_transformer
+    _set_legacy_alias_defaults(financial_transformer, {"dropout": legacy_dropout})
+    _set_dataclass_defaults(financial_transformer, FinancialTransformerModelConfig)
+    financial_transformer["portfolio_output_mode"] = normalize_portfolio_output_mode(
+        financial_transformer.get("portfolio_output_mode")
+    )
+    financial_transformer["categorical_feature_names"] = _normalize_string_list(
+        financial_transformer.get("categorical_feature_names"),
+        field_name="training.financial_transformer.categorical_feature_names",
+    )
+    financial_transformer["categorical_embedding_dim"] = max(
+        1, int(financial_transformer["categorical_embedding_dim"])
+    )
+    financial_transformer["categorical_embedding_cardinality"] = max(
+        2, int(financial_transformer["categorical_embedding_cardinality"])
     )
 
     gradient_boosted_portfolio_transformer = training.setdefault("gradient_boosted_portfolio_transformer", {})
@@ -1429,6 +1465,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     training["explain_cross_asset_source_chunk_size"] = max(
         1, int(training["explain_cross_asset_source_chunk_size"])
     )
+    training["explain_cross_asset_max_repeated_rows"] = max(
+        1, int(training["explain_cross_asset_max_repeated_rows"])
+    )
     training["explain_cross_asset_perturb_scale"] = float(training["explain_cross_asset_perturb_scale"])
     raw_cross_shocks = training["explain_cross_asset_shocks"]
     if isinstance(raw_cross_shocks, str):
@@ -1628,6 +1667,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_perturb_batch_size=training_raw["explain_perturb_batch_size"],
             explain_perturb_max_auto_batch_size=training_raw["explain_perturb_max_auto_batch_size"],
             explain_perturb_max_input_elements=training_raw["explain_perturb_max_input_elements"],
+            explain_counterfactual_compile=training_raw["explain_counterfactual_compile"],
             explain_write_plots=training_raw["explain_write_plots"],
             explain_report_style=training_raw["explain_report_style"],
             explain_plot_theme=training_raw["explain_plot_theme"],
@@ -1648,6 +1688,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_cross_asset_max_targets=training_raw["explain_cross_asset_max_targets"],
             explain_cross_asset_top_edges=training_raw["explain_cross_asset_top_edges"],
             explain_cross_asset_source_chunk_size=training_raw["explain_cross_asset_source_chunk_size"],
+            explain_cross_asset_max_repeated_rows=training_raw["explain_cross_asset_max_repeated_rows"],
             explain_cross_asset_perturb_scale=training_raw["explain_cross_asset_perturb_scale"],
             explain_cross_asset_shocks=training_raw["explain_cross_asset_shocks"],
             explain_cross_asset_attention_flow=training_raw["explain_cross_asset_attention_flow"],
@@ -1715,6 +1756,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             transformer_base_portfolio=TransformerBasePortfolioModelConfig(
                 **training_raw["transformer_base_portfolio"]
+            ),
+            financial_transformer=FinancialTransformerModelConfig(
+                **training_raw["financial_transformer"]
             ),
             gradient_boosted_portfolio_transformer=GradientBoostedPortfolioTransformerConfig(
                 **training_raw["gradient_boosted_portfolio_transformer"]
