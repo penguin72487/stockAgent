@@ -215,6 +215,40 @@ def _empty_tpex_quotes() -> pl.DataFrame:
     )
 
 
+def test_official_frame_excludes_partial_rows_after_completed_cutoff(
+    tmp_path: Path,
+) -> None:
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    tpex = pl.DataFrame(
+        {
+            "date": [date(2026, 7, 15), date(2026, 7, 16)],
+            "代號": ["2330", "2330"],
+            "名稱": ["台積電", "台積電"],
+            "開盤": [1000.0, 1010.0],
+            "最高": [1020.0, 1030.0],
+            "最低": [995.0, 1005.0],
+            "收盤": [1015.0, 1025.0],
+            "成交股數": [1000.0, 1200.0],
+            "漲跌": ["+15", "除權息"],
+            "次日參考價": [1015.0, None],
+        }
+    )
+    _write_core_official_sources(
+        public_dir,
+        twse=_empty_twse_quotes(),
+        tpex=tpex,
+        sessions=[date(2026, 7, 15), date(2026, 7, 16)],
+    )
+
+    frame, _, _, _, _ = _official_frame(
+        public_dir,
+        end_date=date(2026, 7, 15),
+    )
+
+    assert frame.get_column("date").to_list() == [date(2026, 7, 15)]
+
+
 def test_builder_summary_is_accepted_by_auditor_and_tampering_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

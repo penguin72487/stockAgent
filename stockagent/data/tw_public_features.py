@@ -225,6 +225,7 @@ def build_tw_public_training_features(
     symbols_root: str | Path | None = "data_yahoo/tw_stocks",
     market_symbol: str = DEFAULT_MARKET_SYMBOL,
     summary_path: str | Path | None = None,
+    end_date: date | None = None,
 ) -> TwPublicFeatureBuildResult:
     input_dir = Path(input_dir)
     output_path = Path(output_path)
@@ -271,6 +272,8 @@ def build_tw_public_training_features(
     frames = [frame for frame in (stock_features, market_features) if not frame.is_empty()]
     if frames:
         output = pl.concat(frames, how="diagonal_relaxed")
+        if end_date is not None:
+            output = output.filter(pl.col("date") <= pl.lit(end_date))
         output = _ensure_feature_columns(output).sort(["date", "symbol"])
     else:
         output = pl.DataFrame(

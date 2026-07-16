@@ -181,6 +181,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("data_tw_public/stocks"))
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
+        "--end-date",
+        default=None,
+        help=(
+            "Inclusive completed-session cutoff (YYYY-MM-DD). Source rows after this "
+            "date are ignored so a partial future download cannot contaminate the build."
+        ),
+    )
+    parser.add_argument(
         "--legacy-official-ohlcv",
         type=Path,
         action="append",
@@ -1541,6 +1549,7 @@ def _official_frame(
     input_dir: Path,
     legacy_paths: list[Path] | None = None,
     fallback_paths: list[Path] | None = None,
+    end_date: date | None = None,
 ) -> tuple[
     pl.DataFrame,
     list[dict[str, Any]],
@@ -1613,6 +1622,8 @@ def _official_frame(
         pl.lit(-1, dtype=pl.Int32).alias("_legacy_source_id"),
         pl.lit(2, dtype=pl.Int8).alias("_source_priority"),
     ).select(merge_columns)
+    if end_date is not None:
+        current = current.filter(pl.col("date") <= pl.lit(end_date))
     lifecycle_policy = _load_official_lifecycle_policy(
         input_dir,
         current,
@@ -1639,6 +1650,14 @@ def _official_frame(
         ).select(merge_columns)
         for source_id, path in enumerate(fallback_paths)
     ]
+    if end_date is not None:
+        cutoff = pl.lit(end_date)
+        legacy_frames = [
+            frame.filter(pl.col("date") <= cutoff) for frame in legacy_frames
+        ]
+        fallback_frames = [
+            frame.filter(pl.col("date") <= cutoff) for frame in fallback_frames
+        ]
     for path, fallback_frame in zip(fallback_paths, fallback_frames, strict=True):
         before_2000 = fallback_frame.filter(pl.col("date") < pl.lit(date(2000, 1, 1)))
         if before_2000.height:
@@ -2512,6 +2531,8 @@ def _write_symbol(
 
 def main() -> None:
     args = parse_args()
+    end_date_text = getattr(args, "end_date", None)
+    end_date = date.fromisoformat(end_date_text) if end_date_text else None
     if args.legacy_official_ohlcv and not args.legacy_source_name:
         raise ValueError("--legacy-source-name is required with --legacy-official-ohlcv")
     if args.legacy_source_name and not args.legacy_official_ohlcv:
@@ -2535,9 +2556,12 @@ def main() -> None:
         args.input_dir,
         list(args.legacy_official_ohlcv),
         list(args.fallback_ohlcv),
+        end_date=end_date,
     )
+    if frame.is_empty():
+        raise RuntimeError(f"no official rows remain through end_date={end_date_text!r}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    requested_end_date = str(frame["date"].max())
+    requested_end_date = str(end_date or frame["date"].max())
     groups = frame.partition_by("symbol", as_dict=True, maintain_order=False)
     results: list[BuildResult] = []
     with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:

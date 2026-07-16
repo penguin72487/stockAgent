@@ -120,6 +120,35 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     assert [item.code for item in findings] == ["stale_feature_build_receipt"]
 
 
+def test_tw_public_feature_builder_excludes_rows_after_completed_cutoff(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "tw_public"
+    input_dir.mkdir()
+    symbols_root = tmp_path / "symbols"
+    symbols_root.mkdir()
+    _write_symbol(symbols_root / "2330_features.parquet", [10.0, 11.0])
+    pl.DataFrame(
+        {
+            "證券代號": ["2330", "2330"],
+            "本益比": ["20.5", "21.0"],
+            "股價淨值比": ["5.2", "5.3"],
+            "殖利率(%)": ["2.5", "2.4"],
+            "date": ["2024-01-02", "2024-01-03"],
+        }
+    ).write_parquet(input_dir / "twse_daily_valuation.parquet")
+
+    output_path = tmp_path / "tw_public_features.parquet"
+    build_tw_public_training_features(
+        input_dir,
+        output_path,
+        symbols_root=symbols_root,
+        end_date=date(2024, 1, 2),
+    )
+
+    assert pl.read_parquet(output_path).get_column("date").max() == date(2024, 1, 2)
+
+
 def test_legacy_tpex_quote_statistics_feed_public_features_without_fabricating_price(
     tmp_path: Path,
 ) -> None:

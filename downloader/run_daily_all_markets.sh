@@ -102,7 +102,7 @@ AUDIT_DAILY_GAP_DAYS="${AUDIT_DAILY_GAP_DAYS:-10}"
 AUDIT_INTRADAY_GAP_MULTIPLE="${AUDIT_INTRADAY_GAP_MULTIPLE:-4}"
 
 TW_CLOSE_TZ="${TW_CLOSE_TZ:-Asia/Taipei}"
-TW_CLOSE_TIME="${TW_CLOSE_TIME:-13:40}"
+TW_CLOSE_TIME="${TW_CLOSE_TIME:-18:00}"
 US_CLOSE_TZ="${US_CLOSE_TZ:-America/New_York}"
 US_CLOSE_TIME="${US_CLOSE_TIME:-16:20}"
 FOREX_CLOSE_TZ="${FOREX_CLOSE_TZ:-America/New_York}"
@@ -512,7 +512,6 @@ run_cex_incremental() {
 }
 
 run_tw_public_data_update() {
-  local today
   local rc=0
   local -a cmd=()
 
@@ -521,7 +520,6 @@ run_tw_public_data_update() {
     return 0
   fi
 
-  today="$(date +%F)"
   cmd=(
     "$PYTHON_BIN" downloader/download_tw_official_data.py
     --mode daily
@@ -529,7 +527,6 @@ run_tw_public_data_update() {
     --public-dir "$TW_PUBLIC_OUTPUT_DIR"
     --stock-root "$TW_PUBLIC_STOCKS_ROOT"
     --public-feature-path "$TW_PUBLIC_FEATURE_PATH"
-    --end-date "$today"
     --workers "$TW_OFFICIAL_BACKFILL_WORKERS"
     --public-workers "$TW_PUBLIC_WORKERS"
     --date-workers "$TW_PUBLIC_DATE_WORKERS"
