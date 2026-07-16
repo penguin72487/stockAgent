@@ -1,6 +1,6 @@
 market: crypto
 label: 加密貨幣
-enabled: true
+enabled: false
 market_type: crypto
 timezone: UTC
 open_time:
@@ -46,4 +46,4 @@ benchmark_window_days: 32
 max_turnover_warning: 1.5
 max_top_weight_warning: 0.1
 max_gross_warning: 1.05
-unsupported_message: "**加密貨幣** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
+unsupported_message: "**加密貨幣** 目前暫停支援，完成資料與推論驗證後再重新開放。"

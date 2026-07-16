@@ -94,7 +94,7 @@ def test_default_tw_end_date_uses_last_completed_session() -> None:
     after_data_ready = datetime.fromisoformat("2026-07-15T18:01:00+08:00")
     monday_before_open = datetime.fromisoformat("2026-07-13T10:00:00+08:00")
     assert _default_tw_end_date(before_open) == "2026-07-14"
-    assert _default_tw_end_date(after_close) == "2026-07-14"
+    assert _default_tw_end_date(after_close) == "2026-07-15"
     assert _default_tw_end_date(after_data_ready) == "2026-07-15"
     assert _default_tw_end_date(monday_before_open) == "2026-07-10"
 
