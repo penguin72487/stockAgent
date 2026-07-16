@@ -14,6 +14,8 @@ trading:
   portfolio_activation: identity
 
 training:
+  financial_transformer:
+    candle_dropout: 0.0
   loss_portfolio_activation: identity
   # Keep the differentiable loss dense; the validation-selected trading
   # threshold is applied only by evaluation and inference backtests.

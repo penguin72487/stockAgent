@@ -18,6 +18,8 @@ runner:
   start_fold: 20
 
 training:
+  financial_transformer:
+    candle_dropout: 0.0
   # Auto uses every GPU exposed by the launcher through torchrun/DDP, while the
   # same config remains runnable on one visible GPU for debugging and resume.
   multi_gpu_strategy: auto

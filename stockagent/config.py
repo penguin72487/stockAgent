@@ -509,6 +509,11 @@ class TransformerBasePortfolioModelConfig:
 
 
 @dataclass(slots=True)
+class FinancialTransformerModelConfig(TransformerBasePortfolioModelConfig):
+    candle_dropout: float = 0.0
+
+
+@dataclass(slots=True)
 class GradientBoostedPortfolioTransformerConfig:
     d_model: int = 64
     temporal_layers: int = 2
@@ -799,6 +804,9 @@ class TrainingConfig:
     transformer_base_portfolio: TransformerBasePortfolioModelConfig = field(
         default_factory=TransformerBasePortfolioModelConfig
     )
+    financial_transformer: FinancialTransformerModelConfig = field(
+        default_factory=FinancialTransformerModelConfig
+    )
     gradient_boosted_portfolio_transformer: GradientBoostedPortfolioTransformerConfig = field(
         default_factory=GradientBoostedPortfolioTransformerConfig
     )
@@ -857,6 +865,7 @@ def _nested_training_schemas() -> dict[str, type[Any]]:
         "latent_factor_market_token_portfolio": LatentFactorMarketTokenPortfolioModelConfig,
         "low_rank_market_transformer_portfolio": LowRankMarketTransformerPortfolioModelConfig,
         "transformer_base_portfolio": TransformerBasePortfolioModelConfig,
+        "financial_transformer": FinancialTransformerModelConfig,
         "gradient_boosted_portfolio_transformer": GradientBoostedPortfolioTransformerConfig,
         "bottleneck_portfolio_autoencoder": BottleneckPortfolioAutoencoderConfig,
         "tcn_hybrid_tabular_resnet": TCNHybridTabularResNetModelConfig,
@@ -1167,6 +1176,8 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         LowRankMarketTransformerPortfolioModelConfig,
     )
 
+    financial_transformer_overrides = deepcopy(training.get("financial_transformer", {}))
+
     transformer_base_portfolio = training.setdefault("transformer_base_portfolio", {})
     _set_legacy_alias_defaults(transformer_base_portfolio, {"dropout": legacy_dropout})
     _set_dataclass_defaults(transformer_base_portfolio, TransformerBasePortfolioModelConfig)
@@ -1182,6 +1193,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
     transformer_base_portfolio["categorical_embedding_cardinality"] = max(
         2, int(transformer_base_portfolio["categorical_embedding_cardinality"])
+    )
+
+    # Financial Transformer extends the market-specific Transformer Base
+    # settings. Its YAML section only needs to declare Candle Encoder overrides.
+    financial_transformer = _deep_merge_config(
+        deepcopy(transformer_base_portfolio),
+        financial_transformer_overrides,
+    )
+    training["financial_transformer"] = financial_transformer
+    _set_legacy_alias_defaults(financial_transformer, {"dropout": legacy_dropout})
+    _set_dataclass_defaults(financial_transformer, FinancialTransformerModelConfig)
+    financial_transformer["portfolio_output_mode"] = normalize_portfolio_output_mode(
+        financial_transformer.get("portfolio_output_mode")
+    )
+    financial_transformer["categorical_feature_names"] = _normalize_string_list(
+        financial_transformer.get("categorical_feature_names"),
+        field_name="training.financial_transformer.categorical_feature_names",
+    )
+    financial_transformer["categorical_embedding_dim"] = max(
+        1, int(financial_transformer["categorical_embedding_dim"])
+    )
+    financial_transformer["categorical_embedding_cardinality"] = max(
+        2, int(financial_transformer["categorical_embedding_cardinality"])
     )
 
     gradient_boosted_portfolio_transformer = training.setdefault("gradient_boosted_portfolio_transformer", {})
@@ -1722,6 +1756,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             ),
             transformer_base_portfolio=TransformerBasePortfolioModelConfig(
                 **training_raw["transformer_base_portfolio"]
+            ),
+            financial_transformer=FinancialTransformerModelConfig(
+                **training_raw["financial_transformer"]
             ),
             gradient_boosted_portfolio_transformer=GradientBoostedPortfolioTransformerConfig(
                 **training_raw["gradient_boosted_portfolio_transformer"]

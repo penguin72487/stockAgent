@@ -8,7 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from plot_epoch_curves import _write_parquet_table_as_csv, export_report_csvs
+from plot_epoch_curves import _load_curve, _write_parquet_table_as_csv, export_report_csvs
 from stockagent import explainability as explainability_module
 from stockagent.explainability import (
     ExplainabilitySettings,
@@ -54,6 +54,31 @@ def test_export_report_csvs_uses_same_name_outputs(tmp_path: Path) -> None:
     assert result["candidates"] == 1
     assert result["written"] == 1
     assert (fold_dir / "daily_weights.csv").exists()
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".parquet"])
+def test_load_curve_replaces_float_nan_without_touching_strings(
+    tmp_path: Path, suffix: str
+) -> None:
+    curve_path = tmp_path / f"epoch_curve{suffix}"
+    table = pa.table(
+        {
+            "epoch": [1, 2],
+            "phase": ["train", "validation"],
+            "loss": [1.0, float("nan")],
+        }
+    )
+    if suffix == ".csv":
+        import pyarrow.csv as pacsv
+
+        pacsv.write_csv(table, curve_path)
+    else:
+        pq.write_table(table, curve_path)
+
+    rows = _load_curve(curve_path)
+
+    assert [row["phase"] for row in rows] == ["train", "validation"]
+    assert rows[1]["loss"] is None
 
 
 def test_explainability_reads_compacted_universe_from_parquet_weight_schema(tmp_path: Path) -> None:

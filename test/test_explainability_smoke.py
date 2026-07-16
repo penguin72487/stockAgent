@@ -17,6 +17,8 @@ from stockagent.explainability import (
     _align_panel_to_checkpoint_universe,
     _daily_weight_symbols,
     _method_agreement_table,
+    _forward_outputs,
+    _perturbation_importance,
     _representation_aux_summary,
     _save_matplotlib_figure,
     _with_numeric,
@@ -26,6 +28,39 @@ from stockagent.explainability import (
     write_fold_stability_outputs,
     write_explanation_outputs,
 )
+
+
+class _BatchShapeSensitiveExplainModel(torch.nn.Module):
+    def forward(self, x, mask, return_aux=None):
+        scores = x.sum(dim=(1, 3)) + float(x.size(0)) * 0.01
+        scores = scores.masked_fill(~mask, 0.0)
+        return scores, scores, {}
+
+
+def test_perturbation_uses_batch_matched_baseline() -> None:
+    x = torch.randn(1, 2, 3, 2)
+    x[..., 1] = 0.0
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    model = _BatchShapeSensitiveExplainModel()
+    base_weights, base_scores, _ = _forward_outputs(model, x, mask)
+
+    feature_time, _, diagnostics = _perturbation_importance(
+        model,
+        x,
+        mask,
+        base_weights,
+        base_scores,
+        ["signal", "already_zero"],
+        batch_size=2,
+        progress_enabled=False,
+    )
+
+    zero_rows = feature_time.filter(feature_time["feature"] == "already_zero")
+    assert zero_rows["weight_abs_delta"].max() == pytest.approx(0.0)
+    assert zero_rows["score_abs_delta"].max() == pytest.approx(0.0)
+    assert diagnostics["batch_matched_baseline"] is True
+    assert diagnostics["baseline_forward_batches"] == 1
+    assert diagnostics["original_vs_matched_baseline_weight_abs_delta"] > 0.0
 
 
 def test_daily_weight_symbols_supports_parquet_and_csv(tmp_path: Path) -> None:

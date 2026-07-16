@@ -1155,6 +1155,10 @@ def _perturbation_importance(
         "oom_chunk_sizes": [],
         "elapsed_s": 0.0,
         "perturbations_per_s": 0.0,
+        "batch_matched_baseline": True,
+        "baseline_forward_batches": 0,
+        "original_vs_matched_baseline_weight_abs_delta": 0.0,
+        "original_vs_matched_baseline_score_abs_delta": 0.0,
         "embedded_fast_path": False,
         "compiled_forward": False,
     }
@@ -1181,6 +1185,7 @@ def _perturbation_importance(
     embedded_api = _embedded_explainability_api(model)
     base_projected: torch.Tensor | None = None
     base_embedded: torch.Tensor | None = None
+    matched_baseline_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     if embedded_api is not None:
         with torch.no_grad():
             base_projected = embedded_api.project_features_for_explainability(x.detach())
@@ -1249,8 +1254,48 @@ def _perturbation_importance(
                     )
                 weights_p = weights_p.reshape(work_repeats, *tuple(base_weights.shape))[:repeats]
                 scores_p = scores_p.reshape(work_repeats, *tuple(base_scores.shape))[:repeats]
-                weight_deltas = (weights_p - base_weights.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
-                score_deltas = (scores_p - base_scores.unsqueeze(0)).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+                matched_baseline = matched_baseline_cache.get(work_repeats)
+                if matched_baseline is None:
+                    if embedded_api is not None and base_embedded is not None:
+                        embedded_base = base_embedded.unsqueeze(0).expand(
+                            (work_repeats,) + tuple(base_embedded.shape)
+                        ).reshape(work_repeats * int(x.size(0)), *tuple(base_embedded.shape[1:]))
+                        base_weights_repeated, base_scores_repeated, _ = _forward_embedded_outputs(
+                            embedded_api,
+                            embedded_base,
+                            mask_perturbed,
+                            compile_forward=bool(compile_forward),
+                        )
+                    else:
+                        x_base = x.detach().unsqueeze(0).expand(
+                            (work_repeats,) + tuple(x.shape)
+                        ).reshape(work_repeats * int(x.size(0)), *tuple(x.shape[1:]))
+                        base_weights_repeated, base_scores_repeated, _ = _forward_outputs(
+                            model,
+                            x_base,
+                            mask_perturbed,
+                            return_aux=False,
+                        )
+                    base_weights_repeated = base_weights_repeated.reshape(
+                        work_repeats, *tuple(base_weights.shape)
+                    )
+                    base_scores_repeated = base_scores_repeated.reshape(
+                        work_repeats, *tuple(base_scores.shape)
+                    )
+                    matched_baseline = (base_weights_repeated, base_scores_repeated)
+                    matched_baseline_cache[work_repeats] = matched_baseline
+                    diagnostics["baseline_forward_batches"] = int(diagnostics["baseline_forward_batches"]) + 1
+                    diagnostics["original_vs_matched_baseline_weight_abs_delta"] = max(
+                        float(diagnostics["original_vs_matched_baseline_weight_abs_delta"]),
+                        float((base_weights_repeated[0] - base_weights).abs().mean().detach().cpu()),
+                    )
+                    diagnostics["original_vs_matched_baseline_score_abs_delta"] = max(
+                        float(diagnostics["original_vs_matched_baseline_score_abs_delta"]),
+                        float((base_scores_repeated[0] - base_scores).abs().mean().detach().cpu()),
+                    )
+                base_weights_matched, base_scores_matched = matched_baseline
+                weight_deltas = (weights_p - base_weights_matched[:repeats]).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+                score_deltas = (scores_p - base_scores_matched[:repeats]).abs().mean(dim=(1, 2)).detach().cpu().numpy()
             except RuntimeError as exc:
                 if not _is_cuda_oom(exc) or chunk_size <= 1:
                     raise
@@ -2633,6 +2678,10 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
         "oom_chunk_sizes": [],
         "elapsed_s": 0.0,
         "perturbations_per_s": 0.0,
+        "batch_matched_baseline": True,
+        "baseline_forward_batches": 0,
+        "original_vs_matched_baseline_weight_abs_delta": 0.0,
+        "original_vs_matched_baseline_score_abs_delta": 0.0,
     }
     for result, _ in chunk_results:
         diag = result.get("summary", {}).get("perturb_diagnostics", {})
@@ -2641,6 +2690,14 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
             merged[key] = max(int(merged[key]), int(diag.get(key, 0) or 0))
         for key in ("forward_batches", "attempted_forward_batches", "oom_retries"):
             merged[key] = int(merged[key]) + int(diag.get(key, 0) or 0)
+        merged["baseline_forward_batches"] = int(merged["baseline_forward_batches"]) + int(
+            diag.get("baseline_forward_batches", 0) or 0
+        )
+        for key in (
+            "original_vs_matched_baseline_weight_abs_delta",
+            "original_vs_matched_baseline_score_abs_delta",
+        ):
+            merged[key] = max(float(merged[key]), float(diag.get(key, 0.0) or 0.0))
         merged["elapsed_s"] = float(merged["elapsed_s"]) + float(diag.get("elapsed_s", 0.0) or 0.0)
         merged["oom_chunk_sizes"].extend(int(v) for v in diag.get("oom_chunk_sizes", []) or [])
     total_perturbations = int(merged["num_perturbations"]) * max(1, len(chunk_results))
@@ -3412,6 +3469,8 @@ def _diagnostic_risk_table(daily: pl.DataFrame) -> pl.DataFrame:
 def _semantic_plot_quality(
     frames: dict[str, pl.DataFrame],
     entries: list[dict[str, Any]],
+    *,
+    summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Annotate technically valid but analytically empty figures."""
     perturb = frames.get("feature_time_perturbation", pl.DataFrame())
@@ -3419,6 +3478,10 @@ def _semantic_plot_quality(
         not _is_empty_frame(perturb)
         and "score_abs_delta" in perturb.columns
         and _numeric_max(perturb, "score_abs_delta") <= 0.0
+    )
+    perturb_legacy_baseline = (
+        not _is_empty_frame(perturb)
+        and not bool((summary or {}).get("perturb_diagnostics", {}).get("batch_matched_baseline", False))
     )
     for entry in entries:
         path = str(entry.get("path", ""))
@@ -3429,7 +3492,41 @@ def _semantic_plot_quality(
                 "所有 score_abs_delta 都是 0；BF16 下沒有可辨識的 raw-score 變化。"
                 "此圖不能支持特徵重要性結論，應改看 weight_abs_delta。"
             )
+        elif perturb_legacy_baseline and "perturbation_weight_abs_delta" in path:
+            entry["semantic_status"] = "provisional_legacy_baseline"
+            entry["semantic_note"] = (
+                "此既有 artifact 由舊版 perturbation 基準產生：原始與反事實 forward 的 batch shape 不同，"
+                "可能混入 BF16／kernel-shape 數值底噪。新版已改成同 batch、同執行路徑基準；"
+                "本圖需重算後才可用於特徵重要性結論。"
+            )
     return entries
+
+
+def _omitted_uninformative_visuals(frames: dict[str, pl.DataFrame]) -> list[dict[str, str]]:
+    """Describe complete numeric outputs that must not be presented as evidence."""
+    perturb = frames.get("feature_time_perturbation", pl.DataFrame())
+    if (
+        _is_empty_frame(perturb)
+        or "score_abs_delta" not in perturb.columns
+        or _numeric_max(perturb, "score_abs_delta") > 0.0
+    ):
+        return []
+    reason = (
+        "完整 score_abs_delta 表的所有值皆為 0；目前 BF16 counterfactual 的 raw-score "
+        "變化低於可辨識解析度。保留 CSV 供稽核，但空白圖不能支持特徵重要性結論。"
+    )
+    return [
+        {
+            "path": "plots/feature_importance_perturbation_score_abs_delta.png",
+            "reason": reason,
+            "alternative": "plots/feature_importance_perturbation_weight_abs_delta.png",
+        },
+        {
+            "path": "plots/feature_time_perturbation_score_abs_delta_heatmap.png",
+            "reason": reason,
+            "alternative": "plots/feature_time_perturbation_weight_abs_delta_heatmap.png",
+        },
+    ]
 
 
 
@@ -3540,11 +3637,17 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
     plot_data = _concat_frames(melted)
     if plot_data.is_empty():
         return
-    plt, sns = _setup_paper_plotting()
+    plt, _ = _setup_paper_plotting()
     feature_count = int(data.select(pl.col("feature_label").n_unique()).item())
-    fig, ax = plt.subplots(
-        figsize=_figsize_for_rows(feature_count, width=22.0, row_height=0.30, overhead=2.8),
+    panel_rows = 36
+    grid_rows, grid_columns, panel_count = _complete_panel_grid(feature_count, panel_rows=panel_rows)
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_columns,
+        figsize=(max(18.0, 8.5 * grid_columns), max(8.0, grid_rows * 13.0)),
         dpi=160,
+        squeeze=False,
+        sharex=True,
     )
     palette = {
         "Grad x input": PAPER_TOKENS["blue_mid"],
@@ -3552,29 +3655,30 @@ def _plot_paper_global_attribution(table: pl.DataFrame, output_path: Path, *, su
         "Perturbation": PAPER_TOKENS["orange_mid"],
         "Surrogate SHAP": PAPER_TOKENS["olive_mid"],
     }
-    order = _string_list(data, "feature_label")[::-1]
-    methods = _string_list(plot_data.select(pl.col("method").unique(maintain_order=True)), "method")
-    sns.barplot(
-        data=_to_plot_data(plot_data),
-        y="feature_label",
-        x="share",
-        hue="method",
-        order=order,
-        palette={key: palette[key] for key in methods if key in palette},
-        ax=ax,
-    )
-    ax.set_xlabel("Attribution share")
-    ax.set_ylabel("")
-    ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
-    ax.grid(True, axis="x", color=PAPER_TOKENS["grid"], linewidth=0.8)
-    ax.legend(loc="lower right", frameon=True, fontsize=8)
-    _add_paper_header(
-        fig,
-        ax,
-        "Global feature attribution agrees on the dominant decision signals",
-        subtitle,
-    )
-    _finish_paper_axes(ax)
+    labels = _string_list(data, "feature_label")
+    bar_height = 0.8 / max(1, len(available))
+    for panel_idx, ax in enumerate(axes.flat):
+        if panel_idx >= panel_count:
+            ax.set_visible(False)
+            continue
+        start = panel_idx * panel_rows
+        end = min(feature_count, start + panel_rows)
+        y = np.arange(end - start)
+        for method_idx, (column, method_label) in enumerate(available):
+            values = _numeric_numpy(data, column)[start:end]
+            offset = (method_idx - (len(available) - 1) / 2.0) * bar_height
+            ax.barh(y + offset, values, height=bar_height, color=palette[method_label], label=method_label)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels[start:end], fontsize=7)
+        ax.invert_yaxis()
+        ax.set_xlabel("Attribution share")
+        ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
+        ax.grid(True, axis="x", color=PAPER_TOKENS["grid"], linewidth=0.8)
+        ax.set_title(f"Features {start + 1}–{end}", fontsize=10)
+        _finish_paper_axes(ax)
+    axes.flat[0].legend(loc="best", frameon=True, fontsize=8)
+    fig.suptitle("Global feature attribution across all features", fontsize=16, y=0.995)
+    fig.text(0.5, 0.975, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
@@ -3613,12 +3717,17 @@ def _plot_paper_feature_time_heatmap(
     )
     if matrix.size == 0:
         return
-    plt, sns = _setup_paper_plotting()
+    plt, _ = _setup_paper_plotting()
     from matplotlib.colors import LinearSegmentedColormap
 
-    fig, ax = plt.subplots(
-        figsize=_figsize_for_rows(len(labels), width=24.0, row_height=0.25, overhead=3.0),
+    panel_rows = 36
+    grid_rows, grid_columns, panel_count = _complete_panel_grid(len(labels), panel_rows=panel_rows)
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_columns,
+        figsize=(max(18.0, 9.0 * grid_columns), max(8.0, grid_rows * 13.0)),
         dpi=170,
+        squeeze=False,
     )
     cmap = LinearSegmentedColormap.from_list(
         "paper_blue_gold",
@@ -3627,23 +3736,26 @@ def _plot_paper_feature_time_heatmap(
     vmax = float(np.nanpercentile(matrix, 98))
     if vmax <= 0.0:
         vmax = None
-    sns.heatmap(
-        matrix,
-        cmap=cmap,
-        vmin=0.0,
-        vmax=vmax,
-        linewidths=0.7,
-        linecolor=PAPER_TOKENS["panel"],
-        cbar_kws={"label": value_col},
-        ax=ax,
-        xticklabels=[_lookback_label(column) for column in columns],
-        yticklabels=[str(label) for label in labels],
-    )
-    ax.set_xlabel("Lookback day (t-0 = latest day before decision)")
-    ax.set_ylabel("")
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=0)
-    ax.tick_params(axis="y", labelsize=8)
-    _add_paper_header(fig, ax, title, subtitle)
+    image = None
+    visible_axes = []
+    for panel_idx, ax in enumerate(axes.flat):
+        if panel_idx >= panel_count:
+            ax.set_visible(False)
+            continue
+        visible_axes.append(ax)
+        start = panel_idx * panel_rows
+        end = min(len(labels), start + panel_rows)
+        image = ax.imshow(matrix[start:end], aspect="auto", interpolation="nearest", cmap=cmap, vmin=0.0, vmax=vmax)
+        ax.set_xlabel("Lookback day (t-0 = latest)")
+        ax.set_xticks(np.arange(len(columns)))
+        ax.set_xticklabels([_lookback_label(column) for column in columns], rotation=90, fontsize=7)
+        ax.set_yticks(np.arange(end - start))
+        ax.set_yticklabels([str(label) for label in labels[start:end]], fontsize=7)
+        ax.set_title(f"Features {start + 1}–{end}", fontsize=10)
+    if image is not None:
+        fig.colorbar(image, ax=visible_axes, fraction=0.012, pad=0.015, label=value_col)
+    fig.suptitle(title, fontsize=16, y=0.995)
+    fig.text(0.5, 0.975, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
@@ -3689,29 +3801,39 @@ def _plot_paper_feature_correlations(frame: pl.DataFrame, *, output_path: Path, 
     data = data.with_columns(
         pl.concat_str([pl.col("source").cast(pl.String), pl.lit(" / "), pl.col("feature").cast(pl.String)]).alias("label")
     )
-    plot = data.select(["label", "score_corr", "weight_corr"]).unpivot(
-        index=["label"], on=["score_corr", "weight_corr"], variable_name="target", value_name="corr"
-    )
-    plt, sns = _setup_paper_plotting()
-    fig, ax = plt.subplots(
-        figsize=_figsize_for_rows(data.height, width=22.0, row_height=0.24, overhead=2.8),
+    plt, _ = _setup_paper_plotting()
+    panel_rows = 36
+    grid_rows, grid_columns, panel_count = _complete_panel_grid(data.height, panel_rows=panel_rows)
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_columns,
+        figsize=(max(18.0, 8.5 * grid_columns), max(8.0, grid_rows * 13.0)),
         dpi=160,
+        squeeze=False,
+        sharex=True,
     )
-    sns.barplot(
-        data=_to_plot_data(plot),
-        y="label",
-        x="corr",
-        hue="target",
-        order=_string_list(data, "label")[::-1],
-        palette={"score_corr": PAPER_TOKENS["blue_mid"], "weight_corr": PAPER_TOKENS["pink_mid"]},
-        ax=ax,
-    )
-    ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
-    ax.set_xlabel("Correlation")
-    ax.set_ylabel("")
-    ax.legend(loc="lower right", frameon=True, fontsize=8)
-    _add_paper_header(fig, ax, "Simple feature correlations test for shortcut rules", subtitle)
-    _finish_paper_axes(ax)
+    labels = _string_list(data, "label")
+    score_values = _numeric_numpy(data, "score_corr")
+    weight_values = _numeric_numpy(data, "weight_corr")
+    for panel_idx, ax in enumerate(axes.flat):
+        if panel_idx >= panel_count:
+            ax.set_visible(False)
+            continue
+        start = panel_idx * panel_rows
+        end = min(data.height, start + panel_rows)
+        y = np.arange(end - start)
+        ax.barh(y - 0.19, score_values[start:end], height=0.36, color=PAPER_TOKENS["blue_mid"], label="score_corr")
+        ax.barh(y + 0.19, weight_values[start:end], height=0.36, color=PAPER_TOKENS["pink_mid"], label="weight_corr")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels[start:end], fontsize=7)
+        ax.invert_yaxis()
+        ax.axvline(0.0, color=PAPER_TOKENS["neutral_dark"], linewidth=1.0)
+        ax.set_xlabel("Correlation")
+        ax.set_title(f"Feature-source pairs {start + 1}–{end}", fontsize=10)
+        _finish_paper_axes(ax)
+    axes.flat[0].legend(loc="best", frameon=True, fontsize=8)
+    fig.suptitle("Simple feature correlations test for shortcut rules", fontsize=16, y=0.995)
+    fig.text(0.5, 0.975, subtitle, ha="center", va="top", fontsize=9, color=PAPER_TOKENS["muted"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
     plt.close(fig)
@@ -4270,6 +4392,20 @@ def _expected_explainability_plot_paths(
         if not _is_empty_frame(frame) and set(required).issubset(frame.columns):
             expected.add(relative_path)
 
+    def add_if_nonzero(
+        frame_name: str,
+        relative_path: str,
+        required: tuple[str, ...],
+        value_col: str,
+    ) -> None:
+        frame = frames.get(frame_name, pl.DataFrame())
+        if (
+            not _is_empty_frame(frame)
+            and set(required).issubset(frame.columns)
+            and _numeric_max(frame, value_col) > 0.0
+        ):
+            expected.add(relative_path)
+
     if write_standard_plots:
         for frame_name, value_col in (
             ("feature_importance_gradient", "grad_x_input_abs"),
@@ -4279,7 +4415,12 @@ def _expected_explainability_plot_paths(
             ("aux_summary", "mean_abs"),
         ):
             label_col = "name" if frame_name == "aux_summary" else "feature"
-            add_if(frame_name, f"plots/{frame_name}_{value_col}.png", (label_col, value_col))
+            add_if_nonzero(
+                frame_name,
+                f"plots/{frame_name}_{value_col}.png",
+                (label_col, value_col),
+                value_col,
+            )
         for frame_name, value_col in (
             ("time_importance_gradient", "grad_x_input_abs"),
             ("time_importance_integrated_gradients", "integrated_gradients_abs"),
@@ -4291,10 +4432,11 @@ def _expected_explainability_plot_paths(
             ("feature_time_perturbation", "weight_abs_delta"),
             ("feature_time_perturbation", "score_abs_delta"),
         ):
-            add_if(
+            add_if_nonzero(
                 frame_name,
                 f"plots/{frame_name}_{value_col}_heatmap.png",
                 ("feature", "lookback_from_end", value_col),
+                value_col,
             )
         add_if("feature_correlations", "plots/feature_correlations.png", ("feature", "score_corr", "weight_corr"))
         add_if(
@@ -4421,6 +4563,11 @@ def _write_comprehensive_explainability_report(
     global_attribution = _global_attribution_table(frames)
     method_agreement = _method_agreement_table(global_attribution)
     risk_diagnostic = _diagnostic_risk_table(frames.get("daily_portfolio", pl.DataFrame()))
+    omitted_visuals = _omitted_uninformative_visuals(frames)
+    perturb_legacy_baseline = (
+        not _is_empty_frame(frames.get("feature_time_perturbation", pl.DataFrame()))
+        and not bool(summary.get("perturb_diagnostics", {}).get("batch_matched_baseline", False))
+    )
     lines: list[str] = ["# 完整模型可解釋性報告", ""]
     lines.extend(
         [
@@ -4441,6 +4588,17 @@ def _write_comprehensive_explainability_report(
         lines.append(
             f"- **另有 {len(semantic_issues)} 張圖技術上有效、但資料沒有可辨識變化；"
             "它們已標成 `uninformative`，不可作為模型規則證據。**"
+        )
+    if omitted_visuals:
+        lines.append(
+            f"- **有 {len(omitted_visuals)} 個全零圖表已停止輸出。** 完整數值仍保留在 CSV；"
+            "這些 omission 是語意 QA 結果，不是漏算。"
+        )
+    if perturb_legacy_baseline:
+        lines.append(
+            "- **Perturbation weight 圖目前是待重算的舊版產物。** 舊演算法用不同 batch shape 的基準與反事實 forward 相減，"
+            "可能把 BF16／kernel-shape 底噪算成特徵效果；新版已採同 batch、同執行路徑基準。"
+            "在重新執行 perturbation 前，不可用這些圖判定特徵重要性。"
         )
     if bool(metadata.get("validation_test_overlap", False)):
         lines.append(
@@ -4476,6 +4634,20 @@ def _write_comprehensive_explainability_report(
         if status == "ok":
             title = _figure_title(relative_path)
             lines.extend([f"[![{title}]({relative_path})]({relative_path})", "", "_點擊圖片可開啟完整解析度版本。_", ""])
+
+    if omitted_visuals:
+        lines.extend(["## 已省略的無資訊圖表", ""])
+        for item in omitted_visuals:
+            lines.extend(
+                [
+                    f"### {_figure_title(item['path'])}",
+                    "",
+                    f"- **狀態**：`omitted_uninformative`",
+                    f"- **原因**：{item['reason']}",
+                    f"- **替代圖**：`{item['alternative']}`",
+                    "",
+                ]
+            )
 
     lines.extend(
         [
@@ -4520,7 +4692,7 @@ def _write_comprehensive_explainability_report(
             "- Integrated Gradients 從零基準積分敏感度，因此結論會受到基準值選擇影響。",
             f"- Integrated Gradients 使用 `{summary.get('ig_steps', 'unknown')}` 個積分 steps；目前 artifact **沒有保存 completeness residual**（歸因總和對輸出差值），因此只能確認 cell coverage，不能證明數值積分已收斂。",
             "- Perturbation 將每個特徵–日期格歸零後，衡量分數與配置變化。",
-            "- 若 `score_abs_delta` 全為 0，代表目前 BF16 執行沒有可辨識的 raw-score 差；此時只採用非零的 `weight_abs_delta`，不解讀空白 score 圖。",
+            "- 若 `score_abs_delta` 全為 0，代表目前 BF16 執行沒有可辨識的 raw-score 差，不解讀空白 score 圖。`weight_abs_delta` 只有在 `batch_matched_baseline=true` 時才可採用。",
             "- 代理 SHAP 解釋的是擬合後的 score-head surrogate，不是端到端 Transformer 的精確 Shapley 分解。",
             "- Aux 維度圖檢查激活使用情況；UMAP 只近似保留局部鄰域，不提供具語意的座標軸。",
             "- 圖片 QA 會開啟並解碼每個預期／找到的 PNG，驗證格式、非零檔案大小與正尺寸；這不等於證明金融結論正確。",
@@ -4559,6 +4731,277 @@ def _write_comprehensive_explainability_report(
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+@dataclass(frozen=True)
+class _CrossFoldFigureSpec:
+    source: str
+    key_cols: tuple[str, ...]
+    value_cols: tuple[str, ...]
+    mode: str = "vector"
+
+
+def _cross_fold_figure_spec(relative_path: str) -> _CrossFoldFigureSpec | None:
+    path = Path(relative_path)
+    name = path.name
+    if path.parent.name == "aux_dims":
+        return _CrossFoldFigureSpec(f"aux_dims/{path.stem}.csv", ("dim",), ("mean_abs",))
+    if path.parent.name == "aux_umap":
+        return _CrossFoldFigureSpec(f"aux_projections/{path.stem}.csv", (), ("umap_x", "umap_y"), "umap")
+    exact: dict[str, _CrossFoldFigureSpec] = {
+        "aux_summary_mean_abs.png": _CrossFoldFigureSpec("aux_summary.csv", ("name",), ("mean_abs",)),
+        "aux_token_diagnostics.png": _CrossFoldFigureSpec("aux_summary.csv", ("name",), ("mean_abs",)),
+        "decision_inventory_exposure_by_side.png": _CrossFoldFigureSpec("decision_inventory.csv", ("side",), ("weight",), "group_abs"),
+        "decision_case_studies.png": _CrossFoldFigureSpec("decision_case_studies.csv", ("case_type",), ("gross_contribution", "abs_weight"), "group_mean_abs"),
+        "feature_correlations.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
+        "feature_correlations_shortcut_checks.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
+        "feature_importance_gradient_grad_x_input_abs.png": _CrossFoldFigureSpec("feature_importance_gradient.csv", ("feature",), ("grad_x_input_abs",)),
+        "feature_importance_integrated_gradients_integrated_gradients_abs.png": _CrossFoldFigureSpec("feature_importance_integrated_gradients.csv", ("feature",), ("integrated_gradients_abs",)),
+        "feature_importance_perturbation_weight_abs_delta.png": _CrossFoldFigureSpec("feature_importance_perturbation.csv", ("feature",), ("weight_abs_delta",)),
+        "feature_importance_perturbation_score_abs_delta.png": _CrossFoldFigureSpec("feature_importance_perturbation.csv", ("feature",), ("score_abs_delta",)),
+        "feature_time_gradient_grad_x_input_abs_heatmap.png": _CrossFoldFigureSpec("feature_time_gradient.csv", ("feature", "lookback_from_end"), ("grad_x_input_abs",)),
+        "feature_time_integrated_gradients_integrated_gradients_abs_heatmap.png": _CrossFoldFigureSpec("feature_time_integrated_gradients.csv", ("feature", "lookback_from_end"), ("integrated_gradients_abs",)),
+        "feature_time_perturbation_weight_abs_delta_heatmap.png": _CrossFoldFigureSpec("feature_time_perturbation.csv", ("feature", "lookback_from_end"), ("weight_abs_delta",)),
+        "feature_time_perturbation_score_abs_delta_heatmap.png": _CrossFoldFigureSpec("feature_time_perturbation.csv", ("feature", "lookback_from_end"), ("score_abs_delta",)),
+        "time_importance_gradient.png": _CrossFoldFigureSpec("time_importance_gradient.csv", ("lookback_from_end",), ("grad_x_input_abs",)),
+        "time_importance_integrated_gradients.png": _CrossFoldFigureSpec("time_importance_integrated_gradients.csv", ("lookback_from_end",), ("integrated_gradients_abs",)),
+        "global_feature_attribution.png": _CrossFoldFigureSpec("paper_tables/global_feature_attribution.csv", ("feature",), ("gradient_share", "integrated_gradients_share", "perturbation_weight_share", "shap_share")),
+        "feature_attribution_coverage_curve.png": _CrossFoldFigureSpec("paper_tables/feature_attribution_coverage_curve.csv", ("feature_rank",), ("cumulative_mean_attribution_share",)),
+        "portfolio_exposure_coverage_curve.png": _CrossFoldFigureSpec("paper_tables/exposure_coverage_curve.csv", ("fraction_of_tradable_names",), ("mean_cumulative_gross_exposure",), "curve"),
+        "regime_analysis.png": _CrossFoldFigureSpec("regime_analysis.csv", ("dimension", "regime"), ("mean_strategy_log_return", "mean_turnover_proxy", "mean_gross_exposure", "mean_net_exposure", "hit_rate")),
+        "trust_checks.png": _CrossFoldFigureSpec("trust_checks.csv", ("check",), ("value",)),
+    }
+    return exact.get(name)
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+    return ranks
+
+
+def _vector_similarity(left: np.ndarray, right: np.ndarray) -> tuple[float, float, float]:
+    left = np.nan_to_num(np.asarray(left, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    right = np.nan_to_num(np.asarray(right, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    left_l1 = np.abs(left).sum()
+    right_l1 = np.abs(right).sum()
+    left_dist = np.abs(left) / left_l1 if left_l1 > 0.0 else np.zeros_like(left)
+    right_dist = np.abs(right) / right_l1 if right_l1 > 0.0 else np.zeros_like(right)
+    distribution_l1 = float(0.5 * np.abs(left_dist - right_dist).sum())
+    denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+    cosine = float(np.dot(left, right) / denom) if denom > 0.0 else (1.0 if left_l1 == right_l1 == 0.0 else 0.0)
+    active = (left != 0.0) | (right != 0.0)
+    rank_corr = _safe_corrcoef(_average_ranks(left[active]), _average_ranks(right[active])) if int(active.sum()) >= 3 else (1.0 if np.array_equal(left, right) else 0.0)
+    return distribution_l1, cosine, float(rank_corr)
+
+
+def _fold_vector_from_table(frame: pl.DataFrame, spec: _CrossFoldFigureSpec) -> dict[str, float]:
+    if frame.is_empty():
+        return {}
+    available_values = [column for column in spec.value_cols if column in frame.columns]
+    if not available_values:
+        return {}
+    if spec.mode == "curve":
+        x_col = spec.key_cols[0] if spec.key_cols else ""
+        if x_col not in frame.columns:
+            return {}
+        numeric = _with_numeric(frame, x_col, *available_values).drop_nulls(subset=[x_col]).sort(x_col)
+        x = _numeric_numpy(numeric, x_col)
+        if x.size == 0:
+            return {}
+        grid = np.linspace(0.0, 1.0, 101)
+        result: dict[str, float] = {}
+        for column in available_values:
+            y = _numeric_numpy(numeric, column)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not finite.any():
+                continue
+            sampled = np.interp(grid, x[finite], y[finite])
+            result.update({f"{column} :: q{idx:03d}": float(value) for idx, value in enumerate(sampled)})
+        return result
+    if spec.mode in {"group_abs", "group_mean_abs"}:
+        if not set(spec.key_cols).issubset(frame.columns):
+            return {}
+        expressions = []
+        for column in available_values:
+            expr = _numeric_expr(column).fill_null(0.0).abs()
+            expressions.append((expr.sum() if spec.mode == "group_abs" else expr.mean()).alias(column))
+        frame = frame.group_by(list(spec.key_cols)).agg(expressions)
+    if not set(spec.key_cols).issubset(frame.columns):
+        return {}
+    rows: dict[str, float] = {}
+    for row in frame.iter_rows(named=True):
+        key = " | ".join(str(row.get(column, "")) for column in spec.key_cols)
+        for column in available_values:
+            value = _safe_float(row.get(column), default=0.0)
+            rows[f"{column} :: {key}"] = rows.get(f"{column} :: {key}", 0.0) + value
+    return rows
+
+
+def _umap_fold_statistics(frame: pl.DataFrame) -> dict[str, float]:
+    if frame.is_empty() or not {"umap_x", "umap_y"}.issubset(frame.columns):
+        return {}
+    data = _with_numeric(frame.select(["umap_x", "umap_y"]), "umap_x", "umap_y").drop_nulls()
+    if data.is_empty():
+        return {}
+    points = np.column_stack((_numeric_numpy(data, "umap_x"), _numeric_numpy(data, "umap_y")))
+    centered = points - points.mean(axis=0, keepdims=True)
+    radii = np.sqrt(np.square(centered).sum(axis=1))
+    covariance = np.cov(centered, rowvar=False) if points.shape[0] > 1 else np.zeros((2, 2))
+    eigenvalues = np.sort(np.clip(np.linalg.eigvalsh(np.atleast_2d(covariance)), 0.0, None))
+    anisotropy = float(eigenvalues[-1] / max(eigenvalues[0], 1e-12)) if eigenvalues.size >= 2 else 0.0
+    return {
+        "point_count": float(points.shape[0]),
+        "centered_rms_radius": float(np.sqrt(np.mean(np.square(radii)))) if radii.size else 0.0,
+        "radius_cv": float(radii.std() / max(radii.mean(), 1e-12)) if radii.size else 0.0,
+        "anisotropy": anisotropy,
+    }
+
+
+def _write_cross_fold_figure_drift(
+    root: Path,
+    fold_dirs: list[Path],
+    figure_paths: set[str],
+    *,
+    perturb_artifacts_verified: bool,
+) -> tuple[pl.DataFrame, list[dict[str, Any]]]:
+    table_root = root / "tables_cross_fold" / "by_figure"
+    source_root = root / "tables_cross_fold" / "complete_source_values"
+    plot_root = root / "plots_cross_fold" / "by_figure"
+    table_root.mkdir(parents=True, exist_ok=True)
+    source_root.mkdir(parents=True, exist_ok=True)
+    plot_root.mkdir(parents=True, exist_ok=True)
+    source_cache: dict[_CrossFoldFigureSpec, tuple[list[int], list[dict[str, float]], Path | None]] = {}
+    manifest: list[dict[str, Any]] = []
+    expected_plots: list[dict[str, Any]] = []
+
+    for relative_path in sorted(figure_paths):
+        spec = _cross_fold_figure_spec(relative_path)
+        if spec is None:
+            manifest.append({"figure": relative_path, "status": "unsupported", "reason": "尚未定義來源表對應"})
+            continue
+        cache_key = spec
+        if cache_key not in source_cache:
+            fold_ids: list[int] = []
+            vectors: list[dict[str, float]] = []
+            for fold_dir in fold_dirs:
+                source_path = fold_dir / spec.source
+                if not source_path.exists():
+                    continue
+                frame = pl.read_csv(source_path)
+                vector = _umap_fold_statistics(frame) if spec.mode == "umap" else _fold_vector_from_table(frame, spec)
+                if not vector:
+                    continue
+                fold_ids.append(int(fold_dir.name.removeprefix("fold_").removesuffix("_test")))
+                vectors.append(vector)
+            complete_path: Path | None = None
+            if vectors:
+                source_slug = _safe_plot_filename(f"{spec.source}_{'_'.join(spec.value_cols)}")
+                complete_path = source_root / f"{source_slug}.csv"
+                complete_rows = [
+                    {"fold_id": fold_id, "cell": key, "value": value}
+                    for fold_id, vector in zip(fold_ids, vectors, strict=True)
+                    for key, value in sorted(vector.items())
+                ]
+                _write_csv(pl.DataFrame(complete_rows), complete_path)
+            source_cache[cache_key] = (fold_ids, vectors, complete_path)
+        fold_ids, vectors, complete_path = source_cache[cache_key]
+        slug = _safe_plot_filename(relative_path.removesuffix(".png").replace("/", "__"))
+        drift_table = table_root / f"{slug}.csv"
+        drift_plot = plot_root / f"{slug}.png"
+        if not vectors:
+            manifest.append({"figure": relative_path, "status": "missing_source", "source": spec.source})
+            continue
+        keys = sorted({key for vector in vectors for key in vector})
+        matrix = np.asarray([[vector.get(key, 0.0) for key in keys] for vector in vectors], dtype=np.float64)
+        all_zero = bool(matrix.size == 0 or np.nanmax(np.abs(matrix)) <= 0.0)
+        rows = []
+        for index, fold_id in enumerate(fold_ids):
+            versus_first = _vector_similarity(matrix[index], matrix[0])
+            versus_previous = _vector_similarity(matrix[index], matrix[index - 1] if index > 0 else matrix[index])
+            rows.append(
+                {
+                    "fold_id": fold_id,
+                    "cells_in_union": len(keys),
+                    "nonzero_cells": int(np.count_nonzero(matrix[index])),
+                    "absolute_scale_total": float(np.abs(matrix[index]).sum()),
+                    "l1_distribution_drift_from_fold_1": versus_first[0],
+                    "cosine_similarity_to_fold_1": versus_first[1],
+                    "rank_correlation_to_fold_1": versus_first[2],
+                    "l1_distribution_drift_from_previous_fold": versus_previous[0],
+                    "cosine_similarity_to_previous_fold": versus_previous[1],
+                    "rank_correlation_to_previous_fold": versus_previous[2],
+                }
+            )
+        drift = pl.DataFrame(rows)
+        _write_csv(drift, drift_table)
+        legacy_weight_perturbation = (
+            not perturb_artifacts_verified
+            and "perturbation_weight_abs_delta" in relative_path
+        )
+        status = (
+            "all_zero_omitted"
+            if all_zero
+            else "provisional_legacy_baseline"
+            if legacy_weight_perturbation
+            else "ok"
+        )
+        if all_zero:
+            drift_plot.unlink(missing_ok=True)
+        else:
+            plt, _ = _setup_paper_plotting()
+            fig, axes = plt.subplots(3, 1, figsize=(17, 11), dpi=150, sharex=True)
+            x = drift.get_column("fold_id").to_numpy()
+            axes[0].plot(x, drift.get_column("l1_distribution_drift_from_fold_1").to_numpy(), marker="o", label="vs Fold 1", color=PAPER_TOKENS["blue_mid"])
+            axes[0].plot(x, drift.get_column("l1_distribution_drift_from_previous_fold").to_numpy(), marker="s", label="vs previous", color=PAPER_TOKENS["orange_mid"])
+            axes[0].set_ylabel("L1 distribution drift (0=same, 1=max)")
+            axes[0].legend(frameon=False, ncol=2)
+            axes[1].plot(x, drift.get_column("cosine_similarity_to_fold_1").to_numpy(), marker="o", label="cosine", color=PAPER_TOKENS["blue_mid"])
+            axes[1].plot(x, drift.get_column("rank_correlation_to_fold_1").to_numpy(), marker="s", label="rank corr", color=PAPER_TOKENS["olive_mid"])
+            axes[1].set_ylabel("Similarity to Fold 1")
+            axes[1].set_ylim(-1.05, 1.05)
+            axes[1].legend(frameon=False, ncol=2)
+            axes[2].plot(x, drift.get_column("absolute_scale_total").to_numpy(), marker="o", color=PAPER_TOKENS["pink_mid"])
+            axes[2].set_ylabel("Absolute scale total")
+            axes[2].set_xlabel("Fold")
+            for ax in axes:
+                ax.grid(True, axis="y", alpha=0.25)
+                ax.set_xticks(x)
+            fig.suptitle(f"Cross-fold drift: {relative_path}", fontsize=14)
+            _safe_matplotlib_tight_layout(fig)
+            _save_matplotlib_figure(fig, drift_plot, pad_to_standard_aspect=False)
+            plt.close(fig)
+            expected_plots.append({"path": str(drift_plot.relative_to(root))})
+        manifest.append(
+            {
+                "figure": relative_path,
+                "status": status,
+                "folds_compared": len(fold_ids),
+                "source": spec.source,
+                "complete_source_values": str(complete_path.relative_to(root)) if complete_path else "",
+                "drift_table": str(drift_table.relative_to(root)),
+                "drift_plot": str(drift_plot.relative_to(root)) if drift_plot.exists() else "",
+                "comparison_note": (
+                    "Legacy perturbation artifacts used a batch-unmatched baseline; drift is provisional until recomputed. "
+                    "All aligned source cells are retained."
+                    if legacy_weight_perturbation
+                    else "UMAP coordinates are independently fitted; drift uses centered shape invariants, not raw axis alignment."
+                    if spec.mode == "umap"
+                    else "All aligned source cells are used; no Top-K truncation."
+                ),
+            }
+        )
+    manifest_frame = pl.DataFrame(manifest) if manifest else pl.DataFrame()
+    _write_csv(manifest_frame, root / "tables_cross_fold" / "cross_fold_figure_manifest.csv")
+    return manifest_frame, expected_plots
+
+
 def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], stability_output: Path) -> Path:
     """Write a synthesized cross-fold report, not a concatenation of fold reports."""
 
@@ -4568,7 +5011,6 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     metric_rows: list[dict[str, Any]] = []
-    top_feature_rows: list[dict[str, Any]] = []
     method_agreement_rows: list[dict[str, Any]] = []
     warning_folds: dict[str, set[int]] = {}
     warning_labels = {
@@ -4641,28 +5083,21 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
                 "shap_valid_rows": shap_info.get("valid_rows"),
                 "plot_qa_ok": sum(item.get("status") == "ok" for item in validation),
                 "plot_qa_total": len(validation),
+                "perturb_batch_matched_baseline": bool(
+                    summary.get("perturb_diagnostics", {}).get("batch_matched_baseline", False)
+                ),
             }
         )
         attribution_path = fold_dir / "paper_tables" / "global_feature_attribution.csv"
         if attribution_path.exists():
             attribution = pl.read_csv(attribution_path)
             if not attribution.is_empty() and {"feature", "mean_available_share"}.issubset(attribution.columns):
-                top = attribution.sort("mean_available_share", descending=True).row(0, named=True)
-                top_feature_rows.append(
-                    {
-                        "fold_id": fold_id,
-                        "feature": top.get("feature"),
-                        "feature_label": top.get("feature_label", top.get("feature")),
-                        "mean_available_share": top.get("mean_available_share"),
-                    }
-                )
                 for row in _method_agreement_table(attribution).iter_rows(named=True):
                     method_agreement_rows.append({"fold_id": fold_id, **row})
         for warning in summary.get("warnings", []):
             warning_folds.setdefault(warning_category(warning), set()).add(fold_id)
 
     metrics = pl.DataFrame(metric_rows).sort("fold_id") if metric_rows else pl.DataFrame()
-    top_features = pl.DataFrame(top_feature_rows).sort("fold_id") if top_feature_rows else pl.DataFrame()
     method_agreement = (
         pl.DataFrame(method_agreement_rows).sort(["method_a", "method_b", "fold_id"])
         if method_agreement_rows
@@ -4682,11 +5117,39 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
         pl.DataFrame(warning_rows).sort("folds_affected", descending=True) if warning_rows else pl.DataFrame()
     )
     _write_csv(metrics, table_dir / "cross_fold_portfolio_and_shap.csv")
-    _write_csv(top_features, table_dir / "cross_fold_top_feature_by_fold.csv")
+    (table_dir / "cross_fold_top_feature_by_fold.csv").unlink(missing_ok=True)
     _write_csv(method_agreement, table_dir / "cross_fold_method_agreement.csv")
     _write_csv(warnings_frame, table_dir / "cross_fold_warning_summary.csv")
 
-    expected_plots: set[str] = set()
+    figure_paths = {
+        str(item.get("path"))
+        for fold_dir in fold_dirs
+        for item in (
+            json.loads((fold_dir / "plot_validation.json").read_text(encoding="utf-8"))
+            if (fold_dir / "plot_validation.json").exists()
+            else []
+        )
+        if item.get("path")
+    }
+    figure_paths.update(
+        {
+            "plots/feature_importance_perturbation_score_abs_delta.png",
+            "plots/feature_time_perturbation_score_abs_delta_heatmap.png",
+        }
+    )
+    perturb_artifacts_verified = bool(metric_rows) and all(
+        bool(row.get("perturb_batch_matched_baseline", False)) for row in metric_rows
+    )
+    cross_figure_manifest, cross_figure_expected = _write_cross_fold_figure_drift(
+        root,
+        fold_dirs,
+        figure_paths,
+        perturb_artifacts_verified=perturb_artifacts_verified,
+    )
+
+    expected_plots: set[str] = {
+        str(item["path"]) for item in cross_figure_expected if item.get("path")
+    }
     plt, _ = _setup_paper_plotting()
     if not metrics.is_empty() and "mean_abs_net" in metrics.columns:
         x = metrics.get_column("fold_id").to_numpy()
@@ -4830,14 +5293,6 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
             .agg([pl.len().alias("fold_count"), pl.col("fold_id").sort().alias("fold_ids")])
             .filter(pl.col("fold_count") > 1)
         )
-    top_feature_summary = pl.DataFrame()
-    if not top_features.is_empty():
-        top_feature_summary = (
-            top_features.group_by(["feature", "feature_label"])
-            .agg(pl.len().alias("folds_as_top_feature"))
-            .sort("folds_as_top_feature", descending=True)
-        )
-
     report_path = root / "comprehensive_all_folds_report.md"
     lines = [
         "# 跨 Fold 模型可解釋性綜合分析",
@@ -4849,11 +5304,17 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
         f"- 單一股票最大權重曾達 0.5 以上：**{count_at_least('max_abs_weight_max', 0.5)}/{len(fold_dirs)} folds**；換手代理 ≥ 1：**{count_at_least('mean_turnover_proxy', 1.0)}/{len(fold_dirs)} folds**。",
         f"- 代理 SHAP 平均 R2：**{mean_shap:.3f}**；低於 0.8：**{count_at_most('shap_surrogate_r2', 0.799999)}/{len(fold_dirs)} folds**。",
         f"- 跨 Fold 聚合圖表 QA：**{sum(item.get('status') == 'ok' for item in plot_validation)}/{len(plot_validation)}**。",
+        (
+            "- **21 個 Fold 的既有 perturbation artifact 尚未使用 batch-matched baseline；"
+            "weight perturbation 的跨 Fold 漂移目前只可視為 provisional，必須重算後才能做特徵重要性結論。**"
+            if not perturb_artifacts_verified
+            else "- Perturbation artifact 已全部使用同 batch、同執行路徑基準。"
+        ),
         "- Cross-asset 刻意排除；它由獨立流程計算。",
         "",
         "## 1. 特徵重要性是否跨 Fold 穩定",
         "",
-        "下圖使用每個 Fold 的完整特徵歸因表重新聚合。報告內只預覽穩定性最高的 15 列，完整特徵沒有做 Top-K 刪除，全部保存在 `paper_fold_stability/paper_tables/fold_feature_stability.csv`。",
+        "下圖與表格使用每個 Fold 的完整特徵歸因表重新聚合；所有特徵全部保留，不做 Top-K／Top-N 截斷。完整資料在 `paper_fold_stability/paper_tables/fold_feature_stability.csv`。",
         "",
     ]
     if not duplicate_windows.is_empty():
@@ -4866,9 +5327,7 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
     if stability_plot.exists():
         stability_relative = str(stability_plot.relative_to(root))
         lines.extend([f"[![跨 Fold 特徵穩定性]({stability_relative})]({stability_relative})", ""])
-    lines.extend([_render_frame_markdown(complete_stability, limit=15), ""])
-    if not top_feature_summary.is_empty():
-        lines.extend(["### 各 Fold 第一名特徵的重複性", "", _render_frame_markdown(top_feature_summary, limit=None), ""])
+    lines.extend([_render_frame_markdown(complete_stability, limit=None), ""])
     lines.extend(
         [
             "## 2. 曝險、集中度與換手是否隨 Fold 漂移",
@@ -4915,10 +5374,57 @@ def _write_all_folds_comprehensive_report(root: Path, fold_dirs: list[Path], sta
             "2. 只把跨多數 Fold 維持前段排名，且 Gradient × Input、IG、Perturbation 方向一致的特徵視為穩健候選。",
             "3. 對 SHAP R2 偏低的 Fold，回到完整模型歸因與 perturbation 圖，不做局部 SHAP 敘事。",
             "",
-            "## 各 Fold 詳細報告索引",
-            "",
         ]
     )
+    cross_figure_lines = [
+        "## 6. 每一種圖表的 Fold 1–21 漂移",
+        "",
+        "以下每一節都從該圖的完整來源表重新對齊 Fold 1–21；L1 分布漂移 0 代表形狀相同、1 代表最大差異，cosine 與 rank correlation 越接近 1 越穩定，absolute scale 則檢查整體訊號強度是否改變。所有 cells 都參與計算，不做 Top-K／Top-N。",
+        "",
+    ]
+    if cross_figure_manifest.is_empty():
+        cross_figure_lines.extend(["沒有可用的逐圖跨 Fold 來源。", ""])
+    else:
+        for item in cross_figure_manifest.iter_rows(named=True):
+            figure = str(item.get("figure", ""))
+            what, how, suspicious = _figure_reading_guide(figure)
+            cross_figure_lines.extend(
+                [
+                    f"### {_figure_title(figure)}",
+                    "",
+                    f"- **原 Fold 圖**：`{figure}`",
+                    f"- **漂移狀態**：`{item.get('status', 'unknown')}`；比較 folds：`{item.get('folds_compared', 0)}`",
+                    f"- **原圖衡量內容**：{what}",
+                    f"- **原圖解讀方式**：{how}",
+                    f"- **跨 Fold 解讀**：先看相鄰 Fold 的 L1 跳升，再看相對 Fold 1 的 cosine／rank 是否持續下降；最後用 absolute scale 判斷是結構改變，還是只有整體幅度縮放。",
+                    f"- **可疑訊號**：{suspicious}",
+                    f"- **完整來源值**：`{item.get('complete_source_values', '')}`",
+                    f"- **逐 Fold 漂移數值**：`{item.get('drift_table', '')}`",
+                    f"- **限制**：{item.get('comparison_note', '')}",
+                    "",
+                ]
+            )
+            drift_plot = str(item.get("drift_plot", "") or "")
+            if drift_plot:
+                cross_figure_lines.extend(
+                    [
+                        f"[![{_figure_title(figure)} 跨 Fold 漂移]({drift_plot})]({drift_plot})",
+                        "",
+                    ]
+                )
+            elif item.get("status") == "all_zero_omitted":
+                cross_figure_lines.extend(
+                    [
+                        "此指標在 21 folds 全部為零，因此沒有可誠實呈現的漂移曲線；這是量測解析度限制，不應解讀成所有特徵都不重要。",
+                        "",
+                    ]
+                )
+    try:
+        scope_index = lines.index("## 範圍、方法與限制")
+    except ValueError:
+        scope_index = len(lines)
+    lines[scope_index:scope_index] = cross_figure_lines
+    lines.extend(["## 各 Fold 詳細報告索引", ""])
     for fold_dir in fold_dirs:
         relative = fold_dir.relative_to(root) / "comprehensive_explainability_report.md"
         lines.append(f"- [{fold_dir.name}]({relative})")
@@ -5193,26 +5699,16 @@ def write_fold_stability_outputs(
     plot_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(combined, table_dir / "fold_feature_attribution_long.csv")
     _write_csv(summary, table_dir / "fold_feature_stability.csv")
-    plt, sns = _setup_paper_plotting()
     data = summary
     if not data.is_empty():
-        fig, ax = plt.subplots(
-            figsize=_figsize_for_rows(data.height, width=22.0, row_height=0.30, overhead=2.8),
-            dpi=160,
-        )
-        sns.barplot(data=_frame_to_dict(data), y="feature_label", x="mean_share", color=PAPER_TOKENS["blue_mid"], ax=ax)
-        ax.set_xlabel("Mean attribution share across folds")
-        ax.set_ylabel("")
-        ax.xaxis.set_major_formatter(lambda value, _: f"{100.0 * value:.0f}%")
         fold_count = int(combined.select(pl.col("fold_id").n_unique()).item())
-        _add_paper_header(fig, ax, "Fold stability shows whether the same features remain important", f"Computed across {fold_count} fold explainability outputs.")
-        _finish_paper_axes(ax)
-        _save_matplotlib_figure(
-            fig,
-            plot_dir / "fold_stability_feature_share.png",
-            pad_to_standard_aspect=False,
+        _plot_barh(
+            data,
+            output_path=plot_dir / "fold_stability_feature_share.png",
+            label_col="feature_label",
+            value_col="mean_share",
+            title=f"Complete feature stability across {fold_count} folds",
         )
-        plt.close(fig)
     report = [
         "# Paper Fold 穩定性摘要",
         "",
@@ -5230,8 +5726,132 @@ def write_fold_stability_outputs(
 
 
 
+_SAVED_EXPLAINABILITY_FRAME_NAMES = (
+    "feature_time_gradient", "feature_importance_gradient", "time_importance_gradient",
+    "feature_time_integrated_gradients", "feature_importance_integrated_gradients",
+    "time_importance_integrated_gradients", "feature_time_perturbation",
+    "feature_importance_perturbation", "feature_importance_shap", "shap_components",
+    "feature_correlations", "decision_inventory", "explainability_completeness",
+    "exposure_coverage_curve", "position_distribution", "daily_portfolio",
+    "regime_analysis", "decision_case_studies", "trust_checks",
+    "aux_summary",
+)
+
+
+def _load_saved_explainability_fold(
+    fold_dir: Path,
+) -> tuple[dict[str, pl.DataFrame], dict[str, pl.DataFrame], dict[str, pl.DataFrame], dict[str, Any]]:
+    frames = {
+        name: (
+            pl.read_csv(fold_dir / f"{name}.csv", infer_schema_length=None)
+            if (fold_dir / f"{name}.csv").exists()
+            else pl.DataFrame()
+        )
+        for name in _SAVED_EXPLAINABILITY_FRAME_NAMES
+    }
+    aux_dims = (
+        {path.stem: pl.read_csv(path) for path in sorted((fold_dir / "aux_dims").glob("*.csv"))}
+        if (fold_dir / "aux_dims").exists()
+        else {}
+    )
+    aux_projections = (
+        {path.stem: pl.read_csv(path) for path in sorted((fold_dir / "aux_projections").glob("*.csv"))}
+        if (fold_dir / "aux_projections").exists()
+        else {}
+    )
+    summary_path = fold_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    return frames, aux_dims, aux_projections, summary
+
+
+def refresh_saved_explainability_reports(
+    explainability_root: Path,
+    *,
+    progress_enabled: bool = True,
+    regenerate_plots: bool = True,
+) -> Path:
+    """Rebuild figures and reports from the already-complete saved fold tables."""
+    root = Path(explainability_root)
+    fold_dirs = sorted(path for path in root.glob("fold_*_test") if path.is_dir())
+    if not fold_dirs:
+        raise FileNotFoundError(f"No fold_*_test explainability directories found under {root}")
+    progress = tqdm(fold_dirs, desc="Refresh explainability reports", unit="fold", disable=not progress_enabled)
+    for fold_dir in progress:
+        progress.set_postfix(fold=fold_dir.name, stage="load", refresh=False)
+        frames, aux_dims, aux_projections, summary = _load_saved_explainability_fold(fold_dir)
+        metadata = dict(summary.get("metadata", {}))
+        if regenerate_plots:
+            progress.set_postfix(fold=fold_dir.name, stage="standard_plots", refresh=False)
+            _plot_all_explanation_figures(
+                frames,
+                aux_dims,
+                fold_dir,
+                aux_projection_frames=aux_projections,
+                plot_backend="matplotlib",
+                strict_no_fallback=True,
+                progress_enabled=False,
+            )
+            paper_tables = (
+                {path.stem: str(path.relative_to(fold_dir)) for path in sorted((fold_dir / "paper_tables").glob("*.csv"))}
+                if (fold_dir / "paper_tables").exists()
+                else {}
+            )
+            progress.set_postfix(fold=fold_dir.name, stage="paper_plots", refresh=False)
+            _plot_all_paper_figures(
+                fold_dir,
+                frames=frames,
+                summary=summary,
+                metadata=metadata,
+                paper_tables=paper_tables,
+                progress_enabled=False,
+            )
+        expected = _expected_explainability_plot_paths(
+            frames,
+            aux_dims,
+            aux_projections,
+            write_standard_plots=True,
+            write_paper_plots=True,
+        )
+        validation = _semantic_plot_quality(
+            frames,
+            _validate_explainability_plots(fold_dir, expected),
+            summary=summary,
+        )
+        (fold_dir / "plot_validation.json").write_text(
+            json.dumps(_to_builtin(validation), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        _write_comprehensive_explainability_report(
+            fold_dir / "comprehensive_explainability_report.md",
+            metadata=metadata,
+            summary=summary,
+            frames=frames,
+            plot_validation=validation,
+        )
+        failures = sum(item.get("status") != "ok" for item in validation)
+        summary["plot_validation"] = {
+            "expected": len(expected), "checked": len(validation),
+            "passed": len(validation) - failures, "failed": failures,
+            "manifest": "plot_validation.json", "report": "comprehensive_explainability_report.md",
+        }
+        (fold_dir / "summary.json").write_text(
+            json.dumps(_to_builtin(summary), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    output = write_fold_stability_outputs(root, strict_no_fallback=True, progress_enabled=progress_enabled)
+    if output is None:
+        raise RuntimeError(f"Could not build cross-fold explainability outputs under {root}")
+    return output
+
+
 def _safe_plot_filename(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(name))
+
+
+def _complete_panel_grid(item_count: int, *, panel_rows: int = 36, max_columns: int = 4) -> tuple[int, int, int]:
+    """Return a bounded subplot grid that still includes every ordered item."""
+    panel_count = max(1, math.ceil(max(0, int(item_count)) / max(1, int(panel_rows))))
+    columns = min(max(1, int(max_columns)), panel_count)
+    rows = max(1, math.ceil(panel_count / columns))
+    return rows, columns, panel_count
 
 
 def _plot_barh(
@@ -5249,24 +5869,44 @@ def _plot_barh(
     if data.is_empty():
         return
     if _numeric_max(data, value_col) <= 0.0:
-        _plot_no_signal_figure(
-            output_path,
-            title=title,
-            message=f"All {value_col} values are zero; no measurable signal.",
-        )
+        output_path.unlink(missing_ok=True)
         return
     labels = _string_list(data, label_col)
     values = _numeric_numpy(data, value_col)
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(
-        figsize=_figsize_for_rows(data.height, width=20.0, row_height=0.26, overhead=2.0),
-        dpi=130,
+    # A single 100+ row axis technically contains every feature but is not
+    # readable in Markdown or an image viewer.  Facet the complete ordered
+    # inventory into columns while retaining one shared quantitative scale.
+    panel_rows = 36
+    grid_rows, grid_columns, panel_count = _complete_panel_grid(data.height, panel_rows=panel_rows)
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_columns,
+        figsize=(max(17.0, 8.0 * grid_columns), max(7.0, grid_rows * (0.31 * min(panel_rows, data.height) + 2.6))),
+        dpi=150,
+        squeeze=False,
+        sharex=True,
     )
-    ax.barh(labels[::-1], values[::-1])
-    ax.set_title(title)
-    ax.set_xlabel(value_col)
-    ax.grid(True, axis="x", alpha=0.25)
+    max_value = max(float(np.nanmax(values)), np.finfo(np.float64).eps)
+    for panel_idx, ax in enumerate(axes.flat):
+        if panel_idx >= panel_count:
+            ax.set_visible(False)
+            continue
+        start = panel_idx * panel_rows
+        end = min(data.height, start + panel_rows)
+        panel_labels = labels[start:end]
+        panel_values = values[start:end]
+        y = np.arange(len(panel_labels))
+        ax.barh(y, panel_values, color=PAPER_TOKENS["blue_mid"])
+        ax.set_yticks(y)
+        ax.set_yticklabels(panel_labels, fontsize=7)
+        ax.invert_yaxis()
+        ax.set_xlim(0.0, max_value * 1.03)
+        ax.set_xlabel(value_col)
+        ax.set_title(f"Features {start + 1}–{end}", fontsize=10)
+        ax.grid(True, axis="x", alpha=0.25)
+    fig.suptitle(title, fontsize=14, y=0.995)
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
@@ -5329,11 +5969,7 @@ def _plot_feature_time_heatmap(
     if data.is_empty():
         return
     if _numeric_max(data, value_col) <= 0.0:
-        _plot_no_signal_figure(
-            output_path,
-            title=title,
-            message=f"All {value_col} cells are zero; use the weight-delta diagnostic.",
-        )
+        output_path.unlink(missing_ok=True)
         return
     features = _values_by_sum(data, "feature", value_col)
     if not features:
@@ -5351,19 +5987,44 @@ def _plot_feature_time_heatmap(
         return
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(
-        figsize=_figsize_for_rows(len(labels), width=22.0, row_height=0.24, overhead=2.2),
-        dpi=130,
+    from matplotlib.colors import PowerNorm
+
+    panel_rows = 36
+    grid_rows, grid_columns, panel_count = _complete_panel_grid(len(labels), panel_rows=panel_rows)
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_columns,
+        figsize=(max(18.0, 9.0 * grid_columns), max(8.0, grid_rows * (0.30 * min(panel_rows, len(labels)) + 3.0))),
+        dpi=150,
+        squeeze=False,
     )
-    image = ax.imshow(matrix, aspect="auto", interpolation="nearest")
-    ax.set_title(title)
-    ax.set_xlabel("lookback_from_end (0 = latest)")
-    ax.set_ylabel("feature")
-    ax.set_xticks(np.arange(len(columns)))
-    ax.set_xticklabels([str(col) for col in columns])
-    ax.set_yticks(np.arange(len(labels)))
-    ax.set_yticklabels([str(idx) for idx in labels])
-    fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+    vmax = max(float(np.nanmax(matrix)), np.finfo(np.float64).eps)
+    image = None
+    visible_axes = []
+    for panel_idx, ax in enumerate(axes.flat):
+        if panel_idx >= panel_count:
+            ax.set_visible(False)
+            continue
+        visible_axes.append(ax)
+        start = panel_idx * panel_rows
+        end = min(len(labels), start + panel_rows)
+        panel = matrix[start:end]
+        image = ax.imshow(
+            panel,
+            aspect="auto",
+            interpolation="nearest",
+            cmap="viridis",
+            norm=PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax),
+        )
+        ax.set_xlabel("lookback_from_end (0 = latest)")
+        ax.set_title(f"Features {start + 1}–{end}", fontsize=10)
+        ax.set_xticks(np.arange(len(columns)))
+        ax.set_xticklabels([str(col) for col in columns], fontsize=7, rotation=90)
+        ax.set_yticks(np.arange(end - start))
+        ax.set_yticklabels([str(idx) for idx in labels[start:end]], fontsize=7)
+    fig.suptitle(title, fontsize=14, y=0.995)
+    if image is not None:
+        fig.colorbar(image, ax=visible_axes, fraction=0.012, pad=0.015, label=value_col)
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
@@ -5385,11 +6046,7 @@ def _plot_feature_time_heatmap_datashader(
     if data.is_empty():
         return
     if _numeric_max(data, value_col) <= 0.0:
-        _plot_no_signal_figure(
-            output_path,
-            title=title,
-            message=f"All {value_col} cells are zero; use the weight-delta diagnostic.",
-        )
+        output_path.unlink(missing_ok=True)
         return
     features = [str(value) for value in _values_by_sum(data, "feature", value_col)]
     if not features:
@@ -5433,22 +6090,36 @@ def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
         data.with_columns(pl.concat_str([pl.col("source").cast(pl.String), pl.lit(":"), pl.col("feature").cast(pl.String)]).alias("__label")),
         "__label",
     )
-    y = np.arange(data.height)
-    fig, ax = plt.subplots(
-        figsize=_figsize_for_rows(data.height, width=22.0, row_height=0.22, overhead=2.2),
+    panel_rows = 36
+    grid_rows, grid_columns, panel_count = _complete_panel_grid(data.height, panel_rows=panel_rows)
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_columns,
+        figsize=(max(18.0, 8.5 * grid_columns), max(8.0, grid_rows * 13.0)),
         dpi=130,
+        squeeze=False,
+        sharex=True,
     )
-    ax.barh(y - 0.18, _numeric_numpy(data, "score_corr"), height=0.35, label="score_corr")
-    if "weight_corr" in data.columns:
-        ax.barh(y + 0.18, _numeric_numpy(data, "weight_corr"), height=0.35, label="weight_corr")
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels)
-    ax.invert_yaxis()
-    ax.axvline(0.0, color="black", linewidth=0.8)
-    ax.set_title("Complete Simple Feature Correlations")
-    ax.set_xlabel("correlation")
-    ax.grid(True, axis="x", alpha=0.25)
-    ax.legend()
+    score_values = _numeric_numpy(data, "score_corr")
+    weight_values = _numeric_numpy(data, "weight_corr") if "weight_corr" in data.columns else np.zeros(data.height)
+    for panel_idx, ax in enumerate(axes.flat):
+        if panel_idx >= panel_count:
+            ax.set_visible(False)
+            continue
+        start = panel_idx * panel_rows
+        end = min(data.height, start + panel_rows)
+        y = np.arange(end - start)
+        ax.barh(y - 0.18, score_values[start:end], height=0.35, label="score_corr")
+        ax.barh(y + 0.18, weight_values[start:end], height=0.35, label="weight_corr")
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels[start:end], fontsize=7)
+        ax.invert_yaxis()
+        ax.axvline(0.0, color="black", linewidth=0.8)
+        ax.set_title(f"Feature-source pairs {start + 1}–{end}", fontsize=10)
+        ax.set_xlabel("correlation")
+        ax.grid(True, axis="x", alpha=0.25)
+    axes.flat[0].legend()
+    fig.suptitle("Complete Simple Feature Correlations", fontsize=14, y=0.995)
     _safe_matplotlib_tight_layout(fig)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
@@ -5673,22 +6344,10 @@ def _plot_all_explanation_figures(
     for frame_name, value_col, title in heatmap_specs:
         out = plot_dir / f"{frame_name}_{value_col}_heatmap.png"
         frame = frames.get(frame_name, pl.DataFrame())
-        if use_datashader:
-            try:
-                _plot_feature_time_heatmap_datashader(frame, output_path=out, value_col=value_col, title=title)
-            except Exception as exc:
-                if strict_no_fallback:
-                    raise RuntimeError(
-                        f"Datashader plot failed for {out.name}; strict_no_fallback=true so "
-                        "matplotlib fallback is disabled."
-                    ) from exc
-                if plot_timing is not None:
-                    plot_timing.setdefault("datashader_fallbacks", []).append(
-                        {"plot": out.name, "error": f"{type(exc).__name__}: {exc}"}
-                    )
-                _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
-        else:
-            _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
+        # Feature × lookback is a small discrete matrix, not a point cloud.
+        # Always render true cells so every one of the F*L values remains
+        # visible and labels stay aligned with the matrix.
+        _plot_feature_time_heatmap(frame, output_path=out, value_col=value_col, title=title)
         if out.exists():
             generated.append(out)
         plot_progress.update(1)
@@ -6021,6 +6680,7 @@ def write_explanation_outputs(
     plot_validation = _semantic_plot_quality(
         frames,
         _validate_explainability_plots(output_dir, expected_plot_paths),
+        summary=summary,
     )
     (output_dir / "plot_validation.json").write_text(
         json.dumps(_to_builtin(plot_validation), indent=2, ensure_ascii=False),
@@ -7049,6 +7709,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None, type=Path, help="Optional explicit checkpoint path.")
     parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--explain-output-dir", default=None, type=Path)
+    parser.add_argument(
+        "--reports-only",
+        action="store_true",
+        help="Rebuild all fold plots, per-figure Chinese guides, and Fold 1-N drift reports from saved explainability CSVs without rerunning the model.",
+    )
+    parser.add_argument(
+        "--regenerate-plots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --reports-only, redraw fold PNGs before rebuilding reports.",
+    )
     parser.add_argument("--device", default=None, help="Override config environment.device, e.g. cuda or cpu.")
     parser.add_argument(
         "--cpu-threads",
@@ -7188,6 +7859,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if bool(args.reports_only):
+        if args.explain_output_dir is not None:
+            explainability_root = Path(args.explain_output_dir)
+        elif args.output_dir is not None:
+            candidate = Path(args.output_dir)
+            explainability_root = candidate if candidate.name == "explainability" else candidate / "explainability"
+        else:
+            raise ValueError("--reports-only requires --explain-output-dir or --output-dir")
+        output = refresh_saved_explainability_reports(
+            explainability_root,
+            progress_enabled=bool(args.progress),
+            regenerate_plots=bool(args.regenerate_plots),
+        )
+        print(f"refreshed explainability reports: {output}")
+        return
     initialized_here = _initialize_explainability_process_group()
     if int(args.cpu_threads) > 0:
         cpu_threads = max(1, int(args.cpu_threads))
