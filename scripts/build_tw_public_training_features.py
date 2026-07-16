@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from pathlib import Path
 import sys
 
@@ -31,6 +32,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional *_features.parquet directory used to keep only trainable TW symbols.",
     )
     parser.add_argument("--market-symbol", default=DEFAULT_MARKET_SYMBOL, help="Synthetic symbol for market-wide rows.")
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="Inclusive completed-session cutoff (YYYY-MM-DD).",
+    )
     parser.add_argument("--summary-path", default=None, help="Optional JSON summary path.")
     return parser.parse_args()
 
@@ -43,6 +49,7 @@ def main() -> None:
         symbols_root=Path(args.symbols_root) if args.symbols_root else None,
         market_symbol=str(args.market_symbol),
         summary_path=Path(args.summary_path) if args.summary_path else None,
+        end_date=date.fromisoformat(args.end_date) if args.end_date else None,
     )
     print(
         "[tw-public-features] "

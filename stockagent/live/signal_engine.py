@@ -276,11 +276,25 @@ def _load_previous_weights(
     prefer_live_weights: bool = True,
     strictly_before_asof: bool = False,
 ) -> tuple[np.ndarray, str | None, str | None]:
-    paths = (
-        [Path(weights_path)]
-        if weights_path is not None
-        else _candidate_weights_paths(output_dir, fold_id, prefer_live_weights=prefer_live_weights)
-    )
+    if weights_path is not None:
+        explicit_path = Path(weights_path)
+        paths = (
+            _candidate_weights_paths(
+                output_dir,
+                fold_id,
+                prefer_live_weights=True,
+            )
+            if prefer_live_weights
+            else []
+        )
+        if explicit_path not in paths:
+            paths.append(explicit_path)
+    else:
+        paths = _candidate_weights_paths(
+            output_dir,
+            fold_id,
+            prefer_live_weights=prefer_live_weights,
+        )
     if not paths:
         return np.zeros((len(symbols),), dtype=np.float64), None, None
 
@@ -411,10 +425,9 @@ def _find_panel_date_index(panel: PanelData, date_text: str | None) -> int | Non
     return int(matches[-1])
 
 
-def _live_weights_has_date(fold_dir: str | Path, date_text: str | None) -> bool:
+def _weights_file_has_date(path: Path, date_text: str | None) -> bool:
     if not date_text:
         return False
-    path = Path(fold_dir) / LIVE_SIGNAL_WEIGHTS_NAME
     if not path.exists():
         return False
     try:
@@ -433,6 +446,26 @@ def _live_weights_has_date(fold_dir: str | Path, date_text: str | None) -> bool:
         if _date_string(raw) == _date_string(date_text):
             return True
     return False
+
+
+def _live_weights_has_date(fold_dir: str | Path, date_text: str | None) -> bool:
+    return _weights_file_has_date(
+        Path(fold_dir) / LIVE_SIGNAL_WEIGHTS_NAME,
+        date_text,
+    )
+
+
+def _weights_history_has_date(fold_dir: str | Path, date_text: str | None) -> bool:
+    root = Path(fold_dir)
+    return any(
+        _weights_file_has_date(root / name, date_text)
+        for name in (
+            LIVE_SIGNAL_WEIGHTS_NAME,
+            "live_signal_weights.csv",
+            "daily_weights.parquet",
+            "daily_weights.csv",
+        )
+    )
 
 
 def write_live_weights_history(
@@ -1243,6 +1276,7 @@ def generate_live_signal(
     previous_signal_backfill_limit: int = 8,
     progress_callback: ProgressCallback | None = None,
     progress_label: str | None = None,
+    _panel_override: PanelData | None = None,
 ) -> LiveSignalResult:
     progress_total = 17
     progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
@@ -1283,7 +1317,11 @@ def generate_live_signal(
     if not isinstance(state_dict, dict):
         raise ValueError(f"Checkpoint does not contain model_state_dict: {checkpoint}")
 
-    panel = _build_panel(config, live_tail=True)
+    panel = (
+        _panel_override
+        if _panel_override is not None
+        else _build_panel(config, live_tail=True)
+    )
     _emit_progress(progress_callback, label=progress_name, step=4, total=progress_total, message="panel ready")
     panel = _align_panel_to_state_dict_universe(
         panel,
@@ -1357,9 +1395,8 @@ def generate_live_signal(
         and int(previous_signal_backfill_limit) > 0
         and write
         and not intraday_frequency
-        and weights_path is None
         and expected_previous_data_date
-        and not _live_weights_has_date(fold_dir, expected_previous_data_date)
+        and not _weights_history_has_date(fold_dir, expected_previous_data_date)
     ):
         previous_asof = _daily_bar_timestamp(expected_previous_data_date, daily_bar_time) or expected_previous_data_date
         previous_notice = (
@@ -1396,6 +1433,7 @@ def generate_live_signal(
             previous_signal_backfill_limit=max(0, int(previous_signal_backfill_limit) - 1),
             progress_callback=progress_callback,
             progress_label=f"{progress_name}:previous",
+            _panel_override=panel,
         )
 
     previous_weights, previous_weights_date, previous_weights_path = _load_previous_weights(
@@ -1405,7 +1443,9 @@ def generate_live_signal(
         weights_path=weights_path,
         asof_date=expected_previous_data_date or panel_date_str,
         prefer_live_weights=True,
-        strictly_before_asof=not uses_realtime_daily_prices,
+        # expected_previous_data_date is already the resolved prior session for
+        # panel-close signals (or today's panel date for realtime marks).
+        strictly_before_asof=False,
     )
     previous_weights_data_date = previous_weights_date
     previous_weights_display_date = (

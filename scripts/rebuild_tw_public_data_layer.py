@@ -10,9 +10,13 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -46,6 +50,22 @@ def _utc_now() -> str:
 
 def _run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _default_tw_end_date(now: datetime | None = None) -> str:
+    local_now = now or datetime.now(ZoneInfo("Asia/Taipei"))
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    else:
+        local_now = local_now.astimezone(ZoneInfo("Asia/Taipei"))
+    candidate = local_now.date()
+    # The complete daily bundle includes valuation and margin endpoints that
+    # are published later than the 13:30 OHLCV close.
+    if local_now.time() < datetime_time(hour=18, minute=0):
+        candidate -= timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate.isoformat()
 
 
 def _acquire_data_layer_lock(path: Path) -> None:
@@ -310,6 +330,89 @@ def _validate_transfer_adjustment_reference(
     end: date,
 ) -> None:
     _load_verified_transfer_adjustments(path, start=start, end=end)
+
+
+def _daily_yahoo_refresh_symbols(summary_path: Path) -> list[str]:
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"transfer-adjustment probe did not write a readable summary: {summary_path}"
+        ) from exc
+    unresolved = payload.get("unresolved")
+    if not isinstance(unresolved, list) or not unresolved:
+        raise RuntimeError(
+            "transfer-adjustment probe failed without actionable Yahoo coverage gaps: "
+            f"{summary_path}"
+        )
+
+    symbols: set[str] = set()
+    for row in unresolved:
+        if not isinstance(row, dict):
+            raise RuntimeError(f"invalid transfer-adjustment unresolved row: {row!r}")
+        symbol = str(row.get("symbol") or "").strip()
+        error = str(row.get("error") or "")
+        if not symbol or "Yahoo source metadata is not coverage-eligible" not in error:
+            raise RuntimeError(
+                "transfer-adjustment probe found a non-Yahoo failure; refusing to hide it "
+                f"behind a targeted refresh: symbol={symbol or 'n/a'} error={error or 'n/a'}"
+            )
+        symbols.add(symbol)
+    return sorted(symbols)
+
+
+def _probe_daily_yahoo_refresh_symbols(
+    command: list[str],
+    *,
+    summary_path: Path,
+) -> list[str]:
+    print(
+        f"[tw-data-rebuild] stage=tw_transfer_adjustment_preflight command={' '.join(command)}",
+        flush=True,
+    )
+    completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+    if completed.returncode == 0:
+        print(
+            "[tw-data-rebuild] daily Yahoo refresh skipped: transfer candidates are current",
+            flush=True,
+        )
+        return []
+    symbols = _daily_yahoo_refresh_symbols(summary_path)
+    preview = ",".join(symbols[:20])
+    suffix = "..." if len(symbols) > 20 else ""
+    print(
+        f"[tw-data-rebuild] daily Yahoo refresh targets={len(symbols)} "
+        f"symbols={preview}{suffix}",
+        flush=True,
+    )
+    return symbols
+
+
+def _retained_daily_yahoo_symbols(
+    *,
+    archive_path: Path,
+    stock_root: Path,
+) -> list[str]:
+    symbols: set[str] = set()
+    if archive_path.is_file():
+        archive_symbols = pq.read_table(archive_path, columns=["symbol"])["symbol"]
+        symbols.update(str(value).strip() for value in archive_symbols.to_pylist() if value)
+
+    summary_path = stock_root / "official_symbol_build_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        summary = {}
+    if int(summary.get("missing_adjustment_rows") or 0) > 0:
+        for path in sorted(stock_root.glob("*_features.parquet")):
+            schema = pq.read_schema(path)
+            if "adjclose" not in schema.names:
+                continue
+            values = pq.read_table(path, columns=["adjclose"])["adjclose"]
+            missing = pc.any(pc.or_(pc.is_null(values), pc.is_nan(values))).as_py()
+            if missing:
+                symbols.add(path.name.removesuffix("_features.parquet"))
+    return sorted(symbol for symbol in symbols if symbol)
 
 
 def _taiex_command(args: argparse.Namespace, public_dir: Path) -> list[str]:
@@ -610,7 +713,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("artifacts/data_locks/tw_official_data.lock"),
     )
     parser.add_argument("--run-id", default=None)
-    parser.add_argument("--end-date", default=date.today().isoformat())
+    parser.add_argument("--end-date", default=None)
     parser.add_argument("--public-start-date", default="earliest")
     parser.add_argument(
         "--taiex-start-date",
@@ -688,6 +791,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.end_date is None:
+        args.end_date = _default_tw_end_date()
     requested_mode = args.mode
     if args.mode is None:
         args.mode = {
@@ -854,6 +959,29 @@ def main() -> None:
             yahoo_mode = "incremental"
         else:
             yahoo_mode = "repair"
+        daily_yahoo_symbols: list[str] | None = None
+        if args.mode == "daily" and not args.skip_yahoo_download and not args.dry_run:
+            daily_yahoo_symbols = _probe_daily_yahoo_refresh_symbols(
+                _transfer_adjustment_command(
+                    args,
+                    public_dir=public_dir,
+                    yahoo_source_dir=yahoo_fallback_dir,
+                    output_path=transfer_adjustment_reference,
+                ),
+                summary_path=transfer_adjustment_reference.with_suffix(".summary.json"),
+            )
+            retained_symbols = _retained_daily_yahoo_symbols(
+                archive_path=yahoo_fallback_archive,
+                stock_root=stock_root,
+            )
+            daily_yahoo_symbols = sorted(
+                set(daily_yahoo_symbols) | set(retained_symbols)
+            )
+            print(
+                f"[tw-data-rebuild] daily Yahoo retained targets="
+                f"{len(daily_yahoo_symbols)}",
+                flush=True,
+            )
         if not args.skip_yahoo_download:
             yahoo_command = _python_command(
                 "downloader/download_yahoo_ohlcv.py",
@@ -882,25 +1010,28 @@ def main() -> None:
                 "--retry-blacklisted-repair-symbols",
                 "--fail-on-any-error",
             )
+            if daily_yahoo_symbols:
+                yahoo_command.extend(["--symbols", *daily_yahoo_symbols])
             yahoo_report = (
                 yahoo_fallback_dir / "download_report.csv"
                 if yahoo_mode == "download"
                 else yahoo_fallback_dir / "repair_report.csv"
             )
-            runner.run(
-                "yahoo_ohlcv_fallback_download",
-                yahoo_command,
-                outputs=list(
-                    dict.fromkeys(
-                        [
-                            yahoo_fallback_dir / "symbols.csv",
-                            yahoo_report,
-                            yahoo_fallback_dir / "download_report.csv",
-                            yahoo_fallback_dir / "download_summary.json",
-                        ]
-                    )
-                ),
-            )
+            if daily_yahoo_symbols != []:
+                runner.run(
+                    "yahoo_ohlcv_fallback_download",
+                    yahoo_command,
+                    outputs=list(
+                        dict.fromkeys(
+                            [
+                                yahoo_fallback_dir / "symbols.csv",
+                                yahoo_report,
+                                yahoo_fallback_dir / "download_report.csv",
+                                yahoo_fallback_dir / "download_summary.json",
+                            ]
+                        )
+                    ),
+                )
         runner.run(
             "tw_transfer_adjustment_reference",
             _transfer_adjustment_command(
@@ -953,6 +1084,8 @@ def main() -> None:
             str(public_dir),
             "--output-dir",
             str(stock_root),
+            "--end-date",
+            args.end_date,
             "--workers",
             str(args.workers),
         )
@@ -1028,6 +1161,8 @@ def main() -> None:
                 str(stock_root),
                 "--market-symbol",
                 str(config.data.tw_public_market_symbol),
+                "--end-date",
+                args.end_date,
             ),
             outputs=[public_feature_path, public_feature_path.with_suffix(".summary.json")],
         )
