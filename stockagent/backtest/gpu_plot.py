@@ -302,7 +302,11 @@ def save_scatter_datashader(
     legend = []
     for label, x, y, color in converted:
         frame = cudf.DataFrame({"x": x.astype(cp.float64, copy=False), "y": y.astype(cp.float64, copy=False)})
-        images.append(tf.shade(canvas.points(frame, "x", "y"), cmap=[color], how="eq_hist"))
+        shaded = tf.shade(canvas.points(frame, "x", "y"), cmap=[color], how="eq_hist")
+        # Sparse UMAP/token projections otherwise render as isolated one-pixel
+        # marks on report-sized canvases. Dynamic spreading preserves every
+        # point while making the complete projection legible.
+        images.append(tf.spread(shaded, px=2, shape="circle"))
         legend.append((label, color))
     image = tf.set_background(tf.stack(*images), "white")
     _draw_overlay(image.to_pil(), title=title, legend=legend).save(output)
@@ -378,6 +382,7 @@ def run_cuml_umap(
     n_neighbors: int = 15,
     min_dist: float = 0.1,
     random_state: int = 42,
+    verbose: bool = False,
 ):
     cp, _cudf, _ds, _tf = _import_rapids_stack()
     matrix = to_cupy_2d(values, dtype="float32")
@@ -392,5 +397,6 @@ def run_cuml_umap(
         min_dist=float(min_dist),
         random_state=int(random_state),
         output_type="cupy",
+        verbose=bool(verbose),
     )
     return reducer.fit_transform(matrix)

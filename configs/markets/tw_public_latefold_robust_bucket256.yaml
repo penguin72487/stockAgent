@@ -6,6 +6,8 @@ runner:
   output_dir: artifacts/diagnostics/tw_public_latefold_robust_bucket256
 
 training:
+  financial_transformer:
+    candle_dropout: 0.0
   # Late folds have 2.1k-2.3k active symbols. Padding masked symbols to a
   # shared 2304-token shape lets TorchInductor reuse one compiled train graph
   # across folds while leaving the model and all executable outputs unchanged.

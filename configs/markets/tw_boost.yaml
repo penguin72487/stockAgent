@@ -229,6 +229,8 @@ trading:
   portfolio_activation: pre_normalized
   long_only: false
 training:
+  financial_transformer:
+    candle_dropout: 0.0
   non_blocking_transfer: true
   seed: 1
   model_name: gradient_boosted_portfolio_transformer

@@ -719,65 +719,6 @@ def parse_args() -> argparse.Namespace:
         help="Override training.explain_standard_plots.",
     )
     parser.add_argument(
-        "--explain-cross-asset",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override training.explain_cross_asset_enabled.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-max-sources",
-        type=int,
-        default=None,
-        help="Override training.explain_cross_asset_max_sources.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-max-targets",
-        type=int,
-        default=None,
-        help="Override training.explain_cross_asset_max_targets.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-source-chunk-size",
-        type=int,
-        default=None,
-        help="Override training.explain_cross_asset_source_chunk_size.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-shocks",
-        default=None,
-        help="Comma-separated override for training.explain_cross_asset_shocks.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-graph-backend",
-        choices=("auto", "polars", "cugraph"),
-        default=None,
-        help="Override training.explain_cross_asset_graph_backend.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-graph-benchmark-min-edges",
-        type=int,
-        default=None,
-        help="Override training.explain_cross_asset_graph_benchmark_min_edges.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-graph-explainability",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Override training.explain_cross_asset_graph_explainability.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-graph-betweenness-max-vertices",
-        type=int,
-        default=None,
-        help="Override training.explain_cross_asset_graph_betweenness_max_vertices.",
-    )
-    parser.add_argument(
-        "--explain-cross-asset-graph-plot-max-nodes",
-        type=int,
-        default=None,
-        help="Override training.explain_cross_asset_graph_plot_max_nodes.",
-    )
-    parser.add_argument(
         "--save-daily-weights-csv",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -964,37 +905,6 @@ def main() -> None:
         config.training.explain_write_plots = bool(args.explain_write_plots)
     if args.explain_standard_plots is not None:
         config.training.explain_standard_plots = bool(args.explain_standard_plots)
-    if args.explain_cross_asset is not None:
-        config.training.explain_cross_asset_enabled = bool(args.explain_cross_asset)
-    if args.explain_cross_asset_max_sources is not None:
-        config.training.explain_cross_asset_max_sources = max(1, int(args.explain_cross_asset_max_sources))
-    if args.explain_cross_asset_max_targets is not None:
-        config.training.explain_cross_asset_max_targets = max(1, int(args.explain_cross_asset_max_targets))
-    if args.explain_cross_asset_source_chunk_size is not None:
-        config.training.explain_cross_asset_source_chunk_size = max(1, int(args.explain_cross_asset_source_chunk_size))
-    if args.explain_cross_asset_shocks is not None:
-        config.training.explain_cross_asset_shocks = [
-            value.strip().lower() for value in str(args.explain_cross_asset_shocks).split(",") if value.strip()
-        ]
-    if args.explain_cross_asset_graph_backend is not None:
-        config.training.explain_cross_asset_graph_backend = str(args.explain_cross_asset_graph_backend)
-    if args.explain_cross_asset_graph_benchmark_min_edges is not None:
-        config.training.explain_cross_asset_graph_benchmark_min_edges = max(
-            0,
-            int(args.explain_cross_asset_graph_benchmark_min_edges),
-        )
-    if args.explain_cross_asset_graph_explainability is not None:
-        config.training.explain_cross_asset_graph_explainability = bool(args.explain_cross_asset_graph_explainability)
-    if args.explain_cross_asset_graph_betweenness_max_vertices is not None:
-        config.training.explain_cross_asset_graph_betweenness_max_vertices = max(
-            0,
-            int(args.explain_cross_asset_graph_betweenness_max_vertices),
-        )
-    if args.explain_cross_asset_graph_plot_max_nodes is not None:
-        config.training.explain_cross_asset_graph_plot_max_nodes = max(
-            5,
-            int(args.explain_cross_asset_graph_plot_max_nodes),
-        )
     if args.save_daily_weights_csv is not None:
         config.training.save_daily_weights_table = bool(args.save_daily_weights_csv)
     if args.save_integer_share_heavy_csv is not None:

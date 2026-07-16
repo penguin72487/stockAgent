@@ -182,14 +182,19 @@ def _load_curve(curve_path: Path) -> list[dict]:
         raise ValueError(f"Unsupported curve file extension: {curve_path}")
 
     if suffix == ".csv":
-        frame = pl.read_csv(curve_path)
+        frame = pl.read_csv(curve_path, null_values=["nan", "NaN", "NAN"])
     else:
         frame = pl.from_arrow(pq.read_table(curve_path))
     if frame.is_empty():
         raise ValueError(f"Curve file is empty: {curve_path}")
     if "epoch" not in frame.columns:
         raise ValueError(f"Curve file is missing required column 'epoch': {curve_path}")
-    return frame.with_columns(pl.all().fill_nan(None)).to_dicts()
+    float_columns = [
+        name for name, dtype in frame.schema.items() if dtype.is_float()
+    ]
+    if float_columns:
+        frame = frame.with_columns(pl.col(float_columns).fill_nan(None))
+    return frame.to_dicts()
 
 
 def _write_curve_parquet_cache(curve_path: Path, rows: list[dict]) -> tuple[Path | None, float]:
