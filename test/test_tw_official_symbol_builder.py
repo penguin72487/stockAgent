@@ -21,6 +21,7 @@ from scripts.build_tw_official_symbol_parquets import (
     _normalized_reference_index,
     _receipt,
     _source_adjustment_factors,
+    _validate_download_receipts,
     _validate_yahoo_fallback_archive,
     _write_symbol,
     _write_official_quote_parquet,
@@ -1954,3 +1955,47 @@ def test_official_ohlcv_can_use_yahoo_factor_only_when_official_factor_is_missin
         "yahoo_fallback",
     ]
     assert math.isclose(output["adjclose"][1] / output["adjclose"][0], 1.05)
+def test_daily_close_receipt_allows_only_certified_margin_publication_lag(
+    tmp_path: Path,
+) -> None:
+    corporate_path = tmp_path / "tw_corporate_action_reference.parquet"
+    corporate_path.write_bytes(b"certified-corporate-reference")
+    (tmp_path / "tw_corporate_action_reference.summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "coverage_complete": True,
+                "failure_count": 0,
+                "output_receipt": _receipt(corporate_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    public_summary_path = tmp_path / "download_summary.json"
+    public_summary = {
+        "mode": "daily",
+        "coverage_complete": False,
+        "failed_count": 2,
+        "blocking_failed_count": 0,
+        "daily_close_ready": True,
+        "publication_lag_datasets": [
+            "tpex_margin_balance",
+            "twse_margin_balance",
+        ],
+    }
+    public_summary_path.write_text(json.dumps(public_summary), encoding="utf-8")
+
+    _validate_download_receipts(
+        tmp_path,
+        allow_incomplete=False,
+        allow_daily_publication_lag=True,
+    )
+
+    public_summary["publication_lag_datasets"] = ["twse_daily_ohlcv"]
+    public_summary_path.write_text(json.dumps(public_summary), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="complete source receipts"):
+        _validate_download_receipts(
+            tmp_path,
+            allow_incomplete=False,
+            allow_daily_publication_lag=True,
+        )

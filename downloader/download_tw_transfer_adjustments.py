@@ -447,12 +447,20 @@ def _validate_official_inputs(
         public_end = date.fromisoformat(str(public_summary["end_date"])[:10])
     except (KeyError, TypeError, ValueError) as exc:
         raise TransferAdjustmentError("official download_summary has invalid coverage dates") from exc
+    certified_daily_close = (
+        public_summary.get("mode") == "daily"
+        and public_summary.get("daily_close_ready") is True
+        and int(public_summary.get("blocking_failed_count", -1)) == 0
+        and set(public_summary.get("publication_lag_datasets") or ())
+        <= {"twse_margin_balance", "tpex_margin_balance"}
+    )
     if (
-        public_summary.get("coverage_complete") is not True
-        or int(public_summary.get("failed_count", -1)) != 0
-        or public_start > start
-        or public_end < end
-    ):
+        (
+            public_summary.get("coverage_complete") is not True
+            or int(public_summary.get("failed_count", -1)) != 0
+        )
+        and not certified_daily_close
+    ) or public_start > start or public_end < end:
         raise TransferAdjustmentError(
             "official download_summary is not coverage-complete for the requested range"
         )
