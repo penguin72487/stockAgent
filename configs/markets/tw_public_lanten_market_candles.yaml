@@ -1,11 +1,12 @@
-experiment_name: tw-stock-transformer-market-public-data-all-available
+experiment_name: tw-financial-transformer-candles-full-gross-naive-dual5090
 
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_lanten_market_candles_tw_cash_gradfix_v2
+  output_dir: artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds
   mode: train
-  resume: true
+  # The exact cash and old projection contracts are incompatible with this run.
+  resume: false
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
   start_fold: 1
@@ -13,7 +14,9 @@ environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  # Fold20 single-GPU compile uses this host-wide Inductor worker budget.
+  # Dual RTX 5090 / EPYC 7662 host budgets: 64 runtime and 8 compile threads
+  # per DDP rank.
+  cpu_threads: 128
   torch_compile_threads: 16
 
 data:
@@ -227,10 +230,11 @@ walk_forward:
 
 trading:
   frequency: daily
-  execution_mode: tw_cash
-  # Exact MOPS cash amounts/payment dates; complex or unavailable actions
-  # remain fail-safe pre-event liquidations.
-  tw_corporate_action_mode: exact
+  # The receipt-verified MOPS entitlement archive is incomplete, and avoid-mode
+  # mandatory covers are not executable on every historical action date. Use
+  # the research-only executor instead of fabricating exact cash entitlements.
+  execution_mode: naive
+  tw_corporate_action_mode: avoid
   tw_corporate_action_claim_queue_sessions: 256
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
@@ -256,8 +260,11 @@ training:
     # single 32-dimensional candle vector.
     d_model: 32
     candle_dropout: 0.0
+    # sum(abs(long and short weights)) = 1 for every nonzero portfolio row.
+    portfolio_output_mode: l1
   non_blocking_transfer: true
   model_name: financial_transformer
+  multi_gpu_strategy: auto
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
@@ -313,9 +320,8 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  # Fold20 RTX 5070 Ti, 131 features, S=2582: the direct 131 -> 32 Candle
-  # Encoder reached 14.88 ms/model-forward batch and a 10.12s steady epoch.
-  # Keep one power-of-two batch128 graph for throughput and VRAM headroom.
+  # Dual RTX 5090 full-workflow measurements favored global batch128 over 256;
+  # DDP therefore uses the power-of-two local batch64 on each rank.
   batch_size_train: 128
   batch_size_eval: 128
   epochs: 1000
