@@ -706,6 +706,10 @@ class TrainingConfig:
     # allowing one compiled canonical-loss graph to serve changing symbol
     # counts across expanding walk-forward folds.
     compile_loss_dynamic_symbols: bool = False
+    # Compile a separate inference-mode fixed-shape panel-slab forward for
+    # repeated validation/test passes. This never shares the train autograd
+    # graph because grad mode is a distinct compiler ABI.
+    compile_eval_model: bool = False
     loss_portfolio_activation: str = "auto"
     loss_min_trade_weight: float | None = None
     warm_start_from_previous_fold: bool = False
@@ -1753,6 +1757,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             compile_loss=training_raw["compile_loss"],
             compile_model_dynamic_symbols=training_raw["compile_model_dynamic_symbols"],
             compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],
+            compile_eval_model=training_raw["compile_eval_model"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
             loss_min_trade_weight=training_raw["loss_min_trade_weight"],
             warm_start_from_previous_fold=training_raw["warm_start_from_previous_fold"],

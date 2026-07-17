@@ -3398,19 +3398,45 @@ def test_run_training_restores_strict_backtest_runtime_after_empty_fold(tmp_path
     assert torch.isfinite(result.strategy_returns).all()
 
 
-def test_train_group_recompile_budget_scales_and_restores() -> None:
-    import torch._dynamo.config as dynamo_config
+def test_dynamo_compile_counter_delta_reports_only_new_graphs() -> None:
+    before = {
+        "frames_total": 7,
+        "frames_ok": 6,
+        "unique_graphs": 3,
+        "fxgraph_cache_hit": 2,
+        "fxgraph_cache_miss": 1,
+    }
+    after = {
+        "frames_total": 8,
+        "frames_ok": 7,
+        "unique_graphs": 4,
+        "fxgraph_cache_hit": 3,
+        "fxgraph_cache_miss": 1,
+    }
+    assert trainer_module._dynamo_compile_counter_delta(after, before) == {
+        "frames_total": 1,
+        "frames_ok": 1,
+        "unique_graphs": 1,
+        "fxgraph_cache_hit": 1,
+        "fxgraph_cache_miss": 0,
+    }
 
-    original = int(dynamo_config.recompile_limit)
-    group_count = original + 4
-    with trainer_module._dynamo_recompile_budget_for_train_groups(group_count) as limit:
-        assert limit == group_count + 1
-        assert int(dynamo_config.recompile_limit) == group_count + 1
-    assert int(dynamo_config.recompile_limit) == original
-    with pytest.raises(RuntimeError, match="probe failure"):
-        with trainer_module._dynamo_recompile_budget_for_train_groups(group_count):
-            raise RuntimeError("probe failure")
-    assert int(dynamo_config.recompile_limit) == original
+
+def test_eval_backtest_compile_never_builds_one_shot_history_graph(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_EVAL_BACKTEST_COMPILE", "1")
+    assert trainer_module._eval_backtest_compile_enabled(
+        return_weights_history=False
+    )
+    assert not trainer_module._eval_backtest_compile_enabled(
+        return_weights_history=True
+    )
+
+    monkeypatch.setenv("STOCKAGENT_EVAL_BACKTEST_COMPILE", "0")
+    assert not trainer_module._eval_backtest_compile_enabled(
+        return_weights_history=False
+    )
 
 
 def test_compiled_panel_slab_eval_uses_separate_eager_wrapper() -> None:

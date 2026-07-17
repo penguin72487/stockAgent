@@ -47,6 +47,47 @@ OPTIONAL_ARRAY_NAMES = (
 ARRAY_NAMES = (*REQUIRED_ARRAY_NAMES, *OPTIONAL_ARRAY_NAMES)
 
 
+def array_content_fingerprint(value: np.ndarray | None) -> dict[str, Any]:
+    """Hash complete logical C-order content without allocating an array copy."""
+
+    if value is None:
+        return {"present": False}
+    array = np.asarray(value)
+    digest = hashlib.sha256()
+    header = {
+        "present": True,
+        "shape": [int(size) for size in array.shape],
+        "dtype": str(array.dtype),
+    }
+    digest.update(
+        json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    if array.dtype.hasobject:
+        for item in array.flat:
+            encoded = json.dumps(item, ensure_ascii=False, default=str).encode(
+                "utf-8"
+            )
+            digest.update(
+                len(encoded).to_bytes(8, byteorder="little", signed=False)
+            )
+            digest.update(encoded)
+    elif array.flags.c_contiguous:
+        digest.update(memoryview(array.view(np.uint8).reshape(-1)))
+    else:
+        iterator = np.nditer(
+            array,
+            flags=["external_loop", "buffered", "zerosize_ok"],
+            op_flags=["readonly"],
+            order="C",
+            buffersize=1 << 20,
+        )
+        for chunk in iterator:
+            contiguous = np.ascontiguousarray(chunk)
+            digest.update(memoryview(contiguous.view(np.uint8).reshape(-1)))
+    header["sha256"] = digest.hexdigest()
+    return header
+
+
 def panel_cache_v2_dir(parquet_root: str | Path) -> Path:
     return Path(parquet_root) / PANEL_CACHE_V2_DIRNAME
 
@@ -181,6 +222,10 @@ def _save_array(cache_dir: Path, name: str, array: np.ndarray) -> dict[str, Any]
         "file": path.name,
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
+        # Compute this once when an immutable generation is written. Training
+        # checkpoints can then reuse the exact logical-array digest instead of
+        # rereading a multi-gigabyte feature cube on every process start.
+        "content_fingerprint": array_content_fingerprint(arr),
     }
 
 
@@ -289,6 +334,11 @@ def _save_panel_cache_v2_locked(
             ),
             "arrays": array_meta,
         }
+        if hasattr(panel_like, "content_fingerprints"):
+            panel_like.content_fingerprints = {
+                name: dict(item["content_fingerprint"])
+                for name, item in array_meta.items()
+            }
         variants_dir = cache_dir / PANEL_CACHE_V2_VARIANTS_DIRNAME
         variants_dir.mkdir(parents=True, exist_ok=True)
 
@@ -468,6 +518,12 @@ def _load_panel_cache_v2_generation(
     payload: dict[str, Any] = {
         "symbols": list(_read_json(cache_dir / symbols_file)),
         "feature_names": list(_read_json(cache_dir / feature_names_file)),
+        "_content_fingerprints": {
+            name: dict(item["content_fingerprint"])
+            for name, item in meta.get("arrays", {}).items()
+            if isinstance(item, dict)
+            and isinstance(item.get("content_fingerprint"), dict)
+        },
     }
     arrays_meta = meta.get("arrays", {})
     for name in REQUIRED_ARRAY_NAMES:
