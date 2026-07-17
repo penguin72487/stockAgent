@@ -667,6 +667,41 @@ def test_tw_public_select_uses_full_gross_long_short_l1_contract() -> None:
     assert config.trading.portfolio_activation == "pre_normalized"
 
 
+def test_tw_public_candles_select_uses_dual_5090_research_contract() -> None:
+    config = load_config("configs/markets/tw_public_lanten_market_candles_select.yaml")
+
+    model = config.training.financial_transformer
+    assert config.trading.execution_mode == "naive"
+    assert config.trading.tw_corporate_action_mode == "avoid"
+    assert config.trading.tw_short_capacity_limit_enabled is False
+    assert config.trading.long_only is False
+    assert model.portfolio_output_mode == "l1"
+    assert config.training.transformer_base_portfolio.portfolio_output_mode == "l1"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+    assert config.trading.portfolio_activation == "pre_normalized"
+    assert config.training.multi_gpu_strategy == "auto"
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+    assert config.environment.cpu_threads == 128
+    assert config.environment.torch_compile_threads == 16
+
+
+def test_tw_public_candles_all_folds_uses_runnable_research_contract() -> None:
+    config = load_config("configs/markets/tw_public_lanten_market_candles.yaml")
+
+    assert config.trading.execution_mode == "naive"
+    assert config.trading.tw_corporate_action_mode == "avoid"
+    assert config.trading.tw_short_capacity_limit_enabled is False
+    assert config.training.financial_transformer.portfolio_output_mode == "l1"
+    assert config.training.transformer_base_portfolio.portfolio_output_mode == "l1"
+    assert config.training.multi_gpu_strategy == "auto"
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+    assert config.environment.cpu_threads == 128
+    assert config.environment.torch_compile_threads == 16
+    assert config.runner.resume is False
+
+
 def test_tw_rule_switch_is_independent_from_tw_model_features() -> None:
     tw = load_config("configs/markets/tw.yaml")
     tw_public = load_config("configs/markets/tw_public.yaml")

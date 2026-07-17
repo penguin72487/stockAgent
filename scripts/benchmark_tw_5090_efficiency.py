@@ -28,6 +28,34 @@ class Variant:
 
 
 VARIANTS: dict[str, Variant] = {
+    "dual_ddp_b128_cached": Variant(
+        name="dual_ddp_b128_cached",
+        cuda_visible_devices="0,1",
+        args=(
+            "--multi-gpu-strategy",
+            "distributed_data_parallel",
+            "--batch-size-train",
+            "128",
+            "--batch-size-eval",
+            "128",
+            "--cache-eval-tensors-on-gpu",
+        ),
+        notes="Dual-RTX-5090 DDP, global batch 128, shared panel cached on GPU.",
+    ),
+    "dual_ddp_b256_cached": Variant(
+        name="dual_ddp_b256_cached",
+        cuda_visible_devices="0,1",
+        args=(
+            "--multi-gpu-strategy",
+            "distributed_data_parallel",
+            "--batch-size-train",
+            "256",
+            "--batch-size-eval",
+            "128",
+            "--cache-eval-tensors-on-gpu",
+        ),
+        notes="Dual-RTX-5090 DDP, global batch 256, shared panel cached on GPU.",
+    ),
     "dual_ddp_b128": Variant(
         name="dual_ddp_b128",
         cuda_visible_devices="0,1",
