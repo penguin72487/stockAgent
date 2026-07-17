@@ -655,16 +655,16 @@ def test_checkpoint_manifest_records_complete_configuration_fingerprint() -> Non
     assert changed_manifest["fingerprints"] == manifest["fingerprints"]
 
 
-def test_schema5_prior_backtest_contract_cannot_resume_but_can_infer(
+def test_schema6_prior_backtest_contract_cannot_resume_but_can_infer(
     tmp_path: Path,
 ) -> None:
     expected = _checkpoint_manifest(_panel(), _config())
     assert (
         expected["contracts"]["trading"]["canonical_backtest_contract_version"]
-        == 6
+        == 7
     )
     prior_contract = copy.deepcopy(expected)
-    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 5
+    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 6
     prior_contract["fingerprints"]["trading"] = trainer_module._stable_fingerprint(
         prior_contract["contracts"]["trading"]
     )
@@ -674,7 +674,7 @@ def test_schema5_prior_backtest_contract_cannot_resume_but_can_infer(
         _validate_checkpoint_manifest(
             checkpoint,
             expected,
-            checkpoint_path=tmp_path / "prior_backtest_schema5.pt",
+            checkpoint_path=tmp_path / "prior_backtest_schema6.pt",
             scope="resume",
         )
 
@@ -683,8 +683,28 @@ def test_schema5_prior_backtest_contract_cannot_resume_but_can_infer(
     _validate_checkpoint_manifest(
         checkpoint,
         expected,
-        checkpoint_path=tmp_path / "prior_backtest_schema5.pt",
+        checkpoint_path=tmp_path / "prior_backtest_schema6.pt",
         scope="inference",
+    )
+
+
+def test_taiwan_settlement_gradient_horizon_is_checkpoint_semantic() -> None:
+    panel = _panel()
+    naive = _config()
+    naive_changed = copy.deepcopy(naive)
+    naive_changed.training.tw_continuous_gradient_horizon_rows += 8
+    assert (
+        _checkpoint_manifest(panel, naive)["fingerprints"]["training"]
+        == _checkpoint_manifest(panel, naive_changed)["fingerprints"]["training"]
+    )
+
+    taiwan = copy.deepcopy(naive)
+    taiwan.trading.execution_mode = "tw_cash"
+    taiwan_changed = copy.deepcopy(taiwan)
+    taiwan_changed.training.tw_continuous_gradient_horizon_rows += 8
+    assert (
+        _checkpoint_manifest(panel, taiwan)["fingerprints"]["training"]
+        != _checkpoint_manifest(panel, taiwan_changed)["fingerprints"]["training"]
     )
 
 

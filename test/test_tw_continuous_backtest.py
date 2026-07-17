@@ -863,6 +863,35 @@ def test_tw_cash_official_action_transition_fails_if_held_sale_is_blocked() -> N
         )
 
 
+def test_tw_cash_prior_alive_selection_mask_does_not_block_current_exit() -> None:
+    """Selection causality must not erase an independently executable close."""
+
+    weights = torch.tensor([[0.5], [0.5]], dtype=torch.float32)
+    selection_mask = torch.tensor([[True], [False]])
+    side_mask = torch.ones_like(selection_mask)
+    actions = torch.tensor([[False], [True]])
+
+    result = run_backtest_torch(
+        weights,
+        torch.zeros_like(weights),
+        selection_mask,
+        torch.zeros(2),
+        0.0,
+        0.0,
+        execution_mode="tw_cash",
+        long_only=True,
+        can_buy_mask=side_mask,
+        can_sell_mask=side_mask,
+        buy_fee_rates=torch.zeros(1),
+        sell_fee_rates=torch.zeros(1),
+        unresolved_corporate_action_mask=actions,
+    )
+
+    assert result.weights_history[0, 0] > 0.0
+    torch.testing.assert_close(result.weights_history[1], torch.zeros(1))
+    assert result.turnovers[1] > 0.0
+
+
 def test_tw_cash_official_action_transition_blocks_new_entry_without_holding() -> None:
     weights = torch.tensor([[0.5]], dtype=torch.float64)
     mask = _mask_like(weights)
@@ -2604,6 +2633,178 @@ def test_zero_cost_unchanged_cash_target_has_zero_gradient(rows: int) -> None:
     torch.testing.assert_close(objective, torch.zeros_like(objective), rtol=0.0, atol=0.0)
     assert weights.grad is not None
     torch.testing.assert_close(weights.grad, torch.zeros_like(weights), rtol=0.0, atol=0.0)
+
+
+def test_fixed_reference_cap_has_finite_gradient_at_zero_equity_scale() -> None:
+    """An inactive zero-NAV branch must not form Inf in DivBackward."""
+
+    requested = torch.tensor([0.0, 0.4], dtype=torch.float64, requires_grad=True)
+    equity_scale = torch.zeros((), dtype=torch.float64, requires_grad=True)
+    capped = tw_continuous_module._cap_current_nav_request_from_reference_notional(
+        requested,
+        torch.tensor([0.25, 0.25], dtype=torch.float64),
+        equity_scale,
+    )
+
+    torch.testing.assert_close(capped, requested)
+    capped.sum().backward()
+    assert requested.grad is not None and torch.isfinite(requested.grad).all()
+    assert equity_scale.grad is not None and torch.isfinite(equity_scale.grad)
+    torch.testing.assert_close(requested.grad, torch.ones_like(requested))
+    torch.testing.assert_close(equity_scale.grad, torch.zeros_like(equity_scale))
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_day_trade"])
+def test_dead_taiwan_account_volume_cap_backward_is_finite(
+    execution_mode: str,
+) -> None:
+    """Absorbing ruin remains a differentiable no-op for later target rows."""
+
+    weights = torch.tensor([[0.4]], dtype=torch.float64, requires_grad=True)
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    common = dict(
+        target_weights=weights,
+        asset_log_returns=torch.zeros_like(weights),
+        tradable_mask=mask,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        buy_fee_rates=torch.zeros(1, dtype=torch.float64),
+        sell_fee_rates=torch.zeros(1, dtype=torch.float64),
+        volume_limit_weights=torch.tensor([[0.5]], dtype=torch.float64),
+        initial_cash=torch.zeros((), dtype=torch.float64),
+        initial_payables=torch.zeros(2, dtype=torch.float64),
+        initial_receivables=torch.zeros(2, dtype=torch.float64),
+        initial_alive=torch.tensor(False),
+        initial_equity_scale=torch.zeros((), dtype=torch.float64),
+    )
+    if execution_mode == "tw_cash":
+        result = run_tw_cash_continuous(
+            unresolved_corporate_action_mask=torch.zeros_like(mask),
+            initial_weights=torch.zeros(1, dtype=torch.float64),
+            initial_short_sale_collateral=torch.zeros(1, dtype=torch.float64),
+            initial_short_margin_collateral=torch.zeros(1, dtype=torch.float64),
+            **common,
+        )
+    else:
+        day_common = dict(common)
+        day_common["intraday_log_returns"] = day_common.pop("asset_log_returns")
+        result = run_tw_day_trade_continuous(
+            can_short_open_mask=mask,
+            day_trade_eligible_mask=mask,
+            day_trade_can_buy_open_mask=mask,
+            day_trade_can_sell_open_mask=mask,
+            **day_common,
+        )
+
+    result.strategy_returns.sum().backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
+    torch.testing.assert_close(weights.grad, torch.zeros_like(weights))
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_day_trade"])
+def test_settlement_gradient_horizon_preserves_exact_forward_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    execution_mode: str,
+) -> None:
+    """Truncated ledger BPTT changes graph connectivity, never account values."""
+
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_COMPILE", "0")
+    weights = torch.tensor(
+        [[0.2, -0.1], [0.4, 0.1], [-0.2, 0.3], [0.1, 0.5]],
+        dtype=torch.float64,
+    )
+    returns = torch.tensor(
+        [[0.01, -0.02], [0.02, 0.01], [-0.01, 0.03], [0.04, -0.02]],
+        dtype=torch.float64,
+    )
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    fees = torch.tensor([0.000855, 0.001], dtype=torch.float64)
+
+    def execute() -> object:
+        if execution_mode == "tw_cash":
+            return run_tw_cash_continuous(
+                weights,
+                returns,
+                mask,
+                mask,
+                mask,
+                fees,
+                fees,
+                can_short_open_mask=mask,
+                force_short_cover_mask=mask,
+                short_margin_rate=0.9,
+                short_capacity_weights=torch.ones_like(weights),
+                unresolved_corporate_action_mask=torch.zeros_like(mask),
+            )
+        return run_tw_day_trade_continuous(
+            weights,
+            returns,
+            mask,
+            mask,
+            mask,
+            mask,
+            mask,
+            fees,
+            fees,
+            day_trade_can_buy_open_mask=mask,
+            day_trade_can_sell_open_mask=mask,
+        )
+
+    monkeypatch.setenv("STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS", "0")
+    full_horizon = execute()
+    monkeypatch.setenv("STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS", "2")
+    truncated = execute()
+
+    for field in (
+        "strategy_returns",
+        "turnovers",
+        "weights_history",
+        "cash_history",
+        "payables_history",
+        "receivables_history",
+        "settlement_default",
+        "equity_scale_history",
+        "final_weights",
+        "final_cash",
+        "final_payables",
+        "final_receivables",
+        "final_alive",
+        "final_equity_scale",
+    ):
+        assert torch.equal(getattr(full_horizon, field), getattr(truncated, field))
+
+
+def test_settlement_gradient_horizon_cuts_only_prior_state_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_COMPILE", "0")
+    monkeypatch.setenv("STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS", "2")
+    weights = torch.tensor(
+        [[0.2, 0.3], [0.5, 0.1], [0.1, 0.6], [0.4, 0.2]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    returns = torch.tensor(
+        [[0.01, -0.02], [0.02, 0.01], [-0.01, 0.03], [0.04, -0.02]],
+        dtype=torch.float64,
+    )
+    mask = torch.ones_like(weights, dtype=torch.bool)
+    result = run_tw_cash_continuous(
+        weights,
+        returns,
+        mask,
+        mask,
+        mask,
+        torch.tensor([0.000855, 0.000855], dtype=torch.float64),
+        torch.tensor([0.003855, 0.003855], dtype=torch.float64),
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
+    )
+
+    result.strategy_returns[2:].sum().backward()
+    assert weights.grad is not None and torch.isfinite(weights.grad).all()
+    torch.testing.assert_close(weights.grad[:2], torch.zeros_like(weights.grad[:2]))
+    assert float(weights.grad[2:].abs().sum()) > 0.0
 
 
 def test_cash_and_day_trade_ledgers_pass_double_precision_gradcheck() -> None:

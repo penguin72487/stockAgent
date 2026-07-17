@@ -78,6 +78,11 @@ class TaiwanIntegerBacktestResult:
     receivable_history: np.ndarray
     payable_queue_history: np.ndarray
     receivable_queue_history: np.ndarray
+    # Queue totals at the execution/mark boundary.  End-of-row queue history
+    # may additionally contain a cash-dividend entitlement earned after that
+    # boundary, so holdings reports must not mix the two accounting times.
+    execution_payable_history: np.ndarray
+    execution_receivable_history: np.ndarray
     # NAV at the row's execution/mark boundary, before the supplied forward
     # valuation return.  This keeps exact holdings reports reconstructable even
     # when a halted symbol has no raw execution quote on that row.
@@ -932,6 +937,8 @@ def _empty_result_arrays(
         "receivable_queue_history": np.zeros(
             (time, receivable_lag), dtype=np.float64
         ),
+        "execution_payable_history": np.zeros(time, dtype=np.float64),
+        "execution_receivable_history": np.zeros(time, dtype=np.float64),
         "execution_nav_history": np.zeros(time, dtype=np.float64),
         "nav_history": np.zeros(time, dtype=np.float64),
         "settlement_net_history": np.zeros(time, dtype=np.float64),
@@ -957,6 +964,8 @@ def _record_state(
     receivable: np.ndarray,
     nav: float,
     execution_nav: float | None = None,
+    execution_payable: float | None = None,
+    execution_receivable: float | None = None,
     short_sale_collateral: np.ndarray | None = None,
     short_margin_collateral: np.ndarray | None = None,
 ) -> None:
@@ -967,6 +976,16 @@ def _record_state(
     arrays["receivable_history"][index] = float(np.sum(receivable))
     arrays["payable_queue_history"][index] = payable
     arrays["receivable_queue_history"][index] = receivable
+    arrays["execution_payable_history"][index] = (
+        float(np.sum(payable))
+        if execution_payable is None
+        else float(execution_payable)
+    )
+    arrays["execution_receivable_history"][index] = (
+        float(np.sum(receivable))
+        if execution_receivable is None
+        else float(execution_receivable)
+    )
     arrays["execution_nav_history"][index] = (
         float(nav) if execution_nav is None else float(execution_nav)
     )
@@ -1232,8 +1251,10 @@ def _run_tw_cash_integer_long_only(
     )
     lots = _as_lot_vector(lot_sizes, symbols, default=1)
     tradable = _as_bool_matrix("tradable_mask", tradable_mask, targets.shape)
-    can_buy = _as_bool_matrix("can_buy_mask", can_buy_mask, targets.shape) & tradable
-    can_sell = _as_bool_matrix("can_sell_mask", can_sell_mask, targets.shape) & tradable
+    # ``tradable`` is the causal selection universe; current-close side masks
+    # independently govern execution of existing holdings.
+    can_buy = _as_bool_matrix("can_buy_mask", can_buy_mask, targets.shape)
+    can_sell = _as_bool_matrix("can_sell_mask", can_sell_mask, targets.shape)
     force_exit = (
         np.zeros(targets.shape, dtype=np.bool_)
         if force_exit_mask is None
@@ -1567,6 +1588,8 @@ def _run_tw_cash_integer_long_only(
             + float(np.sum(receivable))
             - float(np.sum(payable))
         )
+        execution_payable = float(np.sum(payable))
+        execution_receivable = float(np.sum(receivable))
         expected_nav_at_execution = nav_before_trade - fees
         if not np.isclose(
             nav_at_execution,
@@ -1639,6 +1662,8 @@ def _run_tw_cash_integer_long_only(
             receivable=receivable,
             nav=nav,
             execution_nav=nav_at_execution,
+            execution_payable=execution_payable,
+            execution_receivable=execution_receivable,
         )
         last_nav = nav
 
@@ -1749,8 +1774,10 @@ def _run_tw_cash_integer_signed(
     lots = _as_lot_vector(lot_sizes, symbols, default=1)
     short_lots = _as_lot_vector(short_lot_sizes, symbols, default=1000)
     tradable = _as_bool_matrix("tradable_mask", tradable_mask, targets.shape)
-    can_buy = _as_bool_matrix("can_buy_mask", can_buy_mask, targets.shape) & tradable
-    can_sell = _as_bool_matrix("can_sell_mask", can_sell_mask, targets.shape) & tradable
+    # Keep current-close execution facts separate from the prior-alive model
+    # selection mask, matching the canonical tensor TW cash ledger.
+    can_buy = _as_bool_matrix("can_buy_mask", can_buy_mask, targets.shape)
+    can_sell = _as_bool_matrix("can_sell_mask", can_sell_mask, targets.shape)
     if can_short_open_mask is None:
         can_short_open = np.zeros(targets.shape, dtype=np.bool_)
     else:
@@ -2368,6 +2395,8 @@ def _run_tw_cash_integer_signed(
             + float(np.sum(receivable))
             - float(np.sum(payable))
         )
+        execution_payable = float(np.sum(payable))
+        execution_receivable = float(np.sum(receivable))
         expected_nav_at_execution = nav_before_trade - fees
         if not np.isclose(
             nav_at_execution,
@@ -2439,6 +2468,8 @@ def _run_tw_cash_integer_signed(
             receivable=receivable,
             nav=nav,
             execution_nav=nav_at_execution,
+            execution_payable=execution_payable,
+            execution_receivable=execution_receivable,
             short_sale_collateral=short_sale_collateral,
             short_margin_collateral=short_margin_collateral,
         )

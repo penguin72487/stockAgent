@@ -954,6 +954,49 @@ def test_official_delisting_event_extends_suspension_then_marks_untradable(tmp_p
     assert bool(panel.force_exit_mask[delisted_idx, symbol_idx]) is True
 
 
+def test_delisting_without_event_day_quote_exits_at_final_positive_close(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0])
+    # A second symbol extends the global panel calendar beyond 2330's final
+    # quote, reproducing a suspension before the official termination date.
+    _write_symbol(
+        tmp_path / "2317_features.parquet",
+        [50.0, 51.0, 52.0, 53.0],
+    )
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-05"],
+            "symbol": ["2330"],
+            "_twpub_delisted": [1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+    )
+    symbol_idx = panel.symbols.index("2330")
+    last_quote_idx = int(
+        np.where(panel.dates == np.datetime64("2024-01-03"))[0][0]
+    )
+    termination_idx = int(
+        np.where(panel.dates == np.datetime64("2024-01-05"))[0][0]
+    )
+
+    assert panel.close_prices[last_quote_idx, symbol_idx] == pytest.approx(101.0)
+    assert np.isnan(panel.close_prices[termination_idx, symbol_idx])
+    assert bool(panel.force_exit_mask[last_quote_idx, symbol_idx]) is True
+    assert bool(panel.force_exit_mask[termination_idx, symbol_idx]) is False
+    assert bool(panel.tradable_mask[termination_idx, symbol_idx]) is False
+
+
 def test_same_symbol_trading_next_session_is_not_a_terminal_delisting(
     tmp_path: Path,
 ) -> None:

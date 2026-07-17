@@ -45,6 +45,34 @@ _TW_CASH_COMPILE_STATS: dict[str, int] = {
 }
 
 
+def _settlement_gradient_horizon_rows() -> int:
+    try:
+        return max(
+            0,
+            int(
+                os.environ.get(
+                    "STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS",
+                    "0",
+                )
+            ),
+        )
+    except ValueError:
+        return 0
+
+
+def _restart_recurrent_gradient(
+    value: torch.Tensor,
+    *,
+    requires_grad: bool,
+) -> torch.Tensor:
+    """Detach carried state while preserving the compiled-call tensor ABI."""
+
+    restarted = value.detach().clone(memory_format=torch.contiguous_format)
+    if requires_grad and restarted.is_floating_point():
+        restarted.requires_grad_(True)
+    return restarted
+
+
 def _validate_finite_nonnegative_eager(value: torch.Tensor, name: str) -> None:
     """Validate external state without introducing data guards into fullgraph compile."""
 
@@ -593,6 +621,41 @@ def _advance_equity_scale(
     return torch.where(alive, next_scale, torch.zeros_like(next_scale))
 
 
+def _cap_current_nav_request_from_reference_notional(
+    requested: torch.Tensor,
+    reference_cap: torch.Tensor,
+    equity_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Cap a current-NAV request using a fixed-reference notional limit.
+
+    The direct expression ``reference_cap / equity_scale`` is algebraically
+    simple but unsafe for reverse-mode AD: a dead account has equity scale zero,
+    so even an ultimately unselected branch can overflow and produce
+    ``0 * inf == nan`` in ``DivBackward``.  Compare in fixed-reference units
+    first and divide only on cells where the cap genuinely binds.  On those
+    cells ``equity_scale * requested > reference_cap >= 0``, which proves the
+    selected denominator is positive and the quotient cannot exceed the finite
+    request.
+    """
+
+    valid_cap = torch.isfinite(reference_cap) & (reference_cap >= 0.0)
+    requested_reference_notional = requested * equity_scale
+    cap_binds = valid_cap & (reference_cap < requested_reference_notional)
+    safe_cap = torch.where(
+        cap_binds,
+        reference_cap,
+        torch.zeros_like(reference_cap),
+    )
+    safe_equity_scale = torch.where(
+        cap_binds,
+        equity_scale,
+        torch.ones_like(requested_reference_notional),
+    )
+    capped_when_binding = safe_cap / safe_equity_scale
+    capped = torch.where(cap_binds, capped_when_binding, requested)
+    return torch.where(valid_cap, capped, torch.zeros_like(requested))
+
+
 def _settle_open_phase(
     cash: torch.Tensor,
     payables: torch.Tensor,
@@ -719,30 +782,35 @@ def _finalize_day(
     nav_ruin_now = advance & alive & ~finite_positive
     newly_dead = default_now | nav_ruin_now
     survived = alive & (~advance | finite_positive)
-    denominator = nav_end.clamp_min(_MIN_WEALTH_FACTOR)
-    simple_return = nav_end / nav_start.clamp_min(_MIN_WEALTH_FACTOR) - 1.0
-    simple_return = torch.where(advance & survived, simple_return, torch.zeros_like(simple_return))
+    live_advance = advance & survived
+    safe_nav_start = torch.where(
+        live_advance,
+        nav_start.clamp_min(_MIN_WEALTH_FACTOR),
+        torch.ones_like(nav_start),
+    )
+    safe_nav_end = torch.where(live_advance, nav_end, safe_nav_start)
+    simple_return = safe_nav_end / safe_nav_start - 1.0
     ruin_return = simple_return.new_tensor(-1.0 + _MIN_WEALTH_FACTOR)
     # An absorbing dead account produces the ruin return exactly once.  Later
     # real sessions (and synthetic padding) are recurrent no-ops.
     simple_return = torch.where(newly_dead, ruin_return, simple_return)
 
-    risky_normalized = risky_end / denominator
-    cash_normalized = cash / denominator
-    payables_normalized = payables / denominator
-    receivables_normalized = receivables / denominator
+    safe_denominator = torch.where(
+        live_advance,
+        nav_end,
+        torch.ones_like(nav_end),
+    )
 
-    risky_normalized = torch.where(survived, risky_normalized, torch.zeros_like(risky_normalized))
-    cash_normalized = torch.where(survived, cash_normalized, torch.zeros_like(cash_normalized))
-    payables_normalized = torch.where(survived, payables_normalized, torch.zeros_like(payables_normalized))
-    receivables_normalized = torch.where(survived, receivables_normalized, torch.zeros_like(receivables_normalized))
-    # A compile-shape padding row is an exact state transition identity.  Even
-    # dividing by a numerically-near-one NAV would accumulate drift across a
-    # padded tail and break chunk-size invariance.
-    risky_normalized = torch.where(advance, risky_normalized, risky_end)
-    cash_normalized = torch.where(advance, cash_normalized, cash)
-    payables_normalized = torch.where(advance, payables_normalized, payables)
-    receivables_normalized = torch.where(advance, receivables_normalized, receivables)
+    def normalize(value: torch.Tensor) -> torch.Tensor:
+        safe_value = torch.where(live_advance, value, torch.zeros_like(value))
+        normalized = safe_value / safe_denominator
+        normalized = torch.where(survived, normalized, torch.zeros_like(normalized))
+        return torch.where(advance, normalized, value)
+
+    risky_normalized = normalize(risky_end)
+    cash_normalized = normalize(cash)
+    payables_normalized = normalize(payables)
+    receivables_normalized = normalize(receivables)
     survived = torch.where(advance, survived, alive)
     return (
         simple_return,
@@ -785,13 +853,14 @@ def _finalize_cash_day(
     nav_ruin_now = advance & alive & ~finite_positive
     newly_dead = default_now | nav_ruin_now
     survived = alive & (~advance | finite_positive)
-    denominator = nav_end.clamp_min(_MIN_WEALTH_FACTOR)
-    simple_return = nav_end / nav_start.clamp_min(_MIN_WEALTH_FACTOR) - 1.0
-    simple_return = torch.where(
-        advance & survived,
-        simple_return,
-        torch.zeros_like(simple_return),
+    live_advance = advance & survived
+    safe_nav_start = torch.where(
+        live_advance,
+        nav_start.clamp_min(_MIN_WEALTH_FACTOR),
+        torch.ones_like(nav_start),
     )
+    safe_nav_end = torch.where(live_advance, nav_end, safe_nav_start)
+    simple_return = safe_nav_end / safe_nav_start - 1.0
     simple_return = torch.where(
         newly_dead,
         simple_return.new_tensor(-1.0 + _MIN_WEALTH_FACTOR),
@@ -799,7 +868,13 @@ def _finalize_cash_day(
     )
 
     def normalize(value: torch.Tensor) -> torch.Tensor:
-        normalized = value / denominator
+        safe_value = torch.where(live_advance, value, torch.zeros_like(value))
+        safe_denominator = torch.where(
+            live_advance,
+            nav_end,
+            torch.ones_like(nav_end),
+        )
+        normalized = safe_value / safe_denominator
         normalized = torch.where(survived, normalized, torch.zeros_like(normalized))
         return torch.where(advance, normalized, value)
 
@@ -919,11 +994,17 @@ def _run_tw_cash_continuous_impl(
             raise ValueError(f"{name} shape must match target_weights")
     buy_fees = _as_fee_vector(buy_fee_rates, reference=target_weights, name="buy_fee_rates")
     sell_fees = _as_fee_vector(sell_fee_rates, reference=target_weights, name="sell_fee_rates")
-    buy_mask = can_buy_mask.to(device=target_weights.device, dtype=torch.bool) & tradable_mask.to(
-        device=target_weights.device, dtype=torch.bool
+    # ``tradable_mask`` is the causal model-selection universe (prior-alive for
+    # TW cash), while these are current-close broker execution facts.  A held
+    # name that resumes trading must remain reducible even if it was not
+    # selectable from yesterday's information.
+    buy_mask = can_buy_mask.to(
+        device=target_weights.device,
+        dtype=torch.bool,
     )
-    sell_mask = can_sell_mask.to(device=target_weights.device, dtype=torch.bool) & tradable_mask.to(
-        device=target_weights.device, dtype=torch.bool
+    sell_mask = can_sell_mask.to(
+        device=target_weights.device,
+        dtype=torch.bool,
     )
     if can_short_open_mask is None:
         short_open_mask = torch.zeros_like(sell_mask)
@@ -1084,8 +1165,30 @@ def _run_tw_cash_continuous_impl(
     turnover_cap = target_weights.new_tensor(float(max_turnover_ratio))
     gross_cap = target_weights.new_tensor(float(gross_budget)).clamp(min=0.0, max=1.0)
     maintenance_ratio = target_weights.new_tensor(maintenance_ratio_value)
+    gradient_horizon = _settlement_gradient_horizon_rows()
 
     for idx in range(int(t_len)):
+        if gradient_horizon > 0 and idx > 0 and idx % gradient_horizon == 0:
+            risky = _restart_recurrent_gradient(risky, requires_grad=False)
+            cash = _restart_recurrent_gradient(cash, requires_grad=False)
+            payables = _restart_recurrent_gradient(payables, requires_grad=False)
+            receivables = _restart_recurrent_gradient(
+                receivables,
+                requires_grad=False,
+            )
+            short_sale_collateral = _restart_recurrent_gradient(
+                short_sale_collateral,
+                requires_grad=False,
+            )
+            short_margin_collateral = _restart_recurrent_gradient(
+                short_margin_collateral,
+                requires_grad=False,
+            )
+            alive = _restart_recurrent_gradient(alive, requires_grad=False)
+            equity_scale = _restart_recurrent_gradient(
+                equity_scale,
+                requires_grad=False,
+            )
         advance = advance_mask[idx]
         risky_before = risky
         cash, payables, receivables, alive_after_settlement, default_now = _settle_open_phase(
@@ -1186,13 +1289,11 @@ def _run_tw_cash_continuous_impl(
                 device=target_weights.device,
                 dtype=target_weights.dtype,
             )
-            short_cap = torch.where(
-                torch.isfinite(raw_short_cap) & (raw_short_cap >= 0.0),
-                raw_short_cap
-                / equity_scale.clamp_min(torch.finfo(target_weights.dtype).tiny),
-                torch.zeros_like(raw_short_cap),
+            voluntary_short_open = _cap_current_nav_request_from_reference_notional(
+                voluntary_short_open,
+                raw_short_cap,
+                equity_scale,
             )
-            voluntary_short_open = torch.minimum(voluntary_short_open, short_cap)
 
         if volume_limit_weights is not None:
             volume_cap = volume_limit_weights[idx].to(
@@ -1205,15 +1306,28 @@ def _run_tw_cash_continuous_impl(
                 + voluntary_short_cover
                 + voluntary_short_open
             )
-            safe_cap = torch.where(
-                torch.isfinite(volume_cap) & (volume_cap >= 0.0),
-                volume_cap.clamp_min(0.0)
-                / equity_scale.clamp_min(torch.finfo(target_weights.dtype).tiny),
-                torch.zeros_like(voluntary_notional),
+            capped_notional = _cap_current_nav_request_from_reference_notional(
+                voluntary_notional,
+                volume_cap,
+                equity_scale,
             )
-            participation_scale = torch.minimum(
+            cap_is_valid = torch.isfinite(volume_cap) & (volume_cap >= 0.0)
+            cap_binds = cap_is_valid & (
+                volume_cap < voluntary_notional * equity_scale
+            )
+            safe_requested = torch.where(
+                cap_binds,
+                voluntary_notional,
                 torch.ones_like(voluntary_notional),
-                safe_cap / voluntary_notional.clamp_min(1.0e-12),
+            )
+            participation_scale = torch.where(
+                cap_is_valid,
+                torch.where(
+                    cap_binds,
+                    capped_notional / safe_requested,
+                    torch.ones_like(voluntary_notional),
+                ),
+                torch.zeros_like(voluntary_notional),
             )
             voluntary_long_sell = voluntary_long_sell * participation_scale
             voluntary_long_buy = voluntary_long_buy * participation_scale
@@ -2376,7 +2490,45 @@ def run_tw_cash_continuous(
     try:
         total_rows = int(target_weights.size(0))
         full_stop = total_rows - total_rows % chunk_rows
+        gradient_horizon = _settlement_gradient_horizon_rows()
         for start in range(0, full_stop, chunk_rows):
+            if (
+                gradient_horizon > 0
+                and start > 0
+                and start % gradient_horizon == 0
+            ):
+                risky = _restart_recurrent_gradient(
+                    risky,
+                    requires_grad=requires_state_grad,
+                )
+                cash = _restart_recurrent_gradient(
+                    cash,
+                    requires_grad=requires_state_grad,
+                )
+                payables = _restart_recurrent_gradient(
+                    payables,
+                    requires_grad=requires_state_grad,
+                )
+                receivables = _restart_recurrent_gradient(
+                    receivables,
+                    requires_grad=requires_state_grad,
+                )
+                short_sale_collateral = _restart_recurrent_gradient(
+                    short_sale_collateral,
+                    requires_grad=requires_state_grad,
+                )
+                short_margin_collateral = _restart_recurrent_gradient(
+                    short_margin_collateral,
+                    requires_grad=requires_state_grad,
+                )
+                alive = _restart_recurrent_gradient(
+                    alive,
+                    requires_grad=False,
+                )
+                equity_scale = _restart_recurrent_gradient(
+                    equity_scale,
+                    requires_grad=requires_state_grad,
+                )
             stop = start + chunk_rows
             chunk_tensors_2d = (
                 target_weights[start:stop],
@@ -2436,6 +2588,31 @@ def run_tw_cash_continuous(
             _TW_CASH_COMPILE_STATS["compiled_chunk_calls"] += 1
 
         if full_stop < total_rows:
+            if (
+                gradient_horizon > 0
+                and full_stop > 0
+                and full_stop % gradient_horizon == 0
+            ):
+                risky = _restart_recurrent_gradient(risky, requires_grad=False)
+                cash = _restart_recurrent_gradient(cash, requires_grad=False)
+                payables = _restart_recurrent_gradient(payables, requires_grad=False)
+                receivables = _restart_recurrent_gradient(
+                    receivables,
+                    requires_grad=False,
+                )
+                short_sale_collateral = _restart_recurrent_gradient(
+                    short_sale_collateral,
+                    requires_grad=False,
+                )
+                short_margin_collateral = _restart_recurrent_gradient(
+                    short_margin_collateral,
+                    requires_grad=False,
+                )
+                alive = _restart_recurrent_gradient(alive, requires_grad=False)
+                equity_scale = _restart_recurrent_gradient(
+                    equity_scale,
+                    requires_grad=False,
+                )
             tail = _run_tw_cash_continuous_impl(
                 target_weights[full_stop:],
                 asset_log_returns[full_stop:],
@@ -2710,8 +2887,22 @@ def run_tw_day_trade_continuous(
     default_rows: list[torch.Tensor] = []
     equity_scale_rows: list[torch.Tensor] = []
     turnover_cap = target_weights.new_tensor(float(max_turnover_ratio))
+    gradient_horizon = _settlement_gradient_horizon_rows()
 
     for idx in range(int(t_len)):
+        if gradient_horizon > 0 and idx > 0 and idx % gradient_horizon == 0:
+            risky = _restart_recurrent_gradient(risky, requires_grad=False)
+            cash = _restart_recurrent_gradient(cash, requires_grad=False)
+            payables = _restart_recurrent_gradient(payables, requires_grad=False)
+            receivables = _restart_recurrent_gradient(
+                receivables,
+                requires_grad=False,
+            )
+            alive = _restart_recurrent_gradient(alive, requires_grad=False)
+            equity_scale = _restart_recurrent_gradient(
+                equity_scale,
+                requires_grad=False,
+            )
         advance = advance_mask[idx]
         cash, payables, receivables, alive_after_settlement, default_now = _settle_open_phase(
             cash,
@@ -2753,16 +2944,12 @@ def run_tw_day_trade_continuous(
             # share budget.  Scaling by buy+sell dollars would incorrectly make
             # the share cap depend on the intraday return/closing price.
             position_cap = volume_cap * 0.5
-            safe_cap = torch.where(
-                torch.isfinite(volume_cap) & (volume_cap >= 0.0),
-                position_cap.clamp_min(0.0)
-                / equity_scale.clamp_min(torch.finfo(target_weights.dtype).tiny),
-                torch.zeros_like(position_cap),
-            )
-            signed_target = torch.sign(signed_target) * torch.minimum(
+            capped_position = _cap_current_nav_request_from_reference_notional(
                 signed_target.abs(),
-                safe_cap,
+                position_cap,
+                equity_scale,
             )
+            signed_target = torch.sign(signed_target) * capped_position
         if max_turnover_ratio > 0.0:
             # Entry sizing is decided at the open.  Actual close notional is
             # future information, so use a two-leg open-notional budget here.

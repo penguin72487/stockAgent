@@ -3,7 +3,7 @@ experiment_name: tw-stock-transformer-market-public-data-all-available
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_lanten_market_candles_tw_cash_all_available
+  output_dir: artifacts/markets/tw_public_lanten_market_candles_tw_cash_gradfix_v2
   mode: train
   resume: true
   post_train_infer: true
@@ -278,6 +278,10 @@ training:
   # of eight-session chunks (43.6ms vs 40.6ms for 32 rows). Persistent-cache
   # startup then measured 5.6s. This is the cold-start/throughput Pareto point.
   tw_continuous_compile_chunk_rows: 4
+  # The forward T+2 ledger stays continuous for every session. Only its
+  # reverse-mode state is restarted every 32 rows, preventing normalized-ledger
+  # gradient overflow while keeping batch128 model/optimizer throughput.
+  tw_continuous_gradient_horizon_rows: 32
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
@@ -406,7 +410,9 @@ training:
   lr_scheduler_threshold: 0.0005
   weight_decay: 0.01
   grad_clip_norm: 1.0
-  finite_check_interval_steps: 100
+  # Numerical faults are prevented in the settlement math and bounded
+  # recurrence above; do not scan every parameter/gradient in this hot path.
+  finite_check_interval_steps: 0
   checkpoint_finite_check: false
   loss_type: log_utility
   min_batch_size: 1

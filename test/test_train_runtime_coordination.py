@@ -134,6 +134,9 @@ def test_tw_public_candle_run_reuses_dynamic_model_and_loss_graphs() -> None:
     assert config.training.compile_model_dynamic_symbols is True
     assert config.training.compile_loss_dynamic_symbols is True
     assert config.training.tw_continuous_compile_chunk_rows == 4
+    assert config.training.tw_continuous_gradient_horizon_rows == 32
+    assert config.training.finite_check_interval_steps == 0
+    assert config.training.checkpoint_finite_check is False
     assert config.trading.tw_short_capacity_limit_enabled is False
 
 

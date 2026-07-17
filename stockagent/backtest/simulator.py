@@ -40,7 +40,10 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
-CANONICAL_BACKTEST_CONTRACT_VERSION = 6
+# v7 separates TW cash's prior-session model-selection mask from current-close
+# buy/sell execution facts.  Old checkpoints must not silently resume through
+# the resulting turnover/return semantics change.
+CANONICAL_BACKTEST_CONTRACT_VERSION = 7
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -1779,6 +1782,7 @@ def _prepare_runner_factory(
     gross_budget: float,
     min_trade_weight: float,
     portfolio_activation: str,
+    side_masks_require_tradable: bool,
 ):
     activation_name = normalize_portfolio_activation(portfolio_activation)
 
@@ -1791,14 +1795,25 @@ def _prepare_runner_factory(
         compute_dtype = _supported_scan_dtype(weights.dtype)
         target_weights = weights.to(dtype=compute_dtype)
         tradable = tradable_mask.to(device=target_weights.device, dtype=torch.bool)
-        buy_mask = (
-            can_buy_mask.to(device=target_weights.device, dtype=torch.bool)
-            & tradable
+        raw_buy_mask = can_buy_mask.to(
+            device=target_weights.device,
+            dtype=torch.bool,
         )
-        sell_mask = (
-            can_sell_mask.to(device=target_weights.device, dtype=torch.bool)
-            & tradable
+        raw_sell_mask = can_sell_mask.to(
+            device=target_weights.device,
+            dtype=torch.bool,
         )
+        if side_masks_require_tradable:
+            buy_mask = raw_buy_mask & tradable
+            sell_mask = raw_sell_mask & tradable
+        else:
+            # TW cash commits today's signal from the previous completed
+            # session, so its selection mask is deliberately prior-alive.
+            # Current-close execution masks are independent observables: a
+            # held security that resumes today must still be sellable or
+            # coverable even when it was absent from yesterday's universe.
+            buy_mask = raw_buy_mask
+            sell_mask = raw_sell_mask
         target_weights = _normalize_target_weights_torch(
             target_weights,
             long_only=long_only,
@@ -1820,6 +1835,7 @@ def _prepare_compile_key(
     gross_budget: float,
     min_trade_weight: float,
     portfolio_activation: str,
+    side_masks_require_tradable: bool,
 ) -> tuple:
     return (
         str(weights.device),
@@ -1833,6 +1849,7 @@ def _prepare_compile_key(
         float(gross_budget),
         float(min_trade_weight),
         normalize_portfolio_activation(portfolio_activation),
+        bool(side_masks_require_tradable),
         bool(_compile_dynamic_enabled()),
     )
 
@@ -1847,12 +1864,14 @@ def _resolve_prepare_runner(
     gross_budget: float,
     min_trade_weight: float,
     portfolio_activation: str,
+    side_masks_require_tradable: bool,
 ):
     base_runner = _prepare_runner_factory(
         long_only=long_only,
         gross_budget=gross_budget,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
+        side_masks_require_tradable=side_masks_require_tradable,
     )
     # When an outer torch.compile is tracing risk_aware_loss, do not create a
     # nested compiled prepare runner and do not mutate compile stats. Stats dict
@@ -1878,6 +1897,7 @@ def _resolve_prepare_runner(
         gross_budget,
         min_trade_weight,
         portfolio_activation,
+        side_masks_require_tradable,
     )
     if key in _PREP_COMPILE_FAILED:
         if _strict_no_fallback_enabled():
@@ -1935,6 +1955,7 @@ def _prepare_scan_inputs(
     gross_leverage: float,
     min_trade_weight: float,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    side_masks_require_tradable: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Model forward stays under BF16/FP16 AMP, but portfolio state, fee-adjusted
     # returns, turnover, and finance reductions are numerically sensitive. Keep
@@ -1954,6 +1975,7 @@ def _prepare_scan_inputs(
         gross_budget=gross_budget,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
+        side_masks_require_tradable=side_masks_require_tradable,
     )
     try:
         return runner(weights, tradable_mask, buy_input, sell_input)
@@ -1974,6 +1996,7 @@ def _prepare_scan_inputs(
             gross_budget,
             min_trade_weight,
             portfolio_activation,
+            side_masks_require_tradable,
         )
         _PREP_COMPILE_FAILED.add(key)
         _PREP_COMPILED_CACHE.pop(key, None)
@@ -1995,6 +2018,7 @@ def _prepare_scan_inputs(
             gross_budget=gross_budget,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
+            side_masks_require_tradable=side_masks_require_tradable,
         )
         return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
@@ -2589,6 +2613,7 @@ def run_backtest_torch(
             gross_leverage,
             min_trade_weight,
             portfolio_activation,
+            side_masks_require_tradable=(mode != "tw_cash"),
         )
         prepped_volume = (
             None
@@ -2929,10 +2954,14 @@ def _tw_integer_holdings_records(
 
     records: list[HoldingsRecord] = []
     for t in range(t_len):
+        # Use claims from the same execution/mark boundary as
+        # ``execution_nav_history`` and ``weights``.  The end-of-row queue may
+        # already include a newly earned dividend receivable and therefore
+        # belongs to a later accounting instant.
         free_cash_and_claims = float(
             result.settled_cash_history[t]
-            + result.receivable_history[t]
-            - result.payable_history[t]
+            + result.execution_receivable_history[t]
+            - result.execution_payable_history[t]
         )
         sale_collateral_history = getattr(
             result, "short_sale_collateral_history", None

@@ -4372,6 +4372,14 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "use_tensor_cores": bool(config.environment.use_tensor_cores),
         },
     }
+    if str(config.trading.execution_mode).strip().lower() in {
+        "tw_cash",
+        "tw_day_trade",
+    }:
+        contract["settlement_gradient_horizon_rows"] = max(
+            0,
+            int(getattr(training, "tw_continuous_gradient_horizon_rows", 32)),
+        )
     if bool(getattr(training, "cache_train_features_in_amp_dtype", False)):
         # This opt-in changes the immutable feature storage seen by the train
         # executor. Keep default=false schema-4 checkpoints backward compatible,
@@ -10172,70 +10180,75 @@ def _run_eval_backtest_from_weight_buffers(
             if _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", compile_default)
             else _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0")
         )
-        with compile_context:
-            backtest_chunk = run_backtest_torch(
-                weights_chunk,
-                returns_chunk,
-                mask_chunk,
-                bench_chunk,
-                buy_fee_rate,
-                sell_fee_rate,
-                long_only=long_only,
-                max_turnover_ratio=max_turnover_ratio,
-                gross_leverage=gross_leverage,
-                min_trade_weight=min_trade_weight,
-                portfolio_activation=portfolio_activation,
-                can_buy_mask=buy_mask_chunk,
-                can_sell_mask=sell_mask_chunk,
-                can_short_open_mask=short_open_mask_chunk,
-                force_short_cover_mask=force_cover_mask_chunk,
-                short_margin_rate=effective_short_margin_rate_chunk,
-                short_capacity_weights=short_capacity_weights_chunk,
-                short_maintenance_ratio=(
-                    1.30
-                    if execution_runtime is None
-                    else execution_runtime.short_maintenance_ratio
-                ),
-                short_handling_fee_rate=(
-                    0.0
-                    if execution_runtime is None
-                    else execution_runtime.short_handling_fee_rate
-                ),
-                force_exit_mask=force_exit_mask_chunk,
-                return_weights_history=return_weights_history,
-                initial_weights=initial_weights_chunk,
-                initial_alive=prev_alive,
-                volume_limit_weights=volume_limit_chunk,
-                execution_mode=execution_mode,
-                buy_fee_rates=(
-                    None if execution_runtime is None else execution_runtime.buy_fee_rates
-                ),
-                sell_fee_rates=(
-                    None if execution_runtime is None else execution_runtime.sell_fee_rates
-                ),
-                settlement_lag_sessions=(
-                    2 if execution_runtime is None else execution_runtime.settlement_lag_sessions
-                ),
-                state_advance_mask=state_advance_chunk,
-                day_trade_eligible_mask=day_trade_eligible_chunk,
-                day_trade_can_buy_open_mask=day_trade_buy_open_chunk,
-                day_trade_can_sell_open_mask=day_trade_sell_open_chunk,
-                unresolved_corporate_action_mask=unresolved_corporate_action_chunk,
-                cash_dividend_yield=cash_dividend_yield_chunk,
-                cash_dividend_payment_delay_sessions=cash_dividend_delay_chunk,
-                claim_queue_sessions=(
-                    None
-                    if execution_runtime is None
-                    else execution_runtime.claim_queue_sessions
-                ),
-                initial_cash=prev_cash,
-                initial_payables=prev_payables,
-                initial_receivables=prev_receivables,
-                initial_equity_scale=prev_equity_scale,
-                initial_short_sale_collateral=prev_short_sale_collateral,
-                initial_short_margin_collateral=prev_short_margin_collateral,
-                symbol_indices=symbol_indices,
-            )
+        try:
+            with compile_context:
+                backtest_chunk = run_backtest_torch(
+                    weights_chunk,
+                    returns_chunk,
+                    mask_chunk,
+                    bench_chunk,
+                    buy_fee_rate,
+                    sell_fee_rate,
+                    long_only=long_only,
+                    max_turnover_ratio=max_turnover_ratio,
+                    gross_leverage=gross_leverage,
+                    min_trade_weight=min_trade_weight,
+                    portfolio_activation=portfolio_activation,
+                    can_buy_mask=buy_mask_chunk,
+                    can_sell_mask=sell_mask_chunk,
+                    can_short_open_mask=short_open_mask_chunk,
+                    force_short_cover_mask=force_cover_mask_chunk,
+                    short_margin_rate=effective_short_margin_rate_chunk,
+                    short_capacity_weights=short_capacity_weights_chunk,
+                    short_maintenance_ratio=(
+                        1.30
+                        if execution_runtime is None
+                        else execution_runtime.short_maintenance_ratio
+                    ),
+                    short_handling_fee_rate=(
+                        0.0
+                        if execution_runtime is None
+                        else execution_runtime.short_handling_fee_rate
+                    ),
+                    force_exit_mask=force_exit_mask_chunk,
+                    return_weights_history=return_weights_history,
+                    initial_weights=initial_weights_chunk,
+                    initial_alive=prev_alive,
+                    volume_limit_weights=volume_limit_chunk,
+                    execution_mode=execution_mode,
+                    buy_fee_rates=(
+                        None if execution_runtime is None else execution_runtime.buy_fee_rates
+                    ),
+                    sell_fee_rates=(
+                        None if execution_runtime is None else execution_runtime.sell_fee_rates
+                    ),
+                    settlement_lag_sessions=(
+                        2 if execution_runtime is None else execution_runtime.settlement_lag_sessions
+                    ),
+                    state_advance_mask=state_advance_chunk,
+                    day_trade_eligible_mask=day_trade_eligible_chunk,
+                    day_trade_can_buy_open_mask=day_trade_buy_open_chunk,
+                    day_trade_can_sell_open_mask=day_trade_sell_open_chunk,
+                    unresolved_corporate_action_mask=unresolved_corporate_action_chunk,
+                    cash_dividend_yield=cash_dividend_yield_chunk,
+                    cash_dividend_payment_delay_sessions=cash_dividend_delay_chunk,
+                    claim_queue_sessions=(
+                        None
+                        if execution_runtime is None
+                        else execution_runtime.claim_queue_sessions
+                    ),
+                    initial_cash=prev_cash,
+                    initial_payables=prev_payables,
+                    initial_receivables=prev_receivables,
+                    initial_equity_scale=prev_equity_scale,
+                    initial_short_sale_collateral=prev_short_sale_collateral,
+                    initial_short_margin_collateral=prev_short_margin_collateral,
+                    symbol_indices=symbol_indices,
+                )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"evaluation backtest chunk rows=[{start},{end}) failed: {exc}"
+            ) from exc
         _maybe_sync_cuda(device, profile_timing)
         timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
 
@@ -12621,6 +12634,12 @@ def _configure_backtest_runtime_from_config(config: ExperimentConfig) -> None:
     os.environ["STOCKAGENT_TW_CONTINUOUS_COMPILE_CHUNK_ROWS"] = str(
         max(0, int(getattr(training, "tw_continuous_compile_chunk_rows", 8)))
     )
+    os.environ["STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS"] = str(
+        max(
+            0,
+            int(getattr(training, "tw_continuous_gradient_horizon_rows", 32)),
+        )
+    )
     eval_backtest_compile = getattr(training, "eval_backtest_compile", None)
     if eval_backtest_compile is not None:
         os.environ["STOCKAGENT_EVAL_BACKTEST_COMPILE"] = "1" if bool(eval_backtest_compile) else "0"
@@ -12637,6 +12656,7 @@ _BACKTEST_RUNTIME_ENV_NAMES = (
     "STOCKAGENT_BACKTEST_COMPILE_STATEFUL",
     "STOCKAGENT_BACKTEST_COMPILE_DYNAMIC",
     "STOCKAGENT_TW_CONTINUOUS_COMPILE_CHUNK_ROWS",
+    "STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS",
     "STOCKAGENT_TW_COMPILE_SYMBOL_MAX",
     "STOCKAGENT_EVAL_BACKTEST_COMPILE",
     "STOCKAGENT_BACKTEST_VERBOSE",
