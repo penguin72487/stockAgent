@@ -724,6 +724,10 @@ class TrainingConfig:
     # Compile Taiwan's sequential settlement ledger in bounded time chunks.
     # Zero disables chunk compilation; eight avoids full-horizon graph blowup.
     tw_continuous_compile_chunk_rows: int = 8
+    # Bound reverse-mode recurrence without changing the forward settlement
+    # ledger. Zero keeps full-horizon BPTT; a positive value detaches only the
+    # carried normalized account state at this many-session boundaries.
+    tw_continuous_gradient_horizon_rows: int = 32
     inference_backtest_autotune: bool | None = None
     inference_backtest_compile: bool | None = None
     backtest_verbose: bool = False
@@ -1069,6 +1073,21 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         0,
         int(training["tw_continuous_compile_chunk_rows"]),
     )
+    training["tw_continuous_gradient_horizon_rows"] = max(
+        0,
+        int(training["tw_continuous_gradient_horizon_rows"]),
+    )
+    tw_compile_rows = training["tw_continuous_compile_chunk_rows"]
+    tw_gradient_rows = training["tw_continuous_gradient_horizon_rows"]
+    if (
+        tw_compile_rows > 0
+        and tw_gradient_rows > 0
+        and tw_gradient_rows % tw_compile_rows != 0
+    ):
+        raise ValueError(
+            "training.tw_continuous_gradient_horizon_rows must be zero or "
+            "an exact multiple of tw_continuous_compile_chunk_rows"
+        )
     training["best_checkpoint_max_epoch"] = max(0, int(training["best_checkpoint_max_epoch"]))
     save_best_val_artifacts = bool(training["save_best_val_artifacts"])
     training["save_best_val_artifacts"] = save_best_val_artifacts
@@ -1751,6 +1770,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             backtest_compile_dynamic=training_raw["backtest_compile_dynamic"],
             tw_continuous_compile_chunk_rows=training_raw[
                 "tw_continuous_compile_chunk_rows"
+            ],
+            tw_continuous_gradient_horizon_rows=training_raw[
+                "tw_continuous_gradient_horizon_rows"
             ],
             inference_backtest_autotune=training_raw["inference_backtest_autotune"],
             inference_backtest_compile=training_raw["inference_backtest_compile"],

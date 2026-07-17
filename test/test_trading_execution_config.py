@@ -80,6 +80,17 @@ def test_execution_config_defaults_preserve_naive_mode_and_legacy_fees(tmp_path:
     assert trading.tw_corporate_action_claim_queue_sessions == 256
 
 
+def test_tw_gradient_horizon_must_align_with_compile_chunks(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, {"execution_mode": "tw_cash"})
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["training"]["tw_continuous_compile_chunk_rows"] = 4
+    payload["training"]["tw_continuous_gradient_horizon_rows"] = 30
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exact multiple"):
+        load_config(path)
+
+
 @pytest.mark.parametrize(
     ("raw_mode", "canonical_mode"),
     [

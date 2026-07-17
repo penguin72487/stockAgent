@@ -861,6 +861,40 @@ def test_tw_cash_holdings_report_uses_oracle_mark_when_raw_quote_is_missing() ->
     )
 
 
+def test_tw_cash_holdings_report_keeps_dividend_claim_at_its_ledger_time() -> None:
+    integer_result = run_tw_cash_integer(
+        np.ones((2, 1), dtype=np.float64),
+        np.array([[10.0], [9.0]], dtype=np.float64),
+        future_log_returns=np.array([[np.log(0.9)], [0.0]], dtype=np.float64),
+        cash_dividend_yield=np.array([[0.1], [0.0]], dtype=np.float64),
+        cash_dividend_payment_delay_sessions=np.array(
+            [[3], [0]], dtype=np.int64
+        ),
+        claim_queue_sessions=3,
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        tradable_mask=np.ones((2, 1), dtype=np.bool_),
+        can_buy_mask=np.ones((2, 1), dtype=np.bool_),
+        can_sell_mask=np.ones((2, 1), dtype=np.bool_),
+        unresolved_corporate_action_mask=np.zeros((2, 1), dtype=np.bool_),
+        initial_cash=1_000.0,
+    )
+
+    records = _tw_integer_holdings_records(
+        integer_result,
+        close_prices=np.array([[10.0], [9.0]], dtype=np.float64),
+        symbols=["DIVIDEND"],
+        dates=np.array(["2024-01-02", "2024-01-03"], dtype="datetime64[D]"),
+    )
+
+    first_day = [record for record in records if record.date == "2024-01-02"]
+    by_symbol = {record.symbol: record for record in first_day}
+    assert by_symbol["CASH"].market_value == pytest.approx(0.0)
+    assert by_symbol["DIVIDEND"].market_value == pytest.approx(1_000.0)
+    assert integer_result.execution_receivable_history[0] == pytest.approx(0.0)
+    assert integer_result.receivable_history[0] == pytest.approx(100.0)
+
+
 def test_tw_day_trade_full_panel_ignores_inactive_invalid_price_legs() -> None:
     tradable = np.array([[True, False], [False, True]], dtype=np.bool_)
     result, _ = run_backtest_integer_shares(

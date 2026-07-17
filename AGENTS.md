@@ -379,6 +379,11 @@ Rules:
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
 - Keep curve plotting async where possible.
 - When comparing throughput after compile, chunking, or cache changes, use the second epoch or later steady-state numbers. Do not choose defaults from the first epoch, because compile/autotune/warmup can dominate it.
+- For the high-throughput TW cash candles configuration, keep
+  `finite_check_interval_steps: 0` and `checkpoint_finite_check: false` when the
+  user opts out of scanners. Prevent non-finite states in the settlement math
+  and bound recurrent differentiation instead of adding parameter/gradient
+  sweeps to the training hot path.
 - GPU tensor caching is allowed when transfer dominates and VRAM checks pass:
   - prefer `cache_train_tensors_on_gpu: true` for transfer-bound long-year runs
   - keep `cache_eval_tensors_on_gpu: true` for lazy windowed tensor runs when train/val/test can reuse the same cached base panel tensors
@@ -703,6 +708,15 @@ Rules:
 - Ordinary non-tradability, missing data, zero volume, halts, and price-limit blocks
   freeze the affected position. Only an explicit official permanent-exit event sets
   `force_exit_mask` and settles a position (with the applicable buy/sell fee).
+- An official permanent-exit date may follow a quote-less suspension. Place its
+  `force_exit_mask` on the final finite positive close of that security episode,
+  while blocking the delisted interval from the official event date onward. Never
+  ask exact-share execution to fabricate a termination-day price or reuse a prior
+  incarnation's close after a genuine relisting boundary.
+- Exact-share holdings reports must reconcile claims, risky marks, collateral,
+  and NAV at one accounting instant. A cash-dividend receivable earned after the
+  row's execution mark belongs to end-of-row queues, not the execution-time cash
+  row; preserve separate execution-time queue totals instead of mixing them.
 - Do not treat every venue-level delisting as a terminal asset exit. TPEx rows
   identified by the official TWSE new-listing feed as `櫃轉市` continue under the
   same symbol and must not fabricate a sale/fee. Likewise, if a symbol resumes on

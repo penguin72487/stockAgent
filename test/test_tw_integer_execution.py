@@ -885,6 +885,44 @@ def test_tw_cash_integer_official_action_fails_if_held_sale_is_blocked() -> None
         )
 
 
+@pytest.mark.parametrize("signed_contract", [False, True])
+def test_tw_cash_integer_selection_mask_does_not_block_current_exit(
+    signed_contract: bool,
+) -> None:
+    targets = np.array([[0.5], [0.5]])
+    actions = np.array([[False], [True]])
+    selection_mask = np.array([[True], [False]])
+    side_mask = np.ones_like(selection_mask)
+    signed_kwargs = (
+        {
+            "can_short_open_mask": np.zeros_like(selection_mask),
+            "short_margin_rate": np.full(targets.shape, 0.9),
+            "short_capacity_shares": np.full(targets.shape, 1_000),
+            "short_lot_sizes": np.array([1]),
+        }
+        if signed_contract
+        else {}
+    )
+
+    result = run_tw_cash_integer(
+        targets,
+        np.full(targets.shape, 10.0),
+        buy_fee_rates=0.0,
+        sell_fee_rates=0.0,
+        lot_sizes=np.array([1]),
+        tradable_mask=selection_mask,
+        can_buy_mask=side_mask,
+        can_sell_mask=side_mask,
+        unresolved_corporate_action_mask=actions,
+        initial_cash=1_000.0,
+        **signed_kwargs,
+    )
+
+    assert result.positions[0, 0] > 0
+    assert result.positions[1, 0] == 0
+    assert result.turnover[1] > 0.0
+
+
 def test_tw_cash_integer_official_action_blocks_new_entry_without_holding() -> None:
     targets = np.array([[1.0]])
     result = run_tw_cash_integer(

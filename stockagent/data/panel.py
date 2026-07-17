@@ -108,8 +108,10 @@ LOG_RETURN_FEATURE_COLUMNS = [
 # eligibility mask and cannot support an explicit no-capacity-limit account.
 # v47 carries receipt-verified exact cash-dividend entitlement/payment tensors.
 # v48 applies the Article 76 Lunar New Year settlement-day counting exception
-# to exact MOPS stop-transfer dates.
-PANEL_CACHE_VERSION = 48
+# to exact MOPS stop-transfer dates.  v49 places a permanent-exit liquidation
+# on the final positive close of the ending security episode when the official
+# termination date itself has no executable quote.
+PANEL_CACHE_VERSION = 49
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -3517,6 +3519,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             if day_trade_short_open is not None:
                 day_trade_short_open[short_banned, sym_idx] = False
         delisted_rows = np.empty((0,), dtype=np.int64)
+        force_exit_rows = np.empty((0,), dtype=np.int64)
         delisted_blocked = np.zeros((panel.num_dates,), dtype=bool)
         if delisted_idx is not None:
             event_mask = np.isfinite(rule_values[:, delisted_idx]) & (rule_values[:, delisted_idx] > 0.0)
@@ -3528,6 +3531,12 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     candidate_rows[candidate_rows < panel.num_dates]
                 ).astype(np.int64)
                 effective_rows: list[int] = []
+                liquidation_rows: list[int] = []
+                episode_start = 0
+                positive_close_rows = np.flatnonzero(
+                    np.isfinite(close_prices[:, sym_idx])
+                    & (close_prices[:, sym_idx] > 0.0)
+                )
                 for candidate in candidate_rows:
                     start = int(candidate)
                     later_traded = np.flatnonzero(base_tradable[start + 1 :])
@@ -3544,8 +3553,30 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                         continue
                     if not delisted_blocked[start]:
                         effective_rows.append(start)
+                        # The official termination session commonly follows a
+                        # multi-day trading suspension.  Integer-share cash
+                        # execution cannot sell at a missing termination-day
+                        # quote, so liquidate at the final observed positive
+                        # close of this security episode.  Search only inside
+                        # the current episode: a later relisting must never be
+                        # settled against the preceding incarnation's price.
+                        right = int(
+                            np.searchsorted(
+                                positive_close_rows,
+                                start,
+                                side="right",
+                            )
+                        )
+                        if right > 0:
+                            liquidation_row = int(positive_close_rows[right - 1])
+                            if liquidation_row >= episode_start:
+                                liquidation_rows.append(liquidation_row)
+                        episode_start = next_traded
                     delisted_blocked[start:next_traded] = True
                 delisted_rows = np.asarray(effective_rows, dtype=np.int64)
+                force_exit_rows = np.unique(
+                    np.asarray(liquidation_rows, dtype=np.int64)
+                )
         if traded_idx is not None:
             official_traded = np.isfinite(aligned_rules[:, traded_idx]) & (aligned_rules[:, traded_idx] > 0.0)
             observed_rows = np.flatnonzero(official_traded)
@@ -3587,7 +3618,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     can_short_open[suspended, sym_idx] = False
                     panel.returns_1d[suspended, sym_idx] = 0.0
         if delisted_rows.size:
-            force_exit[delisted_rows, sym_idx] = True
+            force_exit[force_exit_rows, sym_idx] = True
             panel.tradable_mask[delisted_blocked, sym_idx] = False
             can_buy[delisted_blocked, sym_idx] = False
             can_sell[delisted_blocked, sym_idx] = False
