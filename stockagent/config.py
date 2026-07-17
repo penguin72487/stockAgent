@@ -8,6 +8,11 @@ from typing import Any, get_args, get_type_hints
 
 import yaml
 
+from stockagent.backtest.tw_execution import (
+    TaiwanFeeSchedule,
+    TaiwanMarginShortSchedule,
+    normalize_execution_mode,
+)
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
     normalize_portfolio_activation,
@@ -312,6 +317,41 @@ class TradingConfig:
     reporting_leverage: float = 1.0
     min_trade_weight: float = 0.0
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION
+    # Execution accounting is selected independently from portfolio construction.
+    # ``naive`` preserves the historical continuous-weight, immediate-fee path.
+    execution_mode: str = "naive"
+    tw_commission_rate: float = 0.001425
+    tw_commission_discount: float = 0.6
+    tw_stock_sell_tax: float = 0.003
+    tw_etf_sell_tax: float = 0.001
+    tw_day_trade_stock_sell_tax: float = 0.0015
+    tw_day_trade_etf_sell_tax: float = 0.001
+    # Optional broker/account profile for exact integer evaluation.  Defaults
+    # intentionally preserve pure proportional fees; e.g. a 20 TWD minimum is
+    # common but not universal across brokers and order channels.
+    tw_minimum_commission: float = 0.0
+    tw_commission_rounding: str = "none"
+    tw_tax_rounding: str = "none"
+    tw_settlement_lag_sessions: int = 2
+    # ``exact`` consumes receipt-verified issuer cash amounts/payment dates;
+    # unsupported events still use pre-event liquidation. ``avoid`` liquidates
+    # before every known action and creates no entitlement claim.
+    tw_corporate_action_mode: str = "avoid"
+    tw_corporate_action_claim_queue_sessions: int = 256
+    tw_cash_lot_size: int = 1
+    tw_day_trade_lot_size: int = 1000
+    # A negative tw_cash position is a separate margin-short liability, never
+    # a negative cash-share holding.  These fields are serialized as part of
+    # TradingConfig and therefore participate in checkpoint compatibility.
+    tw_short_initial_margin_rate: float = 0.9
+    tw_short_maintenance_ratio: float = 1.3
+    tw_short_lot_size: int = 1000
+    tw_short_handling_fee_rate: float = 0.0
+    # Broker borrow inventory is not universally available historically.  Keep
+    # the realistic fail-closed capacity ceiling by default, but allow an
+    # explicit counterfactual account contract that leaves eligible shorts
+    # uncapped while preserving every other short-sale rule.
+    tw_short_capacity_limit_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -658,6 +698,10 @@ class TrainingConfig:
     triton_cache_dir: str = "~/.cache/triton"
     cuda_cache_path: str = "~/.cache/nv_cuda"
     compile_loss: bool | None = None
+    # Executor-only optimization: compile the panel-slab model with a symbolic
+    # stock axis so expanding walk-forward folds can reuse one Inductor graph.
+    # Batch/time/feature axes remain static and assets are never padded.
+    compile_model_dynamic_symbols: bool = False
     # Executor-only optimization: keep the train batch/time axis static while
     # allowing one compiled canonical-loss graph to serve changing symbol
     # counts across expanding walk-forward folds.
@@ -677,6 +721,9 @@ class TrainingConfig:
     backtest_compile: bool = True
     backtest_compile_stateful: bool = True
     backtest_compile_dynamic: bool = False
+    # Compile Taiwan's sequential settlement ledger in bounded time chunks.
+    # Zero disables chunk compilation; eight avoids full-horizon graph blowup.
+    tw_continuous_compile_chunk_rows: int = 8
     inference_backtest_autotune: bool | None = None
     inference_backtest_compile: bool | None = None
     backtest_verbose: bool = False
@@ -724,6 +771,8 @@ class TrainingConfig:
     explain_interactive_plots: bool = False
     explain_shap_enabled: bool = False
     explain_shap_mode: str = "score_head_surrogate"
+    explain_j_lens_enabled: bool = False
+    explain_j_lens_intervention_fraction: float = 0.01
     explain_case_study_top_k: int = 5
     explain_regime_analysis: bool = False
     explain_fold_stability: bool = False
@@ -1016,6 +1065,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("training.multi_gpu_strategy must be one of: auto, none, distributed_data_parallel")
     training["multi_gpu_strategy"] = multi_gpu_strategy
     training["ddp_bucket_cap_mb"] = int(training["ddp_bucket_cap_mb"])
+    training["tw_continuous_compile_chunk_rows"] = max(
+        0,
+        int(training["tw_continuous_compile_chunk_rows"]),
+    )
     training["best_checkpoint_max_epoch"] = max(0, int(training["best_checkpoint_max_epoch"]))
     save_best_val_artifacts = bool(training["save_best_val_artifacts"])
     training["save_best_val_artifacts"] = save_best_val_artifacts
@@ -1446,6 +1499,10 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     if shap_mode not in valid_shap_modes:
         raise ValueError(f"training.explain_shap_mode must be one of {sorted(valid_shap_modes)}")
     training["explain_shap_mode"] = shap_mode
+    j_lens_intervention_fraction = float(training["explain_j_lens_intervention_fraction"])
+    if not 0.0 <= j_lens_intervention_fraction <= 1.0:
+        raise ValueError("training.explain_j_lens_intervention_fraction must be between 0 and 1")
+    training["explain_j_lens_intervention_fraction"] = j_lens_intervention_fraction
     training["explain_case_study_top_k"] = max(1, int(training["explain_case_study_top_k"]))
     training["explain_ig_batch_size"] = max(0, int(training["explain_ig_batch_size"]))
     training["explain_perturb_batch_size"] = max(0, int(training["explain_perturb_batch_size"]))
@@ -1531,6 +1588,69 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 + ", ".join(conflicting_aliases)
             )
     _set_dataclass_defaults(trading, TradingConfig)
+    trading["execution_mode"] = normalize_execution_mode(trading["execution_mode"])
+    taiwan_fee_schedule = TaiwanFeeSchedule(
+        commission_rate=trading["tw_commission_rate"],
+        commission_discount=trading["tw_commission_discount"],
+        stock_sell_tax=trading["tw_stock_sell_tax"],
+        etf_sell_tax=trading["tw_etf_sell_tax"],
+        day_trade_stock_sell_tax=trading["tw_day_trade_stock_sell_tax"],
+        day_trade_etf_sell_tax=trading["tw_day_trade_etf_sell_tax"],
+        minimum_commission=trading["tw_minimum_commission"],
+        commission_rounding=trading["tw_commission_rounding"],
+        tax_rounding=trading["tw_tax_rounding"],
+        settlement_lag_sessions=trading["tw_settlement_lag_sessions"],
+        cash_lot_size=trading["tw_cash_lot_size"],
+        day_trade_default_lot_size=trading["tw_day_trade_lot_size"],
+    )
+    # Keep the normalized config payload canonical and typed exactly like the
+    # validated execution schedule consumed by the backtest executor.
+    trading["tw_commission_rate"] = taiwan_fee_schedule.commission_rate
+    trading["tw_commission_discount"] = taiwan_fee_schedule.commission_discount
+    trading["tw_stock_sell_tax"] = taiwan_fee_schedule.stock_sell_tax
+    trading["tw_etf_sell_tax"] = taiwan_fee_schedule.etf_sell_tax
+    trading["tw_day_trade_stock_sell_tax"] = (
+        taiwan_fee_schedule.day_trade_stock_sell_tax
+    )
+    trading["tw_day_trade_etf_sell_tax"] = taiwan_fee_schedule.day_trade_etf_sell_tax
+    trading["tw_minimum_commission"] = taiwan_fee_schedule.minimum_commission
+    trading["tw_commission_rounding"] = taiwan_fee_schedule.commission_rounding
+    trading["tw_tax_rounding"] = taiwan_fee_schedule.tax_rounding
+    trading["tw_settlement_lag_sessions"] = taiwan_fee_schedule.settlement_lag_sessions
+    trading["tw_cash_lot_size"] = taiwan_fee_schedule.cash_lot_size
+    trading["tw_day_trade_lot_size"] = taiwan_fee_schedule.day_trade_default_lot_size
+    taiwan_short_schedule = TaiwanMarginShortSchedule(
+        initial_margin_rate=trading["tw_short_initial_margin_rate"],
+        maintenance_ratio=trading["tw_short_maintenance_ratio"],
+        lot_size=trading["tw_short_lot_size"],
+        handling_fee_rate=trading["tw_short_handling_fee_rate"],
+    )
+    trading["tw_short_initial_margin_rate"] = taiwan_short_schedule.initial_margin_rate
+    trading["tw_short_maintenance_ratio"] = taiwan_short_schedule.maintenance_ratio
+    trading["tw_short_lot_size"] = taiwan_short_schedule.lot_size
+    trading["tw_short_handling_fee_rate"] = taiwan_short_schedule.handling_fee_rate
+    if not isinstance(trading["tw_short_capacity_limit_enabled"], bool):
+        raise ValueError(
+            "trading.tw_short_capacity_limit_enabled must be a boolean"
+        )
+    corporate_action_mode = str(
+        trading["tw_corporate_action_mode"]
+    ).strip().lower()
+    if corporate_action_mode not in {"avoid", "exact"}:
+        raise ValueError(
+            "trading.tw_corporate_action_mode must be 'avoid' or 'exact'"
+        )
+    trading["tw_corporate_action_mode"] = corporate_action_mode
+    claim_queue = trading["tw_corporate_action_claim_queue_sessions"]
+    if isinstance(claim_queue, bool) or not isinstance(claim_queue, int):
+        raise ValueError(
+            "trading.tw_corporate_action_claim_queue_sessions must be an integer"
+        )
+    if claim_queue < trading["tw_settlement_lag_sessions"]:
+        raise ValueError(
+            "trading.tw_corporate_action_claim_queue_sessions must be at least "
+            "tw_settlement_lag_sessions"
+        )
     # Report/post-processing leverage only. Canonical model/loss/backtest exposure stays unlevered.
     trading["max_turnover_ratio"] = max(0.0, float(trading["max_turnover_ratio"]))
     trading["max_volume_participation"] = max(0.0, float(trading["max_volume_participation"]))
@@ -1612,6 +1732,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             triton_cache_dir=training_raw["triton_cache_dir"],
             cuda_cache_path=training_raw["cuda_cache_path"],
             compile_loss=training_raw["compile_loss"],
+            compile_model_dynamic_symbols=training_raw["compile_model_dynamic_symbols"],
             compile_loss_dynamic_symbols=training_raw["compile_loss_dynamic_symbols"],
             loss_portfolio_activation=training_raw["loss_portfolio_activation"],
             loss_min_trade_weight=training_raw["loss_min_trade_weight"],
@@ -1628,6 +1749,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
             backtest_compile=training_raw["backtest_compile"],
             backtest_compile_stateful=training_raw["backtest_compile_stateful"],
             backtest_compile_dynamic=training_raw["backtest_compile_dynamic"],
+            tw_continuous_compile_chunk_rows=training_raw[
+                "tw_continuous_compile_chunk_rows"
+            ],
             inference_backtest_autotune=training_raw["inference_backtest_autotune"],
             inference_backtest_compile=training_raw["inference_backtest_compile"],
             backtest_verbose=training_raw["backtest_verbose"],
@@ -1675,6 +1799,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
             explain_interactive_plots=training_raw["explain_interactive_plots"],
             explain_shap_enabled=training_raw["explain_shap_enabled"],
             explain_shap_mode=training_raw["explain_shap_mode"],
+            explain_j_lens_enabled=training_raw["explain_j_lens_enabled"],
+            explain_j_lens_intervention_fraction=training_raw["explain_j_lens_intervention_fraction"],
             explain_case_study_top_k=training_raw["explain_case_study_top_k"],
             explain_regime_analysis=training_raw["explain_regime_analysis"],
             explain_fold_stability=training_raw["explain_fold_stability"],

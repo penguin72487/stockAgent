@@ -27,10 +27,12 @@ from stockagent.models.normalization import (
 )
 from stockagent.training.loss import risk_aware_loss
 from stockagent.training.trainer import (
+    _DynamicSymbolPanelSlabWrapper,
     _extract_weights_and_aux,
     _load_state_dict,
     _maybe_compact_train_windowed_symbols,
     _PanelSlabForwardWrapper,
+    _panel_slab_dynamic_symbol_bounds,
 )
 from stockagent.training.windowed import WindowedSplitTensors
 
@@ -728,6 +730,87 @@ def test_panel_slab_compiles_fullgraph_on_cpu_with_compact_symbols_and_backward(
     assert torch.isfinite(feature_slab.grad).all()
 
 
+def test_panel_slab_symbolic_stock_axis_reuses_one_graph_and_matches_eager() -> None:
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile is unavailable")
+
+    model = _make_model(
+        attention_mode="market_token",
+        portfolio_mode="long_short",
+        portfolio_output_mode="projection_l1",
+        temporal_pooling="attention",
+        temporal_query_mode="full_then_last",
+        allow_dynamic_symbols=False,
+        return_aux=False,
+        return_aux_details=False,
+    ).cpu().train()
+    eager = _PanelSlabForwardWrapper(model)
+    graph_count = 0
+
+    def counting_backend(graph_module, _example_inputs):
+        nonlocal graph_count
+        graph_count += 1
+        return graph_module.forward
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(
+            eager,
+            backend=counting_backend,
+            fullgraph=True,
+            dynamic=None,
+        )
+        symbolic = _DynamicSymbolPanelSlabWrapper(
+            compiled,
+            min_symbols=4,
+            max_symbols=8,
+        )
+
+        for symbols in (5, 7, 6):
+            feature_slab = torch.randn(
+                3 + model.lookback - 1,
+                symbols,
+                model.num_features,
+                requires_grad=True,
+            )
+            mask = torch.ones(3, symbols, dtype=torch.bool)
+            mask[-1, -1] = False
+            symbol_indices = torch.arange(symbols, dtype=torch.long)
+
+            with torch.no_grad():
+                expected = eager(feature_slab, mask, symbol_indices)
+            actual = symbolic(feature_slab, mask, symbol_indices)
+            actual.square().sum().backward()
+
+            assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+            assert feature_slab.grad is not None
+            assert not hasattr(feature_slab, "_dynamo_dynamic_indices")
+            assert not hasattr(mask, "_dynamo_dynamic_indices")
+            assert not hasattr(symbol_indices, "_dynamo_dynamic_indices")
+            model.zero_grad(set_to_none=True)
+
+        assert graph_count == 1
+    finally:
+        torch._dynamo.reset()
+
+
+def test_panel_slab_dynamic_bounds_do_not_cross_sdpa_loop_count() -> None:
+    model = _make_model(sdpa_batch_limit=65_535).cpu()
+
+    assert _panel_slab_dynamic_symbol_bounds(
+        model,
+        observed_symbols=2_582,
+        max_symbols=2_735,
+        local_batch_rows=128,
+    ) == (2_560, 2_735)
+    assert _panel_slab_dynamic_symbol_bounds(
+        model,
+        observed_symbols=2_653,
+        max_symbols=2_735,
+        local_batch_rows=128,
+    ) == (2_560, 2_735)
+
+
 def test_symbol_indices_preserve_full_universe_symbol_positions() -> None:
     device = _device()
     symbol_indices_cpu = torch.tensor([0, 2, 5, 8], dtype=torch.long)
@@ -1364,6 +1447,11 @@ def test_portfolio_output_mode_l1_uses_identity_l1_weights() -> None:
     )
     assert model.portfolio_output_mode == "l1"
     assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    long_gross = weights.clamp_min(0.0).sum(dim=1)
+    short_gross = (-weights.clamp_max(0.0)).sum(dim=1)
+    expected_gross = torch.ones_like(long_gross)
+    assert torch.allclose(weights.abs().sum(dim=1), expected_gross, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(long_gross + short_gross, expected_gross, atol=1e-6, rtol=1e-6)
 
 
 def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:

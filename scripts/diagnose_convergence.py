@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.tw_execution import require_naive_execution_for_tool
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -999,6 +1000,10 @@ def main() -> None:
     np.random.seed(int(args.seed))
 
     config = load_config(args.config)
+    require_naive_execution_for_tool(
+        config.trading.execution_mode,
+        tool_name="diagnose_convergence.py",
+    )
     if args.device is not None:
         config.environment.device = str(args.device)
     _configure_runtime(
@@ -1056,7 +1061,14 @@ def main() -> None:
         device=device,
     )
 
-    dataset = CrossSectionalDataset(panel, _split_indices(fold, args.split), config.training.lookback)
+    dataset = CrossSectionalDataset(
+        panel,
+        _split_indices(fold, args.split),
+        config.training.lookback,
+        execution_mode=config.trading.execution_mode,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+    )
     split = dataset_to_windowed_tensors(dataset)
     row_indices = _select_indices(len(split), args.rows, args.sample_method, args.seed)
     batch = _batch_from_windowed(split, row_indices, device=device, non_blocking=non_blocking)

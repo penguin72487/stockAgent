@@ -3,7 +3,7 @@ experiment_name: tw-stock-transformer-market-public-data-all-available
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_lanten_market_candles
+  output_dir: artifacts/markets/tw_public_lanten_market_candles_tw_cash_all_available
   mode: train
   resume: true
   post_train_infer: true
@@ -227,15 +227,29 @@ walk_forward:
 
 trading:
   frequency: daily
+  execution_mode: tw_cash
+  # Exact MOPS cash amounts/payment dates; complex or unavailable actions
+  # remain fail-safe pre-event liquidations.
+  tw_corporate_action_mode: exact
+  tw_corporate_action_claim_queue_sessions: 256
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
   max_turnover_ratio: 0.0
   max_volume_participation: 0.5
   volume_participation_equity: 1000000.0
-  reporting_leverage: 2.5
+  reporting_leverage: 1.0
   min_trade_weight: 0.0
   portfolio_activation: pre_normalized
+  # Positive targets are cash longs; negative targets are point-in-time
+  # eligibility-constrained margin shorts (融券), never naked negative shares.
   long_only: false
+  tw_short_lot_size: 1000
+  tw_short_initial_margin_rate: 0.9
+  tw_short_maintenance_ratio: 1.3
+  tw_short_handling_fee_rate: 0.0
+  # No broker-specific historical borrow inventory is available for this run.
+  # Keep official eligibility/bans/covers, but do not cap eligible short size.
+  tw_short_capacity_limit_enabled: false
 training:
   financial_transformer:
     # All raw candle features are jointly encoded directly into the model's
@@ -251,10 +265,19 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
+  # The actual fold20/fold21 production shapes compile to one symbolic-S graph:
+  # no stock padding, no parameter change, and unchanged steady-state step time.
+  compile_model_dynamic_symbols: true
   # Expanding train_union folds change S each year. Keep T=128 fixed and make
   # only S symbolic, so remaining folds reuse one canonical-loss graph without
   # padding assets or changing checkpoint/trading semantics.
   compile_loss_dynamic_symbols: true
+  # Do not unroll all 128 settlement days into one horizon-sized graph. On the
+  # actual S=2304 RTX 5070 Ti margin-short benchmark, four-session chunks cut
+  # cold compile from 77.8s to 41.4s while keeping steady backward within 7.4%
+  # of eight-session chunks (43.6ms vs 40.6ms for 32 rows). Persistent-cache
+  # startup then measured 5.6s. This is the cold-start/throughput Pareto point.
+  tw_continuous_compile_chunk_rows: 4
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
@@ -288,7 +311,7 @@ training:
   lookback: 32
   # Fold20 RTX 5070 Ti, 131 features, S=2582: the direct 131 -> 32 Candle
   # Encoder reached 14.88 ms/model-forward batch and a 10.12s steady epoch.
-  # Keep one power-of-two batch64 graph for throughput and VRAM headroom.
+  # Keep one power-of-two batch128 graph for throughput and VRAM headroom.
   batch_size_train: 128
   batch_size_eval: 128
   epochs: 1000
@@ -349,8 +372,11 @@ training:
   save_integer_share_holdings_table: true
   backtest_artifact_compression: none
   save_best_val_artifacts: false
-  postprocess_benchmark_after_fold: true
-  postprocess_benchmark_after_best_val: true
+  # The activation/threshold sweep consumes raw transformer_base_portfolio
+  # logits and is unsupported by financial_transformer. Avoid repeated no-op
+  # subprocess checks during resume and best-validation handling.
+  postprocess_benchmark_after_fold: false
+  postprocess_benchmark_after_best_val: false
   # Hyperparameter selection belongs to validation. Test-only sweeps may be
   # run as diagnostics, but must never choose deployment settings.
   postprocess_benchmark_split: val

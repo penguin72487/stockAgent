@@ -16,9 +16,13 @@ from stockagent.explainability import (
     ExplainabilitySettings,
     _align_panel_to_checkpoint_universe,
     _daily_weight_symbols,
+    _evenly_spaced_sample_indices,
     _method_agreement_table,
     _forward_outputs,
     _perturbation_importance,
+    _portfolio_j_lens,
+    _combine_j_lens_frames_from_chunks,
+    _plot_all_explanation_figures,
     _representation_aux_summary,
     _save_matplotlib_figure,
     _with_numeric,
@@ -30,10 +34,155 @@ from stockagent.explainability import (
 )
 
 
+class _TinyResidualBlock(torch.nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 0.1 * torch.tanh(self.linear(x))
+
+
+class _TinyJLensePortfolio(torch.nn.Module):
+    def __init__(self, features: int = 3, dim: int = 4) -> None:
+        super().__init__()
+        self.input_projection = torch.nn.Linear(features, dim, bias=False)
+        self.temporal_blocks = torch.nn.ModuleList([_TinyResidualBlock(dim)])
+        self.score_head = torch.nn.Linear(dim, 1, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, return_aux: bool | None = None):
+        z_stock = self.input_projection(x.mean(dim=1))
+        for block in self.temporal_blocks:
+            z_stock = block(z_stock)
+        scores = self.score_head(z_stock).squeeze(-1).masked_fill(~mask, 0.0)
+        weights = scores.masked_fill(~mask, 0.0)
+        aux = {"z_stock": z_stock, "score_logits": scores}
+        return weights, scores, aux if return_aux else {}
+
+
+def test_evenly_spaced_sample_indices_stay_in_bounds_above_float32_exact_range() -> None:
+    n_points = 216 * 32 * 2735
+    indices = _evenly_spaced_sample_indices(
+        n_points,
+        65_536,
+        device=torch.device("cpu"),
+    )
+
+    assert indices.dtype == torch.long
+    assert indices.numel() == 65_536
+    assert int(indices[0]) == 0
+    assert int(indices[-1]) == n_points - 1
+    assert bool(torch.all(indices[1:] > indices[:-1]))
+    assert int(indices.min()) >= 0
+    assert int(indices.max()) < n_points
+
+
+def test_portfolio_j_lens_is_complete_and_faithfulness_checked() -> None:
+    torch.manual_seed(9)
+    model = _TinyJLensePortfolio()
+    x = torch.randn(2, 3, 5, 3)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    frames, summary, warnings_out = _portfolio_j_lens(
+        model,
+        x,
+        mask,
+        dates=["2026-01-01", "2026-01-02"],
+        symbols=[f"S{i}" for i in range(5)],
+        enabled=True,
+        intervention_fraction=0.01,
+        progress_enabled=False,
+    )
+
+    assert warnings_out == []
+    assert summary["status"] == "ok"
+    assert summary["d_model"] == 4
+    assert summary["layers"] == 2
+    assert frames["j_lens_transport"].height == 2 * 4 * 4
+    assert frames["j_lens_dimension_readout"].height == 2 * 4
+    assert frames["j_lens_date_readout"].height == 2 * 2
+    assert frames["j_lens_stock_readout"].height == 2 * 5
+    assert frames["j_lens_faithfulness"].height == 1
+    completeness = frames["j_lens_completeness"].row(0, named=True)
+    assert completeness["transport_cell_coverage"] == pytest.approx(1.0)
+    assert completeness["dimension_cell_coverage"] == pytest.approx(1.0)
+    assert completeness["top_k_truncation"] is False
+
+
+def test_portfolio_j_lens_chunk_aggregation_preserves_complete_cells() -> None:
+    torch.manual_seed(10)
+    model = _TinyJLensePortfolio()
+    chunks = []
+    for chunk_id in range(2):
+        x = torch.randn(1, 3, 5, 3)
+        mask = torch.ones(1, 5, dtype=torch.bool)
+        frames, summary, _ = _portfolio_j_lens(
+            model,
+            x,
+            mask,
+            dates=[f"2026-01-0{chunk_id + 1}"],
+            symbols=[f"S{i}" for i in range(5)],
+            enabled=True,
+            intervention_fraction=0.01,
+            progress_enabled=False,
+        )
+        chunks.append(({"frames": frames, "summary": {"j_lens": summary}}, 1))
+
+    combined, summary = _combine_j_lens_frames_from_chunks(chunks)
+
+    assert summary["status"] == "ok"
+    assert summary["chunks_aggregated"] == 2
+    assert combined["j_lens_transport"].height == 2 * 4 * 4
+    assert combined["j_lens_date_readout"].height == 2 * 2
+    assert combined["j_lens_stock_readout"].height == 2 * 5
+    assert combined["j_lens_stock_readout"].get_column("active_dates").min() == 2
+    assert combined["j_lens_completeness"].row(0, named=True)["transport_cell_coverage"] == pytest.approx(1.0)
+
+
+def test_portfolio_j_lens_writes_all_diagnostic_plots(tmp_path: Path) -> None:
+    torch.manual_seed(11)
+    model = _TinyJLensePortfolio()
+    frames, _, _ = _portfolio_j_lens(
+        model,
+        torch.randn(2, 3, 5, 3),
+        torch.ones(2, 5, dtype=torch.bool),
+        dates=["2026-01-01", "2026-01-02"],
+        symbols=[f"S{i}" for i in range(5)],
+        enabled=True,
+        intervention_fraction=0.01,
+        progress_enabled=False,
+    )
+
+    generated = _plot_all_explanation_figures(
+        frames,
+        {},
+        tmp_path,
+        plot_backend="matplotlib",
+        strict_no_fallback=True,
+        progress_enabled=False,
+    )
+
+    expected = {
+        "plots/j_lens_layer_transport_strength.png",
+        "plots/j_lens_transport_matrix_heatmap.png",
+        "plots/j_lens_layer_stock_score_heatmap.png",
+        "plots/j_lens_layer_date_heatmap.png",
+        "plots/j_lens_linearization_faithfulness.png",
+    }
+    assert expected.issubset(set(generated))
+    assert all((tmp_path / relative).stat().st_size > 0 for relative in expected)
+
+
 class _BatchShapeSensitiveExplainModel(torch.nn.Module):
     def forward(self, x, mask, return_aux=None):
         scores = x.sum(dim=(1, 3)) + float(x.size(0)) * 0.01
         scores = scores.masked_fill(~mask, 0.0)
+        return scores, scores, {}
+
+
+class _BFloat16PerturbationModel(torch.nn.Module):
+    def forward(self, x, mask, return_aux=None):
+        del return_aux
+        scores = x.sum(dim=(1, 3)).masked_fill(~mask, 0.0).to(torch.bfloat16)
         return scores, scores, {}
 
 
@@ -61,6 +210,27 @@ def test_perturbation_uses_batch_matched_baseline() -> None:
     assert diagnostics["batch_matched_baseline"] is True
     assert diagnostics["baseline_forward_batches"] == 1
     assert diagnostics["original_vs_matched_baseline_weight_abs_delta"] > 0.0
+
+
+def test_perturbation_exports_bfloat16_outputs_as_float32() -> None:
+    x = torch.randn(1, 2, 3, 2)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    model = _BFloat16PerturbationModel()
+    base_weights, base_scores, _ = _forward_outputs(model, x, mask)
+
+    feature_time, _, _ = _perturbation_importance(
+        model,
+        x,
+        mask,
+        base_weights,
+        base_scores,
+        ["f0", "f1"],
+        batch_size=2,
+        progress_enabled=False,
+    )
+
+    assert feature_time.height == 4
+    assert np.isfinite(feature_time["score_abs_delta"].to_numpy()).all()
 
 
 def test_daily_weight_symbols_supports_parquet_and_csv(tmp_path: Path) -> None:

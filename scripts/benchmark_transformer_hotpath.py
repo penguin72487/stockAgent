@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from stockagent.backtest.tw_execution import require_naive_execution_for_tool
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -128,6 +129,9 @@ def _run_case(
         fold.train_indices,
         int(lookback),
         include_volume_notional=include_volume_notional,
+        execution_mode=config.trading.execution_mode,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
     )
     real_rows = len(dataset)
     batch_size = max(1, min(int(batch_size), real_rows))
@@ -383,6 +387,10 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    require_naive_execution_for_tool(
+        config.trading.execution_mode,
+        tool_name="benchmark_transformer_hotpath.py",
+    )
     if args.parquet_root is not None:
         config.data.parquet_root = str(args.parquet_root)
     if args.public_feature_path is not None:

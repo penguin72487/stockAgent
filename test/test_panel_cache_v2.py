@@ -115,6 +115,125 @@ def test_panel_cache_v2_invalidates_on_backend_key(tmp_path) -> None:
     )
 
 
+def test_panel_cache_v2_retains_distinct_backend_variants(tmp_path) -> None:
+    source = tmp_path / "AAA_features.parquet"
+    source.write_bytes(b"parquet-placeholder")
+    masks = np.ones((2, 1), dtype=bool)
+
+    def make_panel(value: float) -> PanelData:
+        return PanelData(
+            dates=np.arange(2).astype("datetime64[D]"),
+            symbols=["AAA"],
+            feature_names=["f0"],
+            features=np.full((2, 1, 1), value, dtype=np.float32),
+            returns_1d=np.zeros((2, 1), dtype=np.float32),
+            tradable_mask=masks,
+            can_buy_mask=masks.copy(),
+            can_sell_mask=masks.copy(),
+            alive_mask=masks.copy(),
+            benchmark_returns=np.zeros((2,), dtype=np.float32),
+            close_prices=np.ones((2, 1), dtype=np.float32),
+        )
+
+    backend_a = "pyarrow|feature_zero_fill=[]"
+    backend_b = "pyarrow|feature_zero_fill=['twpub_*']"
+    save_panel_cache_v2(
+        tmp_path,
+        make_panel(1.0),
+        source_hash="hash-v1",
+        backend_key=backend_a,
+        version=123,
+    )
+    save_panel_cache_v2(
+        tmp_path,
+        make_panel(9.0),
+        source_hash="hash-v1",
+        backend_key=backend_b,
+        version=123,
+    )
+
+    for backend_key, expected in ((backend_a, 1.0), (backend_b, 9.0)):
+        assert panel_cache_v2_is_valid(
+            tmp_path,
+            source_hash="hash-v1",
+            backend_key=backend_key,
+            version=123,
+            source_paths=[source],
+        )
+        payload = load_panel_cache_v2(
+            tmp_path,
+            mmap_mode="r",
+            source_hash="hash-v1",
+            backend_key=backend_key,
+            version=123,
+        )
+        assert np.array_equal(
+            payload["features"],
+            np.full((2, 1, 1), expected, dtype=np.float32),
+        )
+
+    cache_dir = panel_cache.panel_cache_v2_dir(tmp_path)
+    assert len(list((cache_dir / "variants").glob("*.json"))) == 2
+    assert len(list((cache_dir / "generations").iterdir())) == 2
+
+
+def test_panel_cache_v2_replaces_stale_source_for_same_backend(tmp_path) -> None:
+    source = tmp_path / "AAA_features.parquet"
+    source.write_bytes(b"parquet-placeholder")
+    masks = np.ones((2, 1), dtype=bool)
+    panel = PanelData(
+        dates=np.arange(2).astype("datetime64[D]"),
+        symbols=["AAA"],
+        feature_names=["f0"],
+        features=np.ones((2, 1, 1), dtype=np.float32),
+        returns_1d=np.zeros((2, 1), dtype=np.float32),
+        tradable_mask=masks,
+        can_buy_mask=masks.copy(),
+        can_sell_mask=masks.copy(),
+        alive_mask=masks.copy(),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.ones((2, 1), dtype=np.float32),
+    )
+    backend_key = "pyarrow|bounded-source-history"
+    save_panel_cache_v2(
+        tmp_path,
+        panel,
+        source_hash="hash-v1",
+        backend_key=backend_key,
+        version=123,
+    )
+    panel.features.fill(7.0)
+    save_panel_cache_v2(
+        tmp_path,
+        panel,
+        source_hash="hash-v2",
+        backend_key=backend_key,
+        version=123,
+    )
+
+    cache_dir = panel_cache.panel_cache_v2_dir(tmp_path)
+    assert len(list((cache_dir / "variants").glob("*.json"))) == 1
+    assert len(list((cache_dir / "generations").iterdir())) == 1
+    assert not panel_cache_v2_is_valid(
+        tmp_path,
+        source_hash="hash-v1",
+        backend_key=backend_key,
+        version=123,
+        source_paths=[source],
+    )
+    payload = load_panel_cache_v2(
+        tmp_path,
+        mmap_mode="r",
+        source_hash="hash-v2",
+        backend_key=backend_key,
+        version=123,
+    )
+    assert np.array_equal(
+        payload["features"],
+        np.full((2, 1, 1), 7.0, dtype=np.float32),
+    )
+
+
 def test_failed_cache_refresh_keeps_previous_generation_readable(
     tmp_path,
     monkeypatch,
