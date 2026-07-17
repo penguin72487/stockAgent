@@ -78,6 +78,7 @@ def test_scheduled_markets_defaults_to_all_configured_markets(monkeypatch) -> No
         "services.discord_bot.bot._market_configs",
         lambda: {"tw": object(), "crypto": object(), "us": object()},
     )
+    monkeypatch.setattr("services.discord_bot.bot._market_enabled", lambda cfg: True)
 
     assert _scheduled_markets() == ["crypto", "tw", "us"]
 
@@ -88,8 +89,21 @@ def test_scheduled_markets_respects_explicit_env(monkeypatch) -> None:
         "services.discord_bot.bot._market_configs",
         lambda: {"tw": object(), "crypto": object(), "us": object()},
     )
+    monkeypatch.setattr("services.discord_bot.bot._market_enabled", lambda cfg: True)
 
     assert _scheduled_markets() == ["tw", "crypto"]
+
+
+def test_scheduled_markets_excludes_disabled_market_even_when_explicit(monkeypatch) -> None:
+    configs = {"tw": object(), "crypto": object(), "us": object()}
+    monkeypatch.setenv("STOCKAGENT_SCHEDULED_MARKETS", "all")
+    monkeypatch.setattr("services.discord_bot.bot._market_configs", lambda: configs)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_enabled",
+        lambda cfg: cfg is not configs["crypto"],
+    )
+
+    assert _scheduled_markets() == ["tw", "us"]
 
 
 def test_public_broadcasts_default_to_disabled(monkeypatch) -> None:

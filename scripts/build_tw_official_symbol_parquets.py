@@ -215,10 +215,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Diagnostics only: permit non-full public download receipts.",
     )
+    parser.add_argument(
+        "--allow-daily-publication-lag",
+        action="store_true",
+        help=(
+            "Accept a certified daily-close receipt whose only missing current-day "
+            "datasets are the late TWSE/TPEx margin-balance reports."
+        ),
+    )
     return parser.parse_args()
 
 
-def _validate_download_receipts(input_dir: Path, *, allow_incomplete: bool) -> None:
+def _validate_download_receipts(
+    input_dir: Path,
+    *,
+    allow_incomplete: bool,
+    allow_daily_publication_lag: bool = False,
+) -> None:
     public_summary_path = input_dir / "download_summary.json"
     corporate_summary_path = input_dir / "tw_corporate_action_reference.summary.json"
     problems: list[str] = []
@@ -228,13 +241,28 @@ def _validate_download_receipts(input_dir: Path, *, allow_incomplete: bool) -> N
             "coverage_complete" not in public_summary
             and public_summary.get("mode") == "full"
         )
-        if public_summary.get("coverage_complete") is not True and not legacy_full_receipt:
+        certified_daily_close = (
+            allow_daily_publication_lag
+            and public_summary.get("mode") == "daily"
+            and public_summary.get("daily_close_ready") is True
+            and int(public_summary.get("blocking_failed_count", -1)) == 0
+            and set(public_summary.get("publication_lag_datasets") or ())
+            <= {"twse_margin_balance", "tpex_margin_balance"}
+        )
+        if (
+            public_summary.get("coverage_complete") is not True
+            and not legacy_full_receipt
+            and not certified_daily_close
+        ):
             problems.append(
                 "public historical coverage is incomplete "
                 f"(mode={public_summary.get('mode')!r}, "
                 f"coverage_complete={public_summary.get('coverage_complete')!r})"
             )
-        if int(public_summary.get("failed_count", -1)) != 0:
+        if (
+            int(public_summary.get("failed_count", -1)) != 0
+            and not certified_daily_close
+        ):
             problems.append(f"public failed_count={public_summary.get('failed_count')!r}")
     except Exception as exc:
         problems.append(f"invalid public receipt: {type(exc).__name__}: {exc}")
@@ -2551,6 +2579,9 @@ def main() -> None:
     _validate_download_receipts(
         args.input_dir,
         allow_incomplete=bool(args.allow_incomplete_source),
+        allow_daily_publication_lag=bool(
+            getattr(args, "allow_daily_publication_lag", False)
+        ),
     )
     frame, receipts, legacy_receipts, fallback_receipts, merge_stats = _official_frame(
         args.input_dir,
