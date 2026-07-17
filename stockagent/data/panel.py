@@ -111,7 +111,9 @@ LOG_RETURN_FEATURE_COLUMNS = [
 # to exact MOPS stop-transfer dates.  v49 places a permanent-exit liquidation
 # on the final positive close of the ending security episode when the official
 # termination date itself has no executable quote.
-PANEL_CACHE_VERSION = 49
+# v50 resolves that terminal liquidation only after every buy/sell side rule is
+# known, and stores immutable logical-array fingerprints in the panel cache.
+PANEL_CACHE_VERSION = 50
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -287,6 +289,10 @@ class PanelData:
     # Optional per-session/per-symbol legal or broker margin ratio.  Historical
     # sources in this module do not guess it; unknown values remain NaN/None.
     short_margin_rate: np.ndarray | None = None
+    # Exact logical-array hashes supplied only by an immutable panel-cache
+    # generation. Synthetic or caller-mutated panels leave this unset and are
+    # hashed directly by checkpoint construction.
+    content_fingerprints: dict[str, dict[str, Any]] | None = None
 
     @property
     def num_dates(self) -> int:
@@ -3519,7 +3525,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             if day_trade_short_open is not None:
                 day_trade_short_open[short_banned, sym_idx] = False
         delisted_rows = np.empty((0,), dtype=np.int64)
-        force_exit_rows = np.empty((0,), dtype=np.int64)
+        force_exit_windows: list[tuple[int, int, int]] = []
         delisted_blocked = np.zeros((panel.num_dates,), dtype=bool)
         if delisted_idx is not None:
             event_mask = np.isfinite(rule_values[:, delisted_idx]) & (rule_values[:, delisted_idx] > 0.0)
@@ -3531,12 +3537,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     candidate_rows[candidate_rows < panel.num_dates]
                 ).astype(np.int64)
                 effective_rows: list[int] = []
-                liquidation_rows: list[int] = []
                 episode_start = 0
-                positive_close_rows = np.flatnonzero(
-                    np.isfinite(close_prices[:, sym_idx])
-                    & (close_prices[:, sym_idx] > 0.0)
-                )
                 for candidate in candidate_rows:
                     start = int(candidate)
                     later_traded = np.flatnonzero(base_tradable[start + 1 :])
@@ -3560,23 +3561,12 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                         # close of this security episode.  Search only inside
                         # the current episode: a later relisting must never be
                         # settled against the preceding incarnation's price.
-                        right = int(
-                            np.searchsorted(
-                                positive_close_rows,
-                                start,
-                                side="right",
-                            )
+                        force_exit_windows.append(
+                            (int(episode_start), int(start), int(next_traded))
                         )
-                        if right > 0:
-                            liquidation_row = int(positive_close_rows[right - 1])
-                            if liquidation_row >= episode_start:
-                                liquidation_rows.append(liquidation_row)
                         episode_start = next_traded
                     delisted_blocked[start:next_traded] = True
                 delisted_rows = np.asarray(effective_rows, dtype=np.int64)
-                force_exit_rows = np.unique(
-                    np.asarray(liquidation_rows, dtype=np.int64)
-                )
         if traded_idx is not None:
             official_traded = np.isfinite(aligned_rules[:, traded_idx]) & (aligned_rules[:, traded_idx] > 0.0)
             observed_rows = np.flatnonzero(official_traded)
@@ -3618,7 +3608,6 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     can_short_open[suspended, sym_idx] = False
                     panel.returns_1d[suspended, sym_idx] = 0.0
         if delisted_rows.size:
-            force_exit[force_exit_rows, sym_idx] = True
             panel.tradable_mask[delisted_blocked, sym_idx] = False
             can_buy[delisted_blocked, sym_idx] = False
             can_sell[delisted_blocked, sym_idx] = False
@@ -3733,6 +3722,46 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     executable = np.flatnonzero(can_buy[knowledge_idx:end, sym_idx])
                     if executable.size:
                         force_short_cover[knowledge_idx + int(executable[0]), sym_idx] = True
+
+        # One terminal mask is consumed by both long liquidation and short
+        # cover.  Therefore its close must be executable on both sides.  The
+        # old implementation chose the final positive quote before delisting
+        # and only afterwards applied limit/halt masks; a limit-up close could
+        # consequently become an impossible short cover and crash the real
+        # fold even though an earlier two-sided close existed.  Resolve the
+        # terminal row after every side rule has been applied, and prohibit a
+        # fresh position between that liquidation and the next incarnation of
+        # the same symbol.
+        for episode_start, termination_row, next_traded in force_exit_windows:
+            episode_slice = slice(episode_start, termination_row + 1)
+            executable = np.flatnonzero(
+                can_buy[episode_slice, sym_idx]
+                & can_sell[episode_slice, sym_idx]
+                & np.isfinite(close_prices[episode_slice, sym_idx])
+                & (close_prices[episode_slice, sym_idx] > 0.0)
+            )
+            if executable.size:
+                liquidation_row = episode_start + int(executable[-1])
+            else:
+                # Preserve fail-closed observability for genuinely impossible
+                # exits.  The executor will reject a held position rather than
+                # fabricate an execution price or silently drop the event.
+                quoted = np.flatnonzero(
+                    np.isfinite(close_prices[episode_slice, sym_idx])
+                    & (close_prices[episode_slice, sym_idx] > 0.0)
+                )
+                if not quoted.size:
+                    continue
+                liquidation_row = episode_start + int(quoted[-1])
+            force_exit[liquidation_row, sym_idx] = True
+            block_start = liquidation_row + 1
+            block_end = min(int(next_traded), panel.num_dates)
+            if block_start < block_end:
+                can_buy[block_start:block_end, sym_idx] = False
+                can_sell[block_start:block_end, sym_idx] = False
+                can_short_open[block_start:block_end, sym_idx] = False
+                day_trade_can_buy_open[block_start:block_end, sym_idx] = False
+                day_trade_can_sell_open[block_start:block_end, sym_idx] = False
 
     if changed_buy or changed_sell:
         print(
@@ -4032,6 +4061,7 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         cash_dividend_payment_delay_sessions=payload.get(
             "cash_dividend_payment_delay_sessions"
         ),
+        content_fingerprints=payload.get("_content_fingerprints"),
     )
 
 
