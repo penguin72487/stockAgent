@@ -108,6 +108,29 @@ def test_daily_resolution_preserves_known_manifest_without_retrying_missing(tmp_
     assert [record.code for record in resolution.manifest_records] == ["1111", "9999", "2222", "3333"]
 
 
+def test_targeted_incremental_resolution_reuses_known_provider_candidates(tmp_path, monkeypatch):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    pl.DataFrame(
+        [
+            {"code": "3303", "name": "existing", "market": "tw_stocks", "yahoo_symbol": "3303.TWO"},
+        ]
+    ).write_csv(output_dir / "symbols.csv")
+    monkeypatch.setattr(
+        yahoo,
+        "_load_repo_symbol_fallback",
+        lambda _asset: [yahoo.SymbolRecord("8111", "repo", "tw_stocks", "8111.TWO")],
+    )
+    args = _base_args(tmp_path, symbols=["3303"])
+
+    resolution = yahoo._resolve_symbol_resolution("tw_stocks", args)
+
+    assert [record.code for record in resolution.scheduled_records] == ["3303"]
+    assert [record.code for record in resolution.manifest_records] == ["3303"]
+    assert resolution.scheduled_records[0].yahoo_symbol == "3303.TWO"
+    assert resolution.manifest_records[0].yahoo_symbol == "3303.TW"
+
+
 def test_tw_exchange_parser_excludes_warrant_like_listings(monkeypatch):
     def fake_read_html_table_rows(url):
         if "strMode=2" not in url:

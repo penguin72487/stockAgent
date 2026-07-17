@@ -951,6 +951,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-date", default="earliest", help="Historical start date or 'earliest'.")
     parser.add_argument("--end-date", default="today", help="Historical end date, today, or now.")
+    parser.add_argument(
+        "--allow-daily-publication-lag",
+        action="store_true",
+        help=(
+            "In daily mode only, do not fail the close-price pipeline when the "
+            "current session's TWSE/TPEx margin-balance reports have not been "
+            "published yet. All other dataset failures remain fatal."
+        ),
+    )
     parser.add_argument("--output-dir", default="data_tw_public", help="Output directory.")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent historical dataset workers.")
     parser.add_argument(
@@ -5950,13 +5959,34 @@ def main() -> None:
         for row in historical_results
         if row.dataset in TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES
     }
+    publication_lag_candidates = {"twse_margin_balance", "tpex_margin_balance"}
+    resolved_end_date = resolve_end_date(args.end_date)
+    publication_lag_results = [
+        row
+        for row in results
+        if (
+            bool(args.allow_daily_publication_lag)
+            and args.mode == "daily"
+            and row.dataset in publication_lag_candidates
+            and row.status in failed_statuses
+            and int(row.failed_dates) == 1
+            and int(row.missing_dates_after) == 1
+            and resolved_end_date in str(row.message)
+        )
+    ]
+    publication_lag_names = {row.dataset for row in publication_lag_results}
+    blocking_failures = [
+        row
+        for row in results
+        if row.status in failed_statuses and row.dataset not in publication_lag_names
+    ]
     summary = {
         "schema_version": 3,
         "generated_at_utc": _now_utc(),
         "mode": args.mode,
         "requested_mode": requested_mode,
         "start_date": args.start_date,
-        "end_date": resolve_end_date(args.end_date),
+        "end_date": resolved_end_date,
         "output_dir": str(output_dir),
         "request_interval_seconds": request_interval,
         "configured_requests_per_second": 1.0 / request_interval if request_interval > 0 else None,
@@ -5969,6 +5999,12 @@ def main() -> None:
         "ok_count": sum(row.status == "ok" for row in results),
         "up_to_date_count": sum(row.status == "up_to_date" for row in results),
         "failed_count": sum(row.status in failed_statuses for row in results),
+        "blocking_failed_count": len(blocking_failures),
+        "publication_lag_count": len(publication_lag_results),
+        "publication_lag_datasets": sorted(publication_lag_names),
+        "daily_close_ready": bool(
+            args.mode == "daily" and not blocking_failures
+        ),
         "incomplete_count": sum(row.status == "incomplete" for row in results),
         "empty_count": sum(row.status in {"empty", "no_new_rows", "no_distribution"} for row in results),
         "historical_dataset_count": len(historical_results),
@@ -5998,7 +6034,7 @@ def main() -> None:
         f"rows={summary['rows_total']}"
     )
 
-    if summary["failed_count"]:
+    if summary["blocking_failed_count"]:
         sys.exit(1)
 
 

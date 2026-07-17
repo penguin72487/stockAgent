@@ -698,13 +698,18 @@ def _require_trader_permission(interaction: discord.Interaction, cfg: LiveMarket
 
 
 def _scheduled_markets() -> list[str]:
+    configs = _market_configs()
     raw = _env("STOCKAGENT_SCHEDULED_MARKETS")
     if raw:
         items = [item.strip() for item in raw.split(",") if item.strip()]
         if any(item.lower() in {"all", "*"} for item in items):
-            return sorted(_market_configs())
-        return items
-    return sorted(_market_configs())
+            items = sorted(configs)
+        return [
+            key
+            for key in items
+            if key in configs and _market_enabled(configs[key])
+        ]
+    return sorted(key for key, cfg in configs.items() if _market_enabled(cfg))
 
 
 def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
@@ -900,7 +905,8 @@ def _should_use_realtime_quote_after_open(cfg: LiveMarketConfig, status: MarketR
         now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
     except Exception:
         now = datetime.now()
-    open_minutes = _hhmm_minutes(getattr(cfg, "open_time", None)) or (9 * 60)
+    configured_open = _hhmm_minutes(getattr(cfg, "open_time", None))
+    open_minutes = configured_open if configured_open is not None else (9 * 60)
     if now.hour * 60 + now.minute < open_minutes:
         return False
     data = getattr(status, "data", None)
@@ -963,6 +969,8 @@ async def market_autocomplete(
     query = str(current or "").strip().lower()
     choices: list[app_commands.Choice[str]] = []
     for key, cfg in sorted(_market_configs().items()):
+        if not _market_enabled(cfg):
+            continue
         label = f"{key} - {cfg.label}"
         if query and query not in key.lower() and query not in cfg.label.lower():
             continue
@@ -2184,6 +2192,9 @@ def _can_reuse_latest_signal_now(
     *,
     requested_price_source: str,
 ) -> tuple[bool, str | None]:
+    deployment_ok, deployment_reason = _summary_matches_market_deployment(cfg, status, summary)
+    if not deployment_ok:
+        return False, deployment_reason
     requested = str(requested_price_source or "auto").strip().lower()
     summary_price = str(summary.get("price_source") or "").strip().lower()
     summary_date = _summary_data_date_key(summary)
@@ -2256,6 +2267,30 @@ def _can_reuse_latest_signal_now(
     if summary_price and not (summary_price.startswith("panel") or summary_price in {"close", "panel_close"}):
         return False, None
     return True, "cached_latest_close"
+
+
+def _summary_matches_market_deployment(
+    cfg: LiveMarketConfig,
+    status: MarketRuntimeStatus,
+    summary: dict[str, Any],
+) -> tuple[bool, str | None]:
+    expected_fold = getattr(cfg, "fold_id", None)
+    if expected_fold is not None:
+        try:
+            if int(summary.get("fold_id")) != int(expected_fold):
+                return False, "deployment_fold_changed"
+        except (TypeError, ValueError):
+            return False, "deployment_fold_missing"
+
+    checkpoint = getattr(status, "checkpoint", None)
+    expected_checkpoint = str(getattr(checkpoint, "fingerprint", "") or "").strip()
+    if expected_checkpoint and str(summary.get("checkpoint_fingerprint") or "").strip() != expected_checkpoint:
+        return False, "deployment_checkpoint_changed"
+
+    expected_config = str(getattr(status, "config_fingerprint", "") or "").strip()
+    if expected_config and str(summary.get("config_fingerprint") or "").strip() != expected_config:
+        return False, "deployment_config_changed"
+    return True, None
 
 
 def _latest_signal_result_from_artifacts(
@@ -2394,6 +2429,14 @@ def _sync_latest_live_weights_to_market_artifact(cfg: LiveMarketConfig) -> str |
     if latest is None:
         return None
     summary_path, summary = latest
+    status = _runtime_status_for_display(cfg)
+    deployment_ok, reason = _summary_matches_market_deployment(cfg, status, summary)
+    if not deployment_ok:
+        print(
+            f"[live-weights:{cfg.market}] skip artifact from another deployment: {reason}",
+            flush=True,
+        )
+        return None
     weights_path = _summary_artifact_path(summary, "weights_path", summary_path)
     if weights_path is None or not weights_path.exists():
         return None
@@ -2766,7 +2809,11 @@ def _risk_message(
 
 
 def _guide_message() -> str:
-    markets = ", ".join(f"`{key}`" for key in sorted(_market_configs()))
+    markets = ", ".join(
+        f"`{key}`"
+        for key, cfg in sorted(_market_configs().items())
+        if _market_enabled(cfg)
+    )
     lines = [
         "**stockAgent guide**",
         f"markets: {markets or '`n/a`'}",
@@ -2911,6 +2958,47 @@ async def _run_signal_now_background_refresh(
 ) -> None:
     cfg = _resolve_market(market)
     try:
+        initial_status = await asyncio.to_thread(_ensure_signal_ready_cached, cfg)
+        if not bool(getattr(initial_status.data, "fresh", False)):
+            try:
+                preview_price_source = _auto_signal_price_source(
+                    cfg,
+                    initial_status,
+                    requested_price_source,
+                )
+                preview = await _run_market_signal(
+                    market=cfg.market,
+                    price_source=preview_price_source,
+                    top_n=top_n,
+                    min_abs_delta=min_abs_delta,
+                    progress_label=f"signal_now:preview:{cfg.market}",
+                )
+                preview = _enrich_signal_performance_for_discord(cfg, preview, max_rows=0, debug=debug)
+                preview_issues = _signal_sanity_issues(cfg, preview.summary)
+                if preview_issues:
+                    preview.message = _prepend_sanity_notice(preview.message, cfg, preview.summary)
+                preview_waiters = set(bot._signal_now_background_waiters.get(key, set()))
+                preview_header = (
+                    f"`{cfg.market}` 快速訊號已完成；資料仍在背景更新，完成後會再傳正式結果。\n"
+                    f"panel=`{preview.summary.get('panel_date') or 'n/a'}` "
+                    f"price_time=`{preview.summary.get('price_timestamp') or 'n/a'}`"
+                )
+                for user_id in sorted(preview_waiters):
+                    try:
+                        user = await bot.fetch_user(int(user_id))
+                        content = f"{preview_header}\n\n{preview.message}"
+                        await user.send(
+                            content if len(content) <= 1900 else content[:1900],
+                            view=SignalReviewView(
+                                signal_id=str(preview.summary.get("signal_id")),
+                                market=str(preview.summary.get("market") or cfg.market),
+                            ),
+                        )
+                    except Exception as send_exc:
+                        _log_exception(f"signal_now_preview_dm:{cfg.market}:{user_id}", send_exc)
+            except Exception as preview_exc:
+                _log_exception(f"signal_now_preview:{cfg.market}", preview_exc)
+
         resolved_price_source, status, auto_refreshed = await asyncio.to_thread(
             _prepare_realtime_signal_sync,
             cfg,
@@ -3295,6 +3383,21 @@ def _include_live_signals_in_portfolio_history(
         return dt or datetime.min, str(path)
 
     latest_by_date: dict[str, tuple[Path, dict[str, Any]]] = {}
+    history_ceiling: datetime | None = None
+    try:
+        import polars as pl
+
+        live_weights_path = _market_fold_dir(cfg) / "live_signal_weights.parquet"
+        if live_weights_path.exists():
+            latest_weight_date = (
+                pl.scan_parquet(live_weights_path)
+                .select(pl.col("date").max())
+                .collect()
+                .item()
+            )
+            history_ceiling = _history_datetime(latest_weight_date)
+    except Exception:
+        history_ceiling = None
     scan_limit = max(max_rows * 4, max_rows + 16, 64)
     recent_signals = _recent_market_signals(cfg, max_summaries=scan_limit)
     if not recent_signals:
@@ -3303,6 +3406,13 @@ def _include_live_signals_in_portfolio_history(
         for summary_path, summary in signals:
             key = signal_date_key(summary)
             if not key:
+                continue
+            signal_dt = _history_datetime(key)
+            if (
+                history_ceiling is not None
+                and signal_dt is not None
+                and signal_dt > history_ceiling
+            ):
                 continue
             current = latest_by_date.get(key)
             if current is None or summary_path.stat().st_mtime >= current[0].stat().st_mtime:

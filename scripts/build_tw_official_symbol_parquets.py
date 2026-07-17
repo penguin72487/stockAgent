@@ -181,6 +181,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("data_tw_public/stocks"))
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
+        "--end-date",
+        default=None,
+        help=(
+            "Inclusive completed-session cutoff (YYYY-MM-DD). Source rows after this "
+            "date are ignored so a partial future download cannot contaminate the build."
+        ),
+    )
+    parser.add_argument(
         "--legacy-official-ohlcv",
         type=Path,
         action="append",
@@ -207,10 +215,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Diagnostics only: permit non-full public download receipts.",
     )
+    parser.add_argument(
+        "--allow-daily-publication-lag",
+        action="store_true",
+        help=(
+            "Accept a certified daily-close receipt whose only missing current-day "
+            "datasets are the late TWSE/TPEx margin-balance reports."
+        ),
+    )
     return parser.parse_args()
 
 
-def _validate_download_receipts(input_dir: Path, *, allow_incomplete: bool) -> None:
+def _validate_download_receipts(
+    input_dir: Path,
+    *,
+    allow_incomplete: bool,
+    allow_daily_publication_lag: bool = False,
+) -> None:
     public_summary_path = input_dir / "download_summary.json"
     corporate_summary_path = input_dir / "tw_corporate_action_reference.summary.json"
     problems: list[str] = []
@@ -220,13 +241,28 @@ def _validate_download_receipts(input_dir: Path, *, allow_incomplete: bool) -> N
             "coverage_complete" not in public_summary
             and public_summary.get("mode") == "full"
         )
-        if public_summary.get("coverage_complete") is not True and not legacy_full_receipt:
+        certified_daily_close = (
+            allow_daily_publication_lag
+            and public_summary.get("mode") == "daily"
+            and public_summary.get("daily_close_ready") is True
+            and int(public_summary.get("blocking_failed_count", -1)) == 0
+            and set(public_summary.get("publication_lag_datasets") or ())
+            <= {"twse_margin_balance", "tpex_margin_balance"}
+        )
+        if (
+            public_summary.get("coverage_complete") is not True
+            and not legacy_full_receipt
+            and not certified_daily_close
+        ):
             problems.append(
                 "public historical coverage is incomplete "
                 f"(mode={public_summary.get('mode')!r}, "
                 f"coverage_complete={public_summary.get('coverage_complete')!r})"
             )
-        if int(public_summary.get("failed_count", -1)) != 0:
+        if (
+            int(public_summary.get("failed_count", -1)) != 0
+            and not certified_daily_close
+        ):
             problems.append(f"public failed_count={public_summary.get('failed_count')!r}")
     except Exception as exc:
         problems.append(f"invalid public receipt: {type(exc).__name__}: {exc}")
@@ -1541,6 +1577,7 @@ def _official_frame(
     input_dir: Path,
     legacy_paths: list[Path] | None = None,
     fallback_paths: list[Path] | None = None,
+    end_date: date | None = None,
 ) -> tuple[
     pl.DataFrame,
     list[dict[str, Any]],
@@ -1613,6 +1650,8 @@ def _official_frame(
         pl.lit(-1, dtype=pl.Int32).alias("_legacy_source_id"),
         pl.lit(2, dtype=pl.Int8).alias("_source_priority"),
     ).select(merge_columns)
+    if end_date is not None:
+        current = current.filter(pl.col("date") <= pl.lit(end_date))
     lifecycle_policy = _load_official_lifecycle_policy(
         input_dir,
         current,
@@ -1639,6 +1678,14 @@ def _official_frame(
         ).select(merge_columns)
         for source_id, path in enumerate(fallback_paths)
     ]
+    if end_date is not None:
+        cutoff = pl.lit(end_date)
+        legacy_frames = [
+            frame.filter(pl.col("date") <= cutoff) for frame in legacy_frames
+        ]
+        fallback_frames = [
+            frame.filter(pl.col("date") <= cutoff) for frame in fallback_frames
+        ]
     for path, fallback_frame in zip(fallback_paths, fallback_frames, strict=True):
         before_2000 = fallback_frame.filter(pl.col("date") < pl.lit(date(2000, 1, 1)))
         if before_2000.height:
@@ -2512,6 +2559,8 @@ def _write_symbol(
 
 def main() -> None:
     args = parse_args()
+    end_date_text = getattr(args, "end_date", None)
+    end_date = date.fromisoformat(end_date_text) if end_date_text else None
     if args.legacy_official_ohlcv and not args.legacy_source_name:
         raise ValueError("--legacy-source-name is required with --legacy-official-ohlcv")
     if args.legacy_source_name and not args.legacy_official_ohlcv:
@@ -2530,14 +2579,20 @@ def main() -> None:
     _validate_download_receipts(
         args.input_dir,
         allow_incomplete=bool(args.allow_incomplete_source),
+        allow_daily_publication_lag=bool(
+            getattr(args, "allow_daily_publication_lag", False)
+        ),
     )
     frame, receipts, legacy_receipts, fallback_receipts, merge_stats = _official_frame(
         args.input_dir,
         list(args.legacy_official_ohlcv),
         list(args.fallback_ohlcv),
+        end_date=end_date,
     )
+    if frame.is_empty():
+        raise RuntimeError(f"no official rows remain through end_date={end_date_text!r}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    requested_end_date = str(frame["date"].max())
+    requested_end_date = str(end_date or frame["date"].max())
     groups = frame.partition_by("symbol", as_dict=True, maintain_order=False)
     results: list[BuildResult] = []
     with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:

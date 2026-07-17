@@ -5,7 +5,7 @@ import json
 import math
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -32,8 +32,11 @@ from scripts.audit_tw_public_data_layer import (
 )
 from scripts.rebuild_tw_public_data_layer import (
     RebuildRunner,
+    _daily_yahoo_refresh_symbols,
+    _default_tw_end_date,
     _file_receipt as _runner_file_receipt,
     _promote_one,
+    _retained_daily_yahoo_symbols,
     _rollback_promoted_tree,
     _validate_corporate_action_entitlements,
     _validate_official_symbol_build_summary,
@@ -50,6 +53,72 @@ from scripts.build_tw_official_symbol_parquets import (
 from stockagent.config import load_config
 from stockagent.data.panel import PanelData
 from stockagent.data.tw_public_features import _file_content_receipt
+
+
+def test_daily_yahoo_refresh_symbols_extracts_only_actionable_gaps(tmp_path: Path) -> None:
+    summary = tmp_path / "transfer.summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "unresolved": [
+                    {
+                        "symbol": "8926",
+                        "error": "TransferAdjustmentError: Yahoo source metadata is not coverage-eligible for 8926",
+                    },
+                    {
+                        "symbol": "4526",
+                        "error": "TransferAdjustmentError: Yahoo source metadata is not coverage-eligible for 4526",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _daily_yahoo_refresh_symbols(summary) == ["4526", "8926"]
+
+
+def test_daily_yahoo_refresh_symbols_rejects_non_yahoo_failures(tmp_path: Path) -> None:
+    summary = tmp_path / "transfer.summary.json"
+    summary.write_text(
+        json.dumps({"unresolved": [{"symbol": "2330", "error": "bad official row"}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="non-Yahoo failure"):
+        _daily_yahoo_refresh_symbols(summary)
+
+
+def test_default_tw_end_date_uses_last_completed_session() -> None:
+    before_open = datetime.fromisoformat("2026-07-15T01:00:00+08:00")
+    after_close = datetime.fromisoformat("2026-07-15T14:00:00+08:00")
+    after_data_ready = datetime.fromisoformat("2026-07-15T18:01:00+08:00")
+    monday_before_open = datetime.fromisoformat("2026-07-13T10:00:00+08:00")
+    assert _default_tw_end_date(before_open) == "2026-07-14"
+    assert _default_tw_end_date(after_close) == "2026-07-15"
+    assert _default_tw_end_date(after_data_ready) == "2026-07-15"
+    assert _default_tw_end_date(monday_before_open) == "2026-07-10"
+
+
+def test_retained_daily_yahoo_symbols_keeps_archive_and_missing_adjustments(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "fallback.parquet"
+    stock_root = tmp_path / "stocks"
+    stock_root.mkdir()
+    pl.DataFrame({"symbol": ["4526", "8926"]}).write_parquet(archive)
+    (stock_root / "official_symbol_build_summary.json").write_text(
+        json.dumps({"missing_adjustment_rows": 1}),
+        encoding="utf-8",
+    )
+    pl.DataFrame({"adjclose": [10.0, float("nan")]}).write_parquet(
+        stock_root / "3303_features.parquet"
+    )
+
+    assert _retained_daily_yahoo_symbols(
+        archive_path=archive,
+        stock_root=stock_root,
+    ) == ["3303", "4526", "8926"]
 
 
 def _panel(dates: list[str]) -> PanelData:
