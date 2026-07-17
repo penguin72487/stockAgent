@@ -40,14 +40,27 @@ def main() -> None:
     device = torch.device(args.device)
     panel = build_panel(
         config.data.parquet_root,
-        use_rapids=config.data.use_rapids,
         benchmark_name=config.data.benchmark_name,
         usd_only_trading_pairs=config.data.usd_only_trading_pairs,
         tradable_mode=config.data.tradable_mode,
         trading_volume_policy=config.data.trading_volume_policy,
+        security_filter=config.data.security_filter,
         strict_no_fallback=config.training.strict_no_fallback,
         panel_backend=config.data.panel_backend,
         panel_load_workers=config.data.panel_load_workers,
+        external_feature_path=(
+            config.data.tw_public_feature_path
+            if config.data.use_tw_public_features or config.data.use_tw_public_rules
+            else None
+        ),
+        external_market_symbol=config.data.tw_public_market_symbol,
+        external_include_features=config.data.use_tw_public_features,
+        external_include_rules=config.data.use_tw_public_rules,
+        external_data_required=config.data.use_tw_public_features or config.data.use_tw_public_rules,
+        feature_include=config.data.feature_include,
+        feature_exclude=config.data.feature_exclude,
+        feature_zero_fill=config.data.feature_zero_fill,
+        panel_start_date=config.data.panel_start_date,
     )
     folds = build_expanding_year_folds(
         dates=panel.dates,

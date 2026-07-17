@@ -108,7 +108,6 @@ def test_portfolio_autoencoder_loss_backward() -> None:
         long_only=False,
         objective="portfolio_autoencoder",
         aux_outputs=aux,
-        autoencoder_cost_rate=0.001425,
         autoencoder_lambda_turnover=0.1,
         autoencoder_lambda_concentration=0.01,
         autoencoder_lambda_latent=0.001,
@@ -129,6 +128,6 @@ if __name__ == "__main__":
     print(f"Device: {_device()}")
     test_long_only_forward_shape_mask_and_normalization()
     test_long_short_forward_shape_mask_and_normalization()
-    test_tcn_temporal_option_and_empty_mask_row()
+    test_tcn_temporal_option_rejects_empty_mask_row()
     test_portfolio_autoencoder_loss_backward()
     print("SUCCESS")

@@ -79,15 +79,15 @@ row_indices -> valid date indices -> window date indices -> features[window_idx]
 
 ```text
 parquet per symbol
--> load by pandas/polars/cuDF path
+-> load by Polars/PyArrow path
 -> feature normalization and tradable masks
 -> concat/pivot to PanelData
 -> panel_cache_v2 memmap
 ```
 
-目前 `panel_backend=auto` 會優先使用 cuDF when `use_rapids=true`，
-否則使用 polars/pandas。注意 cuDF path 最後仍會轉成 pandas frame
-去建 `PanelData`，所以它是 build-time 加速，不代表訓練 tensor 永遠留在 GPU。
+目前 `panel_backend=auto` 會優先使用 Polars Lazy，必要時回到 PyArrow。
+需要和 PyArrow build 做嚴格 feature parity 比較時，明確設定 `panel_backend=pyarrow`。
+`PanelData` 建構仍會轉成訓練用 tensor；build-time backend 不代表訓練 tensor 永遠留在 GPU。
 
 ### Walk-forward
 
@@ -112,7 +112,10 @@ WindowedSplitTensors.batch_by_rows
 
 重點:
 
-- `materialize_window_tensors: false` 應該是長 lookback 預設。
+- Neural executor 固定從 lazy `WindowedSplitTensors` 開始；舊的
+  `materialize_window_tensors` 選項與整個 split 的 materialized executor 已移除。
+- 連續 batch 優先走 compile-friendly panel slab；無法滿足 slab 合約時才在該
+  batch 做 guarded window gather，不會常駐 `[rows, lookback, symbols, features]`。
 - `cache_train_tensors_on_gpu` / `cache_eval_tensors_on_gpu` 只 cache base tensors，
   不 cache 展開 windows。
 - portfolio state 跨 batch/chunk 用 detached GPU clone，不搬 CPU。
@@ -145,16 +148,24 @@ feature projection
 -> temporal attention per stock
 -> attention_mode-specific cross-asset mixing
 -> score head
--> tanh/softmax-like portfolio normalization path
+-> configured bounded activation + L1 portfolio normalization path
 ```
 
 ### attention_mode
 
 - `full`: `O((L*S)^2)`，最完整，只適合小 universe 或 debug。
 - `axial`: `O(S*L^2 + L*S^2)`，時間和股票分解。
-- `latent`: `O(S*L^2 + S*K + K*M + S*(K+M))`，大型 universe 預設友善。
+- `latent`: `O(S*L^2 + S*K + K*M + S*(K+M))`，latent factors 加
+  market tokens 的歷史 preset。
+- `latent_only`: `O(S*L^2 + S*K)`，只保留 latent-factor bottleneck。
 - `market_token`: `O(S*L^2 + S*M)`，更小的 cross-stock bottleneck。
 - `temporal_only`: 只看個股時間序列，不做 cross-stock mixing。
+
+`use_latent_factors` 與 `use_market_tokens` 可獨立覆寫 compact preset；設為
+`null` 時沿用 `attention_mode` 的歷史語意。在 compact attention modes 中，
+兩者分別為 `true/false` 即 factor-only，`false/true` 即 market-only，皆為
+`false` 即 temporal-only。`full`/`axial` 不可同時啟用這兩個 compact
+bottleneck；兩者皆關閉時仍保留原本的 full/axial 路徑。
 
 目前 modern transformer 元件:
 
@@ -164,7 +175,7 @@ feature projection
 - QK-Norm
 - temporal RoPE
 - PyTorch SDPA/FlashAttention path
-- dynamic latent/market token generator
+- learned static latent/market query anchors
 
 2026-06-09 熱路徑更新:
 
@@ -327,8 +338,6 @@ UMAP candidates:
 - `market_tokens`
 - `dynamic_latent_queries`
 - `dynamic_market_queries`
-- `dynamic_latent_delta`
-- `dynamic_market_delta`
 - `z_factor_context`
 - `z_market_context`
 - `token_embedding`
@@ -347,15 +356,16 @@ UMAP 解讀:
 
 ```yaml
 training:
-  materialize_window_tensors: false
   model_name: transformer_base_portfolio
   lookback: 32
   plot_backend: auto
   explain_umap_enabled: true
   transformer_base_portfolio:
-    attention_mode: latent   # or market_token for tighter VRAM
+    attention_mode: market_token
+    use_latent_factors: false
+    use_market_tokens: true
     use_flash_attention: true
-    sdpa_batch_limit: 4096
+    sdpa_batch_limit: 16384
     return_aux_details: false
 ```
 

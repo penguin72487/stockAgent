@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import sys
@@ -12,6 +13,11 @@ from typing import Callable
 import numpy as np
 import torch
 
+from stockagent.models.normalization import (
+    DEFAULT_PORTFOLIO_ACTIVATION,
+    apply_portfolio_activation,
+    normalize_portfolio_activation,
+)
 from stockagent.runtime_env import normalize_cuda_env
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
@@ -20,15 +26,10 @@ try:
 except Exception:  # pragma: no cover - Numba is an acceleration dependency
     _panel_numba = None
 
-from stockagent.backtest.cpp_long_short import (
-    cpp_long_short_enabled,
-    run_long_short_cpp_autograd,
-)
-
-
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
+CANONICAL_BACKTEST_CONTRACT_VERSION = 2
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -42,19 +43,12 @@ _SCAN_COMPILED_CACHE: dict[
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
+            torch.Tensor,
         ],
-    ],
-] = {}
-_REDUCED_COMPILED_CACHE: dict[
-    tuple,
-    Callable[
-        ...,
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ],
 ] = {}
 _PREP_COMPILED_CACHE: dict[tuple, Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
 _SCAN_COMPILE_FAILED: set[tuple] = set()
-_REDUCED_COMPILE_FAILED: set[tuple] = set()
 _PREP_COMPILE_FAILED: set[tuple] = set()
 _SCAN_COMPILE_STATS: dict[str, int] = {
     "hits": 0,
@@ -76,10 +70,6 @@ _BACKTEST_RUNTIME_STATS: dict[str, float] = {
     "prep_cuda_s": 0.0,
     "prev_init_s": 0.0,
     "prev_init_cuda_s": 0.0,
-    "dense_fast_path_s": 0.0,
-    "dense_fast_path_cuda_s": 0.0,
-    "cpp_ext_s": 0.0,
-    "cpp_ext_cuda_s": 0.0,
     "runner_resolve_s": 0.0,
     "runner_call_s": 0.0,
     "runner_call_cuda_s": 0.0,
@@ -88,9 +78,6 @@ _BACKTEST_RUNTIME_STATS: dict[str, float] = {
     "checkpoint_cuda_s": 0.0,
     "finalize_s": 0.0,
     "finalize_cuda_s": 0.0,
-    "dense_fast_path_calls": 0.0,
-    "cpp_ext_calls": 0.0,
-    "cpp_ext_failures": 0.0,
     "checkpoint_calls": 0.0,
     "compiled_prep_calls": 0.0,
     "eager_prep_calls": 0.0,
@@ -103,10 +90,6 @@ _BACKTEST_RUNTIME_STATS: dict[str, float] = {
     "nonstateful_eager_runner_calls": 0.0,
     "runtime_fallback_calls": 0.0,
     "return_weights_history_calls": 0.0,
-    "reduced_calls": 0.0,
-    "compiled_reduced_runner_calls": 0.0,
-    "eager_reduced_runner_calls": 0.0,
-    "reduced_runtime_fallback_calls": 0.0,
 }
 _BACKTEST_PENDING_CUDA_EVENTS: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
@@ -156,8 +139,157 @@ def _trunc_to_int64(values: np.ndarray | float) -> np.ndarray:
 
 
 def _resolve_exposure_budget(gross_leverage: float) -> float:
-    """Return the effective absolute exposure budget in [0, 1]."""
-    return min(1.0, max(0.0, float(gross_leverage)))
+    """Return the canonical unlevered absolute exposure budget in [0, 1]."""
+    value = float(gross_leverage)
+    if not math.isfinite(value):
+        return 0.0
+    return min(1.0, max(0.0, value))
+
+
+_MIN_PORTFOLIO_SIMPLE_RETURN = -0.999999
+_MIN_PORTFOLIO_WEALTH_FACTOR = 1.0 + _MIN_PORTFOLIO_SIMPLE_RETURN
+
+
+def _asset_log_returns_to_simple_numpy(asset_log_returns: np.ndarray) -> np.ndarray:
+    clean = np.nan_to_num(
+        np.asarray(asset_log_returns, dtype=np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    return np.expm1(clean).astype(np.float32, copy=False)
+
+
+def _portfolio_simple_returns_to_log_numpy(simple_returns: np.ndarray) -> np.ndarray:
+    clean = np.nan_to_num(
+        np.asarray(simple_returns, dtype=np.float32),
+        nan=0.0,
+        posinf=np.finfo(np.float32).max,
+        neginf=_MIN_PORTFOLIO_SIMPLE_RETURN,
+    )
+    clipped = np.clip(clean, _MIN_PORTFOLIO_SIMPLE_RETURN, None)
+    return np.log1p(clipped).astype(np.float32, copy=False)
+
+
+def _asset_log_returns_to_simple_torch(
+    asset_log_returns: torch.Tensor,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    clean = torch.nan_to_num(
+        asset_log_returns.to(
+            device=device if device is not None else asset_log_returns.device,
+            dtype=dtype if dtype is not None else asset_log_returns.dtype,
+        ),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    return torch.expm1(clean)
+
+
+def _portfolio_simple_returns_to_log_torch(simple_returns: torch.Tensor) -> torch.Tensor:
+    floor = torch.as_tensor(_MIN_PORTFOLIO_SIMPLE_RETURN, device=simple_returns.device, dtype=simple_returns.dtype)
+    clean = torch.nan_to_num(
+        simple_returns,
+        nan=0.0,
+        posinf=torch.finfo(simple_returns.dtype).max,
+        neginf=_MIN_PORTFOLIO_SIMPLE_RETURN,
+    )
+    return torch.log1p(clean.clamp_min(floor))
+
+
+def _drift_weights_after_return_numpy(
+    executed_weights: np.ndarray,
+    asset_simple_returns: np.ndarray,
+    strategy_net_simple_return: float | np.floating,
+) -> tuple[np.ndarray, bool]:
+    """Mark executed holdings to the next period's net-equity denominator.
+
+    Fees are paid from cash/equity, so they reduce the denominator while the
+    asset notionals remain ``w * (1 + r)``.  A non-finite or bankrupt wealth
+    factor has no meaningful normalized holdings state; reset it to all cash
+    (zero risky weights) rather than propagating infinities into later rows.
+    """
+    wealth_factor = 1.0 + float(strategy_net_simple_return)
+    if (
+        not math.isfinite(wealth_factor)
+        or wealth_factor <= _MIN_PORTFOLIO_WEALTH_FACTOR
+    ):
+        return np.zeros_like(executed_weights, dtype=np.float32), False
+    drifted = (
+        np.asarray(executed_weights, dtype=np.float32)
+        * (np.float32(1.0) + np.asarray(asset_simple_returns, dtype=np.float32))
+        / np.float32(wealth_factor)
+    )
+    drifted = np.nan_to_num(
+        drifted,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32, copy=False)
+    return drifted, bool(np.isfinite(drifted).all())
+
+
+def _drift_weights_after_return_torch(
+    executed_weights: torch.Tensor,
+    asset_simple_returns: torch.Tensor,
+    strategy_net_simple_return: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch counterpart of :func:`_drift_weights_after_return_numpy`."""
+    wealth_factor = strategy_net_simple_return + 1.0
+    valid = torch.isfinite(wealth_factor) & (
+        wealth_factor > float(_MIN_PORTFOLIO_WEALTH_FACTOR)
+    )
+    safe_denominator = torch.where(
+        valid,
+        wealth_factor,
+        torch.ones_like(wealth_factor),
+    )
+    drifted = executed_weights * (1.0 + asset_simple_returns) / safe_denominator
+    drifted = torch.nan_to_num(drifted, nan=0.0, posinf=0.0, neginf=0.0)
+    drifted = torch.where(valid, drifted, torch.zeros_like(drifted))
+    survived = valid & torch.isfinite(drifted).all()
+    return drifted, survived
+
+
+def _erf_numpy(values: np.ndarray) -> np.ndarray:
+    try:
+        from scipy import special as scipy_special  # type: ignore
+
+        return scipy_special.erf(values)
+    except Exception:
+        return np.vectorize(math.erf, otypes=[values.dtype])(values)
+
+
+def _apply_portfolio_activation_numpy(
+    values: np.ndarray,
+    dtype: np.dtype = np.dtype(np.float32),
+    activation: str | None = None,
+) -> np.ndarray:
+    activation_name = normalize_portfolio_activation(activation)
+    out = values.astype(dtype, copy=False)
+    if activation_name in {"identity", "pre_normalized"}:
+        return np.where(np.isfinite(out), out, dtype.type(0.0)).astype(dtype, copy=False)
+    out = np.nan_to_num(out, nan=0.0, posinf=20.0, neginf=-20.0)
+    out = np.clip(out, dtype.type(-20.0), dtype.type(20.0))
+    if activation_name == "tanh":
+        return np.tanh(out).astype(dtype, copy=False)
+    if activation_name == "softsign":
+        return out / (dtype.type(1.0) + np.abs(out))
+    if activation_name == "isru":
+        return out / np.sqrt(dtype.type(1.0) + np.square(out))
+    if activation_name == "erf":
+        return _erf_numpy(out * dtype.type(math.sqrt(math.pi) / 2.0)).astype(dtype, copy=False)
+    if activation_name == "atan":
+        return (dtype.type(2.0 / math.pi) * np.arctan(out * dtype.type(math.pi / 2.0))).astype(dtype, copy=False)
+    if activation_name == "gudermannian":
+        return (
+            dtype.type(2.0 / math.pi)
+            * np.arctan(np.sinh(out * dtype.type(math.pi / 2.0)))
+        ).astype(dtype, copy=False)
+    raise AssertionError(f"Unhandled portfolio activation: {activation_name}")
 
 
 def _normalize_target_weights_numpy(
@@ -165,11 +297,19 @@ def _normalize_target_weights_numpy(
     *,
     long_only: bool,
     gross_budget: float,
+    portfolio_activation: str | None = None,
 ) -> np.ndarray:
-    """Normalize target weights via tanh + L1 and apply gross budget."""
-    out = np.tanh(np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False))
+    """Normalize target weights via bounded activation + L1 and apply gross budget."""
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    out = _apply_portfolio_activation_numpy(weights, np.dtype(np.float32), activation_name)
     if long_only:
         out = np.clip(out, 0.0, None)
+    if activation_name == "pre_normalized":
+        l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
+        gross = np.float32(gross_budget)
+        scale = np.ones_like(l1, dtype=np.float32)
+        np.divide(gross, np.clip(l1, 1e-12, None), out=scale, where=l1 > gross)
+        return (out * scale).astype(np.float32, copy=False)
     l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
     out = out / np.clip(l1, 1e-12, None)
     out *= np.float32(gross_budget)
@@ -181,12 +321,19 @@ def _normalize_target_weights_row_numpy(
     *,
     long_only: bool,
     gross_budget: float,
+    portfolio_activation: str | None = None,
 ) -> np.ndarray:
-    """Single-row variant of tanh + L1 normalization for integer-share path."""
-    row = np.tanh(np.nan_to_num(weights_row, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64, copy=False))
+    """Single-row variant of bounded activation + L1 normalization for integer-share path."""
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    row = _apply_portfolio_activation_numpy(weights_row, np.dtype(np.float64), activation_name)
     if long_only:
         row = np.clip(row, 0.0, None)
     l1 = float(np.abs(row).sum(dtype=np.float64))
+    if activation_name == "pre_normalized":
+        gross = float(gross_budget)
+        if l1 > gross and l1 > 1e-12:
+            row = row * (gross / l1)
+        return row
     if l1 > 1e-12:
         row = row / l1
     else:
@@ -200,16 +347,65 @@ def _normalize_target_weights_torch(
     *,
     long_only: bool,
     gross_budget: float,
+    portfolio_activation: str | None = None,
 ) -> torch.Tensor:
-    """Torch normalization via tanh + L1 and gross budget scaling."""
-    out = torch.tanh(weights)
+    """Torch normalization via bounded activation + L1 and gross budget scaling."""
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    out = apply_portfolio_activation(weights, activation_name)
     if long_only:
         out = out.clamp_min(0.0)
+    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
+    if activation_name == "pre_normalized":
+        l1 = out.abs().sum(dim=1, keepdim=True)
+        scale = torch.where(l1 > leverage, leverage / l1.clamp_min(1e-12), torch.ones_like(l1))
+        return out * scale
     l1 = out.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
     out = out / l1
-    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
     out = out * leverage
     return out
+
+
+def _apply_min_trade_weight_numpy(weights: np.ndarray, min_trade_weight: float) -> np.ndarray:
+    threshold = float(min_trade_weight)
+    if threshold <= 0.0:
+        return weights
+    gross_before = np.abs(weights).sum(axis=1, keepdims=True).astype(np.float32)
+    out = np.where(np.abs(weights) >= np.float32(threshold), weights, np.float32(0.0)).astype(np.float32, copy=False)
+    gross_after = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
+    scale = np.divide(
+        gross_before,
+        np.clip(gross_after, 1e-12, None),
+        out=np.zeros_like(gross_before, dtype=np.float32),
+        where=gross_after > 1e-12,
+    )
+    return (out * scale).astype(np.float32, copy=False)
+
+
+def _apply_min_trade_weight_row_numpy(weights_row: np.ndarray, min_trade_weight: float) -> np.ndarray:
+    threshold = float(min_trade_weight)
+    if threshold <= 0.0:
+        return weights_row
+    gross_before = float(np.abs(weights_row).sum(dtype=np.float64))
+    out = np.where(np.abs(weights_row) >= threshold, weights_row, 0.0).astype(weights_row.dtype, copy=False)
+    gross_after = float(np.abs(out).sum(dtype=np.float64))
+    if gross_before <= 1e-12 or gross_after <= 1e-12:
+        return out
+    return (out * (gross_before / gross_after)).astype(weights_row.dtype, copy=False)
+
+
+def _apply_min_trade_weight_torch(weights: torch.Tensor, min_trade_weight: float) -> torch.Tensor:
+    threshold = float(min_trade_weight)
+    if threshold <= 0.0:
+        return weights
+    gross_before = weights.abs().sum(dim=1, keepdim=True)
+    out = torch.where(weights.abs() >= threshold, weights, torch.zeros_like(weights))
+    gross_after = out.abs().sum(dim=1, keepdim=True)
+    scale = torch.where(
+        gross_after > 1e-12,
+        gross_before / gross_after.clamp_min(1e-12),
+        torch.zeros_like(gross_after),
+    )
+    return out * scale
 
 
 def _apply_turnover_cap_numpy(
@@ -229,6 +425,57 @@ def _apply_turnover_cap_numpy(
     return (prev_weights + deltas * scale).astype(np.float32)
 
 
+def _apply_gross_exposure_cap_numpy(
+    prev_weights: np.ndarray,
+    proposed_weights: np.ndarray,
+    gross_budget: float,
+) -> np.ndarray:
+    """Cap new exposure without manufacturing trades in frozen positions.
+
+    ``proposed_weights`` has already passed the side, volume, and turnover
+    constraints. Scaling the whole portfolio here would alter positions whose
+    delta was deliberately set to zero by those constraints. Instead, execute
+    every exposure-reducing part of the proposed rebalance, then scale only the
+    exposure-increasing remainder into the available gross budget.
+    """
+    prev = np.asarray(prev_weights, dtype=np.float32)
+    proposed = np.asarray(proposed_weights, dtype=np.float32)
+    same_direction = (prev * proposed) > np.float32(0.0)
+    reduced_base = np.where(
+        same_direction,
+        np.sign(prev) * np.minimum(np.abs(prev), np.abs(proposed)),
+        np.float32(0.0),
+    ).astype(np.float32, copy=False)
+    additions = (proposed - reduced_base).astype(np.float32, copy=False)
+    base_gross = float(np.abs(reduced_base).sum(dtype=np.float32))
+    addition_gross = float(np.abs(additions).sum(dtype=np.float32))
+    available = max(0.0, float(gross_budget) - base_gross)
+    scale = min(1.0, available / max(addition_gross, 1e-12))
+    return (reduced_base + additions * np.float32(scale)).astype(np.float32, copy=False)
+
+
+def _apply_gross_exposure_cap_torch(
+    prev_weights: torch.Tensor,
+    proposed_weights: torch.Tensor,
+    gross_budget: torch.Tensor,
+) -> torch.Tensor:
+    """Torch counterpart of :func:`_apply_gross_exposure_cap_numpy`."""
+    same_direction = (prev_weights * proposed_weights) > 0.0
+    reduced_base = torch.where(
+        same_direction,
+        torch.sign(prev_weights) * torch.minimum(prev_weights.abs(), proposed_weights.abs()),
+        torch.zeros_like(prev_weights),
+    )
+    additions = proposed_weights - reduced_base
+    available = (gross_budget - reduced_base.abs().sum()).clamp_min(0.0)
+    addition_gross = additions.abs().sum()
+    scale = torch.minimum(
+        torch.ones_like(addition_gross),
+        available / addition_gross.clamp_min(1e-12),
+    )
+    return reduced_base + additions * scale
+
+
 def _apply_turnover_cap_torch(
     prev_weights: torch.Tensor,
     target_weights: torch.Tensor,
@@ -244,25 +491,6 @@ def _apply_turnover_cap_torch(
     scale = torch.where(turnovers > cap, cap / turnovers.clamp_min(1e-12), scale)
     scale = scale.clamp_(0.0, 1.0)
     return prev_weights + deltas * scale
-
-
-def can_use_dense_fast_path(
-    tradable: torch.Tensor,
-    can_buy: torch.Tensor,
-    can_sell: torch.Tensor,
-    effective_max_turnover_ratio: float,
-) -> bool:
-    """Return true only when the recurrent trading state cannot change semantics."""
-    if float(effective_max_turnover_ratio) > 0.0:
-        return False
-    try:
-        return bool(
-            torch.all(tradable.to(dtype=torch.bool)).detach().cpu().item()
-            and torch.all(can_buy.to(dtype=torch.bool)).detach().cpu().item()
-            and torch.all(can_sell.to(dtype=torch.bool)).detach().cpu().item()
-        )
-    except Exception:
-        return False
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
@@ -399,10 +627,6 @@ def _compile_dynamic_enabled() -> bool:
 
 def _compile_prep_enabled() -> bool:
     return _env_flag("STOCKAGENT_BACKTEST_COMPILE_PREP", "1")
-
-
-def _compile_reduced_enabled() -> bool:
-    return _env_flag("STOCKAGENT_BACKTEST_COMPILE_REDUCED", "0")
 
 
 def _compile_verbose() -> bool:
@@ -543,6 +767,8 @@ def _scan_compile_key(
     long_only: bool,
     max_turnover_ratio: float,
     gross_budget: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     scan_chunk_size: int,
     record_weights_history: bool,
     stateful_initial: bool = False,
@@ -554,6 +780,8 @@ def _scan_compile_key(
         bool(long_only),
         float(max_turnover_ratio),
         float(gross_budget),
+        float(buy_fee_rate),
+        float(sell_fee_rate),
         int(scan_chunk_size),
         bool(record_weights_history),
         bool(stateful_initial),
@@ -566,6 +794,8 @@ def _scan_runner_factory(
     long_only: bool,
     max_turnover_ratio: float,
     gross_budget: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     scan_chunk_size: int,
     record_weights_history: bool,
 ):
@@ -576,7 +806,12 @@ def _scan_runner_factory(
         can_buy_mask: torch.Tensor | None,
         can_sell_mask: torch.Tensor | None,
         prev_init: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        alive_init: torch.Tensor,
+        can_short_open_mask: torch.Tensor,
+        force_short_cover_mask: torch.Tensor,
+        force_exit_mask: torch.Tensor,
+        volume_limit_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if long_only:
             return _vectorized_backtest_torch_scan_long_only(
                 weights,
@@ -584,8 +819,14 @@ def _scan_runner_factory(
                 tradable_mask,
                 can_buy_mask,
                 can_sell_mask,
+                force_exit_mask=force_exit_mask,
                 prev_init=prev_init,
+                alive_init=alive_init,
                 max_turnover_ratio=max_turnover_ratio,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
+                volume_limit_weights=volume_limit_weights,
+                gross_budget=gross_budget,
                 scan_chunk_size=scan_chunk_size,
                 record_weights_history=record_weights_history,
             )
@@ -595,8 +836,15 @@ def _scan_runner_factory(
             tradable_mask,
             can_buy_mask,
             can_sell_mask,
+            can_short_open_mask=can_short_open_mask,
+            force_short_cover_mask=force_short_cover_mask,
+            force_exit_mask=force_exit_mask,
             prev_init=prev_init,
+            alive_init=alive_init,
             max_turnover_ratio=max_turnover_ratio,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
+            volume_limit_weights=volume_limit_weights,
             gross_budget=gross_budget,
             scan_chunk_size=scan_chunk_size,
             record_weights_history=record_weights_history,
@@ -605,154 +853,18 @@ def _scan_runner_factory(
     return _runner
 
 
-def _reduced_scan_compile_key(
-    weights: torch.Tensor,
-    long_only: bool,
-    max_turnover_ratio: float,
-    gross_budget: float,
-    scan_chunk_size: int,
-    stateful_initial: bool = False,
-) -> tuple:
-    return (
-        str(weights.device),
-        int(weights.size(1)),
-        str(weights.dtype),
-        bool(long_only),
-        float(max_turnover_ratio),
-        float(gross_budget),
-        int(scan_chunk_size),
-        bool(stateful_initial),
-        bool(_compile_dynamic_enabled()),
-        "log_utility",
-    )
-
-
-def _reduced_scan_runner_factory(
-    *,
-    long_only: bool,
-    max_turnover_ratio: float,
-    gross_budget: float,
-    scan_chunk_size: int,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
-):
-    def _runner(
-        weights: torch.Tensor,
-        future_returns: torch.Tensor,
-        tradable_mask: torch.Tensor,
-        can_buy_mask: torch.Tensor | None,
-        can_sell_mask: torch.Tensor | None,
-        sample_mask: torch.Tensor | None,
-        prev_init: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return _vectorized_backtest_torch_scan_log_utility_reduced(
-            weights,
-            future_returns,
-            tradable_mask,
-            can_buy_mask,
-            can_sell_mask,
-            sample_mask,
-            prev_init,
-            buy_fee_rate=buy_fee_rate,
-            sell_fee_rate=sell_fee_rate,
-            long_only=long_only,
-            max_turnover_ratio=max_turnover_ratio,
-            gross_budget=gross_budget,
-            scan_chunk_size=scan_chunk_size,
-        )
-
-    return _runner
-
-
-def _resolve_reduced_scan_runner(
-    weights: torch.Tensor,
-    *,
-    long_only: bool,
-    max_turnover_ratio: float,
-    gross_budget: float,
-    scan_chunk_size: int,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
-    stateful_initial: bool = False,
-):
-    base_runner = _reduced_scan_runner_factory(
-        long_only=long_only,
-        max_turnover_ratio=max_turnover_ratio,
-        gross_budget=gross_budget,
-        scan_chunk_size=scan_chunk_size,
-        buy_fee_rate=buy_fee_rate,
-        sell_fee_rate=sell_fee_rate,
-    )
-    if _torch_dynamo_is_compiling():
-        return base_runner
-    if (
-        not _compile_reduced_enabled()
-        or not _compile_enabled()
-        or weights.device.type != "cuda"
-        or not hasattr(torch, "compile")
-    ):
-        _add_backtest_runtime_stat("eager_reduced_runner_calls")
-        return base_runner
-
-    key = _reduced_scan_compile_key(
-        weights,
-        long_only,
-        max_turnover_ratio,
-        gross_budget,
-        scan_chunk_size,
-        stateful_initial,
-    )
-    if key in _REDUCED_COMPILE_FAILED:
-        if _strict_no_fallback_enabled():
-            raise RuntimeError(
-                "Reduced backtest runner compile was previously marked failed for this shape; "
-                "strict_no_fallback=true so eager reduced-runner fallback is disabled."
-            )
-        _add_backtest_runtime_stat("eager_reduced_runner_calls")
-        return base_runner
-    cached = _REDUCED_COMPILED_CACHE.get(key)
-    if cached is not None:
-        _add_backtest_runtime_stat("compiled_reduced_runner_calls")
-        return cached
-
-    try:
-        _mark_static_shape(weights, [1])
-        _configure_inductor_cudagraphs()
-        compile_dynamic = _compile_dynamic_enabled()
-        compiled = torch.compile(
-            base_runner,
-            dynamic=compile_dynamic,
-            options={"triton.cudagraphs": False},
-        )
-        _REDUCED_COMPILED_CACHE[key] = compiled
-        _add_backtest_runtime_stat("compiled_reduced_runner_calls")
-        return compiled
-    except Exception as exc:
-        if _strict_no_fallback_enabled():
-            raise RuntimeError(
-                "Reduced backtest runner torch.compile failed; "
-                "strict_no_fallback=true so eager reduced-runner fallback is disabled."
-            ) from exc
-        _REDUCED_COMPILE_FAILED.add(key)
-        _add_backtest_runtime_stat("eager_reduced_runner_calls")
-        if _compile_verbose():
-            print(
-                "[backtest reduced compile] compile failed, falling back to eager for "
-                f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}, "
-                f"long_only={long_only}, scan_chunk={scan_chunk_size}, stateful={stateful_initial}, dynamic={compile_dynamic})"
-            )
-        return base_runner
-
-
 def _autotune_scan_chunk_size(
     weights: torch.Tensor,
     future_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    volume_limit_weights: torch.Tensor,
     long_only: bool,
     max_turnover_ratio: float,
     gross_budget: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
 ) -> int:
     key = _scan_chunk_key(weights, long_only, max_turnover_ratio)
     cached = _SCAN_CHUNK_CACHE.get(key)
@@ -769,7 +881,12 @@ def _autotune_scan_chunk_size(
     t_probe = tradable_mask[:probe_rows]
     buy_probe = can_buy_mask[:probe_rows] if can_buy_mask is not None else None
     sell_probe = can_sell_mask[:probe_rows] if can_sell_mask is not None else None
+    volume_probe = volume_limit_weights[:probe_rows]
     prev_probe = torch.zeros_like(w_probe[0])
+    alive_probe = torch.ones((), device=w_probe.device, dtype=torch.bool)
+    short_probe = sell_probe if sell_probe is not None else t_probe
+    force_probe = torch.zeros_like(t_probe, dtype=torch.bool)
+    exit_probe = torch.zeros_like(t_probe, dtype=torch.bool)
 
     candidates = [c for c in SCAN_CHUNK_CANDIDATES if c <= probe_rows]
     if not candidates:
@@ -780,15 +897,41 @@ def _autotune_scan_chunk_size(
             long_only=long_only,
             max_turnover_ratio=max_turnover_ratio,
             gross_budget=gross_budget,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
             scan_chunk_size=chunk_size,
             record_weights_history=True,
         )
         with torch.inference_mode():
-            _ = runner(w_probe, r_probe, t_probe, buy_probe, sell_probe, prev_probe)
+            _ = runner(
+                w_probe,
+                r_probe,
+                t_probe,
+                buy_probe,
+                sell_probe,
+                prev_probe,
+                alive_probe,
+                short_probe,
+                force_probe,
+                exit_probe,
+                volume_probe,
+            )
             if weights.device.type == "cuda":
                 torch.cuda.synchronize(weights.device)
             start = time.perf_counter()
-            _ = runner(w_probe, r_probe, t_probe, buy_probe, sell_probe, prev_probe)
+            _ = runner(
+                w_probe,
+                r_probe,
+                t_probe,
+                buy_probe,
+                sell_probe,
+                prev_probe,
+                alive_probe,
+                short_probe,
+                force_probe,
+                exit_probe,
+                volume_probe,
+            )
             if weights.device.type == "cuda":
                 torch.cuda.synchronize(weights.device)
             return time.perf_counter() - start
@@ -822,6 +965,8 @@ def _resolve_scan_runner(
     long_only: bool,
     max_turnover_ratio: float,
     gross_budget: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     scan_chunk_size: int,
     record_weights_history: bool,
     stateful_initial: bool = False,
@@ -830,6 +975,8 @@ def _resolve_scan_runner(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_budget=gross_budget,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
         scan_chunk_size=scan_chunk_size,
         record_weights_history=record_weights_history,
     )
@@ -852,6 +999,8 @@ def _resolve_scan_runner(
         long_only,
         max_turnover_ratio,
         gross_budget,
+        buy_fee_rate,
+        sell_fee_rate,
         scan_chunk_size,
         record_weights_history,
         stateful_initial,
@@ -894,11 +1043,17 @@ def _resolve_scan_runner(
         if stateful_initial:
             compiled = torch.compile(
                 base_runner,
+                fullgraph=True,
                 dynamic=compile_dynamic,
                 options={"triton.cudagraphs": False},
             )
         else:
-            compiled = torch.compile(base_runner, mode="reduce-overhead", dynamic=compile_dynamic)
+            compiled = torch.compile(
+                base_runner,
+                mode="reduce-overhead",
+                fullgraph=True,
+                dynamic=compile_dynamic,
+            )
         _SCAN_COMPILED_CACHE[key] = compiled
         return compiled
     except Exception as exc:
@@ -923,6 +1078,8 @@ def _fallback_scan_runner_after_runtime_failure(
     long_only: bool,
     max_turnover_ratio: float,
     gross_budget: float,
+    buy_fee_rate: float,
+    sell_fee_rate: float,
     scan_chunk_size: int,
     record_weights_history: bool,
     stateful_initial: bool = False,
@@ -932,6 +1089,8 @@ def _fallback_scan_runner_after_runtime_failure(
         long_only,
         max_turnover_ratio,
         gross_budget,
+        buy_fee_rate,
+        sell_fee_rate,
         scan_chunk_size,
         record_weights_history,
         stateful_initial,
@@ -955,6 +1114,8 @@ def _fallback_scan_runner_after_runtime_failure(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_budget=gross_budget,
+        buy_fee_rate=buy_fee_rate,
+        sell_fee_rate=sell_fee_rate,
         scan_chunk_size=scan_chunk_size,
         record_weights_history=record_weights_history,
     )
@@ -964,8 +1125,8 @@ def _fallback_scan_runner_after_runtime_failure(
 class BacktestResult:
     """Container for a single backtest simulation run."""
 
-    strategy_returns: np.ndarray   # [T] net daily returns after costs
-    benchmark_returns: np.ndarray  # [T] universe-average daily returns
+    strategy_returns: np.ndarray   # [T] net portfolio log returns after costs
+    benchmark_returns: np.ndarray  # [T] benchmark log returns
     turnovers: np.ndarray          # [T] total absolute weight change per day
     weights_history: np.ndarray    # [T, S] realised portfolio weights
 
@@ -974,106 +1135,30 @@ class BacktestResult:
 class BacktestResultTensor:
     """Torch tensor container for a single backtest simulation run."""
 
-    strategy_returns: torch.Tensor   # [T]
-    benchmark_returns: torch.Tensor  # [T]
+    strategy_returns: torch.Tensor   # [T] net portfolio log returns after costs
+    benchmark_returns: torch.Tensor  # [T] benchmark log returns
     turnovers: torch.Tensor          # [T]
     weights_history: torch.Tensor    # [T, S], may be empty when caller disables history recording.
     final_weights: torch.Tensor | None = None  # [S], realised weights after the final simulated day.
+    final_alive: torch.Tensor | None = None  # scalar bool; false is absorbing ruin.
 
     def to_numpy(self) -> BacktestResult:
+        # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
+        # than after .numpy(), because the latter raises before astype can run.
+        def as_float32(tensor: torch.Tensor) -> np.ndarray:
+            return tensor.detach().to(device="cpu", dtype=torch.float32).numpy()
+
         return BacktestResult(
-            strategy_returns=self.strategy_returns.detach().cpu().numpy().astype(np.float32),
-            benchmark_returns=self.benchmark_returns.detach().cpu().numpy().astype(np.float32),
-            turnovers=self.turnovers.detach().cpu().numpy().astype(np.float32),
-            weights_history=self.weights_history.detach().cpu().numpy().astype(np.float32),
-        )
-
-
-@dataclass(slots=True)
-class BacktestStaticInputs:
-    future_returns: torch.Tensor
-    tradable_mask: torch.Tensor
-    can_buy_mask: torch.Tensor
-    can_sell_mask: torch.Tensor
-    benchmark: torch.Tensor
-    sample_mask: torch.Tensor | None
-    buy_fee_rate: float
-    sell_fee_rate: float
-    long_only: bool
-    max_turnover_ratio: float
-    gross_leverage: float
-
-
-@dataclass(slots=True)
-class BacktestReducedResult:
-    loss: torch.Tensor
-    return_sum: torch.Tensor
-    turnover_sum: torch.Tensor
-    valid_count: torch.Tensor
-    final_weights: torch.Tensor | None = None
-
-
-class DifferentiableBacktestExecutor(torch.nn.Module):
-    """Single torch entry point for train loss and eval curve backtests."""
-
-    def forward_curve(
-        self,
-        weights: torch.Tensor,
-        static: BacktestStaticInputs,
-        *,
-        initial_weights: torch.Tensor | None = None,
-        return_weights_history: bool = True,
-        dense_mask_constraints: bool = False,
-    ) -> BacktestResultTensor:
-        return run_backtest_torch(
-            weights,
-            static.future_returns,
-            static.tradable_mask,
-            static.benchmark,
-            static.buy_fee_rate,
-            static.sell_fee_rate,
-            long_only=static.long_only,
-            max_turnover_ratio=static.max_turnover_ratio,
-            gross_leverage=static.gross_leverage,
-            can_buy_mask=static.can_buy_mask,
-            can_sell_mask=static.can_sell_mask,
-            return_weights_history=return_weights_history,
-            dense_mask_constraints=dense_mask_constraints,
-            initial_weights=initial_weights,
-        )
-
-    def forward_log_utility_reduced(
-        self,
-        weights: torch.Tensor,
-        static: BacktestStaticInputs,
-        *,
-        initial_weights: torch.Tensor | None = None,
-        gamma_sharpe: float = 1.0,
-        gamma_turnover: float = 0.0,
-    ) -> BacktestReducedResult:
-        return run_backtest_torch_reduced(
-            weights,
-            static.future_returns,
-            static.tradable_mask,
-            static.benchmark,
-            static.buy_fee_rate,
-            static.sell_fee_rate,
-            long_only=static.long_only,
-            max_turnover_ratio=static.max_turnover_ratio,
-            gross_leverage=static.gross_leverage,
-            can_buy_mask=static.can_buy_mask,
-            can_sell_mask=static.can_sell_mask,
-            sample_mask=static.sample_mask,
-            initial_weights=initial_weights,
-            reduction="log_utility",
-            gamma_sharpe=gamma_sharpe,
-            gamma_turnover=gamma_turnover,
+            strategy_returns=as_float32(self.strategy_returns),
+            benchmark_returns=as_float32(self.benchmark_returns),
+            turnovers=as_float32(self.turnovers),
+            weights_history=as_float32(self.weights_history),
         )
 
 
 @dataclass(slots=True)
 class HoldingsRecord:
-    """Single holding record for one date/symbol, sorted by holding ratio."""
+    """Single holding record for one date/symbol, sorted by absolute holding ratio."""
 
     date: str
     symbol: str
@@ -1084,78 +1169,200 @@ class HoldingsRecord:
     is_cash: bool
 
 
+def holding_record_abs_sort_key(record: HoldingsRecord) -> tuple[float, str]:
+    return (-abs(float(record.holding_ratio)), str(record.symbol))
+
+
 def _vectorized_backtest(
     weights: np.ndarray,
     future_returns: np.ndarray,
     tradable_mask: np.ndarray,
     can_buy_mask: np.ndarray | None,
     can_sell_mask: np.ndarray | None,
+    can_short_open_mask: np.ndarray | None,
+    force_short_cover_mask: np.ndarray | None,
+    force_exit_mask: np.ndarray | None,
     buy_fee_rate: float,
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    volume_limit_weights: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     target_weights = np.asarray(weights, dtype=np.float32).copy()
     gross_budget = _resolve_exposure_budget(gross_leverage)
     tradable = tradable_mask.astype(bool)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="numpy backtest")
-    buy_mask = tradable if can_buy_mask is None else can_buy_mask.astype(bool)
-    sell_mask = tradable if can_sell_mask is None else can_sell_mask.astype(bool)
+    # ``tradable`` is the outer execution gate.  Side masks may further
+    # restrict an otherwise tradable asset, but they must never make an
+    # ordinary halt/data hole executable.  ``force_exit_mask`` is the sole
+    # exception and is settled separately below.
+    buy_mask = (
+        tradable
+        if can_buy_mask is None
+        else can_buy_mask.astype(bool) & tradable
+    )
+    sell_mask = (
+        tradable
+        if can_sell_mask is None
+        else can_sell_mask.astype(bool) & tradable
+    )
+    short_open_mask = (
+        sell_mask
+        if can_short_open_mask is None
+        else can_short_open_mask.astype(bool) & sell_mask & tradable
+    )
+    force_cover_mask = (
+        np.zeros_like(tradable, dtype=bool)
+        if force_short_cover_mask is None
+        else force_short_cover_mask.astype(bool) & tradable
+    )
+    terminal_exit_mask = (
+        np.zeros_like(tradable, dtype=bool)
+        if force_exit_mask is None
+        else np.asarray(force_exit_mask, dtype=bool)
+    )
 
     target_weights = _normalize_target_weights_numpy(
         target_weights,
         long_only=long_only,
         gross_budget=gross_budget,
+        portfolio_activation=portfolio_activation,
     )
+    target_weights = _apply_min_trade_weight_numpy(target_weights, min_trade_weight)
+    volume_limits = None
+    if volume_limit_weights is not None:
+        volume_limits = np.asarray(volume_limit_weights, dtype=np.float32)
+        if volume_limits.shape != target_weights.shape:
+            raise ValueError(
+                "volume_limit_weights shape must match weights: "
+                f"{volume_limits.shape} != {target_weights.shape}"
+            )
 
     t_len, n_symbols = target_weights.shape
+    asset_simple_returns = _asset_log_returns_to_simple_numpy(future_returns)
     weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
     buy_turnovers = np.zeros((t_len,), dtype=np.float32)
     sell_turnovers = np.zeros((t_len,), dtype=np.float32)
+    gross_simple_returns = np.zeros((t_len,), dtype=np.float32)
 
     prev = np.zeros((n_symbols,), dtype=np.float32)
+    alive = True
     for t in range(t_len):
-        target_t = target_weights[t].copy()
+        if not alive:
+            # Ruin is absorbing: later model targets cannot recreate capital.
+            weights_history[t] = 0.0
+            prev.fill(0.0)
+            continue
         tradable_t = tradable[t]
-        # If symbol is not tradable today, keep previous holdings instead of forcing liquidation.
-        target_t[~tradable_t] = prev[~tradable_t]
+        # Only an explicit lifecycle event may settle a position. Generic
+        # non-tradability (data holes, zero volume, halts) freezes it instead.
+        terminal_exit_t = terminal_exit_mask[t]
+        forced_exit = np.where(terminal_exit_t, prev, 0.0).astype(
+            np.float32, copy=False
+        )
+        forced_buy_turnover = np.clip(-forced_exit, 0.0, None).sum(dtype=np.float32)
+        forced_sell_turnover = np.clip(forced_exit, 0.0, None).sum(dtype=np.float32)
+        prev = np.where(terminal_exit_t, 0.0, prev).astype(np.float32, copy=False)
+        target_t = target_weights[t].copy()
+        target_t[~tradable_t] = 0.0
+        target_t[terminal_exit_t] = 0.0
+        forced_cover_now = force_cover_mask[t] & (prev < 0.0) & buy_mask[t]
+        if not long_only:
+            target_t = np.where(force_cover_mask[t] & (target_t < 0.0), 0.0, target_t)
 
         delta = target_t - prev
         buy_t = buy_mask[t]
         sell_t = sell_mask[t]
         delta[(delta > 0.0) & ~buy_t] = 0.0
-        delta[(delta < 0.0) & ~sell_t] = 0.0
 
         if long_only:
+            delta[(delta < 0.0) & ~sell_t] = 0.0
             sell_deltas = np.clip(delta, None, 0.0)
             base_after_sells = prev + sell_deltas
             buy_deltas = np.clip(delta, 0.0, None)
             buy_sum = float(buy_deltas.sum(dtype=np.float32))
-            buy_capacity = max(0.0, 1.0 - float(base_after_sells.sum(dtype=np.float32)))
+            buy_capacity = max(
+                0.0,
+                float(gross_budget) - float(base_after_sells.sum(dtype=np.float32)),
+            )
             if buy_sum > buy_capacity and buy_sum > 0.0:
                 buy_deltas *= np.float32(buy_capacity / buy_sum)
             delta = sell_deltas + buy_deltas
+        else:
+            constrained_target = prev + delta
+            down = constrained_target < prev
+            reduce_long = down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_t
+            constrained_target[reduce_long] = prev[reduce_long]
+
+            cross_from_long = down & (prev > 0.0) & (constrained_target < 0.0)
+            blocked_cross_sell = cross_from_long & ~sell_t
+            constrained_target[blocked_cross_sell] = prev[blocked_cross_sell]
+            blocked_cross_short = cross_from_long & sell_t & ~short_open_mask[t]
+            constrained_target[blocked_cross_short] = 0.0
+
+            open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_open_mask[t]
+            constrained_target[open_or_increase_short] = prev[open_or_increase_short]
+            delta = constrained_target - prev
 
         next_weights = prev + delta
+        if volume_limits is not None:
+            volume_cap = volume_limits[t]
+            abs_delta = np.abs(delta)
+            cap_safe = np.where(np.isfinite(volume_cap) & (volume_cap >= 0.0), np.maximum(volume_cap, 0.0), abs_delta)
+            delta = np.sign(delta) * np.minimum(abs_delta, cap_safe)
+            next_weights = prev + delta
         if max_turnover_ratio > 0.0:
             next_weights = _apply_turnover_cap_numpy(prev[None, :], next_weights[None, :], max_turnover_ratio)[0]
             delta = next_weights - prev
 
         if not long_only:
-            gross_next = float(np.abs(next_weights).sum(dtype=np.float32))
-            if gross_next > gross_budget and gross_next > 0.0:
-                next_weights = next_weights * np.float32(gross_budget / gross_next)
-                delta = next_weights - prev
+            # A regulatory/broker forced cover is mandatory liquidation, not a
+            # discretionary rebalance.  Voluntary turnover and participation
+            # caps must not leave a known-illegal short open on an executable
+            # deadline session.
+            next_weights[forced_cover_now] = np.maximum(
+                next_weights[forced_cover_now],
+                np.float32(0.0),
+            )
+            delta = next_weights - prev
 
-        weights_history[t] = next_weights.astype(np.float32, copy=False)
-        buy_turnovers[t] = np.clip(delta, 0.0, None).sum(dtype=np.float32)
-        sell_turnovers[t] = np.clip(-delta, 0.0, None).sum(dtype=np.float32)
-        prev = next_weights.astype(np.float32, copy=False)
+        if not long_only:
+            next_weights = _apply_gross_exposure_cap_numpy(
+                prev,
+                next_weights,
+                gross_budget,
+            )
+            delta = next_weights - prev
+
+        executed_weights = next_weights.astype(np.float32, copy=False)
+        weights_history[t] = executed_weights
+        buy_turnovers[t] = np.clip(delta, 0.0, None).sum(dtype=np.float32) + forced_buy_turnover
+        sell_turnovers[t] = np.clip(-delta, 0.0, None).sum(dtype=np.float32) + forced_sell_turnover
+        gross_simple_returns[t] = np.sum(
+            executed_weights * asset_simple_returns[t],
+            dtype=np.float32,
+        )
+        net_simple_t = (
+            gross_simple_returns[t]
+            - np.float32(buy_fee_rate) * buy_turnovers[t]
+            - np.float32(sell_fee_rate) * sell_turnovers[t]
+        )
+        prev, alive = _drift_weights_after_return_numpy(
+            executed_weights,
+            asset_simple_returns[t],
+            net_simple_t,
+        )
 
     turnovers = (buy_turnovers + sell_turnovers).astype(np.float32)
-    gross = np.einsum("ts,ts->t", weights_history, future_returns, dtype=np.float32)
-    strategy_returns = gross - buy_fee_rate * buy_turnovers - sell_fee_rate * sell_turnovers
+    net_simple = (
+        gross_simple_returns
+        - buy_fee_rate * buy_turnovers
+        - sell_fee_rate * sell_turnovers
+    )
+    strategy_returns = _portfolio_simple_returns_to_log_numpy(net_simple)
     return strategy_returns.astype(np.float32), turnovers, weights_history
 
 
@@ -1165,22 +1372,46 @@ def _vectorized_backtest_torch_scan_long_only(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    force_exit_mask: torch.Tensor | None = None,
     prev_init: torch.Tensor | None = None,
+    alive_init: torch.Tensor | None = None,
     max_turnover_ratio: float = 0.0,
+    buy_fee_rate: float = 0.0,
+    sell_fee_rate: float = 0.0,
+    volume_limit_weights: torch.Tensor | None = None,
+    gross_budget: float = 1.0,
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
     target_weights = weights
     tradable = tradable_mask
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
-    buy_mask = tradable if can_buy_mask is None else can_buy_mask
-    sell_mask = tradable if can_sell_mask is None else can_sell_mask
+    buy_mask = (
+        tradable
+        if can_buy_mask is None
+        else can_buy_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
+    sell_mask = (
+        tradable
+        if can_sell_mask is None
+        else can_sell_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
+    terminal_exit_mask = (
+        torch.zeros_like(tradable, dtype=torch.bool)
+        if force_exit_mask is None
+        else force_exit_mask.to(device=weights.device, dtype=torch.bool)
+    )
 
     t_len, n_symbols = target_weights.shape
     dtype = target_weights.dtype
     device = target_weights.device
     prev = prev_init.to(device=device, dtype=dtype) if prev_init is not None else torch.zeros_like(target_weights[0])
+    alive = (
+        alive_init.to(device=device, dtype=torch.bool).reshape(())
+        if alive_init is not None
+        else torch.ones((), device=device, dtype=torch.bool)
+    )
     weights_history = (
         torch.empty((t_len, n_symbols), device=device, dtype=dtype)
         if record_weights_history
@@ -1190,8 +1421,8 @@ def _vectorized_backtest_torch_scan_long_only(
     sell_turnovers = torch.empty((t_len,), device=device, dtype=dtype)
     gross_returns = torch.empty((t_len,), device=device, dtype=dtype)
     cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
+    gross_cap = torch.as_tensor(gross_budget, device=device, dtype=dtype)
     chunk_size = max(1, int(scan_chunk_size))
-    one = torch.ones((), device=device, dtype=dtype)
 
     for start in range(0, t_len, chunk_size):
         end = min(start + chunk_size, t_len)
@@ -1199,17 +1430,32 @@ def _vectorized_backtest_torch_scan_long_only(
         tradable_chunk = tradable[start:end]
         buy_chunk = buy_mask[start:end]
         sell_chunk = sell_mask[start:end]
+        terminal_chunk = terminal_exit_mask[start:end]
+        volume_chunk = None if volume_limit_weights is None else volume_limit_weights[start:end]
 
         for offset in range(end - start):
             idx = start + offset
-            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            prev = torch.where(alive, prev, torch.zeros_like(prev))
+            tradable_t = tradable_chunk[offset]
+            terminal_exit_t = terminal_chunk[offset]
+            forced_exit = torch.where(
+                terminal_exit_t, prev, torch.zeros_like(prev)
+            )
+            forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+            forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
+            prev = torch.where(terminal_exit_t, torch.zeros_like(prev), prev)
+            target_t = torch.where(
+                alive & tradable_t & ~terminal_exit_t,
+                target_chunk[offset],
+                torch.zeros_like(prev),
+            )
 
             delta = target_t - prev
             buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
             sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
             base_after_sells = prev + sell_delta
             buy_sum = buy_delta.sum()
-            buy_capacity = (one - base_after_sells.sum()).clamp_min(0.0)
+            buy_capacity = (gross_cap - base_after_sells.sum()).clamp_min(0.0)
             buy_scale = torch.minimum(
                 torch.ones_like(buy_sum),
                 buy_capacity / buy_sum.clamp_min(1e-12),
@@ -1217,6 +1463,16 @@ def _vectorized_backtest_torch_scan_long_only(
             delta = sell_delta + buy_delta * buy_scale
 
             next_weights = prev + delta
+            if volume_chunk is not None:
+                volume_cap = volume_chunk[offset].to(device=device, dtype=dtype)
+                abs_delta = delta.abs()
+                cap_safe = torch.where(
+                    torch.isfinite(volume_cap) & (volume_cap >= 0.0),
+                    volume_cap.clamp_min(0.0),
+                    abs_delta,
+                )
+                delta = torch.sign(delta) * torch.minimum(abs_delta, cap_safe)
+                next_weights = prev + delta
             if max_turnover_ratio > 0.0:
                 turnover = delta.abs().sum()
                 turnover_scale = torch.minimum(
@@ -1228,13 +1484,25 @@ def _vectorized_backtest_torch_scan_long_only(
 
             if record_weights_history:
                 weights_history[idx] = next_weights
-            buy_turnovers[idx] = delta.clamp_min(0.0).sum()
-            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum()
-            gross_returns[idx] = (next_weights * future_returns_t[idx]).sum()
-            prev = next_weights
+            buy_turnovers[idx] = delta.clamp_min(0.0).sum() + forced_buy_turnover
+            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
+            gross_return = (next_weights * future_returns_t[idx]).sum()
+            gross_returns[idx] = gross_return
+            net_simple_return = (
+                gross_return
+                - float(buy_fee_rate) * buy_turnovers[idx]
+                - float(sell_fee_rate) * sell_turnovers[idx]
+            )
+            prev, survived = _drift_weights_after_return_torch(
+                next_weights,
+                future_returns_t[idx],
+                net_simple_return,
+            )
+            alive = alive & survived
+            prev = torch.where(alive, prev, torch.zeros_like(prev))
 
     turnovers = buy_turnovers + sell_turnovers
-    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev
+    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev, alive
 
 
 def _vectorized_backtest_torch_scan_long_short(
@@ -1243,24 +1511,59 @@ def _vectorized_backtest_torch_scan_long_short(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    can_short_open_mask: torch.Tensor | None = None,
+    force_short_cover_mask: torch.Tensor | None = None,
+    force_exit_mask: torch.Tensor | None = None,
     prev_init: torch.Tensor | None = None,
+    alive_init: torch.Tensor | None = None,
     max_turnover_ratio: float = 0.0,
+    buy_fee_rate: float = 0.0,
+    sell_fee_rate: float = 0.0,
+    volume_limit_weights: torch.Tensor | None = None,
     gross_budget: float = 1.0,
     scan_chunk_size: int = 256,
     record_weights_history: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    future_returns_t = _asset_log_returns_to_simple_torch(future_returns, device=weights.device, dtype=weights.dtype)
 
     target_weights = weights
     tradable = tradable_mask
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="torch scan backtest")
-    buy_mask = tradable if can_buy_mask is None else can_buy_mask
-    sell_mask = tradable if can_sell_mask is None else can_sell_mask
+    buy_mask = (
+        tradable
+        if can_buy_mask is None
+        else can_buy_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
+    sell_mask = (
+        tradable
+        if can_sell_mask is None
+        else can_sell_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
+    short_open_mask = (
+        sell_mask
+        if can_short_open_mask is None
+        else can_short_open_mask.to(device=weights.device, dtype=torch.bool) & sell_mask & tradable
+    )
+    force_cover_mask = (
+        torch.zeros_like(tradable, dtype=torch.bool)
+        if force_short_cover_mask is None
+        else force_short_cover_mask.to(device=weights.device, dtype=torch.bool) & tradable
+    )
+    terminal_exit_mask = (
+        torch.zeros_like(tradable, dtype=torch.bool)
+        if force_exit_mask is None
+        else force_exit_mask.to(device=weights.device, dtype=torch.bool)
+    )
 
     t_len, n_symbols = target_weights.shape
     dtype = target_weights.dtype
     device = target_weights.device
     prev = prev_init.to(device=device, dtype=dtype) if prev_init is not None else torch.zeros_like(target_weights[0])
+    alive = (
+        alive_init.to(device=device, dtype=torch.bool).reshape(())
+        if alive_init is not None
+        else torch.ones((), device=device, dtype=torch.bool)
+    )
     weights_history = (
         torch.empty((t_len, n_symbols), device=device, dtype=dtype)
         if record_weights_history
@@ -1279,17 +1582,63 @@ def _vectorized_backtest_torch_scan_long_short(
         tradable_chunk = tradable[start:end]
         buy_chunk = buy_mask[start:end]
         sell_chunk = sell_mask[start:end]
+        short_chunk = short_open_mask[start:end]
+        force_chunk = force_cover_mask[start:end]
+        terminal_chunk = terminal_exit_mask[start:end]
+        volume_chunk = None if volume_limit_weights is None else volume_limit_weights[start:end]
 
         for offset in range(end - start):
             idx = start + offset
-            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
+            prev = torch.where(alive, prev, torch.zeros_like(prev))
+            tradable_t = tradable_chunk[offset]
+            terminal_exit_t = terminal_chunk[offset]
+            forced_exit = torch.where(
+                terminal_exit_t, prev, torch.zeros_like(prev)
+            )
+            forced_buy_turnover = (-forced_exit).clamp_min(0.0).sum()
+            forced_sell_turnover = forced_exit.clamp_min(0.0).sum()
+            prev = torch.where(terminal_exit_t, torch.zeros_like(prev), prev)
+            target_t = torch.where(
+                alive & tradable_t & ~terminal_exit_t,
+                target_chunk[offset],
+                torch.zeros_like(prev),
+            )
+            forced_cover_now = force_chunk[offset] & (prev < 0.0) & buy_chunk[offset]
+            target_t = torch.where(
+                force_chunk[offset] & (target_t < 0.0),
+                torch.zeros_like(target_t),
+                target_t,
+            )
 
             delta = target_t - prev
-            buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
-            sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
-            delta = sell_delta + buy_delta
+            constrained_target = torch.where((delta > 0.0) & ~buy_chunk[offset], prev, target_t)
+            down = constrained_target < prev
+            reduce_long = down & (prev > 0.0) & (constrained_target >= 0.0) & ~sell_chunk[offset]
+            constrained_target = torch.where(reduce_long, prev, constrained_target)
+
+            cross_from_long = down & (prev > 0.0) & (constrained_target < 0.0)
+            constrained_target = torch.where(cross_from_long & ~sell_chunk[offset], prev, constrained_target)
+            constrained_target = torch.where(
+                cross_from_long & sell_chunk[offset] & ~short_chunk[offset],
+                torch.zeros_like(constrained_target),
+                constrained_target,
+            )
+
+            open_or_increase_short = down & (prev <= 0.0) & (constrained_target < prev) & ~short_chunk[offset]
+            constrained_target = torch.where(open_or_increase_short, prev, constrained_target)
+            delta = constrained_target - prev
 
             next_weights = prev + delta
+            if volume_chunk is not None:
+                volume_cap = volume_chunk[offset].to(device=device, dtype=dtype)
+                abs_delta = delta.abs()
+                cap_safe = torch.where(
+                    torch.isfinite(volume_cap) & (volume_cap >= 0.0),
+                    volume_cap.clamp_min(0.0),
+                    abs_delta,
+                )
+                delta = torch.sign(delta) * torch.minimum(abs_delta, cap_safe)
+                next_weights = prev + delta
             if max_turnover_ratio > 0.0:
                 turnover = delta.abs().sum()
                 turnover_scale = torch.minimum(
@@ -1299,132 +1648,54 @@ def _vectorized_backtest_torch_scan_long_short(
                 next_weights = prev + delta * turnover_scale
                 delta = next_weights - prev
 
-            gross_next = next_weights.abs().sum()
-            gross_scale = torch.minimum(
-                torch.ones_like(gross_next),
-                gross_cap / gross_next.clamp_min(1e-12),
+            # Forced covers are mandatory and therefore override voluntary
+            # turnover/volume caps once the buy side is executable.
+            next_weights = torch.where(
+                forced_cover_now,
+                next_weights.clamp_min(0.0),
+                next_weights,
             )
-            next_weights = next_weights * gross_scale
+            delta = next_weights - prev
+
+            next_weights = _apply_gross_exposure_cap_torch(
+                prev,
+                next_weights,
+                gross_cap,
+            )
             delta = next_weights - prev
 
             if record_weights_history:
                 weights_history[idx] = next_weights
-            buy_turnovers[idx] = delta.clamp_min(0.0).sum()
-            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum()
-            gross_returns[idx] = (next_weights * future_returns_t[idx]).sum()
-            prev = next_weights
+            buy_turnovers[idx] = delta.clamp_min(0.0).sum() + forced_buy_turnover
+            sell_turnovers[idx] = (-delta).clamp_min(0.0).sum() + forced_sell_turnover
+            gross_return = (next_weights * future_returns_t[idx]).sum()
+            gross_returns[idx] = gross_return
+            net_simple_return = (
+                gross_return
+                - float(buy_fee_rate) * buy_turnovers[idx]
+                - float(sell_fee_rate) * sell_turnovers[idx]
+            )
+            prev, survived = _drift_weights_after_return_torch(
+                next_weights,
+                future_returns_t[idx],
+                net_simple_return,
+            )
+            alive = alive & survived
+            prev = torch.where(alive, prev, torch.zeros_like(prev))
 
     turnovers = buy_turnovers + sell_turnovers
-    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev
-
-
-def _vectorized_backtest_torch_scan_log_utility_reduced(
-    weights: torch.Tensor,
-    future_returns: torch.Tensor,
-    tradable_mask: torch.Tensor,
-    can_buy_mask: torch.Tensor | None,
-    can_sell_mask: torch.Tensor | None,
-    sample_mask: torch.Tensor | None,
-    prev_init: torch.Tensor,
-    *,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
-    long_only: bool,
-    max_turnover_ratio: float = 0.0,
-    gross_budget: float = 1.0,
-    scan_chunk_size: int = 256,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    future_returns_t = future_returns.to(device=weights.device, dtype=weights.dtype)
-    target_weights = weights
-    tradable = tradable_mask
-    _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="reduced torch backtest")
-    buy_mask = tradable if can_buy_mask is None else can_buy_mask
-    sell_mask = tradable if can_sell_mask is None else can_sell_mask
-
-    t_len, _ = target_weights.shape
-    dtype = target_weights.dtype
-    device = target_weights.device
-    prev = prev_init.to(device=device, dtype=dtype)
-    if sample_mask is None:
-        valid_mask = torch.ones((t_len,), device=device, dtype=torch.bool)
-    else:
-        valid_mask = sample_mask.to(device=device, dtype=torch.bool)
-
-    cap = torch.as_tensor(max_turnover_ratio, device=device, dtype=dtype)
-    gross_cap = torch.as_tensor(gross_budget, device=device, dtype=dtype)
-    chunk_size = max(1, int(scan_chunk_size))
-    one = torch.ones((), device=device, dtype=dtype)
-    return_sum = torch.zeros((), device=device, dtype=torch.float32)
-    turnover_sum = torch.zeros((), device=device, dtype=torch.float32)
-    valid_count = torch.zeros((), device=device, dtype=torch.float32)
-
-    for start in range(0, t_len, chunk_size):
-        end = min(start + chunk_size, t_len)
-        target_chunk = target_weights[start:end]
-        tradable_chunk = tradable[start:end]
-        buy_chunk = buy_mask[start:end]
-        sell_chunk = sell_mask[start:end]
-
-        for offset in range(end - start):
-            idx = start + offset
-            target_t = torch.where(tradable_chunk[offset], target_chunk[offset], prev)
-            delta = target_t - prev
-            buy_delta = delta.clamp_min(0.0) * buy_chunk[offset].to(dtype=dtype)
-            sell_delta = delta.clamp_max(0.0) * sell_chunk[offset].to(dtype=dtype)
-
-            if long_only:
-                base_after_sells = prev + sell_delta
-                buy_sum = buy_delta.sum()
-                buy_capacity = (one - base_after_sells.sum()).clamp_min(0.0)
-                buy_scale = torch.minimum(
-                    torch.ones_like(buy_sum),
-                    buy_capacity / buy_sum.clamp_min(1e-12),
-                )
-                delta = sell_delta + buy_delta * buy_scale
-            else:
-                delta = sell_delta + buy_delta
-
-            next_weights = prev + delta
-            if max_turnover_ratio > 0.0:
-                turnover_raw = delta.abs().sum()
-                turnover_scale = torch.minimum(
-                    torch.ones_like(turnover_raw),
-                    cap / turnover_raw.clamp_min(1e-12),
-                )
-                next_weights = prev + delta * turnover_scale
-                delta = next_weights - prev
-
-            if not long_only:
-                gross_next = next_weights.abs().sum()
-                gross_scale = torch.minimum(
-                    torch.ones_like(gross_next),
-                    gross_cap / gross_next.clamp_min(1e-12),
-                )
-                next_weights = next_weights * gross_scale
-                delta = next_weights - prev
-
-            buy_turnover = delta.clamp_min(0.0).sum()
-            sell_turnover = (-delta).clamp_min(0.0).sum()
-            turnover = buy_turnover + sell_turnover
-            gross_return = (next_weights * future_returns_t[idx]).sum()
-            strategy_return = gross_return - float(buy_fee_rate) * buy_turnover - float(sell_fee_rate) * sell_turnover
-
-            valid_f = valid_mask[idx].to(dtype=torch.float32)
-            clean_return = torch.nan_to_num(strategy_return.to(dtype).float(), nan=0.0, posinf=0.0, neginf=0.0)
-            clean_turnover = torch.nan_to_num(turnover.to(dtype).float(), nan=0.0, posinf=0.0, neginf=0.0)
-            return_sum = return_sum + clean_return * valid_f
-            turnover_sum = turnover_sum + clean_turnover * valid_f
-            valid_count = valid_count + valid_f
-            prev = next_weights
-
-    return return_sum, turnover_sum, valid_count, prev
+    return turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, prev, alive
 
 
 def _prepare_runner_factory(
     *,
     long_only: bool,
     gross_budget: float,
+    min_trade_weight: float,
+    portfolio_activation: str,
 ):
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+
     def _runner(
         weights: torch.Tensor,
         tradable_mask: torch.Tensor,
@@ -1434,13 +1705,21 @@ def _prepare_runner_factory(
         compute_dtype = _supported_scan_dtype(weights.dtype)
         target_weights = weights.to(dtype=compute_dtype)
         tradable = tradable_mask.to(device=target_weights.device, dtype=torch.bool)
-        buy_mask = can_buy_mask.to(device=target_weights.device, dtype=torch.bool)
-        sell_mask = can_sell_mask.to(device=target_weights.device, dtype=torch.bool)
+        buy_mask = (
+            can_buy_mask.to(device=target_weights.device, dtype=torch.bool)
+            & tradable
+        )
+        sell_mask = (
+            can_sell_mask.to(device=target_weights.device, dtype=torch.bool)
+            & tradable
+        )
         target_weights = _normalize_target_weights_torch(
             target_weights,
             long_only=long_only,
             gross_budget=gross_budget,
+            portfolio_activation=activation_name,
         )
+        target_weights = _apply_min_trade_weight_torch(target_weights, min_trade_weight)
         return target_weights, tradable, buy_mask, sell_mask
 
     return _runner
@@ -1453,6 +1732,8 @@ def _prepare_compile_key(
     can_sell_mask: torch.Tensor,
     long_only: bool,
     gross_budget: float,
+    min_trade_weight: float,
+    portfolio_activation: str,
 ) -> tuple:
     return (
         str(weights.device),
@@ -1464,6 +1745,8 @@ def _prepare_compile_key(
         str(can_sell_mask.dtype),
         bool(long_only),
         float(gross_budget),
+        float(min_trade_weight),
+        normalize_portfolio_activation(portfolio_activation),
         bool(_compile_dynamic_enabled()),
     )
 
@@ -1476,8 +1759,15 @@ def _resolve_prepare_runner(
     *,
     long_only: bool,
     gross_budget: float,
+    min_trade_weight: float,
+    portfolio_activation: str,
 ):
-    base_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+    base_runner = _prepare_runner_factory(
+        long_only=long_only,
+        gross_budget=gross_budget,
+        min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
+    )
     # When an outer torch.compile is tracing risk_aware_loss, do not create a
     # nested compiled prepare runner and do not mutate compile stats. Stats dict
     # mutation becomes a Dynamo guard and can force repeated loss recompiles.
@@ -1500,6 +1790,8 @@ def _resolve_prepare_runner(
         can_sell_mask,
         long_only,
         gross_budget,
+        min_trade_weight,
+        portfolio_activation,
     )
     if key in _PREP_COMPILE_FAILED:
         if _strict_no_fallback_enabled():
@@ -1523,6 +1815,7 @@ def _resolve_prepare_runner(
         compile_dynamic = _compile_dynamic_enabled()
         compiled = torch.compile(
             base_runner,
+            fullgraph=True,
             dynamic=compile_dynamic,
             options={"triton.cudagraphs": False},
         )
@@ -1554,7 +1847,14 @@ def _prepare_scan_inputs(
     can_sell_mask: torch.Tensor | None,
     long_only: bool,
     gross_leverage: float,
+    min_trade_weight: float,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Model forward stays under BF16/FP16 AMP, but portfolio state, fee-adjusted
+    # returns, turnover, and finance reductions are numerically sensitive. Keep
+    # the canonical backtest in FP32; .to() preserves the gradient path back to
+    # lower-precision model outputs.
+    weights = weights.to(dtype=torch.float32)
     gross_budget = _resolve_exposure_budget(gross_leverage)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="backtest input preparation")
     buy_input = tradable_mask if can_buy_mask is None else can_buy_mask
@@ -1566,6 +1866,8 @@ def _prepare_scan_inputs(
         sell_input,
         long_only=long_only,
         gross_budget=gross_budget,
+        min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
     )
     try:
         return runner(weights, tradable_mask, buy_input, sell_input)
@@ -1584,6 +1886,8 @@ def _prepare_scan_inputs(
             sell_input,
             long_only,
             gross_budget,
+            min_trade_weight,
+            portfolio_activation,
         )
         _PREP_COMPILE_FAILED.add(key)
         _PREP_COMPILED_CACHE.pop(key, None)
@@ -1600,7 +1904,12 @@ def _prepare_scan_inputs(
                 f"shape=(T={int(weights.size(0))}, S={int(weights.size(1))}, dtype={weights.dtype}): "
                 f"{type(e).__name__}: {str(e)[:300]}"
             )
-        eager_runner = _prepare_runner_factory(long_only=long_only, gross_budget=gross_budget)
+        eager_runner = _prepare_runner_factory(
+            long_only=long_only,
+            gross_budget=gross_budget,
+            min_trade_weight=min_trade_weight,
+            portfolio_activation=portfolio_activation,
+        )
         return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
 
@@ -1610,29 +1919,35 @@ def _vectorized_backtest_torch(
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor | None,
     can_sell_mask: torch.Tensor | None,
+    can_short_open_mask: torch.Tensor | None,
+    force_short_cover_mask: torch.Tensor | None,
+    force_exit_mask: torch.Tensor | None,
     buy_fee_rate: float,
     sell_fee_rate: float,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
-    dense_mask_constraints: bool = False,
     initial_weights: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    initial_alive: torch.Tensor | None = None,
+    volume_limit_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_start = _runtime_stat_start()
     _add_backtest_runtime_stat("calls")
-    if initial_weights is not None:
+    if initial_weights is not None or initial_alive is not None:
         _add_backtest_runtime_stat("stateful_calls")
     if return_weights_history:
         _add_backtest_runtime_stat("return_weights_history_calls")
 
     with _CudaRuntimeTimer("total_cuda_s", weights):
         gross_budget = _resolve_exposure_budget(gross_leverage)
+        # MTM drift or frozen holdings can leave prior gross exposure above the
+        # configured budget.  Therefore even a cap >= 2 * gross_budget may bind
+        # and must never be optimized away.
         effective_max_turnover_ratio = float(max_turnover_ratio)
-        max_possible_turnover = 2.0 * gross_budget
-        if effective_max_turnover_ratio >= max_possible_turnover:
-            effective_max_turnover_ratio = 0.0
         prep_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prep_cuda_s", weights):
             prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
@@ -1642,13 +1957,50 @@ def _vectorized_backtest_torch(
                 can_sell_mask,
                 long_only,
                 gross_leverage,
+                min_trade_weight,
+                portfolio_activation,
             )
+            prepped_short_open = (
+                prepped_sell
+                if can_short_open_mask is None
+                else can_short_open_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_sell & prepped_tradable
+            )
+            prepped_force_cover = (
+                torch.zeros_like(prepped_tradable, dtype=torch.bool)
+                if force_short_cover_mask is None
+                else force_short_cover_mask.to(device=prepped_weights.device, dtype=torch.bool) & prepped_tradable
+            )
+            prepped_force_exit = (
+                torch.zeros_like(prepped_tradable, dtype=torch.bool)
+                if force_exit_mask is None
+                else force_exit_mask.to(
+                    device=prepped_weights.device,
+                    dtype=torch.bool,
+                )
+            )
+            if volume_limit_weights is None:
+                # A finite-cap tensor and an all-inf tensor share one compiled
+                # signature; inf means the execution rule is unconstrained.
+                prepped_volume_limit_weights = torch.full_like(prepped_weights, float("inf"))
+            else:
+                prepped_volume_limit_weights = volume_limit_weights.to(
+                    device=prepped_weights.device,
+                    dtype=prepped_weights.dtype,
+                )
+                if tuple(prepped_volume_limit_weights.shape) != tuple(prepped_weights.shape):
+                    raise ValueError(
+                        "volume_limit_weights shape must match weights: "
+                        f"{tuple(prepped_volume_limit_weights.shape)} != {tuple(prepped_weights.shape)}"
+                    )
         _add_backtest_elapsed_stat("prep_s", prep_start)
         prev_init_start = _runtime_stat_start()
         with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
             prev_init = (
                 torch.nan_to_num(
-                    initial_weights.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
+                    initial_weights.detach().clone(memory_format=torch.contiguous_format).to(
+                        device=prepped_weights.device,
+                        dtype=prepped_weights.dtype,
+                    ),
                     nan=0.0,
                     posinf=0.0,
                     neginf=0.0,
@@ -1656,47 +2008,15 @@ def _vectorized_backtest_torch(
                 if initial_weights is not None
                 else torch.zeros_like(prepped_weights[0])
             )
+            alive_init = (
+                initial_alive.detach()
+                .clone(memory_format=torch.contiguous_format)
+                .to(device=prepped_weights.device, dtype=torch.bool)
+                .reshape(())
+                if initial_alive is not None
+                else torch.ones((), device=prepped_weights.device, dtype=torch.bool)
+            )
         _add_backtest_elapsed_stat("prev_init_s", prev_init_start)
-
-    # Fast path: no tradability/side restrictions and no turnover cap.
-    # In this case, each day's realised target equals model target, so we can
-    # compute turnover/returns via pure tensor ops without recurrent scan.
-    use_dense_fast_path = bool(dense_mask_constraints) and can_use_dense_fast_path(
-        prepped_tradable,
-        prepped_buy,
-        prepped_sell,
-        effective_max_turnover_ratio,
-    )
-    if use_dense_fast_path:
-        _add_backtest_runtime_stat("dense_fast_path_calls")
-        dense_start = _runtime_stat_start()
-        with _CudaRuntimeTimer("dense_fast_path_cuda_s", prepped_weights):
-            returns_t = future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype)
-            deltas = torch.empty_like(prepped_weights)
-            deltas[0] = prepped_weights[0] - prev_init
-            if int(prepped_weights.size(0)) > 1:
-                deltas[1:] = prepped_weights[1:] - prepped_weights[:-1]
-
-            buy_turnovers = deltas.clamp_min(0.0).sum(dim=1)
-            sell_turnovers = (-deltas).clamp_min(0.0).sum(dim=1)
-            turnovers = buy_turnovers + sell_turnovers
-            gross_returns = (prepped_weights * returns_t).sum(dim=1)
-            strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
-
-            if return_weights_history:
-                weights_history = prepped_weights
-            else:
-                weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
-
-            returns_dtype = prepped_weights.dtype
-        _add_backtest_elapsed_stat("dense_fast_path_s", dense_start)
-        _add_backtest_elapsed_stat("total_s", total_start)
-        return (
-            strategy_returns.to(returns_dtype),
-            turnovers.to(returns_dtype),
-            weights_history.to(returns_dtype),
-            prepped_weights[-1].to(returns_dtype),
-        )
 
     resolved_chunk = (
         int(scan_chunk_size)
@@ -1709,51 +2029,14 @@ def _vectorized_backtest_torch(
             prepped_tradable,
             prepped_buy,
             prepped_sell,
+            prepped_volume_limit_weights,
             long_only,
             effective_max_turnover_ratio,
             gross_budget,
+            buy_fee_rate,
+            sell_fee_rate,
         )
     )
-    use_cpp_long_short = (
-        not _torch_dynamo_is_compiling()
-        and cpp_long_short_enabled()
-        and not long_only
-        and prepped_weights.device.type == "cuda"
-        and initial_weights is None
-    )
-    if use_cpp_long_short:
-        _add_backtest_runtime_stat("cpp_ext_calls")
-        cpp_start = _runtime_stat_start()
-        try:
-            with _CudaRuntimeTimer("cpp_ext_cuda_s", prepped_weights):
-                strategy_returns, turnovers, weights_history = run_long_short_cpp_autograd(
-                    prepped_weights,
-                    future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
-                    prepped_tradable,
-                    prepped_buy,
-                    prepped_sell,
-                    buy_fee_rate,
-                    sell_fee_rate,
-                    effective_max_turnover_ratio,
-                    gross_budget,
-                )
-            final_weights = weights_history[-1]
-            if not return_weights_history:
-                weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
-            _add_backtest_elapsed_stat("cpp_ext_s", cpp_start)
-            _add_backtest_elapsed_stat("total_s", total_start)
-            return strategy_returns, turnovers, weights_history, final_weights
-        except Exception as e:
-            _add_backtest_runtime_stat("cpp_ext_failures")
-            _add_backtest_elapsed_stat("cpp_ext_s", cpp_start)
-            if _strict_no_fallback_enabled():
-                raise RuntimeError(
-                    "C++ long-short backtest extension failed; "
-                    "strict_no_fallback=true so eager scan fallback is disabled."
-                ) from e
-            if _compile_verbose():
-                print(f"[backtest cpp] long-short extension failed, falling back to eager scan: {e}")
-
     checkpoint_rows = _checkpoint_chunk_rows()
     use_checkpoint = (
         checkpoint_rows > 0
@@ -1770,20 +2053,22 @@ def _vectorized_backtest_torch(
             long_only=long_only,
             max_turnover_ratio=effective_max_turnover_ratio,
             gross_budget=gross_budget,
+            buy_fee_rate=buy_fee_rate,
+            sell_fee_rate=sell_fee_rate,
             scan_chunk_size=resolved_chunk,
             record_weights_history=return_weights_history,
         )
         _add_backtest_elapsed_stat("runner_resolve_s", resolve_start)
         _add_backtest_runtime_stat("eager_runner_calls")
     else:
-        stateful_initial = initial_weights is not None
+        stateful_initial = initial_weights is not None or initial_alive is not None
         compile_possible = (
             _compile_enabled()
             and prepped_weights.device.type == "cuda"
             and hasattr(torch, "compile")
         )
         resolve_start = _runtime_stat_start()
-        if initial_weights is not None:
+        if stateful_initial:
             if _compile_stateful_enabled():
                 # Stateful train/eval scans carry detached portfolio state between
                 # batches/chunks. Compile this path separately with CUDA graphs off.
@@ -1792,6 +2077,8 @@ def _vectorized_backtest_torch(
                     long_only=long_only,
                     max_turnover_ratio=effective_max_turnover_ratio,
                     gross_budget=gross_budget,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
                     scan_chunk_size=resolved_chunk,
                     record_weights_history=return_weights_history,
                     stateful_initial=True,
@@ -1807,6 +2094,8 @@ def _vectorized_backtest_torch(
                     long_only=long_only,
                     max_turnover_ratio=effective_max_turnover_ratio,
                     gross_budget=gross_budget,
+                    buy_fee_rate=buy_fee_rate,
+                    sell_fee_rate=sell_fee_rate,
                     scan_chunk_size=resolved_chunk,
                     record_weights_history=return_weights_history,
                 )
@@ -1818,6 +2107,8 @@ def _vectorized_backtest_torch(
                 long_only=long_only,
                 max_turnover_ratio=effective_max_turnover_ratio,
                 gross_budget=gross_budget,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 scan_chunk_size=resolved_chunk,
                 record_weights_history=return_weights_history,
                 stateful_initial=False,
@@ -1834,13 +2125,18 @@ def _vectorized_backtest_torch(
         try:
             runner_call_start = _runtime_stat_start()
             with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
-                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
+                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights, final_alive = runner(
                     prepped_weights,
                     future_returns,
                     prepped_tradable,
                     prepped_buy,
                     prepped_sell,
                     prev_init,
+                    alive_init,
+                    prepped_short_open,
+                    prepped_force_cover,
+                    prepped_force_exit,
+                    prepped_volume_limit_weights,
                 )
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
         except Exception as e:
@@ -1856,20 +2152,27 @@ def _vectorized_backtest_torch(
                 long_only=long_only,
                 max_turnover_ratio=effective_max_turnover_ratio,
                 gross_budget=gross_budget,
+                buy_fee_rate=buy_fee_rate,
+                sell_fee_rate=sell_fee_rate,
                 scan_chunk_size=resolved_chunk,
                 record_weights_history=return_weights_history,
-                stateful_initial=initial_weights is not None,
+                stateful_initial=stateful_initial,
             )
             _add_backtest_elapsed_stat("runtime_fallback_s", fallback_start)
             runner_call_start = _runtime_stat_start()
             with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
-                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights = runner(
+                turnovers, buy_turnovers, sell_turnovers, gross_returns, weights_history, final_weights, final_alive = runner(
                     prepped_weights,
                     future_returns,
                     prepped_tradable,
                     prepped_buy,
                     prepped_sell,
                     prev_init,
+                    alive_init,
+                    prepped_short_open,
+                    prepped_force_cover,
+                    prepped_force_exit,
+                    prepped_volume_limit_weights,
                 )
             _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
     else:
@@ -1882,6 +2185,7 @@ def _vectorized_backtest_torch(
             gross_chunks: list[torch.Tensor] = []
             weights_chunks: list[torch.Tensor] = [] if return_weights_history else []
             prev = prev_init
+            alive = alive_init
 
             for start in range(0, int(prepped_weights.size(0)), chunk_rows):
                 end = min(start + chunk_rows, int(prepped_weights.size(0)))
@@ -1890,6 +2194,10 @@ def _vectorized_backtest_torch(
                 t_chunk = prepped_tradable[start:end]
                 b_chunk = prepped_buy[start:end]
                 s_chunk = prepped_sell[start:end]
+                short_chunk = prepped_short_open[start:end]
+                force_chunk = prepped_force_cover[start:end]
+                exit_chunk = prepped_force_exit[start:end]
+                volume_chunk = prepped_volume_limit_weights[start:end]
 
                 chunk_out = checkpoint_fn(
                     runner,
@@ -1899,10 +2207,15 @@ def _vectorized_backtest_torch(
                     b_chunk,
                     s_chunk,
                     prev,
+                    alive,
+                    short_chunk,
+                    force_chunk,
+                    exit_chunk,
+                    volume_chunk,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
-                t_out, b_out, s_out, g_out, w_out, last_w = chunk_out
+                t_out, b_out, s_out, g_out, w_out, last_w, last_alive = chunk_out
                 turnovers_chunks.append(t_out)
                 buy_chunks.append(b_out)
                 sell_chunks.append(s_out)
@@ -1910,6 +2223,7 @@ def _vectorized_backtest_torch(
                 if return_weights_history:
                     weights_chunks.append(w_out)
                 prev = last_w
+                alive = last_alive
 
             turnovers = torch.cat(turnovers_chunks, dim=0)
             buy_turnovers = torch.cat(buy_chunks, dim=0)
@@ -1920,17 +2234,24 @@ def _vectorized_backtest_torch(
             else:
                 weights_history = prepped_weights.new_empty((0, prepped_weights.size(1)))
             final_weights = prev
+            final_alive = alive
         _add_backtest_elapsed_stat("checkpoint_s", checkpoint_start)
 
     finalize_start = _runtime_stat_start()
     with _CudaRuntimeTimer("finalize_cuda_s", prepped_weights):
         returns_dtype = prepped_weights.dtype
-        strategy_returns = gross_returns - float(buy_fee_rate) * buy_turnovers - float(sell_fee_rate) * sell_turnovers
+        net_simple_returns = (
+            gross_returns
+            - float(buy_fee_rate) * buy_turnovers
+            - float(sell_fee_rate) * sell_turnovers
+        )
+        strategy_returns = _portfolio_simple_returns_to_log_torch(net_simple_returns)
         result = (
             strategy_returns.to(returns_dtype),
             turnovers.to(returns_dtype),
             weights_history.to(returns_dtype),
             final_weights.to(returns_dtype),
+            final_alive.to(dtype=torch.bool),
         )
     _add_backtest_elapsed_stat("finalize_s", finalize_start)
     _add_backtest_elapsed_stat("total_s", total_start)
@@ -1947,8 +2268,14 @@ def run_backtest(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
+    can_short_open_mask: np.ndarray | None = None,
+    force_short_cover_mask: np.ndarray | None = None,
+    force_exit_mask: np.ndarray | None = None,
+    volume_limit_weights: np.ndarray | None = None,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     strategy_returns, turnovers, weights_history = _vectorized_backtest(
@@ -1957,11 +2284,17 @@ def run_backtest(
         tradable_mask,
         can_buy_mask,
         can_sell_mask,
+        can_short_open_mask,
+        force_short_cover_mask,
+        force_exit_mask,
         buy_fee_rate,
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
+        volume_limit_weights=volume_limit_weights,
     )
 
     return BacktestResult(
@@ -1969,178 +2302,6 @@ def run_backtest(
         benchmark_returns=benchmark_returns.astype(np.float32),
         turnovers=turnovers,
         weights_history=weights_history,
-    )
-
-
-def run_backtest_torch_reduced(
-    weights: torch.Tensor,
-    future_returns: torch.Tensor,
-    tradable_mask: torch.Tensor,
-    benchmark_returns: torch.Tensor | None,
-    buy_fee_rate: float,
-    sell_fee_rate: float,
-    long_only: bool = True,
-    max_turnover_ratio: float = 0.0,
-    gross_leverage: float = 1.0,
-    can_buy_mask: torch.Tensor | None = None,
-    can_sell_mask: torch.Tensor | None = None,
-    sample_mask: torch.Tensor | None = None,
-    initial_weights: torch.Tensor | None = None,
-    scan_chunk_size: int | None = None,
-    reduction: str = "log_utility",
-    gamma_sharpe: float = 1.0,
-    gamma_turnover: float = 0.0,
-) -> BacktestReducedResult:
-    """Run the canonical recurrent backtest and reduce log-utility loss in-loop."""
-    reduction_norm = str(reduction).strip().lower()
-    if reduction_norm not in {"log_utility", "log_util", "kelly", "growth", "mean_log_return"}:
-        raise ValueError(f"unsupported reduced backtest reduction: {reduction}")
-
-    total_start = _runtime_stat_start()
-    _add_backtest_runtime_stat("reduced_calls")
-    _add_backtest_runtime_stat("calls")
-    if initial_weights is not None:
-        _add_backtest_runtime_stat("stateful_calls")
-
-    with _CudaRuntimeTimer("total_cuda_s", weights):
-        gross_budget = _resolve_exposure_budget(gross_leverage)
-        effective_max_turnover_ratio = float(max_turnover_ratio)
-        max_possible_turnover = 2.0 * gross_budget
-        if effective_max_turnover_ratio >= max_possible_turnover:
-            effective_max_turnover_ratio = 0.0
-
-        prep_start = _runtime_stat_start()
-        with _CudaRuntimeTimer("prep_cuda_s", weights):
-            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
-                weights,
-                tradable_mask,
-                can_buy_mask,
-                can_sell_mask,
-                long_only,
-                gross_leverage,
-            )
-        _add_backtest_elapsed_stat("prep_s", prep_start)
-
-        prev_init_start = _runtime_stat_start()
-        with _CudaRuntimeTimer("prev_init_cuda_s", prepped_weights):
-            prev_init = (
-                torch.nan_to_num(
-                    initial_weights.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-                if initial_weights is not None
-                else torch.zeros_like(prepped_weights[0])
-            )
-        _add_backtest_elapsed_stat("prev_init_s", prev_init_start)
-
-        resolved_chunk = (
-            int(scan_chunk_size)
-            if scan_chunk_size is not None and int(scan_chunk_size) > 0
-            else 256
-            if _torch_dynamo_is_compiling()
-            else _autotune_scan_chunk_size(
-                prepped_weights,
-                future_returns,
-                prepped_tradable,
-                prepped_buy,
-                prepped_sell,
-                long_only,
-                effective_max_turnover_ratio,
-                gross_budget,
-            )
-        )
-
-        runner = _resolve_reduced_scan_runner(
-            prepped_weights,
-            long_only=long_only,
-            max_turnover_ratio=effective_max_turnover_ratio,
-            gross_budget=gross_budget,
-            scan_chunk_size=resolved_chunk,
-            buy_fee_rate=buy_fee_rate,
-            sell_fee_rate=sell_fee_rate,
-            stateful_initial=initial_weights is not None,
-        )
-
-        try:
-            runner_call_start = _runtime_stat_start()
-            with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
-                return_sum, turnover_sum, valid_count, final_weights = runner(
-                    prepped_weights,
-                    future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
-                    prepped_tradable,
-                    prepped_buy,
-                    prepped_sell,
-                    sample_mask,
-                    prev_init,
-                )
-            _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
-        except Exception as e:
-            if _torch_dynamo_is_compiling() or not (
-                _compile_enabled() and prepped_weights.device.type == "cuda" and hasattr(torch, "compile")
-            ):
-                raise
-            _add_backtest_runtime_stat("reduced_runtime_fallback_calls")
-            key = _reduced_scan_compile_key(
-                prepped_weights,
-                long_only,
-                effective_max_turnover_ratio,
-                gross_budget,
-                resolved_chunk,
-                initial_weights is not None,
-            )
-            _REDUCED_COMPILE_FAILED.add(key)
-            _REDUCED_COMPILED_CACHE.pop(key, None)
-            if _strict_no_fallback_enabled():
-                raise RuntimeError(
-                    "Compiled reduced backtest runner failed at runtime; "
-                    "strict_no_fallback=true so eager reduced-runner fallback is disabled."
-                ) from e
-            if _compile_verbose():
-                print(
-                    "[backtest reduced compile] runtime failed, falling back to eager for "
-                    f"shape=(T={int(prepped_weights.size(0))}, S={int(prepped_weights.size(1))}, "
-                    f"dtype={prepped_weights.dtype}): {type(e).__name__}: {str(e)[:300]}"
-                )
-            eager_runner = _reduced_scan_runner_factory(
-                long_only=long_only,
-                max_turnover_ratio=effective_max_turnover_ratio,
-                gross_budget=gross_budget,
-                scan_chunk_size=resolved_chunk,
-                buy_fee_rate=buy_fee_rate,
-                sell_fee_rate=sell_fee_rate,
-            )
-            _add_backtest_runtime_stat("eager_reduced_runner_calls")
-            runner_call_start = _runtime_stat_start()
-            with _CudaRuntimeTimer("runner_call_cuda_s", prepped_weights):
-                return_sum, turnover_sum, valid_count, final_weights = eager_runner(
-                    prepped_weights,
-                    future_returns.to(device=prepped_weights.device, dtype=prepped_weights.dtype),
-                    prepped_tradable,
-                    prepped_buy,
-                    prepped_sell,
-                    sample_mask,
-                    prev_init,
-                )
-            _add_backtest_elapsed_stat("runner_call_s", runner_call_start)
-
-    finalize_start = _runtime_stat_start()
-    denom = valid_count.clamp_min(1.0)
-    mean_return = return_sum / denom
-    mean_turnover = turnover_sum / denom
-    annualizer = torch.as_tensor(252.0, device=mean_return.device, dtype=mean_return.dtype)
-    loss = -float(gamma_sharpe) * (mean_return * annualizer)
-    if float(gamma_turnover) != 0.0:
-        loss = loss + float(gamma_turnover) * mean_turnover
-    _add_backtest_elapsed_stat("finalize_s", finalize_start)
-    _add_backtest_elapsed_stat("total_s", total_start)
-    return BacktestReducedResult(
-        loss=loss,
-        return_sum=return_sum,
-        turnover_sum=turnover_sum,
-        valid_count=valid_count,
-        final_weights=final_weights,
     )
 
 
@@ -2154,29 +2315,41 @@ def run_backtest_torch(
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     can_buy_mask: torch.Tensor | None = None,
     can_sell_mask: torch.Tensor | None = None,
+    can_short_open_mask: torch.Tensor | None = None,
+    force_short_cover_mask: torch.Tensor | None = None,
+    force_exit_mask: torch.Tensor | None = None,
     scan_chunk_size: int | None = None,
     return_weights_history: bool = True,
-    dense_mask_constraints: bool = False,
     initial_weights: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+    volume_limit_weights: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
-    strategy_returns, turnovers, weights_history, final_weights = _vectorized_backtest_torch(
+    strategy_returns, turnovers, weights_history, final_weights, final_alive = _vectorized_backtest_torch(
         weights,
         future_returns,
         tradable_mask,
         can_buy_mask,
         can_sell_mask,
+        can_short_open_mask,
+        force_short_cover_mask,
+        force_exit_mask,
         buy_fee_rate,
         sell_fee_rate,
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         gross_leverage=gross_leverage,
+        min_trade_weight=min_trade_weight,
+        portfolio_activation=portfolio_activation,
         scan_chunk_size=scan_chunk_size,
         return_weights_history=return_weights_history,
-        dense_mask_constraints=dense_mask_constraints,
         initial_weights=initial_weights,
+        initial_alive=initial_alive,
+        volume_limit_weights=volume_limit_weights,
     )
 
     return BacktestResultTensor(
@@ -2185,46 +2358,7 @@ def run_backtest_torch(
         turnovers=turnovers,
         weights_history=weights_history,
         final_weights=final_weights,
-    )
-
-
-def run_backtest_cupy(
-    weights,
-    future_returns,
-    tradable_mask,
-    benchmark_returns,
-    fee_per_side: float,
-) -> BacktestResult:
-    """GPU backtest core with CuPy, returned as numpy BacktestResult."""
-    if cp is None:
-        return run_backtest(
-            np.asarray(weights),
-            np.asarray(future_returns),
-            np.asarray(tradable_mask),
-            np.asarray(benchmark_returns),
-            fee_per_side,
-        )
-
-    w = cp.asarray(weights, dtype=cp.float32).copy()
-    r = cp.asarray(future_returns, dtype=cp.float32)
-    m = cp.asarray(tradable_mask).astype(cp.bool_)
-    b = cp.asarray(benchmark_returns, dtype=cp.float32)
-
-    w = cp.where(m, w, cp.zeros_like(w))
-    denom = cp.clip(w.sum(axis=1, keepdims=True), 1e-12, None)
-    w = w / denom
-
-    weights_history = cp.concatenate([cp.zeros_like(w[:1]), w[:-1]], axis=0)
-    prev = cp.concatenate([cp.zeros_like(weights_history[:1]), weights_history[:-1]], axis=0)
-    turnovers = cp.abs(weights_history - prev).sum(axis=1)
-    gross = (weights_history * r).sum(axis=1)
-    strategy_returns = gross - np.float32(fee_per_side) * turnovers
-
-    return BacktestResult(
-        strategy_returns=cp.asnumpy(strategy_returns.astype(cp.float32)),
-        benchmark_returns=cp.asnumpy(b.astype(cp.float32)),
-        turnovers=cp.asnumpy(turnovers.astype(cp.float32)),
-        weights_history=cp.asnumpy(weights_history.astype(cp.float32)),
+        final_alive=final_alive,
     )
 
 
@@ -2235,14 +2369,21 @@ def run_backtest_integer_shares(
     benchmark_returns: np.ndarray,
     can_buy_mask: np.ndarray | None = None,
     can_sell_mask: np.ndarray | None = None,
+    can_short_open_mask: np.ndarray | None = None,
+    force_short_cover_mask: np.ndarray | None = None,
+    force_exit_mask: np.ndarray | None = None,
     *,
     initial_capital: float = 1_000_000.0,
     buy_fee_rate: float = 0.001425,
     sell_fee_rate: float = 0.004425,
     long_only: bool = True,
     max_turnover_ratio: float = 0.0,
+    max_volume_participation: float = 0.0,
     gross_leverage: float = 1.0,
+    min_trade_weight: float = 0.0,
+    portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
     close_prices: np.ndarray | None = None,
+    daily_volumes: np.ndarray | None = None,
     symbols: list[str] | None = None,
     dates: np.ndarray | None = None,
     collect_holdings: bool = True,
@@ -2256,20 +2397,37 @@ def run_backtest_integer_shares(
     - Cash is a virtual asset with 0 daily return.
     """
     w = np.asarray(weights, dtype=np.float64)
+    r = np.nan_to_num(np.asarray(future_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     m = np.asarray(tradable_mask, dtype=bool)
     _require_side_masks_if_strict(can_buy_mask, can_sell_mask, context="integer-share backtest")
-    buy_m = m if can_buy_mask is None else np.asarray(can_buy_mask, dtype=bool)
-    sell_m = m if can_sell_mask is None else np.asarray(can_sell_mask, dtype=bool)
+    buy_m = (
+        m
+        if can_buy_mask is None
+        else np.asarray(can_buy_mask, dtype=bool) & m
+    )
+    sell_m = (
+        m
+        if can_sell_mask is None
+        else np.asarray(can_sell_mask, dtype=bool) & m
+    )
+    short_m = (
+        sell_m
+        if can_short_open_mask is None
+        else np.asarray(can_short_open_mask, dtype=bool) & sell_m & m
+    )
+    force_m = (
+        np.zeros_like(m, dtype=bool)
+        if force_short_cover_mask is None
+        else np.asarray(force_short_cover_mask, dtype=bool) & m
+    )
+    exit_m = (
+        np.zeros_like(m, dtype=bool)
+        if force_exit_mask is None
+        else np.asarray(force_exit_mask, dtype=bool)
+    )
     b = np.nan_to_num(np.asarray(benchmark_returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
     t_len, n_symbols = w.shape
-
-    if lot_size <= 0:
-        raise ValueError(f"lot_size must be positive, got {lot_size}")
-    if settlement_delay_days < 0:
-        raise ValueError(f"settlement_delay_days must be >= 0, got {settlement_delay_days}")
-    if execution_mode not in {"intraday_next_open", "overnight_tplus2"}:
-        raise ValueError(f"Unsupported execution_mode: {execution_mode}")
-
     if symbols is None:
         symbols = [f"SYM_{idx:04d}" for idx in range(n_symbols)]
     tw_symbol_mask = np.asarray([_is_tw_symbol(sym) for sym in symbols], dtype=bool)
@@ -2281,13 +2439,16 @@ def run_backtest_integer_shares(
     else:
         date_text = []
 
-    close_matrix = None
+    strategy_returns = np.zeros(t_len, dtype=np.float32)
+    turnovers = np.zeros(t_len, dtype=np.float32)
+    stock_weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
+
     if close_prices is not None:
-        close_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        if close_matrix.shape != (t_len, n_symbols):
+        price_matrix = np.nan_to_num(np.asarray(close_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        if price_matrix.shape != (t_len, n_symbols):
             raise ValueError(
                 "close_prices shape must match (num_days, num_symbols): "
-                f"expected {(t_len, n_symbols)}, got {close_matrix.shape}"
+                f"expected {(t_len, n_symbols)}, got {price_matrix.shape}"
             )
         if np.any(tw_symbol_mask):
             price_matrix[:, tw_symbol_mask] = _round_half_up(price_matrix[:, tw_symbol_mask], decimals=2)
@@ -2295,31 +2456,44 @@ def run_backtest_integer_shares(
     else:
         price_matrix = None
         current_prices = np.ones(n_symbols, dtype=np.float64)
+    if daily_volumes is not None:
+        volume_matrix = np.asarray(daily_volumes, dtype=np.float64)
+        if volume_matrix.shape != (t_len, n_symbols):
+            raise ValueError(
+                "daily_volumes shape must match (num_days, num_symbols): "
+                f"expected {(t_len, n_symbols)}, got {volume_matrix.shape}"
+            )
+    else:
+        volume_matrix = None
     shares = np.zeros(n_symbols, dtype=np.int64)
     cash = float(initial_capital)
     cash_hold_mode = False
+    portfolio_alive = True
 
-    open_matrix = None
-    if open_prices is not None:
-        open_matrix = np.nan_to_num(np.asarray(open_prices, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        if open_matrix.shape != (t_len, n_symbols):
-            raise ValueError(
-                "open_prices shape must match (num_days, num_symbols): "
-                f"expected {(t_len, n_symbols)}, got {open_matrix.shape}"
-            )
-
-    if execution_mode == "intraday_next_open" and open_matrix is None:
-        raise ValueError("intraday_next_open mode requires open_prices")
-    if execution_mode == "overnight_tplus2" and close_matrix is None:
-        raise ValueError("overnight_tplus2 mode requires close_prices (raw close)")
-
-    strategy_returns = np.zeros(t_len, dtype=np.float32)
-    turnovers = np.zeros(t_len, dtype=np.float32)
-    weights_history = np.zeros((t_len, n_symbols), dtype=np.float32)
     records: list[HoldingsRecord] = []
     gross_leverage = _resolve_exposure_budget(gross_leverage)
 
     for t in range(t_len):
+        if not portfolio_alive:
+            # Absorbing ruin: no later signal may recreate capital.
+            strategy_returns[t] = 0.0
+            turnovers[t] = 0.0
+            stock_weights_history[t] = 0.0
+            shares.fill(0)
+            cash = 0.0
+            if collect_holdings:
+                records.append(
+                    HoldingsRecord(
+                        date=date_text[t],
+                        symbol="CASH",
+                        shares=0,
+                        price=1.0,
+                        market_value=0.0,
+                        holding_ratio=0.0,
+                        is_cash=True,
+                    )
+                )
+            continue
         if cash_hold_mode:
             strategy_returns[t] = 0.0
             turnovers[t] = 0.0
@@ -2343,32 +2517,98 @@ def run_backtest_integer_shares(
 
         day_mask = m[t]
         target_w = np.nan_to_num(w[t], nan=0.0, posinf=0.0, neginf=0.0)
-        target_w[~day_mask] = 0.0
-
         target_w = _normalize_target_weights_row_numpy(
             target_w,
             long_only=long_only,
             gross_budget=gross_leverage,
+            portfolio_activation=portfolio_activation,
         )
+        target_w = _apply_min_trade_weight_row_numpy(target_w, min_trade_weight)
+        # Match the tensor path: normalize the model's complete target first,
+        # then leave unavailable allocations as cash/frozen holdings.  Masking
+        # before L1 normalization would silently redistribute a halted or
+        # terminal asset's desired allocation into unrelated symbols.
+        target_w[~day_mask] = 0.0
+        target_w[exit_m[t]] = 0.0
 
         equity_before = float(cash + np.dot(shares.astype(np.float64), current_prices))
         equity_before = max(equity_before, 1e-12)
+
+        # Terminal lifecycle settlement mirrors the canonical tensor path.
+        # A permanently non-tradable symbol is closed once at its last marked
+        # price, bypassing ordinary side/turnover/volume constraints. Temporary
+        # suspensions keep tradable=True and therefore remain frozen below.
+        terminal_mask = exit_m[t] & (shares != 0)
+        terminal_sell_qty = np.where(terminal_mask & (shares > 0), shares, 0)
+        terminal_buy_qty = np.where(terminal_mask & (shares < 0), -shares, 0)
+        terminal_sell_notional = float(
+            np.dot(terminal_sell_qty.astype(np.float64), current_prices)
+        )
+        terminal_buy_notional = float(
+            np.dot(terminal_buy_qty.astype(np.float64), current_prices)
+        )
+        if bool(terminal_mask.any()):
+            cash += (
+                terminal_sell_notional
+                - terminal_sell_notional * sell_fee_rate
+                - terminal_buy_notional
+                - terminal_buy_notional * buy_fee_rate
+            )
+            shares[terminal_mask] = 0
 
         desired_value = equity_before * target_w
         safe_prices = np.where(current_prices > 1e-12, current_prices, np.inf)
         raw_target_shares = desired_value / safe_prices
         desired_shares = _floor_to_int64(raw_target_shares, non_negative=True) if long_only else _trunc_to_int64(raw_target_shares)
+        if not long_only:
+            desired_shares[force_m[t] & (desired_shares < 0)] = 0
 
-        # Non-tradable symbols keep existing shares.
+        # Terminal-settled symbols stay at zero. A temporary suspension remains
+        # tradable and is frozen by the ordinary side masks below.
         desired_shares[~day_mask] = shares[~day_mask]
 
         can_buy_day = buy_m[t]
         can_sell_day = sell_m[t]
+        can_short_day = short_m[t]
         delta = desired_shares - shares
-        desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
-        desired_shares[(delta < 0) & ~can_sell_day] = shares[(delta < 0) & ~can_sell_day]
+        if long_only:
+            desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
+            desired_shares[(delta < 0) & ~can_sell_day] = shares[(delta < 0) & ~can_sell_day]
+        else:
+            desired_shares[(delta > 0) & ~can_buy_day] = shares[(delta > 0) & ~can_buy_day]
+            constrained_shares = desired_shares.copy()
+            down = constrained_shares < shares
+            reduce_long = down & (shares > 0) & (constrained_shares >= 0) & ~can_sell_day
+            constrained_shares[reduce_long] = shares[reduce_long]
+
+            cross_from_long = down & (shares > 0) & (constrained_shares < 0)
+            blocked_cross_sell = cross_from_long & ~can_sell_day
+            constrained_shares[blocked_cross_sell] = shares[blocked_cross_sell]
+            blocked_cross_short = cross_from_long & can_sell_day & ~can_short_day
+            constrained_shares[blocked_cross_short] = 0
+
+            open_or_increase_short = down & (shares <= 0) & (constrained_shares < shares) & ~can_short_day
+            constrained_shares[open_or_increase_short] = shares[open_or_increase_short]
+            desired_shares = constrained_shares
 
         delta = desired_shares - shares
+        # Match the canonical tensor constraint order: first apply each
+        # symbol's participation cap, then apply the portfolio-wide turnover
+        # cap to the remaining executable order.  The operations do not
+        # commute when only some symbols are volume constrained.
+        if max_volume_participation > 0.0 and volume_matrix is not None:
+            volume_day = volume_matrix[t]
+            valid_volume = np.isfinite(volume_day) & (volume_day >= 0.0)
+            max_qty = np.full(delta.shape, np.iinfo(np.int64).max, dtype=np.int64)
+            if np.any(valid_volume):
+                capped = np.floor(volume_day[valid_volume] * float(max_volume_participation))
+                capped = np.clip(capped, 0.0, float(np.iinfo(np.int64).max))
+                max_qty[valid_volume] = capped.astype(np.int64, copy=False)
+            abs_delta = np.abs(delta.astype(np.int64, copy=False))
+            clipped_abs = np.minimum(abs_delta, max_qty)
+            desired_shares = shares + (np.sign(delta.astype(np.float64)) * clipped_abs.astype(np.float64)).astype(np.int64)
+            delta = desired_shares - shares
+
         if max_turnover_ratio > 0.0:
             traded_notional_before_cap = float(np.dot(np.abs(delta).astype(np.float64), current_prices))
             max_traded_notional = float(equity_before * max_turnover_ratio)
@@ -2378,15 +2618,54 @@ def run_backtest_integer_shares(
                 desired_shares = shares + scaled_delta.astype(np.int64)
                 delta = desired_shares - shares
 
-        # Risk-budget guardrail: enforce |long| + |short| <= gross_leverage using
-        # current-day prices before fees and next-day return realization.
+        forced_cover_now = np.zeros(n_symbols, dtype=bool)
         if not long_only:
-            gross_notional = float(np.dot(np.abs(desired_shares).astype(np.float64), current_prices))
-            gross_cap_notional = float(equity_before * gross_leverage)
-            if gross_notional > gross_cap_notional + 1e-9 and gross_notional > 0.0:
-                scale = max(0.0, gross_cap_notional / gross_notional)
-                desired_shares = _trunc_to_int64(desired_shares.astype(np.float64) * scale)
-                delta = desired_shares - shares
+            forced_cover_now = force_m[t] & (shares < 0) & can_buy_day
+            desired_shares[forced_cover_now] = np.maximum(
+                desired_shares[forced_cover_now],
+                0,
+            )
+            delta = desired_shares - shares
+
+        # Risk-budget guardrail: enforce gross exposure for both long-only and
+        # long/short portfolios. Preserve every executable reduction and every
+        # frozen position; only scale exposure-expanding shares. Scaling the
+        # whole portfolio would fabricate a sale when can_sell=False or a cover
+        # when can_buy=False.
+        gross_notional = float(
+            np.dot(np.abs(desired_shares).astype(np.float64), current_prices)
+        )
+        gross_cap_notional = float(equity_before * gross_leverage)
+        if gross_notional > gross_cap_notional + 1e-9 and gross_notional > 0.0:
+            same_side = (
+                shares.astype(np.float64) * desired_shares.astype(np.float64)
+            ) > 0.0
+            reduced_abs = np.where(
+                same_side,
+                np.minimum(np.abs(shares), np.abs(desired_shares)),
+                0,
+            )
+            reduced_base = (
+                np.sign(shares.astype(np.float64)) * reduced_abs.astype(np.float64)
+            ).astype(np.int64)
+            expansion = desired_shares - reduced_base
+            base_notional = float(
+                np.dot(np.abs(reduced_base).astype(np.float64), current_prices)
+            )
+            expansion_notional = float(
+                np.dot(np.abs(expansion).astype(np.float64), current_prices)
+            )
+            expansion_budget = max(0.0, gross_cap_notional - base_notional)
+            scale = (
+                min(1.0, expansion_budget / expansion_notional)
+                if expansion_notional > 0.0
+                else 0.0
+            )
+            scaled_expansion = _trunc_to_int64(
+                expansion.astype(np.float64) * scale
+            )
+            desired_shares = reduced_base + scaled_expansion
+            delta = desired_shares - shares
 
         sell_qty = np.clip(-delta, 0, None)
         buy_qty = np.clip(delta, 0, None)
@@ -2398,9 +2677,39 @@ def run_backtest_integer_shares(
         max_affordable_buy = available_cash / (1.0 + buy_fee_rate) if buy_fee_rate >= 0.0 else available_cash
 
         if buy_notional > max_affordable_buy + 1e-9 and buy_notional > 0.0:
-            scale = max(0.0, max_affordable_buy / buy_notional)
-            scaled_buy_qty = buy_qty.astype(np.float64) * scale
-            buy_qty = _floor_to_int64(scaled_buy_qty, non_negative=True)
+            # Forced short covers are mandatory.  Execute them in full and
+            # shrink only discretionary buys to the remaining cash capacity.
+            # A temporarily negative cash balance is preferable to retaining
+            # an explicitly illegal short while positive marked equity remains.
+            mandatory_buy_qty = np.where(
+                forced_cover_now,
+                np.minimum(buy_qty, np.maximum(-shares, 0)),
+                0,
+            )
+            discretionary_buy_qty = buy_qty - mandatory_buy_qty
+            mandatory_buy_notional = float(
+                np.dot(mandatory_buy_qty.astype(np.float64), current_prices)
+            )
+            mandatory_cost = mandatory_buy_notional * (1.0 + buy_fee_rate)
+            discretionary_cash = max(0.0, available_cash - mandatory_cost)
+            max_discretionary_notional = (
+                discretionary_cash / (1.0 + buy_fee_rate)
+                if buy_fee_rate >= 0.0
+                else discretionary_cash
+            )
+            discretionary_notional = float(
+                np.dot(discretionary_buy_qty.astype(np.float64), current_prices)
+            )
+            scale = (
+                min(1.0, max_discretionary_notional / discretionary_notional)
+                if discretionary_notional > 0.0
+                else 0.0
+            )
+            scaled_discretionary_qty = _floor_to_int64(
+                discretionary_buy_qty.astype(np.float64) * scale,
+                non_negative=True,
+            )
+            buy_qty = mandatory_buy_qty + scaled_discretionary_qty
             desired_shares = shares - sell_qty + buy_qty
             delta = desired_shares - shares
             sell_qty = np.clip(-delta, 0, None)
@@ -2433,10 +2742,26 @@ def run_backtest_integer_shares(
                 if candidate_prices.size > 0:
                     min_buy_cost = float(candidate_prices.min() * (1.0 + buy_fee_rate))
                     if max_affordable_buy + 1e-12 < min_buy_cost:
-                        strategy_returns[t] = 0.0
-                        turnovers[t] = 0.0
+                        # ``desired_shares`` is all cash at this point.  Settle
+                        # every executable sale before entering permanent cash
+                        # mode; merely zeroing ``shares`` would erase holdings
+                        # without crediting proceeds, fees, or turnover.  Cash
+                        # already includes any terminal settlement above.
+                        cash += sell_notional - sell_notional * sell_fee_rate
+                        shares = desired_shares.copy()
+                        traded_notional = (
+                            sell_notional
+                            + terminal_buy_notional
+                            + terminal_sell_notional
+                        )
+                        equity_cash = max(float(cash), 1e-12)
+                        strategy_returns[t] = np.float32(
+                            np.log(equity_cash / equity_before)
+                        )
+                        turnovers[t] = np.float32(
+                            traded_notional / equity_before
+                        )
                         stock_weights_history[t] = 0.0
-                        shares.fill(0)
                         cash_hold_mode = True
                         if collect_holdings:
                             records.append(
@@ -2455,7 +2780,12 @@ def run_backtest_integer_shares(
         buy_fee = buy_fee_rate * buy_notional
         sell_fee = sell_fee_rate * sell_notional
         fee = buy_fee + sell_fee
-        traded_notional = buy_notional + sell_notional
+        traded_notional = (
+            buy_notional
+            + sell_notional
+            + terminal_buy_notional
+            + terminal_sell_notional
+        )
 
         shares = desired_shares
         cash = cash + sell_notional - sell_fee - buy_notional - buy_fee
@@ -2466,28 +2796,17 @@ def run_backtest_integer_shares(
         equity_after_trade = float(cash + stock_market_values.sum())
         equity_after_trade = max(equity_after_trade, 1e-12)
 
-        # Output normalization for holdings report:
-        # 1) tanh keeps signed direction in (-1, 1)
-        # 2) L1 normalization keeps total absolute exposure at 1.
-        stock_holding_ratio_raw = stock_market_values / equity_after_trade
-        cash_ratio_raw = float(cash / equity_after_trade)
-        ratio_vec = np.empty(n_symbols + 1, dtype=np.float64)
-        ratio_vec[0] = cash_ratio_raw
-        ratio_vec[1:] = stock_holding_ratio_raw
-        ratio_vec = np.tanh(ratio_vec)
-        l1 = float(np.sum(np.abs(ratio_vec), dtype=np.float64))
-        if l1 > 1e-12:
-            ratio_vec /= l1
-        else:
-            ratio_vec.fill(0.0)
-
-        stock_holding_ratio = ratio_vec[1:]
+        # These are realised accounting weights, not another model target.
+        # Activation/L1 was already applied before sizing orders.  Applying it
+        # again here distorts short portfolios (for example, stock=-1 and
+        # cash=2 must remain those exact equity ratios and sum to one).
+        stock_holding_ratio = stock_market_values / equity_after_trade
+        cash_ratio = float(cash / equity_after_trade)
 
         stock_weights_history[t] = stock_holding_ratio.astype(np.float32)
         turnovers[t] = float(traded_notional / equity_before)
 
         if collect_holdings:
-            cash_ratio = float(ratio_vec[0])
             day_rows: list[HoldingsRecord] = []
             day_rows.append(
                 HoldingsRecord(
@@ -2517,7 +2836,7 @@ def run_backtest_integer_shares(
                         is_cash=False,
                     )
                 )
-            day_rows.sort(key=lambda item: item.holding_ratio, reverse=True)
+            day_rows.sort(key=holding_record_abs_sort_key)
             records.extend(day_rows)
 
         # PnL follows the canonical return label (adj close when available).
@@ -2529,9 +2848,18 @@ def run_backtest_integer_shares(
         next_prices = np.where(np.isfinite(next_prices) & (next_prices > 1e-12), next_prices, current_prices)
 
         equity_end = float(equity_after_trade + np.dot(stock_market_values, simple_returns))
-        equity_end = max(equity_end, 1e-12)
-
-        strategy_returns[t] = np.float32(np.log(equity_end / equity_before))
+        net_simple_return = equity_end / equity_before - 1.0
+        strategy_returns[t] = _portfolio_simple_returns_to_log_numpy(
+            np.asarray([net_simple_return], dtype=np.float32)
+        )[0]
+        wealth_factor = 1.0 + net_simple_return
+        if (
+            not math.isfinite(wealth_factor)
+            or wealth_factor <= _MIN_PORTFOLIO_WEALTH_FACTOR
+        ):
+            portfolio_alive = False
+            shares.fill(0)
+            cash = 0.0
         current_prices = next_prices
 
     return (
@@ -2539,7 +2867,7 @@ def run_backtest_integer_shares(
             strategy_returns=strategy_returns,
             benchmark_returns=b.astype(np.float32),
             turnovers=turnovers,
-            weights_history=weights_history,
+            weights_history=stock_weights_history,
         ),
         records,
     )

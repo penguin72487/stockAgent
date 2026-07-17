@@ -59,10 +59,17 @@ def test_backtest_report_plots_handle_nonfinite_extremes_without_runtime_warning
         report.plot_leverage_curve(result, dates, tmp_path / "leverage.png")
         report.plot_configured_leverage_equity_curve(result, dates, tmp_path / "configured_leverage.png")
         report.plot_fold_first_year_returns([dates], [strategy_returns], [benchmark_returns], tmp_path / "fold.png")
+        report.plot_fold_first_year_returns_log10(
+            [dates],
+            [strategy_returns],
+            [benchmark_returns],
+            tmp_path / "fold_log10.png",
+        )
         report.plot_first_year_fold_metric_bars([1], [strategy_returns], [benchmark_returns], tmp_path / "bars.png")
         report.plot_first_year_turnover_concentration([1], [result.turnovers], [weights], tmp_path / "turnover.png")
         report.plot_first_test_year_only(dates, strategy_returns, benchmark_returns, tmp_path / "first_year.png")
 
     assert (tmp_path / "annual.png").exists()
     assert (tmp_path / "equity.png").exists()
+    assert (tmp_path / "fold_log10.png").exists()
     assert (tmp_path / "first_year.png").exists()

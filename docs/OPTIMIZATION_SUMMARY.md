@@ -405,7 +405,7 @@ A: 對比訓練時間、模型質量（Sharpe、最大回撤），同時監控 p
 ### Python 依賴
 
 ```bash
-pip install polars pyarrow pandas numpy torch scikit-learn
+pip install polars pyarrow numpy torch scikit-learn
 ```
 
 ### 導入模板
@@ -443,4 +443,3 @@ def benchmark_optimization():
     params = sum(p.numel() for p in model.parameters())
     print(f"模型參數：{params:,}")  # 應 <50K
 ```
-

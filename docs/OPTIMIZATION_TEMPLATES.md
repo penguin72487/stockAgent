@@ -806,7 +806,7 @@ def main_parallel(config_path: str, num_gpus: int = None):
     if successful_folds:
         print("\n各 Fold 指標：")
         
-        import pandas as pd
+        import polars as pl
         
         metrics_list = []
         for r in successful_folds:
@@ -814,7 +814,7 @@ def main_parallel(config_path: str, num_gpus: int = None):
         
         # 聚合指標
         if metrics_list:
-            df = pd.DataFrame(metrics_list)
+            df = pl.DataFrame(metrics_list)
             print(df)
             
             # 保存聚合報告
@@ -951,4 +951,3 @@ class ImprovedSharpeLoss(nn.Module):
   □ 10. 測試多 GPU 訓練
   □ 效果驗證：N GPU 下 N 倍加速
 ```
-

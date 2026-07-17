@@ -5,7 +5,7 @@ import os
 import torch
 from torch import nn
 
-from stockagent.models.normalization import masked_tanh_l1_weights
+from stockagent.models.normalization import masked_activation_l1_weights, normalize_portfolio_activation
 
 
 class _FeatureResBlock(nn.Module):
@@ -49,29 +49,25 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         stock_embedding_dim: int,
         stock_hidden_dim: int,
         stock_n_blocks: int,
-        temporal_hidden_dim: int,
-        temporal_blocks: int,
-        temporal_kernel_size: int,
         cross_hidden_dim: int,
         cross_heads: int,
         cross_layers: int,
         dropout: float,
         regime_classes: int = 3,
         long_only: bool = True,
+        portfolio_activation: str = "identity",
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
         candidate_top_m: int = 128,
         portfolio_top_k: int = 10,
     ) -> None:
         super().__init__()
-        _ = temporal_hidden_dim
-        _ = temporal_blocks
-        _ = temporal_kernel_size
 
         self.lookback = int(lookback)
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.long_only = bool(long_only)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.runtime_shape_check = bool(runtime_shape_check)
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
         self.regime_classes = max(2, int(regime_classes))
@@ -174,7 +170,12 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         topk_indices_in_candidates = torch.topk(masked_logits, k=k, dim=1).indices
         topk_mask = torch.zeros_like(candidate_mask)
         topk_mask = topk_mask.scatter(1, topk_indices_in_candidates, True) & candidate_mask
-        candidate_weights = masked_tanh_l1_weights(portfolio_logits, topk_mask, long_only=True)
+        candidate_weights = masked_activation_l1_weights(
+            portfolio_logits,
+            topk_mask,
+            long_only=True,
+            activation=self.portfolio_activation,
+        )
         return _scatter_candidates(candidate_weights, candidate_indices, n_symbols)
 
     def _sparse_long_short_weights(
@@ -194,7 +195,12 @@ class CrossSectionalTemporalPortfolioModel(nn.Module):
         short_indices = torch.topk(short_scores, k=k, dim=1).indices
         short_mask = torch.zeros_like(candidate_mask).scatter(1, short_indices, True) & candidate_mask & ~long_mask
 
-        candidate_weights = masked_tanh_l1_weights(portfolio_logits, long_mask | short_mask, long_only=False)
+        candidate_weights = masked_activation_l1_weights(
+            portfolio_logits,
+            long_mask | short_mask,
+            long_only=False,
+            activation=self.portfolio_activation,
+        )
         return _scatter_candidates(candidate_weights, candidate_indices, n_symbols)
 
     def forward(

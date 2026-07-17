@@ -1,0 +1,46 @@
+base_config: tw_public.yaml
+
+experiment_name: tw-stock-transformer-market-public-data-latefold-robust
+
+runner:
+  output_dir: artifacts/diagnostics/tw_public_latefold_robust_decoupled
+  mode: train
+  resume: false
+  post_train_infer: true
+  start_fold: 24
+
+trading:
+  min_trade_weight: 0.0005
+  portfolio_activation: identity
+
+training:
+  financial_transformer:
+    candle_dropout: 0.0
+  loss_portfolio_activation: identity
+  # Keep the differentiable loss dense; the validation-selected trading
+  # threshold is applied only by evaluation and inference backtests.
+  loss_min_trade_weight: 0.0
+  epochs: 120
+  early_stopping_no_improve_ratio: 0.10
+  early_stopping_min_delta: 0.00025
+  learning_rate: 0.0001
+  weight_decay: 0.03
+
+  multitask_loss:
+    rank_ic_weight: 0.00
+    # Cross-sectional argsort made the full-objective validation graph spend
+    # more than four minutes in TorchInductor before finishing one epoch on
+    # the full TW universe. Keep the production objective O(S).
+    return_rank_ic_weight: 0.00
+    direction_weight: 0.00
+    volatility_regime_weight: 0.00
+    concentration_weight: 0.0002
+    net_exposure_weight: 0.00
+
+  transformer_base_portfolio:
+    input_dropout: 0.05
+    dropout: 0.10
+    portfolio_output_mode: logits
+
+evaluation:
+  gamma_turnover: 0.02

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,17 +11,28 @@ import polars as pl
 import pyarrow.parquet as pq
 import requests
 
-from common import resolve_end_date, run_parallel_tasks
+from common import SharedRateLimiter, describe_rate_limit, resolve_end_date, resolve_request_interval, run_parallel_tasks
 
 API_BASE = "https://api.frankfurter.app"
 DEFAULT_SYMBOLS_PATH = Path("data_yahoo") / "forex" / "symbols.csv"
+_RATE_LIMITER: SharedRateLimiter | None = None
+_HTTP_LOCAL = threading.local()
 
 
 def _read_parquet(path: Path) -> pl.DataFrame:
     return pl.from_arrow(pq.read_table(path))
 
 
+def _read_parquet_row_count(path: Path) -> int:
+    return int(pq.ParquetFile(path, memory_map=True).metadata.num_rows)
+
+
+def _read_date_column(path: Path) -> pl.DataFrame:
+    return pl.from_arrow(pq.read_table(path, columns=["date"], memory_map=True))
+
+
 def _write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(frame.to_arrow(), path, compression="snappy", write_statistics=True)
 
 @dataclass(slots=True)
@@ -59,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols-file", default=None, help="Optional text file with one 6-letter pair per line")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent workers")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help="Global minimum seconds between API requests. Default uses Frankfurter public profile.",
+    )
     parser.add_argument("--refresh", action="store_true", help="Re-download even if parquet exists")
     parser.add_argument(
         "--incremental",
@@ -74,7 +92,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def _get_json(url: str, timeout: int) -> dict:
-    response = requests.get(url, timeout=timeout)
+    if _RATE_LIMITER is not None:
+        _RATE_LIMITER.wait()
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _HTTP_LOCAL.session = session
+    response = session.get(url, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, dict):
@@ -159,6 +186,30 @@ def _max_frame_date(frame: pl.DataFrame) -> str | None:
     return latest.date().isoformat()
 
 
+def _existing_row_count_and_latest_date(path: Path) -> tuple[int, str | None]:
+    rows = _read_parquet_row_count(path)
+    try:
+        metadata = pq.read_metadata(path)
+        schema = metadata.schema.to_arrow_schema()
+        date_idx = schema.get_field_index("date")
+        if date_idx >= 0:
+            latest = None
+            for row_group_idx in range(metadata.num_row_groups):
+                stats = metadata.row_group(row_group_idx).column(date_idx).statistics
+                if stats is None or not bool(getattr(stats, "has_min_max", False)):
+                    continue
+                value = stats.max
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="ignore")
+                parsed = value.date().isoformat() if isinstance(value, datetime) else str(value)[:10]
+                latest = parsed if latest is None else max(latest, parsed)
+            if latest is not None:
+                return rows, latest
+    except Exception:
+        pass
+    return rows, _max_frame_date(_read_date_column(path))
+
+
 def _normalize_rate_rows(rows: list[dict[str, object]], fetch_start_date: str, end_date: str) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
@@ -192,15 +243,14 @@ def _download_pair(
     incremental: bool,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
-    existing_frame: pl.DataFrame | None = None
     existing_rows = 0
+    has_existing = False
     fetch_start_date = start_date
 
     if output_path.exists() and incremental:
         try:
-            existing_frame = _read_parquet(output_path)
-            existing_rows = int(existing_frame.height)
-            latest_date = _max_frame_date(existing_frame)
+            existing_rows, latest_date = _existing_row_count_and_latest_date(output_path)
+            has_existing = existing_rows > 0
             if latest_date is not None:
                 next_date = (datetime.strptime(latest_date, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
                 fetch_start_date = max(start_date, next_date)
@@ -222,7 +272,7 @@ def _download_pair(
 
     if output_path.exists() and not refresh and not incremental:
         try:
-            rows = _read_parquet(output_path).height
+            rows = _read_parquet_row_count(output_path)
             return DownloadResult(code=record.code, status="skipped_existing", rows=int(rows), output_path=str(output_path))
         except Exception as exc:
             return DownloadResult(
@@ -267,7 +317,8 @@ def _download_pair(
         if frame.is_empty():
             return DownloadResult(code=record.code, status="empty", rows=0, output_path=None, message="No usable rate points after date filtering")
 
-        if incremental and existing_frame is not None:
+        if incremental and has_existing:
+            existing_frame = _read_parquet(output_path)
             merged = (
                 pl.concat([_normalize_date_frame(existing_frame), frame], how="diagonal_relaxed")
                 .sort("date")
@@ -289,8 +340,12 @@ def _download_pair(
 
 
 def main() -> None:
+    global _RATE_LIMITER
     args = parse_args()
     incremental_mode = args.incremental or args.mode == "daily-update"
+    request_interval = resolve_request_interval("frankfurter_public", args.request_interval)
+    _RATE_LIMITER = SharedRateLimiter(request_interval, name="frankfurter_public")
+    print(f"[frankfurter] {describe_rate_limit('frankfurter_public', request_interval)}", flush=True)
 
     if args.refresh and incremental_mode:
         raise RuntimeError("--refresh cannot be combined with daily incremental mode (--mode daily-update or --incremental)")

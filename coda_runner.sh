@@ -70,60 +70,45 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 2
 fi
 
-read -r ENV_NAME OUTPUT_DIR REQUIRE_CUDA < <("$PYTHON_BIN" - "$CONFIG_PATH" <<'PY'
+read -r OUTPUT_DIR REQUIRE_CUDA < <("$PYTHON_BIN" - "$CONFIG_PATH" <<'PY'
 import sys
-import yaml
+from stockagent.config import load_config
 
-config_path = sys.argv[1]
-with open(config_path, "r", encoding="utf-8") as f:
-    raw = yaml.safe_load(f)
-runner = raw.get("runner", {})
-environment = raw.get("environment", {})
+config = load_config(sys.argv[1])
 print(
-    environment.get("conda_env", ""),
-    runner.get("output_dir", "artifacts"),
-    "1" if runner.get("require_cuda", True) else "0",
+    config.runner.output_dir,
+    "1" if config.runner.require_cuda else "0",
 )
 PY
 )
-
-if [[ -z "$ENV_NAME" ]]; then
-  echo "Unable to resolve conda env name from $CONFIG_PATH." >&2
-  exit 2
-fi
 
 mkdir -p "$OUTPUT_DIR"
 
 MERGED_CONFIG_PATH="$OUTPUT_DIR/generated_config_$(date +%Y%m%d_%H%M%S).yaml"
 
-cp "$CONFIG_PATH" "$MERGED_CONFIG_PATH"
-
-if [[ "$ENV_NAME" == "fintech" && -x "$FINTECH_ENV_PATH/bin/python" ]]; then
-  PY_RUNNER=("$FINTECH_ENV_PATH/bin/python")
-elif [[ -x "$FINTECH_MAMBA_BIN" ]]; then
-  PY_RUNNER=("$FINTECH_MAMBA_BIN" run -n "$ENV_NAME" python)
-elif command -v mamba >/dev/null 2>&1; then
-  PY_RUNNER=(mamba run -n "$ENV_NAME" python)
-elif command -v conda >/dev/null 2>&1; then
-  PY_RUNNER=(conda run -n "$ENV_NAME" python)
-else
-  echo "Neither mamba nor conda found in PATH." >&2
-  exit 2
-fi
-
-echo "[runner] env=$ENV_NAME base_config=$CONFIG_PATH merged_config=$MERGED_CONFIG_PATH output=$OUTPUT_DIR require_cuda=$REQUIRE_CUDA"
-"${PY_RUNNER[@]}" - "$MERGED_CONFIG_PATH" <<'PY'
+"$PYTHON_BIN" - "$CONFIG_PATH" "$MERGED_CONFIG_PATH" <<'PY'
 import sys
 import yaml
+from stockagent.config import _load_raw_config
 
-p = sys.argv[1]
-with open(p, "r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f)
+raw = _load_raw_config(sys.argv[1])
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    yaml.safe_dump(raw, handle, sort_keys=False, allow_unicode=True)
+PY
 
-t = cfg.get("training", {})
+PY_RUNNER=("$PYTHON_BIN")
+
+echo "[runner] python=$PYTHON_BIN base_config=$CONFIG_PATH merged_config=$MERGED_CONFIG_PATH output=$OUTPUT_DIR require_cuda=$REQUIRE_CUDA"
+"${PY_RUNNER[@]}" - "$MERGED_CONFIG_PATH" <<'PY'
+import sys
+from stockagent.config import load_config
+
+cfg = load_config(sys.argv[1])
+
 print("[runner] effective training config: "
-      f"epochs={t.get('epochs')} batch_size={t.get('batch_size')} "
-      f"lr={t.get('learning_rate')} hidden_dim={t.get('hidden_dim')}")
+      f"epochs={cfg.training.epochs} batch_size_train={cfg.training.batch_size_train} "
+      f"batch_size_eval={cfg.training.batch_size_eval} "
+      f"lr={cfg.training.learning_rate} model={cfg.training.model_name}")
 PY
 
 "${PY_RUNNER[@]}" - "$REQUIRE_CUDA" <<'PY'

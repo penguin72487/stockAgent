@@ -5,7 +5,7 @@
 我已為你的項目生成了 **3 份詳細分析文檔**:
 
 ### 1. 📊 **ARCHITECTURE_REVIEW.md** - 架構與Bug分析
-**檔案位置:** `/root/stockAgent/ARCHITECTURE_REVIEW.md`
+**檔案位置:** `ARCHITECTURE_REVIEW.md`
 
 包含:
 - ✅ 完整的數據流架構圖 (Parquet → Panel → Batches → Model)
@@ -23,7 +23,7 @@
 ---
 
 ### 2. ⚙️ **FIXES_IMPLEMENTATION.md** - 修復方案 (代碼級別)
-**檔案位置:** `/root/stockAgent/FIXES_IMPLEMENTATION.md`
+**檔案位置:** `FIXES_IMPLEMENTATION.md`
 
 包含:
 - ✅ **5個優先修復** (完整代碼實現):
@@ -40,7 +40,7 @@
 ---
 
 ### 3. 🏗️ **CODE_ORGANIZATION.md** - 代碼結構重構指南
-**檔案位置:** `/root/stockAgent/CODE_ORGANIZATION.md`
+**檔案位置:** `CODE_ORGANIZATION.md`
 
 包含:
 - ✅ **新舊目錄結構對比**
@@ -92,7 +92,8 @@ cat CODE_ORGANIZATION.md        # 明白如何整理
 3. **第三天** - 完成其他修復 + 驗證 (60分鐘)
    ```bash
    # 運行完整測試套件
-   python -m pytest tests/
+   source scripts/runtime_env.sh
+   run_fintech_python -m pytest -q -s test
    ```
 
 ### **Step 2: 代碼整理 (2-3 天)**
@@ -328,4 +329,3 @@ python train.py --config configs/experiment_baseline.yaml
 你的項目有 **8 個可以立即修復的 Bug**，修復後預計可獲得 **80% 訓練速度提升** + **70% 穩定性改進**。
 
 現在就開始吧! 🚀
-

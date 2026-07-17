@@ -9,6 +9,8 @@ import pytest
 import torch
 from torch import nn
 
+from stockagent.cross_asset_runner import _default_output_root, parse_args as parse_cross_asset_args
+from stockagent import explainability_cross_asset as cross_asset_module
 from stockagent.explainability_cross_asset import (
     MODULE_NAME,
     CrossAssetTransmissionSettings,
@@ -17,6 +19,20 @@ from stockagent.explainability_cross_asset import (
     _process_cross_asset_graph_edges,
 )
 from stockagent.models.transformer_base_portfolio import TransformerBasePortfolioModel
+
+
+def test_standalone_cross_asset_cli_uses_independent_complete_first_year_defaults() -> None:
+    args = parse_cross_asset_args(["--config", "configs/markets/tw_public.yaml"])
+
+    assert args.first_test_year_only is True
+    assert args.max_rows == 0
+    assert args.max_sources == 0
+    assert args.max_targets == 0
+    assert args.progress is True
+    assert args.strict is True
+    assert _default_output_root(Path("artifacts/markets/tw_public_lantent")) == Path(
+        "artifacts/markets/tw_public_lantent/explainability"
+    )
 
 
 class IndependentScoringModel(nn.Module):
@@ -69,6 +85,23 @@ def _batch(rows: int = 4, lookback: int = 3, symbols: int = 5, features: int = 4
     }
 
 
+class LazyBatchSource:
+    def __init__(self, batch: dict[str, torch.Tensor]) -> None:
+        self._batch = batch
+        self.num_rows = int(batch["x"].size(0))
+        self.lookback = int(batch["x"].size(1))
+        self.num_symbols = int(batch["x"].size(2))
+        self.num_features = int(batch["x"].size(3))
+        self.materialize_calls: list[tuple[int, int]] = []
+
+    def materialize(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        self.materialize_calls.append((int(start), int(end)))
+        return {
+            key: value[int(start) : int(end)]
+            for key, value in self._batch.items()
+        }
+
+
 def _feature_names(features: int = 4) -> list[str]:
     return ["ret_feature", "volume_feature", "range_feature", "open_gap_feature"][:features]
 
@@ -110,12 +143,15 @@ def _graph_edge_frame(symbols: int = 4, shocks: tuple[str, ...] = ("zero", "volu
     return pl.DataFrame(rows)
 
 
+def test_cross_asset_graph_default_backend_is_cugraph() -> None:
+    assert CrossAssetTransmissionSettings().graph_backend == "cugraph"
+
+
 def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None:
     edges = _graph_edge_frame()
     result = _process_cross_asset_graph_edges(
         edges,
         CrossAssetTransmissionSettings(
-            top_edges=3,
             graph_backend="auto",
             graph_benchmark_min_edges=edges.height + 1,
         ),
@@ -124,9 +160,9 @@ def test_cross_asset_graph_auto_keeps_polars_below_benchmark_min_edges() -> None
     assert result.backend == "polars"
     assert result.benchmark["selection_reason"] == "below_min_edges"
     assert result.benchmark["backends"]["polars"]["elapsed_s"] >= 0
-    assert result.top_edges.height == 3
-    assert result.top_edges["validated_transmission"].to_list() == sorted(
-        result.top_edges["validated_transmission"].to_list(),
+    assert result.edges.height == edges.height
+    assert result.edges["validated_transmission"].to_list() == sorted(
+        result.edges["validated_transmission"].to_list(),
         reverse=True,
     )
 
@@ -141,7 +177,6 @@ def test_cross_asset_graph_cugraph_matches_polars_when_available() -> None:
     result = _process_cross_asset_graph_edges(
         edges,
         CrossAssetTransmissionSettings(
-            top_edges=5,
             graph_backend="cugraph",
             graph_benchmark_min_edges=0,
         ),
@@ -280,6 +315,136 @@ def test_cross_asset_shape_nan_safety_and_missing_shocks(tmp_path: Path) -> None
     assert np.isfinite(values).all()
 
 
+def test_cross_asset_streams_complete_raw_edges_and_reuses_online_graph_reduction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("STOCKAGENT_CROSS_ASSET_STREAM_EDGE_THRESHOLD", "1")
+    batch = _batch(rows=3, lookback=2, symbols=4, features=4)
+    summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        batch,
+        feature_names=_feature_names(),
+        symbols=_symbols(4),
+        dates=_dates(3),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=4,
+            max_targets=4,
+            source_chunk_size=2,
+            shocks=("zero", "liquidity"),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+        ),
+        device=torch.device("cpu"),
+    )
+
+    base = tmp_path / MODULE_NAME / "tables"
+    raw_edges = pl.read_parquet(base / "edge_metrics.parquet")
+    graph_edges = pl.read_csv(base / "graph_edges.csv")
+    assert raw_edges.height == 2 * 4 * 4
+    assert graph_edges.height == 4 * 4
+    assert summary["graph_benchmark"]["selection_reason"] == "streamed_raw_edges_and_online_graph_reduction"
+
+
+def test_lazy_batch_source_matches_eager_and_materializes_once_per_row_stage(tmp_path: Path) -> None:
+    batch = _batch(rows=4, lookback=3, symbols=5, features=4)
+    settings = CrossAssetTransmissionSettings(
+        max_sources=5,
+        max_targets=5,
+        source_chunk_size=2,
+        row_chunk_size=2,
+        shocks=("zero", "volume"),
+        attention_flow=False,
+        role_embedding=False,
+        graph_backend="polars",
+        graph_explainability=False,
+        progress_enabled=False,
+    )
+    eager_dir = tmp_path / "eager"
+    lazy_dir = tmp_path / "lazy"
+    eager_summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        batch,
+        feature_names=_feature_names(),
+        symbols=_symbols(),
+        dates=_dates(),
+        output_dir=eager_dir,
+        settings=settings,
+        device=torch.device("cpu"),
+    )
+    lazy = LazyBatchSource(batch)
+    lazy_summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        lazy,
+        feature_names=_feature_names(),
+        symbols=_symbols(),
+        dates=_dates(),
+        output_dir=lazy_dir,
+        settings=settings,
+        device=torch.device("cpu"),
+    )
+
+    assert eager_summary["sources"] == lazy_summary["sources"] == 5
+    assert eager_summary["targets"] == lazy_summary["targets"] == 5
+    # One base pass and one row-major shock pass. The number of shocks and
+    # source chunks must not cause additional lazy row materialization.
+    assert lazy.materialize_calls == [(0, 2), (2, 4), (0, 2), (2, 4)]
+    assert all(end - start <= 2 for start, end in lazy.materialize_calls)
+    for name in ("zero_score_abs.csv", "volume_score_abs.csv", "volume_weight_residual_abs.csv"):
+        eager_matrix = _matrix_csv(eager_dir / MODULE_NAME / "matrices" / name)[2]
+        lazy_matrix = _matrix_csv(lazy_dir / MODULE_NAME / "matrices" / name)[2]
+        np.testing.assert_allclose(lazy_matrix, eager_matrix, rtol=1e-6, atol=1e-7)
+
+
+def test_lazy_row_major_oom_halves_source_chunk_without_rematerializing_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    batch = _batch(rows=4, lookback=3, symbols=5, features=4)
+    lazy = LazyBatchSource(batch)
+    real_metrics = cross_asset_module._shock_source_chunk_metrics
+    raised = False
+
+    def fail_first_large_chunk(*args, **kwargs):
+        nonlocal raised
+        chunk_sources = args[9]
+        if not raised and len(chunk_sources) > 1:
+            raised = True
+            raise RuntimeError("CUDA out of memory")
+        return real_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(cross_asset_module, "_shock_source_chunk_metrics", fail_first_large_chunk)
+    summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        lazy,
+        feature_names=_feature_names(),
+        symbols=_symbols(),
+        dates=_dates(),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=5,
+            max_targets=5,
+            source_chunk_size=4,
+            row_chunk_size=2,
+            shocks=("zero",),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+            graph_explainability=False,
+            progress_enabled=False,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    assert raised is True
+    shock = summary["shock_summaries"][0]
+    assert shock["oom_retries"] == 1
+    assert shock["source_chunk_size_final"] == 2
+    assert lazy.materialize_calls == [(0, 2), (2, 4), (0, 2), (2, 4)]
+
+
 def _tiny_transformer() -> TransformerBasePortfolioModel:
     return TransformerBasePortfolioModel(
         lookback=3,
@@ -312,11 +477,6 @@ def _tiny_transformer() -> TransformerBasePortfolioModel:
         num_latent_factors=2,
         num_market_tokens=2,
         market_layers=1,
-        dynamic_latent_tokens=True,
-        dynamic_market_tokens=True,
-        dynamic_token_hidden_mult=1,
-        dynamic_token_gate_init=0.1,
-        dynamic_token_dropout=0.0,
         head_hidden_dim=12,
         head_layers=1,
         dropout=0.0,
@@ -361,8 +521,8 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
         settings=CrossAssetTransmissionSettings(
             max_sources=3,
             max_targets=3,
-            top_edges=4,
             source_chunk_size=1,
+            graph_backend="polars",
             shocks=("zero",),
             attention_flow=False,
             role_embedding=True,
@@ -374,15 +534,24 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
     summary = json.loads((base / "abstract_cross_asset_summary.json").read_text(encoding="utf-8"))
     assert summary["module"] == MODULE_NAME
     assert summary["graph_backend"] == "polars"
-    assert summary["graph_benchmark"]["selection_reason"] == "below_min_edges"
+    assert summary["graph_benchmark"]["selection_reason"] == "backend_polars"
     assert summary["graph_explainability"]["enabled"] is True
     assert summary["graph_explainability"]["backend"] in {"cugraph", "polars"}
+    assert summary["graph_figure_contract"]["node_selection"] == "all"
+    assert summary["graph_figure_contract"]["edge_selection"] == "all"
+    assert summary["graph_figure_contract"]["top_k"] is False
+    assert summary["timing"]["total_s"] > 0.0
+    assert summary["timing"]["sources_per_s"] > 0.0
     assert (base / "abstract_cross_asset_report.md").exists()
-    assert (base / "tables" / "top_edges.csv").exists()
+    assert (base / "tables" / "edge_metrics.csv").exists()
+    assert not (base / "tables" / "top_edges.csv").exists()
     assert (base / "tables" / "graph_edges.csv").exists()
     assert (base / "tables" / "graph_node_metrics.csv").exists()
     assert (base / "tables" / "graph_community_summary.csv").exists()
     assert (base / "tables" / "graph_community_edges.csv").exists()
+    assert (base / "plots" / "graph_topology.png").exists()
+    assert (base / "plots" / "graph_node_importance.png").exists()
+    assert (base / "plots" / "graph_self_influence.png").exists()
     assert (base / "tables" / "shock_summary.csv").exists()
     assert (base / "tables" / "role_embeddings.csv").exists()
     assert (base / "matrices" / "zero_score_abs.csv").exists()
@@ -390,3 +559,91 @@ def test_cross_asset_output_writing(tmp_path: Path) -> None:
     shock_summary = pl.read_csv(base / "tables" / "shock_summary.csv")
     assert shock_summary["matched_feature_count"].to_list() == [4]
     assert shock_summary["matched_features"].to_list() == ["ret_feature;volume_feature;range_feature;open_gap_feature"]
+
+
+def test_compact_artifacts_store_complete_numeric_edges_once(tmp_path: Path) -> None:
+    batch = _batch(rows=3, symbols=4)
+    summary = abstract_cross_asset_transmission(
+        IndependentScoringModel(num_features=4),
+        batch,
+        feature_names=_feature_names(),
+        symbols=_symbols(4),
+        dates=_dates(3),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=4,
+            max_targets=4,
+            source_chunk_size=2,
+            shocks=("zero", "volume"),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+            graph_explainability=False,
+            compact_artifacts=True,
+            progress_enabled=False,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    base = tmp_path / MODULE_NAME
+    edges = pl.read_parquet(base / "tables" / "edge_metrics.parquet")
+    assert edges.height == 2 * 4 * 4
+    assert {"shock_index", "source_index", "target_index", "validated_transmission"}.issubset(
+        edges.columns
+    )
+    assert {"shock", "source_symbol", "target_symbol", "attention_flow"}.isdisjoint(
+        edges.columns
+    )
+    assert pl.read_csv(base / "tables" / "shock_lookup.csv")["shock"].to_list() == [
+        "zero",
+        "volume",
+    ]
+    assert (base / "tables" / "source_lookup.csv").exists()
+    assert (base / "tables" / "target_lookup.csv").exists()
+    assert (base / "matrices" / "attention_flow.npy").exists()
+    assert not (base / "matrices" / "zero_score_abs.csv").exists()
+    assert summary["artifact_layout"] == "compact_numeric_edges"
+
+
+def test_ragged_final_row_chunk_stays_out_of_compiled_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model = _tiny_transformer()
+    batch = _batch(rows=3, lookback=3, symbols=4, features=5)
+    real_metrics = cross_asset_module._shock_source_chunk_metrics
+    compile_flags: list[bool] = []
+
+    def record_compile_shape(*args, **kwargs):
+        compile_flags.append(bool(kwargs.get("compile_forward", False)))
+        kwargs["compile_forward"] = False
+        return real_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(cross_asset_module, "_shock_source_chunk_metrics", record_compile_shape)
+    summary = abstract_cross_asset_transmission(
+        model,
+        batch,
+        feature_names=[f"feature_{idx}" for idx in range(5)],
+        symbols=_symbols(4),
+        dates=_dates(3),
+        output_dir=tmp_path,
+        settings=CrossAssetTransmissionSettings(
+            max_sources=2,
+            max_targets=2,
+            source_chunk_size=2,
+            row_chunk_size=2,
+            max_repeated_rows=4,
+            counterfactual_compile=True,
+            shocks=("zero",),
+            attention_flow=False,
+            role_embedding=False,
+            graph_backend="polars",
+            graph_explainability=False,
+            progress_enabled=False,
+        ),
+        device=torch.device("cpu"),
+    )
+
+    assert compile_flags == [True, False]
+    assert summary["shock_summaries"][0]["compiled_forward_batches"] == 1
+    assert summary["shock_summaries"][0]["eager_forward_batches"] == 1

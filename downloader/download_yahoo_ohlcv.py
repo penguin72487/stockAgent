@@ -2,28 +2,43 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-import contextlib
+import hashlib
 import io
 import json
 import multiprocessing as mp
 import os
 import re
 import socket
+import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from html.parser import HTMLParser
 import math
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import yfinance as yf
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from tqdm import tqdm
+
+from downloader.common import (
+    SharedRateLimiter,
+    describe_rate_limit,
+    resolve_request_interval,
+)
+from downloader.status import download_counts_failure_reason
+from stockagent.data.tw_security import classify_tw_stock_or_etf
+from stockagent.data.us_universe import is_us_broker_tradable_security
 
 try:
     import pyarrow as pa
@@ -73,11 +88,23 @@ BASE_OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Tradi
 REPAIR_REQUIRED_COLUMNS = {"date", "open", "max", "min", "close", "adjclose", "Trading_Volume"}
 PARQUET_META_SOURCE_KEY = b"stockagent.source"
 PARQUET_META_ASSET_CLASS_KEY = b"stockagent.asset_class"
+PARQUET_META_REQUESTED_START_KEY = b"stockagent.yahoo_requested_start"
 PARQUET_META_CHECKED_THROUGH_KEY = b"stockagent.yahoo_checked_through"
 PARQUET_META_REQUESTED_END_KEY = b"stockagent.yahoo_requested_end"
 PARQUET_META_FIRST_DATE_KEY = b"stockagent.first_date"
 PARQUET_META_LAST_DATE_KEY = b"stockagent.last_date"
 PARQUET_META_WRITE_TS_UTC_KEY = b"stockagent.write_ts_utc"
+UNVERIFIED_YAHOO_QUARANTINE_DIR = Path("quarantine") / "unverified_yahoo"
+UNVERIFIED_YAHOO_QUARANTINE_JOURNAL = "events.jsonl"
+QUARANTINE_ELIGIBLE_PRECHECK_STATUSES = frozenset(
+    {
+        "historical_start_unverified",
+        "metadata_invalid",
+        "schema_mismatch",
+        "broken",
+        "empty",
+    }
+)
 BLACKLIST_TRIGGER_TEXT = "possibly delisted; no timezone found"
 UNAVAILABLE_TRIGGER_TEXTS = (
     BLACKLIST_TRIGGER_TEXT,
@@ -88,6 +115,101 @@ UNAVAILABLE_TRIGGER_TEXTS = (
     "unavailable or delisted",
 )
 YF_DOWNLOAD_HARD_TIMEOUT_SECONDS = int(os.environ.get("YF_DOWNLOAD_HARD_TIMEOUT_SECONDS", "60"))
+YAHOO_CHART_429_COOLDOWN_SECONDS = float(
+    os.environ.get("YAHOO_CHART_429_COOLDOWN_SECONDS", "600")
+)
+_YAHOO_CHART_ROUTE_LOCK = threading.Lock()
+_YAHOO_CHART_DISABLED_UNTIL = 0.0
+
+
+class RequestRateLimiter(SharedRateLimiter):
+    def __init__(self, interval_seconds: float) -> None:
+        super().__init__(interval_seconds, name="yahoo_finance")
+
+
+def _yahoo_chart_route_available() -> bool:
+    with _YAHOO_CHART_ROUTE_LOCK:
+        return time.monotonic() >= _YAHOO_CHART_DISABLED_UNTIL
+
+
+def _defer_yahoo_chart_route(seconds: float) -> None:
+    global _YAHOO_CHART_DISABLED_UNTIL
+    delay = max(0.0, float(seconds))
+    if delay <= 0.0:
+        return
+    with _YAHOO_CHART_ROUTE_LOCK:
+        _YAHOO_CHART_DISABLED_UNTIL = max(
+            _YAHOO_CHART_DISABLED_UNTIL,
+            time.monotonic() + delay,
+        )
+
+
+def _build_yfinance_rate_limited_session(
+    limiter: RequestRateLimiter,
+) -> object:
+    """Create a yfinance-compatible session that meters every HTTP request."""
+
+    try:
+        import yfinance as yf
+    except ImportError as exc:  # pragma: no cover - fintech environment contract
+        raise RuntimeError("yfinance is required for the Yahoo fallback route") from exc
+
+    # Keep yfinance's own tested curl_cffi/requests session implementation and
+    # wrap its instance request method. A custom Session subclass can deadlock
+    # with yfinance's singleton cookie/crumb manager under concurrent symbols.
+    session = yf.Ticker("^TWII").session
+    session._stockagent_limiter = limiter
+    if not bool(getattr(session, "_stockagent_rate_limited", False)):
+        original_request = session.request
+
+        def rate_limited_request(*args, **kwargs):
+            active_limiter = session._stockagent_limiter
+            active_limiter.wait()
+            try:
+                response = original_request(*args, **kwargs)
+            except Exception as exc:
+                if "too many requests" in str(exc).lower():
+                    active_limiter.defer(5.0)
+                raise
+            if int(getattr(response, "status_code", 0) or 0) == 429:
+                active_limiter.defer(5.0)
+            return response
+
+        session.request = rate_limited_request
+        session._stockagent_rate_limited = True
+    return session
+
+
+def _warm_yfinance_session(session: object, limiter: RequestRateLimiter) -> None:
+    """Initialize Yahoo cookie/crumb state once before threaded chart reads."""
+
+    if bool(getattr(session, "_stockagent_warmed", False)):
+        return
+    import yfinance as yf
+
+    last_error: BaseException | None = None
+    for attempt in range(3):
+        try:
+            frame = yf.Ticker("2330.TW", session=session).history(
+                period="5d",
+                interval="1d",
+                actions=False,
+                auto_adjust=False,
+                timeout=20,
+                raise_errors=True,
+            )
+            if frame is None or bool(frame.empty):
+                raise RuntimeError("Yahoo session warmup returned no 2330.TW rows")
+            session._stockagent_warmed = True
+            return
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "too many requests" in message or "rate limit" in message:
+                limiter.defer(5.0 * (2**attempt))
+            elif attempt < 2:
+                time.sleep(0.8 * (attempt + 1))
+    raise RuntimeError(f"Yahoo session warmup failed: {last_error}")
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -95,9 +217,24 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _strict_no_fallback(args: argparse.Namespace | None = None) -> bool:
-    if args is not None and hasattr(args, "strict_no_fallback"):
-        return bool(getattr(args, "strict_no_fallback"))
+    if args is not None:
+        # Environment variables are an input-boundary concern: ``parse_args``
+        # already folds STOCKAGENT_STRICT_NO_FALLBACK into this field.  Once a
+        # namespace has been passed down, do not let ambient process state
+        # silently change symbol resolution (notably after another in-process
+        # workflow has toggled the shared training environment).
+        return bool(getattr(args, "strict_no_fallback", False))
     return _env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0")
+
+
+def _is_incremental_mode(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "mode", "")).strip().lower() in {"incremental", "daily-update"}
+
+
+def _mode_label(args: argparse.Namespace) -> str:
+    return str(getattr(args, "mode", "") or "download")
+
+
 YF_CRYPTO_INTRADAY_INTERVAL = "15m"
 YF_CRYPTO_INTRADAY_SECONDS = 15 * 60
 YF_CRYPTO_MAX_LOOKBACK_DAYS = 59
@@ -266,6 +403,10 @@ TW_INCLUDED_SECTION_LABELS: dict[str, set[str]] = {
 }
 TW_SUPPORTED_ACTIVE_CODE_PATTERN = re.compile(r"^(?:\d{4}[A-Z]?|00[0-9A-Z]{3,4})$")
 TW_EXCLUDED_ACTIVE_NAME_PATTERN = re.compile(r"(權證|牛證|熊證|元展|展延)")
+TW_SECURITY_CLASSIFIER_EXCLUSION_REASON = (
+    "tw_security_classifier_not_normal_broker_tradable_stock_or_etf"
+)
+TW_ACTIVE_SECURITY_EXCLUSION_REASON = "unsupported_tw_active_security_name_or_code"
 
 
 @dataclass(slots=True)
@@ -274,6 +415,15 @@ class SymbolRecord:
     name: str
     market: str
     yahoo_symbol: str
+
+
+@dataclass(slots=True, frozen=True)
+class ExcludedSymbolRecord:
+    code: str
+    name: str
+    market: str
+    yahoo_symbol: str
+    reason: str
 
 
 @dataclass(slots=True)
@@ -291,6 +441,10 @@ class DownloadResult:
     checked_through_date: str | None = None
 
 
+class YahooRateLimitedError(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class ExistingFileInfo:
     first_date: str | None
@@ -298,6 +452,10 @@ class ExistingFileInfo:
     error: str | None
     columns: set[str]
     checked_through_date: str | None = None
+    requested_start_date: str | None = None
+    source: str | None = None
+    asset_class: str | None = None
+    metadata_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -319,6 +477,7 @@ class SymbolResolution:
     manifest_records: list[SymbolRecord]
     new_codes: set[str]
     active_discovery_symbols: set[str] = field(default_factory=set)
+    excluded_records: list[ExcludedSymbolRecord] = field(default_factory=list)
 
     @property
     def active_records(self) -> list[SymbolRecord]:
@@ -471,12 +630,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Yahoo Finance OHLCV data into asset-specific parquet directories.")
     parser.add_argument(
         "--mode",
-        choices=["download", "repair", "daily-update"],
+        choices=["download", "repair", "incremental", "daily-update"],
         default="download",
         help=(
             "download: grab the configured universe; "
             "repair: check existing parquet files and refill missing/stale data; "
-            "daily-update: incremental refresh (same behavior as repair; crypto uses 15m bars)."
+            "incremental: refresh missing/stale data; crypto uses 15m bars; "
+            "daily-update: deprecated alias for incremental."
         ),
     )
     parser.add_argument(
@@ -502,6 +662,15 @@ def parse_args() -> argparse.Namespace:
         help="When --asset all, run up to this many asset classes in parallel.",
     )
     parser.add_argument("--retries", type=int, default=2, help="Retries per symbol when Yahoo temporarily fails.")
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help=(
+            "Minimum seconds between Yahoo chart requests across all threads and "
+            "processes. Defaults to the provider policy (10 requests/second)."
+        ),
+    )
     parser.add_argument("--refresh", action="store_true", help="Re-download full history even if parquet exists.")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N symbols after filtering.")
     parser.add_argument("--symbols", nargs="+", default=None, help="Override symbols for the selected asset. Values can be codes or Yahoo symbols.")
@@ -511,6 +680,23 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Include TWSE/TPEx delisted symbol candidates in tw_stocks universe.",
+    )
+    parser.add_argument(
+        "--tw-delisted-dir",
+        default=None,
+        help=(
+            "Optional canonical TW public directory containing "
+            "twse_delisted_company.parquet and tpex_delisted_company.parquet."
+        ),
+    )
+    parser.add_argument(
+        "--verify-tw-delisted-history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In repair mode, query TW delisted records that lack durable Yahoo "
+            "start/checked-through metadata instead of treating them as skipped."
+        ),
     )
     parser.add_argument(
         "--include-us-delisted",
@@ -542,11 +728,20 @@ def parse_args() -> argparse.Namespace:
         help="Max seconds to wait for one symbol's repair download; 0 disables per-symbol timeout.",
     )
     parser.add_argument(
+        "--rate-limit-abort-after",
+        type=int,
+        default=20,
+        help=(
+            "Abort a symbol batch after this many completed requests when all completed failures "
+            "look like Yahoo HTTP 429 rate limiting. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--daily-stale-max-lag-days",
         type=int,
         default=14,
         help=(
-            "Only for --mode daily-update: skip symbols whose local last date lags target end date "
+            "Only for --mode incremental/daily-update: skip symbols whose local last date lags target end date "
             "by more than this many days. Set 0 to disable."
         ),
     )
@@ -555,7 +750,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Only for --mode daily-update: merge fresh stock listings and delisted candidates "
+            "Only for --mode incremental/daily-update: merge fresh stock listings and delisted candidates "
             "from upstream symbol sources into the local tracked universe."
         ),
     )
@@ -564,7 +759,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Only for --mode daily-update: retry symbols that are already present in symbols.csv "
+            "Only for --mode incremental/daily-update: retry symbols that are already present in symbols.csv "
             "but still have no local parquet/whitelist entry. Default false prevents repeated "
             "downloads of known Yahoo-unavailable candidates."
         ),
@@ -583,6 +778,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=_env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0"),
         help="Fail instead of using static/cached/local symbol-universe fallback when discovery fails.",
+    )
+    parser.add_argument(
+        "--fail-on-any-error",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Exit nonzero when any final symbol download is failed or still stale; "
+            "canonical rebuilds should enable this strict gate."
+        ),
     )
     return parser.parse_args()
 
@@ -624,6 +828,11 @@ def _coerce_to_date(value: object) -> date | None:
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
     value_text = str(value).strip()
     if not value_text or value_text.lower() in {"nan", "nat", "none", "null"}:
         return None
@@ -650,6 +859,18 @@ def _decode_metadata_date(value: bytes | str | None) -> str | None:
         return None
     parsed = _coerce_to_date(value)
     return parsed.isoformat() if parsed is not None else None
+
+
+def _decode_metadata_text(value: bytes | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def _frame_date_bounds(frame: object) -> tuple[str | None, str | None]:
@@ -689,7 +910,7 @@ def _previous_weekday(value: date) -> date:
 
 def _effective_repair_target_end_date(asset_class: str, args: argparse.Namespace) -> date:
     requested = _parse_date(args.end_date or _today_str()).date()
-    if getattr(args, "mode", "") != "daily-update":
+    if not _is_incremental_mode(args):
         return requested
     if asset_class not in WEEKDAY_DAILY_ASSET_CLASSES:
         return requested
@@ -728,6 +949,31 @@ def _date_bounds_from_arrow_table(table: object) -> tuple[str | None, str | None
     return first.isoformat(), last.isoformat()
 
 
+def _date_bounds_from_parquet_metadata(parquet_metadata: object, date_column_index: int) -> tuple[str | None, str | None]:
+    first: date | None = None
+    last: date | None = None
+    try:
+        row_group_count = int(parquet_metadata.num_row_groups)
+    except Exception:
+        return None, None
+    for row_group_idx in range(row_group_count):
+        try:
+            stats = parquet_metadata.row_group(row_group_idx).column(date_column_index).statistics
+        except Exception:
+            continue
+        if stats is None or not bool(getattr(stats, "has_min_max", False)):
+            continue
+        min_date = _coerce_to_date(stats.min)
+        max_date = _coerce_to_date(stats.max)
+        if min_date is not None:
+            first = min_date if first is None else min(first, min_date)
+        if max_date is not None:
+            last = max_date if last is None else max(last, max_date)
+    if first is None or last is None:
+        return None, None
+    return first.isoformat(), last.isoformat()
+
+
 def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | None:
     if pq is None:
         return None
@@ -738,20 +984,96 @@ def _load_existing_file_info_pyarrow(output_path: Path) -> ExistingFileInfo | No
         metadata = dict(parquet_metadata.metadata or {})
         metadata.update(arrow_schema.metadata or {})
         checked_through = _decode_metadata_date(metadata.get(PARQUET_META_CHECKED_THROUGH_KEY))
+        requested_start = _decode_metadata_date(
+            metadata.get(PARQUET_META_REQUESTED_START_KEY)
+        )
+        source = _decode_metadata_text(metadata.get(PARQUET_META_SOURCE_KEY))
+        asset_class = _decode_metadata_text(
+            metadata.get(PARQUET_META_ASSET_CLASS_KEY)
+        )
     except Exception as exc:
         return ExistingFileInfo(None, None, f"schema_error: {exc}", set())
 
+    metadata_problems: list[str] = []
+    if source != "yahoo":
+        metadata_problems.append(f"source={source!r}, expected='yahoo'")
+    if asset_class is None:
+        metadata_problems.append("asset_class is missing or invalid")
+    if requested_start is None:
+        metadata_problems.append("yahoo_requested_start is missing or invalid")
+    if checked_through is None:
+        metadata_problems.append("yahoo_checked_through is missing or invalid")
+    metadata_error = "; ".join(metadata_problems) or None
+
+    info_metadata = {
+        "checked_through_date": checked_through,
+        "requested_start_date": requested_start,
+        "source": source,
+        "asset_class": asset_class,
+        "metadata_error": metadata_error,
+    }
+
     if "date" not in columns:
-        return ExistingFileInfo(None, None, "empty", columns, checked_through)
+        return ExistingFileInfo(
+            None,
+            None,
+            "empty",
+            columns,
+            **info_metadata,
+        )
+
+    first_meta = _decode_metadata_date(metadata.get(PARQUET_META_FIRST_DATE_KEY))
+    last_meta = _decode_metadata_date(metadata.get(PARQUET_META_LAST_DATE_KEY))
+    if first_meta is not None and last_meta is not None:
+        return ExistingFileInfo(
+            first_meta,
+            last_meta,
+            None,
+            columns,
+            **info_metadata,
+        )
+
+    try:
+        date_column_index = arrow_schema.get_field_index("date")
+    except Exception:
+        date_column_index = -1
+    if date_column_index >= 0:
+        first_date, last_date = _date_bounds_from_parquet_metadata(parquet_metadata, date_column_index)
+        if first_date is not None and last_date is not None:
+            return ExistingFileInfo(
+                first_date,
+                last_date,
+                None,
+                columns,
+                **info_metadata,
+            )
 
     try:
         date_table = pq.read_table(output_path, columns=["date"], memory_map=True)
         first_date, last_date = _date_bounds_from_arrow_table(date_table)
     except Exception as exc:
-        return ExistingFileInfo(None, None, f"read_error: {exc}", columns, checked_through)
+        return ExistingFileInfo(
+            None,
+            None,
+            f"read_error: {exc}",
+            columns,
+            **info_metadata,
+        )
     if first_date is None or last_date is None:
-        return ExistingFileInfo(None, None, "no_valid_date", columns, checked_through)
-    return ExistingFileInfo(first_date, last_date, None, columns, checked_through)
+        return ExistingFileInfo(
+            None,
+            None,
+            "no_valid_date",
+            columns,
+            **info_metadata,
+        )
+    return ExistingFileInfo(
+        first_date,
+        last_date,
+        None,
+        columns,
+        **info_metadata,
+    )
 
 
 def _prepare_arrow_table_for_write(frame: object) -> object:
@@ -791,12 +1113,101 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _append_jsonl_event(path: Path, event: dict[str, object]) -> None:
+    encoded = (
+        json.dumps(event, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o644,
+    )
+    try:
+        written = os.write(descriptor, encoded)
+        if written != len(encoded):
+            raise OSError(
+                f"short append-only JSONL write: wrote={written} expected={len(encoded)}"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _quarantine_unverified_yahoo_file(
+    *,
+    output_dir: Path,
+    record: SymbolRecord,
+    original_path: Path,
+    precheck_status: str,
+    reason: str,
+) -> Path | None:
+    """Atomically preserve an unverified active Yahoo parquet with an audit event."""
+
+    if not original_path.is_file():
+        return None
+    quarantine_dir = output_dir / UNVERIFIED_YAHOO_QUARANTINE_DIR
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    original_stat = original_path.stat()
+    if original_stat.st_dev != quarantine_dir.stat().st_dev:
+        raise OSError(
+            "Yahoo quarantine must be on the same filesystem as the active input"
+        )
+    digest = _sha256_file(original_path)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    unique_token = f"{time.time_ns()}.{os.getpid()}"
+    quarantine_path = quarantine_dir / (
+        f"{original_path.stem}.{digest[:16]}.{unique_token}{original_path.suffix}"
+    )
+    while quarantine_path.exists():
+        unique_token = f"{time.time_ns()}.{os.getpid()}"
+        quarantine_path = quarantine_dir / (
+            f"{original_path.stem}.{digest[:16]}.{unique_token}{original_path.suffix}"
+        )
+
+    os.replace(original_path, quarantine_path)
+    _fsync_directory(original_path.parent)
+    _fsync_directory(quarantine_dir)
+    event = {
+        "timestamp_utc": timestamp,
+        "code": record.code,
+        "yahoo_symbol": record.yahoo_symbol,
+        "original_path": str(original_path),
+        "quarantine_path": str(quarantine_path),
+        "sha256": digest,
+        "bytes": int(original_stat.st_size),
+        "precheck_status": precheck_status,
+        "reason": reason,
+    }
+    journal_path = quarantine_dir / UNVERIFIED_YAHOO_QUARANTINE_JOURNAL
+    try:
+        _append_jsonl_event(journal_path, event)
+        _fsync_directory(quarantine_dir)
+    except BaseException:
+        if not original_path.exists() and quarantine_path.exists():
+            os.replace(quarantine_path, original_path)
+            _fsync_directory(original_path.parent)
+            _fsync_directory(quarantine_dir)
+        raise
+    return quarantine_path
+
+
 def _write_feature_parquet_atomic(
     frame: object,
     output_path: Path,
     *,
     asset_class: str,
     requested_end_date: str,
+    requested_start_date: str | None = None,
+    source: str = "yahoo",
 ) -> tuple[str | None, str | None]:
     frame = _canonicalize_feature_frame(frame, keep_zero_volume=asset_class != "forex")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -815,7 +1226,7 @@ def _write_feature_parquet_atomic(
             metadata = dict(table.schema.metadata or {})
             metadata.update(
                 {
-                    PARQUET_META_SOURCE_KEY: b"yahoo",
+                    PARQUET_META_SOURCE_KEY: str(source).encode("utf-8"),
                     PARQUET_META_ASSET_CLASS_KEY: asset_class.encode("utf-8"),
                     PARQUET_META_REQUESTED_END_KEY: requested_end_date.encode("utf-8"),
                     PARQUET_META_CHECKED_THROUGH_KEY: requested_end_date.encode("utf-8"),
@@ -827,6 +1238,10 @@ def _write_feature_parquet_atomic(
                     ),
                 }
             )
+            if requested_start_date is not None:
+                metadata[PARQUET_META_REQUESTED_START_KEY] = requested_start_date.encode(
+                    "utf-8"
+                )
             if first_date is not None:
                 metadata[PARQUET_META_FIRST_DATE_KEY] = first_date.encode("utf-8")
             if last_date is not None:
@@ -944,35 +1359,17 @@ class PrecheckLoader:
             self._process = None
 
 
-def _dedupe_column_names(columns: list[str]) -> list[str]:
-    counts: dict[str, int] = {}
-    deduped: list[str] = []
-    for column in columns:
-        base = column or "column"
-        count = counts.get(base, 0)
-        counts[base] = count + 1
-        deduped.append(base if count == 0 else f"{base}_{count}")
-    return deduped
-
-
 def _yahoo_frame_to_polars(frame: object) -> object:
     _require_polars()
     if isinstance(frame, pl.DataFrame):
         return frame
-    if frame is None or bool(getattr(frame, "empty", False)):
+    if frame is None:
         return _empty_feature_frame()
-
-    reset_frame = frame.reset_index()
-    flattened_columns: list[str] = []
-    for column in list(reset_frame.columns):
-        if isinstance(column, tuple):
-            primary = str(column[0]).strip()
-            secondary = str(column[1]).strip() if len(column) > 1 else ""
-            flattened_columns.append(primary or secondary)
-        else:
-            flattened_columns.append(str(column).strip())
-    reset_frame.columns = _dedupe_column_names(flattened_columns)
-    return pl.DataFrame({column: list(reset_frame[column]) for column in reset_frame.columns})
+    if isinstance(frame, dict) or isinstance(frame, list):
+        return pl.DataFrame(frame)
+    if hasattr(frame, "to_arrow"):
+        return pl.from_arrow(frame.to_arrow())
+    raise TypeError(f"Unsupported Yahoo frame type for Polars conversion: {type(frame).__name__}")
 
 
 def _canonicalize_feature_frame(frame: object, *, keep_zero_volume: bool = True) -> object:
@@ -1114,6 +1511,215 @@ def _http_get_text(url: str, timeout: int = 30) -> str:
         return raw.decode("utf-8", errors="ignore")
 
 
+def _unix_seconds_for_date_key(value: str) -> int:
+    return int(_parse_date(value).replace(tzinfo=timezone.utc).timestamp())
+
+
+def _chart_exchange_timezone(meta: object) -> tzinfo:
+    if not isinstance(meta, dict):
+        return timezone.utc
+
+    timezone_name = str(meta.get("exchangeTimezoneName") or "").strip()
+    if timezone_name:
+        try:
+            return ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+
+    try:
+        offset_value = float(meta.get("gmtoffset"))
+        if math.isfinite(offset_value):
+            offset_seconds = int(offset_value)
+            if -24 * 60 * 60 < offset_seconds < 24 * 60 * 60:
+                return timezone(timedelta(seconds=offset_seconds))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return timezone.utc
+
+
+def _chart_timestamp_to_datetime(
+    value: object,
+    *,
+    exchange_timezone: tzinfo = timezone.utc,
+    normalize_daily: bool = False,
+) -> datetime | None:
+    try:
+        parsed = datetime.fromtimestamp(int(value), tz=timezone.utc).astimezone(
+            exchange_timezone
+        )
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if normalize_daily:
+        return datetime(parsed.year, parsed.month, parsed.day)
+    return parsed.replace(tzinfo=None)
+
+
+def _chart_event_key(
+    value: object,
+    *,
+    exchange_timezone: tzinfo = timezone.utc,
+) -> str:
+    parsed = _chart_timestamp_to_datetime(
+        value,
+        exchange_timezone=exchange_timezone,
+    )
+    return parsed.date().isoformat() if parsed is not None else ""
+
+
+def _download_yahoo_chart_frame(
+    *,
+    symbol: str,
+    start_date: str,
+    end_date_exclusive: str,
+    interval: str,
+    timeout: int = 20,
+    session: object | None = None,
+) -> object:
+    _require_polars()
+    period1 = _unix_seconds_for_date_key(start_date)
+    period2 = _unix_seconds_for_date_key(end_date_exclusive)
+    query = urlencode(
+        {
+            "period1": str(period1),
+            "period2": str(period2),
+            "interval": interval,
+            "events": "div,splits",
+            "includeAdjustedClose": "true",
+        }
+    )
+    host = "query2.finance.yahoo.com" if session is not None else "query1.finance.yahoo.com"
+    url = f"https://{host}/v8/finance/chart/{quote(symbol, safe='')}?{query}"
+    if session is None:
+        payload = json.loads(_http_get_text(url, timeout=timeout))
+    else:
+        response = session.get(url, timeout=timeout)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        try:
+            payload = response.json()
+        except Exception as exc:
+            if status_code >= 400:
+                raise HTTPError(url, status_code, str(exc), None, None) from exc
+            raise json.JSONDecodeError(
+                "Yahoo chart session returned invalid JSON",
+                str(getattr(response, "text", "")),
+                0,
+            ) from exc
+        if status_code >= 400:
+            chart_error = payload.get("chart", {}).get("error") if isinstance(payload, dict) else None
+            description = (
+                chart_error.get("description")
+                if isinstance(chart_error, dict)
+                else str(chart_error or f"HTTP {status_code}")
+            )
+            raise HTTPError(url, status_code, description, None, None)
+    chart = payload.get("chart") or {}
+    error = chart.get("error")
+    if error:
+        description = error.get("description") if isinstance(error, dict) else str(error)
+        raise RuntimeError(description or "Yahoo chart API returned an error")
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        return _empty_feature_frame()
+
+    exchange_tz = _chart_exchange_timezone(result.get("meta"))
+    normalize_daily = interval == "1d"
+    timestamps = list(result.get("timestamp") or [])
+    indicators = result.get("indicators") or {}
+    quote_rows = indicators.get("quote") or []
+    quote_row = quote_rows[0] if quote_rows else {}
+    adj_rows = indicators.get("adjclose") or []
+    adj_row = adj_rows[0] if adj_rows else {}
+    open_values = list(quote_row.get("open") or [])
+    high_values = list(quote_row.get("high") or [])
+    low_values = list(quote_row.get("low") or [])
+    close_values = list(quote_row.get("close") or [])
+    volume_values = list(quote_row.get("volume") or [])
+    adjclose_values = list(adj_row.get("adjclose") or close_values)
+
+    events = result.get("events") or {}
+    dividends_by_date: dict[str, float] = {}
+    for item in (events.get("dividends") or {}).values():
+        key = _chart_event_key(
+            item.get("date"),
+            exchange_timezone=exchange_tz,
+        )
+        if key:
+            dividends_by_date[key] = float(item.get("amount") or 0.0)
+    splits_by_date: dict[str, float] = {}
+    for item in (events.get("splits") or {}).values():
+        key = _chart_event_key(
+            item.get("date"),
+            exchange_timezone=exchange_tz,
+        )
+        numerator = float(item.get("numerator") or 0.0)
+        denominator = float(item.get("denominator") or 0.0)
+        if key and numerator > 0.0 and denominator > 0.0:
+            splits_by_date[key] = numerator / denominator
+
+    def value_at(values: list[object], idx: int) -> object:
+        return values[idx] if idx < len(values) else None
+
+    date_column = "Date" if interval == "1d" else "Datetime"
+    rows: list[dict[str, object]] = []
+    for idx, ts in enumerate(timestamps):
+        dt = _chart_timestamp_to_datetime(
+            ts,
+            exchange_timezone=exchange_tz,
+            normalize_daily=normalize_daily,
+        )
+        if dt is None:
+            continue
+        key = dt.date().isoformat()
+        rows.append(
+            {
+                date_column: dt,
+                "Open": value_at(open_values, idx),
+                "High": value_at(high_values, idx),
+                "Low": value_at(low_values, idx),
+                "Close": value_at(close_values, idx),
+                "Adj Close": value_at(adjclose_values, idx),
+                "Volume": value_at(volume_values, idx),
+                "Dividends": dividends_by_date.get(key, 0.0),
+                "Stock Splits": splits_by_date.get(key, 0.0),
+            }
+        )
+    return pl.DataFrame(rows, infer_schema_length=None) if rows else _empty_feature_frame()
+
+
+def _download_yfinance_frame(
+    *,
+    symbol: str,
+    start_date: str,
+    end_date_exclusive: str,
+    interval: str,
+    timeout: int = 20,
+    session: object | None = None,
+) -> object:
+    try:
+        import yfinance as yf
+    except ImportError as exc:  # pragma: no cover - fintech environment contract
+        raise RuntimeError(
+            "Yahoo chart request failed and yfinance fallback is unavailable"
+        ) from exc
+    # ``yf.download`` logs per-symbol failures and collapses both a genuine
+    # no-history result and a provider rate-limit failure to an empty frame.
+    # The strict TW fallback must distinguish those outcomes, so use the
+    # single-symbol history API with raise_errors=True.
+    frame = yf.Ticker(symbol, session=session).history(
+        start=start_date,
+        end=end_date_exclusive,
+        interval=interval,
+        actions=True,
+        auto_adjust=False,
+        timeout=timeout,
+        raise_errors=True,
+    )
+    if frame is None or bool(frame.empty):
+        return _empty_feature_frame()
+    frame = frame.reset_index()
+    return pl.from_pandas(frame)
+
+
 class _HTMLTableRowParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -1205,6 +1811,50 @@ def _load_tw_delisted_symbols() -> list[SymbolRecord]:
         records.append(SymbolRecord(code=f"{code}_TWO", name=f"{code} (delisted)", market="tw_delisted", yahoo_symbol=f"{code}.TWO"))
     return records
 
+
+def _load_tw_delisted_symbols_from_parquet(
+    root_value: str | Path | None,
+) -> list[SymbolRecord]:
+    """Recover the durable official delisted universe from canonical parquet."""
+
+    if root_value in {None, ""} or pl is None:
+        return []
+    root = Path(root_value)
+    specs = (
+        (root / "twse_delisted_company.parquet", "TW"),
+        (root / "tpex_delisted_company.parquet", "TWO"),
+    )
+    records: list[SymbolRecord] = []
+    seen: set[tuple[str, str]] = set()
+    for path, venue in specs:
+        if not path.is_file():
+            continue
+        try:
+            schema_names = set(pq.read_schema(path).names) if pq is not None else set()
+            if not {"symbol", "company_name"} <= schema_names:
+                continue
+            frame = pl.read_parquet(path, columns=["symbol", "company_name"])
+        except Exception as exc:
+            print(f"[symbols] failed to read official delisted parquet {path}: {exc}")
+            continue
+        for row in frame.iter_rows(named=True):
+            symbol = str(row.get("symbol") or "").strip().upper()
+            name = str(row.get("company_name") or symbol).strip() or symbol
+            key = (symbol, venue)
+            if key in seen or classify_tw_stock_or_etf(symbol) is None:
+                continue
+            seen.add(key)
+            records.append(
+                SymbolRecord(
+                    code=f"{symbol}_{venue}",
+                    name=name,
+                    market="tw_delisted",
+                    yahoo_symbol=f"{symbol}.{venue}",
+                )
+            )
+    return records
+
+
 def _record_from_input(asset_class: str, raw_symbol: str) -> SymbolRecord:
     value = raw_symbol.strip()
     if not value:
@@ -1233,8 +1883,41 @@ def _record_from_input(asset_class: str, raw_symbol: str) -> SymbolRecord:
     return SymbolRecord(code=upper_value, name=upper_value, market=asset_class, yahoo_symbol=upper_value)
 
 
+def _normalize_manifest_record(
+    asset_class: str,
+    *,
+    code: str,
+    name: str,
+    market: str,
+    yahoo_symbol: str,
+) -> SymbolRecord:
+    if asset_class == "us_stocks" and code.endswith("_DL"):
+        base_symbol = code[: -len("_DL")].strip().upper()
+        normalized_yahoo_symbol = yahoo_symbol.strip().upper()
+        if not normalized_yahoo_symbol or normalized_yahoo_symbol.endswith("_DL"):
+            normalized_yahoo_symbol = base_symbol
+        normalized_yahoo_symbol = _normalize_us_yahoo_symbol(normalized_yahoo_symbol)
+        if "_" in normalized_yahoo_symbol:
+            normalized_yahoo_symbol = _normalize_us_yahoo_symbol(base_symbol)
+        return SymbolRecord(
+            code=code,
+            name=name,
+            market="us_delisted",
+            yahoo_symbol=normalized_yahoo_symbol,
+        )
+    return SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol)
+
+
 def _record_from_local_code(asset_class: str, code: str) -> SymbolRecord:
     normalized = code.strip().upper()
+    if asset_class == "us_stocks" and normalized.endswith("_DL"):
+        return _normalize_manifest_record(
+            asset_class,
+            code=normalized,
+            name=normalized,
+            market=asset_class,
+            yahoo_symbol=normalized,
+        )
     if asset_class == "tw_stocks" and TW_GENERIC_CODE_PATTERN.fullmatch(normalized):
         record = SymbolRecord(
             code=normalized,
@@ -1323,17 +2006,64 @@ def _with_market(record: SymbolRecord, market: str) -> SymbolRecord:
 def _is_supported_tw_active_record(record: SymbolRecord) -> bool:
     code = record.code.strip().upper()
     name = record.name.strip()
+    if classify_tw_stock_or_etf(code) is None:
+        return False
     if not TW_SUPPORTED_ACTIVE_CODE_PATTERN.fullmatch(code):
         return False
     return not TW_EXCLUDED_ACTIVE_NAME_PATTERN.search(name)
 
 
-def _filter_tw_records_for_supported_universe(records: list[SymbolRecord]) -> list[SymbolRecord]:
+def _tw_record_exclusion_reason(record: SymbolRecord) -> str | None:
+    code = record.code.strip().upper()
+    for suffix in ("_TWO", "_TW"):
+        if code.endswith(suffix):
+            code = code[: -len(suffix)]
+            break
+    if classify_tw_stock_or_etf(code) is None:
+        return TW_SECURITY_CLASSIFIER_EXCLUSION_REASON
+    if not _is_delisted_record(record) and not _is_supported_tw_active_record(record):
+        return TW_ACTIVE_SECURITY_EXCLUSION_REASON
+    return None
+
+
+def _filter_tw_records_for_supported_universe(
+    records: list[SymbolRecord],
+    *,
+    excluded_records: list[ExcludedSymbolRecord] | None = None,
+) -> list[SymbolRecord]:
     filtered: list[SymbolRecord] = []
     for record in records:
-        if _is_delisted_record(record) or _is_supported_tw_active_record(record):
+        reason = _tw_record_exclusion_reason(record)
+        if reason is None:
             filtered.append(record)
+            continue
+        if excluded_records is not None:
+            excluded_records.append(
+                ExcludedSymbolRecord(
+                    code=record.code,
+                    name=record.name,
+                    market=record.market,
+                    yahoo_symbol=record.yahoo_symbol,
+                    reason=reason,
+                )
+            )
     return filtered
+
+
+def _filter_us_records_for_broker_tradable_universe(records: list[SymbolRecord]) -> list[SymbolRecord]:
+    return [
+        record
+        for record in records
+        if is_us_broker_tradable_security(record.code, record.name, record.market)
+    ]
+
+
+def _filter_records_for_supported_universe(asset_class: str, records: list[SymbolRecord]) -> list[SymbolRecord]:
+    if asset_class == "tw_stocks":
+        return _filter_tw_records_for_supported_universe(records)
+    if asset_class == "us_stocks":
+        return _filter_us_records_for_broker_tradable_universe(records)
+    return records
 
 
 def _apply_daily_listing_state(
@@ -1629,7 +2359,7 @@ def _load_forex_expanded_fallback() -> list[SymbolRecord]:
 
 
 def _load_local_tracked_records(asset_class: str, output_dir: Path, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    """For daily-update, prefer symbols that are already tracked locally.
+    """For incremental updates, prefer symbols that are already tracked locally.
 
     This avoids reprocessing huge historical universes from stale manifests.
     """
@@ -1711,12 +2441,21 @@ def _use_daily_update_cache_if_available(
     asset_class: str,
     args: argparse.Namespace,
     cached: list[SymbolRecord],
+    *,
+    excluded_records: list[ExcludedSymbolRecord] | None = None,
 ) -> list[SymbolRecord] | None:
-    is_daily_update = getattr(args, "mode", "") == "daily-update"
-    if cached and is_daily_update and not getattr(args, "daily_discover_symbols", True):
-        records = _filter_tw_records_for_supported_universe(cached) if asset_class == "tw_stocks" else cached
+    is_incremental = _is_incremental_mode(args)
+    if cached and is_incremental and not getattr(args, "daily_discover_symbols", True):
+        records = (
+            _filter_tw_records_for_supported_universe(
+                cached,
+                excluded_records=excluded_records,
+            )
+            if asset_class == "tw_stocks"
+            else _filter_records_for_supported_universe(asset_class, cached)
+        )
         pruned = len(cached) - len(records)
-        message = f"[symbols] daily-update: cached manifest {asset_class} ({len(records)} symbols, skipping HTTP)"
+        message = f"[symbols] {_mode_label(args)}: cached manifest {asset_class} ({len(records)} symbols, skipping HTTP)"
         if pruned:
             message += f"; pruned {pruned} unsupported records"
         print(message)
@@ -1724,15 +2463,38 @@ def _use_daily_update_cache_if_available(
     return None
 
 
-def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("tw_stocks", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+def _resolve_tw_symbols(
+    args: argparse.Namespace,
+    cached: list[SymbolRecord],
+    *,
+    excluded_records: list[ExcludedSymbolRecord] | None = None,
+) -> list[SymbolRecord]:
+    cached_incremental = _use_daily_update_cache_if_available(
+        "tw_stocks",
+        args,
+        cached,
+        excluded_records=excluded_records,
+    )
+    if cached_incremental is not None:
+        return cached_incremental
 
     records: list[SymbolRecord] = []
+    output_dir = _resolve_asset_output_dir(args, "tw_stocks")
     local_manifest_records = _load_tw_symbols_from_local_manifest()
     local_parquet_records = _load_tw_symbols_from_local_parquet()
     repo_fallback_records = _load_repo_symbol_fallback("tw_stocks")
+    tracked_output_records = _load_local_tracked_records(
+        "tw_stocks",
+        output_dir,
+        cached,
+    )
+    official_delisted_records = (
+        _load_tw_delisted_symbols_from_parquet(
+            getattr(args, "tw_delisted_dir", None)
+        )
+        if args.include_tw_delisted
+        else []
+    )
     try:
         print(f"[symbols] fetching tw_stocks from exchange (timeout=60s)…")
         fetched = _fetch_with_hard_timeout(_load_tw_symbols_from_exchange, timeout=60)
@@ -1747,38 +2509,73 @@ def _resolve_tw_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
         print(f"[symbols] failed to load tw symbols from exchange: {exc}")
 
     if records:
-        # Keep historical/local names and stale but previously-tracked symbols in
-        # the manifest while still allowing new exchange listings to be added.
+        # A successful live discovery is only the current active universe. Keep
+        # the stable manifest, repository archive, and existing per-symbol files
+        # in the scheduled universe so repair cannot erase delisted/historical
+        # coverage or introduce survivorship bias. Live rows stay first, so they
+        # win duplicate codes during the final stable dedupe.
+        records.extend(cached)
+        records.extend(repo_fallback_records)
+        records.extend(tracked_output_records)
         records.extend(local_manifest_records)
         records.extend(local_parquet_records)
-        pruned_count = len(records) - len(_filter_tw_records_for_supported_universe(records))
+        records.extend(official_delisted_records)
+        filtered_records = _filter_tw_records_for_supported_universe(
+            records,
+            excluded_records=excluded_records,
+        )
+        pruned_count = len(records) - len(filtered_records)
         if pruned_count:
-            print(f"[symbols] pruned {pruned_count} unsupported tw_stocks records outside stock/ETF universe")
-        records = _filter_tw_records_for_supported_universe(records)
+            print(
+                f"[symbols] pruned {pruned_count} unsupported tw_stocks records "
+                "outside normal broker-tradable stock/ETF universe; "
+                f"reason={TW_SECURITY_CLASSIFIER_EXCLUSION_REASON}"
+            )
+        records = filtered_records
     elif _strict_no_fallback(args):
         raise RuntimeError(
             "Loaded zero tw_stocks symbols from exchange; strict_no_fallback=true "
             "so repo/local/cached symbol fallback is disabled."
         )
-    elif repo_fallback_records:
-        print(f"[symbols] using repo fallback manifest for tw_stocks ({len(repo_fallback_records)} symbols)")
-        records = _filter_tw_records_for_supported_universe(repo_fallback_records)
-    elif local_manifest_records:
-        print(f"[symbols] using local data_parquet manifest for tw_stocks ({len(local_manifest_records)} symbols)")
-        records = _filter_tw_records_for_supported_universe(local_manifest_records)
-    elif local_parquet_records:
-        print(f"[symbols] fallback to local data_parquet codes for tw_stocks ({len(local_parquet_records)} symbols)")
-        records = _filter_tw_records_for_supported_universe(local_parquet_records)
     else:
-        records = cached or []
-        records = _filter_tw_records_for_supported_universe(records)
+        # Discovery failure must not choose one fallback by precedence and drop
+        # the others. Their union is the only stable recovery universe after an
+        # interrupted manifest rewrite.
+        records = [
+            *cached,
+            *repo_fallback_records,
+            *tracked_output_records,
+            *local_manifest_records,
+            *local_parquet_records,
+            *official_delisted_records,
+        ]
+        print(
+            "[symbols] using unioned tw_stocks fallback universe "
+            f"cached={len(cached)} repo={len(repo_fallback_records)} "
+            f"tracked={len(tracked_output_records)} "
+            f"local_manifest={len(local_manifest_records)} "
+            f"local_parquet={len(local_parquet_records)} "
+            f"official_delisted={len(official_delisted_records)}"
+        )
+        records = _filter_tw_records_for_supported_universe(
+            records,
+            excluded_records=excluded_records,
+        )
 
     if args.include_tw_delisted:
+        if official_delisted_records:
+            print(
+                f"[symbols] loaded {len(official_delisted_records)} TW delisted "
+                "venue records from canonical official parquet"
+            )
         try:
             records.extend(_fetch_with_hard_timeout(_load_tw_delisted_symbols, timeout=60))
         except Exception as exc:
             print(f"[symbols] failed to load tw delisted list: {exc}")
-    return records
+    return _filter_tw_records_for_supported_universe(
+        records,
+        excluded_records=excluded_records,
+    )
 
 
 def _discover_daily_stock_records(
@@ -1800,9 +2597,9 @@ def _discover_daily_stock_records(
 
 
 def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("us_stocks", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("us_stocks", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     repo_fallback_records = _load_repo_symbol_fallback("us_stocks")
     records = [] if _strict_no_fallback(args) else _records_from_defaults("us_stocks")
@@ -1841,13 +2638,20 @@ def _resolve_us_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) ->
             )
         except Exception as exc:
             print(f"[symbols] failed to load us delisted list: {exc}")
+    before_filter = len(records)
+    records = _filter_us_records_for_broker_tradable_universe(records)
+    if before_filter != len(records):
+        print(
+            f"[symbols] pruned {before_filter - len(records)} unsupported us_stocks records "
+            "outside broker-tradable stock/ETF/ADR universe"
+        )
     return records
 
 
 def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("crypto", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("crypto", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     repo_fallback_records = _load_repo_symbol_fallback("crypto")
     records = [] if _strict_no_fallback(args) else _records_from_defaults("crypto")
@@ -1878,9 +2682,9 @@ def _resolve_crypto_symbols(args: argparse.Namespace, cached: list[SymbolRecord]
 
 
 def _resolve_forex_symbols(args: argparse.Namespace, output_dir: Path, cached: list[SymbolRecord]) -> list[SymbolRecord]:
-    cached_daily = _use_daily_update_cache_if_available("forex", args, cached)
-    if cached_daily is not None:
-        return cached_daily
+    cached_incremental = _use_daily_update_cache_if_available("forex", args, cached)
+    if cached_incremental is not None:
+        return cached_incremental
 
     repo_fallback_records = _load_repo_symbol_fallback("forex")
     records = [] if _strict_no_fallback(args) else _records_from_defaults("forex")
@@ -1927,26 +2731,84 @@ def _dedupe_records_by_code(records: list[SymbolRecord]) -> list[SymbolRecord]:
     return deduped
 
 
+def _dedupe_excluded_records(
+    records: list[ExcludedSymbolRecord],
+) -> list[ExcludedSymbolRecord]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[ExcludedSymbolRecord] = []
+    for record in records:
+        key = (record.code, record.reason)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
+
+
 def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> SymbolResolution:
+    excluded_records: list[ExcludedSymbolRecord] = []
     if args.symbols_file:
         records = _load_symbols_from_file(asset_class, args.symbols_file)
+        if asset_class == "tw_stocks":
+            records = _filter_tw_records_for_supported_universe(
+                records,
+                excluded_records=excluded_records,
+            )
         deduped = _dedupe_records_by_code(records)
         if args.limit is not None:
             deduped = deduped[: args.limit]
-        return SymbolResolution(scheduled_records=deduped, manifest_records=deduped, new_codes=set())
+        manifest_records = list(deduped)
+        if _is_incremental_mode(args):
+            output_dir = _resolve_asset_output_dir(args, asset_class)
+            known = {
+                record.code: record
+                for record in [
+                    *_resolve_cached_manifest(output_dir, asset_class),
+                    *_load_repo_symbol_fallback(asset_class),
+                ]
+            }
+            deduped = [known.get(record.code, record) for record in deduped]
+        return SymbolResolution(
+            scheduled_records=deduped,
+            manifest_records=manifest_records,
+            new_codes=set(),
+            excluded_records=_dedupe_excluded_records(excluded_records),
+        )
     elif args.symbols:
         records = [_record_from_input(asset_class, symbol) for symbol in args.symbols]
+        if asset_class == "tw_stocks":
+            records = _filter_tw_records_for_supported_universe(
+                records,
+                excluded_records=excluded_records,
+            )
         deduped = _dedupe_records_by_code(records)
         if args.limit is not None:
             deduped = deduped[: args.limit]
-        return SymbolResolution(scheduled_records=deduped, manifest_records=deduped, new_codes=set())
+        manifest_records = list(deduped)
+        if _is_incremental_mode(args):
+            output_dir = _resolve_asset_output_dir(args, asset_class)
+            known = {
+                record.code: record
+                for record in [
+                    *_resolve_cached_manifest(output_dir, asset_class),
+                    *_load_repo_symbol_fallback(asset_class),
+                ]
+            }
+            deduped = [known.get(record.code, record) for record in deduped]
+        return SymbolResolution(
+            scheduled_records=deduped,
+            manifest_records=manifest_records,
+            new_codes=set(),
+            excluded_records=_dedupe_excluded_records(excluded_records),
+        )
     else:
         output_dir = _resolve_asset_output_dir(args, asset_class)
         cached = _resolve_cached_manifest(output_dir, asset_class)
         blacklist_symbols = _load_blacklist(_blacklist_file_path(output_dir))
-        is_daily_update = getattr(args, "mode", "") == "daily-update"
+        is_incremental = _is_incremental_mode(args)
+        mode_label = _mode_label(args)
 
-        if is_daily_update:
+        if is_incremental:
             active_records = _load_local_tracked_records(asset_class, output_dir, cached)
             if not _strict_no_fallback(args):
                 active_records.extend(_records_from_defaults(asset_class))
@@ -1956,22 +2818,44 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 active_records.extend(cached)
             if asset_class == "tw_stocks":
                 active_before = len(active_records)
-                active_records = _filter_tw_records_for_supported_universe(active_records)
+                active_records = _filter_tw_records_for_supported_universe(
+                    active_records,
+                    excluded_records=excluded_records,
+                )
                 if active_before != len(active_records):
                     print(
-                        f"[symbols] daily-update: pruned {active_before - len(active_records)} "
+                        f"[symbols] {mode_label}: pruned {active_before - len(active_records)} "
                         "unsupported tw_stocks active records outside stock/ETF universe"
+                    )
+            elif asset_class == "us_stocks":
+                active_before = len(active_records)
+                active_records = _filter_us_records_for_broker_tradable_universe(active_records)
+                if active_before != len(active_records):
+                    print(
+                        f"[symbols] {mode_label}: pruned {active_before - len(active_records)} "
+                        "unsupported us_stocks active records outside broker-tradable universe"
                     )
 
             manifest_records = list(cached)
             manifest_records.extend(active_records)
             if asset_class == "tw_stocks":
                 manifest_before = len(manifest_records)
-                manifest_records = _filter_tw_records_for_supported_universe(manifest_records)
+                manifest_records = _filter_tw_records_for_supported_universe(
+                    manifest_records,
+                    excluded_records=excluded_records,
+                )
                 if manifest_before != len(manifest_records):
                     print(
-                        f"[symbols] daily-update: pruned {manifest_before - len(manifest_records)} "
+                        f"[symbols] {mode_label}: pruned {manifest_before - len(manifest_records)} "
                         "unsupported tw_stocks manifest records outside stock/ETF universe"
+                    )
+            elif asset_class == "us_stocks":
+                manifest_before = len(manifest_records)
+                manifest_records = _filter_us_records_for_broker_tradable_universe(manifest_records)
+                if manifest_before != len(manifest_records):
+                    print(
+                        f"[symbols] {mode_label}: pruned {manifest_before - len(manifest_records)} "
+                        "unsupported us_stocks manifest records outside broker-tradable universe"
                     )
             known_before = {record.code for record in manifest_records}
             known_symbol_keys: set[str] = set()
@@ -1983,23 +2867,41 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
             if getattr(args, "daily_retry_known_missing_symbols", False):
                 active_codes = {record.code for record in active_records}
                 known_missing = [record for record in cached if record.code not in active_codes]
-                if asset_class == "tw_stocks":
-                    known_missing = _filter_tw_records_for_supported_universe(known_missing)
+                known_missing = (
+                    _filter_tw_records_for_supported_universe(
+                        known_missing,
+                        excluded_records=excluded_records,
+                    )
+                    if asset_class == "tw_stocks"
+                    else _filter_records_for_supported_universe(
+                        asset_class,
+                        known_missing,
+                    )
+                )
                 if known_missing:
                     print(
-                        f"[symbols] daily-update: retrying {len(known_missing)} known missing "
+                        f"[symbols] {mode_label}: retrying {len(known_missing)} known missing "
                         f"{asset_class} symbols from cached manifest"
                     )
                     active_records.extend(known_missing)
 
             if not _strict_no_fallback(args):
                 repo_candidates = _load_repo_symbol_fallback(asset_class)
-                if asset_class == "tw_stocks":
-                    repo_candidates = _filter_tw_records_for_supported_universe(repo_candidates)
+                repo_candidates = (
+                    _filter_tw_records_for_supported_universe(
+                        repo_candidates,
+                        excluded_records=excluded_records,
+                    )
+                    if asset_class == "tw_stocks"
+                    else _filter_records_for_supported_universe(
+                        asset_class,
+                        repo_candidates,
+                    )
+                )
                 new_from_repo = [record for record in repo_candidates if record.code not in known_before]
                 if new_from_repo:
                     print(
-                        f"[symbols] daily-update: adding {len(new_from_repo)} new symbols "
+                        f"[symbols] {mode_label}: adding {len(new_from_repo)} new symbols "
                         f"from repo fallback manifest for {asset_class}"
                     )
                     active_records.extend(new_from_repo)
@@ -2016,10 +2918,19 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                             f"Daily symbol discovery failed for {asset_class}; strict_no_fallback=true "
                             "so cached/repo discovery fallback is disabled."
                         ) from exc
-                    print(f"[symbols] daily-update: discovery failed for {asset_class}: {exc}")
+                    print(f"[symbols] {mode_label}: discovery failed for {asset_class}: {exc}")
                 else:
-                    if asset_class == "tw_stocks":
-                        discovered = _filter_tw_records_for_supported_universe(discovered)
+                    discovered = (
+                        _filter_tw_records_for_supported_universe(
+                            discovered,
+                            excluded_records=excluded_records,
+                        )
+                        if asset_class == "tw_stocks"
+                        else _filter_records_for_supported_universe(
+                            asset_class,
+                            discovered,
+                        )
+                    )
                     discovered_active_symbols: set[str] = set()
                     discovered_delisted_symbols: set[str] = set()
                     for record in discovered:
@@ -2062,7 +2973,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                     ]
                     if new_from_discovery:
                         print(
-                            f"[symbols] daily-update: adding {len(new_from_discovery)} new symbols "
+                            f"[symbols] {mode_label}: adding {len(new_from_discovery)} new symbols "
                             f"from upstream discovery for {asset_class}"
                         )
                         active_records.extend(new_from_discovery)
@@ -2074,8 +2985,17 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                                 active_discovery_symbols.update(_candidate_symbol_keys(asset_class, record) & discovered_active_symbols)
 
             if asset_class == "tw_stocks":
-                active_records = _filter_tw_records_for_supported_universe(active_records)
-                manifest_records = _filter_tw_records_for_supported_universe(manifest_records)
+                active_records = _filter_tw_records_for_supported_universe(
+                    active_records,
+                    excluded_records=excluded_records,
+                )
+                manifest_records = _filter_tw_records_for_supported_universe(
+                    manifest_records,
+                    excluded_records=excluded_records,
+                )
+            elif asset_class == "us_stocks":
+                active_records = _filter_us_records_for_broker_tradable_universe(active_records)
+                manifest_records = _filter_us_records_for_broker_tradable_universe(manifest_records)
 
             active_deduped = _dedupe_records_by_code(active_records)
             manifest_deduped = _dedupe_records_by_code(manifest_records)
@@ -2083,7 +3003,7 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 active_deduped = active_deduped[: args.limit]
                 manifest_deduped = manifest_deduped[: args.limit]
             print(
-                f"[symbols] daily-update: scheduled {asset_class} "
+                f"[symbols] {mode_label}: scheduled {asset_class} "
                 f"({len(active_deduped)} scheduled, {len(manifest_deduped)} known; "
                 "parquet+whitelist+defaults+new_discovery)"
             )
@@ -2092,10 +3012,15 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
                 manifest_records=manifest_deduped,
                 new_codes=new_codes,
                 active_discovery_symbols=active_discovery_symbols,
+                excluded_records=_dedupe_excluded_records(excluded_records),
             )
 
         if asset_class == "tw_stocks":
-            records = _resolve_tw_symbols(args, cached)
+            records = _resolve_tw_symbols(
+                args,
+                cached,
+                excluded_records=excluded_records,
+            )
         elif asset_class == "us_stocks":
             records = _resolve_us_symbols(args, cached)
         elif asset_class == "crypto":
@@ -2105,11 +3030,21 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         else:
             records = _records_from_defaults(asset_class)
 
+    if asset_class == "tw_stocks":
+        records = _filter_tw_records_for_supported_universe(
+            records,
+            excluded_records=excluded_records,
+        )
     deduped = _dedupe_records_by_code(records)
 
     if args.limit is not None:
         deduped = deduped[: args.limit]
-    return SymbolResolution(scheduled_records=deduped, manifest_records=deduped, new_codes=set())
+    return SymbolResolution(
+        scheduled_records=deduped,
+        manifest_records=deduped,
+        new_codes=set(),
+        excluded_records=_dedupe_excluded_records(excluded_records),
+    )
 
 
 def _resolve_symbols(asset_class: str, args: argparse.Namespace) -> list[SymbolRecord]:
@@ -2131,6 +3066,8 @@ def _download_symbol(
     whitelist_symbols: set[str] | None = None,
     whitelist_path: Path | None = None,
     whitelist_lock: threading.Lock | None = None,
+    request_rate_limiter: RequestRateLimiter | None = None,
+    yfinance_session: object | None = None,
 ) -> DownloadResult:
     output_path = output_dir / f"{record.code}_features.parquet"
     candidates_to_try = _available_candidate_symbols(asset_class, record, blacklist_symbols)
@@ -2188,8 +3125,12 @@ def _download_symbol(
                 )
 
     existing_frame: object | None = None
+    existing_requested_start_date: str | None = None
     if output_path.exists() and merge_existing:
         try:
+            existing_requested_start_date = _load_existing_file_info(
+                output_path
+            ).requested_start_date
             existing_frame = _read_parquet_frame(output_path)
             if asset_class == "crypto" and not _frame_matches_expected_interval(
                 existing_frame,
@@ -2222,35 +3163,119 @@ def _download_symbol(
     for candidate_symbol in candidates_to_try:
         for attempt in range(retries + 1):
             try:
-                std_capture = io.StringIO()
-                err_capture = io.StringIO()
+                bare_chart_rate_limit_error: BaseException | None = None
 
-                def _download_frame() -> object:
-                    return yf.download(
-                        tickers=candidate_symbol,
-                        start=effective_start_date,
-                        end=period_end_exclusive,
-                        interval=yf_interval,
-                        auto_adjust=False,
-                        actions=True,
-                        progress=False,
-                        threads=False,
-                        timeout=20,
-                    )
+                def _download_frame(symbol: str = candidate_symbol) -> object:
+                    nonlocal bare_chart_rate_limit_error
+                    def session_chart() -> object:
+                        if yfinance_session is not None:
+                            return _download_yahoo_chart_frame(
+                                symbol=symbol,
+                                start_date=effective_start_date,
+                                end_date_exclusive=period_end_exclusive,
+                                interval=yf_interval,
+                                timeout=20,
+                                session=yfinance_session,
+                            )
+                        if request_rate_limiter is not None:
+                            request_rate_limiter.wait()
+                        return _download_yfinance_frame(
+                            symbol=symbol,
+                            start_date=effective_start_date,
+                            end_date_exclusive=period_end_exclusive,
+                            interval=yf_interval,
+                            timeout=20,
+                            session=yfinance_session,
+                        )
 
-                with contextlib.redirect_stdout(std_capture), contextlib.redirect_stderr(err_capture):
-                    # Guard yfinance against indefinite socket/DNS stalls.
-                    frame = _fetch_with_hard_timeout(
-                        _download_frame,
-                        timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
-                    )
+                    if not _yahoo_chart_route_available():
+                        return session_chart()
+                    if request_rate_limiter is not None:
+                        request_rate_limiter.wait()
+                    # Check the circuit only after claiming the bare-route
+                    # slot. Another worker may have observed a 429 while this
+                    # worker was waiting; checking earlier would let a whole
+                    # batch hit the blocked route and extend cooldown N times.
+                    if not _yahoo_chart_route_available():
+                        return session_chart()
+                    try:
+                        return _download_yahoo_chart_frame(
+                            symbol=symbol,
+                            start_date=effective_start_date,
+                            end_date_exclusive=period_end_exclusive,
+                            interval=yf_interval,
+                            timeout=20,
+                        )
+                    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                        # yfinance is a second HTTP route to the same upstream,
+                        # not a free retry outside the provider budget. After a
+                        # 429, defer the whole provider and claim a new slot for
+                        # the cookie/session-backed chart request. Every request
+                        # made by that session is independently metered.
+                        is_rate_limited = (
+                            isinstance(exc, HTTPError) and exc.code == 429
+                        ) or "too many requests" in str(exc).lower()
+                        if is_rate_limited:
+                            bare_chart_rate_limit_error = exc
+                            _defer_yahoo_chart_route(
+                                YAHOO_CHART_429_COOLDOWN_SECONDS
+                            )
+                            if request_rate_limiter is not None:
+                                request_rate_limiter.defer(5.0)
+                        return session_chart()
+
+                # Guard Yahoo chart API calls against indefinite socket/DNS
+                # stalls. Do not use redirect_stdout/redirect_stderr here:
+                # those mutate process-global streams and are unsafe across
+                # concurrent symbol threads.
+                frame = _fetch_with_hard_timeout(
+                    _download_frame,
+                    timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
+                )
                 normalized = _normalize_download_frame(frame, keep_zero_volume=asset_class != "forex")
-                captured = f"{std_capture.getvalue()}\n{err_capture.getvalue()}".lower()
+                captured = ""
+                captured_rate_limit = any(
+                    marker in captured
+                    for marker in ("too many requests", "rate limited", "rate limit")
+                )
+                if captured_rate_limit:
+                    if request_rate_limiter is not None:
+                        request_rate_limiter.defer(5.0)
+                    raise RuntimeError("Yahoo Too Many Requests from fallback route")
+                if (
+                    yfinance_session is None
+                    and bare_chart_rate_limit_error is not None
+                    and (
+                        normalized.is_empty()
+                        or _captured_indicates_unavailable(captured)
+                    )
+                ):
+                    raise bare_chart_rate_limit_error
                 if _captured_indicates_unavailable(captured):
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
                     last_error = f"{candidate_symbol}: unavailable or delisted"
                     break
                 if normalized.is_empty():
+                    if asset_class == "tw_stocks" and record.market == "tw_delisted":
+                        _blacklist_symbol(
+                            candidate_symbol,
+                            blacklist_symbols,
+                            blacklist_path,
+                            blacklist_lock,
+                        )
+                        return DownloadResult(
+                            asset_class=asset_class,
+                            code=record.code,
+                            yahoo_symbol=candidate_symbol,
+                            market=record.market,
+                            status="failed",
+                            rows=0,
+                            output_path=None,
+                            message=(
+                                f"{candidate_symbol}: unavailable or delisted; "
+                                "Yahoo returned a valid empty history."
+                            ),
+                        )
                     last_error = f"{candidate_symbol}: Yahoo returned no rows."
                     if attempt < retries:
                         time.sleep(0.8 * (attempt + 1))
@@ -2269,6 +3294,11 @@ def _download_symbol(
                     output_path,
                     asset_class=asset_class,
                     requested_end_date=end_date,
+                    requested_start_date=(
+                        min(existing_requested_start_date, effective_start_date)
+                        if existing_requested_start_date is not None
+                        else effective_start_date
+                    ),
                 )
                 _whitelist_symbol(candidate_symbol, whitelist_symbols, whitelist_path, whitelist_lock)
                 return DownloadResult(
@@ -2289,7 +3319,15 @@ def _download_symbol(
                     _blacklist_symbol(candidate_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
                     break
                 if attempt < retries:
-                    time.sleep(0.8 * (attempt + 1))
+                    is_rate_limited = isinstance(exc, HTTPError) and exc.code == 429
+                    if is_rate_limited or "too many requests" in str(exc).lower():
+                        delay = 5.0 * (2**attempt)
+                        if request_rate_limiter is not None:
+                            request_rate_limiter.defer(delay)
+                        else:
+                            time.sleep(delay)
+                    else:
+                        time.sleep(0.8 * (attempt + 1))
 
     return DownloadResult(
         asset_class=asset_class,
@@ -2303,10 +3341,49 @@ def _download_symbol(
     )
 
 
-def _write_symbol_manifest(output_dir: Path, records: list[SymbolRecord]) -> None:
+def _write_symbol_manifest(
+    output_dir: Path,
+    records: list[SymbolRecord],
+    *,
+    asset_class: str,
+    excluded_records: list[ExcludedSymbolRecord] | None = None,
+) -> None:
     manifest_path = output_dir / "symbols.csv"
     _require_polars()
-    pl.DataFrame([asdict(record) for record in _dedupe_records_by_code(records)]).write_csv(manifest_path)
+    exclusions = list(excluded_records or [])
+    included = list(records)
+    if asset_class == "tw_stocks":
+        included = _filter_tw_records_for_supported_universe(
+            included,
+            excluded_records=exclusions,
+        )
+    included = _dedupe_records_by_code(included)
+    exclusions = _dedupe_excluded_records(exclusions)
+    pl.DataFrame([asdict(record) for record in included]).write_csv(manifest_path)
+
+    reason_counts: dict[str, int] = {}
+    for record in exclusions:
+        reason_counts[record.reason] = reason_counts.get(record.reason, 0) + 1
+    (output_dir / "symbols_manifest_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at_utc": datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat(),
+                "asset_class": asset_class,
+                "included_record_count": len(included),
+                "excluded_record_count": len(exclusions),
+                "excluded_reason_counts": reason_counts,
+                "excluded_records": [asdict(record) for record in exclusions],
+            },
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> list[SymbolRecord]:
@@ -2328,7 +3405,15 @@ def _load_symbols_from_manifest_csv(manifest_path: Path, asset_class: str) -> li
             continue
         name = str(row.get("name", code)).strip() or code
         market = str(row.get("market", asset_class)).strip() or asset_class
-        records.append(SymbolRecord(code=code, name=name, market=market, yahoo_symbol=yahoo_symbol))
+        records.append(
+            _normalize_manifest_record(
+                asset_class,
+                code=code,
+                name=name,
+                market=market,
+                yahoo_symbol=yahoo_symbol,
+            )
+        )
     return records
 
 
@@ -2418,11 +3503,23 @@ def _summarize_post_repair_coverage(
         for r in results
         if r.status in {"repaired", "schema_repaired", "new_symbol_repaired"} and r.last_date
     }
+    terminal_results = {
+        result.code: result
+        for result in results
+        if result.status in {"not_found", "delisted_no_history", "delisted_removed"}
+    }
 
     first_dates: list[date] = []
     last_dates: list[date] = []
     for check in checks:
         if check.status == "broken" or check.first_date is None:
+            continue
+        terminal_result = terminal_results.get(check.record.code)
+        if terminal_result is not None and not check.output_path.is_file():
+            # A terminal refresh may quarantine an unverified legacy parquet.
+            # Do not keep reporting its precheck dates after it left the active
+            # input root. A valid existing history that remains active still
+            # counts even when the upstream is currently unavailable.
             continue
         first_dates.append(_parse_date(check.first_date).date())
         repaired_last_date = repaired_last_dates.get(check.record.code)
@@ -2481,11 +3578,16 @@ def _resolve_repair_plan(
         output_path: Path,
         reason: str,
     ) -> RepairCheck:
-        removed = False
+        quarantined: Path | None = None
         if output_path.exists():
             try:
-                output_path.unlink()
-                removed = True
+                quarantined = _quarantine_unverified_yahoo_file(
+                    output_dir=output_dir,
+                    record=record,
+                    original_path=output_path,
+                    precheck_status="delisted_no_history",
+                    reason=reason,
+                )
             except Exception as exc:
                 return RepairCheck(
                     record=record,
@@ -2495,18 +3597,22 @@ def _resolve_repair_plan(
                     last_date=None,
                     repair_start_date=None,
                     merge_existing=False,
-                    message=f"failed to remove delisted no-history file: {exc}",
+                    message=f"failed to quarantine delisted no-history file: {exc}",
                 )
         _blacklist_record_symbols(record.yahoo_symbol, blacklist_symbols, blacklist_path, blacklist_lock)
         return RepairCheck(
             record=record,
-            status="delisted_removed" if removed else "delisted_no_history",
+            status="delisted_removed" if quarantined is not None else "delisted_no_history",
             output_path=output_path,
             first_date=None,
             last_date=None,
             repair_start_date=None,
             merge_existing=False,
-            message=reason,
+            message=(
+                f"{reason}; quarantined_unverified_yahoo={quarantined}"
+                if quarantined is not None
+                else reason
+            ),
         )
 
     progress = tqdm(records, desc=f"precheck:{asset_class}", unit="symbol")
@@ -2514,6 +3620,11 @@ def _resolve_repair_plan(
         for record in progress:
             progress.set_postfix_str(record.code, refresh=False)
             output_path = output_dir / f"{record.code}_features.parquet"
+            verify_tw_delisted = (
+                asset_class == "tw_stocks"
+                and _is_delisted_record(record)
+                and bool(getattr(args, "verify_tw_delisted_history", False))
+            )
             try:
                 if precheck_loader is not None:
                     info = precheck_loader.load_with_timeout(output_path, args.precheck_file_timeout_seconds)
@@ -2554,7 +3665,7 @@ def _resolve_repair_plan(
             columns = info.columns
             checked_through_date = info.checked_through_date
             if error == "missing":
-                if _is_delisted_record(record):
+                if _is_delisted_record(record) and not verify_tw_delisted:
                     checks.append(_delisted_no_history(record, output_path, "confirmed delisted with no local history"))
                     continue
                 if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
@@ -2573,7 +3684,7 @@ def _resolve_repair_plan(
                 )
                 continue
             if error is not None:
-                if _is_delisted_record(record):
+                if _is_delisted_record(record) and not verify_tw_delisted:
                     if error in {"empty", "no_valid_date"}:
                         checks.append(_delisted_no_history(record, output_path, f"confirmed delisted with no usable history: {error}"))
                     else:
@@ -2593,7 +3704,7 @@ def _resolve_repair_plan(
                 )
                 continue
             if last_date is None:
-                if _is_delisted_record(record):
+                if _is_delisted_record(record) and not verify_tw_delisted:
                     checks.append(_delisted_no_history(record, output_path, "confirmed delisted with no valid dates"))
                     continue
                 checks.append(
@@ -2611,8 +3722,15 @@ def _resolve_repair_plan(
 
             missing_required = sorted(REPAIR_REQUIRED_COLUMNS - columns)
             if missing_required:
-                if _is_delisted_record(record):
-                    checks.append(_unavailable_skip(record, output_path, first_date, last_date))
+                if _is_delisted_record(record) and not verify_tw_delisted:
+                    checks.append(
+                        _delisted_no_history(
+                            record,
+                            output_path,
+                            f"confirmed delisted with schema mismatch: "
+                            f"missing_required_columns={','.join(missing_required)}",
+                        )
+                    )
                     continue
                 if not retry_blacklisted and _all_candidate_symbols_blacklisted(asset_class, record, blacklist_symbols):
                     checks.append(_unavailable_skip(record, output_path, first_date, last_date))
@@ -2632,7 +3750,7 @@ def _resolve_repair_plan(
                 continue
 
             local_last_dt = _parse_date(last_date).date()
-            if _is_delisted_record(record):
+            if _is_delisted_record(record) and not verify_tw_delisted:
                 checks.append(_unavailable_skip(record, output_path, first_date, last_date))
                 continue
 
@@ -2640,7 +3758,63 @@ def _resolve_repair_plan(
                 checks.append(_unavailable_skip(record, output_path, first_date, last_date))
                 continue
 
-            if args.mode == "daily-update" and args.daily_stale_max_lag_days > 0:
+            requested_start_dt = _parse_date(args.start_date).date()
+            checked_start_dt = (
+                _parse_date(info.requested_start_date).date()
+                if info.requested_start_date
+                else None
+            )
+            if asset_class == "tw_stocks" and (
+                checked_start_dt is None or checked_start_dt > requested_start_dt
+            ):
+                metadata_detail = (
+                    f", metadata_error={info.metadata_error}"
+                    if info.metadata_error
+                    else ""
+                )
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="historical_start_unverified",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=args.start_date,
+                        checked_through_date=checked_through_date,
+                        merge_existing=True,
+                        message=(
+                            f"requested_start={args.start_date}, "
+                            f"checked_start={info.requested_start_date}"
+                            f"{metadata_detail}"
+                        ),
+                    )
+                )
+                continue
+
+            metadata_problems: list[str] = []
+            if info.metadata_error:
+                metadata_problems.append(info.metadata_error)
+            if info.asset_class is not None and info.asset_class != asset_class:
+                metadata_problems.append(
+                    f"asset_class={info.asset_class!r}, expected={asset_class!r}"
+                )
+            if metadata_problems:
+                checks.append(
+                    RepairCheck(
+                        record=record,
+                        status="metadata_invalid",
+                        output_path=output_path,
+                        first_date=first_date,
+                        last_date=last_date,
+                        repair_start_date=args.start_date,
+                        checked_through_date=checked_through_date,
+                        merge_existing=False,
+                        message="; ".join(metadata_problems),
+                    )
+                )
+                continue
+
+            if _is_incremental_mode(args) and args.daily_stale_max_lag_days > 0:
                 lag_days = (target_end_dt - local_last_dt).days
                 if lag_days > args.daily_stale_max_lag_days:
                     checks.append(
@@ -2676,8 +3850,7 @@ def _resolve_repair_plan(
                 )
                 continue
             if (
-                args.mode == "daily-update"
-                and checked_through_dt is not None
+                checked_through_dt is not None
                 and checked_through_dt >= requested_target_end_dt
             ):
                 checks.append(
@@ -2733,6 +3906,14 @@ def _run_parallel_symbol_downloads(
         return []
 
     results: list[DownloadResult] = []
+    completed = 0
+    rate_limited_failures = 0
+    abort_after = max(0, int(getattr(args, "rate_limit_abort_after", 20) or 0))
+    request_rate_limiter = RequestRateLimiter(
+        float(getattr(args, "request_interval", 0.0) or 0.0)
+    )
+    yfinance_session = _build_yfinance_rate_limited_session(request_rate_limiter)
+    _warm_yfinance_session(yfinance_session, request_rate_limiter)
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
             executor.submit(
@@ -2751,6 +3932,8 @@ def _run_parallel_symbol_downloads(
                 whitelist_symbols,
                 whitelist_path,
                 whitelist_lock,
+                request_rate_limiter,
+                yfinance_session,
             ): (record, meta)
             for record, start_date, refresh, merge_existing, meta in tasks
         }
@@ -2761,6 +3944,8 @@ def _run_parallel_symbol_downloads(
                 record, meta = futures[future]
                 try:
                     result = future.result(timeout=symbol_timeout_seconds)
+                except CancelledError:
+                    continue
                 except TimeoutError:
                     if timeout_handler is None:
                         raise
@@ -2769,11 +3954,86 @@ def _run_parallel_symbol_downloads(
                 if result_transformer is not None:
                     result = result_transformer(result, meta)
                 results.append(result)
+                completed += 1
+                message = str(result.message or "").lower()
+                if result.status == "failed" and ("429" in message or "too many requests" in message):
+                    rate_limited_failures += 1
                 progress.update(1)
+                if abort_after and completed >= abort_after and rate_limited_failures == completed:
+                    message = (
+                        f"{asset_class}: Yahoo HTTP 429 rate limited all first {completed} completed requests; "
+                        "abort remaining symbols to avoid a long doomed update"
+                    )
+                    print(f"[{progress_desc}] aborted: {message}", file=sys.stderr, flush=True)
+                    for pending in futures:
+                        if not pending.done():
+                            pending.cancel()
+                    raise YahooRateLimitedError(message)
         finally:
             progress.close()
 
     return results
+
+
+def _transform_repair_result(
+    result: DownloadResult,
+    check: RepairCheck,
+    *,
+    output_dir: Path,
+) -> DownloadResult:
+    if result.status == "updated":
+        if check.status == "new_symbol":
+            result.status = "new_symbol_repaired"
+        elif check.status == "schema_mismatch":
+            result.status = "schema_repaired"
+        else:
+            result.status = "repaired"
+        return result
+
+    terminal_unavailable = result.status == "not_found"
+    if (
+        result.status == "failed"
+        and result.message
+        and _captured_indicates_unavailable(result.message.lower())
+    ):
+        result.status = "not_found"
+        terminal_unavailable = True
+
+    if terminal_unavailable and check.status in QUARANTINE_ELIGIBLE_PRECHECK_STATUSES:
+        original_message = str(result.message or "Yahoo confirmed unavailable")
+        reason = (
+            f"fresh repair returned terminal unavailable; {original_message}; "
+            f"precheck_message={check.message!r}"
+        )
+        try:
+            quarantined = _quarantine_unverified_yahoo_file(
+                output_dir=output_dir,
+                record=check.record,
+                original_path=check.output_path,
+                precheck_status=check.status,
+                reason=reason,
+            )
+        except Exception as exc:
+            result.status = "failed_quarantine"
+            result.message = (
+                f"{original_message}; failed to quarantine unverified existing "
+                f"Yahoo parquet: {type(exc).__name__}: {exc}"
+            )
+            return result
+        if quarantined is not None:
+            result.output_path = None
+            result.message = (
+                f"{original_message}; quarantined_unverified_yahoo={quarantined}"
+            )
+        return result
+
+    if result.status == "empty":
+        result.status = "still_stale"
+        if check.last_date:
+            result.message = (
+                f"No newer rows returned; local last date remains {check.last_date}"
+            )
+    return result
 
 
 def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str, int]:
@@ -2800,11 +4060,16 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     )
     if adjustment_reason is not None:
         print(
-            f"[daily-update] asset={asset_class} effective_target_end={effective_target_end_dt.isoformat()} "
+            f"[{_mode_label(args)}] asset={asset_class} effective_target_end={effective_target_end_dt.isoformat()} "
             f"requested_end={requested_target_end_dt.isoformat()} reason={adjustment_reason}"
         )
 
-    _write_symbol_manifest(output_dir, resolution.manifest_records)
+    _write_symbol_manifest(
+        output_dir,
+        resolution.manifest_records,
+        asset_class=asset_class,
+        excluded_records=resolution.excluded_records,
+    )
     if resolution.active_discovery_symbols:
         active_listing_candidates: set[str] = set()
         for record in records:
@@ -2830,6 +4095,8 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
         _write_symbol_manifest(
             output_dir,
             [record for record in resolution.manifest_records if record.code not in removed_delisted_codes],
+            asset_class=asset_class,
+            excluded_records=resolution.excluded_records,
         )
 
     status_counts: dict[str, int] = {}
@@ -2853,13 +4120,24 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
 
     needs_update = sum(
         status_counts.get(status, 0)
-        for status in ("missing", "new_symbol", "stale", "empty", "broken", "schema_mismatch")
+        for status in (
+            "missing",
+            "new_symbol",
+            "stale",
+            "empty",
+            "broken",
+            "schema_mismatch",
+            "metadata_invalid",
+            "historical_start_unverified",
+        )
     )
     print(
         f"[repair] asset={asset_class} up_to_date={status_counts.get('current', 0)} "
         f"needs_update={needs_update} stale={status_counts.get('stale', 0)} "
         f"missing={status_counts.get('missing', 0)} new_symbol={status_counts.get('new_symbol', 0)} "
         f"broken={status_counts.get('broken', 0)} schema_mismatch={status_counts.get('schema_mismatch', 0)} "
+        f"metadata_invalid={status_counts.get('metadata_invalid', 0)} "
+        f"historical_unverified={status_counts.get('historical_start_unverified', 0)} "
         f"delisted_skip={status_counts.get('delisted_skip', 0)} "
         f"delisted_no_history={status_counts.get('delisted_no_history', 0)} "
         f"delisted_removed={status_counts.get('delisted_removed', 0)} "
@@ -2893,20 +4171,7 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     def _repair_result_transform(result: DownloadResult, meta: object) -> DownloadResult:
         check = meta
         assert isinstance(check, RepairCheck)
-        if result.status == "updated":
-            if check.status == "new_symbol":
-                result.status = "new_symbol_repaired"
-            elif check.status == "schema_mismatch":
-                result.status = "schema_repaired"
-            else:
-                result.status = "repaired"
-        elif result.status == "failed" and result.message and _captured_indicates_unavailable(result.message.lower()):
-            result.status = "not_found"
-        elif result.status == "empty":
-            result.status = "still_stale"
-            if check.last_date:
-                result.message = f"No newer rows returned; local last date remains {check.last_date}"
-        return result
+        return _transform_repair_result(result, check, output_dir=output_dir)
 
     repair_tasks = [
         (check.record, check.repair_start_date, True, check.merge_existing, check)
@@ -2992,7 +4257,12 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
     if not records:
         raise RuntimeError(f"No symbols resolved for asset class: {asset_class}")
 
-    _write_symbol_manifest(output_dir, resolution.manifest_records)
+    _write_symbol_manifest(
+        output_dir,
+        resolution.manifest_records,
+        asset_class=asset_class,
+        excluded_records=resolution.excluded_records,
+    )
     download_tasks = [(record, args.start_date, args.refresh, False, None) for record in records]
     results = _run_parallel_symbol_downloads(
         asset_class=asset_class,
@@ -3019,10 +4289,10 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
 
 def _run_one_asset(asset_class: str, args: argparse.Namespace) -> tuple[str, dict[str, int]]:
     print(f"[{args.mode}] asset={asset_class} start={args.start_date} end={args.end_date}")
-    if args.mode == "daily-update":
+    if _is_incremental_mode(args):
         output_dir = _resolve_asset_output_dir(args, asset_class)
         if _asset_output_is_bootstrap_empty(output_dir):
-            print(f"[daily-update] asset={asset_class} bootstrap empty output; switching to download mode")
+            print(f"[{_mode_label(args)}] asset={asset_class} bootstrap empty output; switching to download mode")
             download_args = argparse.Namespace(**vars(args))
             download_args.mode = "download"
             counts = _download_asset_class(asset_class, download_args)
@@ -3041,6 +4311,13 @@ def main() -> None:
     # so any single blocking call can't hang the process indefinitely.
     socket.setdefaulttimeout(30)
     args = parse_args()
+    if args.request_interval is not None and args.request_interval < 0.0:
+        raise ValueError("--request-interval must be >= 0")
+    args.request_interval = resolve_request_interval(
+        "yahoo_finance",
+        args.request_interval,
+    )
+    print(f"[yahoo] {describe_rate_limit('yahoo_finance', args.request_interval)}")
     asset_classes = list(ASSET_CLASSES) if args.asset == "all" else [args.asset]
     summaries: dict[str, dict[str, int]] = {}
 
@@ -3059,6 +4336,9 @@ def main() -> None:
                     key, counts = future.result()
                     summaries[key] = counts
                     asset_progress.update(1)
+    except YahooRateLimitedError as exc:
+        print(f"[{args.mode}] aborted: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(str(exc)) from exc
     finally:
         asset_progress.close()
 
@@ -3066,11 +4346,30 @@ def main() -> None:
         summary_name = "download_summary.json"
     elif args.mode == "repair":
         summary_name = "repair_summary.json"
+    elif args.mode == "incremental":
+        summary_name = "incremental_update_summary.json"
     else:
         summary_name = "daily_update_summary.json"
     summary_path = Path(args.output_root) / summary_name
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
+    failures = []
+    for asset_class, counts in summaries.items():
+        reason = download_counts_failure_reason(counts)
+        if reason:
+            failures.append(f"{asset_class}: {reason}")
+        if args.fail_on_any_error:
+            unresolved = sum(
+                int(count or 0)
+                for status, count in counts.items()
+                if str(status).startswith("failed") or status == "still_stale"
+            )
+            if unresolved:
+                failures.append(
+                    f"{asset_class}: strict gate found {unresolved} unresolved final symbols"
+                )
+    if failures:
+        raise SystemExit("; ".join(failures))
 
 
 if __name__ == "__main__":

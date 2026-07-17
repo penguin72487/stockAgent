@@ -604,7 +604,6 @@ def benchmark_panel_build(
             try:
                 panel = build_panel(
                     tmp_dir,
-                    use_rapids=False,
                     benchmark_name=benchmark_name,
                     strict_no_fallback=False,
                     panel_backend=backend,

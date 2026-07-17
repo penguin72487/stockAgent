@@ -528,7 +528,7 @@
 
 ```
 專案結構：
-/root/stockAgent/
+<repo-root>/
 ├── OPTIMIZATION_SUMMARY.md           ← 📍 本文 (執行摘要)
 ├── OPTIMIZATION_ANALYSIS.md          ← 詳細分析 (第一性原理)
 ├── DATA_STRUCTURES_ALGORITHMS.md     ← 數據結構改進
@@ -560,4 +560,3 @@
 └── configs/
     └── experiment_baseline.yaml      ← 配置檔
 ```
-

@@ -150,7 +150,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.0.0",
-        "pandas>=2.0.0",
+        "polars>=0.20.0",
         "numpy>=1.24.0",
         "pyyaml>=6.0",
         "tqdm>=4.65.0",
@@ -510,4 +510,3 @@ def test_stuff():
 | **協作** | 新開發者更易上手 |
 | **發佈** | 支持通過 `pip install` 安裝 |
 | **版本控制** | 清晰的依賴管理和版本記錄 |
-

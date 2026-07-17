@@ -1,0 +1,13 @@
+# Within-fold DDP: one market job sees both physical GPUs and train.py relaunches
+# one rank per visible GPU. Add indices to this list when the host gains GPUs.
+state_dir: artifacts/gpu_jobs/tw_parallel
+allow_gpu_sharing: false
+
+jobs:
+  - name: tw_parallel
+    enabled: true
+    config: configs/markets/tw_public.yaml
+    gpus: [0, 1]
+    output_dir: artifacts/markets/tw_parallel
+    # CLI budgets are host-wide; train.py divides them across local ranks.
+    extra_args: ["--cpu-threads", "128", "--torch-compile-threads", "128"]

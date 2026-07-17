@@ -21,6 +21,7 @@ INTERVAL_SECONDS="${INTERVAL_SECONDS:-86400}"       # daemon mode sleep interval
 MARKET_CHECK_INTERVAL_SECONDS="${MARKET_CHECK_INTERVAL_SECONDS:-300}"
 MAX_CYCLES="${MAX_CYCLES:-0}"                       # 0 means unlimited
 FAIL_FAST="${FAIL_FAST:-0}"                         # 1 => fail immediately on any step error
+DAILY_PARALLEL_GROUPS="${DAILY_PARALLEL_GROUPS:-1}" # 1 => run independent provider groups concurrently
 LOCK_FILE="${LOCK_FILE:-/tmp/stockagent_daily.lock}"
 SCHEDULE_STATE_FILE="${SCHEDULE_STATE_FILE:-/tmp/stockagent_market_schedule.state}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -30,36 +31,70 @@ RUN_RECORD_FILE="${RUN_RECORD_FILE:-${RUN_LOG_DIR}/daily_runs.tsv}"
 TEE_LOG="${TEE_LOG:-1}"
 
 WORKERS="${WORKERS:-16}"
-ASSET_WORKERS="${ASSET_WORKERS:-1}"
+ASSET_WORKERS="${ASSET_WORKERS:-2}"
 RETRIES="${RETRIES:-2}"
 REPAIR_OVERLAP_DAYS="${REPAIR_OVERLAP_DAYS:-7}"
 DAILY_STALE_MAX_LAG_DAYS="${DAILY_STALE_MAX_LAG_DAYS:-14}"
 PRECHECK_FILE_TIMEOUT_SECONDS="${PRECHECK_FILE_TIMEOUT_SECONDS:-20}"
 REPAIR_SYMBOL_TIMEOUT_SECONDS="${REPAIR_SYMBOL_TIMEOUT_SECONDS:-90}"
+YAHOO_RATE_LIMIT_ABORT_AFTER="${YAHOO_RATE_LIMIT_ABORT_AFTER:-20}"
 YAHOO_DAILY_DISCOVER_SYMBOLS="${YAHOO_DAILY_DISCOVER_SYMBOLS:-1}"
 YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS="${YAHOO_DAILY_RETRY_KNOWN_MISSING_SYMBOLS:-0}"
 YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS="${YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS:-0}"
-YAHOO_INCLUDE_TW_DELISTED="${YAHOO_INCLUDE_TW_DELISTED:-1}"
 YAHOO_INCLUDE_US_DELISTED="${YAHOO_INCLUDE_US_DELISTED:-1}"
 FRANKFURTER_TIMEOUT="${FRANKFURTER_TIMEOUT:-30}"
-FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_forex_frankfurter}"
+FRANKFURTER_OUTPUT_DIR="${FRANKFURTER_OUTPUT_DIR:-data_yahoo/forex}"
 FRANKFURTER_SYMBOLS_FILE="${FRANKFURTER_SYMBOLS_FILE:-configs/forex_all_pairs_frankfurter.txt}"
 FRANKFURTER_SKIP_MANIFEST="${FRANKFURTER_SKIP_MANIFEST:-0}"
-RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-1}"
+FRANKFURTER_REQUEST_INTERVAL="${FRANKFURTER_REQUEST_INTERVAL:-}"
+RUN_FRANKFURTER="${RUN_FRANKFURTER:-1}"
+RUN_PEPPERSTONE_GROUPS="${RUN_PEPPERSTONE_GROUPS:-0}"
 PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
-OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-0.1}"
+OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-}"
 OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
 BYBIT_WORKERS="${BYBIT_WORKERS:-16}"
-BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-0.1}"
+BYBIT_REQUEST_INTERVAL="${BYBIT_REQUEST_INTERVAL:-}"
 BYBIT_MAX_RETRIES="${BYBIT_MAX_RETRIES:-8}"
 BYBIT_CATEGORIES="${BYBIT_CATEGORIES:-linear inverse}"
-RUN_YAHOO="${RUN_YAHOO:-1}"
-YAHOO_ASSETS="${YAHOO_ASSETS:-tw_stocks us_stocks crypto forex}"
-YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-0}"  # 0 disables timeout
-RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-1}"
-AUDIT_ROOTS="${AUDIT_ROOTS:-data_yahoo/tw_stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
+RUN_ALPACA_US="${RUN_ALPACA_US:-1}"
+ALPACA_US_WORKERS="${ALPACA_US_WORKERS:-16}"
+ALPACA_US_METADATA_WORKERS="${ALPACA_US_METADATA_WORKERS:-4}"
+ALPACA_US_BATCH_SIZE="${ALPACA_US_BATCH_SIZE:-500}"
+ALPACA_US_RETRIES="${ALPACA_US_RETRIES:-4}"
+ALPACA_US_TIMEOUT="${ALPACA_US_TIMEOUT:-30}"
+ALPACA_REQUESTS_PER_MINUTE="${ALPACA_REQUESTS_PER_MINUTE:-200}"
+ALPACA_US_STEP_TIMEOUT_SECONDS="${ALPACA_US_STEP_TIMEOUT_SECONDS:-1800}"  # 0 disables timeout
+RUN_YAHOO="${RUN_YAHOO:-0}"
+YAHOO_ASSETS="${YAHOO_ASSETS:-}"
+YAHOO_STEP_TIMEOUT_SECONDS="${YAHOO_STEP_TIMEOUT_SECONDS:-900}"  # 0 disables timeout
+RUN_TW_PUBLIC_DATA="${RUN_TW_PUBLIC_DATA:-1}"
+TW_PUBLIC_CONFIG="${TW_PUBLIC_CONFIG:-configs/markets/tw_public.yaml}"
+TW_PUBLIC_OUTPUT_DIR="${TW_PUBLIC_OUTPUT_DIR:-data_tw_public}"
+TW_PUBLIC_STOCKS_ROOT="${TW_PUBLIC_STOCKS_ROOT:-data_tw_public/stocks}"
+TW_PUBLIC_WORKERS="${TW_PUBLIC_WORKERS:-4}"
+TW_PUBLIC_DATE_WORKERS="${TW_PUBLIC_DATE_WORKERS:-4}"
+TW_PUBLIC_TIMEOUT="${TW_PUBLIC_TIMEOUT:-30}"
+TW_PUBLIC_RETRIES="${TW_PUBLIC_RETRIES:-3}"
+TW_PUBLIC_REQUEST_INTERVAL="${TW_PUBLIC_REQUEST_INTERVAL:-}"
+TW_PUBLIC_FLUSH_EVERY_DATES="${TW_PUBLIC_FLUSH_EVERY_DATES:-250}"
+TW_PUBLIC_DAILY_OVERLAP_DAYS="${TW_PUBLIC_DAILY_OVERLAP_DAYS:-7}"
+TW_PUBLIC_EMPTY_RECHECK_DAYS="${TW_PUBLIC_EMPTY_RECHECK_DAYS:-30}"
+TW_PUBLIC_SKIP_RAW="${TW_PUBLIC_SKIP_RAW:-0}"
+TW_PUBLIC_OHLCV_FALLBACK="${TW_PUBLIC_OHLCV_FALLBACK:-yahoo}"
+TW_PUBLIC_FALLBACK_START_DATE="${TW_PUBLIC_FALLBACK_START_DATE:-2000-01-01}"
+TW_PUBLIC_YAHOO_FALLBACK_DIR="${TW_PUBLIC_YAHOO_FALLBACK_DIR:-}"
+TW_PUBLIC_YAHOO_WORKERS="${TW_PUBLIC_YAHOO_WORKERS:-1}"
+TW_PUBLIC_YAHOO_RETRIES="${TW_PUBLIC_YAHOO_RETRIES:-3}"
+TW_PUBLIC_YAHOO_REQUEST_INTERVAL="${TW_PUBLIC_YAHOO_REQUEST_INTERVAL:-1.5}"
+TW_PUBLIC_SKIP_YAHOO_DOWNLOAD="${TW_PUBLIC_SKIP_YAHOO_DOWNLOAD:-0}"
+RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
+RUN_TW_SHORT_RESTRICTIONS="${RUN_TW_SHORT_RESTRICTIONS:-1}"
+TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
+TW_OFFICIAL_BACKFILL_WORKERS="${TW_OFFICIAL_BACKFILL_WORKERS:-8}"
+RUN_DATA_QUALITY_AUDIT="${RUN_DATA_QUALITY_AUDIT:-0}"
+AUDIT_ROOTS="${AUDIT_ROOTS:-data_tw_public/stocks data_yahoo/us_stocks data_yahoo/forex data_yahoo/crypto data_okx data_bybit data_forex_frankfurter data_peperstone}"
 AUDIT_OUTPUT_DIR="${AUDIT_OUTPUT_DIR:-artifacts/data_quality}"
 AUDIT_WORKERS="${AUDIT_WORKERS:-16}"
 AUDIT_STALE_MAX_LAG_DAYS="${AUDIT_STALE_MAX_LAG_DAYS:-14}"
@@ -67,7 +102,7 @@ AUDIT_DAILY_GAP_DAYS="${AUDIT_DAILY_GAP_DAYS:-10}"
 AUDIT_INTRADAY_GAP_MULTIPLE="${AUDIT_INTRADAY_GAP_MULTIPLE:-4}"
 
 TW_CLOSE_TZ="${TW_CLOSE_TZ:-Asia/Taipei}"
-TW_CLOSE_TIME="${TW_CLOSE_TIME:-13:40}"
+TW_CLOSE_TIME="${TW_CLOSE_TIME:-13:30}"
 US_CLOSE_TZ="${US_CLOSE_TZ:-America/New_York}"
 US_CLOSE_TIME="${US_CLOSE_TIME:-16:20}"
 FOREX_CLOSE_TZ="${FOREX_CLOSE_TZ:-America/New_York}"
@@ -126,6 +161,63 @@ record_failure() {
     log "fail_fast=1 step=${step_name} action=exit"
     exit 1
   fi
+}
+
+run_parallel_groups() {
+  if [[ "$DAILY_PARALLEL_GROUPS" != "1" || "$FAIL_FAST" == "1" ]]; then
+    while (( "$#" > 0 )); do
+      local group_name="$1"
+      local group_func="$2"
+      shift 2
+      "$group_func" || true
+    done
+    return 0
+  fi
+
+  local tmp_dir
+  local pids=()
+  local names=()
+  local funcs=()
+  local idx
+  local pid
+  local name
+  local rc
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/stockagent_daily_groups.XXXXXX")"
+  while (( "$#" > 0 )); do
+    names+=("$1")
+    funcs+=("$2")
+    shift 2
+  done
+
+  for idx in "${!names[@]}"; do
+    name="${names[$idx]}"
+    (
+      "${funcs[$idx]}"
+      printf "%s\n" "$?" > "${tmp_dir}/${name}.rc"
+    ) &
+    pids+=("$!")
+    log "group=${name} pid=${pids[$idx]} start_async"
+  done
+
+  for idx in "${!pids[@]}"; do
+    pid="${pids[$idx]}"
+    name="${names[$idx]}"
+    wait "$pid" || true
+    rc=1
+    if [[ -f "${tmp_dir}/${name}.rc" ]]; then
+      rc="$(<"${tmp_dir}/${name}.rc")"
+    fi
+    if [[ "$rc" == "0" ]]; then
+      log "group=${name} done"
+    else
+      log "group=${name} failed rc=${rc}"
+      record_failure "$name"
+    fi
+  done
+
+  rm -rf "$tmp_dir"
+  return 0
 }
 
 run_step() {
@@ -246,11 +338,11 @@ run_yahoo_incremental() {
   else
     yahoo_flags+=(--no-retry-blacklisted-repair-symbols)
   fi
-  if [[ "$YAHOO_INCLUDE_TW_DELISTED" == "1" ]]; then
-    yahoo_flags+=(--include-tw-delisted)
-  else
-    yahoo_flags+=(--no-include-tw-delisted)
-  fi
+  # The canonical TW data layer lives entirely below data_tw_public.  Keep the
+  # generic Yahoo updater from recreating the retired data_yahoo/tw_stocks tree;
+  # the official updater manages its audited Yahoo fallback inside
+  # data_tw_public/fallback instead.
+  yahoo_flags+=(--no-include-tw-delisted)
   if [[ "$YAHOO_INCLUDE_US_DELISTED" == "1" ]]; then
     yahoo_flags+=(--include-us-delisted)
   else
@@ -258,9 +350,15 @@ run_yahoo_incremental() {
   fi
 
   for asset in "${assets[@]}"; do
+    local yahoo_mode="daily-update"
+    local step_suffix="daily_update"
+    if [[ "$asset" == "crypto" ]]; then
+      yahoo_mode="incremental"
+      step_suffix="15m_update"
+    fi
     base_cmd=(
       "$PYTHON_BIN" downloader/download_yahoo_ohlcv.py
-      --mode daily-update
+      --mode "$yahoo_mode"
       --asset "$asset"
       --end-date "$today"
       --workers "$WORKERS"
@@ -270,6 +368,7 @@ run_yahoo_incremental() {
       --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
       --precheck-file-timeout-seconds "$PRECHECK_FILE_TIMEOUT_SECONDS"
       --repair-symbol-timeout-seconds "$REPAIR_SYMBOL_TIMEOUT_SECONDS"
+      --rate-limit-abort-after "$YAHOO_RATE_LIMIT_ABORT_AFTER"
       "${yahoo_flags[@]}"
     )
 
@@ -282,14 +381,55 @@ run_yahoo_incremental() {
       fi
     fi
 
-    run_step "yahoo_${asset}_daily_update" "${run_cmd[@]}" || rc=1
+    run_step "yahoo_${asset}_${step_suffix}" "${run_cmd[@]}" || rc=1
   done
   return "$rc"
+}
+
+run_alpaca_us_incremental() {
+  local today
+  local -a base_cmd=()
+  local -a run_cmd=()
+
+  today="$(TZ="$US_CLOSE_TZ" date +%F)"
+  if [[ "$RUN_ALPACA_US" != "1" ]]; then
+    log "skip=alpaca_us_incremental reason=RUN_ALPACA_US=${RUN_ALPACA_US}"
+    return 0
+  fi
+
+  base_cmd=(
+    "$PYTHON_BIN" downloader/download_alpaca_us_ohlcv.py
+    --mode daily-update
+    --end-date "$today"
+    --output-root data_yahoo
+    --workers "$ALPACA_US_WORKERS"
+    --metadata-workers "$ALPACA_US_METADATA_WORKERS"
+    --batch-size "$ALPACA_US_BATCH_SIZE"
+    --retries "$ALPACA_US_RETRIES"
+    --timeout "$ALPACA_US_TIMEOUT"
+    --requests-per-minute "$ALPACA_REQUESTS_PER_MINUTE"
+    --repair-overlap-days "$REPAIR_OVERLAP_DAYS"
+    --daily-stale-max-lag-days "$DAILY_STALE_MAX_LAG_DAYS"
+  )
+  run_cmd=("${base_cmd[@]}")
+  if [[ "$ALPACA_US_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && [[ "$ALPACA_US_STEP_TIMEOUT_SECONDS" -gt 0 ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+      run_cmd=(timeout --signal=TERM --kill-after=30s "${ALPACA_US_STEP_TIMEOUT_SECONDS}" "${base_cmd[@]}")
+    else
+      log "timeout command not found; continue without per-asset timeout"
+    fi
+  fi
+
+  run_step "alpaca_us_daily_update" "${run_cmd[@]}"
 }
 
 run_frankfurter_incremental() {
   local today
   local -a cmd=()
+  if [[ "$RUN_FRANKFURTER" != "1" ]]; then
+    log "skip=frankfurter_forex_incremental reason=RUN_FRANKFURTER=${RUN_FRANKFURTER}"
+    return 0
+  fi
   today="$(date +%F)"
   if [[ -f "$FRANKFURTER_SYMBOLS_FILE" ]]; then
     cmd=(
@@ -301,6 +441,9 @@ run_frankfurter_incremental() {
       --workers "$WORKERS"
       --timeout "$FRANKFURTER_TIMEOUT"
     )
+    if [[ -n "$FRANKFURTER_REQUEST_INTERVAL" ]]; then
+      cmd+=(--request-interval "$FRANKFURTER_REQUEST_INTERVAL")
+    fi
     if [[ "$FRANKFURTER_SKIP_MANIFEST" == "1" ]]; then
       cmd+=(--skip-manifest)
     fi
@@ -334,27 +477,91 @@ run_cex_incremental() {
 
   today="$(date +%F)"
   if [[ "$RUN_CEX_PERP" != "1" ]]; then
-    log "skip=cex_perp_daily_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
+    log "skip=cex_perp_15m_update reason=RUN_CEX_PERP=${RUN_CEX_PERP}"
     return 0
   fi
 
-  run_step okx_perp_daily_update \
-    "$PYTHON_BIN" downloader/download_okx_perp_daily.py \
-    --mode daily-update \
-    --end-date "$today" \
-    --workers "$OKX_WORKERS" \
-    --request-interval "$OKX_REQUEST_INTERVAL" \
-    --max-retries "$OKX_MAX_RETRIES" || rc=1
-
   read -r -a bybit_categories <<< "$BYBIT_CATEGORIES"
-  run_step bybit_perp_daily_update \
-    "$PYTHON_BIN" downloader/download_bybit_perp_daily.py \
-    --mode daily-update \
-    --end-date "$today" \
-    --workers "$BYBIT_WORKERS" \
-    --request-interval "$BYBIT_REQUEST_INTERVAL" \
-    --max-retries "$BYBIT_MAX_RETRIES" \
-    --categories "${bybit_categories[@]}" || rc=1
+  local -a okx_cmd=()
+  local -a bybit_cmd=()
+  okx_cmd=(
+    "$PYTHON_BIN" downloader/download_okx_perp_15m.py
+    --mode incremental
+    --end-date "$today"
+    --workers "$OKX_WORKERS"
+    --max-retries "$OKX_MAX_RETRIES"
+  )
+  if [[ -n "$OKX_REQUEST_INTERVAL" ]]; then
+    okx_cmd+=(--request-interval "$OKX_REQUEST_INTERVAL")
+  fi
+  run_step okx_perp_15m_update "${okx_cmd[@]}" || rc=1
+
+  bybit_cmd=(
+    "$PYTHON_BIN" downloader/download_bybit_perp_15m.py
+    --mode incremental
+    --end-date "$today"
+    --workers "$BYBIT_WORKERS"
+    --max-retries "$BYBIT_MAX_RETRIES"
+    --categories "${bybit_categories[@]}"
+  )
+  if [[ -n "$BYBIT_REQUEST_INTERVAL" ]]; then
+    bybit_cmd+=(--request-interval "$BYBIT_REQUEST_INTERVAL")
+  fi
+  run_step bybit_perp_15m_update "${bybit_cmd[@]}" || rc=1
+  return "$rc"
+}
+
+run_tw_public_data_update() {
+  local rc=0
+  local -a cmd=()
+
+  if [[ "$RUN_TW_PUBLIC_DATA" != "1" ]]; then
+    log "skip=tw_public_data_daily_update reason=RUN_TW_PUBLIC_DATA=${RUN_TW_PUBLIC_DATA}"
+    return 0
+  fi
+
+  cmd=(
+    "$PYTHON_BIN" downloader/download_tw_official_data.py
+    --mode daily
+    --config "$TW_PUBLIC_CONFIG"
+    --public-dir "$TW_PUBLIC_OUTPUT_DIR"
+    --stock-root "$TW_PUBLIC_STOCKS_ROOT"
+    --public-feature-path "$TW_PUBLIC_FEATURE_PATH"
+    --workers "$TW_OFFICIAL_BACKFILL_WORKERS"
+    --public-workers "$TW_PUBLIC_WORKERS"
+    --date-workers "$TW_PUBLIC_DATE_WORKERS"
+    --timeout "$TW_PUBLIC_TIMEOUT"
+    --retries "$TW_PUBLIC_RETRIES"
+    --flush-every-dates "$TW_PUBLIC_FLUSH_EVERY_DATES"
+    --daily-overlap-days "$TW_PUBLIC_DAILY_OVERLAP_DAYS"
+    --empty-recheck-days "$TW_PUBLIC_EMPTY_RECHECK_DAYS"
+    --ohlcv-fallback "$TW_PUBLIC_OHLCV_FALLBACK"
+    --fallback-start-date "$TW_PUBLIC_FALLBACK_START_DATE"
+    --yahoo-workers "$TW_PUBLIC_YAHOO_WORKERS"
+    --yahoo-retries "$TW_PUBLIC_YAHOO_RETRIES"
+    --yahoo-request-interval "$TW_PUBLIC_YAHOO_REQUEST_INTERVAL"
+  )
+  if [[ -n "$TW_PUBLIC_REQUEST_INTERVAL" ]]; then
+    cmd+=(--request-interval "$TW_PUBLIC_REQUEST_INTERVAL")
+  fi
+  if [[ "$TW_PUBLIC_SKIP_RAW" == "1" ]]; then
+    cmd+=(--skip-raw)
+  fi
+  if [[ -n "$TW_PUBLIC_YAHOO_FALLBACK_DIR" ]]; then
+    cmd+=(--yahoo-fallback-dir "$TW_PUBLIC_YAHOO_FALLBACK_DIR")
+  fi
+  if [[ "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" == "1" ]]; then
+    cmd+=(--skip-yahoo-download)
+  fi
+  if [[ "$RUN_TW_SHORT_RESTRICTIONS" != "1" ]]; then
+    cmd+=(--skip-short-rules)
+  fi
+  if [[ "$RUN_TW_PUBLIC_FEATURES" != "1" ]]; then
+    cmd+=(--skip-feature-build)
+  fi
+
+  run_step tw_public_data_daily_update "${cmd[@]}" || rc=1
+
   return "$rc"
 }
 
@@ -407,7 +614,7 @@ run_market_close_cycle() {
     tw_date="$(TZ="$TW_CLOSE_TZ" date +%F)"
     log "market=tw due date=${tw_date} close=${TW_CLOSE_TIME} tz=${TW_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "tw_stocks" || true
+    run_tw_public_data_update
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_TW="$tw_date"
@@ -418,7 +625,7 @@ run_market_close_cycle() {
     us_date="$(TZ="$US_CLOSE_TZ" date +%F)"
     log "market=us due date=${us_date} close=${US_CLOSE_TIME} tz=${US_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "us_stocks" || true
+    run_alpaca_us_incremental || true
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_US="$us_date"
@@ -429,9 +636,9 @@ run_market_close_cycle() {
     fx_date="$(TZ="$FOREX_CLOSE_TZ" date +%F)"
     log "market=forex due date=${fx_date} close=${FOREX_CLOSE_TIME} tz=${FOREX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "forex" || true
-    run_frankfurter_incremental || true
-    run_pepperstone_incremental || true
+    run_parallel_groups \
+      frankfurter run_frankfurter_incremental \
+      pepperstone run_pepperstone_incremental
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_FOREX="$fx_date"
@@ -442,8 +649,7 @@ run_market_close_cycle() {
     cex_date="$(TZ="$CEX_CLOSE_TZ" date +%F)"
     log "market=cex due date=${cex_date} close=${CEX_CLOSE_TIME} tz=${CEX_CLOSE_TZ}"
     failures_before="${#FAILED_STEPS[@]}"
-    run_yahoo_incremental_assets "crypto" || true
-    run_cex_incremental || true
+    run_cex_incremental
     did_run=1
     if (( ${#FAILED_STEPS[@]} == failures_before )); then
       LAST_RUN_CEX="$cex_date"
@@ -480,10 +686,14 @@ run_once_cycle() {
   cycle_start="$(date +%s)"
   log "cycle=${cycle_id} start mode=${RUN_MODE} root=${ROOT_DIR}"
 
-  run_yahoo_incremental || true
-  run_frankfurter_incremental || true
-  run_pepperstone_incremental || true
-  run_cex_incremental || true
+  run_parallel_groups \
+    alpaca_us run_alpaca_us_incremental \
+    yahoo run_yahoo_incremental \
+    tw_public run_tw_public_data_update \
+    frankfurter run_frankfurter_incremental \
+    pepperstone run_pepperstone_incremental \
+    cex run_cex_incremental
+
   run_data_quality_audit "$cycle_id" || true
 
   cycle_end="$(date +%s)"
@@ -526,6 +736,10 @@ validate_settings() {
     echo "[daily] FAIL_FAST must be 0 or 1" >&2
     exit 2
   fi
+  if [[ "$DAILY_PARALLEL_GROUPS" != "0" && "$DAILY_PARALLEL_GROUPS" != "1" ]]; then
+    echo "[daily] DAILY_PARALLEL_GROUPS must be 0 or 1" >&2
+    exit 2
+  fi
   if [[ "$TEE_LOG" != "0" && "$TEE_LOG" != "1" ]]; then
     echo "[daily] TEE_LOG must be 0 or 1" >&2
     exit 2
@@ -542,10 +756,6 @@ validate_settings() {
     echo "[daily] YAHOO_RETRY_BLACKLISTED_REPAIR_SYMBOLS must be 0 or 1" >&2
     exit 2
   fi
-  if [[ "$YAHOO_INCLUDE_TW_DELISTED" != "0" && "$YAHOO_INCLUDE_TW_DELISTED" != "1" ]]; then
-    echo "[daily] YAHOO_INCLUDE_TW_DELISTED must be 0 or 1" >&2
-    exit 2
-  fi
   if [[ "$YAHOO_INCLUDE_US_DELISTED" != "0" && "$YAHOO_INCLUDE_US_DELISTED" != "1" ]]; then
     echo "[daily] YAHOO_INCLUDE_US_DELISTED must be 0 or 1" >&2
     exit 2
@@ -554,12 +764,28 @@ validate_settings() {
     echo "[daily] RUN_DATA_QUALITY_AUDIT must be 0 or 1" >&2
     exit 2
   fi
+  if [[ "$TW_PUBLIC_OHLCV_FALLBACK" != "yahoo" && "$TW_PUBLIC_OHLCV_FALLBACK" != "none" ]]; then
+    echo "[daily] TW_PUBLIC_OHLCV_FALLBACK must be yahoo or none" >&2
+    exit 2
+  fi
+  if [[ "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" != "0" && "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" != "1" ]]; then
+    echo "[daily] TW_PUBLIC_SKIP_YAHOO_DOWNLOAD must be 0 or 1" >&2
+    exit 2
+  fi
   if [[ "$RUN_YAHOO" != "0" && "$RUN_YAHOO" != "1" ]]; then
     echo "[daily] RUN_YAHOO must be 0 or 1" >&2
     exit 2
   fi
+  if [[ " $YAHOO_ASSETS " == *" tw_stocks "* ]]; then
+    echo "[daily] tw_stocks is managed only by downloader/download_tw_official_data.py under data_tw_public; remove it from YAHOO_ASSETS" >&2
+    exit 2
+  fi
   if [[ "$FRANKFURTER_SKIP_MANIFEST" != "0" && "$FRANKFURTER_SKIP_MANIFEST" != "1" ]]; then
     echo "[daily] FRANKFURTER_SKIP_MANIFEST must be 0 or 1" >&2
+    exit 2
+  fi
+  if [[ "$RUN_FRANKFURTER" != "0" && "$RUN_FRANKFURTER" != "1" ]]; then
+    echo "[daily] RUN_FRANKFURTER must be 0 or 1" >&2
     exit 2
   fi
   if ! [[ "$YAHOO_STEP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
@@ -612,5 +838,5 @@ init_run_logging
 validate_settings
 acquire_lock
 load_schedule_state
-log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
+log "scheduler boot run_id=${RUN_ID} run_mode=${RUN_MODE} parallel_groups=${DAILY_PARALLEL_GROUPS} interval_sec=${INTERVAL_SECONDS} max_cycles=${MAX_CYCLES} python=${PYTHON_BIN} log_file=${RUN_LOG_FILE}"
 run_scheduler
