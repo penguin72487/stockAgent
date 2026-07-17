@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 
+from stockagent.backtest.tw_execution import require_naive_execution_for_tool
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -196,8 +197,12 @@ def main() -> None:
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     args = parser.parse_args()
 
-    _configure_cuda_runtime()
     config = load_config(args.config)
+    require_naive_execution_for_tool(
+        config.trading.execution_mode,
+        tool_name="benchmark_inference_chunks.py",
+    )
+    _configure_cuda_runtime()
     _configure_backtest_runtime_from_config(config)
     os.environ["STOCKAGENT_BACKTEST_COMPILE"] = "1" if bool(args.backtest_compile) else "0"
     os.environ["STOCKAGENT_BACKTEST_AUTOTUNE"] = "1" if bool(args.backtest_compile) else "0"
@@ -257,7 +262,14 @@ def main() -> None:
         context=f"inference benchmark {Path(args.config).stem} fold {fold_id}",
     )
 
-    dataset = CrossSectionalDataset(panel, fold.test_indices, config.training.lookback)
+    dataset = CrossSectionalDataset(
+        panel,
+        fold.test_indices,
+        config.training.lookback,
+        execution_mode=config.trading.execution_mode,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+    )
     base_split = dataset_to_windowed_tensors(dataset)
     benchmark_rows = min(_default_rows(panel.num_symbols, args.rows), len(base_split))
     if benchmark_rows <= 0:

@@ -186,12 +186,18 @@ def test_backtest_result_tensor_to_numpy_casts_bfloat16_before_numpy_boundary() 
         benchmark_returns=torch.tensor([0.0, 0.01], dtype=torch.bfloat16),
         turnovers=torch.tensor([0.1, 0.2], dtype=torch.bfloat16),
         weights_history=torch.tensor([[0.5, -0.5], [0.4, -0.4]], dtype=torch.bfloat16),
+        equity_scale_history=torch.tensor([1.0, 1.01], dtype=torch.bfloat16),
+        final_equity_scale=torch.tensor(1.01, dtype=torch.bfloat16),
     ).to_numpy()
 
     assert result.strategy_returns.dtype == np.float32
     assert result.benchmark_returns.dtype == np.float32
     assert result.turnovers.dtype == np.float32
     assert result.weights_history.dtype == np.float32
+    assert result.equity_scale_history is not None
+    assert result.equity_scale_history.dtype == np.float32
+    assert result.final_equity_scale is not None
+    assert result.final_equity_scale.dtype == np.float32
 
 
 def test_bfloat16_model_weights_use_float32_finance_backtest_with_gradients() -> None:
@@ -1597,6 +1603,55 @@ def test_evaluate_tensor_batch_decoupled_backtest_chunk_matches_old_chunking() -
     assert new_calls == 2
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    ["can_short_open_mask", "short_capacity_notional", "short_margin_rate"],
+)
+def test_tw_cash_long_short_decoupled_eval_requires_complete_short_contract(
+    missing_field: str,
+) -> None:
+    rows, symbols = 2, 1
+    values: dict[str, torch.Tensor | None] = {
+        "can_short_open_mask": torch.ones((rows, symbols), dtype=torch.bool),
+        "short_capacity_notional": torch.full((rows, symbols), 100_000.0),
+        "short_margin_rate": torch.full((rows, symbols), 0.9),
+    }
+    values[missing_field] = None
+    runtime = trainer_module._ExecutionRuntime(
+        mode="tw_cash",
+        buy_fee_rates=torch.zeros(symbols),
+        sell_fee_rates=torch.zeros(symbols),
+        lot_sizes=np.ones(symbols, dtype=np.int64),
+        settlement_lag_sessions=2,
+    )
+
+    with pytest.raises(ValueError, match=rf"missing: {missing_field}"):
+        trainer_module._evaluate_tensor_batch_decoupled(
+            model=_EchoWeightModel(),
+            x=torch.zeros((rows, 1, symbols, 1)),
+            future_log_returns=torch.zeros((rows, symbols)),
+            tradable_mask=torch.ones((rows, symbols), dtype=torch.bool),
+            can_buy_mask=torch.ones((rows, symbols), dtype=torch.bool),
+            can_sell_mask=torch.ones((rows, symbols), dtype=torch.bool),
+            benchmark=torch.zeros(rows),
+            device=torch.device("cpu"),
+            amp_dtype=None,
+            non_blocking=False,
+            long_only=False,
+            buy_fee_rate=0.0,
+            sell_fee_rate=0.0,
+            max_turnover_ratio=0.0,
+            gross_leverage=1.0,
+            min_trade_weight=0.0,
+            model_chunk_rows=2,
+            backtest_chunk_rows=2,
+            can_short_open_mask=values["can_short_open_mask"],
+            short_capacity_notional=values["short_capacity_notional"],
+            short_margin_rate=values["short_margin_rate"],
+            execution_runtime=runtime,
+        )
+
+
 def test_force_exit_at_backtest_chunk_boundary_matches_full_and_ragged_tail() -> None:
     rows = 5
     raw_weights = torch.ones((rows, 1), dtype=torch.float32)
@@ -2026,6 +2081,74 @@ def test_compiled_loss_probe_executes_rules_and_backward_at_fixed_batch_shape() 
     assert bool(captured["force_exit"][0, 0]) is True
 
 
+def test_tw_cash_loss_probe_supplies_unlimited_capacity_and_margin_contract() -> None:
+    panel = _make_panel(rows=9, symbols=4, features=3)
+    shape = panel.tradable_mask.shape
+    panel.can_short_open_mask = np.ones(shape, dtype=np.bool_)
+    panel.short_capacity_shares = np.zeros(shape, dtype=np.int64)
+    panel.short_margin_rate = np.full(shape, 0.9, dtype=np.float32)
+    panel.raw_close_returns_1d = np.asarray(panel.returns_1d, dtype=np.float32)
+    panel.unresolved_corporate_action_mask = np.zeros(shape, dtype=np.bool_)
+    dataset = CrossSectionalDataset(
+        panel,
+        np.arange(panel.num_dates),
+        lookback=3,
+        execution_mode="tw_cash",
+    )
+    split = _pad_windowed_training_split(
+        dataset_to_windowed_tensors(dataset), batch_size=4
+    )
+    runtime = trainer_module._ExecutionRuntime(
+        mode="tw_cash",
+        buy_fee_rates=torch.zeros(panel.num_symbols),
+        sell_fee_rates=torch.zeros(panel.num_symbols),
+        lot_sizes=np.ones(panel.num_symbols, dtype=np.int64),
+        settlement_lag_sessions=2,
+        short_capacity_limit_enabled=False,
+    )
+    captured: dict[str, object] = {}
+
+    def loss_fn(
+        weights: torch.Tensor,
+        returns: torch.Tensor,
+        tradable: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        del tradable
+        captured.update(kwargs)
+        return (weights.square() + weights * returns).mean()
+
+    ok, error = _probe_compiled_loss_forward_backward(
+        loss_fn,
+        split,
+        batch_size=4,
+        device=torch.device("cpu"),
+        amp_dtype=None,
+        non_blocking=False,
+        loss_kwargs={"long_only": False},
+        max_volume_participation=0.0,
+        volume_participation_equity=1_000_000.0,
+        execution_runtime=runtime,
+    )
+
+    assert ok, error
+    capacity = captured["short_capacity_weights"]
+    margin = captured["short_margin_rate"]
+    assert isinstance(capacity, torch.Tensor)
+    assert capacity.shape == (4, panel.num_symbols)
+    assert torch.isfinite(capacity).all()
+    assert torch.equal(
+        capacity,
+        torch.ones_like(capacity),
+    )
+    assert isinstance(margin, torch.Tensor)
+    assert torch.equal(margin, torch.full_like(margin, 0.9))
+    aux = captured["aux_outputs"]
+    assert isinstance(aux, dict)
+    assert aux["initial_short_sale_collateral"].shape == (panel.num_symbols,)
+    assert aux["initial_short_margin_collateral"].shape == (panel.num_symbols,)
+
+
 def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None:
     panel = _make_panel(rows=9, symbols=4, features=3)
     dataset = CrossSectionalDataset(panel, np.arange(panel.num_dates), lookback=3)
@@ -2072,7 +2195,9 @@ def test_compiled_loss_probe_reproduces_ddp_gathered_inputs(monkeypatch) -> None
     )
 
     assert ok, error
-    assert gather_calls == {"autograd": 1, "no_grad": 9}
+    # The real-settlement graph also gathers the per-row session clock so the
+    # compile probe exactly matches the first DDP loss invocation.
+    assert gather_calls == {"autograd": 1, "no_grad": 12}
     assert captured["weights"].shape == (4, panel.num_symbols)
     assert captured["returns"].shape == captured["weights"].shape
     assert captured["tradable"].shape == captured["weights"].shape
@@ -2992,7 +3117,10 @@ def test_windowed_contiguous_fast_path_matches_indexed_path() -> None:
 
     assert set(fast) == set(indexed)
     for key in fast:
-        assert torch.equal(fast[key], indexed[key]), key
+        if key == "short_margin_rate":
+            torch.testing.assert_close(fast[key], indexed[key], equal_nan=True)
+        else:
+            assert torch.equal(fast[key], indexed[key]), key
 
 
 def test_padded_windowed_training_split_keeps_contiguous_prefix_fast_path() -> None:
@@ -3469,7 +3597,10 @@ def test_windowed_shared_base_cache_preserves_batches_without_copying_base() -> 
     expected = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
     actual = shared.batch_by_rows(0, len(shared), torch.device("cpu"), non_blocking=False)
     for key in expected:
-        assert torch.equal(actual[key], expected[key]), key
+        if key == "short_margin_rate":
+            torch.testing.assert_close(actual[key], expected[key], equal_nan=True)
+        else:
+            assert torch.equal(actual[key], expected[key]), key
 
 
 def test_prepare_windowed_split_reuses_prepared_shared_base() -> None:
@@ -3499,7 +3630,10 @@ def test_prepare_windowed_split_reuses_prepared_shared_base() -> None:
     expected = second_raw.batch_by_rows(0, len(second_raw), torch.device("cpu"), non_blocking=False)
     actual = second.batch_by_rows(0, len(second), torch.device("cpu"), non_blocking=False)
     for key in expected:
-        assert torch.equal(actual[key], expected[key]), key
+        if key == "short_margin_rate":
+            torch.testing.assert_close(actual[key], expected[key], equal_nan=True)
+        else:
+            assert torch.equal(actual[key], expected[key]), key
 
 
 def test_full_eval_splits_share_base_when_train_symbols_are_compacted() -> None:

@@ -160,6 +160,90 @@ def _validate_official_symbol_build_summary(path: Path) -> None:
         )
 
 
+def _validate_corporate_action_entitlements(
+    output: Path,
+    *,
+    reference: Path,
+) -> None:
+    summary_path = output.with_suffix(".summary.json")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"corporate-action entitlement receipt is unreadable: {summary_path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(summary, dict):
+        raise RuntimeError("corporate-action entitlement receipt is not a JSON object")
+    if int(summary.get("schema_version", -1)) < 3:
+        raise RuntimeError("corporate-action entitlement schema_version must be >= 3")
+    if not bool(summary.get("baseline_established")) or not bool(
+        summary.get("coverage_complete")
+    ):
+        raise RuntimeError("corporate-action entitlement baseline is incomplete")
+    if int(summary.get("failure_count", -1)) != 0:
+        raise RuntimeError("corporate-action entitlement download contains failures")
+    manifest_receipt = summary.get("raw_receipt_manifest")
+    manifest_relative = (
+        str(manifest_receipt.get("relative_path", "")).strip()
+        if isinstance(manifest_receipt, dict)
+        else ""
+    )
+    if not manifest_relative:
+        raise RuntimeError(
+            "corporate-action entitlement raw receipt manifest is missing"
+        )
+    output_root = output.parent.resolve()
+    manifest_path = (output_root / manifest_relative).resolve()
+    if not manifest_path.is_relative_to(output_root) or not manifest_path.is_file():
+        raise RuntimeError(
+            "corporate-action entitlement raw receipt manifest path is invalid"
+        )
+    actual_manifest = _file_receipt(manifest_path)
+    if {
+        "size": int(manifest_receipt.get("size", -1)),
+        "sha256": str(manifest_receipt.get("sha256", "")),
+    } != {
+        "size": actual_manifest["size"],
+        "sha256": actual_manifest["sha256"],
+    }:
+        raise RuntimeError(
+            "corporate-action entitlement raw receipt manifest mismatch"
+        )
+    if manifest_path.stem != actual_manifest["sha256"]:
+        raise RuntimeError(
+            "corporate-action entitlement raw receipt manifest is not "
+            "content-addressed"
+        )
+    with manifest_path.open("rb") as manifest_handle:
+        manifest_rows = sum(1 for line in manifest_handle if line.strip())
+    if manifest_rows != int(manifest_receipt.get("entries", -1)):
+        raise RuntimeError(
+            "corporate-action entitlement raw receipt manifest row mismatch"
+        )
+    expected_output = summary.get("output_receipt")
+    if not isinstance(expected_output, dict) or {
+        "size": int(expected_output.get("size", -1)),
+        "sha256": str(expected_output.get("sha256", "")),
+    } != {
+        "size": _file_receipt(output)["size"],
+        "sha256": _file_receipt(output)["sha256"],
+    }:
+        raise RuntimeError("corporate-action entitlement output receipt mismatch")
+    expected_reference = summary.get("reference_receipt")
+    actual_reference = _file_receipt(reference)
+    if not isinstance(expected_reference, dict) or {
+        "size": int(expected_reference.get("size", -1)),
+        "sha256": str(expected_reference.get("sha256", "")),
+    } != {
+        "size": actual_reference["size"],
+        "sha256": actual_reference["sha256"],
+    }:
+        raise RuntimeError(
+            "corporate-action entitlement ledger was built from another reference"
+        )
+
+
 class RebuildRunner:
     def __init__(
         self,
@@ -827,6 +911,8 @@ def main() -> None:
             str(args.timeout),
             "--retries",
             str(args.retries),
+            "--workers",
+            str(args.workers),
         )
         if args.request_interval is not None:
             corporate_command.extend(["--request-interval", str(args.request_interval)])
@@ -976,10 +1062,51 @@ def main() -> None:
                 stock_root / "2330_features.parquet",
                 stock_root / "symbols.csv",
                 stock_root / "official_symbol_build_summary.json",
+                stock_root / "official_symbol_build_report.csv",
                 stock_root / "return_price_provenance.json",
             ],
             validate_outputs=lambda: _validate_official_symbol_build_summary(
                 stock_root / "official_symbol_build_summary.json"
+            ),
+        )
+
+    if not args.skip_corporate_actions:
+        entitlement_output = (
+            public_dir / "tw_corporate_action_entitlements.parquet"
+        )
+        entitlement_command = _python_command(
+            "downloader/download_tw_corporate_action_entitlements.py",
+            "--output-dir",
+            str(public_dir),
+            "--reference",
+            str(public_dir / "tw_corporate_action_reference.parquet"),
+            "--universe-report",
+            str(stock_root / "official_symbol_build_report.csv"),
+            "--start-date",
+            str(config.data.panel_start_date or fallback_start.isoformat()),
+            "--end-date",
+            str(args.end_date),
+            "--mode",
+            str(args.mode),
+            "--timeout",
+            str(args.timeout),
+            "--retries",
+            str(args.retries),
+        )
+        if args.request_interval is not None:
+            entitlement_command.extend(
+                ["--request-interval", str(args.request_interval)]
+            )
+        runner.run(
+            "corporate_action_entitlements",
+            entitlement_command,
+            outputs=[
+                entitlement_output,
+                entitlement_output.with_suffix(".summary.json"),
+            ],
+            validate_outputs=lambda: _validate_corporate_action_entitlements(
+                entitlement_output,
+                reference=public_dir / "tw_corporate_action_reference.parquet",
             ),
         )
 

@@ -17,10 +17,195 @@ from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
     FEATURE_COLUMNS,
     RULE_COLUMNS,
+    _build_margin_features,
     _build_official_ohlcv_features,
     _build_twse_market_index_features,
     build_tw_public_training_features,
 )
+
+
+def test_margin_short_rules_convert_official_lots_to_exact_shares_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame(
+        {
+            "代號": ["2330", "2317", "1301"],
+            "前日餘額": ["0", "0", "0"],
+            "今日餘額": ["0", "0", "0"],
+            "前日餘額_2": ["10", "7", "1"],
+            "今日餘額_2": ["20", "7", "bad"],
+            "次一營業日限額_2": ["100", "10", "20"],
+            "買進": ["0", "0", "0"],
+            "賣出": ["0", "0", "0"],
+            "賣出_2": ["0", "0", "0"],
+            "買進_2": ["0", "0", "0"],
+            "註記": ["", "X", ""],
+            "date": ["2024-01-02"] * 3,
+        }
+    ).write_parquet(tmp_path / "twse_margin_balance.parquet")
+    pl.DataFrame(
+        {
+            "代號": ["6488", "5347"],
+            "前資餘額(張)": ["0", "0"],
+            "資買": ["0", "0"],
+            "資賣": ["0", "0"],
+            "資餘額": ["0", "0"],
+            "前券餘額(張)": ["2", "1"],
+            "券賣": ["0", "0"],
+            "券買": ["0", "0"],
+            "券餘額": ["3", "1"],
+            "券限額": ["10", ""],
+            "備註": ["", ""],
+            "date": ["2024-01-02", "2024-01-02"],
+        }
+    ).write_parquet(tmp_path / "tpex_margin_balance.parquet")
+
+    rules = _build_margin_features(tmp_path).select(
+        [
+            "symbol",
+            "_twpub_margin_short_evidence_next_session",
+            "_twpub_short_capacity_shares_next_session",
+        ]
+    )
+    by_symbol = {row["symbol"]: row for row in rules.to_dicts()}
+
+    assert by_symbol["2330"]["_twpub_margin_short_evidence_next_session"] == 1.0
+    assert by_symbol["2330"]["_twpub_short_capacity_shares_next_session"] == 80_000.0
+    assert by_symbol["6488"]["_twpub_margin_short_evidence_next_session"] == 1.0
+    assert by_symbol["6488"]["_twpub_short_capacity_shares_next_session"] == 7_000.0
+    for symbol in ("2317", "1301", "5347"):
+        assert by_symbol[symbol]["_twpub_margin_short_evidence_next_session"] == 0.0
+        assert by_symbol[symbol]["_twpub_short_capacity_shares_next_session"] == 0.0
+
+
+def test_margin_short_capacity_is_exactly_next_session_and_never_forward_filled(
+    tmp_path: Path,
+) -> None:
+    dates = np.asarray(
+        ["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05", "2024-01-08"],
+        dtype="datetime64[D]",
+    )
+    close = np.full((dates.size,), 100.0, dtype=np.float64)
+    pq.write_table(
+        pa.table(
+            {
+                "date": pa.array(dates),
+                "open": pa.array(close),
+                "max": pa.array(close),
+                "min": pa.array(close),
+                "close": pa.array(close),
+                "adjclose": pa.array(close),
+                "Trading_Volume": pa.array(np.full(dates.size, 1_000.0)),
+            }
+        ),
+        tmp_path / "2330_features.parquet",
+    )
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-04", "2024-01-05"],
+            "symbol": ["2330", "2330", "2330"],
+            "_twpub_margin_short_evidence_next_session": [1.0, 1.0, 1.0],
+            "_twpub_short_capacity_shares_next_session": [
+                6_483_021_000.0,
+                2_000.0,
+                9_000.0,
+            ],
+            # The 2024-01-05 ban intersects the capacity shifted from 01-04.
+            "_twpub_short_open_ban": [0.0, 0.0, 1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+
+    # Source rows describe the *next* exchange session.  Missing evidence on
+    # 01-03 therefore closes 01-04 instead of carrying the 01-02 receipt.
+    np.testing.assert_array_equal(
+        panel.short_capacity_shares[:, 0],
+        np.asarray([0, 6_483_021_000, 0, 0, 9_000], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        panel.can_short_open_mask[:, 0],
+        [False, True, False, False, True],
+    )
+
+
+def test_margin_short_eligibility_is_independent_of_zero_capacity(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02"],
+            "symbol": ["2330"],
+            "_twpub_margin_short_evidence_next_session": [1.0],
+            "_twpub_short_capacity_shares_next_session": [0.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+
+    np.testing.assert_array_equal(panel.short_capacity_shares[:, 0], [0, 0])
+    np.testing.assert_array_equal(panel.can_short_open_mask[:, 0], [False, True])
+
+
+def test_all_null_margin_short_schema_is_fail_closed_not_generic_sell_permission(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02"],
+            "symbol": ["2330"],
+            "_twpub_margin_short_evidence_next_session": [None],
+            "_twpub_short_capacity_shares_next_session": [None],
+        },
+        schema_overrides={
+            "_twpub_margin_short_evidence_next_session": pl.Float64,
+            "_twpub_short_capacity_shares_next_session": pl.Float64,
+        },
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+
+    assert panel.can_sell_mask.all()
+    assert not panel.can_short_open_mask.any()
+    np.testing.assert_array_equal(
+        panel.short_capacity_shares,
+        np.zeros_like(panel.tradable_mask, dtype=np.int64),
+    )
 
 
 def _write_symbol(path: Path, closes: list[float]) -> None:
@@ -402,6 +587,41 @@ def test_build_panel_zero_fill_keeps_feature_slots_and_zeros_matching_values(tmp
     assert panel.features.shape[-1] == 3
     assert np.count_nonzero(panel.features[:, :, 1:]) == 0
 
+    # A second experiment using the same parquet root but the unmodified
+    # feature values gets its own immutable cache generation. Switching back
+    # must reuse the zero-filled variant instead of rebuilding or inheriting
+    # the other experiment's values.
+    raw_panel = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["close_logret_1d", "twpub_*"],
+        feature_zero_fill=[],
+    )
+    assert np.count_nonzero(raw_panel.features[:, :, 1:]) > 0
+
+    cache_dir = tmp_path / "panel_cache_v2"
+    assert len(list((cache_dir / "variants").glob("*.json"))) == 2
+    assert len(list((cache_dir / "generations").iterdir())) == 2
+
+    zero_filled_again = build_panel(
+        tmp_path,
+        benchmark_name="universe_average_return",
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        feature_include=["close_logret_1d", "twpub_*"],
+        feature_zero_fill=["twpub_*"],
+    )
+    assert np.count_nonzero(zero_filled_again.features[:, :, 1:]) == 0
+    assert len(list((cache_dir / "generations").iterdir())) == 2
+
 
 def test_market_point_in_time_state_is_forward_filled_after_release(tmp_path: Path) -> None:
     _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
@@ -531,6 +751,75 @@ def test_external_rules_can_be_enabled_without_appending_model_features(
     )
     assert "twpub_pe_log" not in live_tail.feature_names
     assert bool(live_tail.can_short_open_mask[date_idx, symbol_idx]) is False
+
+
+def test_day_trade_direction_rule_is_exact_session_and_does_not_change_naive_shorting(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03", "2024-01-04"],
+            "symbol": ["2330", "2330", "2330"],
+            "_twpub_day_trade_eligible": [1.0, 0.0, 1.0],
+            "_twpub_day_trade_short_open": [0.0, 0.0, 1.0],
+        }
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+
+    np.testing.assert_array_equal(
+        panel.day_trade_eligible_mask[:, 0], [True, False, True]
+    )
+    np.testing.assert_array_equal(
+        panel.day_trade_can_short_open_mask[:, 0], [False, False, True]
+    )
+    # The ordinary short-open rule remains independent for naive/margin paths.
+    np.testing.assert_array_equal(panel.can_short_open_mask[:, 0], [True, True, True])
+
+
+def test_all_null_day_trade_rule_schema_is_absent_evidence_not_false_history(
+    tmp_path: Path,
+) -> None:
+    _write_symbol(tmp_path / "2330_features.parquet", [100.0, 101.0, 102.0])
+    external_path = tmp_path / "external.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02"],
+            "symbol": ["2330"],
+            "_twpub_day_trade_eligible": [None],
+            "_twpub_day_trade_short_open": [None],
+        },
+        schema_overrides={
+            "_twpub_day_trade_eligible": pl.Float64,
+            "_twpub_day_trade_short_open": pl.Float64,
+        },
+    ).write_parquet(external_path)
+
+    panel = build_panel(
+        tmp_path,
+        tradable_mode="tradable",
+        trading_volume_policy="required",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        external_feature_path=external_path,
+        external_include_features=False,
+        external_include_rules=True,
+        external_data_required=True,
+    )
+    assert panel.day_trade_eligible_mask is None
+    assert panel.day_trade_can_short_open_mask is None
 
 
 def test_rules_only_external_loader_projects_rule_columns(

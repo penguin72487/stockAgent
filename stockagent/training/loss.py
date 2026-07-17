@@ -12,6 +12,7 @@ from stockagent.backtest.simulator import (
     _resolve_exposure_budget,
     run_backtest_torch,
 )
+from stockagent.backtest.tw_execution import normalize_execution_mode
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -45,6 +46,30 @@ _LOSS_RUNTIME_STATS: dict[str, float] = {
     "autograd_graph_build_s": 0.0,
     "autograd_graph_build_calls": 0.0,
 }
+
+
+def _execution_and_safe_returns(
+    future_log_returns: Tensor,
+    *,
+    reference: Tensor,
+    execution_mode: str,
+) -> tuple[Tensor, Tensor]:
+    """Keep invalid Taiwan labels observable to the canonical executor.
+
+    Naive accounting historically treats every missing return as zero.  Taiwan
+    ledgers instead decide validity from recurrent state: an inactive cell may
+    be absent, while a held cash position or an entered day trade must fail
+    closed.  Return a separate sanitized tensor for rank/benchmark statistics
+    so those non-execution calculations cannot erase the raw ledger contract.
+    """
+
+    # Finance labels/reductions stay FP32 even when model logits arrive from
+    # BF16 autocast.  Casting through the model dtype first would irreversibly
+    # quantize returns before the canonical backtest promotes its state.
+    raw = future_log_returns.to(device=reference.device, dtype=torch.float32)
+    safe = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    execution = safe if normalize_execution_mode(execution_mode) == "naive" else raw
+    return execution, safe
 
 
 def _add_loss_runtime_stat(key: str, value: float = 1.0) -> None:
@@ -299,9 +324,26 @@ def factor_generalization_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     volume_limit_weights: Tensor | None = None,
+    short_margin_rate: Tensor | float | None = None,
+    short_capacity_weights: Tensor | None = None,
+    short_maintenance_ratio: float = 1.30,
+    short_handling_fee_rate: Tensor | float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    execution_mode: str = "naive",
+    buy_fee_rates: Tensor | None = None,
+    sell_fee_rates: Tensor | None = None,
+    settlement_lag_sessions: int = 2,
+    day_trade_eligible_mask: Tensor | None = None,
+    day_trade_can_buy_open_mask: Tensor | None = None,
+    day_trade_can_sell_open_mask: Tensor | None = None,
+    unresolved_corporate_action_mask: Tensor | None = None,
+    cash_dividend_yield: Tensor | None = None,
+    cash_dividend_payment_delay_sessions: Tensor | None = None,
+    claim_queue_sessions: int | None = None,
+    state_advance_mask: Tensor | None = None,
+    symbol_indices: Tensor | None = None,
     aux_outputs: dict[str, Tensor] | None = None,
     slope_tstat_weight: float = 1.0,
     rank_ic_weight: float = 0.5,
@@ -322,7 +364,11 @@ def factor_generalization_loss(
 ) -> Tensor:
     """Train scores as a stable, tradable cross-sectional characteristic factor."""
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    returns = torch.nan_to_num(future_log_returns.to(device=weights.device), nan=0.0, posinf=0.0, neginf=0.0)
+    execution_returns, returns = _execution_and_safe_returns(
+        future_log_returns,
+        reference=weights,
+        execution_mode=execution_mode,
+    )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     if sample_mask is None:
         valid_rows = torch.ones(weights.size(0), device=weights.device, dtype=torch.bool)
@@ -371,9 +417,21 @@ def factor_generalization_loss(
     )
     initial_weights = aux_outputs.get("initial_weights") if aux_outputs else None
     initial_alive = aux_outputs.get("initial_alive") if aux_outputs else None
+    initial_cash = aux_outputs.get("initial_cash") if aux_outputs else None
+    initial_payables = aux_outputs.get("initial_payables") if aux_outputs else None
+    initial_receivables = aux_outputs.get("initial_receivables") if aux_outputs else None
+    initial_equity_scale = (
+        aux_outputs.get("initial_equity_scale") if aux_outputs else None
+    )
+    initial_short_sale_collateral = (
+        aux_outputs.get("initial_short_sale_collateral") if aux_outputs else None
+    )
+    initial_short_margin_collateral = (
+        aux_outputs.get("initial_short_margin_collateral") if aux_outputs else None
+    )
     factor_backtest = run_backtest_torch(
         factor_scores,
-        returns,
+        execution_returns,
         tradable,
         benchmark,
         buy_fee_rate,
@@ -381,6 +439,10 @@ def factor_generalization_loss(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         volume_limit_weights=volume_limit_weights,
+        short_margin_rate=short_margin_rate,
+        short_capacity_weights=short_capacity_weights,
+        short_maintenance_ratio=short_maintenance_ratio,
+        short_handling_fee_rate=short_handling_fee_rate,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -404,6 +466,27 @@ def factor_generalization_loss(
         return_weights_history=needs_penalty_weights,
         initial_weights=initial_weights,
         initial_alive=initial_alive,
+        execution_mode=execution_mode,
+        buy_fee_rates=buy_fee_rates,
+        sell_fee_rates=sell_fee_rates,
+        settlement_lag_sessions=settlement_lag_sessions,
+        day_trade_eligible_mask=day_trade_eligible_mask,
+        day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+        day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+        unresolved_corporate_action_mask=unresolved_corporate_action_mask,
+        cash_dividend_yield=cash_dividend_yield,
+        cash_dividend_payment_delay_sessions=(
+            cash_dividend_payment_delay_sessions
+        ),
+        claim_queue_sessions=claim_queue_sessions,
+        state_advance_mask=state_advance_mask if state_advance_mask is not None else sample_mask,
+        initial_cash=initial_cash,
+        initial_payables=initial_payables,
+        initial_receivables=initial_receivables,
+        initial_equity_scale=initial_equity_scale,
+        initial_short_sale_collateral=initial_short_sale_collateral,
+        initial_short_margin_collateral=initial_short_margin_collateral,
+        symbol_indices=symbol_indices,
     )
     if aux_outputs is not None and factor_backtest.final_weights is not None:
         aux_outputs["_final_weights"] = _clone_portfolio_state_for_loss(
@@ -415,6 +498,32 @@ def factor_generalization_loss(
             factor_backtest.final_alive,
             stat_prefix="final_alive_clone",
         )
+    if aux_outputs is not None:
+        for public_name, private_name, value in (
+            ("cash", "_final_cash", factor_backtest.final_cash),
+            ("payables", "_final_payables", factor_backtest.final_payables),
+            ("receivables", "_final_receivables", factor_backtest.final_receivables),
+            (
+                "equity_scale",
+                "_final_equity_scale",
+                factor_backtest.final_equity_scale,
+            ),
+            (
+                "short_sale_collateral",
+                "_final_short_sale_collateral",
+                factor_backtest.final_short_sale_collateral,
+            ),
+            (
+                "short_margin_collateral",
+                "_final_short_margin_collateral",
+                factor_backtest.final_short_margin_collateral,
+            ),
+        ):
+            if value is not None:
+                aux_outputs[private_name] = _clone_portfolio_state_for_loss(
+                    value,
+                    stat_prefix=f"final_{public_name}_clone",
+                )
     factor_returns = torch.nan_to_num(factor_backtest.strategy_returns, nan=0.0, posinf=0.0, neginf=0.0)
     factor_returns_valid = factor_returns[valid_rows]
     if factor_returns_valid.numel() > 0 and float(factor_sharpe_weight) > 0.0:
@@ -491,9 +600,26 @@ def portfolio_autoencoder_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     volume_limit_weights: Tensor | None = None,
+    short_margin_rate: Tensor | float | None = None,
+    short_capacity_weights: Tensor | None = None,
+    short_maintenance_ratio: float = 1.30,
+    short_handling_fee_rate: Tensor | float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    execution_mode: str = "naive",
+    buy_fee_rates: Tensor | None = None,
+    sell_fee_rates: Tensor | None = None,
+    settlement_lag_sessions: int = 2,
+    day_trade_eligible_mask: Tensor | None = None,
+    day_trade_can_buy_open_mask: Tensor | None = None,
+    day_trade_can_sell_open_mask: Tensor | None = None,
+    unresolved_corporate_action_mask: Tensor | None = None,
+    cash_dividend_yield: Tensor | None = None,
+    cash_dividend_payment_delay_sessions: Tensor | None = None,
+    claim_queue_sessions: int | None = None,
+    state_advance_mask: Tensor | None = None,
+    symbol_indices: Tensor | None = None,
     aux_outputs: dict[str, Tensor] | None = None,
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
@@ -502,11 +628,10 @@ def portfolio_autoencoder_loss(
     """Portfolio-level objective evaluated by the canonical execution simulator."""
 
     weights_safe = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    returns = torch.nan_to_num(
-        future_log_returns.to(device=weights.device, dtype=weights_safe.dtype),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
+    execution_returns, returns = _execution_and_safe_returns(
+        future_log_returns,
+        reference=weights_safe,
+        execution_mode=execution_mode,
     )
     tradable = tradable_mask.to(device=weights.device, dtype=torch.bool)
     if sample_mask is None:
@@ -527,9 +652,21 @@ def portfolio_autoencoder_loss(
         )
     initial_weights = aux_outputs.get("initial_weights") if aux_outputs else None
     initial_alive = aux_outputs.get("initial_alive") if aux_outputs else None
+    initial_cash = aux_outputs.get("initial_cash") if aux_outputs else None
+    initial_payables = aux_outputs.get("initial_payables") if aux_outputs else None
+    initial_receivables = aux_outputs.get("initial_receivables") if aux_outputs else None
+    initial_equity_scale = (
+        aux_outputs.get("initial_equity_scale") if aux_outputs else None
+    )
+    initial_short_sale_collateral = (
+        aux_outputs.get("initial_short_sale_collateral") if aux_outputs else None
+    )
+    initial_short_margin_collateral = (
+        aux_outputs.get("initial_short_margin_collateral") if aux_outputs else None
+    )
     backtest = run_backtest_torch(
         weights_safe,
-        returns,
+        execution_returns,
         tradable,
         benchmark,
         buy_fee_rate,
@@ -537,6 +674,10 @@ def portfolio_autoencoder_loss(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         volume_limit_weights=volume_limit_weights,
+        short_margin_rate=short_margin_rate,
+        short_capacity_weights=short_capacity_weights,
+        short_maintenance_ratio=short_maintenance_ratio,
+        short_handling_fee_rate=short_handling_fee_rate,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -567,6 +708,27 @@ def portfolio_autoencoder_loss(
         ),
         initial_weights=initial_weights,
         initial_alive=initial_alive,
+        execution_mode=execution_mode,
+        buy_fee_rates=buy_fee_rates,
+        sell_fee_rates=sell_fee_rates,
+        settlement_lag_sessions=settlement_lag_sessions,
+        day_trade_eligible_mask=day_trade_eligible_mask,
+        day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+        day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+        unresolved_corporate_action_mask=unresolved_corporate_action_mask,
+        cash_dividend_yield=cash_dividend_yield,
+        cash_dividend_payment_delay_sessions=(
+            cash_dividend_payment_delay_sessions
+        ),
+        claim_queue_sessions=claim_queue_sessions,
+        state_advance_mask=state_advance_mask if state_advance_mask is not None else sample_mask,
+        initial_cash=initial_cash,
+        initial_payables=initial_payables,
+        initial_receivables=initial_receivables,
+        initial_equity_scale=initial_equity_scale,
+        initial_short_sale_collateral=initial_short_sale_collateral,
+        initial_short_margin_collateral=initial_short_margin_collateral,
+        symbol_indices=symbol_indices,
         return_weights_history=True,
     )
     if aux_outputs is not None and backtest.final_weights is not None:
@@ -579,6 +741,28 @@ def portfolio_autoencoder_loss(
             backtest.final_alive,
             stat_prefix="final_alive_clone",
         )
+    if aux_outputs is not None:
+        for public_name, private_name, value in (
+            ("cash", "_final_cash", backtest.final_cash),
+            ("payables", "_final_payables", backtest.final_payables),
+            ("receivables", "_final_receivables", backtest.final_receivables),
+            ("equity_scale", "_final_equity_scale", backtest.final_equity_scale),
+            (
+                "short_sale_collateral",
+                "_final_short_sale_collateral",
+                backtest.final_short_sale_collateral,
+            ),
+            (
+                "short_margin_collateral",
+                "_final_short_margin_collateral",
+                backtest.final_short_margin_collateral,
+            ),
+        ):
+            if value is not None:
+                aux_outputs[private_name] = _clone_portfolio_state_for_loss(
+                    value,
+                    stat_prefix=f"final_{public_name}_clone",
+                )
     net_return = torch.nan_to_num(backtest.strategy_returns, nan=0.0, posinf=0.0, neginf=0.0)
     turnover = torch.nan_to_num(backtest.turnovers, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -635,7 +819,9 @@ def sharpe_aware_loss(
 ) -> Tensor:
     """Sharpe-aware loss driven by the same backtest kernel used in evaluation."""
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-    returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
+    returns = torch.nan_to_num(
+        future_log_returns, nan=0.0, posinf=0.0, neginf=0.0
+    )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     can_buy = (
         can_buy_mask.to(dtype=torch.bool, device=weights.device)
@@ -849,9 +1035,26 @@ def risk_aware_loss(
     sell_fee_rate: float = 0.0,
     max_turnover_ratio: float = 0.0,
     volume_limit_weights: Tensor | None = None,
+    short_margin_rate: Tensor | float | None = None,
+    short_capacity_weights: Tensor | None = None,
+    short_maintenance_ratio: float = 1.30,
+    short_handling_fee_rate: Tensor | float = 0.0,
     gross_leverage: float = 1.0,
     min_trade_weight: float = 0.0,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    execution_mode: str = "naive",
+    buy_fee_rates: Tensor | None = None,
+    sell_fee_rates: Tensor | None = None,
+    settlement_lag_sessions: int = 2,
+    day_trade_eligible_mask: Tensor | None = None,
+    day_trade_can_buy_open_mask: Tensor | None = None,
+    day_trade_can_sell_open_mask: Tensor | None = None,
+    unresolved_corporate_action_mask: Tensor | None = None,
+    cash_dividend_yield: Tensor | None = None,
+    cash_dividend_payment_delay_sessions: Tensor | None = None,
+    claim_queue_sessions: int | None = None,
+    state_advance_mask: Tensor | None = None,
+    symbol_indices: Tensor | None = None,
     gamma_sharpe: float = 1.0,
     gamma_excess: float = 1.0,
     gamma_cvar: float = 1.0,
@@ -901,7 +1104,11 @@ def risk_aware_loss(
     _loss_timer_stop("normalize_weights", normalize_start)
 
     prepare_start = _loss_timer_start()
-    returns = torch.nan_to_num(future_log_returns, nan=0.0, posinf=0.0, neginf=0.0)
+    execution_returns, returns = _execution_and_safe_returns(
+        future_log_returns,
+        reference=weights,
+        execution_mode=execution_mode,
+    )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
     _loss_timer_stop("prepare_inputs", prepare_start)
@@ -909,7 +1116,7 @@ def risk_aware_loss(
     if objective_norm in {"portfolio_autoencoder", "bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
         return portfolio_autoencoder_loss(
             weights,
-            returns,
+            execution_returns,
             tradable,
             benchmark_returns=benchmark_returns,
             can_buy_mask=can_buy_mask,
@@ -923,9 +1130,28 @@ def risk_aware_loss(
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=max_turnover_ratio,
             volume_limit_weights=volume_limit_weights,
+            short_margin_rate=short_margin_rate,
+            short_capacity_weights=short_capacity_weights,
+            short_maintenance_ratio=short_maintenance_ratio,
+            short_handling_fee_rate=short_handling_fee_rate,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
+            execution_mode=execution_mode,
+            buy_fee_rates=buy_fee_rates,
+            sell_fee_rates=sell_fee_rates,
+            settlement_lag_sessions=settlement_lag_sessions,
+            day_trade_eligible_mask=day_trade_eligible_mask,
+            day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+            day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+            unresolved_corporate_action_mask=unresolved_corporate_action_mask,
+            cash_dividend_yield=cash_dividend_yield,
+            cash_dividend_payment_delay_sessions=(
+                cash_dividend_payment_delay_sessions
+            ),
+            claim_queue_sessions=claim_queue_sessions,
+            state_advance_mask=state_advance_mask,
+            symbol_indices=symbol_indices,
             aux_outputs=aux_outputs,
             autoencoder_lambda_turnover=autoencoder_lambda_turnover,
             autoencoder_lambda_concentration=autoencoder_lambda_concentration,
@@ -935,7 +1161,7 @@ def risk_aware_loss(
     if objective_norm in {"factor_generalization", "factor", "factor_ic", "characteristic_factor"}:
         return factor_generalization_loss(
             weights,
-            returns,
+            execution_returns,
             tradable,
             benchmark_returns=benchmark_returns,
             can_buy_mask=can_buy_mask,
@@ -949,9 +1175,28 @@ def risk_aware_loss(
             sell_fee_rate=sell_fee_rate,
             max_turnover_ratio=max_turnover_ratio,
             volume_limit_weights=volume_limit_weights,
+            short_margin_rate=short_margin_rate,
+            short_capacity_weights=short_capacity_weights,
+            short_maintenance_ratio=short_maintenance_ratio,
+            short_handling_fee_rate=short_handling_fee_rate,
             gross_leverage=gross_leverage,
             min_trade_weight=min_trade_weight,
             portfolio_activation=portfolio_activation,
+            execution_mode=execution_mode,
+            buy_fee_rates=buy_fee_rates,
+            sell_fee_rates=sell_fee_rates,
+            settlement_lag_sessions=settlement_lag_sessions,
+            day_trade_eligible_mask=day_trade_eligible_mask,
+            day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+            day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+            unresolved_corporate_action_mask=unresolved_corporate_action_mask,
+            cash_dividend_yield=cash_dividend_yield,
+            cash_dividend_payment_delay_sessions=(
+                cash_dividend_payment_delay_sessions
+            ),
+            claim_queue_sessions=claim_queue_sessions,
+            state_advance_mask=state_advance_mask,
+            symbol_indices=symbol_indices,
             aux_outputs=aux_outputs,
             slope_tstat_weight=factor_slope_tstat_weight,
             rank_ic_weight=factor_rank_ic_weight,
@@ -971,7 +1216,10 @@ def risk_aware_loss(
             regime_down_threshold=regime_down_threshold,
         )
 
-    rank_tradable = _apply_sample_mask_to_asset_mask(tradable, sample_mask)
+    rank_tradable = _apply_sample_mask_to_asset_mask(
+        tradable & torch.isfinite(execution_returns),
+        sample_mask,
+    )
 
     if objective_norm in {"pure_rank", "rank_only", "score_rank"}:
         rank_logits = _resolve_rank_scores(weights, aux_outputs)
@@ -1044,6 +1292,12 @@ def risk_aware_loss(
 
     initial_weights = None
     initial_alive = None
+    initial_cash = None
+    initial_payables = None
+    initial_receivables = None
+    initial_equity_scale = None
+    initial_short_sale_collateral = None
+    initial_short_margin_collateral = None
     if aux_outputs:
         initial_weights = aux_outputs.get("initial_weights")
         if isinstance(initial_weights, torch.Tensor):
@@ -1059,12 +1313,52 @@ def risk_aware_loss(
                 initial_alive,
                 stat_prefix="initial_alive_clone",
             )
+        initial_cash = aux_outputs.get("initial_cash")
+        if isinstance(initial_cash, torch.Tensor):
+            initial_cash = _clone_portfolio_state_for_loss(
+                initial_cash,
+                stat_prefix="initial_cash_clone",
+            )
+        initial_payables = aux_outputs.get("initial_payables")
+        if isinstance(initial_payables, torch.Tensor):
+            initial_payables = _clone_portfolio_state_for_loss(
+                initial_payables,
+                stat_prefix="initial_payables_clone",
+            )
+        initial_receivables = aux_outputs.get("initial_receivables")
+        if isinstance(initial_receivables, torch.Tensor):
+            initial_receivables = _clone_portfolio_state_for_loss(
+                initial_receivables,
+                stat_prefix="initial_receivables_clone",
+            )
+        initial_equity_scale = aux_outputs.get("initial_equity_scale")
+        if isinstance(initial_equity_scale, torch.Tensor):
+            initial_equity_scale = _clone_portfolio_state_for_loss(
+                initial_equity_scale,
+                stat_prefix="initial_equity_scale_clone",
+            )
+        initial_short_sale_collateral = aux_outputs.get(
+            "initial_short_sale_collateral"
+        )
+        if isinstance(initial_short_sale_collateral, torch.Tensor):
+            initial_short_sale_collateral = _clone_portfolio_state_for_loss(
+                initial_short_sale_collateral,
+                stat_prefix="initial_short_sale_collateral_clone",
+            )
+        initial_short_margin_collateral = aux_outputs.get(
+            "initial_short_margin_collateral"
+        )
+        if isinstance(initial_short_margin_collateral, torch.Tensor):
+            initial_short_margin_collateral = _clone_portfolio_state_for_loss(
+                initial_short_margin_collateral,
+                stat_prefix="initial_short_margin_collateral_clone",
+            )
 
     backtest_start = _loss_timer_start()
     needs_penalty_weights = float(concentration_weight) > 0.0 or float(net_exposure_weight) > 0.0
     backtest = run_backtest_torch(
         weights,
-        returns,
+        execution_returns,
         tradable,
         benchmark,
         buy_fee_rate,
@@ -1072,6 +1366,10 @@ def risk_aware_loss(
         long_only=long_only,
         max_turnover_ratio=max_turnover_ratio,
         volume_limit_weights=volume_limit_weights,
+        short_margin_rate=short_margin_rate,
+        short_capacity_weights=short_capacity_weights,
+        short_maintenance_ratio=short_maintenance_ratio,
+        short_handling_fee_rate=short_handling_fee_rate,
         gross_leverage=gross_leverage,
         min_trade_weight=min_trade_weight,
         portfolio_activation=portfolio_activation,
@@ -1095,6 +1393,27 @@ def risk_aware_loss(
         return_weights_history=needs_penalty_weights,
         initial_weights=initial_weights,
         initial_alive=initial_alive,
+        execution_mode=execution_mode,
+        buy_fee_rates=buy_fee_rates,
+        sell_fee_rates=sell_fee_rates,
+        settlement_lag_sessions=settlement_lag_sessions,
+        day_trade_eligible_mask=day_trade_eligible_mask,
+        day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+        day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+        unresolved_corporate_action_mask=unresolved_corporate_action_mask,
+        cash_dividend_yield=cash_dividend_yield,
+        cash_dividend_payment_delay_sessions=(
+            cash_dividend_payment_delay_sessions
+        ),
+        claim_queue_sessions=claim_queue_sessions,
+        state_advance_mask=state_advance_mask if state_advance_mask is not None else sample_mask,
+        initial_cash=initial_cash,
+        initial_payables=initial_payables,
+        initial_receivables=initial_receivables,
+        initial_equity_scale=initial_equity_scale,
+        initial_short_sale_collateral=initial_short_sale_collateral,
+        initial_short_margin_collateral=initial_short_margin_collateral,
+        symbol_indices=symbol_indices,
     )
     _loss_timer_stop("backtest", backtest_start)
 
@@ -1110,6 +1429,27 @@ def risk_aware_loss(
                 backtest.final_alive,
                 stat_prefix="final_alive_clone",
             )
+        for public_name, private_name, value in (
+            ("cash", "_final_cash", backtest.final_cash),
+            ("payables", "_final_payables", backtest.final_payables),
+            ("receivables", "_final_receivables", backtest.final_receivables),
+            ("equity_scale", "_final_equity_scale", backtest.final_equity_scale),
+            (
+                "short_sale_collateral",
+                "_final_short_sale_collateral",
+                backtest.final_short_sale_collateral,
+            ),
+            (
+                "short_margin_collateral",
+                "_final_short_margin_collateral",
+                backtest.final_short_margin_collateral,
+            ),
+        ):
+            if value is not None:
+                aux_outputs[private_name] = _clone_portfolio_state_for_loss(
+                    value,
+                    stat_prefix=f"final_{public_name}_clone",
+                )
         _loss_timer_stop("state_update", state_update_start)
 
     postprocess_start = _loss_timer_start()

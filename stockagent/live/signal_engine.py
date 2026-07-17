@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.tw_execution import normalize_execution_mode
 from stockagent.config import ExperimentConfig, load_config
 from stockagent.data.panel import PanelData, build_panel, build_tail_panel, load_cached_panel
 from stockagent.live.portfolio_state import (
@@ -60,6 +61,28 @@ class LiveSignalResult:
 
 LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _require_supported_live_execution(execution_mode: object) -> str:
+    """Fail closed until live signals carry an authoritative settlement ledger.
+
+    Historical inference has the complete recurrent cash/claim state inside the
+    canonical executor.  The live signal store currently persists only weights,
+    so pretending that pending T+2 payables/receivables are zero could approve a
+    purchase that the broker account cannot fund.  Day-trade signals also need a
+    morning-session eligibility snapshot and must not be persisted as overnight
+    holdings.  Refuse both real modes instead of silently dispatching ``naive``.
+    """
+
+    mode = normalize_execution_mode(execution_mode)
+    if mode != "naive":
+        raise RuntimeError(
+            f"live signal generation does not yet support execution_mode={mode}; "
+            "it requires broker-sourced settled cash plus pending T+2 claims, "
+            "and tw_day_trade additionally requires a session-bound morning "
+            "eligibility snapshot. Refusing to fall back to naive execution."
+        )
+    return mode
 
 
 def _emit_progress(
@@ -250,6 +273,59 @@ def _tail_panel_dates(panel: PanelData, rows: int) -> PanelData:
         can_short_open_mask=panel.can_short_open_mask[slc] if panel.can_short_open_mask is not None else None,
         force_short_cover_mask=panel.force_short_cover_mask[slc] if panel.force_short_cover_mask is not None else None,
         force_exit_mask=panel.force_exit_mask[slc] if panel.force_exit_mask is not None else None,
+        daily_volumes=panel.daily_volumes[slc] if panel.daily_volumes is not None else None,
+        open_prices=panel.open_prices[slc] if panel.open_prices is not None else None,
+        intraday_returns=panel.intraday_returns[slc] if panel.intraday_returns is not None else None,
+        day_trade_eligible_mask=(
+            panel.day_trade_eligible_mask[slc]
+            if panel.day_trade_eligible_mask is not None
+            else None
+        ),
+        day_trade_can_short_open_mask=(
+            panel.day_trade_can_short_open_mask[slc]
+            if panel.day_trade_can_short_open_mask is not None
+            else None
+        ),
+        day_trade_can_buy_open_mask=(
+            panel.day_trade_can_buy_open_mask[slc]
+            if panel.day_trade_can_buy_open_mask is not None
+            else None
+        ),
+        day_trade_can_sell_open_mask=(
+            panel.day_trade_can_sell_open_mask[slc]
+            if panel.day_trade_can_sell_open_mask is not None
+            else None
+        ),
+        raw_close_returns_1d=(
+            panel.raw_close_returns_1d[slc]
+            if panel.raw_close_returns_1d is not None
+            else None
+        ),
+        unresolved_corporate_action_mask=(
+            panel.unresolved_corporate_action_mask[slc]
+            if panel.unresolved_corporate_action_mask is not None
+            else None
+        ),
+        cash_dividend_yield=(
+            panel.cash_dividend_yield[slc]
+            if panel.cash_dividend_yield is not None
+            else None
+        ),
+        cash_dividend_payment_delay_sessions=(
+            panel.cash_dividend_payment_delay_sessions[slc]
+            if panel.cash_dividend_payment_delay_sessions is not None
+            else None
+        ),
+        short_capacity_shares=(
+            panel.short_capacity_shares[slc]
+            if panel.short_capacity_shares is not None
+            else None
+        ),
+        short_margin_rate=(
+            panel.short_margin_rate[slc]
+            if panel.short_margin_rate is not None
+            else None
+        ),
     )
 
 
@@ -1248,6 +1324,7 @@ def generate_live_signal(
     progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
     _emit_progress(progress_callback, label=progress_name, step=1, total=progress_total, message="load config")
     config = load_config(config_path)
+    _require_supported_live_execution(config.trading.execution_mode)
     if device is not None:
         config.environment.device = str(device)
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if config.training.strict_no_fallback else "0"
