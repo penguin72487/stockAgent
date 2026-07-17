@@ -125,15 +125,17 @@ def test_tw_public_uses_single_5070ti_runtime_and_dynamic_loss_graph() -> None:
     assert hasattr(config.training, "explain_cross_asset_shocks")
 
 
-def test_tw_public_candle_run_reuses_dynamic_model_and_loss_graphs() -> None:
+def test_tw_public_candle_fold20_uses_one_fixed_train_and_eval_abi() -> None:
     config = train_entry.load_config(
         "configs/markets/tw_public_lanten_market_candles.yaml"
     )
-    assert config.training.train_symbol_compaction == "train_union"
+    assert config.training.train_symbol_compaction == "none"
     assert config.training.train_symbol_compaction_bucket_size == 0
-    assert config.training.compile_model_dynamic_symbols is True
-    assert config.training.compile_loss_dynamic_symbols is True
-    assert config.training.tw_continuous_compile_chunk_rows == 4
+    assert config.training.compile_model_dynamic_symbols is False
+    assert config.training.compile_loss_dynamic_symbols is False
+    assert config.training.compile_eval_model is True
+    assert config.training.eval_backtest_compile is True
+    assert config.training.tw_continuous_compile_chunk_rows == 32
     assert config.training.tw_continuous_gradient_horizon_rows == 32
     assert config.training.finite_check_interval_steps == 0
     assert config.training.checkpoint_finite_check is False

@@ -74,6 +74,7 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
+from stockagent.data.panel_cache import array_content_fingerprint
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import (
@@ -4047,40 +4048,33 @@ def _stable_fingerprint(payload: Mapping[str, Any]) -> str:
 
 
 def _array_content_fingerprint(value: np.ndarray | None) -> dict[str, Any]:
-    """Hash an array's complete logical C-order content without a full-size copy."""
-    if value is None:
-        return {"present": False}
+    return array_content_fingerprint(value)
 
-    array = np.asarray(value)
-    digest = hashlib.sha256()
-    header = {
-        "present": True,
-        "shape": [int(size) for size in array.shape],
-        "dtype": str(array.dtype),
-    }
-    digest.update(
-        json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    )
-    if array.dtype.hasobject:
-        for item in array.flat:
-            encoded = json.dumps(item, ensure_ascii=False, default=str).encode("utf-8")
-            digest.update(len(encoded).to_bytes(8, byteorder="little", signed=False))
-            digest.update(encoded)
-    elif array.flags.c_contiguous:
-        digest.update(memoryview(array.view(np.uint8).reshape(-1)))
-    else:
-        iterator = np.nditer(
-            array,
-            flags=["external_loop", "buffered", "zerosize_ok"],
-            op_flags=["readonly"],
-            order="C",
-            buffersize=1 << 20,
-        )
-        for chunk in iterator:
-            contiguous = np.ascontiguousarray(chunk)
-            digest.update(memoryview(contiguous.view(np.uint8).reshape(-1)))
-    header["sha256"] = digest.hexdigest()
-    return header
+
+def _panel_array_content_fingerprint(
+    panel: PanelData,
+    name: str,
+    value: np.ndarray | None,
+) -> dict[str, Any]:
+    """Reuse an immutable cache-generation digest when its ABI still matches."""
+
+    cached = getattr(panel, "content_fingerprints", None)
+    cached_value = None if not isinstance(cached, Mapping) else cached.get(name)
+    if isinstance(cached_value, Mapping):
+        if value is None:
+            if cached_value.get("present") is False:
+                return dict(cached_value)
+        else:
+            array = np.asarray(value)
+            if (
+                cached_value.get("present") is True
+                and cached_value.get("shape")
+                == [int(size) for size in array.shape]
+                and cached_value.get("dtype") == str(array.dtype)
+                and isinstance(cached_value.get("sha256"), str)
+            ):
+                return dict(cached_value)
+    return _array_content_fingerprint(value)
 
 
 def _active_model_config(config: ExperimentConfig) -> dict[str, Any]:
@@ -4429,6 +4423,7 @@ def _training_checkpoint_contract_schema_3(
     # synthesized into a historical schema-3 fingerprint; the compatibility
     # constraint below separately prevents unsafe optimizer resume when enabled.
     contract.pop("cache_train_features_in_amp_dtype", None)
+    contract.pop("compile_eval_model", None)
     # This decoupling control did not exist in schema 3; historical runs always
     # used trading.min_trade_weight in the loss.
     contract.pop("loss_min_trade_weight", None)
@@ -4894,61 +4889,73 @@ def _checkpoint_manifest(
         np.asarray(effective_force_exit, dtype=bool).any()
     )
     if include_data_content:
+        fingerprint = partial(_panel_array_content_fingerprint, panel)
         panel_arrays = {
-            "dates": _array_content_fingerprint(panel.dates),
-            "features": _array_content_fingerprint(panel.features),
-            "returns_1d": _array_content_fingerprint(panel.returns_1d),
-            "tradable_mask": _array_content_fingerprint(panel.tradable_mask),
-            "alive_mask": _array_content_fingerprint(panel.alive_mask),
-            "benchmark_returns": _array_content_fingerprint(panel.benchmark_returns),
-            "close_prices": _array_content_fingerprint(panel.close_prices),
-            "daily_volumes": _array_content_fingerprint(panel.daily_volumes),
-            "can_buy_mask": _array_content_fingerprint(panel.can_buy_mask),
-            "can_sell_mask": _array_content_fingerprint(panel.can_sell_mask),
-            "can_short_open_mask": _array_content_fingerprint(effective_short_open),
-            "force_short_cover_mask": _array_content_fingerprint(effective_force_cover),
-            "force_exit_mask": _array_content_fingerprint(effective_force_exit),
+            "dates": fingerprint("dates", panel.dates),
+            "features": fingerprint("features", panel.features),
+            "returns_1d": fingerprint("returns_1d", panel.returns_1d),
+            "tradable_mask": fingerprint("tradable_mask", panel.tradable_mask),
+            "alive_mask": fingerprint("alive_mask", panel.alive_mask),
+            "benchmark_returns": fingerprint(
+                "benchmark_returns", panel.benchmark_returns
+            ),
+            "close_prices": fingerprint("close_prices", panel.close_prices),
+            "daily_volumes": fingerprint("daily_volumes", panel.daily_volumes),
+            "can_buy_mask": fingerprint("can_buy_mask", panel.can_buy_mask),
+            "can_sell_mask": fingerprint("can_sell_mask", panel.can_sell_mask),
+            "can_short_open_mask": fingerprint(
+                "can_short_open_mask", effective_short_open
+            ),
+            "force_short_cover_mask": fingerprint(
+                "force_short_cover_mask", effective_force_cover
+            ),
+            "force_exit_mask": fingerprint("force_exit_mask", effective_force_exit),
         }
         if str(config.trading.execution_mode) == "tw_day_trade":
             panel_arrays.update(
                 {
-                    "open_prices": _array_content_fingerprint(panel.open_prices),
-                    "intraday_returns": _array_content_fingerprint(
-                        panel.intraday_returns
+                    "open_prices": fingerprint("open_prices", panel.open_prices),
+                    "intraday_returns": fingerprint(
+                        "intraday_returns", panel.intraday_returns
                     ),
-                    "day_trade_eligible_mask": _array_content_fingerprint(
-                        panel.day_trade_eligible_mask
+                    "day_trade_eligible_mask": fingerprint(
+                        "day_trade_eligible_mask", panel.day_trade_eligible_mask
                     ),
-                    "day_trade_can_short_open_mask": _array_content_fingerprint(
-                        panel.day_trade_can_short_open_mask
+                    "day_trade_can_short_open_mask": fingerprint(
+                        "day_trade_can_short_open_mask",
+                        panel.day_trade_can_short_open_mask,
                     ),
-                    "day_trade_can_buy_open_mask": _array_content_fingerprint(
-                        panel.day_trade_can_buy_open_mask
+                    "day_trade_can_buy_open_mask": fingerprint(
+                        "day_trade_can_buy_open_mask",
+                        panel.day_trade_can_buy_open_mask,
                     ),
-                    "day_trade_can_sell_open_mask": _array_content_fingerprint(
-                        panel.day_trade_can_sell_open_mask
+                    "day_trade_can_sell_open_mask": fingerprint(
+                        "day_trade_can_sell_open_mask",
+                        panel.day_trade_can_sell_open_mask,
                     ),
                 }
             )
         if str(config.trading.execution_mode) == "tw_cash":
             panel_arrays.update(
                 {
-                    "unresolved_corporate_action_mask": _array_content_fingerprint(
-                        panel.unresolved_corporate_action_mask
+                    "unresolved_corporate_action_mask": fingerprint(
+                        "unresolved_corporate_action_mask",
+                        panel.unresolved_corporate_action_mask,
                     ),
-                    "short_margin_rate": _array_content_fingerprint(
-                        panel.short_margin_rate
+                    "short_margin_rate": fingerprint(
+                        "short_margin_rate", panel.short_margin_rate
                     ),
                 }
             )
             if config.trading.tw_corporate_action_mode == "exact":
                 panel_arrays.update(
                     {
-                        "cash_dividend_yield": _array_content_fingerprint(
-                            panel.cash_dividend_yield
+                        "cash_dividend_yield": fingerprint(
+                            "cash_dividend_yield", panel.cash_dividend_yield
                         ),
                         "cash_dividend_payment_delay_sessions": (
-                            _array_content_fingerprint(
+                            fingerprint(
+                                "cash_dividend_payment_delay_sessions",
                                 panel.cash_dividend_payment_delay_sessions
                             )
                         ),
@@ -4957,8 +4964,8 @@ def _checkpoint_manifest(
             if bool(config.trading.tw_short_capacity_limit_enabled):
                 # Capacity changes optimizer trajectories only when the
                 # explicit broker-inventory ceiling is active.
-                panel_arrays["short_capacity_shares"] = _array_content_fingerprint(
-                    panel.short_capacity_shares
+                panel_arrays["short_capacity_shares"] = fingerprint(
+                    "short_capacity_shares", panel.short_capacity_shares
                 )
         schema_2_panel_arrays = {
             name: value for name, value in panel_arrays.items() if name != "force_exit_mask"
@@ -8780,7 +8787,10 @@ def _maybe_cache_tensors_on_device(
     min_post_cache_free_bytes = 0
     if required_bytes >= 4 * 1024**3:
         # Large shared panels can fit by a static free-memory check but still
-        # starve compiled eval/train workspaces on 16GB cards.
+        # starve compiled forward/backward workspaces on 16GB cards.  This was
+        # reproduced on fold20 as a WSL dxg make-resident ENOMEM followed by
+        # CUDA "device not ready" with 7.64 GiB cached and 6.60 GiB reported
+        # free.  Preserve the measured 8 GiB workspace reserve.
         min_post_cache_free_bytes = int(8 * 1024**3)
     post_cache_free_bytes = int(free_mem) - int(required_bytes)
     if min_post_cache_free_bytes > 0 and post_cache_free_bytes < min_post_cache_free_bytes:
@@ -9823,6 +9833,15 @@ def _compute_eval_metrics_like_legacy_online(
     }
 
 
+def _eval_backtest_compile_enabled(*, return_weights_history: bool) -> bool:
+    """Compile only recurrent eval ABIs that repeat and can amortize."""
+
+    return bool(
+        not return_weights_history
+        and _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", "1")
+    )
+
+
 def _run_eval_backtest_from_weight_buffers(
     weights_all: torch.Tensor,
     future_log_returns_all: torch.Tensor,
@@ -10174,10 +10193,16 @@ def _run_eval_backtest_from_weight_buffers(
         # Artifact passes request the full weights history only once. Compiling
         # that distinct recurrent output graph costs minutes on short folds and
         # cannot amortize; repeated epoch metrics keep the compiled fast path.
-        compile_default = "0" if return_weights_history else "1"
+        # This is an executor choice, not a skipped calculation: the eager path
+        # runs the identical canonical settlement recurrence and returns the
+        # complete history.  An explicit eval compile setting must not override
+        # this one-shot ABI boundary.
+        compile_eval_backtest = _eval_backtest_compile_enabled(
+            return_weights_history=return_weights_history
+        )
         compile_context = (
             nullcontext()
-            if _env_truthy("STOCKAGENT_EVAL_BACKTEST_COMPILE", compile_default)
+            if compile_eval_backtest
             else _temporary_env("STOCKAGENT_BACKTEST_COMPILE", "0")
         )
         try:
@@ -12077,6 +12102,43 @@ def _configure_torch_compile_runtime() -> None:
         pass
 
 
+def _dynamo_compile_counter_snapshot() -> dict[str, int]:
+    """Return O(1) process-local graph counters without enabling verbose logs."""
+
+    try:
+        from torch._dynamo.utils import counters
+
+        return {
+            "frames_total": int(counters["frames"].get("total", 0)),
+            "frames_ok": int(counters["frames"].get("ok", 0)),
+            "unique_graphs": int(counters["stats"].get("unique_graphs", 0)),
+            "fxgraph_cache_hit": int(
+                counters["inductor"].get("fxgraph_cache_hit", 0)
+            ),
+            "fxgraph_cache_miss": int(
+                counters["inductor"].get("fxgraph_cache_miss", 0)
+            ),
+        }
+    except Exception:
+        return {
+            "frames_total": 0,
+            "frames_ok": 0,
+            "unique_graphs": 0,
+            "fxgraph_cache_hit": 0,
+            "fxgraph_cache_miss": 0,
+        }
+
+
+def _dynamo_compile_counter_delta(
+    after: Mapping[str, int],
+    before: Mapping[str, int],
+) -> dict[str, int]:
+    return {
+        name: int(after.get(name, 0)) - int(before.get(name, 0))
+        for name in after
+    }
+
+
 def _torch_compile_options(mode: object, *, cudagraphs: bool = False) -> dict[str, Any]:
     """Expand a compile mode into explicit options so cudagraph policy stays singular."""
     normalized = str(mode or "default").strip().lower()
@@ -12657,6 +12719,7 @@ _BACKTEST_RUNTIME_ENV_NAMES = (
     "STOCKAGENT_BACKTEST_COMPILE_DYNAMIC",
     "STOCKAGENT_TW_CONTINUOUS_COMPILE_CHUNK_ROWS",
     "STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS",
+    "STOCKAGENT_TW_COMPILE_SYMBOL_MIN",
     "STOCKAGENT_TW_COMPILE_SYMBOL_MAX",
     "STOCKAGENT_EVAL_BACKTEST_COMPILE",
     "STOCKAGENT_BACKTEST_VERBOSE",
@@ -12688,62 +12751,6 @@ def _isolate_backtest_runtime_environment(func: Callable[..., Any]) -> Callable[
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         with _preserve_backtest_runtime_environment():
             return func(*args, **kwargs)
-
-    return wrapped
-
-
-@contextmanager
-def _dynamo_recompile_budget_for_train_groups(group_count: int):
-    """Temporarily cover intentional fixed-shape graphs for expanding universes.
-
-    The panel-slab model deliberately uses ``dynamic=False``.  Walk-forward
-    train unions therefore create one graph per distinct symbol width, and all
-    wrapper instances share the same Python ``forward`` code object.  Dynamo's
-    default per-code recompile limit (currently 8) is too small for long
-    expanding-universe runs even though each individual group is stable.
-    """
-    try:
-        import torch._dynamo.config as dynamo_config
-
-        current_limit = int(dynamo_config.recompile_limit)
-        required_limit = max(current_limit, max(0, int(group_count)) + 1)
-        patch = dynamo_config.patch
-    except (AttributeError, ImportError, TypeError):
-        # Older PyTorch builds may not expose the patchable setting. Compile
-        # availability is validated separately by _can_enable_torch_compile.
-        yield None
-        return
-    if required_limit == current_limit:
-        yield current_limit
-        return
-    with patch(recompile_limit=required_limit):
-        yield required_limit
-
-
-def _isolate_dynamo_recompile_budget(func: Callable[..., Any]) -> Callable[..., Any]:
-    @wraps(func)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
-        bound = inspect.signature(func).bind_partial(*args, **kwargs)
-        folds = list(bound.arguments.get("folds", ()))
-        bound.arguments["folds"] = folds
-        group_count = len({_group_key(fold.train_years) for fold in folds})
-        config = bound.arguments.get("config")
-        compile_requested = bool(
-            config is not None
-            and (
-                getattr(config.training, "enable_torch_compile", False)
-                or getattr(config.training, "auto_torch_compile_sharpe", False)
-            )
-        )
-        if not compile_requested:
-            return func(*bound.args, **bound.kwargs)
-        with _dynamo_recompile_budget_for_train_groups(group_count) as limit:
-            if limit is not None and group_count > 0 and _distributed_is_rank0():
-                print(
-                    "[torch.compile] fixed-shape train-group recompile budget: "
-                    f"groups={group_count} recompile_limit={limit}"
-                )
-            return func(*bound.args, **bound.kwargs)
 
     return wrapped
 
@@ -15847,7 +15854,6 @@ def run_inference(
 
 
 @_isolate_backtest_runtime_environment
-@_isolate_dynamo_recompile_budget
 def run_training(
     panel: PanelData,
     folds: Iterable[WalkForwardFold],
@@ -16205,6 +16211,15 @@ def run_training(
     # are unchanged.
     shared_dynamic_compiled_loss_fn: Callable[..., torch.Tensor] | None = None
     dynamic_loss_symbol_max = max(1, int(len(panel.symbols)))
+    # A fixed-width run must not carry a symbolic S axis merely because the
+    # process-wide upper bound equals the observed full universe.  Conversely,
+    # expanding compact train groups intentionally share one bounded-dynamic
+    # TW executor graph.
+    os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MIN"] = str(
+        2
+        if bool(getattr(config.training, "compile_loss_dynamic_symbols", False))
+        else dynamic_loss_symbol_max
+    )
     os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MAX"] = str(dynamic_loss_symbol_max)
 
     for train_years_key, group_folds in tqdm(grouped_folds.items(), desc="Train groups", unit="group"):
@@ -16638,15 +16653,19 @@ def run_training(
         panel_slab_model: nn.Module | None = None
         eval_panel_slab_model: nn.Module | None = None
         panel_slab_compile_status = "off"
+        eval_model_compile_status = "off"
         ddp_enabled = bool(distributed_data_parallel_enabled)
         ddp_panel_slab_enabled = bool(ddp_enabled and _model_supports_panel_slab_forward(model))
         if _model_supports_panel_slab_forward(model):
             panel_slab_model = _PanelSlabForwardWrapper(model)
-            # Keep eval eager and separate from the train-only compiled
-            # wrapper. Evaluation runs under inference_mode; sharing the
-            # compiled wrapper would add a grad_mode graph variant for every
-            # expanding symbol width and exhaust Dynamo's recompile budget.
+            # Keep eval separate from the train-autograd wrapper. Evaluation
+            # runs under inference_mode; sharing one OptimizedModule would add
+            # an implicit grad-mode specialization. The separate wrapper may
+            # remain eager or be compiled once through compile_eval_model.
             eval_panel_slab_model = _PanelSlabForwardWrapper(model)
+            eval_model_compile_status = (
+                "eager_panel_slab_separate_from_compiled_train"
+            )
             panel_slab_compile_status = "eager"
         if ddp_enabled:
             print(
@@ -17093,6 +17112,38 @@ def run_training(
                         )
                         model_compile_status = f"enabled:{compile_source}"
 
+                    if (
+                        bool(getattr(config.training, "compile_eval_model", False))
+                        and eval_panel_slab_model is not None
+                    ):
+                        try:
+                            eval_panel_slab_model = torch.compile(
+                                eval_panel_slab_model,
+                                fullgraph=True,
+                                dynamic=False,
+                                options=model_compile_options,
+                            )
+                            eval_model_compile_status = (
+                                "enabled:panel_slab_inference_fullgraph:fixed_shape"
+                            )
+                            print(
+                                f"[Train {train_years}] torch.compile eval panel-slab "
+                                "forward enabled (fullgraph=True, dynamic=False, "
+                                "cudagraphs=False)"
+                            )
+                        except Exception as e:
+                            if bool(config.training.strict_no_fallback):
+                                raise RuntimeError(
+                                    f"[Train {train_years}] torch.compile eval panel-slab "
+                                    "constructor failed; strict_no_fallback=true"
+                                ) from e
+                            eval_panel_slab_model = _PanelSlabForwardWrapper(model)
+                            eval_model_compile_status = "fallback:eager"
+                            print(
+                                f"[Train {train_years}] torch.compile eval panel-slab "
+                                f"failed, using eager eval: {e}"
+                            )
+
                     if compile_loss:
                         try:
                             eager_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
@@ -17185,8 +17236,12 @@ def run_training(
                     if _model_supports_panel_slab_forward(model):
                         panel_slab_model = _PanelSlabForwardWrapper(model)
                         panel_slab_compile_status = "eager"
+                        eval_panel_slab_model = _PanelSlabForwardWrapper(model)
+                        eval_model_compile_status = "fallback:eager"
                     else:
                         panel_slab_model = None
+                        eval_panel_slab_model = None
+                        eval_model_compile_status = "off"
                         panel_slab_compile_status = "off"
                     compiled_loss_fn = partial(risk_aware_loss, **risk_loss_kwargs)
                     model_compile_status = "fallback:eager"
@@ -17229,6 +17284,7 @@ def run_training(
                 if dynamic_model_symbol_bounds is None
                 else int(dynamic_model_symbol_bounds[1])
             ),
+            eval_model_compile_status=str(eval_model_compile_status),
         )
 
         if ddp_enabled and should_enable_compile:
@@ -17346,6 +17402,7 @@ def run_training(
             )
 
         model_probe_started = time.perf_counter()
+        model_probe_compile_before = _dynamo_compile_counter_snapshot()
         model_probe_output_dtypes: list[torch.dtype] = []
         if model_compile_status.startswith("enabled"):
             probe_uses_panel_slab = bool(train_uses_panel_slab and panel_slab_model is not None)
@@ -17398,6 +17455,11 @@ def run_training(
                     f"[Train {train_years}] compiled train probe failed on at least one rank; "
                     f"all ranks will use eager before DDP wrap: {probe_error}"
                 )
+        model_probe_compile_after = _dynamo_compile_counter_snapshot()
+        model_probe_compile_delta = _dynamo_compile_counter_delta(
+            model_probe_compile_after,
+            model_probe_compile_before,
+        )
         pre_epoch_timing.checkpoint(
             "compiled_model_forward_backward_probe",
             active=bool(model_compile_status.startswith("enabled")),
@@ -17427,9 +17489,19 @@ def run_training(
             inductor_compile_threads=int(
                 os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
             ),
+            dynamo_unique_graphs_delta=int(
+                model_probe_compile_delta["unique_graphs"]
+            ),
+            inductor_fxgraph_cache_hits_delta=int(
+                model_probe_compile_delta["fxgraph_cache_hit"]
+            ),
+            inductor_fxgraph_cache_misses_delta=int(
+                model_probe_compile_delta["fxgraph_cache_miss"]
+            ),
         )
 
         loss_probe_started = time.perf_counter()
+        loss_probe_compile_before = _dynamo_compile_counter_snapshot()
         loss_probe_rank_ordered = rank_ordered_compile_probes
         tw_compile_stats_before = get_tw_continuous_compile_stats()
         tw_compile_stats_after = dict(tw_compile_stats_before)
@@ -17539,6 +17611,11 @@ def run_training(
                     f"[Train {train_years}] compiled loss probe failed; all ranks use eager loss: "
                     f"{loss_probe_error}"
                 )
+        loss_probe_compile_after = _dynamo_compile_counter_snapshot()
+        loss_probe_compile_delta = _dynamo_compile_counter_delta(
+            loss_probe_compile_after,
+            loss_probe_compile_before,
+        )
         pre_epoch_timing.checkpoint(
             "compiled_loss_forward_backward_probe",
             active=bool(loss_compile_status.startswith("enabled")),
@@ -17572,6 +17649,15 @@ def run_training(
             inductor_compile_threads=int(
                 os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", "1")
             ),
+            dynamo_unique_graphs_delta=int(
+                loss_probe_compile_delta["unique_graphs"]
+            ),
+            inductor_fxgraph_cache_hits_delta=int(
+                loss_probe_compile_delta["fxgraph_cache_hit"]
+            ),
+            inductor_fxgraph_cache_misses_delta=int(
+                loss_probe_compile_delta["fxgraph_cache_miss"]
+            ),
         )
 
         if ddp_enabled:
@@ -17594,8 +17680,8 @@ def run_training(
         )
 
         eval_model_status = (
-            "eager_panel_slab_separate_from_compiled_train"
-            if panel_slab_compile_status.startswith("compiled")
+            eval_model_compile_status
+            if eval_panel_slab_model is not None
             else "compiled"
             if eval_model is not model
             else "eager"
@@ -18066,6 +18152,7 @@ def run_training(
 
         for epoch in epoch_pbar:
             epoch_start = time.perf_counter()
+            epoch_compile_before = _dynamo_compile_counter_snapshot()
             last_epoch = epoch
             get_backtest_compile_stats(reset=True)
             get_backtest_prep_compile_stats(reset=True)
@@ -18129,6 +18216,18 @@ def run_training(
                         train_timing,
                     )
                 cuda_sync_total = _sync_cuda_for_timing(device)
+                epoch_compile_after = _dynamo_compile_counter_snapshot()
+                epoch_compile_delta = _dynamo_compile_counter_delta(
+                    epoch_compile_after,
+                    epoch_compile_before,
+                )
+                if epoch_compile_delta["unique_graphs"] > 0:
+                    print(
+                        f"[Train {train_years}] epoch {epoch} compiled "
+                        f"{epoch_compile_delta['unique_graphs']} new graph(s); "
+                        "the steady-state contract requires zero after all "
+                        "train/eval ABIs have warmed"
+                    )
                 request_plot = (
                     epoch == start_epoch
                     or (epoch % curve_plot_request_interval == 0)
@@ -18146,6 +18245,18 @@ def run_training(
                         "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
+                        "dynamo_unique_graphs_total": int(
+                            epoch_compile_after["unique_graphs"]
+                        ),
+                        "dynamo_unique_graphs_epoch_delta": int(
+                            epoch_compile_delta["unique_graphs"]
+                        ),
+                        "inductor_fxgraph_cache_hits_epoch_delta": int(
+                            epoch_compile_delta["fxgraph_cache_hit"]
+                        ),
+                        "inductor_fxgraph_cache_misses_epoch_delta": int(
+                            epoch_compile_delta["fxgraph_cache_miss"]
+                        ),
                         **_timing_curve_payload(
                             train_timing=train_timing,
                             scheduler_s=scheduler_total,
@@ -18654,6 +18765,18 @@ def run_training(
                     )
 
                 cuda_sync_total = _sync_cuda_for_timing(device)
+                epoch_compile_after = _dynamo_compile_counter_snapshot()
+                epoch_compile_delta = _dynamo_compile_counter_delta(
+                    epoch_compile_after,
+                    epoch_compile_before,
+                )
+                if epoch_compile_delta["unique_graphs"] > 0:
+                    print(
+                        f"[Train {train_years}] epoch {epoch} compiled "
+                        f"{epoch_compile_delta['unique_graphs']} new graph(s); "
+                        "the steady-state contract requires zero after all "
+                        "train/eval ABIs have warmed"
+                    )
                 request_plot = (
                     epoch == start_epoch
                     or (epoch % curve_plot_request_interval == 0)
@@ -18671,6 +18794,18 @@ def run_training(
                         "test_sample_rows": curve_test_rows,
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "no_improve": int(no_improve_epochs),
+                        "dynamo_unique_graphs_total": int(
+                            epoch_compile_after["unique_graphs"]
+                        ),
+                        "dynamo_unique_graphs_epoch_delta": int(
+                            epoch_compile_delta["unique_graphs"]
+                        ),
+                        "inductor_fxgraph_cache_hits_epoch_delta": int(
+                            epoch_compile_delta["fxgraph_cache_hit"]
+                        ),
+                        "inductor_fxgraph_cache_misses_epoch_delta": int(
+                            epoch_compile_delta["fxgraph_cache_miss"]
+                        ),
                         **_timing_curve_payload(
                             train_timing=train_timing,
                             val_timing=val_timing,

@@ -62,6 +62,13 @@ def test_panel_cache_v2_round_trips_memmap_payload(tmp_path) -> None:
     assert np.array_equal(payload["returns_1d"], panel.returns_1d)
     assert np.array_equal(payload["tradable_mask"], panel.tradable_mask)
     assert np.array_equal(payload["force_exit_mask"], force_exit)
+    assert panel.content_fingerprints is not None
+    assert payload["_content_fingerprints"]["features"] == (
+        panel_cache.array_content_fingerprint(features)
+    )
+    assert panel.content_fingerprints["features"] == payload[
+        "_content_fingerprints"
+    ]["features"]
 
 
 def test_source_hash_invalidates_same_size_replacement_with_preserved_mtime(tmp_path) -> None:

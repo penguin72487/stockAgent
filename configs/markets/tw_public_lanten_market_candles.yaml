@@ -9,7 +9,7 @@ runner:
   resume: false
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 1
+  start_fold: 20
 environment:
   device: cuda
   use_tensor_cores: true
@@ -272,19 +272,15 @@ training:
   triton_cache_dir: ~/.cache/triton
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
-  # The actual fold20/fold21 production shapes compile to one symbolic-S graph:
-  # no stock padding, no parameter change, and unchanged steady-state step time.
-  compile_model_dynamic_symbols: true
-  # Expanding train_union folds change S each year. Keep T=128 fixed and make
-  # only S symbolic, so remaining folds reuse one canonical-loss graph without
-  # padding assets or changing checkpoint/trading semantics.
-  compile_loss_dynamic_symbols: true
-  # Do not unroll all 128 settlement days into one horizon-sized graph. On the
-  # actual S=2304 RTX 5070 Ti margin-short benchmark, four-session chunks cut
-  # cold compile from 77.8s to 41.4s while keeping steady backward within 7.4%
-  # of eight-session chunks (43.6ms vs 40.6ms for 32 rows). Persistent-cache
-  # startup then measured 5.6s. This is the cold-start/throughput Pareto point.
-  tw_continuous_compile_chunk_rows: 4
+  # Fold20 already uses 94.5% of the full universe. The actual dynamic-S A/B
+  # made epoch 1 take 182s without new codegen versus 13.75s for fixed S=2735,
+  # so train/val/test keep one static full-market ABI across fold20/21.
+  compile_model_dynamic_symbols: false
+  compile_loss_dynamic_symbols: false
+  # Compile exactly one reverse-mode horizon per call. On the actual fixed-S
+  # fold20 A/B, rows=32 reduced steady epoch wall from 16.42s to 13.75s versus
+  # rows=4. Cold codegen is intentionally heavier but occurs only at warmup.
+  tw_continuous_compile_chunk_rows: 32
   # The forward T+2 ledger stays continuous for every session. Only its
   # reverse-mode state is restarted every 32 rows, preventing normalized-ledger
   # gradient overflow while keeping batch128 model/optimizer throughput.
@@ -295,18 +291,19 @@ training:
   # Fold20 RTX 5070 Ti validation/test completed safely with 64-row model
   # chunks. Pin the power-of-two shape to avoid redundant VRAM probes.
   eval_model_chunk_rows: 64
+  # Validation/test run every epoch, so amortize a distinct inference-mode
+  # fixed-shape graph instead of paying the eager model cost 2,000 times.
+  compile_eval_model: true
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
-  # Keep train model/loss compile on. Eval backtest scan compile stalls in
-  # TorchInductor front-end analysis for the current fold18 full-universe shape.
-  eval_backtest_compile: false
+  # Repeated epoch metrics use the fixed padded eval graph. The one-shot final
+  # full weights-history artifact is forced through the identical eager
+  # recurrence so it never creates a non-amortizable output-ABI graph.
+  eval_backtest_compile: true
   eval_auto_chunk_rows_cap: 64
-  # Explicit comparison knob: train_union changes the training symbol universe
-  # to the fold's active-symbol union; set none for full-symbol parity runs.
-  train_symbol_compaction: train_union
-  # Keep 0 to resume the existing all-available checkpoints exactly. For a new
-  # artifact root trained from scratch, 512 reduces 21 symbol shapes
-  # (1237..2658) to 1536/2048/2560/2735 at about 10.4% extra masked-token work.
+  # Fixed full width eliminates the duplicate 6.7GB compact train base, shares
+  # one immutable base with val/test, and makes fold20/fold21 graph-identical.
+  train_symbol_compaction: none
   train_symbol_compaction_bucket_size: 0
   backtest_autotune: true
   backtest_compile: true
@@ -400,9 +397,10 @@ training:
   postprocess_benchmark_strict: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
-  # Keep cached feature storage FP32 because the enabled company categorical
-  # columns must be converted to exact embedding indices. Model compute still
-  # uses BF16 AMP; only the pre-forward cache remains FP32.
+  # Keep feature storage FP32 because the enabled company categorical columns
+  # must be converted to exact embedding indices. The shared CPU base avoids
+  # three copies; the 8GB compiled-workspace reserve deliberately rejects a
+  # full 7.64GB GPU cache on this 16GB card.
   cache_train_features_in_amp_dtype: false
   learning_rate: 0.0003
   enable_lr_scheduler: false
