@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,7 +17,7 @@ import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.config import ExperimentConfig, load_config
-from stockagent.data.panel import PanelData, build_panel, build_tail_panel, load_cached_panel
+from stockagent.data.panel import PanelData, build_panel, build_tail_panel
 from stockagent.live.portfolio_state import (
     build_rebalance_rows,
     classify_rebalance_action,
@@ -29,7 +32,7 @@ from stockagent.live.quote_provider import (
     load_prices_csv,
     load_symbol_name_map,
 )
-from stockagent.live.report_formatter import format_signal_message
+from stockagent.live.report_formatter import format_signal_message, is_display_position_row
 from stockagent.live.market_status import cumulative_recent_returns, short_file_fingerprint
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label
 from stockagent.models.factory import build_model
@@ -60,6 +63,57 @@ class LiveSignalResult:
 
 LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
 ProgressCallback = Callable[[dict[str, Any]], None]
+_LIVE_PANEL_CACHE_MAX_ENTRIES = 3
+_LIVE_PANEL_CACHE: OrderedDict[str, PanelData] = OrderedDict()
+_LIVE_PANEL_CACHE_LOCK = threading.Lock()
+
+
+def clear_live_panel_memory_cache() -> None:
+    with _LIVE_PANEL_CACHE_LOCK:
+        _LIVE_PANEL_CACHE.clear()
+
+
+def _live_panel_cache_key(
+    config: ExperimentConfig,
+    *,
+    live_tail_rows: int,
+    panel_kwargs: dict[str, Any],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(Path(config.data.parquet_root).resolve()).encode("utf-8"))
+    digest.update(str(int(live_tail_rows)).encode("ascii"))
+    digest.update(repr(sorted(panel_kwargs.items())).encode("utf-8"))
+    root = Path(config.data.parquet_root)
+    source_paths = sorted(root.glob("*_features.parquet"))
+    external_path = panel_kwargs.get("external_feature_path")
+    if external_path:
+        source_paths.append(Path(str(external_path)))
+    symbols_path = root / "symbols.csv"
+    if symbols_path.exists():
+        source_paths.append(symbols_path)
+    for path in source_paths:
+        stat = path.stat()
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(
+            f":{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode("ascii")
+        )
+    return digest.hexdigest()
+
+
+def _cached_live_panel(key: str) -> PanelData | None:
+    with _LIVE_PANEL_CACHE_LOCK:
+        panel = _LIVE_PANEL_CACHE.get(key)
+        if panel is not None:
+            _LIVE_PANEL_CACHE.move_to_end(key)
+        return panel
+
+
+def _remember_live_panel(key: str, panel: PanelData) -> None:
+    with _LIVE_PANEL_CACHE_LOCK:
+        _LIVE_PANEL_CACHE[key] = panel
+        _LIVE_PANEL_CACHE.move_to_end(key)
+        while len(_LIVE_PANEL_CACHE) > _LIVE_PANEL_CACHE_MAX_ENTRIES:
+            _LIVE_PANEL_CACHE.popitem(last=False)
 
 
 def _emit_progress(
@@ -143,16 +197,22 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
         "feature_zero_fill": config.data.feature_zero_fill,
         "panel_start_date": config.data.panel_start_date,
     }
-    if live_tail and not _is_intraday_frequency(getattr(config.trading, "frequency", "")):
-        cached_panel = load_cached_panel(config.data.parquet_root, **panel_kwargs)
-        if cached_panel is not None:
-            if live_tail_rows <= 0:
-                live_tail_rows = max(int(config.training.lookback) + 8, 48)
-            return _tail_panel_dates(cached_panel, live_tail_rows)
     if live_tail:
         if live_tail_rows <= 0:
             live_tail_rows = max(int(config.training.lookback) + 8, 48)
-        return build_tail_panel(
+        cache_key = _live_panel_cache_key(
+            config,
+            live_tail_rows=live_tail_rows,
+            panel_kwargs=panel_kwargs,
+        )
+        cached = _cached_live_panel(cache_key)
+        if cached is not None:
+            print(
+                f"[panel] live memory cache hit dates={cached.num_dates} "
+                f"symbols={cached.num_symbols}"
+            )
+            return cached
+        panel = build_tail_panel(
             config.data.parquet_root,
             tail_rows=live_tail_rows,
             benchmark_name=config.data.benchmark_name,
@@ -174,6 +234,8 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
             feature_zero_fill=config.data.feature_zero_fill,
             panel_start_date=config.data.panel_start_date,
         )
+        _remember_live_panel(cache_key, panel)
+        return panel
     return build_panel(
         config.data.parquet_root,
         **panel_kwargs,
@@ -672,6 +734,17 @@ def _daily_price_timestamp(
     return price_snapshot.timestamp or resolved_asof
 
 
+def _decision_weights_timestamp(
+    *,
+    panel_data_date: str,
+    resolved_asof: str,
+    uses_realtime_daily_prices: bool,
+) -> str:
+    if uses_realtime_daily_prices:
+        return str(resolved_asof)
+    return str(panel_data_date)
+
+
 def _finite_float_or_none(value: Any) -> float | None:
     try:
         number = float(value)
@@ -908,6 +981,9 @@ def _build_decision_rows(
 
 
 def _top_position_rows_from_weights(rows: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
+    limit = max(0, int(top_n))
+    if limit == 0:
+        return []
     sorted_rows = sorted(
         rows,
         key=lambda row: (
@@ -918,8 +994,10 @@ def _top_position_rows_from_weights(rows: list[dict[str, Any]], top_n: int) -> l
         reverse=True,
     )
     out: list[dict[str, Any]] = []
-    for row in sorted_rows[: max(0, int(top_n))]:
+    for row in sorted_rows:
         weight = float(row.get("target_weight") or 0.0)
+        if not is_display_position_row(row):
+            continue
         out.append(
             {
                 "symbol": str(row.get("symbol") or ""),
@@ -937,6 +1015,8 @@ def _top_position_rows_from_weights(rows: list[dict[str, Any]], top_n: int) -> l
                 "position_status": str(row.get("position_status") or ""),
             }
         )
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -1087,7 +1167,11 @@ def _decision_report_markdown(summary: dict[str, Any], decision_rows: list[dict[
 
 def _write_text_artifacts(result: LiveSignalResult, output_dir: Path) -> None:
     positions = sorted(
-        result.weights_rows,
+        [
+            row
+            for row in result.weights_rows
+            if is_display_position_row(row)
+        ],
         key=lambda row: (abs(float(row.get("target_weight") or 0.0)), abs(float(row.get("delta_weight") or 0.0))),
         reverse=True,
     )
@@ -1704,6 +1788,11 @@ def generate_live_signal(
         source_timezone=source_timezone,
         intraday_frequency=intraday_frequency,
     )
+    weights_timestamp = _decision_weights_timestamp(
+        panel_data_date=panel_date_str,
+        resolved_asof=resolved_asof,
+        uses_realtime_daily_prices=uses_realtime_daily_prices,
+    )
     summary: dict[str, Any] = {
         "signal_id": resolved_signal_id,
         "generated_at": generated_at_text,
@@ -1712,7 +1801,7 @@ def generate_live_signal(
         "market_label": market_name,
         "panel_date": panel_display_date,
         "panel_data_date": panel_date_str,
-        "weights_date": panel_date_str,
+        "weights_date": weights_timestamp,
         "trading_frequency": trading_frequency,
         "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
         "previous_weights_policy": (

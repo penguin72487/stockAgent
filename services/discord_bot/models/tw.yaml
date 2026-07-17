@@ -1,0 +1,20 @@
+# Discord 台股模型選擇。
+# manual: 固定使用下方指定的 fold，忽略自動部署 manifest。
+# auto: 掃描候選目錄，通過實際推論 smoke test 後自動切換。
+mode: manual
+
+# Manual deployment. Change these five fields together when pinning another model.
+config_path: configs/markets/tw_public_lanten_market_candles.yaml
+output_dir: artifacts/markets/tw_public_lanten_market_candles_select_20
+fold_id: 20
+checkpoint_path: artifacts/markets/tw_public_lanten_market_candles_select_20/fold_20/checkpoint_best.pt
+weights_path: artifacts/markets/tw_public_lanten_market_candles_select_20/fold_20/daily_weights.parquet
+model_scoped_live_output: true
+
+# Auto deployment candidates. Later entries have higher priority.
+model_candidate_output_dirs:
+  - artifacts/markets/tw_public_lanten_market_candles_select_20
+model_candidate_config_paths:
+  - configs/markets/tw_public_lanten_market_candles.yaml
+model_deployment_manifest: artifacts/discord_bot/deployments/tw.json
+model_auto_deploy_interval_seconds: 60
