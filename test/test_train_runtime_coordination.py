@@ -125,6 +125,18 @@ def test_tw_public_uses_single_5070ti_runtime_and_dynamic_loss_graph() -> None:
     assert hasattr(config.training, "explain_cross_asset_shocks")
 
 
+def test_tw_public_candle_run_reuses_dynamic_model_and_loss_graphs() -> None:
+    config = train_entry.load_config(
+        "configs/markets/tw_public_lanten_market_candles.yaml"
+    )
+    assert config.training.train_symbol_compaction == "train_union"
+    assert config.training.train_symbol_compaction_bucket_size == 0
+    assert config.training.compile_model_dynamic_symbols is True
+    assert config.training.compile_loss_dynamic_symbols is True
+    assert config.training.tw_continuous_compile_chunk_rows == 4
+    assert config.trading.tw_short_capacity_limit_enabled is False
+
+
 def test_local_world_size_uses_local_not_global_rank_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

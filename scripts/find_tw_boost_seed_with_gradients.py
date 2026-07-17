@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from stockagent.backtest.tw_execution import require_naive_execution_for_tool
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -81,7 +82,14 @@ def _loss_kwargs(config) -> dict:
 def _probe_seed(config, panel, fold, seed: int, device: torch.device, batch_size: int, min_grad_norm: float) -> dict:
     _set_seed(seed)
     config.training.seed = int(seed)
-    dataset = CrossSectionalDataset(panel, fold.train_indices, int(config.training.lookback))
+    dataset = CrossSectionalDataset(
+        panel,
+        fold.train_indices,
+        int(config.training.lookback),
+        execution_mode=config.trading.execution_mode,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+    )
     split = dataset_to_windowed_tensors(dataset)
     batch_size = max(1, min(int(batch_size), len(split)))
     batch = split.batch_by_rows(0, batch_size, device=device, non_blocking=(device.type == "cuda"))
@@ -168,6 +176,10 @@ def main() -> None:
 
     config_path = (REPO_ROOT / args.config).resolve()
     config = load_config(config_path)
+    require_naive_execution_for_tool(
+        config.trading.execution_mode,
+        tool_name="find_tw_boost_seed_with_gradients.py",
+    )
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")

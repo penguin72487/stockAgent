@@ -3,20 +3,18 @@ experiment_name: tw-stock-transformer-market-public-data-all-available
 runner:
   # The all-available feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_lantent
+  output_dir: artifacts/markets/tw_public_lanten_market_candles_select
   mode: train
   resume: true
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 1
+  start_fold: 20
 environment:
   device: cuda
   use_tensor_cores: true
   amp_dtype: bf16
-  # Ryzen 7 5800X3D: use all 16 logical CPUs for runtime work, but only the
-  # eight physical cores for Inductor compilation to avoid SMT contention.
-  cpu_threads: 16
-  torch_compile_threads: 8
+  # Fold20 single-GPU compile uses this host-wide Inductor worker budget.
+  torch_compile_threads: 16
 
 data:
   # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
@@ -213,22 +211,7 @@ data:
     - twpub_taifex_tx_large_oi_log
     - twpub_taifex_tx_final_settlement_logret
   feature_exclude: []
-  # These selected families do not yet have a point-in-time vintage archive or
-  # registered historical lineage. Keep their schema slots deterministic while
-  # preventing present-day snapshots from leaking into historical training.
-  feature_zero_fill:
-    - twpub_cumulative_revenue_yoy
-    - twpub_cbc_*
-    - twpub_dgbas_*
-    - twpub_mof_*
-    - twpub_dividend_*
-    - twpub_exdiv_*
-    - twpub_material_*
-    - twpub_attention_*
-    - twpub_disposal_*
-    - twpub_twse_taiex_*
-    - twpub_usdtwd_*
-    - twpub_taifex_*
+  feature_zero_fill: []
   # tradable_mode: tradable
 
 walk_forward:
@@ -244,26 +227,8 @@ walk_forward:
 
 trading:
   frequency: daily
-  # Select exactly one accounting contract: naive | tw_cash | tw_day_trade.
-  # tw_cash supports cash-only longs or cash longs plus point-in-time,
-  # capacity-limited margin shorts when long_only=false.
-  execution_mode: naive
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
-  # Taiwan modes use product-specific vectors instead of the two legacy scalar
-  # rates above. Commission is 0.1425% at a configurable broker discount.
-  tw_commission_rate: 0.001425
-  tw_commission_discount: 0.6
-  tw_stock_sell_tax: 0.003
-  tw_etf_sell_tax: 0.001
-  tw_day_trade_stock_sell_tax: 0.0015
-  tw_day_trade_etf_sell_tax: 0.001
-  tw_minimum_commission: 0.0
-  tw_commission_rounding: none
-  tw_tax_rounding: none
-  tw_settlement_lag_sessions: 2
-  tw_cash_lot_size: 1
-  tw_day_trade_lot_size: 1000
   max_turnover_ratio: 0.0
   max_volume_participation: 0.5
   volume_participation_equity: 1000000.0
@@ -273,12 +238,12 @@ trading:
   long_only: false
 training:
   financial_transformer:
+    # All raw candle features are jointly encoded directly into the model's
+    # single 32-dimensional candle vector.
+    d_model: 32
     candle_dropout: 0.0
   non_blocking_transfer: true
-  model_name: transformer_base_portfolio
-  # This profile is measured for one RTX 5070 Ti. Avoid torchrun/DDP launch
-  # logic even if another GPU becomes temporarily visible to WSL.
-  multi_gpu_strategy: none
+  model_name: financial_transformer
   enable_torch_compile: true
   auto_torch_compile_sharpe: false
   torch_compile_mode: reduce-overhead
@@ -293,8 +258,8 @@ training:
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  # Measured on the local 16GB RTX 5070 Ti at fold 18 / 2735 symbols. Chunk 64
-  # completed full validation and test evaluation without OOM.
+  # Fold20 RTX 5070 Ti validation/test completed safely with 64-row model
+  # chunks. Pin the power-of-two shape to avoid redundant VRAM probes.
   eval_model_chunk_rows: 64
   eval_backtest_chunk_rows: 512
   eval_backtest_chunk_rows_auto: true
@@ -321,12 +286,11 @@ training:
   runtime_shape_check: false
   allow_dynamic_symbols: false
   lookback: 32
-  # Local RTX 5070 Ti fold18 benchmark (131 features, 2428 compacted train
-  # symbols, factor+market enabled): batch 32 used about 13.3GB and improved
-  # steady epoch wall time from 29.11s at batch 8 to 9.17s. Persistent compile
-  # caches amortize the larger shape's cold compile cost over long runs.
-  batch_size_train: 32
-  batch_size_eval: 32
+  # Fold20 RTX 5070 Ti, 131 features, S=2582: the direct 131 -> 32 Candle
+  # Encoder reached 14.88 ms/model-forward batch and a 10.12s steady epoch.
+  # Keep one power-of-two batch64 graph for throughput and VRAM headroom.
+  batch_size_train: 128
+  batch_size_eval: 128
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -339,19 +303,15 @@ training:
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
   explain_first_test_year_only: true
+  explain_top_k: 20
   explain_max_rows: 32
   explain_ig_steps: 0
-  # 5070 Ti fold21: keep this automatic so one date uses 8 IG alphas while the
-  # normal three-date explain microbatch uses 2 (same aggregate work set).
-  explain_ig_batch_size: 0
+  explain_ig_batch_size: 1
   explain_sample_method: even
   explain_perturb: false
-  # Complete feature-time perturbation, throughput-tuned without dropping any
-  # cells: one date uses 48 repeats; three dates automatically use 16.
-  explain_perturb_batch_size: 0
-  explain_perturb_max_auto_batch_size: 48
-  explain_perturb_max_input_elements: 576000000
-  explain_counterfactual_compile: true
+  explain_perturb_batch_size: 1
+  explain_perturb_max_auto_batch_size: 1
+  explain_perturb_max_input_elements: 8000000
   explain_write_plots: false
   explain_report_style: none
   explain_plot_theme: paper
@@ -359,10 +319,7 @@ training:
   explain_interactive_plots: false
   explain_shap_enabled: false
   explain_shap_mode: score_head_surrogate
-  # Keep training-time explainability lightweight. The standalone
-  # explain_model.py command enables complete Portfolio J-Lens by default.
-  explain_j_lens_enabled: false
-  explain_j_lens_intervention_fraction: 0.01
+  explain_case_study_top_k: 5
   explain_regime_analysis: false
   explain_fold_stability: false
   explain_umap_enabled: false
@@ -373,10 +330,8 @@ training:
   explain_cross_asset_enabled: false
   explain_cross_asset_max_sources: 8
   explain_cross_asset_max_targets: 8
-  # 16 sources x 3 dates keeps each no-grad cross-asset forward near the
-  # measured 48-row throughput plateau.
-  explain_cross_asset_source_chunk_size: 16
-  explain_cross_asset_max_repeated_rows: 48
+  explain_cross_asset_top_edges: 150
+  explain_cross_asset_source_chunk_size: 1
   explain_cross_asset_perturb_scale: 1.0
   explain_cross_asset_shocks: [zero, momentum, gap, volume, volatility, liquidity]
   explain_cross_asset_attention_flow: true
@@ -430,13 +385,11 @@ training:
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  # CUDA reports 15.92GiB total on this 16GB card; do not advertise more than
-  # the allocator can actually use.
-  vram_budget_gb: 15
+  vram_budget_gb: 16
   vram_safety_margin_gb: 1.5
   target_vram_fraction: 0.85
   # Model branches. Only the block named by training.model_name is active.
-  # Current active branch: transformer_base_portfolio.
+  # Current active branch: financial_transformer.
   mlp:
     hidden_dim: 1024
     hidden_layers: 2
@@ -543,15 +496,15 @@ training:
     attention_mode: market_token
     # Independent compact-bottleneck switches; null falls back to attention_mode.
     use_latent_factors: true
-    use_market_tokens: null
+    use_market_tokens: true
     use_flash_attention: true
     use_time_pos: true
     use_symbol_pos: false
     # Keep the trainable symbol-position table at the original fold23 universe
     # size. Official TWSE/TPEx coverage may add symbols without expanding this
     # table; symbols beyond its capacity receive a neutral zero position vector
-    # instead of sharing the last learned slot. The all-available feature input
-    # projection deliberately changes the total model size to 129,486 params.
+    # instead of sharing the last learned slot. With the direct 131 -> 32 Candle
+    # Encoder, the fold20 model has 176,250 trainable parameters.
     symbol_position_capacity: 2330
     input_dropout: 0.0
     # build_panel guarantees finite feature storage. Keep position addition in
@@ -571,7 +524,7 @@ training:
     qk_norm: true
     rope_temporal: true
     rope_base: 10000.0
-    # Keep dynamic market tokens plus attention pooling/full_then_last. Fold18
+    # Keep learned market tokens plus attention pooling/full_then_last. Fold18
     # two-epoch benchmark, using epoch 2 only: temporal_layers=1,
     # temporal_heads=1, temporal_ffn_mult=1, d_model=16, cross_heads=2, and
     # eval_model_chunk_rows=64 (originally selected by auto) reduced epoch wall
@@ -583,15 +536,15 @@ training:
     # validation/test loss, so it is only a lower bound probe, not active.
     temporal_layers: 2
     temporal_heads: 4
-    temporal_ffn_mult: 2
+    temporal_ffn_mult: 4
     temporal_pooling: last
     temporal_query_mode: last_only
     cross_layers: 1
     cross_heads: 4
-    cross_ffn_mult: 2
+    cross_ffn_mult: 4
     joint_layers: 2
     joint_heads: 4
-    joint_ffn_mult: 2
+    joint_ffn_mult: 4
     latent_layers: 1
     num_latent_factors: 16
     num_market_tokens: 16

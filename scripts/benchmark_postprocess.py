@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
+from stockagent.backtest.tw_execution import require_naive_execution_for_tool
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -983,6 +984,10 @@ def main() -> None:
     plot_metrics = _parse_plot_metrics(args.plot_metrics, rank_metric)
 
     config = load_config(args.config)
+    require_naive_execution_for_tool(
+        config.trading.execution_mode,
+        tool_name="benchmark_postprocess.py",
+    )
     _ensure_transformer_base_portfolio_config(config)
     _configure_backtest_runtime_from_config(config)
     _configure_runtime(backtest_compile=bool(args.backtest_compile))
@@ -1044,7 +1049,14 @@ def main() -> None:
     )
 
     indices = _select_fold_indices(fold, args.split)
-    dataset = CrossSectionalDataset(panel, indices, config.training.lookback)
+    dataset = CrossSectionalDataset(
+        panel,
+        indices,
+        config.training.lookback,
+        execution_mode=config.trading.execution_mode,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+    )
     split = dataset_to_windowed_tensors(dataset)
     if args.max_rows is not None:
         max_rows = max(1, int(args.max_rows))

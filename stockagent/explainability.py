@@ -216,6 +216,8 @@ class ExplainabilitySettings:
     interactive_plots: bool = False
     shap_enabled: bool = True
     shap_mode: str = "score_head_surrogate"
+    j_lens_enabled: bool = True
+    j_lens_intervention_fraction: float = 0.01
     regime_analysis: bool = True
     fold_stability: bool = True
     umap_enabled: bool = True
@@ -318,6 +320,10 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         interactive_plots=bool(getattr(training, "explain_interactive_plots", False)),
         shap_enabled=bool(getattr(training, "explain_shap_enabled", False)),
         shap_mode=str(getattr(training, "explain_shap_mode", "score_head_surrogate")),
+        j_lens_enabled=bool(getattr(training, "explain_j_lens_enabled", False)),
+        j_lens_intervention_fraction=float(
+            getattr(training, "explain_j_lens_intervention_fraction", 0.01)
+        ),
         regime_analysis=bool(getattr(training, "explain_regime_analysis", False)),
         fold_stability=bool(getattr(training, "explain_fold_stability", False)),
         umap_enabled=bool(getattr(training, "explain_umap_enabled", False)),
@@ -877,6 +883,485 @@ def _forward_outputs(
     )
 
 
+_J_LENS_BLOCK_GROUPS = (
+    "temporal_blocks",
+    "cross_blocks",
+    "joint_blocks",
+    "latent_blocks",
+    "stock_read_latent_blocks",
+    "market_blocks",
+    "stock_read_market_blocks",
+)
+
+
+def _unwrap_j_lens_model(model: nn.Module) -> nn.Module:
+    """Return the eager subject model so hooks observe real Transformer blocks."""
+    current = model
+    visited: set[int] = set()
+    while id(current) not in visited:
+        visited.add(id(current))
+        candidate = getattr(current, "_orig_mod", None)
+        if isinstance(candidate, nn.Module):
+            current = candidate
+            continue
+        candidate = getattr(current, "module", None)
+        if isinstance(candidate, nn.Module):
+            current = candidate
+            continue
+        break
+    return current
+
+
+def _j_lens_modules(model: nn.Module) -> dict[str, nn.Module]:
+    """Select residual-width modules with stable, architecture-level names."""
+    selected: dict[str, nn.Module] = {}
+    for name, module in model.named_modules():
+        parts = name.split(".")
+        if len(parts) >= 2 and parts[-2] in _J_LENS_BLOCK_GROUPS and parts[-1].isdigit():
+            selected[name] = module
+    return selected
+
+
+def _tensor_from_hook_output(output: Any) -> torch.Tensor | None:
+    if torch.is_tensor(output):
+        return output
+    if isinstance(output, tuple | list):
+        return next((item for item in output if torch.is_tensor(item)), None)
+    return None
+
+
+def _j_lens_stock_aligned_activation(
+    activation: torch.Tensor,
+    *,
+    rows: int,
+    symbols: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return complete stock-aligned and optional lookback-resolved activations."""
+    dim = int(activation.size(-1))
+    if activation.ndim == 3 and int(activation.size(0)) == rows and int(activation.size(1)) == symbols:
+        return activation, None
+    if activation.ndim == 3 and int(activation.size(0)) == rows * symbols:
+        steps = int(activation.size(1))
+        by_time = activation.reshape(rows, symbols, steps, dim).permute(0, 2, 1, 3).contiguous()
+        return by_time.mean(dim=1), by_time
+    if activation.ndim == 4 and int(activation.size(0)) == rows:
+        if int(activation.size(2)) == symbols:
+            return activation.mean(dim=1), activation
+        if int(activation.size(1)) == symbols:
+            by_time = activation.permute(0, 2, 1, 3).contiguous()
+            return by_time.mean(dim=1), by_time
+    return None, None
+
+
+def _j_lens_position_mask(
+    activation: torch.Tensor,
+    *,
+    rows: int,
+    symbols: int,
+    stock_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Mask padded/nontradable stock positions without dropping real tokens."""
+    leading = tuple(int(value) for value in activation.shape[:-1])
+    if activation.ndim == 3 and leading[:2] == (rows, symbols):
+        return stock_mask
+    if activation.ndim == 3 and leading[0] == rows * symbols:
+        steps = leading[1]
+        return stock_mask.reshape(rows * symbols, 1).expand(rows * symbols, steps)
+    if activation.ndim == 4 and leading[0] == rows:
+        if leading[2] == symbols:
+            return stock_mask[:, None, :].expand(rows, leading[1], symbols)
+        if leading[1] == symbols:
+            return stock_mask[:, :, None].expand(rows, symbols, leading[2])
+    return torch.ones(leading, device=activation.device, dtype=torch.bool)
+
+
+def _j_lens_effective_rank(matrix: torch.Tensor) -> tuple[float, float, float]:
+    singular = torch.linalg.svdvals(matrix.float())
+    if singular.numel() == 0:
+        return 0.0, 0.0, 0.0
+    total = singular.sum()
+    if float(total) <= 0.0:
+        return 0.0, 0.0, 0.0
+    probabilities = singular / total
+    entropy = -(probabilities * probabilities.clamp_min(1e-30).log()).sum()
+    effective_rank = float(torch.exp(entropy).detach().cpu())
+    return (
+        effective_rank,
+        float(singular.max().detach().cpu()),
+        float((singular.square().sum() / singular.max().square().clamp_min(1e-30)).detach().cpu()),
+    )
+
+
+def _portfolio_j_lens(
+    model: nn.Module,
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    dates: list[str],
+    symbols: list[str],
+    enabled: bool,
+    intervention_fraction: float,
+    progress_enabled: bool,
+) -> tuple[dict[str, pl.DataFrame], dict[str, Any], list[str]]:
+    """Compute a complete corpus-averaged Jacobian lens for portfolio models.
+
+    The lens transports every residual-width activation to the final stock
+    embedding.  It follows the original J-lens construction: one VJP per
+    output dimension, averaged over positions and examples.  Since this
+    portfolio model has a scalar shared score head rather than a vocabulary,
+    the readable direction is signed bullish/bearish score influence.
+    """
+    empty = {
+        "j_lens_transport": pl.DataFrame(),
+        "j_lens_layer_summary": pl.DataFrame(),
+        "j_lens_dimension_readout": pl.DataFrame(),
+        "j_lens_date_readout": pl.DataFrame(),
+        "j_lens_stock_readout": pl.DataFrame(),
+        "j_lens_lookback_readout": pl.DataFrame(),
+        "j_lens_token_readout": pl.DataFrame(),
+        "j_lens_faithfulness": pl.DataFrame(),
+        "j_lens_completeness": pl.DataFrame(),
+    }
+    if not enabled:
+        return empty, {"enabled": False, "status": "disabled"}, []
+    subject = _unwrap_j_lens_model(model)
+    modules = _j_lens_modules(subject)
+    score_head = getattr(subject, "score_head", None)
+    if not modules or not isinstance(score_head, nn.Module):
+        message = "Portfolio J-Lens requires named Transformer blocks and a shared score_head; module skipped."
+        return empty, {"enabled": True, "status": "unsupported_model"}, [message]
+
+    activations: dict[str, torch.Tensor] = {}
+    handles = []
+    for layer_name, module in modules.items():
+        def capture(_module: nn.Module, _inputs: tuple[Any, ...], output: Any, *, name: str = layer_name) -> None:
+            tensor = _tensor_from_hook_output(output)
+            if tensor is not None and tensor.ndim >= 2:
+                activations[name] = tensor
+
+        handles.append(module.register_forward_hook(capture))
+    try:
+        output = _call_model(subject, x, mask, return_aux=True)
+        _, normalized_scores, aux = _normalize_model_output(output)
+    finally:
+        for handle in handles:
+            handle.remove()
+    z_stock = aux.get("z_stock")
+    if not torch.is_tensor(z_stock) or z_stock.ndim != 3:
+        message = "Portfolio J-Lens could not access final z_stock; enable the model auxiliary-output contract."
+        return empty, {"enabled": True, "status": "missing_z_stock"}, [message]
+    activations["final_z_stock"] = z_stock
+    d_model = int(z_stock.size(-1))
+    active = {
+        name: tensor
+        for name, tensor in activations.items()
+        if tensor.requires_grad and int(tensor.size(-1)) == d_model
+    }
+    if not active:
+        message = "Portfolio J-Lens found no differentiable residual-width activations."
+        return empty, {"enabled": True, "status": "no_differentiable_layers"}, [message]
+
+    raw_scores = aux.get("score_logits", normalized_scores)
+    if not torch.is_tensor(raw_scores) or raw_scores.shape != mask.shape:
+        message = "Portfolio J-Lens could not access differentiable per-stock score logits."
+        return empty, {"enabled": True, "status": "missing_score_logits"}, [message]
+    score_gradient = torch.autograd.grad(
+        raw_scores.masked_fill(~mask, 0.0).sum(),
+        z_stock,
+        retain_graph=True,
+        allow_unused=False,
+    )[0]
+    output_direction = score_gradient.float().reshape(-1, d_model).mean(dim=0)
+
+    layer_names = list(active)
+    tensors = [active[name] for name in layer_names]
+    position_masks = {
+        name: _j_lens_position_mask(
+            tensor,
+            rows=int(x.size(0)),
+            symbols=int(x.size(2)),
+            stock_mask=mask,
+        )
+        for name, tensor in active.items()
+    }
+    matrices = {name: torch.zeros(d_model, d_model, device=x.device, dtype=torch.float32) for name in layer_names}
+    position_counts = {
+        name: int(position_masks[name].sum().detach().cpu())
+        for name in layer_names
+    }
+    vjp_progress = tqdm(
+        range(d_model),
+        desc="J-Lens output dimensions",
+        unit="dim",
+        leave=False,
+        disable=not progress_enabled,
+    )
+    for output_dim in vjp_progress:
+        target = z_stock[..., output_dim].sum()
+        gradients = torch.autograd.grad(
+            target,
+            tensors,
+            retain_graph=output_dim + 1 < d_model,
+            allow_unused=True,
+        )
+        for layer_name, gradient in zip(layer_names, gradients, strict=True):
+            if gradient is None:
+                continue
+            gradient_rows = gradient.float().reshape(-1, d_model)
+            valid_positions = position_masks[layer_name].reshape(-1)
+            matrices[layer_name][output_dim] = gradient_rows[valid_positions].mean(dim=0)
+
+    transport_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+    dimension_rows: list[dict[str, Any]] = []
+    date_rows: list[dict[str, Any]] = []
+    stock_rows: list[dict[str, Any]] = []
+    lookback_rows: list[dict[str, Any]] = []
+    token_rows: list[dict[str, Any]] = []
+    mask_numpy = mask.detach().cpu().numpy().astype(bool, copy=False)
+    for layer_order, layer_name in enumerate(layer_names):
+        matrix = matrices[layer_name]
+        score_direction = matrix.transpose(0, 1).matmul(output_direction)
+        matrix_numpy = matrix.detach().cpu().numpy()
+        score_direction_numpy = score_direction.detach().cpu().numpy()
+        effective_rank, spectral_norm, stable_rank = _j_lens_effective_rank(matrix)
+        summary_rows.append(
+            {
+                "layer_order": layer_order,
+                "layer": layer_name,
+                "positions_averaged": position_counts[layer_name],
+                "frobenius_norm": float(torch.linalg.matrix_norm(matrix).detach().cpu()),
+                "spectral_norm": spectral_norm,
+                "effective_rank": effective_rank,
+                "stable_rank": stable_rank,
+                "score_direction_l2": float(torch.linalg.vector_norm(score_direction).detach().cpu()),
+            }
+        )
+        for output_dim in range(d_model):
+            for input_dim in range(d_model):
+                transport_rows.append(
+                    {
+                        "layer_order": layer_order,
+                        "layer": layer_name,
+                        "output_dim": output_dim,
+                        "input_dim": input_dim,
+                        "jacobian": float(matrix_numpy[output_dim, input_dim]),
+                    }
+                )
+        for input_dim in range(d_model):
+            value = float(score_direction_numpy[input_dim])
+            dimension_rows.append(
+                {
+                    "layer_order": layer_order,
+                    "layer": layer_name,
+                    "input_dim": input_dim,
+                    "signed_score_direction": value,
+                    "abs_score_direction": abs(value),
+                }
+            )
+
+        activation = active[layer_name]
+        stock_aligned, by_time = _j_lens_stock_aligned_activation(
+            activation,
+            rows=int(x.size(0)),
+            symbols=int(x.size(2)),
+        )
+        if stock_aligned is not None:
+            readout = torch.einsum("bsd,d->bs", stock_aligned.float(), score_direction)
+            readout = readout.masked_fill(~mask, 0.0)
+            readout_numpy = readout.detach().cpu().numpy()
+            for row_idx, date in enumerate(dates):
+                valid = mask_numpy[row_idx]
+                values = readout_numpy[row_idx][valid]
+                date_rows.append(
+                    {
+                        "layer_order": layer_order,
+                        "layer": layer_name,
+                        "date": date,
+                        "signed_mean": float(values.mean()) if values.size else 0.0,
+                        "mean_abs": float(np.abs(values).mean()) if values.size else 0.0,
+                        "active_symbols": int(valid.sum()),
+                    }
+                )
+            stock_abs_sum = (np.abs(readout_numpy) * mask_numpy).sum(axis=0)
+            stock_signed_sum = (readout_numpy * mask_numpy).sum(axis=0)
+            stock_count = mask_numpy.sum(axis=0)
+            for symbol_idx, symbol in enumerate(symbols):
+                count = int(stock_count[symbol_idx])
+                stock_rows.append(
+                    {
+                        "layer_order": layer_order,
+                        "layer": layer_name,
+                        "symbol": symbol,
+                        "signed_mean": float(stock_signed_sum[symbol_idx] / max(count, 1)),
+                        "mean_abs": float(stock_abs_sum[symbol_idx] / max(count, 1)),
+                        "active_dates": count,
+                    }
+                )
+        if by_time is not None:
+            temporal = torch.einsum("blsd,d->bls", by_time.float(), score_direction)
+            valid = mask[:, None, :].expand_as(temporal)
+            temporal_numpy = temporal.detach().cpu().numpy()
+            temporal_valid_numpy = valid.detach().cpu().numpy().astype(bool, copy=False)
+            for time_idx in range(int(temporal.size(1))):
+                values = temporal_numpy[:, time_idx][temporal_valid_numpy[:, time_idx]]
+                lookback_rows.append(
+                    {
+                        "layer_order": layer_order,
+                        "layer": layer_name,
+                        "lookback_index": time_idx,
+                        "lookback_from_end": int(temporal.size(1) - 1 - time_idx),
+                        "signed_mean": float(values.mean()) if values.size else 0.0,
+                        "mean_abs": float(np.abs(values).mean()) if values.size else 0.0,
+                    }
+                )
+        elif stock_aligned is None and activation.ndim == 3 and int(activation.size(0)) == int(x.size(0)):
+            token_readout = torch.einsum("btd,d->bt", activation.float(), score_direction)
+            token_numpy = token_readout.detach().cpu().numpy()
+            for row_idx, date in enumerate(dates):
+                for token_idx in range(int(token_readout.size(1))):
+                    value = float(token_numpy[row_idx, token_idx])
+                    token_rows.append(
+                        {
+                            "layer_order": layer_order,
+                            "layer": layer_name,
+                            "date": date,
+                            "token_index": token_idx,
+                            "signed_readout": value,
+                            "abs_readout": abs(value),
+                        }
+                    )
+
+    faithfulness_rows: list[dict[str, Any]] = []
+    fraction = float(min(max(intervention_fraction, 0.0), 0.5))
+    if fraction > 0.0:
+        valid_count = mask.sum().clamp_min(1).to(dtype=z_stock.dtype)
+        base_final = (z_stock * mask.unsqueeze(-1)).sum(dim=(0, 1)) / valid_count
+        intervention_progress = tqdm(
+            [name for name in layer_names if name in modules],
+            desc="J-Lens interventions",
+            unit="layer",
+            leave=False,
+            disable=not progress_enabled,
+        )
+        for layer_name in intervention_progress:
+            activation = active[layer_name]
+            flat_activation_all = activation.detach().float().reshape(-1, d_model)
+            valid_position_mask = position_masks[layer_name].reshape(-1)
+            flat_activation = flat_activation_all[valid_position_mask]
+            rms = flat_activation.square().mean(dim=0).sqrt()
+            direction_sign = torch.sign(flat_activation.mean(dim=0))
+            direction_sign = torch.where(direction_sign == 0.0, torch.ones_like(direction_sign), direction_sign)
+            delta_vector = -fraction * rms * direction_sign
+            input_positions = max(1, int(flat_activation.size(0)))
+            output_positions = max(1, int(mask.sum().detach().cpu()))
+            predicted = matrices[layer_name].matmul(delta_vector) * (input_positions / output_positions)
+
+            def intervene(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> Any:
+                tensor = _tensor_from_hook_output(output)
+                if tensor is None:
+                    return output
+                tensor_mask = position_masks[layer_name].to(device=tensor.device).unsqueeze(-1)
+                delta = delta_vector.to(device=tensor.device, dtype=tensor.dtype)
+                replacement = tensor + tensor_mask.to(dtype=tensor.dtype) * delta
+                if torch.is_tensor(output):
+                    return replacement
+                values = list(output)
+                for index, item in enumerate(values):
+                    if item is tensor:
+                        values[index] = replacement
+                        break
+                return type(output)(values)
+
+            handle = modules[layer_name].register_forward_hook(intervene)
+            try:
+                with torch.no_grad():
+                    intervened_output = _call_model(subject, x, mask, return_aux=True)
+                    _, _, intervened_aux = _normalize_model_output(intervened_output)
+                    intervened_z = intervened_aux.get("z_stock")
+            finally:
+                handle.remove()
+            if not torch.is_tensor(intervened_z):
+                continue
+            actual_final = (intervened_z * mask.unsqueeze(-1)).sum(dim=(0, 1)) / valid_count
+            actual = (actual_final - base_final).float()
+            predicted_norm = torch.linalg.vector_norm(predicted)
+            actual_norm = torch.linalg.vector_norm(actual)
+            cosine = torch.nn.functional.cosine_similarity(predicted[None], actual[None], dim=1)[0]
+            relative_error = torch.linalg.vector_norm(predicted - actual) / actual_norm.clamp_min(1e-12)
+            faithfulness_rows.append(
+                {
+                    "layer": layer_name,
+                    "intervention": "constant_rms_scaled_direction",
+                    "intervention_fraction": fraction,
+                    "predicted_delta_l2": float(predicted_norm.detach().cpu()),
+                    "actual_delta_l2": float(actual_norm.detach().cpu()),
+                    "magnitude_ratio": float((predicted_norm / actual_norm.clamp_min(1e-12)).detach().cpu()),
+                    "cosine_similarity": float(cosine.detach().cpu()),
+                    "relative_l2_error": float(relative_error.detach().cpu()),
+                }
+            )
+
+    frames = {
+        "j_lens_transport": pl.DataFrame(transport_rows),
+        "j_lens_layer_summary": pl.DataFrame(summary_rows),
+        "j_lens_dimension_readout": pl.DataFrame(dimension_rows),
+        "j_lens_date_readout": pl.DataFrame(date_rows),
+        "j_lens_stock_readout": pl.DataFrame(stock_rows),
+        "j_lens_lookback_readout": pl.DataFrame(lookback_rows),
+        "j_lens_token_readout": pl.DataFrame(token_rows),
+        "j_lens_faithfulness": pl.DataFrame(faithfulness_rows),
+    }
+    frames["j_lens_completeness"] = _j_lens_completeness_frame(frames)
+    summary = {
+        "enabled": True,
+        "status": "ok",
+        "definition": "mean_d_z_stock_d_hidden_then_shared_score_head",
+        "layers": len(layer_names),
+        "d_model": d_model,
+        "vjp_passes": d_model,
+        "intervention_fraction": fraction,
+        "faithfulness_layers": len(faithfulness_rows),
+        "complete_no_top_k": True,
+    }
+    return frames, summary, []
+
+
+def _j_lens_completeness_frame(frames: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    transport = frames.get("j_lens_transport", pl.DataFrame())
+    layer_summary = frames.get("j_lens_layer_summary", pl.DataFrame())
+    dimensions = frames.get("j_lens_dimension_readout", pl.DataFrame())
+    date_readout = frames.get("j_lens_date_readout", pl.DataFrame())
+    stock_readout = frames.get("j_lens_stock_readout", pl.DataFrame())
+    lookback = frames.get("j_lens_lookback_readout", pl.DataFrame())
+    tokens = frames.get("j_lens_token_readout", pl.DataFrame())
+    faithfulness = frames.get("j_lens_faithfulness", pl.DataFrame())
+    layers = int(layer_summary.height)
+    d_model = int(dimensions.get_column("input_dim").n_unique()) if not dimensions.is_empty() and "input_dim" in dimensions.columns else 0
+    expected_transport = layers * d_model * d_model
+    expected_dimensions = layers * d_model
+    return pl.DataFrame(
+        [
+            {
+                "layers": layers,
+                "d_model": d_model,
+                "transport_cells_expected": expected_transport,
+                "transport_cells_actual": int(transport.height),
+                "transport_cell_coverage": float(transport.height) / max(expected_transport, 1),
+                "dimension_cells_expected": expected_dimensions,
+                "dimension_cells_actual": int(dimensions.height),
+                "dimension_cell_coverage": float(dimensions.height) / max(expected_dimensions, 1),
+                "date_layer_cells": int(date_readout.height),
+                "stock_layer_cells": int(stock_readout.height),
+                "lookback_layer_cells": int(lookback.height),
+                "token_date_layer_cells": int(tokens.height),
+                "faithfulness_layers": int(faithfulness.height),
+                "top_k_truncation": False,
+            }
+        ]
+    )
+
+
 def _embedded_explainability_api(model: nn.Module) -> nn.Module | None:
     """Return the underlying model when exact preprojected forward is supported."""
     candidates = (model, getattr(model, "module", None), getattr(model, "_orig_mod", None))
@@ -993,6 +1478,7 @@ def _cuda_oom_fallback_settings(settings: ExplainabilitySettings) -> Explainabil
         int(settings.ig_steps) <= 0
         and not bool(settings.perturb)
         and not bool(settings.umap_enabled)
+        and not bool(settings.j_lens_enabled)
     ):
         return None
     return replace(
@@ -1006,6 +1492,7 @@ def _cuda_oom_fallback_settings(settings: ExplainabilitySettings) -> Explainabil
         umap_enabled=False,
         umap_max_points=min(int(settings.umap_max_points), 1000),
         umap_max_projections=0,
+        j_lens_enabled=False,
     )
 
 
@@ -1294,8 +1781,27 @@ def _perturbation_importance(
                         float((base_scores_repeated[0] - base_scores).abs().mean().detach().cpu()),
                     )
                 base_weights_matched, base_scores_matched = matched_baseline
-                weight_deltas = (weights_p - base_weights_matched[:repeats]).abs().mean(dim=(1, 2)).detach().cpu().numpy()
-                score_deltas = (scores_p - base_scores_matched[:repeats]).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+                # NumPy has no native bfloat16 dtype. Keep the model forward in
+                # configured AMP precision, but materialize scalar diagnostics
+                # as float32 before crossing the NumPy boundary.
+                weight_deltas = (
+                    (weights_p - base_weights_matched[:repeats])
+                    .abs()
+                    .mean(dim=(1, 2))
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                score_deltas = (
+                    (scores_p - base_scores_matched[:repeats])
+                    .abs()
+                    .mean(dim=(1, 2))
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
             except RuntimeError as exc:
                 if not _is_cuda_oom(exc) or chunk_size <= 1:
                     raise
@@ -1664,6 +2170,29 @@ def _aux_point_metadata(
     return meta
 
 
+def _evenly_spaced_sample_indices(
+    n_points: int,
+    max_points: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return bounded, evenly spaced indices without float32 rounding drift."""
+    n_points = max(0, int(n_points))
+    max_points = max(0, int(max_points))
+    if n_points == 0:
+        return torch.empty(0, device=device, dtype=torch.long)
+    if max_points <= 0 or n_points <= max_points:
+        return torch.arange(n_points, device=device, dtype=torch.long)
+    if max_points == 1:
+        return torch.zeros(1, device=device, dtype=torch.long)
+    # torch.linspace defaults to float32 on CUDA. Above 2**24, rounding its
+    # endpoint can produce n_points rather than n_points - 1. Integer
+    # arithmetic makes the bounds exact for large flattened aux tensors.
+    numerators = torch.arange(max_points, device=device, dtype=torch.long)
+    numerators.mul_(n_points - 1)
+    return torch.div(numerators, max_points - 1, rounding_mode="floor")
+
+
 def _aux_umap_projection_frames(
     aux: dict[str, torch.Tensor],
     *,
@@ -1744,12 +2273,12 @@ def _aux_umap_projection_frames(
         if n_points < 4:
             warnings.append(f"{name}: fewer than 4 vectors; cuML UMAP skipped.")
             continue
-        if max_points > 0 and n_points > max_points:
-            sample_idx = torch.linspace(0, n_points - 1, max_points, device=flat.device).round().to(torch.long)
-            flat_sample = flat.index_select(0, sample_idx)
-        else:
-            sample_idx = torch.arange(n_points, device=flat.device, dtype=torch.long)
-            flat_sample = flat
+        sample_idx = _evenly_spaced_sample_indices(
+            n_points,
+            max_points,
+            device=flat.device,
+        )
+        flat_sample = flat.index_select(0, sample_idx)
         if flat_sample.device.type != "cuda":
             flat_sample = flat_sample.to(device=device, non_blocking=True)
             sample_idx = sample_idx.to(device=device, non_blocking=True)
@@ -2258,7 +2787,7 @@ def explain_batch(
     device = device or next(model.parameters()).device
     model.eval()
     stage_progress = tqdm(
-        total=9,
+        total=10,
         desc="Explain methods",
         unit="stage",
         leave=False,
@@ -2290,7 +2819,29 @@ def explain_batch(
         mask,
     )
     _mark_elapsed(timing, "base_forward_s", stage_start)
-    complete_stage("gradient", "base_forward_s")
+    complete_stage("j_lens", "base_forward_s")
+
+    stage_start = time.perf_counter()
+    j_lens_precision = (
+        torch.autocast(device_type="cuda", enabled=False)
+        if x.device.type == "cuda"
+        else nullcontext()
+    )
+    with j_lens_precision:
+        j_lens_frames, j_lens_summary, j_lens_warnings = _portfolio_j_lens(
+            model,
+            x.float(),
+            mask,
+            dates=dates,
+            symbols=symbols,
+            enabled=bool(settings.j_lens_enabled),
+            intervention_fraction=float(settings.j_lens_intervention_fraction),
+            progress_enabled=bool(settings.progress_enabled),
+        )
+    if j_lens_summary.get("status") == "ok":
+        j_lens_summary["compute_dtype"] = "fp32"
+    _mark_elapsed(timing, "j_lens_s", stage_start)
+    complete_stage("gradient", "j_lens_s")
 
     stage_start = time.perf_counter()
     grad_attr = _gradient_x_input_attribution(
@@ -2421,6 +2972,7 @@ def explain_batch(
     warnings = _make_warnings(portfolio, grad_feature, grad_time, corr, aux_frame)
     warnings.extend(aux_projection_warnings)
     warnings.extend(shap_warnings)
+    warnings.extend(j_lens_warnings)
     trust_checks = _trust_check_frame(portfolio, grad_feature, grad_time, corr, aux_frame)
     attribution_lookback = 0
     if not _is_empty_frame(grad_ft) and "lookback_from_end" in grad_ft.columns:
@@ -2459,6 +3011,7 @@ def explain_batch(
             "perturb_diagnostics": perturb_diagnostics,
             "shap_mode": _normalize_shap_mode(settings.shap_mode),
             "shap_info": shap_info,
+            "j_lens": j_lens_summary,
             "regime_analysis": bool(settings.regime_analysis),
             "fold_stability": bool(settings.fold_stability),
             "attribution_lookback": attribution_lookback,
@@ -2493,6 +3046,7 @@ def explain_batch(
             "trust_checks": trust_checks,
             "stock_contributions": stock_contrib,
             "aux_summary": aux_frame,
+            **j_lens_frames,
         },
         "aux_dim_frames": aux_dim_frames,
         "aux_projection_frames": aux_projection_frames,
@@ -2705,6 +3259,180 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
     return merged
 
 
+def _combine_j_lens_frames_from_chunks(
+    chunk_results: list[tuple[dict[str, Any], int]],
+) -> tuple[dict[str, pl.DataFrame], dict[str, Any]]:
+    frame_names = (
+        "j_lens_transport",
+        "j_lens_layer_summary",
+        "j_lens_dimension_readout",
+        "j_lens_date_readout",
+        "j_lens_stock_readout",
+        "j_lens_lookback_readout",
+        "j_lens_token_readout",
+        "j_lens_faithfulness",
+        "j_lens_completeness",
+    )
+    empty = {name: pl.DataFrame() for name in frame_names}
+    valid_results = [
+        (result, rows)
+        for result, rows in chunk_results
+        if result.get("summary", {}).get("j_lens", {}).get("status") == "ok"
+    ]
+    if not valid_results:
+        status = next(
+            (
+                result.get("summary", {}).get("j_lens", {})
+                for result, _ in chunk_results
+                if result.get("summary", {}).get("j_lens")
+            ),
+            {"enabled": False, "status": "not_produced"},
+        )
+        return empty, dict(status)
+
+    def weighted_mean_frame(
+        name: str,
+        keys: tuple[str, ...],
+        values: tuple[str, ...],
+    ) -> pl.DataFrame:
+        pieces = []
+        for result, rows in valid_results:
+            frame = result.get("frames", {}).get(name, pl.DataFrame())
+            if _is_empty_frame(frame):
+                continue
+            pieces.append(
+                frame.with_columns(
+                    [(_numeric_expr(value).fill_null(0.0) * float(rows)).alias(value) for value in values]
+                    + [pl.lit(float(rows)).alias("_rows")]
+                )
+            )
+        if not pieces:
+            return pl.DataFrame()
+        combined = _concat_frames(pieces)
+        return combined.group_by(list(keys)).agg(
+            [
+                (_numeric_expr(value).fill_null(0.0).sum() / pl.col("_rows").sum()).alias(value)
+                for value in values
+            ]
+        ).sort(list(keys))
+
+    transport = weighted_mean_frame(
+        "j_lens_transport",
+        ("layer_order", "layer", "output_dim", "input_dim"),
+        ("jacobian",),
+    )
+    dimension = weighted_mean_frame(
+        "j_lens_dimension_readout",
+        ("layer_order", "layer", "input_dim"),
+        ("signed_score_direction", "abs_score_direction"),
+    )
+    lookback = weighted_mean_frame(
+        "j_lens_lookback_readout",
+        ("layer_order", "layer", "lookback_index", "lookback_from_end"),
+        ("signed_mean", "mean_abs"),
+    )
+    faithfulness = weighted_mean_frame(
+        "j_lens_faithfulness",
+        ("layer", "intervention", "intervention_fraction"),
+        (
+            "predicted_delta_l2",
+            "actual_delta_l2",
+            "magnitude_ratio",
+            "cosine_similarity",
+            "relative_l2_error",
+        ),
+    )
+    date_readout = _concat_frames(
+        [
+            result.get("frames", {}).get("j_lens_date_readout", pl.DataFrame())
+            for result, _ in valid_results
+        ]
+    )
+    token_readout = _concat_frames(
+        [
+            result.get("frames", {}).get("j_lens_token_readout", pl.DataFrame())
+            for result, _ in valid_results
+        ]
+    )
+
+    stock_pieces = []
+    for result, _ in valid_results:
+        frame = result.get("frames", {}).get("j_lens_stock_readout", pl.DataFrame())
+        if _is_empty_frame(frame):
+            continue
+        stock_pieces.append(
+            frame.with_columns(
+                [
+                    (_numeric_expr("signed_mean").fill_null(0.0) * _numeric_expr("active_dates").fill_null(0.0)).alias("_signed_sum"),
+                    (_numeric_expr("mean_abs").fill_null(0.0) * _numeric_expr("active_dates").fill_null(0.0)).alias("_abs_sum"),
+                ]
+            )
+        )
+    stock = pl.DataFrame()
+    if stock_pieces:
+        stock = _concat_frames(stock_pieces).group_by(["layer_order", "layer", "symbol"]).agg(
+            [
+                (pl.col("_signed_sum").sum() / _numeric_expr("active_dates").sum().clip(lower_bound=1.0)).alias("signed_mean"),
+                (pl.col("_abs_sum").sum() / _numeric_expr("active_dates").sum().clip(lower_bound=1.0)).alias("mean_abs"),
+                _numeric_expr("active_dates").sum().cast(pl.Int64).alias("active_dates"),
+            ]
+        ).sort(["layer_order", "symbol"])
+
+    position_totals: dict[str, int] = {}
+    for result, _ in valid_results:
+        frame = result.get("frames", {}).get("j_lens_layer_summary", pl.DataFrame())
+        if _is_empty_frame(frame):
+            continue
+        for row in frame.select(["layer", "positions_averaged"]).iter_rows(named=True):
+            layer = str(row["layer"])
+            position_totals[layer] = position_totals.get(layer, 0) + int(row["positions_averaged"])
+    summary_rows = []
+    if not transport.is_empty():
+        for group in transport.partition_by(["layer_order", "layer"], as_dict=False):
+            row0 = _first_row(group)
+            size = int(max(_numeric_max(group, "output_dim"), _numeric_max(group, "input_dim")) + 1)
+            matrix = torch.zeros(size, size, dtype=torch.float32)
+            for row in group.iter_rows(named=True):
+                matrix[int(row["output_dim"]), int(row["input_dim"])] = float(row["jacobian"])
+            effective_rank, spectral_norm, stable_rank = _j_lens_effective_rank(matrix)
+            layer = str(row0["layer"])
+            direction_group = dimension.filter(pl.col("layer") == layer) if not dimension.is_empty() else pl.DataFrame()
+            direction_l2 = float(np.linalg.norm(_numeric_numpy(direction_group, "signed_score_direction"))) if not direction_group.is_empty() else 0.0
+            summary_rows.append(
+                {
+                    "layer_order": int(row0["layer_order"]),
+                    "layer": layer,
+                    "positions_averaged": position_totals.get(layer, 0),
+                    "frobenius_norm": float(torch.linalg.matrix_norm(matrix)),
+                    "spectral_norm": spectral_norm,
+                    "effective_rank": effective_rank,
+                    "stable_rank": stable_rank,
+                    "score_direction_l2": direction_l2,
+                }
+            )
+    frames = {
+        "j_lens_transport": transport,
+        "j_lens_layer_summary": pl.DataFrame(summary_rows).sort("layer_order") if summary_rows else pl.DataFrame(),
+        "j_lens_dimension_readout": dimension,
+        "j_lens_date_readout": date_readout,
+        "j_lens_stock_readout": stock,
+        "j_lens_lookback_readout": lookback,
+        "j_lens_token_readout": token_readout,
+        "j_lens_faithfulness": faithfulness,
+    }
+    frames["j_lens_completeness"] = _j_lens_completeness_frame(frames)
+    first = dict(valid_results[0][0]["summary"]["j_lens"])
+    first.update(
+        {
+            "status": "ok",
+            "chunks_aggregated": len(valid_results),
+            "layers": int(frames["j_lens_layer_summary"].height),
+            "complete_no_top_k": True,
+        }
+    )
+    return frames, first
+
+
 def _combine_chunked_explainability_results(
     chunk_results: list[tuple[dict[str, Any], int]],
     *,
@@ -2859,6 +3587,7 @@ def _combine_chunked_explainability_results(
     timing["row_microbatch_chunks"] = float(len(chunk_results))
 
     perturb_diagnostics = _merge_perturb_diagnostics(chunk_results)
+    j_lens_frames, j_lens_summary = _combine_j_lens_frames_from_chunks(chunk_results)
 
     return {
         "summary": {
@@ -2878,6 +3607,7 @@ def _combine_chunked_explainability_results(
             "perturb_diagnostics": perturb_diagnostics,
             "shap_mode": _normalize_shap_mode(settings.shap_mode),
             "shap_info": shap_info,
+            "j_lens": j_lens_summary,
             "regime_analysis": bool(settings.regime_analysis),
             "fold_stability": bool(settings.fold_stability),
             "attribution_lookback": attribution_lookback,
@@ -2913,6 +3643,7 @@ def _combine_chunked_explainability_results(
             "trust_checks": trust_checks,
             "stock_contributions": stock_contrib,
             "aux_summary": aux_frame,
+            **j_lens_frames,
         },
         "aux_dim_frames": aux_dim_frames,
         "aux_projection_frames": aux_projection_frames,
@@ -3022,7 +3753,7 @@ def explain_batch_row_chunked(
             effective_settings = fallback_settings
             fallback_warning = (
                 "CUDA OOM during explainability; retried with VRAM-safe fallback "
-                "(Integrated Gradients disabled, perturbation disabled, UMAP disabled)."
+                "(Integrated Gradients disabled, perturbation disabled, UMAP disabled, J-Lens disabled)."
             )
             _clear_explainability_runtime_cache()
             print(f"[explain] {fallback_warning}")
@@ -3034,6 +3765,15 @@ def _compact_explain_chunk_result(result: dict[str, Any]) -> None:
         "feature_time_integrated_gradients",
         "feature_time_perturbation",
         "aux_summary",
+        "j_lens_transport",
+        "j_lens_layer_summary",
+        "j_lens_dimension_readout",
+        "j_lens_date_readout",
+        "j_lens_stock_readout",
+        "j_lens_lookback_readout",
+        "j_lens_token_readout",
+        "j_lens_faithfulness",
+        "j_lens_completeness",
     }
     frames = result.get("frames", {})
     result["frames"] = {
@@ -3483,6 +4223,14 @@ def _semantic_plot_quality(
         not _is_empty_frame(perturb)
         and not bool((summary or {}).get("perturb_diagnostics", {}).get("batch_matched_baseline", False))
     )
+    faithfulness = frames.get("j_lens_faithfulness", pl.DataFrame())
+    j_lens_unfaithful = (
+        not _is_empty_frame(faithfulness)
+        and (
+            float(faithfulness.select(_numeric_expr("cosine_similarity").mean()).item() or 0.0) < 0.8
+            or float(faithfulness.select(_numeric_expr("relative_l2_error").mean()).item() or 0.0) > 0.5
+        )
+    )
     for entry in entries:
         path = str(entry.get("path", ""))
         entry["semantic_status"] = "informative"
@@ -3498,6 +4246,12 @@ def _semantic_plot_quality(
                 "此既有 artifact 由舊版 perturbation 基準產生：原始與反事實 forward 的 batch shape 不同，"
                 "可能混入 BF16／kernel-shape 數值底噪。新版已改成同 batch、同執行路徑基準；"
                 "本圖需重算後才可用於特徵重要性結論。"
+            )
+        elif j_lens_unfaithful and "j_lens_" in path and "linearization_faithfulness" not in path:
+            entry["semantic_status"] = "provisional_low_faithfulness"
+            entry["semantic_note"] = (
+                "此 Fold 的小幅 layer-ablation 驗證顯示平均局部線性貼合不足；"
+                "圖可作敏感度診斷，但不可單獨支持因果機制敘事。"
             )
     return entries
 
@@ -4353,6 +5107,45 @@ FIGURE_GUIDE_ZH: dict[str, tuple[str, str, str]] = {
 
 def _figure_reading_guide(relative_path: str) -> tuple[str, str, str]:
     path = Path(relative_path)
+    j_lens_guides = {
+        "j_lens_layer_transport_strength.png": (
+            "顯示每個實際執行層到最終 stock embedding 的 Jacobian transport 強度與有效秩。",
+            "Frobenius／score-direction 越大代表局部變動越容易傳到最終分數；effective rank 越高代表傳遞使用更多 hidden directions。",
+            "單層強度暴增、有效秩突然塌到接近 1，或跨 Fold 大幅漂移，可能代表瓶頸、飽和或不穩定捷徑。",
+        ),
+        "j_lens_transport_matrix_heatmap.png": (
+            "完整呈現每層 32×32 平均 Jacobian，不省略任何 hidden input/output 維度。",
+            "對角結構代表方向大致保留；非對角結構代表層間重新編碼。紅藍表示正負局部傳遞方向；各面板採自己的對稱色階，跨層強度請看左下角 max|J| 或 layer-strength 圖。",
+            "大面積近零、孤立極端 cell 或不同 Fold 的符號翻轉，需要搭配 intervention faithfulness 檢查。",
+        ),
+        "j_lens_layer_stock_score_heatmap.png": (
+            "呈現所有股票在每一層投影到共享 score head 後的平均絕對 readout。",
+            "逐列比較同一股票跨層的訊號形成位置；逐欄比較同層對全股票的選擇性。完整股票分面顯示，不做 Top-K。",
+            "只有少數股票整欄發亮、股票代碼區段性條紋或跨 Fold 大幅改變，可能是集中、排序依賴或 universe shift。",
+        ),
+        "j_lens_layer_date_heatmap.png": (
+            "呈現測試集每個日期在各層的平均絕對 J-Lens score readout。",
+            "橫向看單日訊號在哪層形成，縱向看各層是否只在特定市場時期啟動；所有日期均保留。",
+            "孤立日期尖峰、長時間整層失活或 Fold 邊界跳變，需回查 regime、缺值與模型飽和。",
+        ),
+        "j_lens_layer_lookback_heatmap.png": (
+            "呈現 temporal block 各 lookback 位置經 J-Lens 傳到最終 score 的完整強度。",
+            "lookback_from_end=0 是最新輸入；比較不同層是否逐步把遠期資訊壓縮到近期表示。",
+            "只有固定單日有訊號、所有遠期完全為零，或跨 Fold 使用位置翻轉，可能代表時間捷徑或不穩定記憶。",
+        ),
+        "j_lens_market_token_transport.png": (
+            "呈現所有 bottleneck／market token 在各執行層投影到最終 score 的平均絕對影響。",
+            "比較 token 是否分工，以及資訊經 market blocks 後是否被 stock-read blocks實際使用；所有 token 均顯示。",
+            "所有 token 完全相同、單一 token 長期壟斷或 token 影響很強但 faithfulness 很差，可能代表表示塌縮或局部線性失真。",
+        ),
+        "j_lens_linearization_faithfulness.png": (
+            "比較 J-Lens 對小幅、固定 RMS 比例 layer intervention 的一階預測與真實重新 forward 結果。",
+            "cosine 越接近 1、magnitude ratio 越接近 1、relative L2 error 越接近 0，局部線性解釋越可信。",
+            "cosine 為負、誤差大於 1 或幅度比遠離 1 時，不應用該層 J-Lens 做因果敘事。",
+        ),
+    }
+    if path.name in j_lens_guides:
+        return j_lens_guides[path.name]
     if path.parent.name == "aux_dims":
         tensor_name = path.stem
         return (
@@ -4444,6 +5237,16 @@ def _expected_explainability_plot_paths(
             "plots/decision_inventory_exposure_by_side.png",
             ("weight", "side"),
         )
+        for frame_name, filename, required in (
+            ("j_lens_layer_summary", "j_lens_layer_transport_strength.png", ("layer", "frobenius_norm", "effective_rank")),
+            ("j_lens_transport", "j_lens_transport_matrix_heatmap.png", ("layer", "output_dim", "input_dim", "jacobian")),
+            ("j_lens_stock_readout", "j_lens_layer_stock_score_heatmap.png", ("layer", "symbol", "mean_abs")),
+            ("j_lens_date_readout", "j_lens_layer_date_heatmap.png", ("layer", "date", "mean_abs")),
+            ("j_lens_lookback_readout", "j_lens_layer_lookback_heatmap.png", ("layer", "lookback_from_end", "mean_abs")),
+            ("j_lens_token_readout", "j_lens_market_token_transport.png", ("layer", "token_index", "abs_readout")),
+            ("j_lens_faithfulness", "j_lens_linearization_faithfulness.png", ("layer", "cosine_similarity", "relative_l2_error")),
+        ):
+            add_if(frame_name, f"plots/{filename}", required)
         for name, frame in aux_dim_frames.items():
             if not _is_empty_frame(frame) and {"dim", "mean_abs"}.issubset(frame.columns):
                 expected.add(f"plots/aux_dims/{_safe_plot_filename(name)}.png")
@@ -4563,6 +5366,7 @@ def _write_comprehensive_explainability_report(
     global_attribution = _global_attribution_table(frames)
     method_agreement = _method_agreement_table(global_attribution)
     risk_diagnostic = _diagnostic_risk_table(frames.get("daily_portfolio", pl.DataFrame()))
+    j_lens_completeness = frames.get("j_lens_completeness", pl.DataFrame())
     omitted_visuals = _omitted_uninformative_visuals(frames)
     perturb_legacy_baseline = (
         not _is_empty_frame(frames.get("feature_time_perturbation", pl.DataFrame()))
@@ -4578,6 +5382,13 @@ def _write_comprehensive_explainability_report(
         ]
     )
     lines.extend(_paper_executive_summary(frames=frames, summary=summary, metadata=metadata))
+    j_lens_info = summary.get("j_lens", {})
+    if j_lens_info:
+        lines.append(
+            f"- Portfolio J-Lens：狀態 `{j_lens_info.get('status', 'unknown')}`，"
+            f"完整層數 `{j_lens_info.get('layers', 0)}`，hidden width `{j_lens_info.get('d_model', 'unknown')}`，"
+            f"VJP passes `{j_lens_info.get('vjp_passes', 0)}`；不做 Top-K。"
+        )
     if failed:
         lines.append(
             f"- **有 {len(failed)} 個圖檔未通過完整性檢查。** 在缺失或損壞圖片重新產生前，不應把此 fold 視為完整。"
@@ -4659,6 +5470,12 @@ def _write_comprehensive_explainability_report(
             "",
             _render_frame_markdown(completeness, limit=None),
             "",
+            "### Portfolio J-Lens completeness",
+            "",
+            "下表核對完整 layer × hidden-dimension transport cells，以及日期、股票、lookback、token 與 intervention 覆蓋；不做 Top-K。",
+            "",
+            _render_frame_markdown(j_lens_completeness, limit=None),
+            "",
             "### 不同解釋方法的一致性",
             "",
             "Spearman 同時提供完整特徵（含共同零值 ties）與 active union（任一方法非零）兩種口徑，不做 Top-K。主要解讀 active union，避免大量共同零值把一致性人為拉高。",
@@ -4694,6 +5511,9 @@ def _write_comprehensive_explainability_report(
             "- Perturbation 將每個特徵–日期格歸零後，衡量分數與配置變化。",
             "- 若 `score_abs_delta` 全為 0，代表目前 BF16 執行沒有可辨識的 raw-score 差，不解讀空白 score 圖。`weight_abs_delta` 只有在 `batch_matched_baseline=true` 時才可採用。",
             "- 代理 SHAP 解釋的是擬合後的 score-head surrogate，不是端到端 Transformer 的精確 Shapley 分解。",
+            "- Portfolio J-Lens 使用 corpus-averaged Jacobian，把每個已執行 residual-width layer transport 到最終 `z_stock`，再投影到共享 score head；它衡量局部機制傳遞，不是輸入特徵重要性。",
+            "- J-Lens 的因果敘事必須由 `j_lens_linearization_faithfulness` 的真實 layer intervention 支持；若 cosine 低或 relative L2 error 高，只能視為局部敏感度。",
+            "- 此模型的輸出 head 是共享單一純量方向，所以 J-Lens 的可讀語意是增加／降低股票 score，不等同 LLM vocabulary concept。",
             "- Aux 維度圖檢查激活使用情況；UMAP 只近似保留局部鄰域，不提供具語意的座標軸。",
             "- 圖片 QA 會開啟並解碼每個預期／找到的 PNG，驗證格式、非零檔案大小與正尺寸；這不等於證明金融結論正確。",
             "",
@@ -4768,6 +5588,13 @@ def _cross_fold_figure_spec(relative_path: str) -> _CrossFoldFigureSpec | None:
         "portfolio_exposure_coverage_curve.png": _CrossFoldFigureSpec("paper_tables/exposure_coverage_curve.csv", ("fraction_of_tradable_names",), ("mean_cumulative_gross_exposure",), "curve"),
         "regime_analysis.png": _CrossFoldFigureSpec("regime_analysis.csv", ("dimension", "regime"), ("mean_strategy_log_return", "mean_turnover_proxy", "mean_gross_exposure", "mean_net_exposure", "hit_rate")),
         "trust_checks.png": _CrossFoldFigureSpec("trust_checks.csv", ("check",), ("value",)),
+        "j_lens_layer_transport_strength.png": _CrossFoldFigureSpec("j_lens_layer_summary.csv", ("layer",), ("frobenius_norm", "effective_rank", "score_direction_l2")),
+        "j_lens_transport_matrix_heatmap.png": _CrossFoldFigureSpec("j_lens_transport.csv", ("layer", "output_dim", "input_dim"), ("jacobian",)),
+        "j_lens_layer_stock_score_heatmap.png": _CrossFoldFigureSpec("j_lens_stock_readout.csv", ("layer", "symbol"), ("mean_abs", "signed_mean")),
+        "j_lens_layer_date_heatmap.png": _CrossFoldFigureSpec("j_lens_date_readout.csv", ("layer", "date"), ("mean_abs", "signed_mean")),
+        "j_lens_layer_lookback_heatmap.png": _CrossFoldFigureSpec("j_lens_lookback_readout.csv", ("layer", "lookback_from_end"), ("mean_abs", "signed_mean")),
+        "j_lens_market_token_transport.png": _CrossFoldFigureSpec("j_lens_token_readout.csv", ("layer", "token_index"), ("abs_readout", "signed_readout"), "group_mean_abs"),
+        "j_lens_linearization_faithfulness.png": _CrossFoldFigureSpec("j_lens_faithfulness.csv", ("layer",), ("cosine_similarity", "relative_l2_error", "magnitude_ratio")),
     }
     return exact.get(name)
 
@@ -5734,7 +6561,10 @@ _SAVED_EXPLAINABILITY_FRAME_NAMES = (
     "feature_correlations", "decision_inventory", "explainability_completeness",
     "exposure_coverage_curve", "position_distribution", "daily_portfolio",
     "regime_analysis", "decision_case_studies", "trust_checks",
-    "aux_summary",
+    "aux_summary", "j_lens_transport", "j_lens_layer_summary",
+    "j_lens_dimension_readout", "j_lens_date_readout", "j_lens_stock_readout",
+    "j_lens_lookback_readout", "j_lens_token_readout", "j_lens_faithfulness",
+    "j_lens_completeness",
 )
 
 
@@ -6075,6 +6905,176 @@ def _plot_feature_time_heatmap_datashader(
     )
 
 
+def _plot_j_lens_layer_summary(frame: pl.DataFrame, output_path: Path) -> None:
+    if _is_empty_frame(frame) or not {"layer", "layer_order", "frobenius_norm", "effective_rank"}.issubset(frame.columns):
+        output_path.unlink(missing_ok=True)
+        return
+    import matplotlib.pyplot as plt
+
+    data = frame.sort("layer_order")
+    x = np.arange(data.height)
+    labels = data.get_column("layer").cast(pl.String).to_list()
+    fig, axes = plt.subplots(2, 1, figsize=(17, 10), dpi=150, sharex=True)
+    axes[0].plot(x, _numeric_numpy(data, "frobenius_norm"), marker="o", label="Frobenius norm")
+    if "score_direction_l2" in data.columns:
+        axes[0].plot(x, _numeric_numpy(data, "score_direction_l2"), marker="s", label="Score direction L2")
+    axes[0].set_ylabel("Transport strength")
+    axes[0].legend(frameon=False)
+    axes[1].plot(x, _numeric_numpy(data, "effective_rank"), marker="o", label="Effective rank")
+    if "stable_rank" in data.columns:
+        axes[1].plot(x, _numeric_numpy(data, "stable_rank"), marker="s", label="Stable rank")
+    axes[1].set_ylabel("Rank")
+    axes[1].legend(frameon=False)
+    axes[1].set_xticks(x, labels, rotation=35, ha="right")
+    axes[1].set_xlabel("Executed model layer")
+    for ax in axes:
+        ax.grid(True, axis="y", alpha=0.25)
+    fig.suptitle("Portfolio J-Lens: complete layer transport strength and dimensionality")
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_j_lens_matrix_heatmap(frame: pl.DataFrame, output_path: Path) -> None:
+    if _is_empty_frame(frame) or not {"layer", "layer_order", "output_dim", "input_dim", "jacobian"}.issubset(frame.columns):
+        output_path.unlink(missing_ok=True)
+        return
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    layers = frame.select(["layer_order", "layer"]).unique().sort("layer_order").iter_rows(named=True)
+    layers = list(layers)
+    rows, columns, _ = _complete_panel_grid(len(layers), panel_rows=1, max_columns=4)
+    fig, axes = plt.subplots(rows, columns, figsize=(4.7 * columns, 4.3 * rows), dpi=150, squeeze=False)
+    for ax, layer_row in zip(axes.flat, layers, strict=False):
+        layer = str(layer_row["layer"])
+        data = frame.filter(pl.col("layer") == layer)
+        size = int(max(_numeric_max(data, "output_dim"), _numeric_max(data, "input_dim")) + 1)
+        matrix = np.zeros((size, size), dtype=np.float64)
+        for item in data.iter_rows(named=True):
+            matrix[int(item["output_dim"]), int(item["input_dim"])] = float(item["jacobian"])
+        local_vmax = max(float(np.nanmax(np.abs(matrix))) if matrix.size else 0.0, 1e-12)
+        ax.imshow(matrix, aspect="auto", cmap="RdBu_r", norm=TwoSlopeNorm(vcenter=0.0, vmin=-local_vmax, vmax=local_vmax))
+        ax.set_title(layer, fontsize=9)
+        ax.set_xlabel("Input hidden dimension")
+        ax.set_ylabel("Final hidden dimension")
+        ax.text(0.02, 0.02, f"max|J|={local_vmax:.3g}", transform=ax.transAxes, fontsize=7, bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"})
+    for ax in list(axes.flat)[len(layers):]:
+        ax.axis("off")
+    fig.suptitle("Portfolio J-Lens: complete 32×32 transport matrices (per-layer color scale)")
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_j_lens_complete_heatmap(
+    frame: pl.DataFrame,
+    output_path: Path,
+    *,
+    row_col: str,
+    value_col: str,
+    title: str,
+    facet_rows: int = 48,
+    compact_complete: bool = False,
+) -> None:
+    required = {"layer", "layer_order", row_col, value_col}
+    if _is_empty_frame(frame) or not required.issubset(frame.columns):
+        output_path.unlink(missing_ok=True)
+        return
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import PowerNorm
+
+    layers = frame.select(["layer_order", "layer"]).unique().sort("layer_order").get_column("layer").cast(pl.String).to_list()
+    row_values = frame.get_column(row_col).cast(pl.String).unique(maintain_order=True).to_list()
+    if compact_complete:
+        lookup = {
+            (str(row[row_col]), str(row["layer"])): _safe_float(row[value_col])
+            for row in frame.iter_rows(named=True)
+        }
+        matrix = np.asarray([[lookup.get((row_value, layer), 0.0) for layer in layers] for row_value in row_values])
+        fig, ax = plt.subplots(figsize=(17, min(30.0, max(12.0, len(row_values) / 90.0))), dpi=120)
+        vmax = max(float(np.nanmax(matrix)) if matrix.size else 0.0, 1e-12)
+        image_handle = ax.imshow(matrix, aspect="auto", cmap="magma", norm=PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax), interpolation="nearest")
+        ax.set_xticks(np.arange(len(layers)), layers, rotation=35, ha="right", fontsize=8)
+        tick_count = min(48, len(row_values))
+        tick_indices = np.unique(np.linspace(0, len(row_values) - 1, tick_count, dtype=int)) if row_values else np.asarray([], dtype=int)
+        ax.set_yticks(tick_indices, [row_values[index] for index in tick_indices], fontsize=6)
+        ax.set_xlabel("Executed model layer")
+        ax.set_ylabel(f"{row_col} (all {len(row_values)} rows rendered; labels sampled)")
+        fig.colorbar(image_handle, ax=ax, shrink=0.75, label=value_col)
+        fig.suptitle(title)
+        _safe_matplotlib_tight_layout(fig)
+        _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+        plt.close(fig)
+        return
+    panel_grid_rows, panel_grid_cols, panel_count = _complete_panel_grid(len(row_values), panel_rows=facet_rows)
+    fig, axes = plt.subplots(
+        panel_grid_rows,
+        panel_grid_cols,
+        figsize=(max(10.0, 2.0 + 1.25 * len(layers)) * panel_grid_cols, 0.23 * facet_rows * panel_grid_rows + 2.5),
+        dpi=140,
+        squeeze=False,
+    )
+    vmax = max(_numeric_max(frame, value_col), 1e-12)
+    image_handle = None
+    for panel_index, ax in enumerate(axes.flat):
+        start = panel_index * facet_rows
+        selected_rows = row_values[start : start + facet_rows]
+        if not selected_rows:
+            ax.axis("off")
+            continue
+        lookup = {
+            (str(row[row_col]), str(row["layer"])): _safe_float(row[value_col])
+            for row in frame.filter(pl.col(row_col).cast(pl.String).is_in(selected_rows)).iter_rows(named=True)
+        }
+        matrix = np.asarray([[lookup.get((row_value, layer), 0.0) for layer in layers] for row_value in selected_rows])
+        image_handle = ax.imshow(matrix, aspect="auto", cmap="magma", norm=PowerNorm(gamma=0.5, vmin=0.0, vmax=vmax))
+        ax.set_xticks(np.arange(len(layers)), layers, rotation=35, ha="right", fontsize=7)
+        ax.set_yticks(np.arange(len(selected_rows)), selected_rows, fontsize=6)
+        ax.set_xlabel("Executed model layer")
+        ax.set_ylabel(row_col)
+        ax.set_title(f"Rows {start + 1}–{start + len(selected_rows)} of {len(row_values)}", fontsize=9)
+    fig.suptitle(title)
+    _safe_matplotlib_tight_layout(fig)
+    if image_handle is not None:
+        # Keep the shared scale outside every data panel. Letting Matplotlib
+        # infer the colorbar position can cover cells on tall complete-token
+        # plots, making a technically complete export visually incomplete.
+        fig.subplots_adjust(right=0.88)
+        colorbar_axis = fig.add_axes((0.905, 0.22, 0.018, 0.58))
+        fig.colorbar(image_handle, cax=colorbar_axis, label=value_col)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
+def _plot_j_lens_faithfulness(frame: pl.DataFrame, output_path: Path) -> None:
+    if _is_empty_frame(frame) or not {"layer", "cosine_similarity", "relative_l2_error", "magnitude_ratio"}.issubset(frame.columns):
+        output_path.unlink(missing_ok=True)
+        return
+    import matplotlib.pyplot as plt
+
+    labels = frame.get_column("layer").cast(pl.String).to_list()
+    x = np.arange(frame.height)
+    fig, axes = plt.subplots(2, 1, figsize=(17, 10), dpi=150, sharex=True)
+    axes[0].bar(x, _numeric_numpy(frame, "cosine_similarity"), color=PAPER_TOKENS["blue_mid"])
+    axes[0].axhline(1.0, color=PAPER_TOKENS["neutral_dark"], linestyle="--")
+    axes[0].set_ylabel("Predicted vs actual cosine")
+    axes[0].set_ylim(-1.05, 1.05)
+    axes[1].plot(x, _numeric_numpy(frame, "relative_l2_error"), marker="o", label="Relative L2 error")
+    axes[1].plot(x, _numeric_numpy(frame, "magnitude_ratio"), marker="s", label="Magnitude ratio")
+    axes[1].axhline(1.0, color=PAPER_TOKENS["neutral_dark"], linestyle="--")
+    axes[1].set_ylabel("Faithfulness error / ratio")
+    axes[1].legend(frameon=False)
+    axes[1].set_xticks(x, labels, rotation=35, ha="right")
+    axes[1].set_xlabel("Intervened layer")
+    for ax in axes:
+        ax.grid(True, axis="y", alpha=0.25)
+    fig.suptitle("Portfolio J-Lens: first-order prediction vs real layer intervention")
+    _safe_matplotlib_tight_layout(fig)
+    _save_matplotlib_figure(fig, output_path, pad_to_standard_aspect=False)
+    plt.close(fig)
+
+
 def _plot_feature_correlations(frame: pl.DataFrame, output_path: Path) -> None:
     if _is_empty_frame(frame) or "feature" not in frame.columns:
         return
@@ -6302,7 +7302,7 @@ def _plot_all_explanation_figures(
         ("aux_summary", "name", "mean_abs", "Auxiliary Representation Mean Abs"),
     ]
     plot_progress = tqdm(
-        total=len(specs) + 2 + 4 + 2 + len(aux_dim_frames) + len(aux_projection_frames or {}),
+        total=len(specs) + 2 + 4 + 2 + 7 + len(aux_dim_frames) + len(aux_projection_frames or {}),
         desc="Standard plots",
         unit="plot",
         leave=False,
@@ -6354,6 +7354,83 @@ def _plot_all_explanation_figures(
         plot_progress.set_postfix(plot=out.name, refresh=False)
     if plot_timing is not None:
         plot_timing["heatmap_specs_s"] = float(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    j_lens_plot_specs: list[tuple[str, Callable[[], None]]] = [
+        (
+            "j_lens_layer_transport_strength.png",
+            lambda: _plot_j_lens_layer_summary(
+                frames.get("j_lens_layer_summary", pl.DataFrame()),
+                plot_dir / "j_lens_layer_transport_strength.png",
+            ),
+        ),
+        (
+            "j_lens_transport_matrix_heatmap.png",
+            lambda: _plot_j_lens_matrix_heatmap(
+                frames.get("j_lens_transport", pl.DataFrame()),
+                plot_dir / "j_lens_transport_matrix_heatmap.png",
+            ),
+        ),
+        (
+            "j_lens_layer_stock_score_heatmap.png",
+            lambda: _plot_j_lens_complete_heatmap(
+                frames.get("j_lens_stock_readout", pl.DataFrame()),
+                plot_dir / "j_lens_layer_stock_score_heatmap.png",
+                row_col="symbol",
+                value_col="mean_abs",
+                title="Portfolio J-Lens: complete stock × layer score influence",
+                compact_complete=True,
+            ),
+        ),
+        (
+            "j_lens_layer_date_heatmap.png",
+            lambda: _plot_j_lens_complete_heatmap(
+                frames.get("j_lens_date_readout", pl.DataFrame()),
+                plot_dir / "j_lens_layer_date_heatmap.png",
+                row_col="date",
+                value_col="mean_abs",
+                title="Portfolio J-Lens: complete date × layer score influence",
+            ),
+        ),
+        (
+            "j_lens_layer_lookback_heatmap.png",
+            lambda: _plot_j_lens_complete_heatmap(
+                frames.get("j_lens_lookback_readout", pl.DataFrame()),
+                plot_dir / "j_lens_layer_lookback_heatmap.png",
+                row_col="lookback_from_end",
+                value_col="mean_abs",
+                title="Portfolio J-Lens: complete lookback × layer score influence",
+            ),
+        ),
+        (
+            "j_lens_market_token_transport.png",
+            lambda: _plot_j_lens_complete_heatmap(
+                frames.get("j_lens_token_readout", pl.DataFrame()).group_by(["layer_order", "layer", "token_index"]).agg(
+                    _numeric_expr("abs_readout").mean().alias("mean_abs")
+                ).sort(["layer_order", "token_index"]) if not _is_empty_frame(frames.get("j_lens_token_readout", pl.DataFrame())) else pl.DataFrame(),
+                plot_dir / "j_lens_market_token_transport.png",
+                row_col="token_index",
+                value_col="mean_abs",
+                title="Portfolio J-Lens: complete bottleneck-token × layer influence",
+            ),
+        ),
+        (
+            "j_lens_linearization_faithfulness.png",
+            lambda: _plot_j_lens_faithfulness(
+                frames.get("j_lens_faithfulness", pl.DataFrame()),
+                plot_dir / "j_lens_linearization_faithfulness.png",
+            ),
+        ),
+    ]
+    for filename, plotter in j_lens_plot_specs:
+        out = plot_dir / filename
+        plotter()
+        if out.exists():
+            generated.append(out)
+        plot_progress.update(1)
+        plot_progress.set_postfix(plot=filename, refresh=False)
+    if plot_timing is not None:
+        plot_timing["j_lens_s"] = float(time.perf_counter() - stage_start)
 
     stage_start = time.perf_counter()
     out = plot_dir / "feature_correlations.png"
@@ -6549,8 +7626,8 @@ def write_explanation_outputs(
             # that infer from the first rows may choose an integer dtype and
             # then fail later. Keep the human-readable CSV and add a typed,
             # lossless table for this mixed-identifier artifact.
-            if name == "stock_contributions":
-                frame.write_parquet(output_dir / "stock_contributions.parquet")
+            if name in {"stock_contributions", "j_lens_stock_readout", "j_lens_date_readout", "j_lens_token_readout"}:
+                frame.write_parquet(output_dir / f"{name}.parquet")
         table_progress.update(1)
         table_progress.set_postfix(table=name, rows=len(frame), refresh=False)
     aux_dir = output_dir / "aux_dims"
@@ -6923,6 +8000,67 @@ def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
             if panel.force_exit_mask is not None
             else None
         ),
+        daily_volumes=(
+            panel.daily_volumes[:, indices] if panel.daily_volumes is not None else None
+        ),
+        open_prices=(
+            panel.open_prices[:, indices] if panel.open_prices is not None else None
+        ),
+        intraday_returns=(
+            panel.intraday_returns[:, indices]
+            if panel.intraday_returns is not None
+            else None
+        ),
+        day_trade_eligible_mask=(
+            panel.day_trade_eligible_mask[:, indices]
+            if panel.day_trade_eligible_mask is not None
+            else None
+        ),
+        day_trade_can_short_open_mask=(
+            panel.day_trade_can_short_open_mask[:, indices]
+            if panel.day_trade_can_short_open_mask is not None
+            else None
+        ),
+        day_trade_can_buy_open_mask=(
+            panel.day_trade_can_buy_open_mask[:, indices]
+            if panel.day_trade_can_buy_open_mask is not None
+            else None
+        ),
+        day_trade_can_sell_open_mask=(
+            panel.day_trade_can_sell_open_mask[:, indices]
+            if panel.day_trade_can_sell_open_mask is not None
+            else None
+        ),
+        raw_close_returns_1d=(
+            panel.raw_close_returns_1d[:, indices]
+            if panel.raw_close_returns_1d is not None
+            else None
+        ),
+        unresolved_corporate_action_mask=(
+            panel.unresolved_corporate_action_mask[:, indices]
+            if panel.unresolved_corporate_action_mask is not None
+            else None
+        ),
+        cash_dividend_yield=(
+            panel.cash_dividend_yield[:, indices]
+            if panel.cash_dividend_yield is not None
+            else None
+        ),
+        cash_dividend_payment_delay_sessions=(
+            panel.cash_dividend_payment_delay_sessions[:, indices]
+            if panel.cash_dividend_payment_delay_sessions is not None
+            else None
+        ),
+        short_capacity_shares=(
+            panel.short_capacity_shares[:, indices]
+            if panel.short_capacity_shares is not None
+            else None
+        ),
+        short_margin_rate=(
+            panel.short_margin_rate[:, indices]
+            if panel.short_margin_rate is not None
+            else None
+        ),
     )
 
 
@@ -6987,6 +8125,9 @@ def _dataset_for_split(
     lookback: int,
     *,
     first_test_year_only: bool = True,
+    execution_mode: str = "naive",
+    short_capacity_limit_enabled: bool = True,
+    tw_corporate_action_mode: str = "avoid",
 ) -> CrossSectionalDataset:
     split_norm = split.strip().lower()
     if split_norm == "train":
@@ -6999,7 +8140,14 @@ def _dataset_for_split(
             indices = _first_year_indices(panel, indices)
     else:
         raise ValueError("split must be one of: train, val, test")
-    return CrossSectionalDataset(panel, indices, lookback)
+    return CrossSectionalDataset(
+        panel,
+        indices,
+        lookback,
+        execution_mode=execution_mode,
+        short_capacity_limit_enabled=short_capacity_limit_enabled,
+        tw_corporate_action_mode=tw_corporate_action_mode,
+    )
 
 
 def _sample_dataset_positions(
@@ -7162,6 +8310,25 @@ def run_loaded_model_explanation(
         split_norm,
         config.training.lookback,
         first_test_year_only=settings.first_test_year_only,
+        execution_mode=getattr(
+            getattr(config, "trading", None),
+            "execution_mode",
+            "naive",
+        ),
+        short_capacity_limit_enabled=bool(
+            getattr(
+                getattr(config, "trading", None),
+                "tw_short_capacity_limit_enabled",
+                True,
+            )
+        ),
+        tw_corporate_action_mode=str(
+            getattr(
+                getattr(config, "trading", None),
+                "tw_corporate_action_mode",
+                "avoid",
+            )
+        ),
     )
     batch_source = _sample_dataset_source(
         dataset,
@@ -7820,6 +8987,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--shap-mode", default="score_head_surrogate", choices=("score_head_surrogate", "off", "none"))
     parser.add_argument(
+        "--j-lens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the complete Portfolio Jacobian Lens; on by default for offline explainability.",
+    )
+    parser.add_argument(
+        "--j-lens-intervention-fraction",
+        default=0.01,
+        type=float,
+        help="Fractional layer ablation used to validate J-Lens linearization faithfulness (0 disables interventions).",
+    )
+    parser.add_argument(
         "--regime-analysis",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -7905,6 +9084,8 @@ def main(argv: list[str] | None = None) -> None:
         interactive_plots=not args.no_interactive_plots,
         shap_enabled=bool(args.shap),
         shap_mode=args.shap_mode,
+        j_lens_enabled=bool(args.j_lens),
+        j_lens_intervention_fraction=float(args.j_lens_intervention_fraction),
         regime_analysis=bool(args.regime_analysis),
         fold_stability=bool(args.fold_stability),
         umap_enabled=bool(args.umap),
@@ -7922,6 +9103,7 @@ def main(argv: list[str] | None = None) -> None:
             f"amp={settings.amp_dtype}, compile_model={settings.compile_model}, "
             f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
             f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
+            f"J-Lens={settings.j_lens_enabled}, "
             f"UMAP={'disabled' if not settings.umap_enabled else ('all_points' if settings.umap_max_points <= 0 else settings.umap_max_points)}, "
             f"strict_no_fallback={settings.strict_no_fallback}, "
             f"world_size={_distributed_world_size()}"

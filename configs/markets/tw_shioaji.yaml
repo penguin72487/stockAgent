@@ -1,0 +1,18 @@
+base_config: tw_public.yaml
+
+experiment_name: tw-stock-transformer-public-features-shioaji-quotes
+
+runner:
+  # This quote-source contract is checkpoint-incompatible with tw_public.
+  output_dir: artifacts/markets/tw_shioaji
+  resume: true
+
+data:
+  # Public rows precede each symbol's first Shioaji row. From that row onward,
+  # only receipt-verified Shioaji daily bars remain. Intraday API responses are
+  # aggregated in memory and are never persisted by this dataset module.
+  parquet_root: data_tw_public/shioaji/stocks
+  # Point-in-time fundamentals, public market features, and TW execution rules
+  # remain inherited from the public dataset because Shioaji has no equivalent
+  # complete historical archive for those feature families.
+  tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet

@@ -38,6 +38,7 @@ from scripts.rebuild_tw_public_data_layer import (
     _promote_one,
     _retained_daily_yahoo_symbols,
     _rollback_promoted_tree,
+    _validate_corporate_action_entitlements,
     _validate_official_symbol_build_summary,
 )
 from scripts.build_tw_official_symbol_parquets import (
@@ -143,6 +144,52 @@ def _panel(dates: list[str]) -> PanelData:
         close_prices=np.full((rows, 1), 100.0, dtype=np.float32),
         daily_volumes=np.full((rows, 1), 1000.0, dtype=np.float32),
     )
+
+
+def test_rebuild_validator_requires_bound_entitlement_raw_manifest(tmp_path) -> None:
+    reference = tmp_path / "tw_corporate_action_reference.parquet"
+    output = tmp_path / "tw_corporate_action_entitlements.parquet"
+    pl.DataFrame({"date": [date(2024, 1, 2)], "symbol": ["2330"]}).write_parquet(
+        reference
+    )
+    pl.DataFrame({"date": [date(2024, 1, 2)], "symbol": ["2330"]}).write_parquet(
+        output
+    )
+    manifest_content = b'{"response_sha256":"official"}\n'
+    manifest_sha = hashlib.sha256(manifest_content).hexdigest()
+    manifest = (
+        tmp_path
+        / "raw"
+        / "tw_corporate_action_entitlements"
+        / "manifests"
+        / f"{manifest_sha}.jsonl"
+    )
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(manifest_content)
+    output.with_suffix(".summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "baseline_established": True,
+                "coverage_complete": True,
+                "failure_count": 0,
+                "output_receipt": _runner_file_receipt(output),
+                "reference_receipt": _runner_file_receipt(reference),
+                "raw_receipt_manifest": {
+                    **_runner_file_receipt(manifest),
+                    "relative_path": manifest.relative_to(tmp_path).as_posix(),
+                    "entries": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _validate_corporate_action_entitlements(output, reference=reference)
+
+    manifest.write_bytes(manifest_content + b"tamper\n")
+    with pytest.raises(RuntimeError, match="raw receipt manifest mismatch"):
+        _validate_corporate_action_entitlements(output, reference=reference)
 
 
 def _write_verified_taiex_calendar(
