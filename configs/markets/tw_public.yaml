@@ -244,8 +244,26 @@ walk_forward:
 
 trading:
   frequency: daily
+  # Select exactly one accounting contract: naive | tw_cash | tw_day_trade.
+  # tw_cash supports cash-only longs or cash longs plus point-in-time,
+  # capacity-limited margin shorts when long_only=false.
+  execution_mode: naive
   buy_fee_rate: 0.000855
   sell_fee_rate: 0.003855
+  # Taiwan modes use product-specific vectors instead of the two legacy scalar
+  # rates above. Commission is 0.1425% at a configurable broker discount.
+  tw_commission_rate: 0.001425
+  tw_commission_discount: 0.6
+  tw_stock_sell_tax: 0.003
+  tw_etf_sell_tax: 0.001
+  tw_day_trade_stock_sell_tax: 0.0015
+  tw_day_trade_etf_sell_tax: 0.001
+  tw_minimum_commission: 0.0
+  tw_commission_rounding: none
+  tw_tax_rounding: none
+  tw_settlement_lag_sessions: 2
+  tw_cash_lot_size: 1
+  tw_day_trade_lot_size: 1000
   max_turnover_ratio: 0.0
   max_volume_participation: 0.5
   volume_participation_equity: 1000000.0
@@ -341,6 +359,10 @@ training:
   explain_interactive_plots: false
   explain_shap_enabled: false
   explain_shap_mode: score_head_surrogate
+  # Keep training-time explainability lightweight. The standalone
+  # explain_model.py command enables complete Portfolio J-Lens by default.
+  explain_j_lens_enabled: false
+  explain_j_lens_intervention_fraction: 0.01
   explain_regime_analysis: false
   explain_fold_stability: false
   explain_umap_enabled: false

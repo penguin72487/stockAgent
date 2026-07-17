@@ -90,6 +90,12 @@ def _panel() -> PanelData:
         can_short_open_mask=can_short_open,
         force_short_cover_mask=force_short_cover,
         force_exit_mask=force_exit,
+        short_capacity_shares=np.full(
+            (rows, symbols), 1_000, dtype=np.int64
+        ),
+        short_margin_rate=np.full(
+            (rows, symbols), 0.9, dtype=np.float32
+        ),
     )
 
 
@@ -134,6 +140,62 @@ def test_checkpoint_data_fingerprint_hashes_actual_panel_content(field, mutate) 
     changed = _checkpoint_manifest(changed_panel, config)
 
     assert baseline["fingerprints"]["data"] != changed["fingerprints"]["data"]
+
+
+@pytest.mark.parametrize(
+    "field, mutate",
+    [
+        (
+            "short_capacity_shares",
+            lambda value: value.__setitem__((2, 1), 7_000),
+        ),
+        (
+            "short_margin_rate",
+            lambda value: value.__setitem__((3, 2), 1.2),
+        ),
+    ],
+)
+def test_tw_cash_checkpoint_fingerprints_point_in_time_short_contract(
+    field,
+    mutate,
+) -> None:
+    config = _config()
+    config.trading.execution_mode = "tw_cash"
+    baseline_panel = _panel()
+    changed_panel = _panel()
+    mutate(getattr(changed_panel, field))
+
+    baseline = _checkpoint_manifest(baseline_panel, config)
+    changed = _checkpoint_manifest(changed_panel, config)
+
+    panel_arrays = baseline["contracts"]["data"]["panel_arrays"]
+    assert {"short_capacity_shares", "short_margin_rate"} <= set(panel_arrays)
+    assert baseline["fingerprints"]["data"] != changed["fingerprints"]["data"]
+
+
+def test_disabled_short_capacity_limit_is_semantic_and_omits_unused_data_hash() -> None:
+    config = _config()
+    config.trading.execution_mode = "tw_cash"
+    config.trading.long_only = False
+    config.trading.tw_short_capacity_limit_enabled = False
+    baseline_panel = _panel()
+    changed_panel = _panel()
+    changed_panel.short_capacity_shares[2, 1] = 7_000
+
+    baseline = _checkpoint_manifest(baseline_panel, config)
+    changed_data = _checkpoint_manifest(changed_panel, config)
+    taiwan = baseline["contracts"]["trading"]["taiwan_execution"]
+    assert taiwan["short_capacity_limit_enabled"] is False
+    assert (
+        "short_capacity_shares"
+        not in baseline["contracts"]["data"]["panel_arrays"]
+    )
+    assert baseline["fingerprints"]["data"] == changed_data["fingerprints"]["data"]
+
+    enabled_config = copy.deepcopy(config)
+    enabled_config.trading.tw_short_capacity_limit_enabled = True
+    enabled = _checkpoint_manifest(baseline_panel, enabled_config)
+    assert enabled["fingerprints"]["trading"] != baseline["fingerprints"]["trading"]
 
 
 def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
@@ -340,8 +402,18 @@ def test_checkpoint_manifest_records_but_does_not_block_execution_and_inactive_s
         lambda cfg: setattr(cfg.training, "compile_loss", not bool(cfg.training.compile_loss)),
         lambda cfg: setattr(
             cfg.training,
+            "compile_model_dynamic_symbols",
+            not cfg.training.compile_model_dynamic_symbols,
+        ),
+        lambda cfg: setattr(
+            cfg.training,
             "compile_loss_dynamic_symbols",
             not cfg.training.compile_loss_dynamic_symbols,
+        ),
+        lambda cfg: setattr(
+            cfg.training,
+            "tw_continuous_compile_chunk_rows",
+            cfg.training.tw_continuous_compile_chunk_rows + 1,
         ),
         lambda cfg: setattr(cfg.training, "torchinductor_cache_dir", "/tmp/other-cache"),
         lambda cfg: setattr(cfg.training, "batch_size_eval", cfg.training.batch_size_eval + 1),
@@ -583,28 +655,26 @@ def test_checkpoint_manifest_records_complete_configuration_fingerprint() -> Non
     assert changed_manifest["fingerprints"] == manifest["fingerprints"]
 
 
-def test_schema4_pre_mtm_backtest_contract_cannot_resume_but_can_infer(
+def test_schema5_prior_backtest_contract_cannot_resume_but_can_infer(
     tmp_path: Path,
 ) -> None:
     expected = _checkpoint_manifest(_panel(), _config())
     assert (
         expected["contracts"]["trading"]["canonical_backtest_contract_version"]
-        == 2
+        == 6
     )
-    pre_mtm = copy.deepcopy(expected)
-    pre_mtm["contracts"]["trading"].pop(
-        "canonical_backtest_contract_version"
+    prior_contract = copy.deepcopy(expected)
+    prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 5
+    prior_contract["fingerprints"]["trading"] = trainer_module._stable_fingerprint(
+        prior_contract["contracts"]["trading"]
     )
-    pre_mtm["fingerprints"]["trading"] = trainer_module._stable_fingerprint(
-        pre_mtm["contracts"]["trading"]
-    )
-    checkpoint = {"experiment_manifest": pre_mtm}
+    checkpoint = {"experiment_manifest": prior_contract}
 
     with pytest.raises(RuntimeError, match="trading"):
         _validate_checkpoint_manifest(
             checkpoint,
             expected,
-            checkpoint_path=tmp_path / "pre_mtm_schema4.pt",
+            checkpoint_path=tmp_path / "prior_backtest_schema5.pt",
             scope="resume",
         )
 
@@ -613,7 +683,84 @@ def test_schema4_pre_mtm_backtest_contract_cannot_resume_but_can_infer(
     _validate_checkpoint_manifest(
         checkpoint,
         expected,
-        checkpoint_path=tmp_path / "pre_mtm_schema4.pt",
+        checkpoint_path=tmp_path / "prior_backtest_schema5.pt",
+        scope="inference",
+    )
+
+
+def test_taiwan_short_execution_settings_are_checkpoint_semantics() -> None:
+    config = _config()
+    config.trading.execution_mode = "tw_cash"
+    baseline = _checkpoint_manifest(_panel(), config)
+    taiwan = baseline["contracts"]["trading"]["taiwan_execution"]
+    fields = {
+        "short_initial_margin_rate": "tw_short_initial_margin_rate",
+        "short_maintenance_ratio": "tw_short_maintenance_ratio",
+        "short_lot_size": "tw_short_lot_size",
+        "short_handling_fee_rate": "tw_short_handling_fee_rate",
+    }
+    assert set(fields).issubset(taiwan)
+
+    for contract_name, config_name in fields.items():
+        changed = copy.deepcopy(config)
+        original = getattr(changed.trading, config_name)
+        setattr(
+            changed.trading,
+            config_name,
+            original + (1 if isinstance(original, int) else 0.01),
+        )
+        changed_manifest = _checkpoint_manifest(_panel(), changed)
+        assert (
+            changed_manifest["contracts"]["trading"]["taiwan_execution"][
+                contract_name
+            ]
+            != taiwan[contract_name]
+        )
+        assert (
+            changed_manifest["fingerprints"]["trading"]
+            != baseline["fingerprints"]["trading"]
+        )
+
+    assert taiwan["corporate_action_mode"] == "avoid"
+    exact = copy.deepcopy(config)
+    exact.trading.tw_corporate_action_mode = "exact"
+    exact_manifest = _checkpoint_manifest(_panel(), exact)
+    assert exact_manifest["fingerprints"]["trading"] != baseline["fingerprints"]["trading"]
+
+    longer_queue = copy.deepcopy(exact)
+    longer_queue.trading.tw_corporate_action_claim_queue_sessions += 1
+    longer_queue_manifest = _checkpoint_manifest(_panel(), longer_queue)
+    assert (
+        longer_queue_manifest["fingerprints"]["trading"]
+        != exact_manifest["fingerprints"]["trading"]
+    )
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_day_trade"])
+@pytest.mark.parametrize("scope", ["resume", "artifact"])
+def test_manifestless_checkpoint_cannot_replay_taiwan_execution_contract(
+    tmp_path: Path,
+    execution_mode: str,
+    scope: str,
+) -> None:
+    config = _config()
+    config.trading.execution_mode = execution_mode
+    expected = _checkpoint_manifest(_panel(), config)
+
+    with pytest.raises(RuntimeError, match="without a semantic manifest"):
+        _validate_checkpoint_manifest(
+            {},
+            expected,
+            checkpoint_path=tmp_path / "manifestless.pt",
+            scope=scope,
+        )
+
+    # Structural weight loading remains allowed; only semantic trajectory and
+    # canonical artifact replay are unknowable.
+    _validate_checkpoint_manifest(
+        {},
+        expected,
+        checkpoint_path=tmp_path / "manifestless.pt",
         scope="inference",
     )
 
@@ -1176,6 +1323,43 @@ def test_schema_v3_exact_contract_remains_resume_compatible(tmp_path: Path) -> N
             checkpoint_path=tmp_path / "schema_v3.pt",
             scope="resume",
         )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_pre_execution_mode_checkpoint_cannot_resume_taiwan_accounting(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    panel = _panel()
+    naive = _checkpoint_manifest(panel, _config())
+    historical = _historical_schema_manifest(naive, schema_version)
+
+    if schema_version >= 2:
+        historical_trading = historical["contracts"]["trading"]
+        assert "execution_mode" not in historical_trading
+        assert not any(str(name).startswith("tw_") for name in historical_trading)
+
+    real_config = _config()
+    real_config.trading.execution_mode = "tw_day_trade"
+    expected_real = _checkpoint_manifest(panel, real_config)
+    checkpoint = {"experiment_manifest": historical}
+
+    with pytest.raises(RuntimeError, match="predates trading.execution_mode"):
+        _validate_checkpoint_manifest(
+            checkpoint,
+            expected_real,
+            checkpoint_path=tmp_path / f"schema_v{schema_version}.pt",
+            scope="resume",
+        )
+
+    # Model structure remains usable for inference; only the unrecorded
+    # optimizer/accounting trajectory is forbidden.
+    _validate_checkpoint_manifest(
+        checkpoint,
+        expected_real,
+        checkpoint_path=tmp_path / f"schema_v{schema_version}.pt",
+        scope="inference",
+    )
 
 
 @pytest.mark.parametrize(

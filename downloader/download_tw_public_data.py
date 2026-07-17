@@ -209,6 +209,14 @@ HISTORICAL_PARSER_CONTRACT_VERSION_BY_DATASET = {
     "twse_margin_balance": 5,
     "twse_institutional_trades": 5,
     "twse_daily_valuation": 5,
+    # Point-in-time day-trade membership is a daily exchange rule, not a
+    # current-list snapshot.  v1 binds the selected table and top-level date,
+    # validates unique symbols, and rejects unknown sell-first suspension
+    # markers instead of guessing their meaning. v2 additionally rejects
+    # truncated rows and a declared table total that differs from the payload,
+    # so a missing sell-first marker or partial member list cannot become an
+    # implicit permission/denial downstream.
+    "twse_day_trade_eligibility": 2,
     # v6 treated two real TPEx OHLCV HTML generations as the same layout and
     # silently shifted their price/volume columns. v7 separated the layouts,
     # but missed three corporate-action rows whose split direction cell is
@@ -234,6 +242,7 @@ HISTORICAL_PARSER_CONTRACT_VERSION_BY_DATASET = {
     # v7 recognizes the official labeled ROC date used by the 2004--2006
     # valuation archive (for example ``交易日期:94年08月08日``).
     "tpex_daily_valuation": 7,
+    "tpex_day_trade_eligibility": 2,
 }
 TW_PUBLIC_WAF_COOLDOWN_SECONDS = 30.0
 NO_DATA_STATUS_MARKERS = (
@@ -268,6 +277,13 @@ TPEX_SESSION_DEPENDENT_DATASETS = frozenset(
         "tpex_margin_balance",
         "tpex_institutional_trades",
         "tpex_daily_valuation",
+        "tpex_day_trade_eligibility",
+    }
+)
+DAY_TRADE_ELIGIBILITY_DATASETS = frozenset(
+    {
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
     }
 )
 TPEX_KNOWN_SOURCE_UNAVAILABLE_RANGES: dict[
@@ -295,6 +311,14 @@ TPEX_LEGACY_HTML_RESPONSE_KINDS = frozenset(
     }
 )
 HISTORICAL_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "twse_day_trade_eligibility": (
+        "證券代號",
+        "證券名稱",
+    ),
+    "tpex_day_trade_eligibility": (
+        "證券代號",
+        "證券名稱",
+    ),
     "tpex_margin_balance": (
         "代號",
         "名稱",
@@ -325,6 +349,8 @@ HISTORICAL_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 HISTORICAL_SYMBOL_COLUMNS = {
     **OHLCV_SYMBOL_COLUMNS,
+    "twse_day_trade_eligibility": "證券代號",
+    "tpex_day_trade_eligibility": "證券代號",
     "tpex_margin_balance": "代號",
     "tpex_institutional_trades": "代號",
     "tpex_daily_valuation": "股票代號",
@@ -433,6 +459,23 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         start_date="2005-09-02",
     ),
     DatasetSpec(
+        name="twse_day_trade_eligibility",
+        kind="historical_json_table",
+        source="TWSE",
+        description=(
+            "TWSE point-in-time cash day-trade eligible securities and "
+            "sell-first suspension markers."
+        ),
+        tags=("twse", "execution", "day-trade", "daily", "historical"),
+        url_template=(
+            "https://www.twse.com.tw/rwd/zh/dayTrading/TWTB4U"
+            "?date={date}&selectType=All&response=json"
+        ),
+        date_format="%Y%m%d",
+        start_date="2014-01-06",
+        table_mode="title_contains:當日沖銷交易標的及成交量值",
+    ),
+    DatasetSpec(
         name="tpex_daily_ohlcv",
         kind="historical_json_table",
         source="TPEx",
@@ -485,6 +528,23 @@ HISTORICAL_DAILY_DATASETS: tuple[DatasetSpec, ...] = (
         ),
         date_format="%Y/%m/%d",
         start_date="2003-08-01",
+    ),
+    DatasetSpec(
+        name="tpex_day_trade_eligibility",
+        kind="historical_json_table",
+        source="TPEx",
+        description=(
+            "TPEx point-in-time cash day-trade eligible securities and "
+            "sell-first suspension markers."
+        ),
+        tags=("tpex", "execution", "day-trade", "daily", "historical"),
+        url_template=(
+            "https://www.tpex.org.tw/www/zh-tw/intraday/list"
+            "?date={date}&code="
+        ),
+        date_format="%Y/%m/%d",
+        start_date="2014-01-06",
+        table_mode="title_contains:現股當沖交易標的",
     ),
 )
 
@@ -2306,6 +2366,20 @@ def _declared_dates_from_text(value: Any) -> set[date]:
             declared.add(datetime.strptime(compact, "%Y%m%d").date())
         except ValueError:
             pass
+    separated = re.fullmatch(
+        r"(\d{2,4})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{1,2})",
+        compact,
+    )
+    if separated:
+        try:
+            year = int(separated.group(1))
+            if year < 1911:
+                year += 1911
+            declared.add(
+                date(year, int(separated.group(2)), int(separated.group(3)))
+            )
+        except ValueError:
+            pass
     for raw_year, raw_month, raw_day in re.findall(
         r"(?<!\d)(\d{2,4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
         text,
@@ -2344,12 +2418,18 @@ def _validate_json_historical_response_date(
             title = _strip_html(table.get("title", payload.get("title", "")))
             if _table_matches(spec.table_mode, title):
                 relevant_table_dates.update(_declared_dates_from_text(title))
+                if spec.name == "tpex_day_trade_eligibility":
+                    relevant_table_dates.update(
+                        _declared_dates_from_text(table.get("date", ""))
+                    )
 
-    strict_twse_mi_index_binding = spec.name in {
+    strict_selected_table_and_payload_binding = spec.name in {
         "twse_daily_ohlcv",
         "twse_market_index",
+        "twse_day_trade_eligibility",
+        "tpex_day_trade_eligibility",
     }
-    if strict_twse_mi_index_binding:
+    if strict_selected_table_and_payload_binding:
         if not relevant_table_dates:
             raise HistoricalResponseError(
                 f"official response selected table declares no date for {spec.name}"
@@ -2360,10 +2440,9 @@ def _validate_json_historical_response_date(
             relevant_table_dates,
         )
 
-        # TWSE has returned MI_INDEX bodies whose selected-table title was
-        # rewritten to the request day while payload.date and every data row
-        # came from another session. The top-level date is therefore an
-        # independent mandatory identity check, not a declaration to ignore.
+        # Official endpoints have returned bodies whose selected-table title
+        # and top-level payload belonged to different sessions.  Treat both as
+        # independent mandatory identity checks, never as hints to overwrite.
         top_level_dates = (
             _declared_dates_from_text(payload.get("date", ""))
             if isinstance(payload, dict)
@@ -2718,8 +2797,17 @@ def _parse_json_table_payload(payload: Any, spec: DatasetSpec, request_date: dat
     fields = payload.get("fields")
     data = payload.get("data")
     if isinstance(fields, list) and isinstance(data, list):
+        normalized_fields = _normalize_historical_json_fields(spec, fields)
+        _validate_day_trade_json_table_schema(
+            spec=spec,
+            request_date=request_date,
+            fields=normalized_fields,
+            data=data,
+            container=payload,
+            table_index=0,
+        )
         rows = _records_from_fields_data(
-            fields=_normalize_historical_json_fields(spec, fields),
+            fields=normalized_fields,
             data=data,
             iso_date=iso_date,
             table_title=title,
@@ -2741,9 +2829,18 @@ def _parse_json_table_payload(payload: Any, spec: DatasetSpec, request_date: dat
         table_data = table.get("data")
         if not isinstance(table_fields, list) or not isinstance(table_data, list):
             continue
+        normalized_fields = _normalize_historical_json_fields(spec, table_fields)
+        _validate_day_trade_json_table_schema(
+            spec=spec,
+            request_date=request_date,
+            fields=normalized_fields,
+            data=table_data,
+            container=table,
+            table_index=table_index,
+        )
         records.extend(
             _records_from_fields_data(
-                fields=_normalize_historical_json_fields(spec, table_fields),
+                fields=normalized_fields,
                 data=table_data,
                 iso_date=iso_date,
                 table_title=table_title,
@@ -2764,6 +2861,124 @@ def _normalize_historical_json_fields(
     ):
         return list(TPEX_INSTITUTIONAL_GROUPED_CANONICAL_FIELDS)
     return fields
+
+
+def _validate_day_trade_json_table_schema(
+    *,
+    spec: DatasetSpec,
+    request_date: date,
+    fields: list[Any],
+    data: list[Any],
+    container: dict[str, Any],
+    table_index: int,
+) -> None:
+    """Validate the raw selected-table shape before absent cells are materialized.
+
+    Empty strings are legitimate official sell-first markers, so a short list
+    row must never be padded with ``""``: doing so would turn a missing field
+    into legal permission.  Declared totals are also part of the immutable raw
+    receipt contract because a syntactically valid partial response is not a
+    complete point-in-time eligibility list.
+    """
+
+    if spec.name not in DAY_TRADE_ELIGIBILITY_DATASETS:
+        return
+    normalized_fields = tuple(_strip_html(field) for field in fields)
+    if len(normalized_fields) != len(set(normalized_fields)):
+        raise HistoricalResponseError(
+            f"official response contains duplicate fields for {spec.name} "
+            f"table {table_index}"
+        )
+    required_fields = set(HISTORICAL_REQUIRED_COLUMNS[spec.name])
+    sell_first_regime = request_date >= date(2014, 6, 30)
+    if sell_first_regime:
+        required_fields.add("暫停現股賣出後現款買進當沖註記")
+    missing_fields = sorted(required_fields - set(normalized_fields))
+    if missing_fields:
+        raise HistoricalResponseError(
+            f"official response missing required fields for {spec.name}: "
+            + ",".join(missing_fields)
+        )
+
+    suspension_field = "暫停現股賣出後現款買進當沖註記"
+    suspension_index = (
+        normalized_fields.index(suspension_field)
+        if suspension_field in normalized_fields
+        else None
+    )
+    expected_width = len(normalized_fields)
+    for row_index, row in enumerate(data):
+        if isinstance(row, list):
+            if len(row) != expected_width:
+                raise HistoricalResponseError(
+                    f"official response row width mismatch for {spec.name} "
+                    f"table={table_index} row={row_index}: "
+                    f"expected={expected_width} actual={len(row)}"
+                )
+            if (
+                sell_first_regime
+                and suspension_index is not None
+                and row[suspension_index] is None
+            ):
+                raise HistoricalResponseError(
+                    f"official response contains a null day-trade sell-first "
+                    f"suspension marker for {spec.name} table={table_index} "
+                    f"row={row_index}"
+                )
+            continue
+        if isinstance(row, dict):
+            normalized_row = {_strip_html(key): value for key, value in row.items()}
+            row_fields = set(normalized_row)
+            missing_row_fields = sorted(required_fields - row_fields)
+            if missing_row_fields:
+                raise HistoricalResponseError(
+                    f"official response dict row missing required fields for "
+                    f"{spec.name} table={table_index} row={row_index}: "
+                    + ",".join(missing_row_fields)
+                )
+            if (
+                sell_first_regime
+                and suspension_field in normalized_row
+                and normalized_row[suspension_field] is None
+            ):
+                raise HistoricalResponseError(
+                    f"official response contains a null day-trade sell-first "
+                    f"suspension marker for {spec.name} table={table_index} "
+                    f"row={row_index}"
+                )
+            continue
+        raise HistoricalResponseError(
+            f"official response contains a non-row value for {spec.name} "
+            f"table={table_index} row={row_index}"
+        )
+
+    for total_key in ("total", "totalCount"):
+        if total_key not in container:
+            continue
+        raw_total = container[total_key]
+        if isinstance(raw_total, bool):
+            declared_total = None
+        elif isinstance(raw_total, int):
+            declared_total = raw_total
+        elif isinstance(raw_total, float) and raw_total.is_integer():
+            declared_total = int(raw_total)
+        elif isinstance(raw_total, str) and re.fullmatch(
+            r"[0-9]+", raw_total.strip().replace(",", "")
+        ):
+            declared_total = int(raw_total.strip().replace(",", ""))
+        else:
+            declared_total = None
+        if declared_total is None or declared_total < 0:
+            raise HistoricalResponseError(
+                f"official response {total_key} is not a non-negative integer "
+                f"for {spec.name} table={table_index}: {raw_total!r}"
+            )
+        if declared_total != len(data):
+            raise HistoricalResponseError(
+                f"official response {total_key} does not match data rows for "
+                f"{spec.name} table={table_index}: "
+                f"declared={declared_total} actual={len(data)}"
+            )
 
 
 def _normalize_tpex_price_cell(value: str) -> str:
@@ -3825,6 +4040,28 @@ def _validate_historical_frame(
         raise HistoricalResponseError(
             f"official response contains duplicate symbols for {spec.name}"
         )
+    if spec.name in DAY_TRADE_ELIGIBILITY_DATASETS:
+        suspension_column = "暫停現股賣出後現款買進當沖註記"
+        # Sell-first day trading started on 2014-06-30.  Before that date the
+        # official history legitimately omits this field and every security is
+        # treated as buy-first-only by the feature builder.  Once the regime is
+        # live, absence of the field is ambiguous and must fail closed.
+        if request_date >= date(2014, 6, 30) and suspension_column not in frame.columns:
+            raise HistoricalResponseError(
+                f"official response missing {suspension_column!r} for {spec.name}"
+            )
+        if suspension_column in frame.columns:
+            markers = {
+                str(value or "").strip().upper()
+                for value in frame.get_column(suspension_column).to_list()
+            }
+            allowed_markers = {"", "Y", "*", "＊"}
+            unknown_markers = sorted(markers - allowed_markers)
+            if unknown_markers:
+                raise HistoricalResponseError(
+                    "official response contains unknown day-trade sell-first "
+                    f"suspension markers for {spec.name}: {unknown_markers[:5]}"
+                )
 
 
 def _table_matches(table_mode: str, title: str) -> bool:
@@ -4740,6 +4977,15 @@ def _parse_historical_response_content(
     if frame.is_empty() and not explicit_no_data:
         raise HistoricalResponseError(
             "official JSON response did not explicitly report no data but parser produced no rows"
+        )
+    if frame.is_empty() and spec.name in DAY_TRADE_ELIGIBILITY_DATASETS:
+        # Both exchanges have a nonempty eligible universe on every validated
+        # cash-equity session from the 2014-01-06 regime start.  Accepting an
+        # empty table here would turn a stale/error response into a false
+        # complete receipt and later make the strategy silently untradeable.
+        raise HistoricalResponseError(
+            "official day-trade eligibility report returned no rows on a "
+            "validated open session"
         )
     if (
         frame.is_empty()

@@ -17,6 +17,14 @@ from stockagent.data.tw_delisting_rules import (
 
 
 DEFAULT_MARKET_SYMBOL = "__MARKET__"
+DAY_TRADE_REGIME_START = date(2014, 1, 6)
+DAY_TRADE_SELL_FIRST_START = date(2014, 6, 30)
+DAY_TRADE_SUSPENSION_COLUMN = "暫停現股賣出後現款買進當沖註記"
+# Both official balance products report margin balances/limits in board lots
+# (張/交易單位).  The standard listed/OTC board lot is 1,000 shares, so convert
+# the exchange-wide next-session headroom before exposing it to an exact-share
+# execution ledger.  Unknown source schemas never reach this conversion.
+TW_MARGIN_BOARD_LOT_SHARES = 1_000.0
 
 STOCK_FEATURE_COLUMNS = (
     "twpub_official_close_logret_1d",
@@ -150,11 +158,15 @@ RULE_COLUMNS = (
     "_twpub_attention_flag",
     "_twpub_disposal_flag",
     "_twpub_short_open_ban",
+    "_twpub_margin_short_evidence_next_session",
+    "_twpub_short_capacity_shares_next_session",
     "_twpub_force_short_cover",
     "_twpub_force_cover_lead_sessions",
     "_twpub_force_cover_anchor_ordinal",
     "_twpub_force_cover_cancel_ordinal",
     "_twpub_trading_halt",
+    "_twpub_day_trade_eligible",
+    "_twpub_day_trade_short_open",
 )
 OUTPUT_COLUMNS = (*FEATURE_COLUMNS, *RULE_COLUMNS)
 KEY_COLUMNS = ("date", "symbol")
@@ -166,6 +178,14 @@ AVAILABILITY_POLICY = {
     "snapshot_openapi": "announcement/report date when present; otherwise downloader as-of date",
     "future_event_snapshot": "downloader as-of date for known future-event snapshot rows",
     "delisting_short_rules": "explicit effective date not before publication; otherwise next calendar day after notice",
+    "margin_short_capacity": (
+        "official end-of-session margin-short balance and next-business-day "
+        "limit; shifted exactly one exchange session by the panel before use"
+    ),
+    "day_trade_eligibility": (
+        "official TWSE/TPEx exchange-session list for the exact trade date; "
+        "missing membership and unknown sell-first markers fail closed"
+    ),
 }
 
 
@@ -247,6 +267,7 @@ def build_tw_public_training_features(
         _build_model_useful_ownership_features(input_dir),
         _build_model_useful_shorting_features(input_dir),
         _build_model_useful_rule_features(input_dir),
+        _build_day_trade_rule_features(input_dir, symbols=symbols),
     ]
     stock_features = _merge_feature_frames(stock_frames)
     if symbols is not None and not stock_features.is_empty():
@@ -922,6 +943,242 @@ def _build_model_useful_rule_features(input_dir: Path) -> pl.DataFrame:
     return _finalize_feature_frame(pl.concat(frames, how="diagonal_relaxed")) if frames else pl.DataFrame()
 
 
+def _normalize_day_trade_source(
+    input_dir: Path,
+    *,
+    dataset: str,
+) -> pl.DataFrame:
+    path = input_dir / f"{dataset}.parquet"
+    if not path.exists():
+        return pl.DataFrame()
+    required = {"date", "證券代號", "證券名稱"}
+    schema_columns = set(pl.read_parquet_schema(path))
+    missing = sorted(required - schema_columns)
+    if missing:
+        raise ValueError(
+            f"{dataset}.parquet is missing required day-trade columns: {missing}"
+        )
+
+    has_suspension_marker = DAY_TRADE_SUSPENSION_COLUMN in schema_columns
+    projected_columns = ["date", "證券代號"]
+    if has_suspension_marker:
+        projected_columns.append(DAY_TRADE_SUSPENSION_COLUMN)
+    frame = pl.read_parquet(path, columns=projected_columns)
+    normalized = frame.select(
+        _date_column_expr("date").alias("date"),
+        _symbol_expr("證券代號").alias("symbol"),
+        (
+            pl.col(DAY_TRADE_SUSPENSION_COLUMN)
+            .cast(pl.Utf8, strict=False)
+            .str.strip_chars()
+            .str.to_uppercase()
+            if has_suspension_marker
+            else pl.lit(None, dtype=pl.Utf8)
+        ).alias("_sell_first_suspension"),
+    ).drop_nulls(["date", "symbol"])
+    normalized = normalized.filter(
+        (pl.col("date") >= pl.lit(DAY_TRADE_REGIME_START))
+        & (pl.col("symbol") != "")
+    )
+    if normalized.is_empty():
+        raise ValueError(
+            f"{dataset}.parquet has no rows in the day-trade regime"
+        )
+
+    post_sell_first_missing = normalized.filter(
+        (pl.col("date") >= pl.lit(DAY_TRADE_SELL_FIRST_START))
+        & pl.col("_sell_first_suspension").is_null()
+    )
+    if not post_sell_first_missing.is_empty():
+        raise ValueError(
+            f"{dataset}.parquet has missing sell-first suspension markers on or "
+            f"after {DAY_TRADE_SELL_FIRST_START.isoformat()}"
+        )
+    normalized = normalized.with_columns(
+        pl.col("_sell_first_suspension").fill_null("")
+    )
+    unknown_markers = (
+        normalized.filter(
+            ~pl.col("_sell_first_suspension").is_in(["", "Y", "*", "＊"])
+        )
+        .select("_sell_first_suspension")
+        .unique()
+        .sort("_sell_first_suspension")
+    )
+    if not unknown_markers.is_empty():
+        raise ValueError(
+            f"{dataset}.parquet has unknown sell-first suspension markers: "
+            f"{unknown_markers.to_series().to_list()[:5]}"
+        )
+
+    duplicates = (
+        normalized.group_by(["date", "symbol"])
+        .agg(pl.len().alias("_rows"))
+        .filter(pl.col("_rows") != 1)
+    )
+    if not duplicates.is_empty():
+        raise ValueError(
+            f"{dataset}.parquet has duplicate date-symbol eligibility rows: "
+            f"{duplicates.head(5).to_dicts()}"
+        )
+    return normalized.with_columns(
+        pl.lit(1.0).alias("_eligible_source")
+    )
+
+
+def _normalize_day_trade_universe(
+    input_dir: Path,
+    *,
+    dataset: str,
+    symbol_column: str,
+) -> pl.DataFrame:
+    path = input_dir / f"{dataset}.parquet"
+    if not path.exists():
+        return pl.DataFrame()
+    required = {"date", symbol_column}
+    schema_columns = set(pl.read_parquet_schema(path))
+    missing = sorted(required - schema_columns)
+    if missing:
+        raise ValueError(
+            f"{dataset}.parquet is missing required universe columns: {missing}"
+        )
+    frame = pl.read_parquet(path, columns=["date", symbol_column])
+    return (
+        frame.select(
+            _date_column_expr("date").alias("date"),
+            _symbol_expr(symbol_column).alias("symbol"),
+        )
+        .drop_nulls(["date", "symbol"])
+        .filter(
+            (pl.col("date") >= pl.lit(DAY_TRADE_REGIME_START))
+            & (pl.col("symbol") != "")
+        )
+        .unique()
+        .sort(["date", "symbol"])
+    )
+
+
+def _require_day_trade_date_coverage(
+    *,
+    market: str,
+    universe: pl.DataFrame,
+    eligible: pl.DataFrame,
+) -> None:
+    universe_dates = universe.select("date").unique()
+    eligible_dates = eligible.select("date").unique()
+    missing = universe_dates.join(eligible_dates, on="date", how="anti").sort("date")
+    extra = eligible_dates.join(universe_dates, on="date", how="anti").sort("date")
+    if not missing.is_empty() or not extra.is_empty():
+        raise ValueError(
+            f"{market} day-trade eligibility coverage does not match official "
+            "OHLCV sessions: "
+            f"missing={missing.head(5).to_series().to_list()} "
+            f"extra={extra.head(5).to_series().to_list()}"
+        )
+
+
+def _build_day_trade_rule_features(
+    input_dir: Path,
+    *,
+    symbols: set[str] | None = None,
+) -> pl.DataFrame:
+    """Build exact-session TWSE/TPEx day-trade masks with explicit negatives.
+
+    The official pages publish only members.  A sparse ``1``-only table is not
+    enough for point-in-time correctness because removal from the list would be
+    indistinguishable from a missing receipt.  The receipt-certified daily
+    OHLCV rows provide each venue's observed security universe, so this builder
+    emits an explicit 0/1 for every observed date-symbol key.
+    """
+
+    twse_eligible = _normalize_day_trade_source(
+        input_dir,
+        dataset="twse_day_trade_eligibility",
+    )
+    tpex_eligible = _normalize_day_trade_source(
+        input_dir,
+        dataset="tpex_day_trade_eligibility",
+    )
+    if twse_eligible.is_empty() and tpex_eligible.is_empty():
+        return pl.DataFrame()
+    if twse_eligible.is_empty() or tpex_eligible.is_empty():
+        raise ValueError(
+            "day-trade rule build requires both TWSE and TPEx point-in-time "
+            "eligibility histories"
+        )
+
+    twse_universe = _normalize_day_trade_universe(
+        input_dir,
+        dataset="twse_daily_ohlcv",
+        symbol_column="證券代號",
+    )
+    tpex_universe = _normalize_day_trade_universe(
+        input_dir,
+        dataset="tpex_daily_ohlcv",
+        symbol_column="代號",
+    )
+    if twse_universe.is_empty() or tpex_universe.is_empty():
+        raise ValueError(
+            "day-trade rule build requires receipt-certified TWSE and TPEx "
+            "daily OHLCV universes"
+        )
+
+    frames: list[pl.DataFrame] = []
+    for market, universe, eligible in (
+        ("TWSE", twse_universe, twse_eligible),
+        ("TPEx", tpex_universe, tpex_eligible),
+    ):
+        _require_day_trade_date_coverage(
+            market=market,
+            universe=universe,
+            eligible=eligible,
+        )
+        if symbols is not None:
+            symbol_filter = sorted(symbols)
+            universe = universe.filter(pl.col("symbol").is_in(symbol_filter))
+            eligible = eligible.filter(pl.col("symbol").is_in(symbol_filter))
+        if universe.is_empty():
+            continue
+        frames.append(
+            universe.join(
+                eligible.select(
+                    "date",
+                    "symbol",
+                    "_sell_first_suspension",
+                    "_eligible_source",
+                ),
+                on=["date", "symbol"],
+                how="left",
+            )
+            .with_columns(
+                [
+                    pl.col("_eligible_source")
+                    .fill_null(0.0)
+                    .alias("_twpub_day_trade_eligible"),
+                    pl.when(
+                        pl.col("_eligible_source").is_not_null()
+                        & (pl.col("date") >= pl.lit(DAY_TRADE_SELL_FIRST_START))
+                        & (pl.col("_sell_first_suspension") == "")
+                    )
+                    .then(1.0)
+                    .otherwise(0.0)
+                    .alias("_twpub_day_trade_short_open"),
+                ]
+            )
+            .select(
+                "date",
+                "symbol",
+                "_twpub_day_trade_eligible",
+                "_twpub_day_trade_short_open",
+            )
+        )
+    return (
+        pl.concat(frames, how="vertical").sort(["date", "symbol"])
+        if frames
+        else pl.DataFrame()
+    )
+
+
 def _build_delisting_announcement_rules(input_dir: Path) -> pl.DataFrame:
     """Turn point-in-time delisting notices into executable short rules.
 
@@ -1410,10 +1667,40 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
     twse = _read_optional(input_dir, "twse_margin_balance")
     if not twse.is_empty():
+        columns = set(twse.columns)
         margin_prev = _num_expr("前日餘額")
         margin_today = _num_expr("今日餘額")
         short_prev = _num_expr("前日餘額_2")
         short_today = _num_expr("今日餘額_2")
+        short_limit_next = _optional_num_expr(columns, "次一營業日限額_2")
+        has_margin_schema = {
+            "今日餘額_2",
+            "次一營業日限額_2",
+            "註記",
+        }.issubset(columns)
+        short_note = (
+            _text_expr("註記").fill_null("")
+            if "註記" in columns
+            else pl.lit(None, dtype=pl.Utf8)
+        )
+        valid_short_evidence = (
+            short_today.is_finite()
+            & short_limit_next.is_finite()
+            & (short_today >= 0.0)
+            & (short_limit_next >= 0.0)
+            & (short_today == short_today.round(0))
+            & (short_limit_next == short_limit_next.round(0))
+            & ~short_note.str.contains("X", literal=True).fill_null(True)
+        ).fill_null(False) if has_margin_schema else pl.lit(False)
+        short_capacity_shares = (
+            pl.when(valid_short_evidence)
+            .then(
+                (short_limit_next - short_today)
+                .clip(lower_bound=0.0)
+                * TW_MARGIN_BOARD_LOT_SHARES
+            )
+            .otherwise(0.0)
+        )
         frames.append(
             twse.select(
                 [
@@ -1427,16 +1714,52 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
                     _signed_asinh(_num_expr("賣出")).alias("twpub_margin_sell_flow"),
                     _signed_asinh(_num_expr("賣出_2")).alias("twpub_short_sell_flow"),
                     _signed_asinh(_num_expr("買進_2")).alias("twpub_short_buy_flow"),
+                    valid_short_evidence.cast(pl.Float64).alias(
+                        "_twpub_margin_short_evidence_next_session"
+                    ),
+                    short_capacity_shares.alias(
+                        "_twpub_short_capacity_shares_next_session"
+                    ),
                 ]
             )
         )
 
     tpex = _read_optional(input_dir, "tpex_margin_balance")
     if not tpex.is_empty():
+        columns = set(tpex.columns)
         margin_prev = _num_expr("前資餘額(張)")
         margin_today = _num_expr("資餘額")
         short_prev = _num_expr("前券餘額(張)")
         short_today = _num_expr("券餘額")
+        short_limit_next = _optional_num_expr(columns, "券限額")
+        has_margin_schema = {
+            "券餘額",
+            "券限額",
+            "備註",
+        }.issubset(columns)
+        short_note = (
+            _text_expr("備註").fill_null("")
+            if "備註" in columns
+            else pl.lit(None, dtype=pl.Utf8)
+        )
+        valid_short_evidence = (
+            short_today.is_finite()
+            & short_limit_next.is_finite()
+            & (short_today >= 0.0)
+            & (short_limit_next >= 0.0)
+            & (short_today == short_today.round(0))
+            & (short_limit_next == short_limit_next.round(0))
+            & ~short_note.str.contains("X", literal=True).fill_null(True)
+        ).fill_null(False) if has_margin_schema else pl.lit(False)
+        short_capacity_shares = (
+            pl.when(valid_short_evidence)
+            .then(
+                (short_limit_next - short_today)
+                .clip(lower_bound=0.0)
+                * TW_MARGIN_BOARD_LOT_SHARES
+            )
+            .otherwise(0.0)
+        )
         frames.append(
             tpex.select(
                 [
@@ -1450,6 +1773,12 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
                     _signed_asinh(_num_expr("資賣")).alias("twpub_margin_sell_flow"),
                     _signed_asinh(_num_expr("券賣")).alias("twpub_short_sell_flow"),
                     _signed_asinh(_num_expr("券買")).alias("twpub_short_buy_flow"),
+                    valid_short_evidence.cast(pl.Float64).alias(
+                        "_twpub_margin_short_evidence_next_session"
+                    ),
+                    short_capacity_shares.alias(
+                        "_twpub_short_capacity_shares_next_session"
+                    ),
                 ]
             )
         )

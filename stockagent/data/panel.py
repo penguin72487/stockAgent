@@ -7,6 +7,7 @@ import fnmatch
 from pathlib import Path
 import csv
 import hashlib
+import json
 import pickle
 import os
 from typing import Any
@@ -97,7 +98,18 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 38
+# Version 45 adds point-in-time TW margin-short eligibility/capacity arrays.
+# Version 44 carries raw-close valuation through ordinary symbol halts while
+# resetting the basis at lifecycle/corporate-action boundaries.  Version 43
+# separated causal open-side day-trade masks from full-session close/volume
+# availability.
+# v46 separates point-in-time margin-short eligibility from the optional
+# demonstrated-capacity ceiling.  Older caches folded capacity>0 into the
+# eligibility mask and cannot support an explicit no-capacity-limit account.
+# v47 carries receipt-verified exact cash-dividend entitlement/payment tensors.
+# v48 applies the Article 76 Lunar New Year settlement-day counting exception
+# to exact MOPS stop-transfer dates.
+PANEL_CACHE_VERSION = 48
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -113,6 +125,17 @@ PREV_DAY_LOG_RETURN_RENAME = {
     "close": "close_logret_1d",
     "Trading_Volume": "trading_volume_logret_1d",
 }
+# Canonical writers should use ``day_trade_eligible``.  The remaining aliases
+# make the reader tolerant of existing research receipts without guessing from
+# today's eligibility list.  Presence is still required: absence remains None
+# and the day-trading dataset fails closed.
+DAY_TRADE_ELIGIBILITY_COLUMNS = (
+    "day_trade_eligible",
+    "day_trading_eligible",
+    "is_day_trade_eligible",
+    "Day_Trade_Eligible",
+    "_twpub_day_trade_eligible",
+)
 _MISSING_VOLUME_WARNED_SYMBOLS: set[str] = set()
 
 
@@ -238,6 +261,30 @@ class PanelData:
     can_short_open_mask: np.ndarray | None = None
     force_short_cover_mask: np.ndarray | None = None
     force_exit_mask: np.ndarray | None = None
+    open_prices: np.ndarray | None = None
+    intraday_returns: np.ndarray | None = None
+    day_trade_eligible_mask: np.ndarray | None = None
+    day_trade_can_short_open_mask: np.ndarray | None = None
+    day_trade_can_buy_open_mask: np.ndarray | None = None
+    day_trade_can_sell_open_mask: np.ndarray | None = None
+    raw_close_returns_1d: np.ndarray | None = None
+    # Backward-compatible field name.  This is now a receipt-verified, known
+    # corporate-action avoidance transition, not an adjclose-difference guess.
+    unresolved_corporate_action_mask: np.ndarray | None = None
+    # Exact issuer-announced cash entitlement earned at the preceding close.
+    # The yield is cash-per-share divided by that executable close; the delay
+    # is the number of exchange sessions until the announced payment date.
+    # None means no receipt-verified exact entitlement archive was available.
+    cash_dividend_yield: np.ndarray | None = None
+    cash_dividend_payment_delay_sessions: np.ndarray | None = None
+    # Exchange-wide, point-in-time headroom for opening a margin short.  Values
+    # are exact shares, not board lots.  None means the panel has no verified
+    # historical margin evidence; consumers must fail closed rather than infer
+    # it from can_sell_mask.
+    short_capacity_shares: np.ndarray | None = None
+    # Optional per-session/per-symbol legal or broker margin ratio.  Historical
+    # sources in this module do not guess it; unknown values remain NaN/None.
+    short_margin_rate: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -296,10 +343,26 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
         can_short_open_mask=sliced(panel.can_short_open_mask),
         force_short_cover_mask=sliced(panel.force_short_cover_mask),
         force_exit_mask=sliced(panel.force_exit_mask),
+        short_capacity_shares=sliced(panel.short_capacity_shares),
+        short_margin_rate=sliced(panel.short_margin_rate),
         alive_mask=panel.alive_mask[slc],
         benchmark_returns=panel.benchmark_returns[slc],
         close_prices=panel.close_prices[slc],
         daily_volumes=sliced(panel.daily_volumes),
+        open_prices=sliced(panel.open_prices),
+        intraday_returns=sliced(panel.intraday_returns),
+        day_trade_eligible_mask=sliced(panel.day_trade_eligible_mask),
+        day_trade_can_short_open_mask=sliced(panel.day_trade_can_short_open_mask),
+        day_trade_can_buy_open_mask=sliced(panel.day_trade_can_buy_open_mask),
+        day_trade_can_sell_open_mask=sliced(panel.day_trade_can_sell_open_mask),
+        raw_close_returns_1d=sliced(panel.raw_close_returns_1d),
+        unresolved_corporate_action_mask=sliced(
+            panel.unresolved_corporate_action_mask
+        ),
+        cash_dividend_yield=sliced(panel.cash_dividend_yield),
+        cash_dividend_payment_delay_sessions=sliced(
+            panel.cash_dividend_payment_delay_sessions
+        ),
     )
 
 
@@ -310,11 +373,16 @@ class _SymbolPanelArrays:
     features: np.ndarray
     returns_1d: np.ndarray
     close_prices: np.ndarray
+    open_prices: np.ndarray
+    intraday_returns: np.ndarray
     daily_volumes: np.ndarray
     tradable_mask: np.ndarray
     can_buy_mask: np.ndarray
     can_sell_mask: np.ndarray
+    day_trade_can_buy_open_mask: np.ndarray
+    day_trade_can_sell_open_mask: np.ndarray
     alive_mask: np.ndarray
+    day_trade_eligible_mask: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -327,6 +395,32 @@ class _ExternalFeatureArrays:
     market_rule_values: np.ndarray
     by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]]
     official_session_dates: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class _CorporateActionReferencePaths:
+    parquet: Path
+    summary: Path
+    entitlements_parquet: Path | None = None
+    entitlements_summary: Path | None = None
+
+
+@dataclass(slots=True)
+class _CorporateActionReference:
+    event_dates_by_symbol: dict[str, np.ndarray]
+    coverage_start: np.datetime64
+    coverage_end: np.datetime64
+    exact_cash_terms_by_symbol: dict[
+        str, tuple[np.ndarray, np.ndarray, np.ndarray]
+    ] | None = None
+    exact_coverage_start: np.datetime64 | None = None
+    exact_coverage_end: np.datetime64 | None = None
+    # Receipt-verified MOPS stop-transfer starts.  Article 76 derives the
+    # mandatory margin-short closeout and four-session short-open ban from
+    # this date, independently of the long-side cash entitlement treatment.
+    margin_short_stop_transfer_by_symbol: dict[
+        str, tuple[np.ndarray, np.ndarray]
+    ] | None = None
 
 
 def _symbol_name_from_path(path: Path) -> str:
@@ -368,6 +462,412 @@ def _resolve_external_data_path(
     if not normalized.exists():
         raise FileNotFoundError(f"external_feature_path not found: {normalized}")
     return normalized
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_corporate_action_reference_paths(
+    external_feature_path: Path | None,
+    *,
+    include_rules: bool,
+) -> _CorporateActionReferencePaths | None:
+    """Locate the canonical action reference adjacent to TW public features.
+
+    The feature parquet normally lives under ``data_tw_public/features`` while
+    the reference and its completeness receipt live one directory above.  A
+    synthetic/non-TW external parquet is allowed to have no reference; the
+    Taiwan cash dataset then fails closed instead of inventing a no-action
+    history.
+    """
+
+    if not include_rules or external_feature_path is None:
+        return None
+    candidates: list[Path] = []
+    for directory in (external_feature_path.parent, external_feature_path.parent.parent):
+        candidate = directory / "tw_corporate_action_reference.parquet"
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for parquet_path in candidates:
+        if not parquet_path.exists():
+            continue
+        summary_path = parquet_path.with_suffix(".summary.json")
+        if not summary_path.exists():
+            raise FileNotFoundError(
+                "TW corporate-action reference exists without its completeness "
+                f"receipt: {summary_path}"
+            )
+        entitlement_path = parquet_path.with_name(
+            "tw_corporate_action_entitlements.parquet"
+        )
+        entitlement_summary = entitlement_path.with_suffix(".summary.json")
+        if entitlement_path.exists() != entitlement_summary.exists():
+            raise FileNotFoundError(
+                "TW exact corporate-action entitlement parquet and receipt "
+                "must either both exist or both be absent: "
+                f"{entitlement_path}, {entitlement_summary}"
+            )
+        return _CorporateActionReferencePaths(
+            parquet=parquet_path,
+            summary=summary_path,
+            entitlements_parquet=(
+                entitlement_path if entitlement_path.exists() else None
+            ),
+            entitlements_summary=(
+                entitlement_summary if entitlement_summary.exists() else None
+            ),
+        )
+    return None
+
+
+def _load_exact_cash_entitlements(
+    paths: _CorporateActionReferencePaths,
+) -> tuple[
+    dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] | None,
+    dict[str, tuple[np.ndarray, np.ndarray]] | None,
+    np.datetime64 | None,
+    np.datetime64 | None,
+]:
+    """Load a fail-closed MOPS cash-entitlement archive, when installed."""
+
+    parquet_path = paths.entitlements_parquet
+    summary_path = paths.entitlements_summary
+    if parquet_path is None or summary_path is None:
+        return None, None, None, None
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid TW exact entitlement completeness receipt: {summary_path}"
+        ) from exc
+    if not bool(summary.get("baseline_established")) or not bool(
+        summary.get("coverage_complete")
+    ):
+        raise ValueError("TW exact entitlement archive is not a complete baseline")
+    if int(summary.get("failure_count", -1)) != 0:
+        raise ValueError("TW exact entitlement receipt contains request failures")
+    if int(summary.get("schema_version", -1)) < 3:
+        raise ValueError("TW exact entitlement schema_version must be >= 3")
+    raw_manifest_receipt = summary.get("raw_receipt_manifest")
+    if not isinstance(raw_manifest_receipt, dict):
+        raise ValueError("TW exact entitlement raw_receipt_manifest is missing")
+    raw_manifest_relative = str(
+        raw_manifest_receipt.get("relative_path", "")
+    ).strip()
+    if not raw_manifest_relative:
+        raise ValueError(
+            "TW exact entitlement raw receipt manifest path is missing"
+        )
+    entitlement_root = summary_path.parent.resolve()
+    raw_manifest_path = (entitlement_root / raw_manifest_relative).resolve()
+    if not raw_manifest_path.is_relative_to(entitlement_root):
+        raise ValueError(
+            "TW exact entitlement raw receipt manifest escapes its data root"
+        )
+    if not raw_manifest_path.is_file():
+        raise FileNotFoundError(raw_manifest_path)
+    if int(raw_manifest_receipt.get("size", -1)) != int(
+        raw_manifest_path.stat().st_size
+    ):
+        raise ValueError(
+            "TW exact entitlement raw receipt manifest size mismatch"
+        )
+    raw_manifest_sha = _sha256_file(raw_manifest_path)
+    if (
+        str(raw_manifest_receipt.get("sha256", "")).strip().lower()
+        != raw_manifest_sha
+    ):
+        raise ValueError(
+            "TW exact entitlement raw receipt manifest SHA-256 mismatch"
+        )
+    if raw_manifest_path.stem != raw_manifest_sha:
+        raise ValueError(
+            "TW exact entitlement raw receipt manifest is not content-addressed"
+        )
+    with raw_manifest_path.open("rb") as manifest_handle:
+        raw_manifest_entries = sum(1 for line in manifest_handle if line.strip())
+    if int(raw_manifest_receipt.get("entries", -1)) != raw_manifest_entries:
+        raise ValueError(
+            "TW exact entitlement raw receipt manifest row count mismatch"
+        )
+    reference_receipt = summary.get("reference_receipt")
+    if not isinstance(reference_receipt, dict):
+        raise ValueError("TW exact entitlement reference_receipt is missing")
+    if int(reference_receipt.get("size", -1)) != int(paths.parquet.stat().st_size):
+        raise ValueError("TW exact entitlement was built from another reference size")
+    if str(reference_receipt.get("sha256", "")).strip().lower() != _sha256_file(
+        paths.parquet
+    ):
+        raise ValueError("TW exact entitlement was built from another reference SHA-256")
+    receipt = summary.get("output_receipt")
+    if not isinstance(receipt, dict):
+        raise ValueError("TW exact entitlement output_receipt is missing")
+    if int(receipt.get("size", -1)) != int(parquet_path.stat().st_size):
+        raise ValueError("TW exact entitlement size does not match its receipt")
+    if str(receipt.get("sha256", "")).strip().lower() != _sha256_file(
+        parquet_path
+    ):
+        raise ValueError("TW exact entitlement SHA-256 does not match its receipt")
+
+    required = {
+        "date",
+        "symbol",
+        "handling",
+        "cash_dividend_per_share",
+        "cash_payment_date",
+        "stop_transfer_start",
+    }
+    missing = required - set(pq.read_schema(parquet_path).names)
+    if missing:
+        raise ValueError(
+            "TW exact entitlement archive is missing required columns: "
+            f"{sorted(missing)}"
+        )
+    table = pq.read_table(parquet_path, columns=sorted(required), memory_map=True)
+    if int(summary.get("rows", -1)) != int(table.num_rows):
+        raise ValueError("TW exact entitlement row count does not match its receipt")
+    if int(summary.get("reference_rows", -1)) != int(table.num_rows):
+        raise ValueError(
+            "TW exact entitlement archive does not classify every reference event"
+        )
+    dates = table["date"].combine_chunks().to_numpy(zero_copy_only=False).astype(
+        "datetime64[D]", copy=False
+    )
+    symbols = np.asarray(
+        [
+            str(value).strip().upper() if value is not None else ""
+            for value in table["symbol"].to_pylist()
+        ],
+        dtype=str,
+    )
+    handling = np.asarray(
+        [str(value).strip() if value is not None else "" for value in table["handling"].to_pylist()],
+        dtype=str,
+    )
+    if bool((np.isnat(dates) | (symbols == "")).any()):
+        raise ValueError("TW exact entitlement archive contains invalid event keys")
+    if not bool(np.isin(handling, ["exact_cash", "avoid"]).all()):
+        raise ValueError("TW exact entitlement archive contains an unknown handling mode")
+    order = np.lexsort((dates, symbols))
+    if dates.size > 1:
+        ordered_dates = dates[order]
+        ordered_symbols = symbols[order]
+        if bool(
+            (
+                (ordered_dates[1:] == ordered_dates[:-1])
+                & (ordered_symbols[1:] == ordered_symbols[:-1])
+            ).any()
+        ):
+            raise ValueError("TW exact entitlement archive has duplicate date+symbol keys")
+
+    cash = np.asarray(
+        [np.nan if value is None else float(value) for value in table["cash_dividend_per_share"].to_pylist()],
+        dtype=np.float64,
+    )
+    payment = np.asarray(
+        [
+            np.datetime64("NaT", "D")
+            if value is None
+            else np.datetime64(value, "D")
+            for value in table["cash_payment_date"].to_pylist()
+        ],
+        dtype="datetime64[D]",
+    )
+    stop_transfer = np.asarray(
+        [
+            np.datetime64("NaT", "D")
+            if value is None
+            else np.datetime64(value, "D")
+            for value in table["stop_transfer_start"].to_pylist()
+        ],
+        dtype="datetime64[D]",
+    )
+    exact = handling == "exact_cash"
+    if bool((exact & (~np.isfinite(cash) | (cash <= 0.0) | np.isnat(payment))).any()):
+        raise ValueError("TW exact cash events contain invalid amount or payment date")
+    try:
+        coverage_start = np.datetime64(str(summary["coverage_start"]), "D")
+        coverage_end = np.datetime64(str(summary["coverage_end"]), "D")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("TW exact entitlement receipt has invalid coverage") from exc
+    if coverage_end < coverage_start:
+        raise ValueError("TW exact entitlement coverage is reversed")
+
+    terms: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for symbol in np.unique(symbols[exact]):
+        selected = exact & (symbols == symbol)
+        symbol_order = np.argsort(dates[selected])
+        terms[str(symbol)] = (
+            dates[selected][symbol_order],
+            cash[selected][symbol_order],
+            payment[selected][symbol_order],
+        )
+    short_terms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    has_stop_transfer = ~np.isnat(stop_transfer)
+    for symbol in np.unique(symbols[has_stop_transfer]):
+        selected = has_stop_transfer & (symbols == symbol)
+        symbol_order = np.argsort(dates[selected])
+        short_terms[str(symbol)] = (
+            dates[selected][symbol_order],
+            stop_transfer[selected][symbol_order],
+        )
+    print(
+        "[panel] verified TW exact cash entitlements "
+        f"events={int(exact.sum())} symbols={len(terms)} path={parquet_path}"
+    )
+    return terms, short_terms, coverage_start, coverage_end
+
+
+def _load_corporate_action_reference(
+    paths: _CorporateActionReferencePaths | None,
+) -> _CorporateActionReference | None:
+    """Load and strictly validate the official ex-date reference.
+
+    This source is an execution-safety calendar only.  It is never appended to
+    model features.  The adjacent receipt must prove a complete rebuild and
+    match the exact parquet bytes before any transition is trusted.
+    """
+
+    if paths is None:
+        return None
+    if pq is None:
+        raise RuntimeError("TW corporate-action rules require pyarrow")
+    try:
+        summary = json.loads(paths.summary.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Invalid TW corporate-action completeness receipt: {paths.summary}"
+        ) from exc
+    if not bool(summary.get("baseline_established")):
+        raise ValueError("TW corporate-action reference has no established baseline")
+    if not bool(summary.get("coverage_complete")):
+        raise ValueError("TW corporate-action reference coverage is incomplete")
+    if int(summary.get("failure_count", -1)) != 0:
+        raise ValueError("TW corporate-action reference receipt contains failures")
+    if int(summary.get("schema_version", -1)) < 3:
+        raise ValueError("TW corporate-action reference schema_version must be >= 3")
+    receipt = summary.get("output_receipt")
+    if not isinstance(receipt, dict):
+        raise ValueError("TW corporate-action reference output_receipt is missing")
+    reference_stat_before = paths.parquet.stat()
+    actual_size = int(reference_stat_before.st_size)
+    expected_size = int(receipt.get("size", -1))
+    if actual_size != expected_size:
+        raise ValueError(
+            "TW corporate-action reference size does not match its receipt "
+            f"({actual_size} != {expected_size})"
+        )
+    actual_sha256 = _sha256_file(paths.parquet)
+    expected_sha256 = str(receipt.get("sha256", "")).strip().lower()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("TW corporate-action reference SHA-256 does not match its receipt")
+
+    required_columns = {"date", "symbol", "reference_price", "event_type"}
+    schema_names = set(pq.read_schema(paths.parquet).names)
+    missing = required_columns - schema_names
+    if missing:
+        raise ValueError(
+            "TW corporate-action reference is missing required columns: "
+            f"{sorted(missing)}"
+        )
+    table = pq.read_table(
+        paths.parquet,
+        columns=["date", "symbol", "reference_price"],
+        memory_map=True,
+    )
+    reference_stat_after = paths.parquet.stat()
+    if (
+        int(reference_stat_before.st_size) != int(reference_stat_after.st_size)
+        or int(reference_stat_before.st_mtime_ns)
+        != int(reference_stat_after.st_mtime_ns)
+        or int(reference_stat_before.st_ctime_ns)
+        != int(reference_stat_after.st_ctime_ns)
+    ):
+        raise RuntimeError(
+            "TW corporate-action reference changed while it was being validated"
+        )
+    if int(summary.get("rows", -1)) != int(table.num_rows):
+        raise ValueError(
+            "TW corporate-action reference row count does not match its receipt"
+        )
+    dates = table["date"].combine_chunks().to_numpy(zero_copy_only=False).astype(
+        "datetime64[ns]", copy=False
+    )
+    symbols = np.asarray(
+        [str(value).strip().upper() if value is not None else "" for value in table["symbol"].to_pylist()],
+        dtype=str,
+    )
+    reference_prices = (
+        table["reference_price"]
+        .combine_chunks()
+        .to_numpy(zero_copy_only=False)
+        .astype(np.float64, copy=False)
+    )
+    valid = (
+        ~np.isnat(dates)
+        & (symbols != "")
+        & np.isfinite(reference_prices)
+        & (reference_prices > 0.0)
+    )
+    if not bool(valid.all()):
+        raise ValueError(
+            "TW corporate-action reference contains null/invalid event keys or prices"
+        )
+    try:
+        coverage_start = np.datetime64(
+            f"{int(summary.get('requested_start_year')):04d}-01-01", "D"
+        )
+        receipt_end = np.datetime64(str(summary.get("end_date", "")), "D")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "TW corporate-action receipt has invalid coverage boundaries"
+        ) from exc
+    if dates.size:
+        if receipt_end < dates.max().astype("datetime64[D]"):
+            raise ValueError(
+                "TW corporate-action receipt end_date precedes its latest event"
+            )
+    order = np.lexsort((dates.astype("datetime64[ns]"), symbols))
+    sorted_dates = dates[order]
+    sorted_symbols = symbols[order]
+    if sorted_dates.size > 1:
+        duplicate = (
+            (sorted_dates[1:] == sorted_dates[:-1])
+            & (sorted_symbols[1:] == sorted_symbols[:-1])
+        )
+        if bool(duplicate.any()):
+            raise ValueError(
+                "TW corporate-action reference contains duplicate date+symbol keys"
+            )
+    event_dates_by_symbol: dict[str, np.ndarray] = {}
+    if sorted_dates.size:
+        boundaries = np.flatnonzero(sorted_symbols[1:] != sorted_symbols[:-1]) + 1
+        starts = np.concatenate(([0], boundaries))
+        stops = np.concatenate((boundaries, [sorted_dates.size]))
+        for start, stop in zip(starts, stops):
+            event_dates_by_symbol[str(sorted_symbols[start])] = sorted_dates[start:stop]
+    print(
+        "[panel] verified TW corporate-action reference "
+        f"rows={table.num_rows} symbols={len(event_dates_by_symbol)} "
+        f"path={paths.parquet}"
+    )
+    exact_terms, short_terms, exact_start, exact_end = (
+        _load_exact_cash_entitlements(paths)
+    )
+    return _CorporateActionReference(
+        event_dates_by_symbol=event_dates_by_symbol,
+        coverage_start=coverage_start,
+        coverage_end=receipt_end,
+        exact_cash_terms_by_symbol=exact_terms,
+        exact_coverage_start=exact_start,
+        exact_coverage_end=exact_end,
+        margin_short_stop_transfer_by_symbol=short_terms,
+    )
 
 
 def _load_external_feature_arrays(
@@ -422,7 +922,7 @@ def _load_external_feature_arrays(
                 market_values=np.empty((0, 0), dtype=np.float32),
                 by_symbol={},
                 rule_names=[],
-                market_rule_values=np.empty((0, 0), dtype=np.float32),
+                market_rule_values=np.empty((0, 0), dtype=np.float64),
                 by_symbol_rules={},
                 official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
             )
@@ -448,7 +948,7 @@ def _load_external_feature_arrays(
             market_values=np.empty((0, len(feature_names)), dtype=np.float32),
             by_symbol={},
             rule_names=rule_names,
-            market_rule_values=np.empty((0, len(rule_names)), dtype=np.float32),
+            market_rule_values=np.empty((0, len(rule_names)), dtype=np.float64),
             by_symbol_rules={},
             official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
         )
@@ -456,7 +956,11 @@ def _load_external_feature_arrays(
     market_key = str(market_symbol).strip().upper()
     market_frame = frame.filter(pl.col("symbol") == market_key).sort("date")
     market_dates, market_values = _external_frame_to_arrays(market_frame, feature_names)
-    _, market_rule_values = _external_frame_to_arrays(market_frame, rule_names)
+    _, market_rule_values = _external_frame_to_arrays(
+        market_frame,
+        rule_names,
+        dtype=np.float64,
+    )
 
     by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -481,7 +985,11 @@ def _load_external_feature_arrays(
             key = symbol[0] if isinstance(symbol, tuple) else symbol
             dates, values = _external_frame_to_arrays(symbol_frame.sort("date"), feature_names)
             by_symbol[str(key).upper()] = (dates, values)
-            rule_dates, rule_values = _external_frame_to_arrays(symbol_frame.sort("date"), rule_names)
+            rule_dates, rule_values = _external_frame_to_arrays(
+                symbol_frame.sort("date"),
+                rule_names,
+                dtype=np.float64,
+            )
             by_symbol_rules[str(key).upper()] = (rule_dates, rule_values)
 
     print(
@@ -500,17 +1008,22 @@ def _load_external_feature_arrays(
     )
 
 
-def _external_frame_to_arrays(frame: Any, feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+def _external_frame_to_arrays(
+    frame: Any,
+    feature_names: list[str],
+    *,
+    dtype: Any = np.float32,
+) -> tuple[np.ndarray, np.ndarray]:
     if frame is None or frame.is_empty():
         return (
             np.empty((0,), dtype="datetime64[ns]"),
-            np.empty((0, len(feature_names)), dtype=np.float32),
+            np.empty((0, len(feature_names)), dtype=dtype),
         )
     dates = frame["date"].to_numpy().astype("datetime64[ns]", copy=False)
     values = (
         frame.select([pl.col(name).cast(pl.Float64, strict=False).fill_null(float("nan")) for name in feature_names])
         .to_numpy()
-        .astype(np.float32, copy=False)
+        .astype(dtype, copy=False)
     )
     valid_dates = ~np.isnat(dates)
     if not bool(valid_dates.all()):
@@ -525,7 +1038,16 @@ def _align_external_values(
     source_values: np.ndarray,
 ) -> np.ndarray:
     feature_count = int(source_values.shape[1]) if source_values.ndim == 2 else 0
-    out = np.full((int(panel_dates.size), feature_count), np.nan, dtype=np.float32)
+    output_dtype = (
+        source_values.dtype
+        if source_values.ndim == 2 and np.issubdtype(source_values.dtype, np.floating)
+        else np.float64
+    )
+    out = np.full(
+        (int(panel_dates.size), feature_count),
+        np.nan,
+        dtype=output_dtype,
+    )
     if panel_dates.size == 0 or source_dates.size == 0 or feature_count == 0:
         return out
     row_idx = np.searchsorted(panel_dates, source_dates)
@@ -1284,6 +1806,47 @@ def _tw_limit_masks_from_arrays(
     return base & ~is_limit_up, base & ~is_limit_down
 
 
+def _tw_open_limit_masks_from_arrays(
+    open_raw: np.ndarray,
+    close_raw: np.ndarray,
+    tradable: np.ndarray,
+    dividends: np.ndarray,
+    stock_splits: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return open-side masks using the prior close reference for session t.
+
+    The execution quote is today's open, while the limit reference is derived
+    from yesterday's close (with any source-provided ex-right/ex-dividend
+    adjustment).  Shifting the open itself would compare against yesterday's
+    open and is mathematically the wrong Taiwan price-limit contract.
+    """
+
+    open_px = _round_half_up(np.asarray(open_raw, dtype=np.float64), decimals=2)
+    prior_close = _shift_array(
+        _round_half_up(np.asarray(close_raw, dtype=np.float64), decimals=2),
+        1,
+    )
+    reference = np.asarray(prior_close, dtype=np.float64).copy()
+    div = np.nan_to_num(np.asarray(dividends, dtype=np.float64), nan=0.0)
+    reference = reference - div
+    splits = np.asarray(stock_splits, dtype=np.float64)
+    valid_split = np.isfinite(splits) & (splits > 0.0) & (splits != 1.0)
+    reference[valid_split] = reference[valid_split] / splits[valid_split]
+    reference = np.where(reference > 0.0, reference, np.nan)
+
+    limit_up = _tw_limit_price(reference, 1.10).astype(np.float64, copy=False)
+    limit_down = _tw_limit_price(reference, 0.90).astype(np.float64, copy=False)
+    if np.asarray(tradable).shape != open_px.shape:
+        raise ValueError("tradable and open prices must share shape")
+    # Do not intersect with the full-session tradable flag: that flag depends
+    # on the eventual close and reported daily volume, neither of which exists
+    # when the opening order is submitted.
+    base = np.isfinite(open_px) & (open_px > 0.0)
+    is_limit_up = np.isfinite(reference) & (open_px >= (limit_up - 1e-9))
+    is_limit_down = np.isfinite(reference) & (open_px <= (limit_down + 1e-9))
+    return base & ~is_limit_up, base & ~is_limit_down
+
+
 def _load_symbol_arrays_pyarrow(
     path: Path,
     tradable_mode: str = "tradable",
@@ -1358,10 +1921,14 @@ def _symbol_arrays_from_arrow_table(
             features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
+            open_prices=empty_1d,
+            intraday_returns=empty_1d,
             daily_volumes=empty_1d,
             tradable_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
+            day_trade_can_buy_open_mask=empty_mask,
+            day_trade_can_sell_open_mask=empty_mask,
             alive_mask=empty_mask,
         )
 
@@ -1381,6 +1948,18 @@ def _symbol_arrays_from_arrow_table(
     close_px = _round_half_up(col("close"), decimals=price_decimals)
     adjclose = _round_half_up(col("adjclose"), decimals=adjclose_decimals)
     volume = col("Trading_Volume") if "Trading_Volume" in table.column_names else np.full((rows,), np.nan, dtype=np.float64)
+    eligibility_column = next(
+        (name for name in DAY_TRADE_ELIGIBILITY_COLUMNS if name in table.column_names),
+        None,
+    )
+    raw_day_trade_eligible = (
+        col(eligibility_column) if eligibility_column is not None else None
+    )
+    day_trade_eligible = (
+        None
+        if raw_day_trade_eligible is None
+        else np.isfinite(raw_day_trade_eligible) & (raw_day_trade_eligible != 0.0)
+    )
 
     intraday_return_co = _safe_log_ratio_array(close_px, open_px)
     (
@@ -1448,10 +2027,14 @@ def _symbol_arrays_from_arrow_table(
         dates = dates[valid_dates]
         features = features[valid_dates]
         return_1d = return_1d[valid_dates]
+        open_px = open_px[valid_dates]
+        intraday_return_co = intraday_return_co[valid_dates]
         close_px = close_px[valid_dates]
         volume = volume[valid_dates]
         tradable = tradable[valid_dates]
         close_notna = close_notna[valid_dates]
+        if day_trade_eligible is not None:
+            day_trade_eligible = day_trade_eligible[valid_dates]
 
     tradable = np.asarray(tradable, dtype=bool)
     if tradable_mode == "tw_limit_guard":
@@ -1461,9 +2044,21 @@ def _symbol_arrays_from_arrow_table(
             dividends = dividends[valid_dates]
             stock_splits = stock_splits[valid_dates]
         can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(close_px, tradable, dividends, stock_splits)
+        day_trade_can_buy_open_mask, day_trade_can_sell_open_mask = (
+            _tw_open_limit_masks_from_arrays(
+                open_px,
+                close_px,
+                tradable,
+                dividends,
+                stock_splits,
+            )
+        )
     elif tradable_mode == "tradable":
         can_buy_mask = tradable.copy()
         can_sell_mask = tradable.copy()
+        open_tradable = np.isfinite(open_px) & (open_px > 0.0)
+        day_trade_can_buy_open_mask = open_tradable.copy()
+        day_trade_can_sell_open_mask = open_tradable.copy()
     else:
         raise RuntimeError(f"Unsupported tradable_mode for PyArrow panel backend: {tradable_mode!r}")
     return _SymbolPanelArrays(
@@ -1472,11 +2067,24 @@ def _symbol_arrays_from_arrow_table(
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
+        open_prices=open_px.astype(np.float32, copy=False),
+        intraday_returns=intraday_return_co.astype(np.float32, copy=False),
         daily_volumes=volume.astype(np.float32, copy=False),
         tradable_mask=tradable,
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
+        day_trade_can_buy_open_mask=np.asarray(
+            day_trade_can_buy_open_mask, dtype=bool
+        ),
+        day_trade_can_sell_open_mask=np.asarray(
+            day_trade_can_sell_open_mask, dtype=bool
+        ),
         alive_mask=np.asarray(close_notna, dtype=bool),
+        day_trade_eligible_mask=(
+            None
+            if day_trade_eligible is None
+            else np.asarray(day_trade_eligible, dtype=bool)
+        ),
     )
 
 
@@ -1504,6 +2112,11 @@ def _load_symbol_arrays_polars_lazy(
         if name in schema_names:
             return pl.col(name).cast(pl.Float64, strict=False)
         return pl.lit(None, dtype=pl.Float64)
+
+    eligibility_column = next(
+        (name for name in DAY_TRADE_ELIGIBILITY_COLUMNS if name in schema_names),
+        None,
+    )
 
     price_columns = [
         _polars_round_half_up(num("open"), price_decimals).alias("_open"),
@@ -1572,14 +2185,20 @@ def _load_symbol_arrays_polars_lazy(
     )
     selected_columns = [
         _polars_datetime_ns_expr(frame.schema, "date"),
+        pl.col("_open").alias("open_px"),
         pl.col("_close").alias("close_px"),
         pl.col("_volume").alias("daily_volume"),
         pl.col("return_1d"),
+        pl.col("intraday_return_co"),
         pl.col("tradable"),
         *[pl.col(name) for name in LOG_RETURN_FEATURE_COLUMNS],
     ]
+    if eligibility_column is not None:
+        selected_columns.append(
+            num(eligibility_column).alias("day_trade_eligible")
+        )
     if tradable_mode == "tw_limit_guard":
-        selected_columns[2:2] = [
+        selected_columns[3:3] = [
             pl.col("_dividends").alias("dividends"),
             pl.col("_stock_splits").alias("stock_splits"),
         ]
@@ -1595,17 +2214,35 @@ def _load_symbol_arrays_polars_lazy(
             features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
+            open_prices=empty_1d,
+            intraday_returns=empty_1d,
             daily_volumes=empty_1d,
             tradable_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
+            day_trade_can_buy_open_mask=empty_mask,
+            day_trade_can_sell_open_mask=empty_mask,
             alive_mask=empty_mask,
         )
 
     dates = out["date"].to_numpy().astype("datetime64[ns]", copy=False)
+    open_px = out["open_px"].to_numpy().astype(np.float64, copy=False)
     close_px = out["close_px"].to_numpy().astype(np.float64, copy=False)
     daily_volume = out["daily_volume"].to_numpy().astype(np.float64, copy=False)
     return_1d = out["return_1d"].to_numpy().astype(np.float64, copy=False)
+    intraday_return_co = out["intraday_return_co"].to_numpy().astype(
+        np.float64, copy=False
+    )
+    raw_day_trade_eligible = (
+        None
+        if eligibility_column is None
+        else out["day_trade_eligible"].to_numpy().astype(np.float64, copy=False)
+    )
+    day_trade_eligible = (
+        None
+        if raw_day_trade_eligible is None
+        else np.isfinite(raw_day_trade_eligible) & (raw_day_trade_eligible != 0.0)
+    )
     tradable = out["tradable"].to_numpy().astype(bool, copy=False)
     features = np.column_stack(
         [out[name].to_numpy().astype(np.float64, copy=False) for name in LOG_RETURN_FEATURE_COLUMNS]
@@ -1617,10 +2254,14 @@ def _load_symbol_arrays_polars_lazy(
         dates = dates[valid_dates]
         features = features[valid_dates]
         return_1d = return_1d[valid_dates]
+        open_px = open_px[valid_dates]
+        intraday_return_co = intraday_return_co[valid_dates]
         close_px = close_px[valid_dates]
         daily_volume = daily_volume[valid_dates]
         tradable = tradable[valid_dates]
         close_notna = close_notna[valid_dates]
+        if day_trade_eligible is not None:
+            day_trade_eligible = day_trade_eligible[valid_dates]
 
     if tradable_mode == "tw_limit_guard":
         dividends = out["dividends"].to_numpy().astype(np.float64, copy=False)
@@ -1629,9 +2270,21 @@ def _load_symbol_arrays_polars_lazy(
             dividends = dividends[valid_dates]
             stock_splits = stock_splits[valid_dates]
         can_buy_mask, can_sell_mask = _tw_limit_masks_from_arrays(close_px, tradable, dividends, stock_splits)
+        day_trade_can_buy_open_mask, day_trade_can_sell_open_mask = (
+            _tw_open_limit_masks_from_arrays(
+                open_px,
+                close_px,
+                tradable,
+                dividends,
+                stock_splits,
+            )
+        )
     elif tradable_mode == "tradable":
         can_buy_mask = tradable.copy()
         can_sell_mask = tradable.copy()
+        open_tradable = np.isfinite(open_px) & (open_px > 0.0)
+        day_trade_can_buy_open_mask = open_tradable.copy()
+        day_trade_can_sell_open_mask = open_tradable.copy()
     else:
         raise RuntimeError(f"Unsupported tradable_mode for Polars Lazy panel backend: {tradable_mode!r}")
 
@@ -1641,11 +2294,24 @@ def _load_symbol_arrays_polars_lazy(
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
+        open_prices=open_px.astype(np.float32, copy=False),
+        intraday_returns=intraday_return_co.astype(np.float32, copy=False),
         daily_volumes=daily_volume.astype(np.float32, copy=False),
         tradable_mask=np.asarray(tradable, dtype=bool),
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
+        day_trade_can_buy_open_mask=np.asarray(
+            day_trade_can_buy_open_mask, dtype=bool
+        ),
+        day_trade_can_sell_open_mask=np.asarray(
+            day_trade_can_sell_open_mask, dtype=bool
+        ),
         alive_mask=np.asarray(close_notna, dtype=bool),
+        day_trade_eligible_mask=(
+            None
+            if day_trade_eligible is None
+            else np.asarray(day_trade_eligible, dtype=bool)
+        ),
     )
 
 
@@ -1728,12 +2394,24 @@ def _build_panel_from_symbol_arrays(
 
     features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    open_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    intraday_returns = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     daily_volumes = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     can_buy_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    day_trade_can_buy_open_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    day_trade_can_sell_open_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    has_day_trade_eligibility = any(
+        item.day_trade_eligible_mask is not None for item in symbol_arrays
+    )
+    day_trade_eligible_mask = (
+        np.zeros((num_dates, num_symbols), dtype=bool)
+        if has_day_trade_eligibility
+        else None
+    )
     masked_non_session_returns = 0
 
     market_external = None
@@ -1806,12 +2484,34 @@ def _build_panel_from_symbol_arrays(
         session_returns = np.asarray(item_returns, dtype=np.float32).copy()
         session_returns[~valid_forward] = np.nan
         returns_1d[row_idx, sym_idx] = session_returns
+        open_prices[row_idx, sym_idx] = (
+            item.open_prices if all_valid else item.open_prices[valid]
+        )
         close_prices[row_idx, sym_idx] = item.close_prices if all_valid else item.close_prices[valid]
+        intraday_returns[row_idx, sym_idx] = (
+            item.intraday_returns if all_valid else item.intraday_returns[valid]
+        )
         daily_volumes[row_idx, sym_idx] = item.daily_volumes if all_valid else item.daily_volumes[valid]
         tradable_mask[row_idx, sym_idx] = item_tradable
         can_buy_mask[row_idx, sym_idx] = item.can_buy_mask if all_valid else item.can_buy_mask[valid]
         can_sell_mask[row_idx, sym_idx] = item.can_sell_mask if all_valid else item.can_sell_mask[valid]
+        day_trade_can_buy_open_mask[row_idx, sym_idx] = (
+            item.day_trade_can_buy_open_mask
+            if all_valid
+            else item.day_trade_can_buy_open_mask[valid]
+        )
+        day_trade_can_sell_open_mask[row_idx, sym_idx] = (
+            item.day_trade_can_sell_open_mask
+            if all_valid
+            else item.day_trade_can_sell_open_mask[valid]
+        )
         alive_mask[row_idx, sym_idx] = item.alive_mask if all_valid else item.alive_mask[valid]
+        if day_trade_eligible_mask is not None and item.day_trade_eligible_mask is not None:
+            day_trade_eligible_mask[row_idx, sym_idx] = (
+                item.day_trade_eligible_mask
+                if all_valid
+                else item.day_trade_eligible_mask[valid]
+            )
         if (sym_idx + 1) % 500 == 0 or (sym_idx + 1) == num_symbols:
             print(f"[panel] materialized symbols {sym_idx + 1}/{num_symbols}")
 
@@ -1853,7 +2553,479 @@ def _build_panel_from_symbol_arrays(
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
         daily_volumes=daily_volumes,
+        open_prices=open_prices,
+        intraday_returns=intraday_returns,
+        day_trade_eligible_mask=day_trade_eligible_mask,
+        day_trade_can_short_open_mask=None,
+        day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+        day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+        raw_close_returns_1d=None,
+        unresolved_corporate_action_mask=None,
     )
+
+
+def _attach_raw_close_forward_returns(panel: PanelData) -> PanelData:
+    """Attach causal raw-close valuation returns for a Taiwan cash ledger.
+
+    A cash position survives a symbol-specific trading halt.  During a session
+    with no new quote it is marked at the last observed raw close; when trading
+    resumes, the whole price change since that close is recognized exactly
+    once.  This is a valuation convention only: ``panel.close_prices`` remains
+    the unfilled execution quote and the side masks still prohibit an order on
+    a missing-quote row.
+
+    The scan is O(T*S), the lower bound for materializing the dense return
+    tensor, and needs only O(S) temporary state.  A terminal force-exit or an
+    official corporate-action avoidance transition clears the carried mark
+    after that row.  Consequently a stale value can never bridge a security
+    incarnation or an ex-date whose cash/share entitlement is not modeled.  At
+    the finite panel horizon, a reconstructable final mark values itself with a
+    zero return; this records no unobserved price move while still allowing the
+    final row to charge fees and preserve pending settlement claims.
+    """
+
+    close = np.asarray(panel.close_prices, dtype=np.float64)
+    adjusted = np.asarray(panel.returns_1d)
+    tradable = np.asarray(panel.tradable_mask, dtype=bool)
+    if close.shape != adjusted.shape or close.shape != tradable.shape:
+        raise ValueError(
+            "close_prices, returns_1d, and tradable_mask must share [T,S] shape"
+        )
+    raw = np.full(close.shape, np.nan, dtype=np.float32)
+    if close.shape[0] > 0:
+        force_exit = (
+            np.zeros(close.shape, dtype=bool)
+            if panel.force_exit_mask is None
+            else np.asarray(panel.force_exit_mask, dtype=bool)
+        )
+        corporate_action = (
+            np.zeros(close.shape, dtype=bool)
+            if panel.unresolved_corporate_action_mask is None
+            else np.asarray(panel.unresolved_corporate_action_mask, dtype=bool)
+        )
+        if force_exit.shape != close.shape or corporate_action.shape != close.shape:
+            raise ValueError(
+                "cash valuation reset masks must share close_prices shape"
+            )
+
+        symbols = int(close.shape[1])
+        carried_mark = np.full(symbols, np.nan, dtype=np.float64)
+        previous_mark = np.full(symbols, np.nan, dtype=np.float64)
+        reset_after_previous = np.zeros(symbols, dtype=bool)
+        stale_gap_open = np.zeros(symbols, dtype=bool)
+        stale_sessions = 0
+        resumed_symbols = 0
+
+        for row_index in range(int(close.shape[0])):
+            quote = close[row_index]
+            quote_valid = np.isfinite(quote) & (quote > 0.0)
+            resumed_symbols += int(np.count_nonzero(quote_valid & stale_gap_open))
+            stale_gap_open &= ~quote_valid
+            carried_mark = np.where(quote_valid, quote, carried_mark)
+            current_mark = carried_mark
+            stale_now = ~quote_valid & np.isfinite(current_mark)
+            stale_gap_open |= stale_now
+            stale_sessions += int(np.count_nonzero(stale_now))
+
+            if row_index > 0:
+                valid_transition = (
+                    np.isfinite(previous_mark)
+                    & (previous_mark > 0.0)
+                    & np.isfinite(current_mark)
+                    & (current_mark > 0.0)
+                    & ~reset_after_previous
+                )
+                if np.any(valid_transition):
+                    raw[row_index - 1, valid_transition] = np.log(
+                        current_mark[valid_transition]
+                        / previous_mark[valid_transition]
+                    ).astype(np.float32, copy=False)
+
+            # A reset applies *after* this closing valuation.  The preceding
+            # close can therefore still liquidate at its real quote, while no
+            # stale mark is allowed to flow into the next security basis.
+            reset_now = force_exit[row_index] | corporate_action[row_index]
+            previous_mark = current_mark.copy()
+            reset_after_previous = reset_now
+            carried_mark = np.where(reset_now, np.nan, carried_mark)
+            stale_gap_open &= ~reset_now
+
+        terminal_mark_available = (
+            np.isfinite(current_mark) & (current_mark > 0.0)
+        )
+        raw[-1, terminal_mark_available] = np.float32(0.0)
+
+        if stale_sessions:
+            print(
+                "[panel] cash stale-close valuation "
+                f"sessions={stale_sessions} resumed_quotes={resumed_symbols}"
+            )
+    panel.raw_close_returns_1d = raw
+    return panel
+
+
+def _article76_lunar_new_year_extra_business_days(
+    panel_dates: np.ndarray,
+    stop_transfer_date: np.datetime64,
+) -> int:
+    """Return Article 76's extra Lunar New Year business-day count.
+
+    Article 76 ordinarily defines a business day as an exchange trading day.
+    Around Lunar New Year it additionally counts one or both of the settlement
+    days immediately following the final pre-holiday trading day.  The official
+    panel session calendar identifies that holiday as the long January/February
+    gap; its first two following weekdays are the two settlement days because
+    the exchange deliberately stops trading two settlement days before the
+    holiday closure.
+
+    The return value is added to the ordinary ``stop_insertion - 6`` trading-row
+    deadline.  A value of zero means the stop-transfer date is outside the
+    statutory Lunar New Year exception window.
+    """
+
+    sessions = np.asarray(panel_dates, dtype="datetime64[D]")
+    stop_date = np.datetime64(stop_transfer_date, "D")
+    if sessions.size < 3 or np.isnat(stop_date):
+        return 0
+    stop_month = int(str(stop_date)[5:7])
+    if stop_month not in {1, 2, 3}:
+        return 0
+
+    gaps = np.diff(sessions).astype("timedelta64[D]").astype(np.int64)
+    for gap_index in np.flatnonzero(gaps >= 7):
+        last_trade = sessions[int(gap_index)]
+        first_post_trade = sessions[int(gap_index) + 1]
+        if int(gap_index) + 2 >= sessions.size:
+            continue
+        second_post_trade = sessions[int(gap_index) + 2]
+        # Exclude missing-data gaps and other long closures.  Every Taiwan
+        # Lunar New Year market closure begins and ends in January/February.
+        if int(str(last_trade)[5:7]) not in {1, 2} or int(
+            str(first_post_trade)[5:7]
+        ) not in {1, 2}:
+            continue
+        first_settlement = np.busday_offset(
+            last_trade, 1, roll="forward"
+        ).astype("datetime64[D]")
+        second_settlement = np.busday_offset(
+            last_trade, 2, roll="forward"
+        ).astype("datetime64[D]")
+        if stop_date < second_settlement or stop_date > second_post_trade:
+            continue
+        if stop_date == second_settlement:
+            return 1
+        if stop_date <= first_post_trade:
+            return 2
+        return 1
+    return 0
+
+
+def _apply_corporate_action_avoidance_transitions(
+    panel: PanelData,
+    reference: _CorporateActionReference | None,
+    official_session_dates: np.ndarray | None = None,
+) -> PanelData:
+    """Mark the close immediately before every official ex-date.
+
+    The mask is an execution-only safety rule.  The cash executor liquidates at
+    that prior close and refuses a new position for the transition, avoiding a
+    fabricated dividend/share ledger while keeping raw-price accounting exact.
+    """
+
+    if reference is None:
+        panel.unresolved_corporate_action_mask = None
+        return panel
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+    if panel_dates.size == 0:
+        panel.unresolved_corporate_action_mask = np.zeros(
+            panel.tradable_mask.shape, dtype=bool
+        )
+        return panel
+    if panel_dates[0] < reference.coverage_start:
+        panel.unresolved_corporate_action_mask = None
+        print(
+            "[panel] corporate-action avoidance unavailable: panel begins before "
+            "verified archive "
+            f"({panel_dates[0]} < {reference.coverage_start}); tw_cash will fail closed"
+        )
+        return panel
+    if panel_dates[-1] > reference.coverage_end:
+        panel.unresolved_corporate_action_mask = None
+        print(
+            "[panel] corporate-action avoidance unavailable: panel extends beyond "
+            "verified archive "
+            f"({panel_dates[-1]} > {reference.coverage_end}); tw_cash will fail closed"
+        )
+        return panel
+
+    # Counts, rather than a bool mask, let an exact cash event remove only its
+    # own avoidance interval if another unresolved event overlaps it.
+    avoidance_counts = np.zeros(panel.tradable_mask.shape, dtype=np.int16)
+    verified_calendar = np.asarray(
+        [] if official_session_dates is None else official_session_dates,
+        dtype="datetime64[D]",
+    )
+    verified_future = verified_calendar[verified_calendar > panel_dates[-1]]
+    next_boundary = (
+        verified_future.min()
+        if verified_future.size
+        else np.busday_offset(panel_dates[-1], 1, roll="forward").astype(
+            "datetime64[D]"
+        )
+    )
+    symbol_to_index = {
+        str(symbol).strip().upper(): idx for idx, symbol in enumerate(panel.symbols)
+    }
+
+    can_sell = np.asarray(
+        panel.can_sell_mask
+        if panel.can_sell_mask is not None
+        else panel.tradable_mask,
+        dtype=bool,
+    )
+    can_buy = np.asarray(
+        panel.can_buy_mask
+        if panel.can_buy_mask is not None
+        else panel.tradable_mask,
+        dtype=bool,
+    )
+
+    def avoidance_start(transition: int, sym_idx: int) -> int:
+        # A single shared mask protects both cash longs and margin shorts.
+        # Anchor it at the latest close where either position can be flattened,
+        # then keep the entry ban active through the last cum-right close.
+        executable = np.flatnonzero(
+            can_sell[: transition + 1, sym_idx]
+            & can_buy[: transition + 1, sym_idx]
+            & np.isfinite(panel.close_prices[: transition + 1, sym_idx])
+            & (panel.close_prices[: transition + 1, sym_idx] > 0.0)
+        )
+        return int(executable[-1]) if executable.size else 0
+
+    applied_events = 0
+    for symbol, event_dates_ns in reference.event_dates_by_symbol.items():
+        sym_idx = symbol_to_index.get(symbol)
+        if sym_idx is None:
+            continue
+        event_dates = np.asarray(event_dates_ns, dtype="datetime64[D]")
+        in_horizon = (event_dates > panel_dates[0]) & (
+            event_dates <= next_boundary
+        )
+        if not bool(in_horizon.any()):
+            continue
+        selected_dates = event_dates[in_horizon]
+        # Official annual ex-date archives retain some dates on which the whole
+        # market was later closed (for example typhoon holidays).  Search on the
+        # verified exchange-session calendar and choose the last session before
+        # the declared event date; this is also the last executable close before
+        # the eventual adjusted opening and never shifts the liquidation later.
+        # We also admit every declared event through the next verified official
+        # session after the panel tail.  This includes an ex-date on an
+        # intervening whole-market closure: there is no executable close between
+        # the panel tail and that next session, so the tail is still the correct
+        # transition.  If the calendar has no future row, the fallback is exactly
+        # the next weekday; no farther event may collapse across an unobserved
+        # intervening business session.
+        transition_rows = (
+            np.searchsorted(panel_dates, selected_dates, side="left") - 1
+        )
+        for transition in transition_rows:
+            transition = int(transition)
+            start = avoidance_start(transition, sym_idx)
+            avoidance_counts[start : transition + 1, sym_idx] += 1
+            applied_events += 1
+    panel.cash_dividend_yield = None
+    panel.cash_dividend_payment_delay_sessions = None
+    exact_terms = reference.exact_cash_terms_by_symbol
+    if exact_terms is not None:
+        exact_start = reference.exact_coverage_start
+        exact_end = reference.exact_coverage_end
+        if exact_start is None or exact_end is None:
+            raise RuntimeError("exact entitlement terms are missing coverage bounds")
+        if panel_dates[0] < exact_start or panel_dates[-1] > exact_end:
+            print(
+                "[panel] exact cash entitlements unavailable for this horizon: "
+                f"panel={panel_dates[0]}..{panel_dates[-1]} "
+                f"archive={exact_start}..{exact_end}"
+            )
+        else:
+            yields = np.zeros(panel.tradable_mask.shape, dtype=np.float32)
+            delays = np.zeros(panel.tradable_mask.shape, dtype=np.int32)
+            exact_events = 0
+            downgraded_events = 0
+            for symbol, (event_dates, cash_amounts, payment_dates) in exact_terms.items():
+                sym_idx = symbol_to_index.get(symbol)
+                if sym_idx is None:
+                    continue
+                selected = (event_dates > panel_dates[0]) & (
+                    event_dates <= next_boundary
+                )
+                for event_date, cash_amount, payment_date in zip(
+                    event_dates[selected],
+                    cash_amounts[selected],
+                    payment_dates[selected],
+                ):
+                    transition = int(
+                        np.searchsorted(panel_dates, event_date, side="left") - 1
+                    )
+                    payment_row = int(
+                        np.searchsorted(panel_dates, payment_date, side="left")
+                    )
+                    delay = payment_row - transition
+                    if (
+                        transition < 0
+                        or payment_row >= int(panel_dates.size)
+                        or delay < 1
+                    ):
+                        downgraded_events += 1
+                        continue
+                    close = float(panel.close_prices[transition, sym_idx])
+                    if not np.isfinite(close) or close <= 0.0:
+                        downgraded_events += 1
+                        continue
+                    yields[transition, sym_idx] = np.float32(
+                        float(cash_amount) / close
+                    )
+                    delays[transition, sym_idx] = np.int32(delay)
+                    start = avoidance_start(transition, sym_idx)
+                    avoidance_counts[start : transition + 1, sym_idx] -= 1
+                    if bool(
+                        (avoidance_counts[start : transition + 1, sym_idx] < 0).any()
+                    ):
+                        raise RuntimeError(
+                            "exact cash event did not match an official avoidance interval"
+                        )
+                    exact_events += 1
+            panel.cash_dividend_yield = yields
+            panel.cash_dividend_payment_delay_sessions = delays
+            print(
+                "[panel] attached exact cash-entitlement ledger "
+                f"events={exact_events} downgraded_to_avoidance={downgraded_events}"
+            )
+            short_terms = reference.margin_short_stop_transfer_by_symbol or {}
+            force_short_cover = np.asarray(
+                panel.force_short_cover_mask
+                if panel.force_short_cover_mask is not None
+                else np.zeros_like(panel.tradable_mask, dtype=bool),
+                dtype=bool,
+            ).copy()
+            can_short_open = np.asarray(
+                panel.can_short_open_mask
+                if panel.can_short_open_mask is not None
+                else can_sell,
+                dtype=bool,
+            ).copy()
+            legal_cover_events = 0
+            conservative_cover_events = 0
+            known_short_events: dict[str, set[int]] = {}
+
+            def apply_short_cover_rule(
+                *, sym_idx: int, deadline: int, ban_end: int
+            ) -> bool:
+                if deadline < 0 or deadline >= int(panel_dates.size):
+                    return False
+                executable = np.flatnonzero(
+                    can_buy[: deadline + 1, sym_idx]
+                    & np.isfinite(panel.close_prices[: deadline + 1, sym_idx])
+                    & (panel.close_prices[: deadline + 1, sym_idx] > 0.0)
+                )
+                # Keep an impossible statutory cover observable.  If a short
+                # is actually carried into a deadline with no earlier
+                # executable buy, the executor must fail closed there rather
+                # than silently dropping the action.
+                cover_row = (
+                    int(executable[-1]) if executable.size else int(deadline)
+                )
+                force_short_cover[cover_row, sym_idx] = True
+                # When the deadline itself has no executable buy, the account
+                # has to cover on the last earlier executable close.  Do not
+                # allow a new short in the resulting gap because there would
+                # be no second mandatory-cover event.
+                can_short_open[
+                    cover_row : min(int(ban_end), int(panel_dates.size)), sym_idx
+                ] = False
+                return True
+
+            for symbol, (event_dates, stop_transfer_dates) in short_terms.items():
+                sym_idx = symbol_to_index.get(symbol)
+                if sym_idx is None:
+                    continue
+                selected = (event_dates > panel_dates[0]) & (
+                    event_dates <= next_boundary
+                )
+                for event_date, stop_transfer_date in zip(
+                    event_dates[selected], stop_transfer_dates[selected]
+                ):
+                    known_short_events.setdefault(symbol, set()).add(
+                        int(np.datetime64(event_date, "D").astype(np.int64))
+                    )
+                        # Article 76: close by the sixth exchange business day
+                        # before stop-transfer begins, and prohibit new margin
+                        # short sales for four sessions from that day.
+                    stop_insertion = int(
+                        np.searchsorted(
+                            panel_dates, stop_transfer_date, side="left"
+                        )
+                    )
+                    lunar_new_year_extra = (
+                        _article76_lunar_new_year_extra_business_days(
+                            panel_dates, stop_transfer_date
+                        )
+                    )
+                    deadline = stop_insertion - 6 + lunar_new_year_extra
+                    if apply_short_cover_rule(
+                        sym_idx=sym_idx,
+                        deadline=deadline,
+                        ban_end=deadline + 4,
+                    ):
+                        legal_cover_events += 1
+
+            # MOPS does not cover every ETF or historical complex action.  A
+            # reference ex-date still proves the last cum-right close.  Under
+            # T+2 entitlement settlement, transition-3 is the ordinary sixth
+            # business day before stop-transfer; using it without the Lunar
+            # New Year relaxation is no later than the statutory deadline and
+            # is therefore a conservative, non-look-ahead short fallback.
+            for symbol, event_dates_ns in reference.event_dates_by_symbol.items():
+                sym_idx = symbol_to_index.get(symbol)
+                if sym_idx is None:
+                    continue
+                known = known_short_events.get(symbol, set())
+                event_dates = np.asarray(event_dates_ns, dtype="datetime64[D]")
+                selected_dates = event_dates[
+                    (event_dates > panel_dates[0]) & (event_dates <= next_boundary)
+                ]
+                for event_date in selected_dates:
+                    event_day = int(event_date.astype(np.int64))
+                    if event_day in known:
+                        continue
+                    transition = int(
+                        np.searchsorted(panel_dates, event_date, side="left") - 1
+                    )
+                    if transition < 0:
+                        continue
+                    deadline = max(0, transition - 3)
+                    if apply_short_cover_rule(
+                        sym_idx=sym_idx,
+                        deadline=deadline,
+                        ban_end=transition + 1,
+                    ):
+                        conservative_cover_events += 1
+
+            panel.force_short_cover_mask = force_short_cover
+            panel.can_short_open_mask = can_short_open
+            print(
+                "[panel] applied corporate-action margin-short rules "
+                f"mops_article76={legal_cover_events} "
+                f"conservative_t2_fallback={conservative_cover_events}"
+            )
+    mask = avoidance_counts > 0
+    panel.unresolved_corporate_action_mask = mask
+    print(
+        "[panel] applied official corporate-action avoidance transitions "
+        f"events={applied_events} unique_transitions={int(mask.sum())}"
+    )
+    return panel
 
 
 def build_tail_panel(
@@ -1884,6 +3056,13 @@ def build_tail_panel(
         include_features=external_include_features,
         include_rules=external_include_rules,
         required=external_data_required,
+    )
+    corporate_action_paths = _resolve_corporate_action_reference_paths(
+        external_feature_path,
+        include_rules=external_include_rules,
+    )
+    corporate_action_reference = _load_corporate_action_reference(
+        corporate_action_paths
     )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
@@ -1976,6 +3155,13 @@ def build_tail_panel(
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
     panel = _slice_panel_start(panel, normalized_panel_start_date)
+    panel = _apply_corporate_action_avoidance_transitions(
+        panel,
+        corporate_action_reference,
+        None if external_features is None else external_features.official_session_dates,
+    )
+    if panel.unresolved_corporate_action_mask is not None:
+        panel = _attach_raw_close_forward_returns(panel)
     _print_feature_overview(panel)
     return panel
 
@@ -2010,6 +3196,11 @@ def load_cached_panel(
         include_rules=external_include_rules,
         required=external_data_required,
     )
+    corporate_action_paths = _resolve_corporate_action_reference_paths(
+        external_feature_path,
+        include_rules=external_include_rules,
+    )
+    _load_corporate_action_reference(corporate_action_paths)
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     feature_zero_fill_patterns = _normalize_feature_patterns(
@@ -2052,6 +3243,14 @@ def load_cached_panel(
     tradable_mode = str(tradable_mode).strip().lower()
     trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
     external_key = str(external_feature_path) if external_feature_path is not None else "none"
+    corporate_action_key = (
+        (
+            f"{corporate_action_paths.parquet}:"
+            f"{corporate_action_paths.entitlements_parquet or 'none'}"
+        )
+        if corporate_action_paths is not None
+        else "none"
+    )
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
@@ -2060,6 +3259,7 @@ def load_cached_panel(
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"external_features={bool(external_include_features)}|"
         f"external_rules={bool(external_include_rules)}|"
+        f"corporate_action_reference={corporate_action_key}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
@@ -2068,6 +3268,18 @@ def load_cached_panel(
     source_paths = [*parquet_paths, *security_metadata_paths]
     if external_feature_path is not None:
         source_paths.append(external_feature_path)
+    if corporate_action_paths is not None:
+        source_paths.extend(
+            [corporate_action_paths.parquet, corporate_action_paths.summary]
+        )
+        if corporate_action_paths.entitlements_parquet is not None:
+            assert corporate_action_paths.entitlements_summary is not None
+            source_paths.extend(
+                [
+                    corporate_action_paths.entitlements_parquet,
+                    corporate_action_paths.entitlements_summary,
+                ]
+            )
     source_hash = _compute_source_hash(source_paths)
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
@@ -2085,6 +3297,15 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
     traded_idx = rule_to_idx.get("_twpub_official_traded")
     delisted_idx = rule_to_idx.get("_twpub_delisted")
     short_ban_idx = rule_to_idx.get("_twpub_short_open_ban")
+    margin_short_evidence_idx = rule_to_idx.get(
+        "_twpub_margin_short_evidence_next_session"
+    )
+    short_capacity_idx = rule_to_idx.get(
+        "_twpub_short_capacity_shares_next_session"
+    )
+    margin_short_schema_present = (
+        margin_short_evidence_idx is not None or short_capacity_idx is not None
+    )
     force_short_cover_idx = rule_to_idx.get("_twpub_force_short_cover")
     force_cover_lead_idx = rule_to_idx.get("_twpub_force_cover_lead_sessions")
     force_cover_anchor_idx = rule_to_idx.get("_twpub_force_cover_anchor_ordinal")
@@ -2096,7 +3317,35 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         )
     force_cover_cancel_idx = rule_to_idx.get("_twpub_force_cover_cancel_ordinal")
     trading_halt_idx = rule_to_idx.get("_twpub_trading_halt")
-    if all(
+    day_trade_eligible_idx = rule_to_idx.get("_twpub_day_trade_eligible")
+    day_trade_short_open_idx = rule_to_idx.get("_twpub_day_trade_short_open")
+
+    def has_finite_rule_evidence(rule_index: int | None) -> bool:
+        if rule_index is None:
+            return False
+        return any(
+            values.ndim == 2
+            and int(values.shape[1]) > int(rule_index)
+            and bool(np.isfinite(values[:, rule_index]).any())
+            for _, values in external_features.by_symbol_rules.values()
+        )
+
+    # A fixed external schema can contain all-null columns before the producer
+    # has been backfilled.  Such a column is absence of evidence, not an
+    # all-false historical rule mask.
+    if not has_finite_rule_evidence(day_trade_eligible_idx):
+        day_trade_eligible_idx = None
+    if not has_finite_rule_evidence(day_trade_short_open_idx):
+        day_trade_short_open_idx = None
+    # The two margin fields form one atomic evidence contract.  A partially
+    # generated schema is unknown, not permission to infer capacity.
+    if not (
+        has_finite_rule_evidence(margin_short_evidence_idx)
+        and has_finite_rule_evidence(short_capacity_idx)
+    ):
+        margin_short_evidence_idx = None
+        short_capacity_idx = None
+    if not margin_short_schema_present and all(
         idx is None
         for idx in (
             up_idx,
@@ -2104,21 +3353,61 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             traded_idx,
             delisted_idx,
             short_ban_idx,
+            margin_short_evidence_idx,
+            short_capacity_idx,
             force_short_cover_idx,
             force_cover_lead_idx,
             force_cover_anchor_idx,
             force_cover_cancel_idx,
             trading_halt_idx,
+            day_trade_eligible_idx,
+            day_trade_short_open_idx,
         )
     ):
         return panel
 
     can_buy = np.asarray(panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask, dtype=bool).copy()
     can_sell = np.asarray(panel.can_sell_mask if panel.can_sell_mask is not None else panel.tradable_mask, dtype=bool).copy()
+    day_trade_can_buy_open = np.asarray(
+        panel.day_trade_can_buy_open_mask
+        if panel.day_trade_can_buy_open_mask is not None
+        else panel.tradable_mask,
+        dtype=bool,
+    ).copy()
+    day_trade_can_sell_open = np.asarray(
+        panel.day_trade_can_sell_open_mask
+        if panel.day_trade_can_sell_open_mask is not None
+        else panel.tradable_mask,
+        dtype=bool,
+    ).copy()
     can_short_open = np.asarray(
         panel.can_short_open_mask if panel.can_short_open_mask is not None else can_sell,
         dtype=bool,
     ).copy()
+    margin_short_rules_available = (
+        margin_short_evidence_idx is not None and short_capacity_idx is not None
+    )
+    if margin_short_schema_present:
+        # Margin eligibility must be reconstructed solely from exact official
+        # evidence.  An all-null or partially generated rule schema is still a
+        # declared margin contract, so every symbol/date remains false/zero.
+        can_short_open = np.zeros_like(panel.tradable_mask, dtype=bool)
+        short_capacity_shares: np.ndarray | None = np.zeros(
+            panel.tradable_mask.shape,
+            dtype=np.int64,
+        )
+    elif panel.short_capacity_shares is None:
+        short_capacity_shares = None
+    else:
+        short_capacity_shares = np.asarray(
+            panel.short_capacity_shares,
+            dtype=np.int64,
+        ).copy()
+    short_margin_rate = (
+        None
+        if panel.short_margin_rate is None
+        else np.asarray(panel.short_margin_rate).copy()
+    )
     force_short_cover = np.asarray(
         panel.force_short_cover_mask
         if panel.force_short_cover_mask is not None
@@ -2132,6 +3421,20 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         dtype=bool,
     ).copy()
     close_prices = np.asarray(panel.close_prices, dtype=np.float64)
+    day_trade_eligible = (
+        np.asarray(panel.day_trade_eligible_mask, dtype=bool).copy()
+        if panel.day_trade_eligible_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool)
+        if day_trade_eligible_idx is not None
+        else None
+    )
+    day_trade_short_open = (
+        np.asarray(panel.day_trade_can_short_open_mask, dtype=bool).copy()
+        if panel.day_trade_can_short_open_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool)
+        if day_trade_short_open_idx is not None
+        else None
+    )
     changed_buy = 0
     changed_sell = 0
 
@@ -2149,16 +3452,70 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         if rule_values.size == 0:
             continue
         aligned_rules = _align_external_values(panel.dates, rule_dates, rule_values)
+        if margin_short_rules_available:
+            assert margin_short_evidence_idx is not None
+            assert short_capacity_idx is not None
+            assert short_capacity_shares is not None
+            evidence_values = aligned_rules[:, margin_short_evidence_idx]
+            capacity_values = aligned_rules[:, short_capacity_idx]
+            source_valid = (
+                np.isfinite(evidence_values)
+                & (evidence_values > 0.0)
+                & np.isfinite(capacity_values)
+                & (capacity_values >= 0.0)
+                & (capacity_values == np.floor(capacity_values))
+                & (capacity_values <= float(np.iinfo(np.int64).max))
+            )
+            # Row t's official closing balance and explicitly named
+            # next-business-day limit become usable on exactly panel session
+            # t+1.  Missing t evidence never forward-fills across a gap.
+            next_session_valid = np.zeros((panel.num_dates,), dtype=bool)
+            next_session_capacity = np.zeros((panel.num_dates,), dtype=np.int64)
+            if panel.num_dates > 1:
+                next_session_valid[1:] = source_valid[:-1]
+                valid_source_rows = source_valid[:-1]
+                if bool(valid_source_rows.any()):
+                    source_rows = np.flatnonzero(valid_source_rows)
+                    next_session_capacity[source_rows + 1] = capacity_values[
+                        source_rows
+                    ].astype(np.int64, copy=False)
+            # Eligibility and inventory are separate contracts.  A valid
+            # margin-short row with zero demonstrated headroom is still an
+            # eligible security; the capacity tensor blocks it only when the
+            # account configuration enables the inventory ceiling.
+            can_short_open[:, sym_idx] = next_session_valid
+            short_capacity_shares[:, sym_idx] = next_session_capacity
+        if day_trade_eligible_idx is not None and day_trade_eligible is not None:
+            eligibility_values = aligned_rules[:, day_trade_eligible_idx]
+            observed = np.isfinite(eligibility_values)
+            if bool(observed.any()):
+                # The producer emits explicit 0/1 membership for every venue
+                # universe row on the exact session.  Never carry membership
+                # across a missing receipt.
+                day_trade_eligible[observed, sym_idx] = (
+                    eligibility_values[observed] > 0.0
+                )
+        if day_trade_short_open_idx is not None and day_trade_short_open is not None:
+            direction_values = aligned_rules[:, day_trade_short_open_idx]
+            observed_direction = np.isfinite(direction_values)
+            if bool(observed_direction.any()):
+                day_trade_short_open[observed_direction, sym_idx] = (
+                    direction_values[observed_direction] > 0.0
+                )
         if trading_halt_idx is not None:
             halted = np.isfinite(aligned_rules[:, trading_halt_idx]) & (aligned_rules[:, trading_halt_idx] > 0.0)
             if bool(halted.any()):
                 can_buy[halted, sym_idx] = False
                 can_sell[halted, sym_idx] = False
+                day_trade_can_buy_open[halted, sym_idx] = False
+                day_trade_can_sell_open[halted, sym_idx] = False
                 can_short_open[halted, sym_idx] = False
                 panel.returns_1d[halted, sym_idx] = 0.0
         if short_ban_idx is not None:
             short_banned = np.isfinite(aligned_rules[:, short_ban_idx]) & (aligned_rules[:, short_ban_idx] > 0.0)
             can_short_open[short_banned, sym_idx] = False
+            if day_trade_short_open is not None:
+                day_trade_short_open[short_banned, sym_idx] = False
         delisted_rows = np.empty((0,), dtype=np.int64)
         delisted_blocked = np.zeros((panel.num_dates,), dtype=bool)
         if delisted_idx is not None:
@@ -2225,6 +3582,8 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
                     panel.tradable_mask[suspended, sym_idx] = True
                     can_buy[suspended, sym_idx] = False
                     can_sell[suspended, sym_idx] = False
+                    day_trade_can_buy_open[suspended, sym_idx] = False
+                    day_trade_can_sell_open[suspended, sym_idx] = False
                     can_short_open[suspended, sym_idx] = False
                     panel.returns_1d[suspended, sym_idx] = 0.0
         if delisted_rows.size:
@@ -2232,14 +3591,26 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             panel.tradable_mask[delisted_blocked, sym_idx] = False
             can_buy[delisted_blocked, sym_idx] = False
             can_sell[delisted_blocked, sym_idx] = False
+            day_trade_can_buy_open[delisted_blocked, sym_idx] = False
+            day_trade_can_sell_open[delisted_blocked, sym_idx] = False
             can_short_open[delisted_blocked, sym_idx] = False
         close_ret = _safe_log_ratio_array(close_prices[:, sym_idx], _shift_array(close_prices[:, sym_idx], 1))
+        open_ret = _safe_log_ratio_array(
+            np.asarray(panel.open_prices[:, sym_idx], dtype=np.float64),
+            _shift_array(close_prices[:, sym_idx], 1),
+        ) if panel.open_prices is not None else np.full_like(close_ret, np.nan)
 
         if up_idx is not None:
             next_limit_up_ret = _shift_array(aligned_rules[:, up_idx], 1)
             is_limit_up = np.isfinite(next_limit_up_ret) & np.isfinite(close_ret) & (close_ret >= (next_limit_up_ret - 1e-6))
             before = can_buy[:, sym_idx].copy()
             can_buy[:, sym_idx] &= ~is_limit_up
+            open_is_limit_up = (
+                np.isfinite(next_limit_up_ret)
+                & np.isfinite(open_ret)
+                & (open_ret >= (next_limit_up_ret - 1e-6))
+            )
+            day_trade_can_buy_open[:, sym_idx] &= ~open_is_limit_up
             changed_buy += int(np.count_nonzero(before & ~can_buy[:, sym_idx]))
 
         if down_idx is not None:
@@ -2247,6 +3618,12 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             is_limit_down = np.isfinite(next_limit_down_ret) & np.isfinite(close_ret) & (close_ret <= (next_limit_down_ret + 1e-6))
             before = can_sell[:, sym_idx].copy()
             can_sell[:, sym_idx] &= ~is_limit_down
+            open_is_limit_down = (
+                np.isfinite(next_limit_down_ret)
+                & np.isfinite(open_ret)
+                & (open_ret <= (next_limit_down_ret + 1e-6))
+            )
+            day_trade_can_sell_open[:, sym_idx] &= ~open_is_limit_down
             changed_sell += int(np.count_nonzero(before & ~can_sell[:, sym_idx]))
 
         if force_short_cover_idx is not None:
@@ -2331,6 +3708,13 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
             "[panel] external TW public limit rules updated masks "
             f"(blocked_buy={changed_buy}, blocked_sell={changed_sell})"
         )
+    effective_short_open = can_short_open & can_sell
+    if short_capacity_shares is not None:
+        short_capacity_shares = np.where(
+            effective_short_open,
+            short_capacity_shares,
+            0,
+        ).astype(np.int64, copy=False)
     return PanelData(
         dates=panel.dates,
         symbols=panel.symbols,
@@ -2340,13 +3724,27 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         tradable_mask=panel.tradable_mask,
         can_buy_mask=can_buy,
         can_sell_mask=can_sell,
-        can_short_open_mask=can_short_open & can_sell,
+        can_short_open_mask=effective_short_open,
         force_short_cover_mask=force_short_cover,
         force_exit_mask=force_exit,
+        short_capacity_shares=short_capacity_shares,
+        short_margin_rate=short_margin_rate,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
         daily_volumes=panel.daily_volumes,
+        open_prices=panel.open_prices,
+        intraday_returns=panel.intraday_returns,
+        day_trade_eligible_mask=day_trade_eligible,
+        day_trade_can_short_open_mask=day_trade_short_open,
+        day_trade_can_buy_open_mask=day_trade_can_buy_open,
+        day_trade_can_sell_open_mask=day_trade_can_sell_open,
+        raw_close_returns_1d=panel.raw_close_returns_1d,
+        unresolved_corporate_action_mask=panel.unresolved_corporate_action_mask,
+        cash_dividend_yield=panel.cash_dividend_yield,
+        cash_dividend_payment_delay_sessions=(
+            panel.cash_dividend_payment_delay_sessions
+        ),
     )
 
 
@@ -2471,6 +3869,50 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         if "daily_volumes" in cached_keys
         else np.full_like(close_prices, np.nan, dtype=np.float32)
     )
+    open_prices = cached["open_prices"] if "open_prices" in cached_keys else None
+    intraday_returns = (
+        cached["intraday_returns"] if "intraday_returns" in cached_keys else None
+    )
+    day_trade_eligible_mask = (
+        cached["day_trade_eligible_mask"]
+        if "day_trade_eligible_mask" in cached_keys
+        else None
+    )
+    day_trade_can_short_open_mask = (
+        cached["day_trade_can_short_open_mask"]
+        if "day_trade_can_short_open_mask" in cached_keys
+        else None
+    )
+    day_trade_can_buy_open_mask = (
+        cached["day_trade_can_buy_open_mask"]
+        if "day_trade_can_buy_open_mask" in cached_keys
+        else None
+    )
+    day_trade_can_sell_open_mask = (
+        cached["day_trade_can_sell_open_mask"]
+        if "day_trade_can_sell_open_mask" in cached_keys
+        else None
+    )
+    unresolved_corporate_action_mask = (
+        cached["unresolved_corporate_action_mask"]
+        if "unresolved_corporate_action_mask" in cached_keys
+        else None
+    )
+    raw_close_returns_1d = (
+        cached["raw_close_returns_1d"]
+        if "raw_close_returns_1d" in cached_keys
+        else None
+    )
+    short_capacity_shares = (
+        cached["short_capacity_shares"]
+        if "short_capacity_shares" in cached_keys
+        else None
+    )
+    short_margin_rate = (
+        cached["short_margin_rate"]
+        if "short_margin_rate" in cached_keys
+        else None
+    )
     return PanelData(
         dates=cached["dates"],
         symbols=cached["symbols"].tolist(),
@@ -2483,10 +3925,30 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         force_exit_mask=force_exit_mask,
+        short_capacity_shares=short_capacity_shares,
+        short_margin_rate=short_margin_rate,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
         close_prices=close_prices,
         daily_volumes=daily_volumes,
+        open_prices=open_prices,
+        intraday_returns=intraday_returns,
+        day_trade_eligible_mask=day_trade_eligible_mask,
+        day_trade_can_short_open_mask=day_trade_can_short_open_mask,
+        day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+        day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+        raw_close_returns_1d=raw_close_returns_1d,
+        unresolved_corporate_action_mask=unresolved_corporate_action_mask,
+        cash_dividend_yield=(
+            cached["cash_dividend_yield"]
+            if "cash_dividend_yield" in cached_keys
+            else None
+        ),
+        cash_dividend_payment_delay_sessions=(
+            cached["cash_dividend_payment_delay_sessions"]
+            if "cash_dividend_payment_delay_sessions" in cached_keys
+            else None
+        ),
     )
 
 
@@ -2513,10 +3975,32 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         can_short_open_mask=can_short_open_mask,
         force_short_cover_mask=force_short_cover_mask,
         force_exit_mask=force_exit_mask,
+        short_capacity_shares=payload.get("short_capacity_shares"),
+        short_margin_rate=payload.get("short_margin_rate"),
         alive_mask=payload["alive_mask"],
         benchmark_returns=payload["benchmark_returns"],
         close_prices=close_prices,
         daily_volumes=daily_volumes,
+        open_prices=payload.get("open_prices"),
+        intraday_returns=payload.get("intraday_returns"),
+        day_trade_eligible_mask=payload.get("day_trade_eligible_mask"),
+        day_trade_can_short_open_mask=payload.get(
+            "day_trade_can_short_open_mask"
+        ),
+        day_trade_can_buy_open_mask=payload.get(
+            "day_trade_can_buy_open_mask"
+        ),
+        day_trade_can_sell_open_mask=payload.get(
+            "day_trade_can_sell_open_mask"
+        ),
+        raw_close_returns_1d=payload.get("raw_close_returns_1d"),
+        unresolved_corporate_action_mask=payload.get(
+            "unresolved_corporate_action_mask"
+        ),
+        cash_dividend_yield=payload.get("cash_dividend_yield"),
+        cash_dividend_payment_delay_sessions=payload.get(
+            "cash_dividend_payment_delay_sessions"
+        ),
     )
 
 
@@ -2657,10 +4141,24 @@ def _filter_panel_features(
         can_short_open_mask=panel.can_short_open_mask,
         force_short_cover_mask=panel.force_short_cover_mask,
         force_exit_mask=panel.force_exit_mask,
+        short_capacity_shares=panel.short_capacity_shares,
+        short_margin_rate=panel.short_margin_rate,
         alive_mask=panel.alive_mask,
         benchmark_returns=panel.benchmark_returns,
         close_prices=panel.close_prices,
         daily_volumes=panel.daily_volumes,
+        open_prices=panel.open_prices,
+        intraday_returns=panel.intraday_returns,
+        day_trade_eligible_mask=panel.day_trade_eligible_mask,
+        day_trade_can_short_open_mask=panel.day_trade_can_short_open_mask,
+        day_trade_can_buy_open_mask=panel.day_trade_can_buy_open_mask,
+        day_trade_can_sell_open_mask=panel.day_trade_can_sell_open_mask,
+        raw_close_returns_1d=panel.raw_close_returns_1d,
+        unresolved_corporate_action_mask=panel.unresolved_corporate_action_mask,
+        cash_dividend_yield=panel.cash_dividend_yield,
+        cash_dividend_payment_delay_sessions=(
+            panel.cash_dividend_payment_delay_sessions
+        ),
     )
 
 
@@ -2730,7 +4228,15 @@ def _load_valid_panel_cache(
     ):
         cache_dir = panel_cache_v2_dir(parquet_root)
         print(f"[panel] loading cache v2 (valid): {cache_dir}")
-        return _panel_from_cache_payload(load_panel_cache_v2(parquet_root, mmap_mode="c"))
+        return _panel_from_cache_payload(
+            load_panel_cache_v2(
+                parquet_root,
+                mmap_mode="c",
+                source_hash=source_hash,
+                backend_key=backend_key,
+                version=PANEL_CACHE_VERSION,
+            )
+        )
 
     cache_path = _panel_cache_path(parquet_root)
     meta_path = _cache_meta_path(parquet_root)
@@ -2768,6 +4274,13 @@ def build_panel(
         include_features=external_include_features,
         include_rules=external_include_rules,
         required=external_data_required,
+    )
+    corporate_action_paths = _resolve_corporate_action_reference_paths(
+        external_feature_path,
+        include_rules=external_include_rules,
+    )
+    corporate_action_reference = _load_corporate_action_reference(
+        corporate_action_paths
     )
     feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
@@ -2838,6 +4351,14 @@ def build_panel(
         raise RuntimeError("data.panel_backend='auto' requires pyarrow")
 
     external_key = str(external_feature_path) if external_feature_path is not None else "none"
+    corporate_action_key = (
+        (
+            f"{corporate_action_paths.parquet}:"
+            f"{corporate_action_paths.entitlements_parquet or 'none'}"
+        )
+        if corporate_action_paths is not None
+        else "none"
+    )
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
@@ -2846,6 +4367,7 @@ def build_panel(
         f"external={external_key}|external_market_symbol={external_market_symbol}|"
         f"external_features={bool(external_include_features)}|"
         f"external_rules={bool(external_include_rules)}|"
+        f"corporate_action_reference={corporate_action_key}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
@@ -2854,6 +4376,18 @@ def build_panel(
     source_paths = [*parquet_paths, *security_metadata_paths]
     if external_feature_path is not None:
         source_paths.append(external_feature_path)
+    if corporate_action_paths is not None:
+        source_paths.extend(
+            [corporate_action_paths.parquet, corporate_action_paths.summary]
+        )
+        if corporate_action_paths.entitlements_parquet is not None:
+            assert corporate_action_paths.entitlements_summary is not None
+            source_paths.extend(
+                [
+                    corporate_action_paths.entitlements_parquet,
+                    corporate_action_paths.entitlements_summary,
+                ]
+            )
     source_hash = _compute_source_hash(source_paths)
 
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
@@ -2923,6 +4457,13 @@ def build_panel(
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
     panel = _slice_panel_start(panel, normalized_panel_start_date)
+    panel = _apply_corporate_action_avoidance_transitions(
+        panel,
+        corporate_action_reference,
+        None if external_features is None else external_features.official_session_dates,
+    )
+    if panel.unresolved_corporate_action_mask is not None:
+        panel = _attach_raw_close_forward_returns(panel)
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)

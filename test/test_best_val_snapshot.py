@@ -67,6 +67,84 @@ def test_save_best_val_backtest_snapshot_writes_compressed_npz_and_metadata(tmp_
     assert archive["weights_history"].shape == (0, 5)
 
 
+def test_best_val_tw_cash_snapshot_preserves_short_collateral_state(
+    tmp_path: Path,
+) -> None:
+    backtest = BacktestResultTensor(
+        strategy_returns=torch.tensor([0.01, -0.02, 0.03]),
+        benchmark_returns=torch.zeros(3),
+        turnovers=torch.tensor([0.1, 0.2, 0.3]),
+        weights_history=torch.tensor(
+            [[-0.4, 0.6], [-0.3, 0.7], [-0.2, 0.8]],
+            dtype=torch.float32,
+        ),
+        requested_weights_history=torch.tensor(
+            [[-0.5, 0.5], [-0.4, 0.6], [-0.3, 0.7]],
+            dtype=torch.float32,
+        ),
+        execution_mode="tw_cash",
+        settlement_ledger_unit="nav_ratio",
+        cash_history=torch.tensor([0.5, 0.4, 0.3]),
+        payables_history=torch.tensor(
+            [[0.0, 0.2], [0.2, 0.1], [0.1, 0.0]]
+        ),
+        receivables_history=torch.zeros((3, 2)),
+        settlement_default=torch.zeros(3, dtype=torch.bool),
+        equity_scale_history=torch.tensor([1.0, 0.98, 1.01]),
+        short_sale_collateral_history=torch.tensor(
+            [[40.0, 0.0], [30.0, 0.0], [20.0, 0.0]]
+        ),
+        short_margin_collateral_history=torch.tensor(
+            [[36.0, 0.0], [27.0, 0.0], [18.0, 0.0]]
+        ),
+        final_weights=torch.tensor([-0.2, 0.8]),
+        final_cash=torch.tensor(0.3),
+        final_payables=torch.tensor([0.1, 0.0]),
+        final_receivables=torch.zeros(2),
+        final_alive=torch.tensor(True),
+        final_equity_scale=torch.tensor(1.01),
+        final_short_sale_collateral=torch.tensor([20.0, 0.0]),
+        final_short_margin_collateral=torch.tensor([18.0, 0.0]),
+    )
+    fold = WalkForwardFold(
+        fold_id=25,
+        train_indices=np.array([0], dtype=np.int64),
+        val_indices=np.array([1, 2, 3], dtype=np.int64),
+        test_indices=np.array([4], dtype=np.int64),
+        train_years=[2024],
+        val_years=[2025],
+        test_years=[2026],
+    )
+
+    _save_best_val_backtest_snapshot(
+        fold_dir=tmp_path,
+        fold=fold,
+        epoch=3,
+        val_loss=-0.5,
+        val_backtest=backtest,
+        row_start=1,
+        row_end=3,
+        dates=np.array(["2025-01-02", "2025-01-03"], dtype="datetime64[D]"),
+        objective="log_utility",
+    )
+
+    with np.load(tmp_path / "best_val_backtest.npz") as archive:
+        np.testing.assert_array_equal(
+            archive["short_sale_collateral_history"],
+            [[30.0, 0.0], [20.0, 0.0]],
+        )
+        np.testing.assert_array_equal(
+            archive["short_margin_collateral_history"],
+            [[27.0, 0.0], [18.0, 0.0]],
+        )
+        np.testing.assert_array_equal(
+            archive["final_short_sale_collateral"], [20.0, 0.0]
+        )
+        np.testing.assert_array_equal(
+            archive["final_short_margin_collateral"], [18.0, 0.0]
+        )
+
+
 def test_save_fold_output_artifacts_writes_standard_files_with_compressed_backtest(tmp_path: Path) -> None:
     model = nn.Linear(2, 1)
     backtest = BacktestResult(

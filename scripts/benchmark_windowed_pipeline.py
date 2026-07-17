@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 
+from stockagent.backtest.tw_execution import require_naive_execution_for_tool
 from stockagent.config import load_config
 from stockagent.data.panel import build_panel
 from stockagent.data.walkforward import build_expanding_year_folds
@@ -36,6 +37,10 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    require_naive_execution_for_tool(
+        config.trading.execution_mode,
+        tool_name="benchmark_windowed_pipeline.py",
+    )
     lookback = int(args.lookback) if args.lookback is not None else int(config.training.lookback)
     device = torch.device(args.device)
     panel = build_panel(
@@ -69,7 +74,14 @@ def main() -> None:
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
     fold = folds[min(args.fold_index, len(folds) - 1)]
-    dataset = CrossSectionalDataset(panel, fold.train_indices, lookback)
+    dataset = CrossSectionalDataset(
+        panel,
+        fold.train_indices,
+        lookback,
+        execution_mode=config.trading.execution_mode,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+    )
     configured_batch = int(args.batch_size) if args.batch_size is not None else int(config.training.batch_size_train)
     batch_size = max(1, min(configured_batch, len(dataset)))
 

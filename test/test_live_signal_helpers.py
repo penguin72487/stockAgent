@@ -17,11 +17,22 @@ from stockagent.live.signal_engine import (
     _live_weights_has_date,
     _load_previous_weights,
     _previous_usable_panel_date,
+    _require_supported_live_execution,
     _resolve_usable_panel_index,
     write_live_weights_history,
 )
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
+
+
+def test_live_signal_real_execution_modes_fail_closed_without_broker_ledger() -> None:
+    assert _require_supported_live_execution("naive") == "naive"
+    for mode in ("tw_cash", "tw_day_trade"):
+        with np.testing.assert_raises_regex(
+            RuntimeError,
+            "Refusing to fall back to naive execution",
+        ):
+            _require_supported_live_execution(mode)
 
 
 def test_estimate_drifted_weights_marks_signed_portfolio_to_market() -> None:
