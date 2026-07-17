@@ -10,7 +10,9 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean,
     masked_softmax,
+    normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode
 
 
 class CausalDepthwiseSeparableTCNBlock(nn.Module):
@@ -264,6 +266,7 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         residual_scale: float = 0.5,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_only",
+        portfolio_activation: str = "identity",
         return_aux: bool = True,
         runtime_shape_check: bool = False,
         allow_dynamic_symbols: bool = True,
@@ -275,7 +278,8 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         self.temporal_enabled = bool(temporal_enabled)
         self.set_enabled = bool(set_enabled)
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.return_aux = bool(return_aux)
         self.runtime_shape_check = bool(runtime_shape_check)
         self.allow_dynamic_symbols = bool(allow_dynamic_symbols)
@@ -334,18 +338,6 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
         head.append(nn.Linear(in_dim, 1))
         self.score_head = nn.Sequential(*head)
 
-    @staticmethod
-    def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-        normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-        if normalized in {"long", "long_only", "longonly"}:
-            return "long_only"
-        if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-            return "long_short"
-        raise ValueError(
-            "EfficientTCNTabularSetPortfolioModel portfolio_mode must be "
-            "'long_only' or 'long_short'"
-        )
-
     def _check_shapes(self, x: torch.Tensor, mask: torch.Tensor | None) -> None:
         if x.dim() != 4:
             raise ValueError(f"Expected x shape [B,L,S,F], got ndim={x.dim()}")
@@ -397,10 +389,10 @@ class EfficientTCNTabularSetPortfolioModel(nn.Module):
             temp = masked_scores.new_tensor(float(temperature))
         temp = torch.clamp(temp, min=0.05)
         if self.portfolio_mode == "long_only":
-            weights = masked_softmax(masked_scores / temp, mask_bool)
+            weights = masked_softmax(masked_scores / temp, mask_bool, activation=self.portfolio_activation)
         else:
             relative_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            weights = dual_branch_softmax(relative_scores / temp, mask_bool)
+            weights = dual_branch_softmax(relative_scores / temp, mask_bool, activation=self.portfolio_activation)
 
         aux = {
             "z_time": z_time,

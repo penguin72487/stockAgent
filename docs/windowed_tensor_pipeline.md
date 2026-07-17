@@ -1,13 +1,13 @@
 # Windowed Tensor Pipeline
 
-This project defaults to lazy windowed tensors for neural training when the loss
-objective is compatible with canonical tensor backtesting.
+Neural training always starts from lazy `WindowedSplitTensors`. There is no
+configuration switch that can select the removed persistent materialized-window
+executor.
 
 Default config:
 
 ```yaml
 training:
-  materialize_window_tensors: false
   compile_loss: true
 data:
   panel_backend: auto
@@ -40,7 +40,8 @@ shape without changing the loss.
 Run:
 
 ```bash
-/home/user/miniforge3/envs/fintech/bin/python scripts/benchmark_windowed_pipeline.py \
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_windowed_pipeline.py \
   --config configs/experiment_baseline.yaml
 ```
 
@@ -54,5 +55,8 @@ setup and per-batch gather time. It does not change the training config.
 - Portfolio state is carried across chunks and reset only at fold/segment
   boundaries.
 - Return-series losses keep batch order sequential.
-- Special rank-objective eval paths keep the existing materialized tensor path
-  until they are separately refactored.
+- Contiguous batches use the compile-friendly panel-slab forward. A guarded
+  per-batch window gather remains only for models or batch shapes that cannot
+  satisfy the slab contract; it does not materialize and retain the full split.
+- Rank and auxiliary objectives still consume the same lazy model-forward path;
+  only their objective reduction may require collecting all fold outputs.

@@ -1,0 +1,49 @@
+market: crypto
+label: 加密貨幣
+enabled: false
+market_type: crypto
+timezone: UTC
+open_time:
+close_time:
+schedule_time:
+schedule_interval_minutes: 15
+schedule_delay_seconds: 45
+summary_time:
+data_ready_time: "00:00"
+freshness_max_lag_days: 1
+freshness_max_lag_minutes: 90
+freshness_scan_limit: 0
+history_frequency: bar
+pre_signal_command:
+  - "{python}"
+  - downloader/download_okx_perp_15m.py
+  - --output-dir
+  - data_okx
+  - --mode
+  - incremental
+  - --workers
+  - "16"
+pre_signal_timeout_seconds: 900
+
+config_path: configs/markets/crypto.yaml
+output_dir: artifacts/markets/crypto
+live_output_dir: artifacts/live_signals/crypto
+
+# null/empty/auto/latest means: discover the latest fold_*/checkpoint_best.pt.
+fold_id:
+checkpoint_path:
+weights_path:
+
+panel_date: latest
+device: cuda
+price_source: panel
+prices_csv:
+yahoo_chunk_size: 80
+
+top_n: 388
+min_abs_delta: 0.001
+benchmark_window_days: 32
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 1.05
+unsupported_message: "**加密貨幣** 目前暫停支援，完成資料與推論驗證後再重新開放。"

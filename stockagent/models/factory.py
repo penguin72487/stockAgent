@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+import fnmatch
+
 from torch import nn
 
 from stockagent.config import ExperimentConfig
@@ -7,6 +10,8 @@ from stockagent.models.bottleneck_portfolio_autoencoder import BottleneckPortfol
 from stockagent.models.cross_sectional_temporal_portfolio_model import CrossSectionalTemporalPortfolioModel
 from stockagent.models.efficient_tcn_tabular_set_portfolio import EfficientTCNTabularSetPortfolioModel
 from stockagent.models.ft_transformer import CrossSectionalFTTransformer
+from stockagent.models.financial_transformer import FinancialTransformerModel
+from stockagent.models.gradient_boosted_portfolio_transformer import GradientBoostedPortfolioTransformer
 from stockagent.models.latent_factor_market_token_portfolio import LatentFactorMarketTokenPortfolioModel
 from stockagent.models.low_rank_market_transformer_portfolio import LowRankMarketTransformerPortfolioModel
 from stockagent.models.mlp import CrossSectionalMLP
@@ -20,6 +25,30 @@ from stockagent.models.tree_models import CrossSectionalLightGBM, CrossSectional
 
 def _normalized_model_name(model_name: str) -> str:
     return model_name.strip().lower().replace("-", "_")
+
+
+def _feature_indices_from_patterns(
+    feature_names: Sequence[str] | None,
+    patterns: Sequence[str] | None,
+) -> list[int]:
+    if not feature_names or not patterns:
+        return []
+    selected: list[int] = []
+    seen: set[int] = set()
+    names = [str(name) for name in feature_names]
+    for raw_pattern in patterns:
+        pattern = str(raw_pattern).strip()
+        if not pattern:
+            continue
+        if any(char in pattern for char in "*?[]"):
+            matches = [idx for idx, name in enumerate(names) if fnmatch.fnmatchcase(name, pattern)]
+        else:
+            matches = [idx for idx, name in enumerate(names) if name == pattern]
+        for idx in matches:
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+    return selected
 
 
 _EFFICIENT_TCN_TABULAR_SET_NAMES = {
@@ -62,6 +91,22 @@ _TRANSFORMER_BASE_PORTFOLIO_NAMES = {
     "tbp",
 }
 
+_FINANCIAL_TRANSFORMER_NAMES = {
+    "financial_transformer",
+    "financial_transformer_model",
+    "financial_token_transformer",
+    "financial_tokenized_transformer",
+}
+
+_GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES = {
+    "gradient_boosted_portfolio_transformer",
+    "gradient_boosted_portfolio_transformer_model",
+    "gradient_boosted_transformer_portfolio",
+    "boosted_portfolio_transformer",
+    "boosted_transformer_portfolio",
+    "gbpt",
+}
+
 
 def model_hidden_dim_hint(config: ExperimentConfig) -> int:
     """Return a representative hidden width for VRAM/sample-size estimation."""
@@ -82,13 +127,17 @@ def model_hidden_dim_hint(config: ExperimentConfig) -> int:
         return int(config.training.low_rank_market_transformer_portfolio.stock_embedding_dim)
     if model_name in _TRANSFORMER_BASE_PORTFOLIO_NAMES:
         return int(config.training.transformer_base_portfolio.d_model)
+    if model_name in _FINANCIAL_TRANSFORMER_NAMES:
+        return int(config.training.financial_transformer.d_model)
+    if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
+        return int(config.training.gradient_boosted_portfolio_transformer.d_model)
     if model_name in _BOTTLENECK_PORTFOLIO_AUTOENCODER_NAMES:
         return int(config.training.bottleneck_portfolio_autoencoder.d_model)
     if model_name in {"tcn_hybrid_tabular_resnet", "tcn_hybrid", "tcn_tabresnet"}:
         return int(config.training.tcn_hybrid_tabular_resnet.embedding_dim)
     if model_name in {"cross_sectional_temporal_portfolio_model", "portfolio_multitask", "cstpm"}:
         cstpm_cfg = config.training.cross_sectional_temporal_portfolio_model
-        return int(getattr(cstpm_cfg, "d_model", cstpm_cfg.cross_hidden_dim))
+        return int(cstpm_cfg.d_model)
     if model_name in {"temporal_tabular_resnet", "temporal_resnet", "temporal_tabresnet"}:
         return int(config.training.temporal_tabular_resnet.hidden_dim)
     if model_name in {"lightgbm", "lgbm"}:
@@ -104,6 +153,7 @@ def build_model(
     lookback: int,
     num_features: int,
     num_symbols: int,
+    feature_names: Sequence[str] | None = None,
 ) -> nn.Module:
     model_name = _normalized_model_name(config.training.model_name)
 
@@ -118,6 +168,7 @@ def build_model(
             embedding_dim=mlp_cfg.embedding_dim,
             hidden_layers=mlp_cfg.hidden_layers,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
         )
 
     if model_name in {"ft_transformer", "ft", "transformer"}:
@@ -132,6 +183,7 @@ def build_model(
             ffn_dim=ft_cfg.ffn_dim,
             dropout=ft_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             use_cls_token=ft_cfg.use_cls_token,
         )
 
@@ -146,6 +198,7 @@ def build_model(
             n_blocks=tab_cfg.n_blocks,
             dropout=tab_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -168,6 +221,7 @@ def build_model(
             norm_type=tcn_cfg.norm_type,
             sanitize_inputs=tcn_cfg.sanitize_inputs,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -200,6 +254,7 @@ def build_model(
             residual_scale=efficient_cfg.residual_scale,
             default_temperature=efficient_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             return_aux=efficient_cfg.return_aux,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
@@ -233,6 +288,7 @@ def build_model(
             residual_scale=lfmt_cfg.residual_scale,
             default_temperature=lfmt_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             return_aux=lfmt_cfg.return_aux,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
@@ -267,6 +323,7 @@ def build_model(
             dropout=lrmt_cfg.dropout,
             default_temperature=lrmt_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
             return_aux=lrmt_cfg.return_aux,
             return_aux_details=lrmt_cfg.return_aux_details,
             runtime_shape_check=config.training.runtime_shape_check,
@@ -284,10 +341,17 @@ def build_model(
             num_symbols=num_symbols,
             d_model=tbp_cfg.d_model,
             attention_mode=tbp_cfg.attention_mode,
+            use_latent_factors=tbp_cfg.use_latent_factors,
+            use_market_tokens=tbp_cfg.use_market_tokens,
             use_flash_attention=tbp_cfg.use_flash_attention,
             use_time_pos=tbp_cfg.use_time_pos,
             use_symbol_pos=tbp_cfg.use_symbol_pos,
+            symbol_position_capacity=tbp_cfg.symbol_position_capacity,
             input_dropout=tbp_cfg.input_dropout,
+            sanitize_inputs=tbp_cfg.sanitize_inputs,
+            amp_native_position_add=tbp_cfg.amp_native_position_add,
+            temporal_self_attention_fast_path=tbp_cfg.temporal_self_attention_fast_path,
+            compiled_cross_attention_backend=tbp_cfg.compiled_cross_attention_backend,
             sdpa_batch_limit=tbp_cfg.sdpa_batch_limit,
             norm_type=tbp_cfg.norm_type,
             ffn_type=tbp_cfg.ffn_type,
@@ -309,20 +373,131 @@ def build_model(
             num_latent_factors=tbp_cfg.num_latent_factors,
             num_market_tokens=tbp_cfg.num_market_tokens,
             market_layers=tbp_cfg.market_layers,
-            dynamic_latent_tokens=tbp_cfg.dynamic_latent_tokens,
-            dynamic_market_tokens=tbp_cfg.dynamic_market_tokens,
-            dynamic_token_hidden_mult=tbp_cfg.dynamic_token_hidden_mult,
-            dynamic_token_gate_init=tbp_cfg.dynamic_token_gate_init,
-            dynamic_token_dropout=tbp_cfg.dynamic_token_dropout,
             head_hidden_dim=tbp_cfg.head_hidden_dim,
             head_layers=tbp_cfg.head_layers,
             dropout=tbp_cfg.dropout,
             default_temperature=tbp_cfg.default_temperature,
             portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
+            portfolio_output_mode=tbp_cfg.portfolio_output_mode,
+            center_long_short_logits=tbp_cfg.center_long_short_logits,
             max_full_tokens=tbp_cfg.max_full_tokens,
             checkpoint_blocks=tbp_cfg.checkpoint_blocks,
             return_aux=tbp_cfg.return_aux,
             return_aux_details=tbp_cfg.return_aux_details,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+            categorical_feature_indices=_feature_indices_from_patterns(
+                feature_names,
+                tbp_cfg.categorical_feature_names,
+            ),
+            categorical_embedding_dim=tbp_cfg.categorical_embedding_dim,
+            categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
+        )
+
+    if model_name in _FINANCIAL_TRANSFORMER_NAMES:
+        fin_cfg = config.training.financial_transformer
+        portfolio_mode = str(fin_cfg.portfolio_mode).strip().lower().replace("-", "_")
+        if portfolio_mode in {"", "auto"}:
+            portfolio_mode = "long_only" if config.trading.long_only else "long_short"
+        return FinancialTransformerModel(
+            lookback=lookback,
+            num_features=num_features,
+            num_symbols=num_symbols,
+            d_model=fin_cfg.d_model,
+            attention_mode=fin_cfg.attention_mode,
+            use_latent_factors=fin_cfg.use_latent_factors,
+            use_market_tokens=fin_cfg.use_market_tokens,
+            use_flash_attention=fin_cfg.use_flash_attention,
+            use_time_pos=fin_cfg.use_time_pos,
+            use_symbol_pos=fin_cfg.use_symbol_pos,
+            symbol_position_capacity=fin_cfg.symbol_position_capacity,
+            input_dropout=fin_cfg.input_dropout,
+            sanitize_inputs=fin_cfg.sanitize_inputs,
+            amp_native_position_add=fin_cfg.amp_native_position_add,
+            temporal_self_attention_fast_path=fin_cfg.temporal_self_attention_fast_path,
+            compiled_cross_attention_backend=fin_cfg.compiled_cross_attention_backend,
+            sdpa_batch_limit=fin_cfg.sdpa_batch_limit,
+            norm_type=fin_cfg.norm_type,
+            ffn_type=fin_cfg.ffn_type,
+            qk_norm=fin_cfg.qk_norm,
+            rope_temporal=fin_cfg.rope_temporal,
+            rope_base=fin_cfg.rope_base,
+            temporal_layers=fin_cfg.temporal_layers,
+            temporal_heads=fin_cfg.temporal_heads,
+            temporal_ffn_mult=fin_cfg.temporal_ffn_mult,
+            temporal_pooling=fin_cfg.temporal_pooling,
+            temporal_query_mode=fin_cfg.temporal_query_mode,
+            cross_layers=fin_cfg.cross_layers,
+            cross_heads=fin_cfg.cross_heads,
+            cross_ffn_mult=fin_cfg.cross_ffn_mult,
+            joint_layers=fin_cfg.joint_layers,
+            joint_heads=fin_cfg.joint_heads,
+            joint_ffn_mult=fin_cfg.joint_ffn_mult,
+            latent_layers=fin_cfg.latent_layers,
+            num_latent_factors=fin_cfg.num_latent_factors,
+            num_market_tokens=fin_cfg.num_market_tokens,
+            market_layers=fin_cfg.market_layers,
+            head_hidden_dim=fin_cfg.head_hidden_dim,
+            head_layers=fin_cfg.head_layers,
+            dropout=fin_cfg.dropout,
+            default_temperature=fin_cfg.default_temperature,
+            portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
+            portfolio_output_mode=fin_cfg.portfolio_output_mode,
+            center_long_short_logits=fin_cfg.center_long_short_logits,
+            max_full_tokens=fin_cfg.max_full_tokens,
+            checkpoint_blocks=fin_cfg.checkpoint_blocks,
+            return_aux=fin_cfg.return_aux,
+            return_aux_details=fin_cfg.return_aux_details,
+            runtime_shape_check=config.training.runtime_shape_check,
+            allow_dynamic_symbols=config.training.allow_dynamic_symbols,
+            categorical_feature_indices=_feature_indices_from_patterns(
+                feature_names,
+                fin_cfg.categorical_feature_names,
+            ),
+            categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
+            categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
+            candle_dropout=fin_cfg.candle_dropout,
+        )
+
+    if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:
+        gbpt_cfg = config.training.gradient_boosted_portfolio_transformer
+        portfolio_mode = str(gbpt_cfg.portfolio_mode).strip().lower().replace("-", "_")
+        if portfolio_mode in {"", "auto"}:
+            portfolio_mode = "long_only" if config.trading.long_only else "long_short"
+        return GradientBoostedPortfolioTransformer(
+            lookback=lookback,
+            num_features=num_features,
+            num_symbols=num_symbols,
+            d_model=gbpt_cfg.d_model,
+            temporal_layers=gbpt_cfg.temporal_layers,
+            temporal_heads=gbpt_cfg.temporal_heads,
+            temporal_ffn_mult=gbpt_cfg.temporal_ffn_mult,
+            market_layers=gbpt_cfg.market_layers,
+            market_heads=gbpt_cfg.market_heads,
+            market_ffn_mult=gbpt_cfg.market_ffn_mult,
+            num_market_tokens=gbpt_cfg.num_market_tokens,
+            head_hidden_dim=gbpt_cfg.head_hidden_dim,
+            head_layers=gbpt_cfg.head_layers,
+            dropout=gbpt_cfg.dropout,
+            input_dropout=gbpt_cfg.input_dropout,
+            use_time_pos=gbpt_cfg.use_time_pos,
+            use_symbol_pos=gbpt_cfg.use_symbol_pos,
+            dynamic_market_tokens=gbpt_cfg.dynamic_market_tokens,
+            dynamic_token_gate_init=gbpt_cfg.dynamic_token_gate_init,
+            num_residual_stages=gbpt_cfg.num_residual_stages,
+            stage_eta=gbpt_cfg.stage_eta,
+            trainable_eta=gbpt_cfg.trainable_eta,
+            eta_max=gbpt_cfg.eta_max,
+            detach_stage_condition=gbpt_cfg.detach_stage_condition,
+            default_temperature=gbpt_cfg.default_temperature,
+            portfolio_mode=portfolio_mode,
+            portfolio_activation=config.trading.portfolio_activation,
+            portfolio_output_mode=gbpt_cfg.portfolio_output_mode,
+            center_final_logits=gbpt_cfg.center_final_logits,
+            return_aux=gbpt_cfg.return_aux,
+            return_aux_details=gbpt_cfg.return_aux_details,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -344,6 +519,7 @@ def build_model(
             ffn_mult=bpae_cfg.ffn_mult,
             dropout=bpae_cfg.dropout,
             long_short=bpae_cfg.long_short if not config.trading.long_only else False,
+            portfolio_activation=config.trading.portfolio_activation,
             noise_std=bpae_cfg.noise_std,
             return_aux=bpae_cfg.return_aux,
             runtime_shape_check=config.training.runtime_shape_check,
@@ -363,6 +539,7 @@ def build_model(
             tcn_kernel_size=tcn_cfg.tcn_kernel_size,
             dropout=tcn_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -381,6 +558,7 @@ def build_model(
             n_blocks=ttab_cfg.n_blocks,
             dropout=ttab_cfg.dropout,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
         )
@@ -391,22 +569,20 @@ def build_model(
             lookback=lookback,
             num_features=num_features,
             num_symbols=num_symbols,
-            stock_embedding_dim=int(getattr(cstpm_cfg, "d_model", cstpm_cfg.stock_embedding_dim)),
-            stock_hidden_dim=int(getattr(cstpm_cfg, "scorer_hidden", cstpm_cfg.stock_hidden_dim)),
-            stock_n_blocks=int(getattr(cstpm_cfg, "scorer_blocks", cstpm_cfg.stock_n_blocks)),
-            temporal_hidden_dim=cstpm_cfg.temporal_hidden_dim,
-            temporal_blocks=cstpm_cfg.temporal_blocks,
-            temporal_kernel_size=cstpm_cfg.temporal_kernel_size,
-            cross_hidden_dim=int(getattr(cstpm_cfg, "d_model", cstpm_cfg.cross_hidden_dim)),
-            cross_heads=int(getattr(cstpm_cfg, "heads", cstpm_cfg.cross_heads)),
-            cross_layers=int(getattr(cstpm_cfg, "layers", cstpm_cfg.cross_layers)),
+            stock_embedding_dim=cstpm_cfg.d_model,
+            stock_hidden_dim=cstpm_cfg.scorer_hidden,
+            stock_n_blocks=cstpm_cfg.scorer_blocks,
+            cross_hidden_dim=cstpm_cfg.d_model,
+            cross_heads=cstpm_cfg.heads,
+            cross_layers=cstpm_cfg.layers,
             dropout=cstpm_cfg.dropout,
             regime_classes=cstpm_cfg.regime_classes,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             runtime_shape_check=config.training.runtime_shape_check,
             allow_dynamic_symbols=config.training.allow_dynamic_symbols,
-            candidate_top_m=int(getattr(cstpm_cfg, "candidate_k", cstpm_cfg.candidate_top_m)),
-            portfolio_top_k=int(getattr(cstpm_cfg, "trade_k", cstpm_cfg.portfolio_top_k)),
+            candidate_top_m=cstpm_cfg.candidate_k,
+            portfolio_top_k=cstpm_cfg.trade_k,
         )
 
     if model_name in {"lightgbm", "lgbm"}:
@@ -416,6 +592,7 @@ def build_model(
             num_features=num_features,
             num_symbols=num_symbols,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             use_gpu=lgbm_cfg.use_gpu,
             gpu_device_id=lgbm_cfg.gpu_device_id,
             n_estimators=lgbm_cfg.n_estimators,
@@ -436,6 +613,7 @@ def build_model(
             num_features=num_features,
             num_symbols=num_symbols,
             long_only=config.trading.long_only,
+            portfolio_activation=config.trading.portfolio_activation,
             use_gpu=xgb_cfg.use_gpu,
             gpu_device_id=xgb_cfg.gpu_device_id,
             n_estimators=xgb_cfg.n_estimators,
@@ -454,7 +632,7 @@ def build_model(
         "Supported values: mlp, ft_transformer, tabular_resnet, multi_stock_tcn, "
         "efficient_tcn_tabular_set_portfolio, tcn_hybrid_tabular_resnet, "
         "latent_factor_market_token_portfolio, low_rank_market_transformer_portfolio, "
-        "transformer_base_portfolio, "
+        "transformer_base_portfolio, financial_transformer, gradient_boosted_portfolio_transformer, "
         "bottleneck_portfolio_autoencoder, temporal_tabular_resnet, "
         "cross_sectional_temporal_portfolio_model, lightgbm, xgboost"
     )

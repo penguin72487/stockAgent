@@ -54,7 +54,6 @@ def test_explainability_cuml_umap_aux_projection_outputs(tmp_path: Path) -> None
         symbols=[f"S{i}" for i in range(symbols)],
         dates=[f"2026-01-{i + 1:02d}" for i in range(rows)],
         settings=ExplainabilitySettings(
-            top_k=2,
             max_rows=rows,
             ig_steps=0,
             perturb=False,

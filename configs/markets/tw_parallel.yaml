@@ -1,0 +1,25 @@
+# Fold-parallel Taiwan training intentionally inherits the canonical single-GPU
+# market experiment. GPU assignment and disjoint fold ranges belong to
+# configs/gpu_jobs_tw_parallel.yaml, not to the market/model configuration.
+#
+# This keeps every shard numerically equivalent to invoking tw.yaml once for its
+# selected folds: no DDP gradient averaging, no per-rank recurrent-state split,
+# and no duplicated cross-rank evaluation/compilation work.
+base_config: tw.yaml
+
+experiment_name: tw-stock-transformer-fold-parallel
+
+runner:
+  output_dir: artifacts/markets/tw_parallel
+  mode: train
+  resume: true
+  post_train_infer: false
+  # Inherited 2005 panel horizon: fold20 validates on 2025.
+  start_fold: 20
+
+training:
+  financial_transformer:
+    candle_dropout: 0.0
+  # Auto uses every GPU exposed by the launcher through torchrun/DDP, while the
+  # same config remains runnable on one visible GPU for debugging and resume.
+  multi_gpu_strategy: auto

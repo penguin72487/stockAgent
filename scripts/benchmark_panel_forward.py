@@ -34,8 +34,6 @@ def _make_model(config, *, query_mode: str, device: torch.device, features: int,
     cfg.training.transformer_base_portfolio.attention_mode = "market_token"
     cfg.training.transformer_base_portfolio.temporal_pooling = "last"
     cfg.training.transformer_base_portfolio.temporal_query_mode = query_mode
-    cfg.training.transformer_base_portfolio.dynamic_market_tokens = True
-    cfg.training.transformer_base_portfolio.dynamic_latent_tokens = False
     return build_model(
         config=cfg,
         lookback=int(cfg.training.lookback),

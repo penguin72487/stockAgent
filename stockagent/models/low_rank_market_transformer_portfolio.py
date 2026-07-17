@@ -13,7 +13,9 @@ from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean,
     masked_softmax,
+    normalize_portfolio_activation,
 )
+from stockagent.portfolio_contract import normalize_portfolio_mode
 
 
 class TemporalSelfAttentionBlock(nn.Module):
@@ -306,6 +308,7 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         dropout: float = 0.1,
         default_temperature: float = 1.0,
         portfolio_mode: str = "long_only",
+        portfolio_activation: str = "identity",
         return_aux: bool = True,
         return_aux_details: bool = False,
         runtime_shape_check: bool = False,
@@ -321,7 +324,8 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         self.num_latent_factors = max(1, int(num_latent_factors))
         self.num_market_tokens = max(1, int(num_market_tokens))
         self.default_temperature = float(default_temperature)
-        self.portfolio_mode = self._normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_mode = normalize_portfolio_mode(portfolio_mode)
+        self.portfolio_activation = normalize_portfolio_activation(portfolio_activation)
         self.return_aux = bool(return_aux)
         self.return_aux_details = bool(return_aux_details)
         self.runtime_shape_check = bool(runtime_shape_check)
@@ -421,18 +425,6 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         self.score_head = nn.Sequential(*head)
 
     @staticmethod
-    def _normalize_portfolio_mode(portfolio_mode: str) -> str:
-        normalized = str(portfolio_mode).strip().lower().replace("-", "_")
-        if normalized in {"long", "long_only", "longonly"}:
-            return "long_only"
-        if normalized in {"long_short", "longshort", "short", "dual_branch", "long_and_short"}:
-            return "long_short"
-        raise ValueError(
-            "LowRankMarketTransformerPortfolioModel portfolio_mode must be "
-            "'long_only' or 'long_short'"
-        )
-
-    @staticmethod
     def _normalize_temporal_mixer(temporal_mixer: str) -> str:
         normalized = str(temporal_mixer).strip().lower().replace("-", "_")
         if normalized in {"attention", "attn", "transformer", "self_attention"}:
@@ -504,10 +496,10 @@ class LowRankMarketTransformerPortfolioModel(nn.Module):
         temp = torch.clamp(temp, min=0.05)
 
         if self.portfolio_mode == "long_only":
-            weights = masked_softmax(masked_scores / temp, mask_bool)
+            weights = masked_softmax(masked_scores / temp, mask_bool, activation=self.portfolio_activation)
         else:
             relative_scores = scores - masked_cross_sectional_mean(scores, mask_bool)
-            weights = dual_branch_softmax(relative_scores / temp, mask_bool)
+            weights = dual_branch_softmax(relative_scores / temp, mask_bool, activation=self.portfolio_activation)
         weights = weights.masked_fill(~mask_bool, 0.0)
 
         aux = {

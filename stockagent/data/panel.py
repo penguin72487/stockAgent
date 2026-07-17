@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date
+import fnmatch
 from pathlib import Path
+import csv
 import hashlib
-import os
 import pickle
 import os
 from typing import Any
@@ -33,16 +35,16 @@ from stockagent.data.panel_cache import (
     panel_cache_v2_dir,
     save_panel_cache_v2,
 )
+from stockagent.data.us_universe import (
+    BROKER_TRADABLE_SECURITY_FILTER,
+    normalize_us_symbol_key,
+    us_broker_untradable_reason,
+)
 
 try:
     from stockagent.data import panel_numba as _panel_numba
 except Exception:  # pragma: no cover - Numba is an acceleration dependency
     _panel_numba = None
-
-try:
-    import cudf
-except Exception:  # pragma: no cover - optional GPU dependency
-    cudf = None
 
 
 RESERVED_COLUMNS = {"date", "symbol", "return_1d", "tradable"}
@@ -95,13 +97,15 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
-PANEL_CACHE_VERSION = 19
+PANEL_CACHE_VERSION = 38
 FEATURE_FILE_SUFFIX = "_features.parquet"
+DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
-# Treat single-day price moves beyond +/-100% log-return magnitude as unusable
-# labels/features. The full US universe contains stale/delisted Yahoo rows with
+# Treat single-day price ratios beyond 5x or below 1/5x as unusable labels and
+# features. The full US universe contains stale/delisted Yahoo rows with
 # penny-to-thousands jumps that otherwise dominate log-return backtests.
 MAX_ABS_DAILY_PRICE_LOG_RETURN = float(np.log(5.0))
+TW_MAX_ABS_DAILY_PRICE_LOG_RETURN = float(np.log(2.0))
 PREV_DAY_LOG_RETURN_RENAME = {
     "open": "open_logret_1d",
     "max": "max_logret_1d",
@@ -110,6 +114,12 @@ PREV_DAY_LOG_RETURN_RENAME = {
     "Trading_Volume": "trading_volume_logret_1d",
 }
 _MISSING_VOLUME_WARNED_SYMBOLS: set[str] = set()
+
+
+@dataclass(slots=True)
+class _SymbolSecurityMetadata:
+    name: str
+    market: str
 
 
 class _MissingTradingVolumeError(ValueError):
@@ -168,12 +178,38 @@ def _round_half_up(values: np.ndarray, decimals: int = 2) -> np.ndarray:
     out[neg] = np.ceil(arr[neg] * factor - 0.5) / factor
     return out
 
-def _price_decimals_for_path(path: Path) -> int:
-    """Return market-specific price precision: TW=2, others=8 decimals."""
+
+def _is_tw_market_path(path: Path) -> bool:
     parts = {part.lower() for part in path.parts}
     symbol = _symbol_name_from_path(path)
-    is_tw_market = "tw_stocks" in parts or symbol.isdigit()
-    return 2 if is_tw_market else 8
+    return "tw_stocks" in parts or symbol.isdigit()
+
+
+def _is_tw_official_path(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    return {"data_tw_public", "stocks"} <= parts
+
+
+def _price_decimals_for_path(path: Path) -> int:
+    """Return market-specific price precision: TW=2, others=8 decimals."""
+    return 2 if _is_tw_market_path(path) else 8
+
+
+def _adjclose_decimals_for_path(path: Path) -> int:
+    return 8 if _is_tw_official_path(path) else _price_decimals_for_path(path)
+
+
+def _max_abs_daily_price_log_return_for_path(path: Path) -> float:
+    # Consecutive-session 2x moves in established TW files are scale changes,
+    # not executable total returns. First listings have no preceding row, and
+    # relistings after a gap are rejected by the market-session label contract.
+    if _is_tw_official_path(path):
+        return MAX_ABS_DAILY_PRICE_LOG_RETURN
+    return (
+        TW_MAX_ABS_DAILY_PRICE_LOG_RETURN
+        if _is_tw_market_path(path)
+        else MAX_ABS_DAILY_PRICE_LOG_RETURN
+    )
 
 
 def _return_price_column(frame: Any, path: Path) -> str:
@@ -195,10 +231,13 @@ class PanelData:
     tradable_mask: np.ndarray
     alive_mask: np.ndarray
     benchmark_returns: np.ndarray
-    open_prices: np.ndarray
     close_prices: np.ndarray
+    daily_volumes: np.ndarray | None = None
     can_buy_mask: np.ndarray | None = None
     can_sell_mask: np.ndarray | None = None
+    can_short_open_mask: np.ndarray | None = None
+    force_short_cover_mask: np.ndarray | None = None
+    force_exit_mask: np.ndarray | None = None
 
     @property
     def num_dates(self) -> int:
@@ -209,6 +248,61 @@ class PanelData:
         return int(self.features.shape[1])
 
 
+def _normalize_panel_start_date(value: str | date | np.datetime64 | None) -> np.datetime64 | None:
+    if value is None or not str(value).strip():
+        return None
+    text = str(value).strip()
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            "panel_start_date must be an ISO date (YYYY-MM-DD) or null, "
+            f"got {value!r}"
+        ) from exc
+    return np.datetime64(parsed.isoformat(), "D")
+
+
+def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None) -> PanelData:
+    """Apply the declared inclusive model horizon without deleting source history."""
+    if panel_start_date is None:
+        return panel
+    panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
+    start = int(np.searchsorted(panel_dates, panel_start_date, side="left"))
+    if start >= int(panel_dates.size):
+        raise ValueError(
+            f"panel_start_date={panel_start_date} is after the last panel date "
+            f"{panel_dates[-1] if panel_dates.size else 'n/a'}"
+        )
+    if start == 0:
+        return panel
+    slc = slice(start, None)
+
+    def sliced(values: np.ndarray | None) -> np.ndarray | None:
+        return None if values is None else values[slc]
+
+    print(
+        f"[panel] applied inclusive panel_start_date={panel_start_date}; "
+        f"kept {panel.num_dates - start}/{panel.num_dates} dates"
+    )
+    return PanelData(
+        dates=panel.dates[slc],
+        symbols=panel.symbols,
+        feature_names=panel.feature_names,
+        features=panel.features[slc],
+        returns_1d=panel.returns_1d[slc],
+        tradable_mask=panel.tradable_mask[slc],
+        can_buy_mask=sliced(panel.can_buy_mask),
+        can_sell_mask=sliced(panel.can_sell_mask),
+        can_short_open_mask=sliced(panel.can_short_open_mask),
+        force_short_cover_mask=sliced(panel.force_short_cover_mask),
+        force_exit_mask=sliced(panel.force_exit_mask),
+        alive_mask=panel.alive_mask[slc],
+        benchmark_returns=panel.benchmark_returns[slc],
+        close_prices=panel.close_prices[slc],
+        daily_volumes=sliced(panel.daily_volumes),
+    )
+
+
 @dataclass(slots=True)
 class _SymbolPanelArrays:
     symbol: str
@@ -216,14 +310,406 @@ class _SymbolPanelArrays:
     features: np.ndarray
     returns_1d: np.ndarray
     close_prices: np.ndarray
+    daily_volumes: np.ndarray
     tradable_mask: np.ndarray
     can_buy_mask: np.ndarray
     can_sell_mask: np.ndarray
     alive_mask: np.ndarray
 
 
+@dataclass(slots=True)
+class _ExternalFeatureArrays:
+    feature_names: list[str]
+    market_dates: np.ndarray
+    market_values: np.ndarray
+    by_symbol: dict[str, tuple[np.ndarray, np.ndarray]]
+    rule_names: list[str]
+    market_rule_values: np.ndarray
+    by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]]
+    official_session_dates: np.ndarray
+
+
 def _symbol_name_from_path(path: Path) -> str:
     return path.name.removesuffix(FEATURE_FILE_SUFFIX)
+
+
+def _normalize_external_feature_path(path: str | Path | None) -> Path | None:
+    if path is None:
+        return None
+    text = str(path).strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _resolve_external_data_path(
+    path: str | Path | None,
+    *,
+    include_features: bool,
+    include_rules: bool,
+    required: bool,
+) -> Path | None:
+    """Validate one external parquet request without coupling rules to inputs."""
+
+    include_any = bool(include_features) or bool(include_rules)
+    normalized = _normalize_external_feature_path(path)
+    if required and not include_any:
+        raise ValueError(
+            "external_data_required=True requires external features or rules to be enabled"
+        )
+    if not include_any:
+        return None
+    if normalized is None:
+        if required:
+            raise FileNotFoundError(
+                "external TW public data is required but external_feature_path is empty"
+            )
+        return None
+    if not normalized.exists():
+        raise FileNotFoundError(f"external_feature_path not found: {normalized}")
+    return normalized
+
+
+def _load_external_feature_arrays(
+    path: Path,
+    *,
+    market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    include_features: bool = True,
+    include_rules: bool = True,
+) -> _ExternalFeatureArrays:
+    if pl is None or pq is None:
+        raise RuntimeError("external TW public features require polars and pyarrow")
+    if not path.exists():
+        raise FileNotFoundError(f"external feature parquet not found: {path}")
+
+    required = {"date", "symbol"}
+    parquet_columns = list(pq.read_schema(path).names)
+    missing = required - set(parquet_columns)
+    if missing:
+        raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
+
+    candidate_columns = [
+        column
+        for column in parquet_columns
+        if column not in required
+    ]
+    feature_names = (
+        [column for column in candidate_columns if not str(column).startswith("_")]
+        if include_features
+        else []
+    )
+    rule_names = (
+        [column for column in candidate_columns if str(column).startswith("_twpub_")]
+        if include_rules
+        else []
+    )
+    value_columns = [*feature_names, *rule_names]
+    # Rules-only TW runs should not materialize millions of rows across every
+    # public model feature. Arrow projection keeps I/O and peak RAM proportional
+    # to the independently enabled column families.
+    frame = pl.from_arrow(
+        pq.read_table(
+            path,
+            columns=["date", "symbol", *value_columns],
+            memory_map=True,
+        )
+    )
+    if not feature_names:
+        if not rule_names:
+            return _ExternalFeatureArrays(
+                feature_names=[],
+                market_dates=np.empty((0,), dtype="datetime64[ns]"),
+                market_values=np.empty((0, 0), dtype=np.float32),
+                by_symbol={},
+                rule_names=[],
+                market_rule_values=np.empty((0, 0), dtype=np.float32),
+                by_symbol_rules={},
+                official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
+            )
+
+    frame = (
+        frame.with_columns(
+            [
+                _polars_datetime_ns_expr(frame.schema, "date"),
+                pl.col("symbol").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase().alias("symbol"),
+                *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in value_columns],
+            ]
+        )
+        .drop_nulls(["date", "symbol"])
+        .filter(pl.col("symbol") != "")
+        .group_by(["date", "symbol"])
+        .agg([pl.col(name).drop_nulls().last().alias(name) for name in value_columns])
+        .sort(["symbol", "date"])
+    )
+    if frame.is_empty():
+        return _ExternalFeatureArrays(
+            feature_names=feature_names,
+            market_dates=np.empty((0,), dtype="datetime64[ns]"),
+            market_values=np.empty((0, len(feature_names)), dtype=np.float32),
+            by_symbol={},
+            rule_names=rule_names,
+            market_rule_values=np.empty((0, len(rule_names)), dtype=np.float32),
+            by_symbol_rules={},
+            official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
+        )
+
+    market_key = str(market_symbol).strip().upper()
+    market_frame = frame.filter(pl.col("symbol") == market_key).sort("date")
+    market_dates, market_values = _external_frame_to_arrays(market_frame, feature_names)
+    _, market_rule_values = _external_frame_to_arrays(market_frame, rule_names)
+
+    by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    stock_frame = frame.filter(pl.col("symbol") != market_key)
+    official_session_dates = np.empty((0,), dtype="datetime64[ns]")
+    if "_twpub_official_traded" in rule_names and not market_frame.is_empty():
+        # Only the receipt-derived TAIEX market row defines exchange sessions.
+        # Stock rows are sparse and macro market rows can occur on holidays, so
+        # neither is a safe calendar authority.
+        official_frame = (
+            market_frame.filter(pl.col("_twpub_official_traded").fill_null(0.0) > 0.0)
+            .select("date")
+            .unique()
+            .sort("date")
+        )
+        if not official_frame.is_empty():
+            official_session_dates = official_frame["date"].to_numpy().astype(
+                "datetime64[ns]", copy=False
+            )
+    if not stock_frame.is_empty():
+        for symbol, symbol_frame in stock_frame.partition_by("symbol", as_dict=True).items():
+            key = symbol[0] if isinstance(symbol, tuple) else symbol
+            dates, values = _external_frame_to_arrays(symbol_frame.sort("date"), feature_names)
+            by_symbol[str(key).upper()] = (dates, values)
+            rule_dates, rule_values = _external_frame_to_arrays(symbol_frame.sort("date"), rule_names)
+            by_symbol_rules[str(key).upper()] = (rule_dates, rule_values)
+
+    print(
+        f"[panel] external features loaded path={path} "
+        f"features={len(feature_names)} rules={len(rule_names)} market_rows={market_dates.size} symbols={len(by_symbol)}"
+    )
+    return _ExternalFeatureArrays(
+        feature_names=feature_names,
+        market_dates=market_dates,
+        market_values=market_values,
+        by_symbol=by_symbol,
+        rule_names=rule_names,
+        market_rule_values=market_rule_values,
+        by_symbol_rules=by_symbol_rules,
+        official_session_dates=official_session_dates,
+    )
+
+
+def _external_frame_to_arrays(frame: Any, feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    if frame is None or frame.is_empty():
+        return (
+            np.empty((0,), dtype="datetime64[ns]"),
+            np.empty((0, len(feature_names)), dtype=np.float32),
+        )
+    dates = frame["date"].to_numpy().astype("datetime64[ns]", copy=False)
+    values = (
+        frame.select([pl.col(name).cast(pl.Float64, strict=False).fill_null(float("nan")) for name in feature_names])
+        .to_numpy()
+        .astype(np.float32, copy=False)
+    )
+    valid_dates = ~np.isnat(dates)
+    if not bool(valid_dates.all()):
+        dates = dates[valid_dates]
+        values = values[valid_dates]
+    return dates, values
+
+
+def _align_external_values(
+    panel_dates: np.ndarray,
+    source_dates: np.ndarray,
+    source_values: np.ndarray,
+) -> np.ndarray:
+    feature_count = int(source_values.shape[1]) if source_values.ndim == 2 else 0
+    out = np.full((int(panel_dates.size), feature_count), np.nan, dtype=np.float32)
+    if panel_dates.size == 0 or source_dates.size == 0 or feature_count == 0:
+        return out
+    row_idx = np.searchsorted(panel_dates, source_dates)
+    in_bounds = (row_idx >= 0) & (row_idx < int(panel_dates.size))
+    valid = np.zeros(source_dates.shape, dtype=bool)
+    if bool(in_bounds.any()):
+        valid[in_bounds] = panel_dates[row_idx[in_bounds]] == source_dates[in_bounds]
+    if bool(valid.any()):
+        out[row_idx[valid]] = source_values[valid]
+    return out
+
+
+def _overlay_external_values(
+    target: np.ndarray,
+    panel_dates: np.ndarray,
+    source_dates: np.ndarray,
+    source_values: np.ndarray,
+) -> None:
+    if target.size == 0 or panel_dates.size == 0 or source_dates.size == 0 or source_values.size == 0:
+        return
+    row_idx = np.searchsorted(panel_dates, source_dates)
+    in_bounds = (row_idx >= 0) & (row_idx < int(panel_dates.size))
+    if not bool(in_bounds.any()):
+        return
+    candidate_rows = row_idx[in_bounds]
+    source_pos = np.nonzero(in_bounds)[0]
+    exact = panel_dates[candidate_rows] == source_dates[source_pos]
+    if not bool(exact.any()):
+        return
+    target_rows = candidate_rows[exact]
+    values = source_values[source_pos[exact]]
+    finite = np.isfinite(values)
+    if bool(finite.all()):
+        target[target_rows, :] = values
+        return
+    if not bool(finite.any()):
+        return
+    value_rows, value_cols = np.nonzero(finite)
+    target[target_rows[value_rows], value_cols] = values[value_rows, value_cols]
+
+
+_POINT_IN_TIME_STATE_FEATURE_PREFIXES = (
+    "twpub_monthly_revenue_",
+    "twpub_financial_",
+    "twpub_company_",
+    "twpub_tdcc_",
+    "twpub_cbc_",
+    "twpub_dgbas_",
+    "twpub_mof_",
+)
+_POINT_IN_TIME_STATE_FEATURES = {
+    "twpub_insider_holdings_log",
+    "twpub_insider_pledge_ratio",
+}
+
+
+def _forward_fill_point_in_time_features(values: np.ndarray, feature_names: list[str]) -> None:
+    if values.ndim != 2 or values.shape[0] == 0:
+        return
+    for col_idx, name in enumerate(feature_names):
+        if name not in _POINT_IN_TIME_STATE_FEATURES and not name.startswith(_POINT_IN_TIME_STATE_FEATURE_PREFIXES):
+            continue
+        column = values[:, col_idx]
+        valid = np.flatnonzero(np.isfinite(column))
+        if valid.size == 0:
+            continue
+        last_seen = np.maximum.accumulate(np.where(np.isfinite(column), np.arange(column.size), -1))
+        fill_rows = (last_seen >= 0) & ~np.isfinite(column)
+        column[fill_rows] = column[last_seen[fill_rows]]
+
+
+def _contiguous_indexer(indices: list[int]) -> Any:
+    if not indices:
+        return slice(0, 0)
+    start = int(indices[0])
+    stop = start + len(indices)
+    if indices == list(range(start, stop)):
+        return slice(start, stop)
+    return indices
+
+
+def _normalize_security_filter(value: str | None) -> str:
+    normalized = str(value or "none").strip().lower()
+    if normalized in {"", "off", "false"}:
+        normalized = "none"
+    if normalized not in {"none", BROKER_TRADABLE_SECURITY_FILTER}:
+        raise ValueError(
+            "security_filter must be one of: none, broker_tradable; "
+            f"got {value!r}"
+        )
+    return normalized
+
+
+def _repo_fallback_us_symbols_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "configs" / "fallback_us_stocks_symbols.csv"
+
+
+def _security_filter_metadata_paths(parquet_root: Path, security_filter: str) -> list[Path]:
+    if security_filter != BROKER_TRADABLE_SECURITY_FILTER:
+        return []
+    candidates = [parquet_root / "symbols.csv", _repo_fallback_us_symbols_path()]
+    return [path for path in candidates if path.exists()]
+
+
+def _metadata_name_is_informative(symbol: str, name: str) -> bool:
+    clean_name = str(name or "").strip().upper()
+    if not clean_name:
+        return False
+    clean_symbol = str(symbol or "").strip().upper()
+    base_symbol = normalize_us_symbol_key(clean_symbol)
+    return clean_name not in {clean_symbol, base_symbol, f"{base_symbol}_DL"}
+
+
+def _add_us_security_metadata(
+    metadata: dict[str, _SymbolSecurityMetadata],
+    *,
+    code: str,
+    yahoo_symbol: str,
+    name: str,
+    market: str,
+) -> None:
+    keys = {
+        str(code or "").strip().upper(),
+        normalize_us_symbol_key(code),
+        str(yahoo_symbol or "").strip().upper(),
+        normalize_us_symbol_key(yahoo_symbol),
+    }
+    entry = _SymbolSecurityMetadata(name=str(name or "").strip(), market=str(market or "").strip())
+    new_is_informative = any(_metadata_name_is_informative(key, entry.name) for key in keys)
+    for key in {key for key in keys if key}:
+        existing = metadata.get(key)
+        if existing is None:
+            metadata[key] = entry
+            continue
+        existing_is_informative = _metadata_name_is_informative(key, existing.name)
+        if new_is_informative and not existing_is_informative:
+            metadata[key] = entry
+
+
+def _load_us_security_metadata(paths: list[Path]) -> dict[str, _SymbolSecurityMetadata]:
+    metadata: dict[str, _SymbolSecurityMetadata] = {}
+    for path in paths:
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    _add_us_security_metadata(
+                        metadata,
+                        code=row.get("code", ""),
+                        yahoo_symbol=row.get("yahoo_symbol", ""),
+                        name=row.get("name", ""),
+                        market=row.get("market", ""),
+                    )
+        except OSError:
+            continue
+    return metadata
+
+
+def _filter_us_broker_tradable_paths(
+    parquet_root: Path,
+    parquet_paths: list[Path],
+    metadata_paths: list[Path],
+) -> list[Path]:
+    metadata = _load_us_security_metadata(metadata_paths)
+    kept: list[Path] = []
+    pruned_reasons: dict[str, int] = {}
+    for path in parquet_paths:
+        symbol = _symbol_name_from_path(path)
+        info = metadata.get(symbol.upper()) or metadata.get(normalize_us_symbol_key(symbol))
+        name = info.name if info is not None else symbol
+        market = info.market if info is not None else ("us_delisted" if symbol.upper().endswith("_DL") else "us_stocks")
+        reason = us_broker_untradable_reason(symbol, name, market)
+        if reason is None:
+            kept.append(path)
+            continue
+        pruned_reasons[reason] = pruned_reasons.get(reason, 0) + 1
+
+    if pruned_reasons:
+        details = ", ".join(f"{reason}={count}" for reason, count in sorted(pruned_reasons.items()))
+        print(
+            f"[panel] security_filter=broker_tradable pruned "
+            f"{sum(pruned_reasons.values())} {parquet_root.name} symbols ({details})"
+        )
+    return kept
 
 
 def _is_usd_trading_pair(path: Path) -> bool:
@@ -292,7 +778,13 @@ def _frame_column_bool_array(frame: Any, name: str, *, default: bool = False) ->
 
 
 def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
-    """Compute TW daily limit price with floor-to-tick rule from theoretical price."""
+    """Compute TW daily limit price from theoretical price.
+
+    TW limit-up prices are rounded down to the nearest tick, while limit-down
+    prices are rounded up to the nearest tick. The asymmetry matters around
+    half-tick boundaries, e.g. prev_close=524 -> theoretical down=471.6 ->
+    limit-down=472.0.
+    """
     if _panel_numba is not None:
         return _panel_numba.tw_limit_price(prev_close, ratio)
     prev = _to_float_array(prev_close)
@@ -301,8 +793,12 @@ def _tw_limit_price(prev_close: np.ndarray, ratio: float) -> np.ndarray:
 
     out = np.full(theoretical.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(theoretical) & np.isfinite(tick) & (tick > 0.0)
+    scaled = theoretical[valid] / tick[valid]
     # Small epsilon avoids floating-point edge cases around exact tick boundaries.
-    out[valid] = np.floor((theoretical[valid] / tick[valid]) + 1e-12) * tick[valid]
+    if float(ratio) < 1.0:
+        out[valid] = np.ceil(scaled - 1e-12) * tick[valid]
+    else:
+        out[valid] = np.floor(scaled + 1e-12) * tick[valid]
     return _round_half_up(out, decimals=2)
 
 
@@ -398,6 +894,8 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
         raise ValueError(f"{path.name} is missing required date column")
 
     price_decimals = _price_decimals_for_path(path)
+    adjclose_decimals = _adjclose_decimals_for_path(path)
+    max_abs_price_log_return = _max_abs_daily_price_log_return_for_path(path)
 
     def num(name: str):
         if name in frame.columns:
@@ -414,16 +912,29 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
                 _polars_round_half_up(num("max"), price_decimals).alias("max"),
                 _polars_round_half_up(num("min"), price_decimals).alias("min"),
                 _polars_round_half_up(num("close"), price_decimals).alias("close"),
-                _polars_round_half_up(num("adjclose"), price_decimals).alias("adjclose"),
+                _polars_round_half_up(num("adjclose"), adjclose_decimals).alias("adjclose"),
                 pl.lit(_symbol_name_from_path(path)).alias("symbol"),
             ]
         )
         .with_columns(pl.col("close").cast(pl.Float32, strict=False).alias("close_raw"))
     )
 
-    spread = (pl.col("max") - pl.col("min")).clip(0.0, None)
-    denom = spread + EPSILON
     return_price = pl.col(_return_price_column(frame, path))
+    return_1d = _polars_price_log_return(
+        return_price.shift(-1),
+        return_price,
+        max_abs_price_log_return,
+    )
+    if "return_quarantined" in frame.columns:
+        return_1d = (
+            pl.when(
+                pl.col("return_quarantined")
+                .cast(pl.Boolean, strict=False)
+                .fill_null(False)
+            )
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(return_1d)
+        )
     close_valid = _polars_not_nan_or_null(pl.col("close"))
     if "Trading_Volume" in frame.columns:
         volume = num("Trading_Volume")
@@ -439,16 +950,14 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
             _polars_safe_log(pl.col("close"), pl.col("open")).alias("intraday_return_co"),
             _polars_safe_log(pl.col("open"), pl.col("close").shift(1)).alias("overnight_gap_oc"),
             _polars_safe_log(pl.col("max"), pl.col("min")).alias("intraday_range"),
-            ((pl.col("close") - pl.col("open")).abs() / denom).alias("body_ratio"),
-            ((pl.col("close") - pl.col("open")) / denom).alias("signed_body_ratio"),
-            ((pl.col("close") - pl.col("min")) / denom).alias("clv"),
-            ((pl.col("max") - pl.max_horizontal("open", "close")) / denom).alias("upper_shadow"),
-            ((pl.min_horizontal("open", "close") - pl.col("min")) / denom).alias("lower_shadow"),
-            _polars_price_log_return(return_price.shift(-1), return_price).alias("return_1d"),
-            _polars_price_log_return(pl.col("open"), pl.col("open").shift(1)).alias("open_logret_1d"),
-            _polars_price_log_return(pl.col("max"), pl.col("max").shift(1)).alias("max_logret_1d"),
-            _polars_price_log_return(pl.col("min"), pl.col("min").shift(1)).alias("min_logret_1d"),
-            _polars_price_log_return(pl.col("close"), pl.col("close").shift(1)).alias("close_logret_1d"),
+            *_polars_kbar_ratio_expressions(
+                pl.col("open"), pl.col("max"), pl.col("min"), pl.col("close")
+            ),
+            return_1d.alias("return_1d"),
+            _polars_price_log_return(pl.col("open"), pl.col("open").shift(1), max_abs_price_log_return).alias("open_logret_1d"),
+            _polars_price_log_return(pl.col("max"), pl.col("max").shift(1), max_abs_price_log_return).alias("max_logret_1d"),
+            _polars_price_log_return(pl.col("min"), pl.col("min").shift(1), max_abs_price_log_return).alias("min_logret_1d"),
+            _polars_price_log_return(pl.col("close"), pl.col("close").shift(1), max_abs_price_log_return).alias("close_logret_1d"),
             _polars_safe_log(volume, volume.shift(1)).alias("trading_volume_logret_1d"),
             tradable_expr.alias("tradable"),
         ]
@@ -552,11 +1061,14 @@ def _safe_log_ratio_array(numerator: np.ndarray, denominator: np.ndarray) -> np.
     return out
 
 
-def _sanitize_price_log_return_array(values: np.ndarray) -> np.ndarray:
+def _sanitize_price_log_return_array(
+    values: np.ndarray,
+    max_abs_log_return: float = MAX_ABS_DAILY_PRICE_LOG_RETURN,
+) -> np.ndarray:
     if _panel_numba is not None:
-        return _panel_numba.sanitize_price_log_return_array(values, MAX_ABS_DAILY_PRICE_LOG_RETURN)
+        return _panel_numba.sanitize_price_log_return_array(values, max_abs_log_return)
     out = np.asarray(values, dtype=np.float64).copy()
-    invalid = np.isfinite(out) & (np.abs(out) > MAX_ABS_DAILY_PRICE_LOG_RETURN)
+    invalid = np.isfinite(out) & (np.abs(out) > max_abs_log_return)
     out[invalid] = np.nan
     return out
 
@@ -571,20 +1083,30 @@ def _polars_safe_log(num, den):
     )
 
 
-def _polars_sanitize_price_log_return(expr):
+def _polars_sanitize_price_log_return(
+    expr,
+    max_abs_log_return: float = MAX_ABS_DAILY_PRICE_LOG_RETURN,
+):
     if pl is None:
         raise RuntimeError("Polars is not available")
     return (
         pl.when(expr.is_null() | ~expr.is_finite())
         .then(None)
-        .when(expr.abs() > MAX_ABS_DAILY_PRICE_LOG_RETURN)
+        .when(expr.abs() > max_abs_log_return)
         .then(None)
         .otherwise(expr)
     )
 
 
-def _polars_price_log_return(num, den):
-    return _polars_sanitize_price_log_return(_polars_safe_log(num, den))
+def _polars_price_log_return(
+    num,
+    den,
+    max_abs_log_return: float = MAX_ABS_DAILY_PRICE_LOG_RETURN,
+):
+    return _polars_sanitize_price_log_return(
+        _polars_safe_log(num, den),
+        max_abs_log_return,
+    )
 
 
 def _polars_round_half_up(expr, decimals: int):
@@ -612,6 +1134,125 @@ def _collect_polars_lazy_frame(lazy, *, engine: str = "auto"):
 
 def _polars_not_nan_or_null(expr):
     return expr.is_not_null() & ~expr.is_nan().fill_null(False)
+
+
+def _polars_kbar_ratio_expressions(open_px, high_px, low_px, close_px) -> list[Any]:
+    finite = (
+        _polars_not_nan_or_null(open_px)
+        & _polars_not_nan_or_null(high_px)
+        & _polars_not_nan_or_null(low_px)
+        & _polars_not_nan_or_null(close_px)
+    )
+    valid_envelope = (
+        finite
+        & (high_px >= pl.max_horizontal(open_px, close_px))
+        & (low_px <= pl.min_horizontal(open_px, close_px))
+    )
+    spread = high_px - low_px
+    valid_range = valid_envelope & (spread > EPSILON)
+
+    def bounded_ratio(numerator, *, flat_value: float, lower: float, upper: float):
+        return (
+            pl.when(valid_range)
+            .then((numerator / spread).clip(lower, upper))
+            .when(valid_envelope)
+            .then(pl.lit(flat_value, dtype=pl.Float64))
+            .otherwise(None)
+        )
+
+    return [
+        bounded_ratio(
+            (close_px - open_px).abs(), flat_value=0.0, lower=0.0, upper=1.0
+        ).alias("body_ratio"),
+        bounded_ratio(
+            close_px - open_px, flat_value=0.0, lower=-1.0, upper=1.0
+        ).alias("signed_body_ratio"),
+        bounded_ratio(
+            close_px - low_px, flat_value=0.5, lower=0.0, upper=1.0
+        ).alias("clv"),
+        bounded_ratio(
+            high_px - pl.max_horizontal(open_px, close_px),
+            flat_value=0.0,
+            lower=0.0,
+            upper=1.0,
+        ).alias("upper_shadow"),
+        bounded_ratio(
+            pl.min_horizontal(open_px, close_px) - low_px,
+            flat_value=0.0,
+            lower=0.0,
+            upper=1.0,
+        ).alias("lower_shadow"),
+    ]
+
+
+def _kbar_ratio_arrays(
+    open_px: np.ndarray,
+    high_px: np.ndarray,
+    low_px: np.ndarray,
+    close_px: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    shape = np.asarray(open_px).shape
+    body_ratio = np.full(shape, np.nan, dtype=np.float64)
+    signed_body_ratio = np.full(shape, np.nan, dtype=np.float64)
+    clv = np.full(shape, np.nan, dtype=np.float64)
+    upper_shadow = np.full(shape, np.nan, dtype=np.float64)
+    lower_shadow = np.full(shape, np.nan, dtype=np.float64)
+
+    finite = (
+        np.isfinite(open_px)
+        & np.isfinite(high_px)
+        & np.isfinite(low_px)
+        & np.isfinite(close_px)
+    )
+    valid_envelope = (
+        finite
+        & (high_px >= np.maximum(open_px, close_px))
+        & (low_px <= np.minimum(open_px, close_px))
+    )
+    spread = high_px - low_px
+    valid_range = valid_envelope & (spread > EPSILON)
+    flat = valid_envelope & ~valid_range
+
+    body_ratio[valid_range] = np.clip(
+        np.abs(close_px[valid_range] - open_px[valid_range]) / spread[valid_range],
+        0.0,
+        1.0,
+    )
+    signed_body_ratio[valid_range] = np.clip(
+        (close_px[valid_range] - open_px[valid_range]) / spread[valid_range],
+        -1.0,
+        1.0,
+    )
+    clv[valid_range] = np.clip(
+        (close_px[valid_range] - low_px[valid_range]) / spread[valid_range],
+        0.0,
+        1.0,
+    )
+    upper_shadow[valid_range] = np.clip(
+        (
+            high_px[valid_range]
+            - np.maximum(open_px[valid_range], close_px[valid_range])
+        )
+        / spread[valid_range],
+        0.0,
+        1.0,
+    )
+    lower_shadow[valid_range] = np.clip(
+        (
+            np.minimum(open_px[valid_range], close_px[valid_range])
+            - low_px[valid_range]
+        )
+        / spread[valid_range],
+        0.0,
+        1.0,
+    )
+
+    body_ratio[flat] = 0.0
+    signed_body_ratio[flat] = 0.0
+    clv[flat] = 0.5
+    upper_shadow[flat] = 0.0
+    lower_shadow[flat] = 0.0
+    return body_ratio, signed_body_ratio, clv, upper_shadow, lower_shadow
 
 
 def _tw_limit_masks_from_arrays(
@@ -652,6 +1293,60 @@ def _load_symbol_arrays_pyarrow(
         raise RuntimeError("PyArrow is not available")
 
     table = pq.read_table(path)
+    return _symbol_arrays_from_arrow_table(
+        table,
+        path,
+        tradable_mode=tradable_mode,
+        trading_volume_policy=trading_volume_policy,
+    )
+
+
+def _read_parquet_tail_table(path: Path, rows: int):
+    if pq is None:
+        raise RuntimeError("PyArrow is not available")
+    tail_rows = max(1, int(rows))
+    parquet_file = pq.ParquetFile(path)
+    metadata = parquet_file.metadata
+    if metadata is None or int(metadata.num_row_groups) <= 0:
+        return pq.read_table(path)
+
+    row_groups: list[int] = []
+    row_count = 0
+    for group_idx in range(int(metadata.num_row_groups) - 1, -1, -1):
+        row_groups.append(group_idx)
+        row_count += int(metadata.row_group(group_idx).num_rows)
+        if row_count >= tail_rows:
+            break
+    table = parquet_file.read_row_groups(sorted(row_groups))
+    if int(table.num_rows) <= tail_rows:
+        return table
+    offset = int(table.num_rows) - tail_rows
+    return table.slice(offset, tail_rows)
+
+
+def _load_symbol_arrays_pyarrow_tail(
+    path: Path,
+    *,
+    tail_rows: int,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+) -> _SymbolPanelArrays:
+    table = _read_parquet_tail_table(path, tail_rows)
+    return _symbol_arrays_from_arrow_table(
+        table,
+        path,
+        tradable_mode=tradable_mode,
+        trading_volume_policy=trading_volume_policy,
+    )
+
+
+def _symbol_arrays_from_arrow_table(
+    table: Any,
+    path: Path,
+    *,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+) -> _SymbolPanelArrays:
     _require_trading_volume_column(path, set(table.column_names), trading_volume_policy)
     rows = int(table.num_rows)
     if rows == 0:
@@ -663,6 +1358,7 @@ def _load_symbol_arrays_pyarrow(
             features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
+            daily_volumes=empty_1d,
             tradable_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
@@ -677,22 +1373,24 @@ def _load_symbol_arrays_pyarrow(
         return _coerce_arrow_numeric_column(table, name, rows)[order]
 
     price_decimals = _price_decimals_for_path(path)
+    adjclose_decimals = _adjclose_decimals_for_path(path)
+    max_abs_price_log_return = _max_abs_daily_price_log_return_for_path(path)
     open_px = _round_half_up(col("open"), decimals=price_decimals)
     high_px = _round_half_up(col("max"), decimals=price_decimals)
     low_px = _round_half_up(col("min"), decimals=price_decimals)
     close_px = _round_half_up(col("close"), decimals=price_decimals)
-    adjclose = _round_half_up(col("adjclose"), decimals=price_decimals)
-    volume = col("Trading_Volume")
+    adjclose = _round_half_up(col("adjclose"), decimals=adjclose_decimals)
+    volume = col("Trading_Volume") if "Trading_Volume" in table.column_names else np.full((rows,), np.nan, dtype=np.float64)
 
-    spread = np.clip(high_px - low_px, 0.0, None)
-    denom = spread + EPSILON
     intraday_return_co = _safe_log_ratio_array(close_px, open_px)
-    body_ratio = np.abs(close_px - open_px) / denom
-    signed_body_ratio = (close_px - open_px) / denom
-    clv = (close_px - low_px) / denom
+    (
+        body_ratio,
+        signed_body_ratio,
+        clv,
+        upper_shadow,
+        lower_shadow,
+    ) = _kbar_ratio_arrays(open_px, high_px, low_px, close_px)
     clv_centered = clv - 0.5
-    upper_shadow = (high_px - np.maximum(open_px, close_px)) / denom
-    lower_shadow = (np.minimum(open_px, close_px) - low_px) / denom
     shadow_imbalance = upper_shadow - lower_shadow
     delta_clv = clv - _shift_array(clv, 1)
     delta_body_ratio = body_ratio - _shift_array(body_ratio, 1)
@@ -703,11 +1401,14 @@ def _load_symbol_arrays_pyarrow(
     max_logret_1d = _safe_log_ratio_array(high_px, _shift_array(high_px, 1))
     min_logret_1d = _safe_log_ratio_array(low_px, _shift_array(low_px, 1))
     close_logret_1d = _safe_log_ratio_array(close_px, _shift_array(close_px, 1))
-    return_1d = _sanitize_price_log_return_array(return_1d)
-    open_logret_1d = _sanitize_price_log_return_array(open_logret_1d)
-    max_logret_1d = _sanitize_price_log_return_array(max_logret_1d)
-    min_logret_1d = _sanitize_price_log_return_array(min_logret_1d)
-    close_logret_1d = _sanitize_price_log_return_array(close_logret_1d)
+    return_1d = _sanitize_price_log_return_array(return_1d, max_abs_price_log_return)
+    if "return_quarantined" in table.column_names:
+        return_quarantined = col("return_quarantined")
+        return_1d[np.isfinite(return_quarantined) & (return_quarantined != 0.0)] = np.nan
+    open_logret_1d = _sanitize_price_log_return_array(open_logret_1d, max_abs_price_log_return)
+    max_logret_1d = _sanitize_price_log_return_array(max_logret_1d, max_abs_price_log_return)
+    min_logret_1d = _sanitize_price_log_return_array(min_logret_1d, max_abs_price_log_return)
+    close_logret_1d = _sanitize_price_log_return_array(close_logret_1d, max_abs_price_log_return)
     trading_volume_logret_1d = _safe_log_ratio_array(volume, _shift_array(volume, 1))
     signed_vol = np.sign(intraday_return_co) * trading_volume_logret_1d
 
@@ -748,6 +1449,7 @@ def _load_symbol_arrays_pyarrow(
         features = features[valid_dates]
         return_1d = return_1d[valid_dates]
         close_px = close_px[valid_dates]
+        volume = volume[valid_dates]
         tradable = tradable[valid_dates]
         close_notna = close_notna[valid_dates]
 
@@ -770,6 +1472,7 @@ def _load_symbol_arrays_pyarrow(
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
+        daily_volumes=volume.astype(np.float32, copy=False),
         tradable_mask=tradable,
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
@@ -794,6 +1497,8 @@ def _load_symbol_arrays_polars_lazy(
     schema_names = set(frame.columns)
     _require_trading_volume_column(path, schema_names, trading_volume_policy)
     price_decimals = _price_decimals_for_path(path)
+    adjclose_decimals = _adjclose_decimals_for_path(path)
+    max_abs_price_log_return = _max_abs_daily_price_log_return_for_path(path)
 
     def num(name: str):
         if name in schema_names:
@@ -805,7 +1510,7 @@ def _load_symbol_arrays_polars_lazy(
         _polars_round_half_up(num("max"), price_decimals).alias("_max"),
         _polars_round_half_up(num("min"), price_decimals).alias("_min"),
         _polars_round_half_up(num("close"), price_decimals).alias("_close"),
-        _polars_round_half_up(num("adjclose"), price_decimals).alias("_adjclose"),
+        _polars_round_half_up(num("adjclose"), adjclose_decimals).alias("_adjclose"),
         num("Trading_Volume").alias("_volume"),
     ]
     if tradable_mode == "tw_limit_guard":
@@ -816,9 +1521,22 @@ def _load_symbol_arrays_polars_lazy(
             ]
         )
     lazy = lazy.with_columns(price_columns)
-    spread = (pl.col("_max") - pl.col("_min")).clip(0.0, None)
-    denom = spread + EPSILON
     return_price = pl.col("_adjclose") if "adjclose" in schema_names else pl.col("_close")
+    return_1d = _polars_price_log_return(
+        return_price.shift(-1),
+        return_price,
+        max_abs_price_log_return,
+    )
+    if "return_quarantined" in schema_names:
+        return_1d = (
+            pl.when(
+                pl.col("return_quarantined")
+                .cast(pl.Boolean, strict=False)
+                .fill_null(False)
+            )
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(return_1d)
+        )
     close_valid = _polars_not_nan_or_null(pl.col("_close"))
     if "Trading_Volume" in schema_names:
         volume_missing = pl.col("_volume").is_null() | pl.col("_volume").is_nan().fill_null(False)
@@ -831,16 +1549,14 @@ def _load_symbol_arrays_polars_lazy(
     lazy = lazy.with_columns(
         [
             _polars_safe_log(pl.col("_close"), pl.col("_open")).alias("intraday_return_co"),
-            ((pl.col("_close") - pl.col("_open")).abs() / denom).alias("body_ratio"),
-            ((pl.col("_close") - pl.col("_open")) / denom).alias("signed_body_ratio"),
-            ((pl.col("_close") - pl.col("_min")) / denom).alias("clv"),
-            ((pl.col("_max") - pl.max_horizontal("_open", "_close")) / denom).alias("upper_shadow"),
-            ((pl.min_horizontal("_open", "_close") - pl.col("_min")) / denom).alias("lower_shadow"),
-            _polars_price_log_return(return_price.shift(-1), return_price).alias("return_1d"),
-            _polars_price_log_return(pl.col("_open"), pl.col("_open").shift(1)).alias("open_logret_1d"),
-            _polars_price_log_return(pl.col("_max"), pl.col("_max").shift(1)).alias("max_logret_1d"),
-            _polars_price_log_return(pl.col("_min"), pl.col("_min").shift(1)).alias("min_logret_1d"),
-            _polars_price_log_return(pl.col("_close"), pl.col("_close").shift(1)).alias("close_logret_1d"),
+            *_polars_kbar_ratio_expressions(
+                pl.col("_open"), pl.col("_max"), pl.col("_min"), pl.col("_close")
+            ),
+            return_1d.alias("return_1d"),
+            _polars_price_log_return(pl.col("_open"), pl.col("_open").shift(1), max_abs_price_log_return).alias("open_logret_1d"),
+            _polars_price_log_return(pl.col("_max"), pl.col("_max").shift(1), max_abs_price_log_return).alias("max_logret_1d"),
+            _polars_price_log_return(pl.col("_min"), pl.col("_min").shift(1), max_abs_price_log_return).alias("min_logret_1d"),
+            _polars_price_log_return(pl.col("_close"), pl.col("_close").shift(1), max_abs_price_log_return).alias("close_logret_1d"),
             _polars_safe_log(pl.col("_volume"), pl.col("_volume").shift(1)).alias("trading_volume_logret_1d"),
             tradable_expr.alias("tradable"),
         ]
@@ -857,6 +1573,7 @@ def _load_symbol_arrays_polars_lazy(
     selected_columns = [
         _polars_datetime_ns_expr(frame.schema, "date"),
         pl.col("_close").alias("close_px"),
+        pl.col("_volume").alias("daily_volume"),
         pl.col("return_1d"),
         pl.col("tradable"),
         *[pl.col(name) for name in LOG_RETURN_FEATURE_COLUMNS],
@@ -878,6 +1595,7 @@ def _load_symbol_arrays_polars_lazy(
             features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
+            daily_volumes=empty_1d,
             tradable_mask=empty_mask,
             can_buy_mask=empty_mask,
             can_sell_mask=empty_mask,
@@ -886,6 +1604,7 @@ def _load_symbol_arrays_polars_lazy(
 
     dates = out["date"].to_numpy().astype("datetime64[ns]", copy=False)
     close_px = out["close_px"].to_numpy().astype(np.float64, copy=False)
+    daily_volume = out["daily_volume"].to_numpy().astype(np.float64, copy=False)
     return_1d = out["return_1d"].to_numpy().astype(np.float64, copy=False)
     tradable = out["tradable"].to_numpy().astype(bool, copy=False)
     features = np.column_stack(
@@ -899,6 +1618,7 @@ def _load_symbol_arrays_polars_lazy(
         features = features[valid_dates]
         return_1d = return_1d[valid_dates]
         close_px = close_px[valid_dates]
+        daily_volume = daily_volume[valid_dates]
         tradable = tradable[valid_dates]
         close_notna = close_notna[valid_dates]
 
@@ -921,6 +1641,7 @@ def _load_symbol_arrays_polars_lazy(
         features=features,
         returns_1d=return_1d.astype(np.float32, copy=False),
         close_prices=close_px.astype(np.float32, copy=False),
+        daily_volumes=daily_volume.astype(np.float32, copy=False),
         tradable_mask=np.asarray(tradable, dtype=bool),
         can_buy_mask=np.asarray(can_buy_mask, dtype=bool),
         can_sell_mask=np.asarray(can_sell_mask, dtype=bool),
@@ -931,44 +1652,175 @@ def _load_symbol_arrays_polars_lazy(
 def _build_panel_from_symbol_arrays(
     symbol_arrays: list[_SymbolPanelArrays],
     benchmark_name: str = "universe_average_return",
+    external_features: _ExternalFeatureArrays | None = None,
+    feature_include: tuple[str, ...] = (),
+    feature_exclude: tuple[str, ...] = (),
 ) -> PanelData:
     if not symbol_arrays:
         raise RuntimeError("No valid parquet files could be loaded.")
 
     symbols = [item.symbol for item in symbol_arrays]
+    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
     dated_items = [item.dates for item in symbol_arrays if item.dates.size]
     if not dated_items:
         raise RuntimeError("No valid dated rows could be loaded.")
-    all_dates = np.unique(np.concatenate(dated_items))
+    if (
+        benchmark_symbol_index is not None
+        and symbol_arrays[benchmark_symbol_index].dates.size
+    ):
+        # Lookback is defined in exchange sessions, not arbitrary rows. A union
+        # calendar admits vendor outliers on exchange holidays and silently
+        # shortens every affected model window. The configured benchmark is the
+        # canonical session calendar; symbols observed off-calendar are ignored.
+        all_dates = np.unique(symbol_arrays[benchmark_symbol_index].dates)
+    else:
+        all_dates = np.unique(np.concatenate(dated_items))
+    if external_features is not None and external_features.official_session_dates.size:
+        # Preserve receipt-verified sessions even when every symbol quote is
+        # absent (for example historical Saturday sessions).  Limit the marker
+        # to the observed panel span so TAIEX's earlier archive does not extend
+        # the configured universe outside its own data range.
+        official_dates = np.unique(external_features.official_session_dates)
+        observed_start = all_dates.min()
+        observed_end = all_dates.max()
+        official_dates = official_dates[
+            (official_dates >= observed_start) & (official_dates <= observed_end)
+        ]
+        if official_dates.size:
+            all_dates = np.unique(np.concatenate([all_dates, official_dates]))
     all_dates.sort()
     num_dates = int(all_dates.size)
     num_symbols = len(symbol_arrays)
-    num_features = len(LOG_RETURN_FEATURE_COLUMNS)
+    session_dates = all_dates
+    all_base_feature_names = list(LOG_RETURN_FEATURE_COLUMNS)
+    all_external_feature_names = list(external_features.feature_names) if external_features is not None else []
+    (
+        base_feature_indices,
+        base_dest_indices,
+        external_feature_indices,
+        external_dest_indices,
+        feature_names,
+    ) = _resolve_panel_feature_indices(
+        all_base_feature_names,
+        all_external_feature_names,
+        feature_include=feature_include,
+        feature_exclude=feature_exclude,
+    )
+    num_base_features = len(base_feature_indices)
+    num_external_features = len(external_feature_indices)
+    num_features = len(feature_names)
+    base_source_indexer = _contiguous_indexer(base_feature_indices)
+    base_dest_indexer = _contiguous_indexer(base_dest_indices)
+    external_source_indexer = _contiguous_indexer(external_feature_indices)
+    external_dest_indexer = _contiguous_indexer(external_dest_indices)
+    external_dest_is_slice = isinstance(external_dest_indexer, slice)
+    selected_external_feature_names = [all_external_feature_names[idx] for idx in external_feature_indices]
+    total_available_features = len(all_base_feature_names) + len(all_external_feature_names)
+    if num_features != total_available_features:
+        print(
+            f"[panel] feature filter kept {num_features}/{total_available_features} "
+            f"(include={list(feature_include) or ['*']}, exclude={list(feature_exclude) or []})"
+        )
+    print(
+        f"[panel] materializing panel dates={num_dates} symbols={num_symbols} "
+        f"features={num_features} base_features={num_base_features} external_features={num_external_features}"
+    )
 
     features = np.full((num_dates, num_symbols, num_features), np.nan, dtype=np.float32)
     returns_1d = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     close_prices = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
+    daily_volumes = np.full((num_dates, num_symbols), np.nan, dtype=np.float32)
     tradable_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     can_buy_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     can_sell_mask = np.zeros((num_dates, num_symbols), dtype=bool)
     alive_mask = np.zeros((num_dates, num_symbols), dtype=bool)
+    masked_non_session_returns = 0
+
+    market_external = None
+    if external_features is not None and num_external_features:
+        market_values = external_features.market_values[:, external_source_indexer]
+        market_external = _align_external_values(
+            all_dates,
+            external_features.market_dates,
+            market_values,
+        )
+        _forward_fill_point_in_time_features(
+            market_external,
+            selected_external_feature_names,
+        )
 
     for sym_idx, item in enumerate(symbol_arrays):
         if item.dates.size == 0:
             continue
         row_idx = np.searchsorted(all_dates, item.dates)
-        valid = (row_idx >= 0) & (row_idx < num_dates) & (all_dates[row_idx] == item.dates)
-        if not bool(valid.all()):
+        in_bounds = (row_idx >= 0) & (row_idx < num_dates)
+        valid = np.zeros(item.dates.shape, dtype=bool)
+        if bool(in_bounds.any()):
+            valid[in_bounds] = all_dates[row_idx[in_bounds]] == item.dates[in_bounds]
+        all_valid = bool(valid.all())
+        if not all_valid:
             row_idx = row_idx[valid]
-        features[row_idx, sym_idx, :] = item.features[valid]
-        returns_1d[row_idx, sym_idx] = item.returns_1d[valid]
-        close_prices[row_idx, sym_idx] = item.close_prices[valid]
-        tradable_mask[row_idx, sym_idx] = item.tradable_mask[valid]
-        can_buy_mask[row_idx, sym_idx] = item.can_buy_mask[valid]
-        can_sell_mask[row_idx, sym_idx] = item.can_sell_mask[valid]
-        alive_mask[row_idx, sym_idx] = item.alive_mask[valid]
+        item_features = item.features if all_valid else item.features[valid]
+        item_dates = item.dates if all_valid else item.dates[valid]
+        item_returns = item.returns_1d if all_valid else item.returns_1d[valid]
+        item_tradable = item.tradable_mask if all_valid else item.tradable_mask[valid]
+        symbol_features = features[:, sym_idx, :]
+        if num_base_features:
+            if isinstance(base_dest_indexer, slice):
+                symbol_features[row_idx, base_dest_indexer] = item_features[:, base_source_indexer]
+            else:
+                symbol_features[np.ix_(row_idx, base_dest_indices)] = item_features[:, base_source_indexer]
+        if market_external is not None:
+            symbol_features[:, external_dest_indexer] = market_external
+        if external_features is not None and num_external_features:
+            symbol_external = external_features.by_symbol.get(str(item.symbol).upper())
+            if symbol_external is not None:
+                symbol_values = symbol_external[1][:, external_source_indexer]
+                target = symbol_features[:, external_dest_indexer]
+                _overlay_external_values(target, all_dates, symbol_external[0], symbol_values)
+                _forward_fill_point_in_time_features(target, selected_external_feature_names)
+                if not external_dest_is_slice:
+                    symbol_features[:, external_dest_indexer] = target
+        # A one-day label must end on the next market session and on an
+        # executable quote. Per-symbol shift(-1) alone can bridge a halt or a
+        # split/reduction gap and turn a multi-session price discontinuity into
+        # a fictitious next-day return.
+        valid_forward = np.zeros(item_returns.shape, dtype=bool)
+        if item_returns.size > 1:
+            session_idx = np.searchsorted(session_dates, item_dates)
+            safe_session_idx = np.minimum(session_idx, session_dates.size - 1)
+            on_session = (
+                (session_idx >= 0)
+                & (session_idx < session_dates.size)
+                & (session_dates[safe_session_idx] == item_dates)
+            )
+            valid_forward[:-1] = (
+                on_session[:-1]
+                & on_session[1:]
+                & item_tradable[1:]
+                & (session_idx[1:] == session_idx[:-1] + 1)
+            )
+        masked_non_session_returns += int(
+            np.count_nonzero(np.isfinite(item_returns) & ~valid_forward)
+        )
+        session_returns = np.asarray(item_returns, dtype=np.float32).copy()
+        session_returns[~valid_forward] = np.nan
+        returns_1d[row_idx, sym_idx] = session_returns
+        close_prices[row_idx, sym_idx] = item.close_prices if all_valid else item.close_prices[valid]
+        daily_volumes[row_idx, sym_idx] = item.daily_volumes if all_valid else item.daily_volumes[valid]
+        tradable_mask[row_idx, sym_idx] = item_tradable
+        can_buy_mask[row_idx, sym_idx] = item.can_buy_mask if all_valid else item.can_buy_mask[valid]
+        can_sell_mask[row_idx, sym_idx] = item.can_sell_mask if all_valid else item.can_sell_mask[valid]
+        alive_mask[row_idx, sym_idx] = item.alive_mask if all_valid else item.alive_mask[valid]
+        if (sym_idx + 1) % 500 == 0 or (sym_idx + 1) == num_symbols:
+            print(f"[panel] materialized symbols {sym_idx + 1}/{num_symbols}")
 
-    benchmark_symbol_index = _resolve_benchmark_index(symbols, benchmark_name)
+    if masked_non_session_returns:
+        print(
+            "[panel] masked non-session/non-executable forward returns "
+            f"count={masked_non_session_returns}"
+        )
+
     if benchmark_symbol_index is None:
         valid_returns = np.isfinite(returns_1d)
         n_valid = valid_returns.sum(axis=1)
@@ -983,19 +1835,518 @@ def _build_panel_from_symbol_arrays(
             neginf=0.0,
         ).astype(np.float32, copy=False)
 
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    print("[panel] sanitizing feature NaN/inf values")
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     return PanelData(
         dates=np.asarray(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,
-        feature_names=list(LOG_RETURN_FEATURE_COLUMNS),
+        feature_names=feature_names,
         features=features,
         returns_1d=returns_1d,
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
+        can_short_open_mask=can_sell_mask.copy(),
+        force_short_cover_mask=np.zeros_like(tradable_mask, dtype=bool),
+        force_exit_mask=np.zeros_like(tradable_mask, dtype=bool),
         alive_mask=alive_mask,
         benchmark_returns=benchmark_returns,
         close_prices=close_prices,
+        daily_volumes=daily_volumes,
+    )
+
+
+def build_tail_panel(
+    parquet_root: str | Path,
+    *,
+    tail_rows: int,
+    benchmark_name: str = "universe_average_return",
+    usd_only_trading_pairs: bool = False,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+    security_filter: str | None = "none",
+    strict_no_fallback: bool | None = None,
+    panel_load_workers: int = 4,
+    external_feature_path: str | Path | None = None,
+    external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    external_include_features: bool = True,
+    external_include_rules: bool = True,
+    external_data_required: bool = False,
+    feature_include: Any = None,
+    feature_exclude: Any = None,
+    feature_zero_fill: Any = None,
+    panel_start_date: str | date | np.datetime64 | None = None,
+) -> PanelData:
+    """Build a panel from only the last rows of each symbol file for live inference."""
+    parquet_root = Path(parquet_root)
+    external_feature_path = _resolve_external_data_path(
+        external_feature_path,
+        include_features=external_include_features,
+        include_rules=external_include_rules,
+        required=external_data_required,
+    )
+    feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
+    feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    feature_zero_fill_patterns = _normalize_feature_patterns(
+        feature_zero_fill, label="feature_zero_fill"
+    )
+    normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
+    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    if not parquet_paths:
+        raise FileNotFoundError(f"No parquet files found under {parquet_root}")
+
+    if usd_only_trading_pairs:
+        parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
+        if not parquet_paths:
+            raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
+
+    security_filter = _normalize_security_filter(security_filter)
+    security_metadata_paths = _security_filter_metadata_paths(parquet_root, security_filter)
+    if security_filter == BROKER_TRADABLE_SECURITY_FILTER:
+        parquet_paths = _filter_us_broker_tradable_paths(parquet_root, parquet_paths, security_metadata_paths)
+        if not parquet_paths:
+            raise FileNotFoundError(f"No broker-tradable US symbols found under {parquet_root}")
+
+    if strict_no_fallback is None:
+        strict_no_fallback = str(os.getenv("STOCKAGENT_STRICT_NO_FALLBACK", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        strict_no_fallback = bool(strict_no_fallback)
+
+    tradable_mode = str(tradable_mode).strip().lower()
+    trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
+    read_rows = max(2, int(tail_rows))
+    panel_load_workers = max(0, int(panel_load_workers))
+    print(
+        f"[panel] building live tail from {len(parquet_paths)} parquet files "
+        f"(tail_rows={read_rows}, workers={panel_load_workers})..."
+    )
+
+    def _load_one_arrays(path: Path) -> tuple[Path, _SymbolPanelArrays | None, Exception | None]:
+        try:
+            arrays = _load_symbol_arrays_pyarrow_tail(
+                path,
+                tail_rows=read_rows,
+                tradable_mode=tradable_mode,
+                trading_volume_policy=trading_volume_policy,
+            )
+            if int(arrays.dates.size) == 0:
+                raise ValueError(f"Symbol file is empty: {path.name}")
+            return path, arrays, None
+        except Exception as exc:
+            return path, None, exc
+
+    if panel_load_workers > 1 and len(parquet_paths) > 1:
+        with ThreadPoolExecutor(max_workers=panel_load_workers) as executor:
+            loaded_arrays = list(executor.map(_load_one_arrays, parquet_paths))
+    else:
+        loaded_arrays = [_load_one_arrays(path) for path in parquet_paths]
+
+    valid_arrays: list[_SymbolPanelArrays] = []
+    for path, arrays, exc in loaded_arrays:
+        if exc is not None:
+            if strict_no_fallback or isinstance(exc, _MissingTradingVolumeError):
+                raise type(exc)(f"{path.name}: {exc}") from exc
+            print(f"[panel] SKIP {path.name}: {exc}")
+            continue
+        if arrays is not None:
+            valid_arrays.append(arrays)
+
+    external_features = (
+        _load_external_feature_arrays(
+            external_feature_path,
+            market_symbol=external_market_symbol,
+            include_features=external_include_features,
+            include_rules=external_include_rules,
+        )
+        if external_feature_path is not None
+        else None
+    )
+    panel = _build_panel_from_symbol_arrays(
+        valid_arrays,
+        benchmark_name=benchmark_name,
+        external_features=external_features,
+        feature_include=feature_include_patterns,
+        feature_exclude=feature_exclude_patterns,
+    )
+    panel = _apply_external_rule_masks(panel, external_features)
+    panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _slice_panel_start(panel, normalized_panel_start_date)
+    _print_feature_overview(panel)
+    return panel
+
+
+def load_cached_panel(
+    parquet_root: str | Path,
+    benchmark_name: str = "universe_average_return",
+    usd_only_trading_pairs: bool = False,
+    tradable_mode: str = "tradable",
+    trading_volume_policy: str | bool | None = "auto",
+    security_filter: str | None = "none",
+    strict_no_fallback: bool | None = None,
+    buy_tradable_mode: str | None = None,
+    sell_tradable_mode: str | None = None,
+    panel_backend: str = "auto",
+    panel_load_workers: int = 4,
+    external_feature_path: str | Path | None = None,
+    external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    external_include_features: bool = True,
+    external_include_rules: bool = True,
+    external_data_required: bool = False,
+    feature_include: Any = None,
+    feature_exclude: Any = None,
+    feature_zero_fill: Any = None,
+    panel_start_date: str | date | np.datetime64 | None = None,
+) -> PanelData | None:
+    del panel_load_workers
+    parquet_root = Path(parquet_root)
+    external_feature_path = _resolve_external_data_path(
+        external_feature_path,
+        include_features=external_include_features,
+        include_rules=external_include_rules,
+        required=external_data_required,
+    )
+    feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
+    feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    feature_zero_fill_patterns = _normalize_feature_patterns(
+        feature_zero_fill, label="feature_zero_fill"
+    )
+    normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
+    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    if not parquet_paths:
+        return None
+    if usd_only_trading_pairs:
+        parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
+        if not parquet_paths:
+            return None
+
+    security_filter = _normalize_security_filter(security_filter)
+    security_metadata_paths = _security_filter_metadata_paths(parquet_root, security_filter)
+    if security_filter == BROKER_TRADABLE_SECURITY_FILTER:
+        parquet_paths = _filter_us_broker_tradable_paths(parquet_root, parquet_paths, security_metadata_paths)
+        if not parquet_paths:
+            return None
+
+    panel_backend = str(panel_backend).strip().lower()
+    if panel_backend == "pyarrow":
+        selected_backend = "pyarrow"
+    elif panel_backend in {"polars", "polars_lazy", "polars_streaming"}:
+        selected_backend = "polars_streaming" if panel_backend == "polars_streaming" else "polars_lazy"
+    elif panel_backend == "auto" and pl is not None and pq is not None:
+        selected_backend = "polars_lazy"
+    elif panel_backend == "auto" and pq is not None:
+        selected_backend = "pyarrow"
+    else:
+        return None
+
+    if buy_tradable_mode is not None or sell_tradable_mode is not None:
+        buy_mode = str(buy_tradable_mode if buy_tradable_mode is not None else tradable_mode).strip().lower()
+        sell_mode = str(sell_tradable_mode if sell_tradable_mode is not None else tradable_mode).strip().lower()
+        if buy_mode != sell_mode:
+            return None
+        tradable_mode = buy_mode
+    tradable_mode = str(tradable_mode).strip().lower()
+    trading_volume_policy = _normalize_trading_volume_policy(trading_volume_policy)
+    external_key = str(external_feature_path) if external_feature_path is not None else "none"
+    backend_key = (
+        f"{selected_backend}|benchmark={benchmark_name}|"
+        f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
+        f"tw_limit_rounding=v2|"
+        f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
+        f"external={external_key}|external_market_symbol={external_market_symbol}|"
+        f"external_features={bool(external_include_features)}|"
+        f"external_rules={bool(external_include_rules)}|"
+        f"feature_include={list(feature_include_patterns)!r}|"
+        f"feature_exclude={list(feature_exclude_patterns)!r}|"
+        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"panel_start_date={normalized_panel_start_date}"
+    )
+    source_paths = [*parquet_paths, *security_metadata_paths]
+    if external_feature_path is not None:
+        source_paths.append(external_feature_path)
+    source_hash = _compute_source_hash(source_paths)
+    panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
+    if panel is not None:
+        _print_feature_overview(panel)
+    return panel
+
+
+def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFeatureArrays | None) -> PanelData:
+    if external_features is None or not external_features.rule_names:
+        return panel
+
+    rule_to_idx = {name: idx for idx, name in enumerate(external_features.rule_names)}
+    up_idx = rule_to_idx.get("_twpub_tpex_next_limit_up_ret")
+    down_idx = rule_to_idx.get("_twpub_tpex_next_limit_down_ret")
+    traded_idx = rule_to_idx.get("_twpub_official_traded")
+    delisted_idx = rule_to_idx.get("_twpub_delisted")
+    short_ban_idx = rule_to_idx.get("_twpub_short_open_ban")
+    force_short_cover_idx = rule_to_idx.get("_twpub_force_short_cover")
+    force_cover_lead_idx = rule_to_idx.get("_twpub_force_cover_lead_sessions")
+    force_cover_anchor_idx = rule_to_idx.get("_twpub_force_cover_anchor_ordinal")
+    if force_cover_anchor_idx is None:
+        # Compatibility for public feature parquet generated before the anchor
+        # semantics were named explicitly.
+        force_cover_anchor_idx = rule_to_idx.get(
+            "_twpub_force_cover_delisting_ordinal"
+        )
+    force_cover_cancel_idx = rule_to_idx.get("_twpub_force_cover_cancel_ordinal")
+    trading_halt_idx = rule_to_idx.get("_twpub_trading_halt")
+    if all(
+        idx is None
+        for idx in (
+            up_idx,
+            down_idx,
+            traded_idx,
+            delisted_idx,
+            short_ban_idx,
+            force_short_cover_idx,
+            force_cover_lead_idx,
+            force_cover_anchor_idx,
+            force_cover_cancel_idx,
+            trading_halt_idx,
+        )
+    ):
+        return panel
+
+    can_buy = np.asarray(panel.can_buy_mask if panel.can_buy_mask is not None else panel.tradable_mask, dtype=bool).copy()
+    can_sell = np.asarray(panel.can_sell_mask if panel.can_sell_mask is not None else panel.tradable_mask, dtype=bool).copy()
+    can_short_open = np.asarray(
+        panel.can_short_open_mask if panel.can_short_open_mask is not None else can_sell,
+        dtype=bool,
+    ).copy()
+    force_short_cover = np.asarray(
+        panel.force_short_cover_mask
+        if panel.force_short_cover_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool),
+        dtype=bool,
+    ).copy()
+    force_exit = np.asarray(
+        panel.force_exit_mask
+        if panel.force_exit_mask is not None
+        else np.zeros_like(panel.tradable_mask, dtype=bool),
+        dtype=bool,
+    ).copy()
+    close_prices = np.asarray(panel.close_prices, dtype=np.float64)
+    changed_buy = 0
+    changed_sell = 0
+
+    for sym_idx, symbol in enumerate(panel.symbols):
+        rule_payload = external_features.by_symbol_rules.get(str(symbol).upper())
+        if rule_payload is None:
+            continue
+        # Preserve the source-market observation before official lifecycle
+        # rules mutate it.  A same-symbol security that trades again on the
+        # immediately following panel session is a venue/corporate transition,
+        # not a terminal asset exit; permanently blocking it would create both
+        # a fabricated sale and years of false untradability (for example 2301).
+        base_tradable = np.asarray(panel.tradable_mask[:, sym_idx], dtype=bool).copy()
+        rule_dates, rule_values = rule_payload
+        if rule_values.size == 0:
+            continue
+        aligned_rules = _align_external_values(panel.dates, rule_dates, rule_values)
+        if trading_halt_idx is not None:
+            halted = np.isfinite(aligned_rules[:, trading_halt_idx]) & (aligned_rules[:, trading_halt_idx] > 0.0)
+            if bool(halted.any()):
+                can_buy[halted, sym_idx] = False
+                can_sell[halted, sym_idx] = False
+                can_short_open[halted, sym_idx] = False
+                panel.returns_1d[halted, sym_idx] = 0.0
+        if short_ban_idx is not None:
+            short_banned = np.isfinite(aligned_rules[:, short_ban_idx]) & (aligned_rules[:, short_ban_idx] > 0.0)
+            can_short_open[short_banned, sym_idx] = False
+        delisted_rows = np.empty((0,), dtype=np.int64)
+        delisted_blocked = np.zeros((panel.num_dates,), dtype=bool)
+        if delisted_idx is not None:
+            event_mask = np.isfinite(rule_values[:, delisted_idx]) & (rule_values[:, delisted_idx] > 0.0)
+            if bool(event_mask.any()):
+                # Official termination dates can fall on weekends. Apply the event
+                # on the first panel session at or after the official date.
+                candidate_rows = np.searchsorted(panel.dates, rule_dates[event_mask])
+                candidate_rows = np.unique(
+                    candidate_rows[candidate_rows < panel.num_dates]
+                ).astype(np.int64)
+                effective_rows: list[int] = []
+                for candidate in candidate_rows:
+                    start = int(candidate)
+                    later_traded = np.flatnonzero(base_tradable[start + 1 :])
+                    next_traded = (
+                        start + 1 + int(later_traded[0])
+                        if later_traded.size
+                        else panel.num_dates
+                    )
+                    # Immediate continuation under the same symbol is an
+                    # exchange/corporate migration rather than a terminal
+                    # position.  Longer gaps are real incarnation boundaries:
+                    # exit the old security, then allow a later relisting.
+                    if later_traded.size and next_traded == start + 1:
+                        continue
+                    if not delisted_blocked[start]:
+                        effective_rows.append(start)
+                    delisted_blocked[start:next_traded] = True
+                delisted_rows = np.asarray(effective_rows, dtype=np.int64)
+        if traded_idx is not None:
+            official_traded = np.isfinite(aligned_rules[:, traded_idx]) & (aligned_rules[:, traded_idx] > 0.0)
+            observed_rows = np.flatnonzero(official_traded)
+            if observed_rows.size:
+                # The official OHLC downloads can contain several sparse
+                # archive snapshots rather than one continuous history.  Only
+                # infer a missing-session suspension between nearby positive
+                # observations; a multi-year absence is missing evidence, not
+                # proof that the entire market was halted.  Longer suspensions
+                # come from the explicit halt/resume rule feed above.
+                suspended = np.zeros_like(official_traded)
+                max_contiguous_gap = np.timedelta64(7, "D")
+                for left, right in zip(observed_rows[:-1], observed_rows[1:]):
+                    left_row = int(left)
+                    right_row = int(right)
+                    if right_row <= left_row + 1:
+                        continue
+                    if panel.dates[right_row] - panel.dates[left_row] <= max_contiguous_gap:
+                        suspended[left_row + 1 : right_row] = True
+                for delisted_row in delisted_rows:
+                    prior = observed_rows[observed_rows < int(delisted_row)]
+                    if not prior.size:
+                        continue
+                    left_row = int(prior[-1])
+                    right_row = int(delisted_row)
+                    if (
+                        right_row > left_row + 1
+                        and panel.dates[right_row] - panel.dates[left_row]
+                        <= max_contiguous_gap
+                    ):
+                        suspended[left_row + 1 : right_row] = True
+                suspended &= ~delisted_blocked
+                if bool(suspended.any()):
+                    panel.tradable_mask[suspended, sym_idx] = True
+                    can_buy[suspended, sym_idx] = False
+                    can_sell[suspended, sym_idx] = False
+                    can_short_open[suspended, sym_idx] = False
+                    panel.returns_1d[suspended, sym_idx] = 0.0
+        if delisted_rows.size:
+            force_exit[delisted_rows, sym_idx] = True
+            panel.tradable_mask[delisted_blocked, sym_idx] = False
+            can_buy[delisted_blocked, sym_idx] = False
+            can_sell[delisted_blocked, sym_idx] = False
+            can_short_open[delisted_blocked, sym_idx] = False
+        close_ret = _safe_log_ratio_array(close_prices[:, sym_idx], _shift_array(close_prices[:, sym_idx], 1))
+
+        if up_idx is not None:
+            next_limit_up_ret = _shift_array(aligned_rules[:, up_idx], 1)
+            is_limit_up = np.isfinite(next_limit_up_ret) & np.isfinite(close_ret) & (close_ret >= (next_limit_up_ret - 1e-6))
+            before = can_buy[:, sym_idx].copy()
+            can_buy[:, sym_idx] &= ~is_limit_up
+            changed_buy += int(np.count_nonzero(before & ~can_buy[:, sym_idx]))
+
+        if down_idx is not None:
+            next_limit_down_ret = _shift_array(aligned_rules[:, down_idx], 1)
+            is_limit_down = np.isfinite(next_limit_down_ret) & np.isfinite(close_ret) & (close_ret <= (next_limit_down_ret + 1e-6))
+            before = can_sell[:, sym_idx].copy()
+            can_sell[:, sym_idx] &= ~is_limit_down
+            changed_sell += int(np.count_nonzero(before & ~can_sell[:, sym_idx]))
+
+        if force_short_cover_idx is not None:
+            event_mask = np.isfinite(rule_values[:, force_short_cover_idx]) & (rule_values[:, force_short_cover_idx] > 0.0)
+            for candidate in np.searchsorted(panel.dates, rule_dates[event_mask]):
+                if candidate >= panel.num_dates:
+                    continue
+                # Closing a short is a buy.  Align weekend/holiday deadlines
+                # to the first session where that buy can actually execute,
+                # after halt, delisting and limit-up rules have been applied.
+                executable_after = np.flatnonzero(can_buy[int(candidate) :, sym_idx])
+                if executable_after.size:
+                    force_short_cover[int(candidate) + int(executable_after[0]), sym_idx] = True
+        if force_cover_lead_idx is not None and force_cover_anchor_idx is not None:
+            lead_values = rule_values[:, force_cover_lead_idx]
+            anchor_ordinals = rule_values[:, force_cover_anchor_idx]
+            cancel_ordinals = (
+                rule_values[:, force_cover_cancel_idx]
+                if force_cover_cancel_idx is not None
+                else np.full_like(anchor_ordinals, np.nan)
+            )
+            relative_event_rows = np.flatnonzero(
+                np.isfinite(lead_values)
+                & (lead_values > 0.0)
+                & np.isfinite(anchor_ordinals)
+                & (anchor_ordinals > 0.0)
+            )
+            for event_row in relative_event_rows:
+                knowledge_idx = int(np.searchsorted(panel.dates, rule_dates[event_row], side="right"))
+                anchor_date = np.datetime64(
+                    date.fromordinal(int(round(float(anchor_ordinals[event_row]))))
+                )
+                anchor_session_idx = int(
+                    np.searchsorted(panel.dates, anchor_date, side="left")
+                )
+                deadline_idx = anchor_session_idx - int(
+                    round(float(lead_values[event_row]))
+                )
+                if np.isfinite(cancel_ordinals[event_row]):
+                    cancellation_date = np.datetime64(
+                        date.fromordinal(
+                            int(round(float(cancel_ordinals[event_row])))
+                        )
+                    )
+                    cancellation_session_idx = int(
+                        np.searchsorted(panel.dates, cancellation_date, side="left")
+                    )
+                    # Cancellation is prospective: remove only an obligation
+                    # whose actual exchange-session deadline has not passed.
+                    if cancellation_session_idx <= deadline_idx:
+                        continue
+                if knowledge_idx >= panel.num_dates or knowledge_idx >= anchor_session_idx:
+                    continue
+                if deadline_idx >= knowledge_idx:
+                    candidate = min(deadline_idx, panel.num_dates - 1)
+                    executable = np.flatnonzero(can_buy[knowledge_idx : candidate + 1, sym_idx])
+                    if executable.size:
+                        force_short_cover[knowledge_idx + int(executable[-1]), sym_idx] = True
+                    else:
+                        # If every session through the contractual deadline is
+                        # blocked, do not silently lose the cover obligation.
+                        # Execute on the first available session from the
+                        # deadline onward, but never cross the rule anchor.
+                        end = min(anchor_session_idx, panel.num_dates)
+                        executable_after = np.flatnonzero(
+                            can_buy[candidate:end, sym_idx]
+                        )
+                        if executable_after.size:
+                            force_short_cover[
+                                candidate + int(executable_after[0]), sym_idx
+                            ] = True
+                else:
+                    # A late notice cannot retroactively force a cover. Execute
+                    # on the first known tradable session before the anchor.
+                    end = min(anchor_session_idx, panel.num_dates)
+                    executable = np.flatnonzero(can_buy[knowledge_idx:end, sym_idx])
+                    if executable.size:
+                        force_short_cover[knowledge_idx + int(executable[0]), sym_idx] = True
+
+    if changed_buy or changed_sell:
+        print(
+            "[panel] external TW public limit rules updated masks "
+            f"(blocked_buy={changed_buy}, blocked_sell={changed_sell})"
+        )
+    return PanelData(
+        dates=panel.dates,
+        symbols=panel.symbols,
+        feature_names=panel.feature_names,
+        features=panel.features,
+        returns_1d=panel.returns_1d,
+        tradable_mask=panel.tradable_mask,
+        can_buy_mask=can_buy,
+        can_sell_mask=can_sell,
+        can_short_open_mask=can_short_open & can_sell,
+        force_short_cover_mask=force_short_cover,
+        force_exit_mask=force_exit,
+        alive_mask=panel.alive_mask,
+        benchmark_returns=panel.benchmark_returns,
+        close_prices=panel.close_prices,
+        daily_volumes=panel.daily_volumes,
     )
 
 
@@ -1033,12 +2384,52 @@ def _cache_meta_path(parquet_root: str | Path) -> Path:
 
 
 def _compute_source_hash(paths: list[Path]) -> str:
-    """Compute hash of all parquet files' mtime and size."""
-    hasher = hashlib.md5()
-    for path in sorted(paths):
-        mtime = path.stat().st_mtime
-        size = path.stat().st_size
-        hasher.update(f"{path.name}:{mtime}:{size}".encode())
+    """Fingerprint complete source contents, detecting races while hashing.
+
+    Metadata-only keys can reuse stale panels when a sync/copy preserves path,
+    size and mtime (and some filesystems expose coarse ctime).  A stale cache
+    then defeats the stronger checkpoint panel fingerprint because the new
+    source is never materialized.  Hash every byte once per cache validation;
+    independent files are read concurrently to keep many-small-file universes
+    practical.
+    """
+
+    def file_fingerprint(path: Path) -> tuple[str, int, str]:
+        for attempt in range(2):
+            before = path.stat()
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                while chunk := handle.read(1 << 20):
+                    digest.update(chunk)
+            after = path.stat()
+            unchanged = (
+                int(before.st_size) == int(after.st_size)
+                and int(before.st_mtime_ns) == int(after.st_mtime_ns)
+                and int(before.st_ctime_ns) == int(after.st_ctime_ns)
+            )
+            if unchanged:
+                return str(path), int(after.st_size), digest.hexdigest()
+            if attempt == 0:
+                continue
+        raise RuntimeError(f"Panel source changed while fingerprinting: {path}")
+
+    ordered_paths = sorted(paths)
+    workers = min(
+        len(ordered_paths),
+        max(1, min(16, int(os.cpu_count() or 1))),
+    )
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            identities = list(executor.map(file_fingerprint, ordered_paths))
+    else:
+        identities = [file_fingerprint(path) for path in ordered_paths]
+
+    hasher = hashlib.sha256()
+    for identity in identities:
+        for item in identity:
+            encoded = str(item).encode("utf-8")
+            hasher.update(len(encoded).to_bytes(8, byteorder="little", signed=False))
+            hasher.update(encoded)
     return hasher.hexdigest()
 
 
@@ -1063,6 +2454,23 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
     tradable_mask = cached["tradable_mask"]
     can_buy_mask = cached["can_buy_mask"] if "can_buy_mask" in cached_keys else tradable_mask
     can_sell_mask = cached["can_sell_mask"] if "can_sell_mask" in cached_keys else tradable_mask
+    can_short_open_mask = cached["can_short_open_mask"] if "can_short_open_mask" in cached_keys else can_sell_mask
+    force_short_cover_mask = (
+        cached["force_short_cover_mask"]
+        if "force_short_cover_mask" in cached_keys
+        else np.zeros_like(tradable_mask, dtype=bool)
+    )
+    force_exit_mask = (
+        cached["force_exit_mask"]
+        if "force_exit_mask" in cached_keys
+        else np.zeros_like(tradable_mask, dtype=bool)
+    )
+    close_prices = cached["close_prices"]
+    daily_volumes = (
+        cached["daily_volumes"]
+        if "daily_volumes" in cached_keys
+        else np.full_like(close_prices, np.nan, dtype=np.float32)
+    )
     return PanelData(
         dates=cached["dates"],
         symbols=cached["symbols"].tolist(),
@@ -1072,10 +2480,13 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
+        can_short_open_mask=can_short_open_mask,
+        force_short_cover_mask=force_short_cover_mask,
+        force_exit_mask=force_exit_mask,
         alive_mask=cached["alive_mask"],
         benchmark_returns=cached["benchmark_returns"],
-        open_prices=cached["open_prices"],
-        close_prices=cached["close_prices"],
+        close_prices=close_prices,
+        daily_volumes=daily_volumes,
     )
 
 
@@ -1083,6 +2494,13 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
     tradable_mask = payload["tradable_mask"]
     can_buy_mask = payload.get("can_buy_mask", tradable_mask)
     can_sell_mask = payload.get("can_sell_mask", tradable_mask)
+    can_short_open_mask = payload.get("can_short_open_mask", can_sell_mask)
+    force_short_cover_mask = payload.get("force_short_cover_mask", np.zeros_like(tradable_mask, dtype=bool))
+    force_exit_mask = payload.get(
+        "force_exit_mask", np.zeros_like(tradable_mask, dtype=bool)
+    )
+    close_prices = payload["close_prices"]
+    daily_volumes = payload.get("daily_volumes", np.full_like(close_prices, np.nan, dtype=np.float32))
     return PanelData(
         dates=payload["dates"],
         symbols=list(payload["symbols"]),
@@ -1092,15 +2510,178 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
         tradable_mask=tradable_mask,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
+        can_short_open_mask=can_short_open_mask,
+        force_short_cover_mask=force_short_cover_mask,
+        force_exit_mask=force_exit_mask,
         alive_mask=payload["alive_mask"],
         benchmark_returns=payload["benchmark_returns"],
-        close_prices=payload["close_prices"],
+        close_prices=close_prices,
+        daily_volumes=daily_volumes,
     )
 
 
 def _print_feature_overview(panel: PanelData) -> None:
     feature_list = ", ".join(panel.feature_names)
     print(f"[panel] features ({len(panel.feature_names)}): {feature_list}")
+
+
+def _normalize_feature_patterns(patterns: Any, *, label: str) -> tuple[str, ...]:
+    if patterns is None:
+        return ()
+    if isinstance(patterns, str):
+        raw_items = patterns.split(",")
+    else:
+        try:
+            raw_items = list(patterns)
+        except TypeError as exc:
+            raise ValueError(f"{label} must be a list or comma-separated string") from exc
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.startswith("#") or text in seen:
+            continue
+        cleaned.append(text)
+        seen.add(text)
+    return tuple(cleaned)
+
+
+def _feature_pattern_indices(feature_names: list[str], patterns: tuple[str, ...], *, label: str) -> list[int]:
+    name_to_index = {name: idx for idx, name in enumerate(feature_names)}
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    unmatched: list[str] = []
+    for pattern in patterns:
+        if any(char in pattern for char in "*?[]"):
+            matches = [
+                idx
+                for idx, name in enumerate(feature_names)
+                if fnmatch.fnmatchcase(name, pattern)
+            ]
+        else:
+            idx = name_to_index.get(pattern)
+            matches = [] if idx is None else [idx]
+        if not matches:
+            unmatched.append(pattern)
+            continue
+        for idx in matches:
+            if idx not in selected_set:
+                selected.append(idx)
+                selected_set.add(idx)
+
+    if unmatched:
+        sample = ", ".join(feature_names[:40])
+        suffix = "..." if len(feature_names) > 40 else ""
+        raise ValueError(
+            f"{label} did not match panel features: {unmatched}. "
+            f"Available sample: {sample}{suffix}"
+        )
+    return selected
+
+
+def _resolve_panel_feature_indices(
+    base_feature_names: list[str],
+    external_feature_names: list[str],
+    *,
+    feature_include: tuple[str, ...] = (),
+    feature_exclude: tuple[str, ...] = (),
+) -> tuple[list[int], list[int], list[int], list[int], list[str]]:
+    all_feature_names = [*base_feature_names, *external_feature_names]
+    if feature_include:
+        selected = _feature_pattern_indices(all_feature_names, feature_include, label="feature_include")
+    else:
+        selected = list(range(len(all_feature_names)))
+
+    if feature_exclude:
+        excluded = set(_feature_pattern_indices(all_feature_names, feature_exclude, label="feature_exclude"))
+        selected = [idx for idx in selected if idx not in excluded]
+
+    if not selected:
+        raise ValueError("feature_include/feature_exclude removed all panel features")
+
+    num_base = len(base_feature_names)
+    base_indices: list[int] = []
+    base_dest_indices: list[int] = []
+    external_indices: list[int] = []
+    external_dest_indices: list[int] = []
+    for dest_idx, source_idx in enumerate(selected):
+        if source_idx < num_base:
+            base_indices.append(source_idx)
+            base_dest_indices.append(dest_idx)
+        else:
+            external_indices.append(source_idx - num_base)
+            external_dest_indices.append(dest_idx)
+    selected_names = [all_feature_names[idx] for idx in selected]
+    return base_indices, base_dest_indices, external_indices, external_dest_indices, selected_names
+
+
+def _filter_panel_features(
+    panel: PanelData,
+    *,
+    feature_include: tuple[str, ...] = (),
+    feature_exclude: tuple[str, ...] = (),
+) -> PanelData:
+    if not feature_include and not feature_exclude:
+        return panel
+
+    if feature_include:
+        selected = _feature_pattern_indices(panel.feature_names, feature_include, label="feature_include")
+    else:
+        selected = list(range(len(panel.feature_names)))
+
+    if feature_exclude:
+        excluded = set(_feature_pattern_indices(panel.feature_names, feature_exclude, label="feature_exclude"))
+        selected = [idx for idx in selected if idx not in excluded]
+
+    if not selected:
+        raise ValueError("feature_include/feature_exclude removed all panel features")
+
+    if selected == list(range(len(panel.feature_names))):
+        return panel
+
+    filtered_names = [panel.feature_names[idx] for idx in selected]
+    print(
+        f"[panel] feature filter kept {len(filtered_names)}/{len(panel.feature_names)} "
+        f"(include={list(feature_include) or ['*']}, exclude={list(feature_exclude) or []})"
+    )
+    return PanelData(
+        dates=panel.dates,
+        symbols=panel.symbols,
+        feature_names=filtered_names,
+        features=np.ascontiguousarray(panel.features[:, :, selected]),
+        returns_1d=panel.returns_1d,
+        tradable_mask=panel.tradable_mask,
+        can_buy_mask=panel.can_buy_mask,
+        can_sell_mask=panel.can_sell_mask,
+        can_short_open_mask=panel.can_short_open_mask,
+        force_short_cover_mask=panel.force_short_cover_mask,
+        force_exit_mask=panel.force_exit_mask,
+        alive_mask=panel.alive_mask,
+        benchmark_returns=panel.benchmark_returns,
+        close_prices=panel.close_prices,
+        daily_volumes=panel.daily_volumes,
+    )
+
+
+def _zero_fill_panel_features(
+    panel: PanelData,
+    feature_zero_fill: tuple[str, ...] = (),
+) -> PanelData:
+    if not feature_zero_fill:
+        return panel
+    selected = _feature_pattern_indices(
+        panel.feature_names,
+        feature_zero_fill,
+        label="feature_zero_fill",
+    )
+    for feature_idx in selected:
+        panel.features[:, :, feature_idx] = 0.0
+    print(
+        f"[panel] zero-filled {len(selected)}/{len(panel.feature_names)} retained features "
+        f"(patterns={list(feature_zero_fill)})"
+    )
+    return panel
 
 
 def _check_cache_valid(cache_path: Path, meta_path: Path, parquet_paths: list[Path], backend_key: str) -> bool:
@@ -1161,18 +2742,39 @@ def _load_valid_panel_cache(
 
 def build_panel(
     parquet_root: str | Path,
-    use_rapids: bool = True,
     benchmark_name: str = "universe_average_return",
     usd_only_trading_pairs: bool = False,
     tradable_mode: str = "tradable",
     trading_volume_policy: str | bool | None = "auto",
+    security_filter: str | None = "none",
     strict_no_fallback: bool | None = None,
     buy_tradable_mode: str | None = None,
     sell_tradable_mode: str | None = None,
     panel_backend: str = "auto",
     panel_load_workers: int = 4,
+    external_feature_path: str | Path | None = None,
+    external_market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
+    external_include_features: bool = True,
+    external_include_rules: bool = True,
+    external_data_required: bool = False,
+    feature_include: Any = None,
+    feature_exclude: Any = None,
+    feature_zero_fill: Any = None,
+    panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
+    external_feature_path = _resolve_external_data_path(
+        external_feature_path,
+        include_features=external_include_features,
+        include_rules=external_include_rules,
+        required=external_data_required,
+    )
+    feature_include_patterns = _normalize_feature_patterns(feature_include, label="feature_include")
+    feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
+    feature_zero_fill_patterns = _normalize_feature_patterns(
+        feature_zero_fill, label="feature_zero_fill"
+    )
+    normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
@@ -1181,6 +2783,13 @@ def build_panel(
         parquet_paths = [path for path in parquet_paths if _is_usd_trading_pair(path)]
         if not parquet_paths:
             raise FileNotFoundError(f"No USD trading pairs found under {parquet_root}")
+
+    security_filter = _normalize_security_filter(security_filter)
+    security_metadata_paths = _security_filter_metadata_paths(parquet_root, security_filter)
+    if security_filter == BROKER_TRADABLE_SECURITY_FILTER:
+        parquet_paths = _filter_us_broker_tradable_paths(parquet_root, parquet_paths, security_metadata_paths)
+        if not parquet_paths:
+            raise FileNotFoundError(f"No broker-tradable US symbols found under {parquet_root}")
 
     panel_backend = str(panel_backend).strip().lower()
     valid_backends = {"auto", "polars", "polars_lazy", "polars_streaming", "pyarrow"}
@@ -1228,14 +2837,26 @@ def build_panel(
     else:
         raise RuntimeError("data.panel_backend='auto' requires pyarrow")
 
+    external_key = str(external_feature_path) if external_feature_path is not None else "none"
     backend_key = (
         f"{selected_backend}|benchmark={benchmark_name}|"
         f"usd_only={usd_only_trading_pairs}|tradable_mode={tradable_mode}|"
-        f"trading_volume_policy={trading_volume_policy}"
+        f"tw_limit_rounding=v2|"
+        f"trading_volume_policy={trading_volume_policy}|security_filter={security_filter}|"
+        f"external={external_key}|external_market_symbol={external_market_symbol}|"
+        f"external_features={bool(external_include_features)}|"
+        f"external_rules={bool(external_include_rules)}|"
+        f"feature_include={list(feature_include_patterns)!r}|"
+        f"feature_exclude={list(feature_exclude_patterns)!r}|"
+        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"panel_start_date={normalized_panel_start_date}"
     )
-    source_hash = _compute_source_hash(parquet_paths)
+    source_paths = [*parquet_paths, *security_metadata_paths]
+    if external_feature_path is not None:
+        source_paths.append(external_feature_path)
+    source_hash = _compute_source_hash(source_paths)
 
-    panel = _load_valid_panel_cache(parquet_root, parquet_paths, backend_key, source_hash)
+    panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
         _print_feature_overview(panel)
         return panel
@@ -1282,7 +2903,26 @@ def build_panel(
             continue
         if arrays is not None:
             valid_arrays.append(arrays)
-    panel = _build_panel_from_symbol_arrays(valid_arrays, benchmark_name=benchmark_name)
+    external_features = (
+        _load_external_feature_arrays(
+            external_feature_path,
+            market_symbol=external_market_symbol,
+            include_features=external_include_features,
+            include_rules=external_include_rules,
+        )
+        if external_feature_path is not None
+        else None
+    )
+    panel = _build_panel_from_symbol_arrays(
+        valid_arrays,
+        benchmark_name=benchmark_name,
+        external_features=external_features,
+        feature_include=feature_include_patterns,
+        feature_exclude=feature_exclude_patterns,
+    )
+    panel = _apply_external_rule_masks(panel, external_features)
+    panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _slice_panel_start(panel, normalized_panel_start_date)
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
     _print_feature_overview(panel)

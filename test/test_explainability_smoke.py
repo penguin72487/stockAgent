@@ -7,12 +7,20 @@ import warnings
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import (
     ExplainabilitySettings,
+    _align_panel_to_checkpoint_universe,
+    _daily_weight_symbols,
+    _evenly_spaced_sample_indices,
+    _method_agreement_table,
+    _forward_outputs,
+    _perturbation_importance,
+    _representation_aux_summary,
     _save_matplotlib_figure,
     _with_numeric,
     _feature_correlations,
@@ -21,6 +29,97 @@ from stockagent.explainability import (
     write_fold_stability_outputs,
     write_explanation_outputs,
 )
+
+
+def test_evenly_spaced_sample_indices_stay_in_bounds_above_float32_exact_range() -> None:
+    n_points = 216 * 32 * 2735
+    indices = _evenly_spaced_sample_indices(
+        n_points,
+        65_536,
+        device=torch.device("cpu"),
+    )
+
+    assert indices.dtype == torch.long
+    assert indices.numel() == 65_536
+    assert int(indices[0]) == 0
+    assert int(indices[-1]) == n_points - 1
+    assert bool(torch.all(indices[1:] > indices[:-1]))
+    assert int(indices.min()) >= 0
+    assert int(indices.max()) < n_points
+
+
+class _BatchShapeSensitiveExplainModel(torch.nn.Module):
+    def forward(self, x, mask, return_aux=None):
+        scores = x.sum(dim=(1, 3)) + float(x.size(0)) * 0.01
+        scores = scores.masked_fill(~mask, 0.0)
+        return scores, scores, {}
+
+
+def test_perturbation_uses_batch_matched_baseline() -> None:
+    x = torch.randn(1, 2, 3, 2)
+    x[..., 1] = 0.0
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    model = _BatchShapeSensitiveExplainModel()
+    base_weights, base_scores, _ = _forward_outputs(model, x, mask)
+
+    feature_time, _, diagnostics = _perturbation_importance(
+        model,
+        x,
+        mask,
+        base_weights,
+        base_scores,
+        ["signal", "already_zero"],
+        batch_size=2,
+        progress_enabled=False,
+    )
+
+    zero_rows = feature_time.filter(feature_time["feature"] == "already_zero")
+    assert zero_rows["weight_abs_delta"].max() == pytest.approx(0.0)
+    assert zero_rows["score_abs_delta"].max() == pytest.approx(0.0)
+    assert diagnostics["batch_matched_baseline"] is True
+    assert diagnostics["baseline_forward_batches"] == 1
+    assert diagnostics["original_vs_matched_baseline_weight_abs_delta"] > 0.0
+
+
+def test_daily_weight_symbols_supports_parquet_and_csv(tmp_path: Path) -> None:
+    import polars as pl
+
+    frame = pl.DataFrame({"date": ["2026-01-02"], "2330": [0.5], "0050": [-0.5]})
+    parquet_path = tmp_path / "daily_weights.parquet"
+    csv_path = tmp_path / "daily_weights.csv"
+    frame.write_parquet(parquet_path)
+    frame.write_csv(csv_path)
+
+    assert _daily_weight_symbols(parquet_path) == ["2330", "0050"]
+    assert _daily_weight_symbols(csv_path) == ["2330", "0050"]
+
+
+def test_explainability_alignment_does_not_treat_position_capacity_as_universe(tmp_path: Path) -> None:
+    import polars as pl
+
+    symbols = ["0050", "2330", "2317"]
+    panel = PanelData(
+        dates=np.asarray(["2026-01-02"], dtype="datetime64[D]"),
+        symbols=symbols,
+        feature_names=["f0"],
+        features=np.zeros((1, 3, 1), dtype=np.float32),
+        returns_1d=np.zeros((1, 3), dtype=np.float32),
+        tradable_mask=np.ones((1, 3), dtype=bool),
+        alive_mask=np.ones((1, 3), dtype=bool),
+        benchmark_returns=np.zeros(1, dtype=np.float32),
+        close_prices=np.ones((1, 3), dtype=np.float32),
+    )
+    fold_dir = tmp_path / "fold_01"
+    fold_dir.mkdir()
+    checkpoint_path = fold_dir / "checkpoint_best.pt"
+    torch.save({"model_state_dict": {"symbol_position": torch.zeros(1, 1, 2, 4)}}, checkpoint_path)
+    pl.DataFrame({"date": ["2026-01-02"], **{symbol: [0.0] for symbol in symbols}}).write_parquet(
+        fold_dir / "daily_weights.parquet"
+    )
+
+    aligned = _align_panel_to_checkpoint_universe(panel, tmp_path, 1, checkpoint_path)
+
+    assert aligned is panel
 
 
 class ToyExplainableModel(torch.nn.Module):
@@ -92,13 +191,20 @@ def test_explainability_smoke(tmp_path: Path) -> None:
         feature_names=[f"f{i}" for i in range(features)],
         symbols=[f"S{i}" for i in range(symbols)],
         dates=[f"2026-01-0{i + 1}" for i in range(rows)],
-        settings=ExplainabilitySettings(top_k=2, max_rows=rows, ig_steps=2, perturb=True),
+        settings=ExplainabilitySettings(max_rows=rows, ig_steps=2, perturb=True),
         device=torch.device("cpu"),
     )
 
     assert output["summary"]["warnings"]
+    assert output["summary"]["attribution_scope"] == "all_tradable_nonzero_positions_gross_weighted"
     assert not output["frames"]["feature_importance_gradient"].is_empty()
-    assert not output["frames"]["top_decisions"].is_empty()
+    assert "top_decisions" not in output["frames"]
+    assert len(output["frames"]["decision_inventory"]) == rows * symbols
+    completeness = output["frames"]["explainability_completeness"].row(0, named=True)
+    assert completeness["decision_inventory_rows"] == rows * symbols
+    assert completeness["position_count_coverage"] == pytest.approx(1.0)
+    assert completeness["gross_exposure_coverage"] == pytest.approx(1.0)
+    assert completeness["gradient_feature_time_cells"] == lookback * features
 
     out_dir = tmp_path / "explain"
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -106,16 +212,36 @@ def test_explainability_smoke(tmp_path: Path) -> None:
     assert (out_dir / "summary.json").exists()
     assert (out_dir / "report.md").exists()
     assert (out_dir / "paper_explainability_report.md").exists()
+    assert (out_dir / "comprehensive_explainability_report.md").exists()
+    assert (out_dir / "plot_validation.json").exists()
     assert (out_dir / "paper_explainability_summary.json").exists()
     assert (out_dir / "feature_importance_gradient.csv").exists()
+    assert (out_dir / "decision_inventory.csv").exists()
     assert (out_dir / "paper_tables" / "global_feature_attribution.csv").exists()
+    assert (out_dir / "paper_tables" / "feature_attribution_coverage_curve.csv").exists()
+    assert (out_dir / "paper_tables" / "explainability_completeness.csv").exists()
     assert (out_dir / "paper_tables" / "trust_checks.csv").exists()
     assert (out_dir / "paper_tables" / "lookback_consistency.csv").exists()
+    assert (out_dir / "paper_tables" / "method_agreement.csv").exists()
+    assert (out_dir / "paper_tables" / "gross_pre_fee_risk_diagnostic.csv").exists()
+    assert (out_dir / "stock_contributions.parquet").exists()
     assert (out_dir / "plots_paper" / "feature_time_gradient_grad_x_input_abs_heatmap.png").exists()
+    assert (out_dir / "plots_paper" / "feature_attribution_coverage_curve.png").exists()
+    assert (out_dir / "plots_paper" / "portfolio_exposure_coverage_curve.png").exists()
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["plots_generated"]
     assert summary["paper_plots"]
+    assert summary["plot_validation"]["failed"] == 0
     assert list((out_dir / "plots").glob("*.png"))
+    validation = json.loads((out_dir / "plot_validation.json").read_text(encoding="utf-8"))
+    assert validation
+    assert all(entry["status"] == "ok" for entry in validation)
+    comprehensive_report = (out_dir / "comprehensive_explainability_report.md").read_text(encoding="utf-8")
+    assert "完整視覺證據" in comprehensive_report
+    assert "衡量內容" in comprehensive_report
+    assert "解讀方式" in comprehensive_report
+    assert "可疑訊號" in comprehensive_report
+    assert "![" in comprehensive_report
 
 
 def test_feature_correlations_zero_variance_without_runtime_warning() -> None:
@@ -143,7 +269,6 @@ def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards()
         "tradable_mask": torch.ones(rows, symbols, dtype=torch.bool),
     }
     common = dict(
-        top_k=2,
         max_rows=rows,
         ig_steps=4,
         perturb=True,
@@ -184,6 +309,9 @@ def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards()
         np.testing.assert_allclose(left.get_column(value_col).to_numpy(), right.get_column(value_col).to_numpy(), rtol=1e-5, atol=1e-7)
 
     assert chunked_model.forward_calls < serial_model.forward_calls
+    diagnostics = chunked["summary"]["perturb_diagnostics"]
+    assert diagnostics["elapsed_s"] >= 0.0
+    assert diagnostics["perturbations_per_s"] > 0.0
 
 
 def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path: Path) -> None:
@@ -201,7 +329,6 @@ def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path:
         symbols=[f"S{i}" for i in range(symbols)],
         dates=[f"2026-02-{i + 1:02d}" for i in range(rows)],
         settings=ExplainabilitySettings(
-            top_k=2,
             max_rows=rows,
             ig_steps=1,
             perturb=True,
@@ -226,10 +353,10 @@ def test_paper_explainability_lookback_warning_and_heatmap_readability(tmp_path:
     consistency = (out_dir / "paper_tables" / "lookback_consistency.csv").read_text(encoding="utf-8")
     assert "warn" in consistency
     report = (out_dir / "paper_explainability_report.md").read_text(encoding="utf-8")
-    assert "Lookback warning" in report
-    assert "What it measures" in report
-    assert "How to read it" in report
-    assert "What would be suspicious" in report
+    assert "Lookback 警告" in report
+    assert "衡量內容" in report
+    assert "解讀方式" in report
+    assert "可疑訊號" in report
 
     image_path = out_dir / "plots_paper" / "feature_time_gradient_grad_x_input_abs_heatmap.png"
     assert image_path.exists()
@@ -258,12 +385,78 @@ def test_paper_fold_stability_outputs(tmp_path: Path) -> None:
         import polars as pl
 
         pl.DataFrame(rows).write_csv(table_dir / "global_feature_attribution.csv")
+        fold_dir = table_dir.parent
+        (fold_dir / "summary.json").write_text(
+            json.dumps(
+                {
+                    "portfolio": {
+                        "mean_gross": 1.0,
+                        "mean_abs_net": 0.4 + shift,
+                        "mean_long_gross": 0.7 + shift / 2,
+                        "mean_short_gross": 0.3 - shift / 2,
+                        "mean_turnover_proxy": 1.1 + shift,
+                        "max_abs_weight_mean": 0.2 + shift,
+                        "max_abs_weight_max": 0.5 + shift,
+                        "mean_daily_log_return": 0.001,
+                    },
+                    "metadata": {
+                        "date_start": f"202{fold_id}-01-01",
+                        "date_end": f"202{fold_id}-12-31",
+                        "sample_rows": 200,
+                        "sampled_date_coverage": 1.0,
+                    },
+                    "shap_info": {"surrogate_r2": 0.85 - shift, "valid_rows": 1000},
+                    "warnings": ["Turnover proxy is high; strategy may be relying on unstable daily flips."],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (fold_dir / "plot_validation.json").write_text("[]", encoding="utf-8")
 
     output = write_fold_stability_outputs(root)
     assert output is not None
     assert (output / "paper_tables" / "fold_feature_stability.csv").exists()
     assert (output / "plots_paper" / "fold_stability_feature_share.png").exists()
     assert (output / "paper_fold_stability_report.md").exists()
+    assert (root / "comprehensive_all_folds_report.md").exists()
+    assert (root / "plot_validation_all_folds.json").exists()
+    report = (root / "comprehensive_all_folds_report.md").read_text(encoding="utf-8")
+    assert "不是將各 Fold 報告或圖片串接" in report
+    assert "fold_01_test/plots/" not in report
+    assert report.count("comprehensive_explainability_report.md") == 2
+    assert (root / "tables_cross_fold" / "cross_fold_portfolio_and_shap.csv").exists()
+    assert (root / "plots_cross_fold" / "cross_fold_portfolio_diagnostics.png").exists()
+
+
+def test_method_agreement_active_union_avoids_shared_zero_tie_inflation() -> None:
+    import polars as pl
+
+    table = pl.DataFrame(
+        {
+            "feature": ["a", "b", "c", "d", "e", "f"],
+            "gradient_share": [0.6, 0.3, 0.1, 0.0, 0.0, 0.0],
+            "integrated_gradients_share": [0.1, 0.3, 0.6, 0.0, 0.0, 0.0],
+        }
+    )
+    agreement = _method_agreement_table(table)
+    active = agreement.filter(pl.col("comparison_scope") == "active_union").row(0, named=True)
+    full = agreement.filter(pl.col("comparison_scope") == "all_features_including_zero_ties").row(0, named=True)
+    assert active["features_compared"] == 3
+    assert full["features_compared"] == 6
+    assert active["spearman_rank_correlation"] < full["spearman_rank_correlation"]
+
+
+def test_aux_collapse_scope_excludes_portfolio_accounting_outputs() -> None:
+    import polars as pl
+
+    frame = pl.DataFrame(
+        {
+            "name": ["implicit_cash_weight", "market_tokens", "stock_embedding"],
+            "zero_fraction": [1.0, 0.1, 0.2],
+        }
+    )
+    scoped = _representation_aux_summary(frame)
+    assert scoped.get_column("name").to_list() == ["market_tokens", "stock_embedding"]
 
 
 def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path) -> None:
@@ -293,7 +486,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
     )
     config = SimpleNamespace(training=SimpleNamespace(model_name="toy", lookback=lookback))
     settings = ExplainabilitySettings(
-        top_k=2,
         max_rows=2,
         ig_steps=0,
         perturb=False,
@@ -303,7 +495,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
         regime_analysis=False,
         fold_stability=False,
         umap_enabled=False,
-        cross_asset_enabled=False,
     )
 
     output = run_loaded_model_explanation(
@@ -334,3 +525,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
     assert summary["rows"] == 2
     assert timing["loaded_model_reused"] is True
     assert timing["compute_timing"]["total_s"] >= 0
+    assert "cross_asset_s" not in timing
+    assert "cross_asset_summary" not in timing
+    assert not (output / "abstract_cross_asset_transmission").exists()
