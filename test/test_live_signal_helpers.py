@@ -19,6 +19,7 @@ from stockagent.live.signal_engine import (
     _previous_usable_panel_date,
     _require_supported_live_execution,
     _resolve_usable_panel_index,
+    _weights_history_has_date,
     write_live_weights_history,
 )
 from stockagent.live.portfolio_history import load_portfolio_history
@@ -261,6 +262,17 @@ def test_daily_previous_weights_use_previous_live_trading_day_not_same_day_signa
     assert np.isclose(weights[0], 0.90)
 
 
+def test_previous_signal_backfill_stops_at_checkpoint_daily_weights(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_20"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {"date": ["2026-07-08"], "AAA": [0.25]}
+    ).write_parquet(fold_dir / "daily_weights.parquet")
+
+    assert _weights_history_has_date(fold_dir, "2026-07-08") is True
+    assert _weights_history_has_date(fold_dir, "2026-07-09") is False
+
+
 def test_daily_realtime_previous_weights_can_use_panel_date_signal(tmp_path) -> None:
     fold_dir = tmp_path / "fold_25"
     fold_dir.mkdir()
@@ -349,6 +361,34 @@ def test_previous_weights_choose_latest_prior_date_before_live_preference(tmp_pa
     assert weights_path == str(fold_dir / "daily_weights.parquet")
     assert date_text == "2026-07-02"
     assert np.isclose(weights[0], 0.40)
+
+
+def test_explicit_daily_weights_still_allows_newer_live_history(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_20"
+    fold_dir.mkdir()
+    daily_path = fold_dir / "daily_weights.parquet"
+    pl.DataFrame(
+        {"date": ["2026-07-08"], "AAA": [0.25]}
+    ).write_parquet(daily_path)
+    write_live_weights_history(
+        fold_dir,
+        {"weights_date": "2026-07-14"},
+        [{"symbol": "AAA", "target_weight": 0.75}],
+    )
+
+    weights, date_text, selected_path = _load_previous_weights(
+        ["AAA"],
+        output_dir=tmp_path,
+        fold_id=20,
+        weights_path=daily_path,
+        asof_date="2026-07-15",
+        prefer_live_weights=True,
+        strictly_before_asof=True,
+    )
+
+    assert selected_path == str(fold_dir / LIVE_SIGNAL_WEIGHTS_NAME)
+    assert date_text == "2026-07-14"
+    assert np.isclose(weights[0], 0.75)
 
 
 def test_live_weights_has_date_matches_exact_daily_signal_date(tmp_path) -> None:

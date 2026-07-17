@@ -2757,9 +2757,20 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         deduped = _dedupe_records_by_code(records)
         if args.limit is not None:
             deduped = deduped[: args.limit]
+        manifest_records = list(deduped)
+        if _is_incremental_mode(args):
+            output_dir = _resolve_asset_output_dir(args, asset_class)
+            known = {
+                record.code: record
+                for record in [
+                    *_resolve_cached_manifest(output_dir, asset_class),
+                    *_load_repo_symbol_fallback(asset_class),
+                ]
+            }
+            deduped = [known.get(record.code, record) for record in deduped]
         return SymbolResolution(
             scheduled_records=deduped,
-            manifest_records=deduped,
+            manifest_records=manifest_records,
             new_codes=set(),
             excluded_records=_dedupe_excluded_records(excluded_records),
         )
@@ -2773,9 +2784,20 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         deduped = _dedupe_records_by_code(records)
         if args.limit is not None:
             deduped = deduped[: args.limit]
+        manifest_records = list(deduped)
+        if _is_incremental_mode(args):
+            output_dir = _resolve_asset_output_dir(args, asset_class)
+            known = {
+                record.code: record
+                for record in [
+                    *_resolve_cached_manifest(output_dir, asset_class),
+                    *_load_repo_symbol_fallback(asset_class),
+                ]
+            }
+            deduped = [known.get(record.code, record) for record in deduped]
         return SymbolResolution(
             scheduled_records=deduped,
-            manifest_records=deduped,
+            manifest_records=manifest_records,
             new_codes=set(),
             excluded_records=_dedupe_excluded_records(excluded_records),
         )

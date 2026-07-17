@@ -21,6 +21,7 @@ from scripts.build_tw_official_symbol_parquets import (
     _normalized_reference_index,
     _receipt,
     _source_adjustment_factors,
+    _validate_download_receipts,
     _validate_yahoo_fallback_archive,
     _write_symbol,
     _write_official_quote_parquet,
@@ -213,6 +214,40 @@ def _empty_tpex_quotes() -> pl.DataFrame:
             "次日參考價": pl.Float64,
         }
     )
+
+
+def test_official_frame_excludes_partial_rows_after_completed_cutoff(
+    tmp_path: Path,
+) -> None:
+    public_dir = tmp_path / "public"
+    public_dir.mkdir()
+    tpex = pl.DataFrame(
+        {
+            "date": [date(2026, 7, 15), date(2026, 7, 16)],
+            "代號": ["2330", "2330"],
+            "名稱": ["台積電", "台積電"],
+            "開盤": [1000.0, 1010.0],
+            "最高": [1020.0, 1030.0],
+            "最低": [995.0, 1005.0],
+            "收盤": [1015.0, 1025.0],
+            "成交股數": [1000.0, 1200.0],
+            "漲跌": ["+15", "除權息"],
+            "次日參考價": [1015.0, None],
+        }
+    )
+    _write_core_official_sources(
+        public_dir,
+        twse=_empty_twse_quotes(),
+        tpex=tpex,
+        sessions=[date(2026, 7, 15), date(2026, 7, 16)],
+    )
+
+    frame, _, _, _, _ = _official_frame(
+        public_dir,
+        end_date=date(2026, 7, 15),
+    )
+
+    assert frame.get_column("date").to_list() == [date(2026, 7, 15)]
 
 
 def test_builder_summary_is_accepted_by_auditor_and_tampering_fails_closed(
@@ -1920,3 +1955,47 @@ def test_official_ohlcv_can_use_yahoo_factor_only_when_official_factor_is_missin
         "yahoo_fallback",
     ]
     assert math.isclose(output["adjclose"][1] / output["adjclose"][0], 1.05)
+def test_daily_close_receipt_allows_only_certified_margin_publication_lag(
+    tmp_path: Path,
+) -> None:
+    corporate_path = tmp_path / "tw_corporate_action_reference.parquet"
+    corporate_path.write_bytes(b"certified-corporate-reference")
+    (tmp_path / "tw_corporate_action_reference.summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "coverage_complete": True,
+                "failure_count": 0,
+                "output_receipt": _receipt(corporate_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    public_summary_path = tmp_path / "download_summary.json"
+    public_summary = {
+        "mode": "daily",
+        "coverage_complete": False,
+        "failed_count": 2,
+        "blocking_failed_count": 0,
+        "daily_close_ready": True,
+        "publication_lag_datasets": [
+            "tpex_margin_balance",
+            "twse_margin_balance",
+        ],
+    }
+    public_summary_path.write_text(json.dumps(public_summary), encoding="utf-8")
+
+    _validate_download_receipts(
+        tmp_path,
+        allow_incomplete=False,
+        allow_daily_publication_lag=True,
+    )
+
+    public_summary["publication_lag_datasets"] = ["twse_daily_ohlcv"]
+    public_summary_path.write_text(json.dumps(public_summary), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="complete source receipts"):
+        _validate_download_receipts(
+            tmp_path,
+            allow_incomplete=False,
+            allow_daily_publication_lag=True,
+        )

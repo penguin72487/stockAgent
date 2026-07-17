@@ -7,7 +7,7 @@ open_time: "09:00"
 close_time: "13:30"
 schedule_time: "13:15"
 summary_time: "14:00"
-data_ready_time: "18:00"
+data_ready_time: "13:30"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
@@ -16,6 +16,8 @@ pre_signal_command:
   - downloader/download_tw_official_data.py
   - --mode
   - daily
+  - --config
+  - configs/markets/tw_public.yaml
   - --public-dir
   - data_tw_public
   - --stock-root
@@ -33,20 +35,20 @@ pre_signal_command:
   - --skip-raw
 pre_signal_timeout_seconds: 1800
 
-config_path: configs/markets/tw.yaml
-output_dir: artifacts/markets/tw
+config_path: configs/markets/tw_public.yaml
+output_dir: artifacts/markets/tw_public_lantent
 live_output_dir: artifacts/live_signals/tw
 
-# null/empty/auto/latest means: discover the latest fold_*/checkpoint_best.pt.
-fold_id:
-checkpoint_path:
-weights_path:
+# Pin the full public-data latent model selected for Discord deployment.
+fold_id: 20
+checkpoint_path: artifacts/markets/tw_public_lantent/fold_20/checkpoint_best.pt
+weights_path: artifacts/markets/tw_public_lantent/fold_20/daily_weights.parquet
 
 panel_date: latest
 device: cuda
 price_source: panel
 prices_csv:
-yahoo_chunk_size: 80
+yahoo_chunk_size: 200
 
 top_n: 2400
 min_abs_delta: 0.001

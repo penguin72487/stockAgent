@@ -16,6 +16,7 @@ from stockagent.explainability import (
     ExplainabilitySettings,
     _align_panel_to_checkpoint_universe,
     _daily_weight_symbols,
+    _evenly_spaced_sample_indices,
     _method_agreement_table,
     _forward_outputs,
     _perturbation_importance,
@@ -57,6 +58,23 @@ class _TinyJLensePortfolio(torch.nn.Module):
         weights = scores.masked_fill(~mask, 0.0)
         aux = {"z_stock": z_stock, "score_logits": scores}
         return weights, scores, aux if return_aux else {}
+
+
+def test_evenly_spaced_sample_indices_stay_in_bounds_above_float32_exact_range() -> None:
+    n_points = 216 * 32 * 2735
+    indices = _evenly_spaced_sample_indices(
+        n_points,
+        65_536,
+        device=torch.device("cpu"),
+    )
+
+    assert indices.dtype == torch.long
+    assert indices.numel() == 65_536
+    assert int(indices[0]) == 0
+    assert int(indices[-1]) == n_points - 1
+    assert bool(torch.all(indices[1:] > indices[:-1]))
+    assert int(indices.min()) >= 0
+    assert int(indices.max()) < n_points
 
 
 def test_portfolio_j_lens_is_complete_and_faithfulness_checked() -> None:

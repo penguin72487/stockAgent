@@ -78,6 +78,7 @@ def test_scheduled_markets_defaults_to_all_configured_markets(monkeypatch) -> No
         "services.discord_bot.bot._market_configs",
         lambda: {"tw": object(), "crypto": object(), "us": object()},
     )
+    monkeypatch.setattr("services.discord_bot.bot._market_enabled", lambda cfg: True)
 
     assert _scheduled_markets() == ["crypto", "tw", "us"]
 
@@ -88,8 +89,21 @@ def test_scheduled_markets_respects_explicit_env(monkeypatch) -> None:
         "services.discord_bot.bot._market_configs",
         lambda: {"tw": object(), "crypto": object(), "us": object()},
     )
+    monkeypatch.setattr("services.discord_bot.bot._market_enabled", lambda cfg: True)
 
     assert _scheduled_markets() == ["tw", "crypto"]
+
+
+def test_scheduled_markets_excludes_disabled_market_even_when_explicit(monkeypatch) -> None:
+    configs = {"tw": object(), "crypto": object(), "us": object()}
+    monkeypatch.setenv("STOCKAGENT_SCHEDULED_MARKETS", "all")
+    monkeypatch.setattr("services.discord_bot.bot._market_configs", lambda: configs)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_enabled",
+        lambda cfg: cfg is not configs["crypto"],
+    )
+
+    assert _scheduled_markets() == ["tw", "us"]
 
 
 def test_public_broadcasts_default_to_disabled(monkeypatch) -> None:
@@ -274,6 +288,28 @@ def test_can_reuse_latest_signal_now_rejects_stale_closed_panel() -> None:
     reusable, _ = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
 
     assert not reusable
+
+
+def test_can_reuse_latest_signal_now_rejects_another_model_deployment() -> None:
+    cfg = SimpleNamespace(market="tw", fold_id=20)
+    status = SimpleNamespace(
+        market_open=False,
+        checkpoint=SimpleNamespace(fingerprint="new-checkpoint"),
+        config_fingerprint="new-config",
+        data=SimpleNamespace(fresh=True, last_data_date="2026-07-14", panel_date="2026-07-14"),
+    )
+    summary = {
+        "fold_id": 25,
+        "checkpoint_fingerprint": "old-checkpoint",
+        "config_fingerprint": "old-config",
+        "panel_date": "2026-07-14 13:30:00",
+        "price_source": "panel_close",
+    }
+
+    reusable, reason = _can_reuse_latest_signal_now(cfg, status, summary, requested_price_source="auto")
+
+    assert not reusable
+    assert reason == "deployment_fold_changed"
 
 
 def test_can_reuse_latest_signal_now_rejects_closed_tw_panel_when_today_panel_missing(monkeypatch) -> None:
@@ -1199,6 +1235,52 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
     assert np.isclose(result.period_return, 1.01 * 1.02 * 0.99 - 1.0)
     assert result.rows[0]["source"] == "latest_live_signal"
     assert result.rows[1]["source"] == "latest_live_signal"
+
+
+def test_portfolio_history_excludes_signal_after_canonical_live_weights(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    fold_dir = tmp_path / "fold_20"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {"date": ["2026-07-15 00:00:00"], "AAA": [0.5]}
+    ).write_parquet(fold_dir / "live_signal_weights.parquet")
+    result = SimpleNamespace(
+        rows=[{"date": "2026-07-14", "portfolio_return": 0.0}],
+        source_paths=(),
+        days=2,
+        top_changes=0,
+        start_date="2026-07-14",
+        end_date="2026-07-14",
+        period_return=0.0,
+        benchmark_return=0.0,
+        profit_value=0.0,
+        capital=SimpleNamespace(capital=1_000.0),
+    )
+    summary_path = tmp_path / "bad" / "summary.json"
+    summary_path.parent.mkdir()
+    summary_path.write_text("{}", encoding="utf-8")
+    bad_summary = {
+        "panel_data_date": "2026-07-16 00:00:00",
+        "portfolio_simple_return": -0.18,
+    }
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_fold_dir",
+        lambda cfg: fold_dir,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_signals",
+        lambda cfg: [(summary_path, bad_summary)],
+    )
+
+    _include_live_signals_in_portfolio_history(
+        SimpleNamespace(market="tw", live_output_dir=str(tmp_path)),
+        result,
+        max_rows=2,
+    )
+
+    assert [row["date"] for row in result.rows] == ["2026-07-14"]
 
 
 def test_portfolio_change_line_omits_missing_live_signal_shares() -> None:
