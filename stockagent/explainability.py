@@ -1294,8 +1294,27 @@ def _perturbation_importance(
                         float((base_scores_repeated[0] - base_scores).abs().mean().detach().cpu()),
                     )
                 base_weights_matched, base_scores_matched = matched_baseline
-                weight_deltas = (weights_p - base_weights_matched[:repeats]).abs().mean(dim=(1, 2)).detach().cpu().numpy()
-                score_deltas = (scores_p - base_scores_matched[:repeats]).abs().mean(dim=(1, 2)).detach().cpu().numpy()
+                # NumPy has no native bfloat16 dtype. Keep the model forward in
+                # configured AMP precision, but materialize scalar diagnostics
+                # as float32 before crossing the NumPy boundary.
+                weight_deltas = (
+                    (weights_p - base_weights_matched[:repeats])
+                    .abs()
+                    .mean(dim=(1, 2))
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                score_deltas = (
+                    (scores_p - base_scores_matched[:repeats])
+                    .abs()
+                    .mean(dim=(1, 2))
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
             except RuntimeError as exc:
                 if not _is_cuda_oom(exc) or chunk_size <= 1:
                     raise
@@ -1664,6 +1683,29 @@ def _aux_point_metadata(
     return meta
 
 
+def _evenly_spaced_sample_indices(
+    n_points: int,
+    max_points: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return bounded, evenly spaced indices without float32 rounding drift."""
+    n_points = max(0, int(n_points))
+    max_points = max(0, int(max_points))
+    if n_points == 0:
+        return torch.empty(0, device=device, dtype=torch.long)
+    if max_points <= 0 or n_points <= max_points:
+        return torch.arange(n_points, device=device, dtype=torch.long)
+    if max_points == 1:
+        return torch.zeros(1, device=device, dtype=torch.long)
+    # torch.linspace defaults to float32 on CUDA. Above 2**24, rounding its
+    # endpoint can produce n_points rather than n_points - 1. Integer
+    # arithmetic makes the bounds exact for large flattened aux tensors.
+    numerators = torch.arange(max_points, device=device, dtype=torch.long)
+    numerators.mul_(n_points - 1)
+    return torch.div(numerators, max_points - 1, rounding_mode="floor")
+
+
 def _aux_umap_projection_frames(
     aux: dict[str, torch.Tensor],
     *,
@@ -1744,12 +1786,12 @@ def _aux_umap_projection_frames(
         if n_points < 4:
             warnings.append(f"{name}: fewer than 4 vectors; cuML UMAP skipped.")
             continue
-        if max_points > 0 and n_points > max_points:
-            sample_idx = torch.linspace(0, n_points - 1, max_points, device=flat.device).round().to(torch.long)
-            flat_sample = flat.index_select(0, sample_idx)
-        else:
-            sample_idx = torch.arange(n_points, device=flat.device, dtype=torch.long)
-            flat_sample = flat
+        sample_idx = _evenly_spaced_sample_indices(
+            n_points,
+            max_points,
+            device=flat.device,
+        )
+        flat_sample = flat.index_select(0, sample_idx)
         if flat_sample.device.type != "cuda":
             flat_sample = flat_sample.to(device=device, non_blocking=True)
             sample_idx = sample_idx.to(device=device, non_blocking=True)
