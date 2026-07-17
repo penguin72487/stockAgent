@@ -656,6 +656,17 @@ def test_load_config_rejects_unknown_portfolio_output_mode(tmp_path: Path) -> No
         load_config(config_path)
 
 
+def test_tw_public_select_uses_full_gross_long_short_l1_contract() -> None:
+    config = load_config("configs/markets/tw_public_select.yaml")
+
+    model = config.training.transformer_base_portfolio
+    assert config.trading.long_only is False
+    assert model.portfolio_mode == "long_short"
+    assert model.portfolio_output_mode == "l1"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+    assert config.trading.portfolio_activation == "pre_normalized"
+
+
 def test_tw_rule_switch_is_independent_from_tw_model_features() -> None:
     tw = load_config("configs/markets/tw.yaml")
     tw_public = load_config("configs/markets/tw_public.yaml")

@@ -1364,6 +1364,11 @@ def test_portfolio_output_mode_l1_uses_identity_l1_weights() -> None:
     )
     assert model.portfolio_output_mode == "l1"
     assert torch.allclose(weights, expected, atol=1e-6, rtol=1e-6)
+    long_gross = weights.clamp_min(0.0).sum(dim=1)
+    short_gross = (-weights.clamp_max(0.0)).sum(dim=1)
+    expected_gross = torch.ones_like(long_gross)
+    assert torch.allclose(weights.abs().sum(dim=1), expected_gross, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(long_gross + short_gross, expected_gross, atol=1e-6, rtol=1e-6)
 
 
 def test_portfolio_output_mode_logits_returns_masked_centered_scores() -> None:
