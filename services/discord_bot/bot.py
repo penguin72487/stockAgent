@@ -698,13 +698,18 @@ def _require_trader_permission(interaction: discord.Interaction, cfg: LiveMarket
 
 
 def _scheduled_markets() -> list[str]:
+    configs = _market_configs()
     raw = _env("STOCKAGENT_SCHEDULED_MARKETS")
     if raw:
         items = [item.strip() for item in raw.split(",") if item.strip()]
         if any(item.lower() in {"all", "*"} for item in items):
-            return sorted(_market_configs())
-        return items
-    return sorted(_market_configs())
+            items = sorted(configs)
+        return [
+            key
+            for key in items
+            if key in configs and _market_enabled(configs[key])
+        ]
+    return sorted(key for key, cfg in configs.items() if _market_enabled(cfg))
 
 
 def _scheduled_signal_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
@@ -964,6 +969,8 @@ async def market_autocomplete(
     query = str(current or "").strip().lower()
     choices: list[app_commands.Choice[str]] = []
     for key, cfg in sorted(_market_configs().items()):
+        if not _market_enabled(cfg):
+            continue
         label = f"{key} - {cfg.label}"
         if query and query not in key.lower() and query not in cfg.label.lower():
             continue
@@ -2802,7 +2809,11 @@ def _risk_message(
 
 
 def _guide_message() -> str:
-    markets = ", ".join(f"`{key}`" for key in sorted(_market_configs()))
+    markets = ", ".join(
+        f"`{key}`"
+        for key, cfg in sorted(_market_configs().items())
+        if _market_enabled(cfg)
+    )
     lines = [
         "**stockAgent guide**",
         f"markets: {markets or '`n/a`'}",

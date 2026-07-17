@@ -59,9 +59,9 @@ def _default_tw_end_date(now: datetime | None = None) -> str:
     else:
         local_now = local_now.astimezone(ZoneInfo("Asia/Taipei"))
     candidate = local_now.date()
-    # The complete daily bundle includes valuation and margin endpoints that
-    # are published later than the 13:30 OHLCV close.
-    if local_now.time() < datetime_time(hour=18, minute=0):
+    # Live close-price publication is driven by official OHLCV. Auxiliary
+    # reports can arrive later and are handled as point-in-time lagging inputs.
+    if local_now.time() < datetime_time(hour=13, minute=30):
         candidate -= timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate -= timedelta(days=1)
@@ -480,6 +480,8 @@ def _public_command(args: argparse.Namespace, public_dir: Path) -> list[str]:
         "--require-taiex-session-calendar",
         "--resume" if args.resume else "--no-resume",
     )
+    if args.mode == "daily":
+        command.append("--allow-daily-publication-lag")
     if args.request_interval is not None:
         command.extend(["--request-interval", str(args.request_interval)])
     if args.skip_raw:
@@ -1089,6 +1091,8 @@ def main() -> None:
             "--workers",
             str(args.workers),
         )
+        if args.mode == "daily":
+            symbol_build_command.append("--allow-daily-publication-lag")
         for input_path in args.legacy_official_ohlcv:
             symbol_build_command.extend(["--legacy-official-ohlcv", str(input_path)])
         if args.legacy_source_name:
