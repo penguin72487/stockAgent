@@ -412,6 +412,11 @@ def test_checkpoint_manifest_records_but_does_not_block_execution_and_inactive_s
         ),
         lambda cfg: setattr(
             cfg.training,
+            "compile_eval_model",
+            not cfg.training.compile_eval_model,
+        ),
+        lambda cfg: setattr(
+            cfg.training,
             "tw_continuous_compile_chunk_rows",
             cfg.training.tw_continuous_compile_chunk_rows + 1,
         ),

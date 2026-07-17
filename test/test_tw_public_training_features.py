@@ -945,13 +945,21 @@ def test_official_delisting_event_extends_suspension_then_marks_untradable(tmp_p
         external_feature_path=external_path,
     )
     symbol_idx = panel.symbols.index("2330")
+    last_executable_idx = int(
+        np.where(
+            panel.dates == np.datetime64("2024-01-02T00:00:00.000000000")
+        )[0][0]
+    )
     suspended_idx = int(np.where(panel.dates == np.datetime64("2024-01-03T00:00:00.000000000"))[0][0])
     delisted_idx = int(np.where(panel.dates == np.datetime64("2024-01-04T00:00:00.000000000"))[0][0])
     assert bool(panel.tradable_mask[suspended_idx, symbol_idx]) is True
     assert bool(panel.can_sell_mask[suspended_idx, symbol_idx]) is False
     assert bool(panel.tradable_mask[delisted_idx, symbol_idx]) is False
+    assert bool(panel.force_exit_mask[last_executable_idx, symbol_idx]) is True
     assert bool(panel.force_exit_mask[suspended_idx, symbol_idx]) is False
-    assert bool(panel.force_exit_mask[delisted_idx, symbol_idx]) is True
+    assert bool(panel.force_exit_mask[delisted_idx, symbol_idx]) is False
+    assert not bool(panel.can_buy_mask[suspended_idx:, symbol_idx].any())
+    assert not bool(panel.can_sell_mask[suspended_idx:, symbol_idx].any())
 
 
 def test_delisting_without_event_day_quote_exits_at_final_positive_close(
