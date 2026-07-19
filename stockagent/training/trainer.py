@@ -299,6 +299,145 @@ def _run_rank0_store_synchronized_phase(
         raise RuntimeError(message)
 
 
+@dataclass
+class _Rank0StorePhase:
+    """Store-backed rendezvous for rank-0 work that may exceed NCCL timeout."""
+
+    phase: str
+    timeout: timedelta
+    enabled: bool
+    rank: int = 0
+    store: Any = None
+    phase_key: str = ""
+    ack_key: str = ""
+    ack_keys: tuple[str, ...] = ()
+
+    def finish(self, local_error: BaseException | None) -> None:
+        if not self.enabled:
+            if local_error is not None:
+                raise RuntimeError(
+                    f"Distributed phase {self.phase!r} failed: "
+                    f"{type(local_error).__name__}: {local_error}"
+                ) from local_error
+            return
+
+        status: dict[str, Any]
+        if self.rank == 0:
+            status = {
+                "ok": local_error is None,
+                "error": (
+                    None
+                    if local_error is None
+                    else f"{type(local_error).__name__}: {local_error}"
+                ),
+            }
+            self.store.set(self.phase_key, json.dumps(status))
+            self.store.set(self.ack_key, json.dumps({"ok": True, "error": None}))
+            try:
+                self.store.wait(list(self.ack_keys), self.timeout)
+                acknowledgements = [
+                    json.loads(self.store.get(key).decode("utf-8"))
+                    for key in self.ack_keys
+                ]
+            except BaseException as exc:
+                raise RuntimeError(
+                    f"Distributed phase {self.phase!r} did not receive every rank acknowledgement"
+                ) from exc
+            failed = [
+                (item_rank, acknowledgement.get("error"))
+                for item_rank, acknowledgement in enumerate(acknowledgements)
+                if not bool(acknowledgement.get("ok", False))
+            ]
+            if failed:
+                details = "; ".join(
+                    f"rank{item_rank}: {error}" for item_rank, error in failed
+                )
+                raise RuntimeError(
+                    f"Distributed phase {self.phase!r} acknowledgement failed ({details})"
+                )
+        else:
+            receive_error: BaseException | None = None
+            try:
+                self.store.wait([self.phase_key], self.timeout)
+                status = json.loads(self.store.get(self.phase_key).decode("utf-8"))
+            except BaseException as exc:
+                receive_error = exc
+                status = {
+                    "ok": False,
+                    "error": f"rank 0 status unavailable: {type(exc).__name__}: {exc}",
+                }
+            self.store.set(
+                self.ack_key,
+                json.dumps(
+                    {
+                        "ok": receive_error is None,
+                        "error": None if receive_error is None else status["error"],
+                    }
+                ),
+            )
+            if receive_error is not None:
+                raise RuntimeError(
+                    f"Distributed phase {self.phase!r} did not receive rank 0 status"
+                ) from receive_error
+
+        if not bool(status.get("ok", False)):
+            message = (
+                f"Distributed phase {self.phase!r} failed on rank 0: "
+                f"{status.get('error')}"
+            )
+            if local_error is not None:
+                raise RuntimeError(message) from local_error
+            raise RuntimeError(message)
+
+
+def _begin_rank0_store_synchronized_phase(
+    phase: str,
+    *,
+    timeout: timedelta | None = None,
+) -> _Rank0StorePhase:
+    """Open a short NCCL rendezvous, then return a store-backed phase handle."""
+    if timeout is None:
+        timeout_seconds = float(
+            os.environ.get("STOCKAGENT_DISTRIBUTED_PHASE_TIMEOUT_SECONDS", "86400")
+        )
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+            raise ValueError(
+                "STOCKAGENT_DISTRIBUTED_PHASE_TIMEOUT_SECONDS must be finite and > 0"
+            )
+        timeout = timedelta(seconds=timeout_seconds)
+
+    if not _distributed_is_initialized():
+        if _distributed_world_size() > 1:
+            raise RuntimeError(
+                f"Distributed phase {phase!r} requires an initialized process group"
+            )
+        return _Rank0StorePhase(phase=phase, timeout=timeout, enabled=False)
+    if _distributed_world_size() <= 1:
+        return _Rank0StorePhase(phase=phase, timeout=timeout, enabled=False)
+
+    token: list[str | None] = [
+        f"{time.time_ns()}-{os.getpid()}" if _distributed_is_rank0() else None
+    ]
+    dist.broadcast_object_list(token, src=0)
+    if token[0] is None:
+        raise RuntimeError(f"Distributed phase {phase!r} did not receive a store token")
+    phase_key = f"stockagent/{phase}/{token[0]}"
+    rank = _distributed_rank()
+    return _Rank0StorePhase(
+        phase=phase,
+        timeout=timeout,
+        enabled=True,
+        rank=rank,
+        store=dist.distributed_c10d._get_default_store(),
+        phase_key=phase_key,
+        ack_key=f"{phase_key}/ack/{rank}",
+        ack_keys=tuple(
+            f"{phase_key}/ack/{item_rank}"
+            for item_rank in range(_distributed_world_size())
+        ),
+    )
+
+
 @contextmanager
 def _preserve_process_rng_state(device: torch.device | None = None):
     """Keep non-training preflight work from advancing any stochastic stream."""
@@ -438,12 +577,27 @@ def _build_execution_runtime(
                 "long/short tw_cash with capacity limiting enabled requires "
                 "point-in-time demonstrated short capacity"
             )
-    if mode == "tw_cash" and panel.unresolved_corporate_action_mask is None:
-        raise ValueError(
-            "tw_cash requires a source-derived, receipt-verified official "
-            "corporate-action avoidance mask"
-        )
     corporate_action_mode = str(config.trading.tw_corporate_action_mode)
+    if mode == "tw_cash":
+        if corporate_action_mode == "avoid":
+            execution_action_mask = getattr(
+                panel, "corporate_action_avoidance_mask", None
+            )
+            has_exact_events = (
+                panel.cash_dividend_yield is not None
+                and bool((np.asarray(panel.cash_dividend_yield) > 0.0).any())
+            )
+            if execution_action_mask is None and not has_exact_events:
+                # Synthetic and legacy panels with no exact event to restore
+                # have identical all-action and unresolved masks.
+                execution_action_mask = panel.unresolved_corporate_action_mask
+        else:
+            execution_action_mask = panel.unresolved_corporate_action_mask
+        if execution_action_mask is None:
+            raise ValueError(
+                f"{corporate_action_mode} tw_cash requires a source-derived, "
+                "receipt-verified official corporate-action execution mask"
+            )
     claim_queue_sessions = (
         int(config.trading.tw_corporate_action_claim_queue_sessions)
         if corporate_action_mode == "exact"
@@ -700,6 +854,7 @@ def _active_panel_execution_rows(
     symbol_indices: np.ndarray | None = None,
     *,
     execution_mode: str = "naive",
+    corporate_action_mode: str = "avoid",
 ) -> tuple[
     np.ndarray,
     np.ndarray | None,
@@ -746,6 +901,20 @@ def _active_panel_execution_rows(
             prior[valid_prior] = np.asarray(panel.daily_volumes)[prior_rows[valid_prior]]
         prior = np.where(np.isfinite(prior) & (prior >= 0.0), prior, 0.0)
         execution_volumes = prior if local_symbols is None else prior[:, local_symbols]
+    normalized_action_mode = str(corporate_action_mode).strip().lower()
+    if normalized_action_mode not in {"avoid", "exact"}:
+        raise ValueError("corporate_action_mode must be 'avoid' or 'exact'")
+    if normalized_action_mode == "avoid":
+        action_mask = panel.corporate_action_avoidance_mask
+        has_exact_events = (
+            panel.cash_dividend_yield is not None
+            and bool((np.asarray(panel.cash_dividend_yield) > 0.0).any())
+        )
+        if action_mask is None and not has_exact_events:
+            action_mask = panel.unresolved_corporate_action_mask
+    else:
+        action_mask = panel.unresolved_corporate_action_mask
+    exact_cash = normalized_action_mode == "exact"
     return (
         close_prices,
         select(panel.open_prices),
@@ -753,9 +922,13 @@ def _active_panel_execution_rows(
         select(panel.day_trade_eligible_mask),
         select(panel.day_trade_can_buy_open_mask),
         select(panel.day_trade_can_sell_open_mask),
-        select(panel.unresolved_corporate_action_mask),
-        select(panel.cash_dividend_yield),
-        select(panel.cash_dividend_payment_delay_sessions),
+        select(action_mask),
+        select(panel.cash_dividend_yield) if exact_cash else None,
+        (
+            select(panel.cash_dividend_payment_delay_sessions)
+            if exact_cash
+            else None
+        ),
         symbols,
     )
 
@@ -1282,9 +1455,9 @@ def _mark_compiled_loss_dynamic_symbol_axis(
                 and int(value.size(1)) == symbols
             ):
                 # PyTorch 2.12.1 requires a concrete upper bound. The caller
-                # supplies the full panel width, which covers every compacted
-                # fold without forcing Inductor to reason about an arbitrary
-                # million-symbol range.
+                # supplies the largest width in the current walk-forward train
+                # domain, covering every compacted group without including
+                # validation/test-only symbols or an arbitrary huge range.
                 mark_dynamic(value, 1, min=1, max=symbol_upper_bound)
             elif aux_value and value.dim() == 1 and int(value.size(0)) == symbols:
                 mark_dynamic(value, 0, min=1, max=symbol_upper_bound)
@@ -1299,7 +1472,10 @@ def _mark_compiled_loss_dynamic_symbol_axis(
     for value in args:
         visit(value)
     for name, value in kwargs.items():
-        visit(value, aux_value=name == "aux_outputs")
+        # symbol_indices is the direct [S] companion to the [T,S] canonical
+        # tensors. Leaving it static constrains the traced weights axis to the
+        # first compact fold width and conflicts with later train groups.
+        visit(value, aux_value=name in {"aux_outputs", "symbol_indices"})
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -4936,11 +5112,25 @@ def _checkpoint_manifest(
                 }
             )
         if str(config.trading.execution_mode) == "tw_cash":
+            uses_full_avoidance = (
+                config.trading.tw_corporate_action_mode == "avoid"
+                and panel.corporate_action_avoidance_mask is not None
+            )
+            action_mask_name = (
+                "corporate_action_avoidance_mask"
+                if uses_full_avoidance
+                else "unresolved_corporate_action_mask"
+            )
+            action_mask = (
+                panel.corporate_action_avoidance_mask
+                if uses_full_avoidance
+                else panel.unresolved_corporate_action_mask
+            )
             panel_arrays.update(
                 {
-                    "unresolved_corporate_action_mask": fingerprint(
-                        "unresolved_corporate_action_mask",
-                        panel.unresolved_corporate_action_mask,
+                    "corporate_action_execution_mask": fingerprint(
+                        action_mask_name,
+                        action_mask,
                     ),
                     "short_margin_rate": fingerprint(
                         "short_margin_rate", panel.short_margin_rate
@@ -9141,6 +9331,82 @@ def _bucketed_symbol_count(active_count: int, total_symbols: int, bucket_size: i
     return min(total_symbols, max(active_count, bucketed))
 
 
+def _train_symbol_compaction_upper_bound(
+    panel: PanelData,
+    grouped_folds: Mapping[tuple[int, ...], Sequence[WalkForwardFold]],
+    config: ExperimentConfig,
+) -> int:
+    """Return the largest symbol width that a compact training group can use.
+
+    The compiled train graph never consumes validation/test-only symbols.  Its
+    symbolic ``S`` domain must therefore be derived from the walk-forward train
+    groups, rather than from the full panel (which may contain newly listed
+    symbols that exist only in a future test window).  Recompute this bound for
+    every run so listing/delisting changes remain runtime data, not an ABI
+    constant inherited from an older artifact.
+    """
+
+    total_symbols = int(panel.num_symbols)
+    mode = _normalize_train_symbol_compaction(
+        getattr(config.training, "train_symbol_compaction", "none")
+    )
+    if mode == "none" or total_symbols <= 0:
+        return total_symbols
+
+    execution_mode = normalize_execution_mode(config.trading.execution_mode)
+    if execution_mode == "tw_cash":
+        active_by_date = np.zeros_like(panel.alive_mask, dtype=bool)
+        active_by_date[1:] = np.asarray(panel.alive_mask[:-1], dtype=bool)
+    elif execution_mode == "tw_day_trade":
+        if panel.day_trade_eligible_mask is None:
+            raise ValueError(
+                "tw_day_trade symbol compaction requires day_trade_eligible_mask"
+            )
+        active_by_date = np.asarray(panel.day_trade_eligible_mask, dtype=bool)
+    else:
+        active_by_date = np.asarray(panel.tradable_mask, dtype=bool) & np.isfinite(
+            np.asarray(panel.returns_1d)
+        )
+
+    bucket_size = _normalize_train_symbol_compaction_bucket_size(
+        getattr(config.training, "train_symbol_compaction_bucket_size", 0)
+    )
+    lookback = int(config.training.lookback)
+    feature_lag = execution_feature_lag(execution_mode)
+    upper_bound = 0
+    for group_folds in grouped_folds.values():
+        if not group_folds:
+            continue
+        train_indices = np.sort(
+            np.asarray(group_folds[0].train_indices, dtype=np.int64)
+        )
+        if train_indices.size == 0:
+            continue
+        first_valid = int(train_indices[0]) + lookback - 1 + feature_lag
+        valid_indices = train_indices[train_indices >= first_valid]
+        if valid_indices.size == 0:
+            continue
+        active_count = int(
+            np.count_nonzero(active_by_date[valid_indices].any(axis=0))
+        )
+        # Match _maybe_compact_train_windowed_symbols exactly: an empty or
+        # already-full union keeps the original representation.
+        group_symbols = (
+            total_symbols
+            if active_count <= 0 or active_count >= total_symbols
+            else _bucketed_symbol_count(
+                active_count,
+                total_symbols,
+                bucket_size,
+            )
+        )
+        upper_bound = max(upper_bound, int(group_symbols))
+
+    # No trainable group will reach compilation, but retain a valid conservative
+    # bound so the caller can report the eventual dataset error normally.
+    return total_symbols if upper_bound <= 0 else upper_bound
+
+
 def _maybe_compact_train_windowed_symbols(
     split: WindowedSplitTensors,
     config: ExperimentConfig,
@@ -11610,6 +11876,7 @@ def _replay_taiwan_stitched_deployment(
             panel,
             panel_rows,
             execution_mode=mode,
+            corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
     )
     runtime = _build_execution_runtime(panel, config, torch.device("cpu"))
@@ -11851,7 +12118,6 @@ def _run_fold_explainability(
         model=model,
         checkpoint_path=checkpoint_path,
         output_dir=output_path,
-        split="test",
         explain_output_dir=None,
         settings=settings,
         write_plots=bool(getattr(config.training, "explain_write_plots", True)),
@@ -14730,6 +14996,7 @@ def _run_training_tree_models(
                 panel,
                 test_eval_indices,
                 execution_mode=execution_runtime.mode,
+                corporate_action_mode=execution_runtime.corporate_action_mode,
             )
             (
                 test_integer_short_capacity_shares,
@@ -15150,6 +15417,7 @@ def _run_inference_tree_models(
             panel,
             test_eval_indices,
             execution_mode=execution_runtime.mode,
+            corporate_action_mode=execution_runtime.corporate_action_mode,
         )
         (
             test_integer_short_capacity_shares,
@@ -15651,6 +15919,7 @@ def _run_inference_neural_models(
             test_eval_indices,
             test_symbol_indices,
             execution_mode=fold_execution_runtime.mode,
+            corporate_action_mode=fold_execution_runtime.corporate_action_mode,
         )
         (
             test_integer_short_capacity_shares,
@@ -16210,7 +16479,16 @@ def run_training(
     # This is executor state only; the canonical loss and checkpoint contract
     # are unchanged.
     shared_dynamic_compiled_loss_fn: Callable[..., torch.Tensor] | None = None
-    dynamic_loss_symbol_max = max(1, int(len(panel.symbols)))
+    dynamic_loss_symbol_max = max(
+        1,
+        _train_symbol_compaction_upper_bound(panel, grouped_folds, config),
+    )
+    if _distributed_should_write():
+        print(
+            f"[dynamic symbols] train graph domain S<={dynamic_loss_symbol_max} "
+            f"(full_panel={len(panel.symbols)}, "
+            f"compaction={_normalize_train_symbol_compaction(config.training.train_symbol_compaction)})"
+        )
     # A fixed-width run must not carry a symbolic S axis merely because the
     # process-wide upper bound equals the observed full universe.  Conversely,
     # expanding compact train groups intentionally share one bounded-dynamic
@@ -18031,6 +18309,7 @@ def run_training(
                 test_eval_indices,
                 test_symbol_indices,
                 execution_mode=execution_runtime.mode,
+                corporate_action_mode=execution_runtime.corporate_action_mode,
             )
             (
                 test_integer_short_capacity_shares,
@@ -18897,6 +19176,15 @@ def run_training(
             curve_flush_error = exc
         _raise_if_distributed_phase_failed("final_curve_flush", curve_flush_error)
 
+        final_artifact_sync = _begin_rank0_store_synchronized_phase(
+            "final_fold_artifacts"
+        )
+        # Open both short NCCL rendezvous before ranks diverge. The subsequent
+        # waits use the process store, so rank-0 artifact I/O and allocator
+        # cleanup cannot leave a CUDA collective pending behind the watchdog.
+        final_postprocess_sync = _begin_rank0_store_synchronized_phase(
+            "final_postprocess"
+        )
         if ddp_enabled and not _distributed_should_write():
             # Final fold metrics, plots, and parquet artifacts are rank0-only.
             # Drop rank-local model/data references before waiting so rank0 has
@@ -18914,8 +19202,8 @@ def run_training(
             scheduler = None
             if device.type == "cuda":
                 _release_cuda_memory(device)
-            _raise_if_distributed_phase_failed("final_fold_artifacts", None)
-            _raise_if_distributed_phase_failed("final_postprocess", None)
+            final_artifact_sync.finish(None)
+            final_postprocess_sync.finish(None)
             continue
 
         final_artifact_error: BaseException | None = None
@@ -19045,6 +19333,7 @@ def run_training(
                     test_eval_indices,
                     test_symbol_indices,
                     execution_mode=execution_runtime.mode,
+                    corporate_action_mode=execution_runtime.corporate_action_mode,
                 )
                 (
                     test_integer_short_capacity_shares,
@@ -19211,7 +19500,7 @@ def run_training(
                     )
         except BaseException as exc:
             final_artifact_error = exc
-        _raise_if_distributed_phase_failed("final_fold_artifacts", final_artifact_error)
+        final_artifact_sync.finish(final_artifact_error)
 
         if config.training.warm_start_from_previous_fold:
             warm_start_checkpoint_path = group_checkpoint_path
@@ -19242,6 +19531,6 @@ def run_training(
                     )
         except BaseException as exc:
             final_postprocess_error = exc
-        _raise_if_distributed_phase_failed("final_postprocess", final_postprocess_error)
+        final_postprocess_sync.finish(final_postprocess_error)
 
     return [results_by_fold[fold.fold_id] for fold in fold_list if fold.fold_id in results_by_fold]

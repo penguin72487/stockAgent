@@ -38,6 +38,7 @@ from scripts.build_tw_official_symbol_parquets import (
     OFFICIAL_SYMBOL_ADJUSTED_PRICE_METHOD,
     OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION,
     RETURN_QUARANTINE_REASONS,
+    YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION,
     _load_verified_taiex_session_calendar,
     _official_symbol_source_paths,
     _validate_yahoo_fallback_archive,
@@ -507,6 +508,10 @@ def _audit_quote_file(
         has_data_source = "data_source" in schema
         has_adjustment_source = "adjustment_source" in schema
         has_ohlc_normalization = "ohlc_normalization" in schema
+        has_raw_ohlc_scale_factor = "raw_ohlc_scale_factor" in schema
+        has_raw_ohlc_scale_reference_date = (
+            "raw_ohlc_scale_reference_date" in schema
+        )
         has_fallback_reason = "fallback_reason" in schema
         has_return_quarantined = "return_quarantined" in schema
         has_return_quarantine_reason = "return_quarantine_reason" in schema
@@ -519,6 +524,10 @@ def _audit_quote_file(
             read_columns.append("adjustment_source")
         if has_ohlc_normalization:
             read_columns.append("ohlc_normalization")
+        if has_raw_ohlc_scale_factor:
+            read_columns.append("raw_ohlc_scale_factor")
+        if has_raw_ohlc_scale_reference_date:
+            read_columns.append("raw_ohlc_scale_reference_date")
         if has_fallback_reason:
             read_columns.append("fallback_reason")
         if has_return_quarantined:
@@ -556,6 +565,19 @@ def _audit_quote_file(
                 .cast(pl.Utf8, strict=False)
                 .str.strip_chars()
                 .alias("ohlc_normalization")
+            )
+        if has_raw_ohlc_scale_factor:
+            select_expressions.append(
+                pl.col("raw_ohlc_scale_factor")
+                .cast(pl.Float64, strict=False)
+                .fill_nan(None)
+                .alias("raw_ohlc_scale_factor")
+            )
+        if has_raw_ohlc_scale_reference_date:
+            select_expressions.append(
+                _date_column_expr("raw_ohlc_scale_reference_date").alias(
+                    "raw_ohlc_scale_reference_date"
+                )
             )
         if has_fallback_reason:
             select_expressions.append(
@@ -710,6 +732,16 @@ def _audit_quote_file(
     )
     unapproved_ohlc_normalization_rows = 0
     invalid_flat_bar_normalization_rows = 0
+    fallback_raw_scale_schema_mismatch = int(
+        source == MIXED_QUOTE_SOURCE
+        and not (
+            has_ohlc_normalization
+            and has_raw_ohlc_scale_factor
+            and has_raw_ohlc_scale_reference_date
+        )
+    )
+    invalid_fallback_raw_scale_rows = 0
+    orphan_raw_scale_rows = 0
     audited_data_source = (
         pl.col("data_source")
         if has_data_source
@@ -719,7 +751,15 @@ def _audit_quote_file(
         normalization = pl.col("ohlc_normalization")
         unapproved_ohlc_normalization_rows = int(
             frame.select(
-                (~normalization.is_null() & (normalization != "official_close_flat_bar"))
+                (
+                    ~normalization.is_null()
+                    & ~normalization.is_in(
+                        [
+                            "official_close_flat_bar",
+                            YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION,
+                        ]
+                    )
+                )
                 .sum()
             ).item()
             or 0
@@ -738,8 +778,45 @@ def _audit_quote_file(
                 .fill_null(False)
                 .sum()
             ).item()
-            or 0
+                or 0
         )
+        if has_raw_ohlc_scale_factor and has_raw_ohlc_scale_reference_date:
+            fallback_row = audited_data_source == YAHOO_FALLBACK_SOURCE
+            scale = pl.col("raw_ohlc_scale_factor")
+            scale_reference_date = pl.col("raw_ohlc_scale_reference_date")
+            invalid_fallback_raw_scale_rows = int(
+                frame.select(
+                    (
+                        fallback_row
+                        & (
+                            (normalization != YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION)
+                            | scale.is_null()
+                            | ~scale.is_finite()
+                            | (scale <= 0.0)
+                            | scale_reference_date.is_null()
+                            | (scale_reference_date > pl.col("date"))
+                        )
+                    )
+                    .fill_null(True)
+                    .sum()
+                ).item()
+                or 0
+            )
+            orphan_raw_scale_rows = int(
+                frame.select(
+                    (
+                        ~fallback_row
+                        & (
+                            (normalization == YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION)
+                            | scale.is_not_null()
+                            | scale_reference_date.is_not_null()
+                        )
+                    )
+                    .fill_null(False)
+                    .sum()
+                ).item()
+                or 0
+            )
     unapproved_fallback_reason_rows = 0
     fallback_reason_lineage_mismatch = 0
     fallback_reason_rows = 0
@@ -975,6 +1052,7 @@ def _audit_quote_file(
         .unique("date", keep="last", maintain_order=True)
     )
     raw_close_jumps_gt_2x = 0
+    raw_close_jumps_touching_yahoo = 0
     adjusted_index_jumps_gt_3x = 0
     quarantined_adjusted_index_jumps_gt_3x = 0
     unresolved_adjusted_index_jumps_gt_3x = 0
@@ -991,6 +1069,21 @@ def _audit_quote_file(
         raw_close_jumps_gt_2x = int(
             np.count_nonzero(consecutive & (raw_log_change > math.log(2.0) + 1e-9))
         )
+        if has_data_source:
+            ordered_sources = np.asarray(
+                ordered["data_source"].to_list(), dtype=object
+            )
+            touches_yahoo = (
+                (ordered_sources[1:] == YAHOO_FALLBACK_SOURCE)
+                | (ordered_sources[:-1] == YAHOO_FALLBACK_SOURCE)
+            )
+            raw_close_jumps_touching_yahoo = int(
+                np.count_nonzero(
+                    consecutive
+                    & (raw_log_change > math.log(2.0) + 1e-9)
+                    & touches_yahoo
+                )
+            )
         valid_adjusted_pair = (
             np.isfinite(adjusted[1:])
             & np.isfinite(adjusted[:-1])
@@ -1061,6 +1154,11 @@ def _audit_quote_file(
         ),
         "unapproved_ohlc_normalization_rows": unapproved_ohlc_normalization_rows,
         "invalid_flat_bar_normalization_rows": invalid_flat_bar_normalization_rows,
+        "fallback_raw_scale_schema_mismatch": (
+            fallback_raw_scale_schema_mismatch
+        ),
+        "invalid_fallback_raw_scale_rows": invalid_fallback_raw_scale_rows,
+        "orphan_raw_scale_rows": orphan_raw_scale_rows,
         "rows": rows,
         "audited_rows": int(in_panel_range.height),
         "outside_panel_range_rows": outside_panel_range,
@@ -1075,6 +1173,7 @@ def _audit_quote_file(
         "invalid_ohlc_geometry": invalid_geometry,
         "negative_volume": negative_volume,
         "raw_close_jumps_gt_2x": raw_close_jumps_gt_2x,
+        "raw_close_jumps_touching_yahoo": raw_close_jumps_touching_yahoo,
         "adjusted_index_jumps_gt_3x": adjusted_index_jumps_gt_3x,
         "quarantined_adjusted_index_jumps_gt_3x": (
             quarantined_adjusted_index_jumps_gt_3x
@@ -1151,7 +1250,11 @@ def audit_quote_source_files(
         "return_quarantine_evidence_schema_mismatch",
         "unapproved_ohlc_normalization_rows",
         "invalid_flat_bar_normalization_rows",
+        "fallback_raw_scale_schema_mismatch",
+        "invalid_fallback_raw_scale_rows",
+        "orphan_raw_scale_rows",
         "raw_close_jumps_gt_2x",
+        "raw_close_jumps_touching_yahoo",
         "adjusted_index_jumps_gt_3x",
         "quarantined_adjusted_index_jumps_gt_3x",
         "unresolved_adjusted_index_jumps_gt_3x",
@@ -1257,6 +1360,34 @@ def audit_quote_source_files(
             "invalid_flat_bar_normalization_rows",
             "A declared official flat bar does not match its close or uses Yahoo data.",
             "Rebuild the row from the positive official close sentinel and its provenance.",
+        ),
+        (
+            "fallback_raw_scale_schema_mismatch",
+            "critical",
+            "fallback_raw_scale_schema_mismatch",
+            "A mixed-source quote file cannot prove how Yahoo raw OHLC was mapped into the official per-share scale.",
+            "Rebuild with schema 7 so every Yahoo fallback row carries a causal scale factor and reference date.",
+        ),
+        (
+            "invalid_fallback_raw_scale",
+            "critical",
+            "invalid_fallback_raw_scale_rows",
+            "A Yahoo fallback quote lacks a positive causal official-overlap scale or points to a future reference date.",
+            "Exclude the row until a same-episode official/Yahoo overlap has already established the raw-price scale.",
+        ),
+        (
+            "orphan_fallback_raw_scale",
+            "critical",
+            "orphan_raw_scale_rows",
+            "Yahoo raw-price scale metadata is attached to a non-fallback quote.",
+            "Rebuild row-level lineage so scale metadata exists only on Yahoo fallback OHLC rows.",
+        ),
+        (
+            "unresolved_yahoo_raw_price_scale_jump",
+            "critical",
+            "raw_close_jumps_touching_yahoo",
+            "A >2x raw-price transition touching Yahoo fallback can create impossible exact-share cash returns and dominate NAV.",
+            "Re-anchor from an already-observed official/Yahoo overlap or exclude the fallback mark; never clip the downstream return.",
         ),
         (
             "invalid_adjusted_index",
@@ -1505,6 +1636,7 @@ def audit_official_symbol_build(
         except Exception:
             manifest_valid = False
     fallback_rows = int(summary.get("fallback_rows", -1))
+    input_fallback_rows = int(summary.get("input_fallback_rows", -1))
     fallback_adjustment_rows = int(summary.get("fallback_adjustment_rows", -1))
     fallback_symbols = int(summary.get("fallback_symbols", -1))
     official_unusable_rows = int(summary.get("official_unusable_ohlcv_rows", -1))
@@ -1515,8 +1647,18 @@ def audit_official_symbol_build(
         summary.get("unfilled_unusable_official_rows", -1)
     )
     normalized_zero_rows = int(summary.get("normalized_zero_ohlc_rows", -1))
+    normalized_fallback_rows = int(
+        summary.get("normalized_fallback_ohlc_rows", -1)
+    )
+    dropped_unanchored_fallback_rows = int(
+        summary.get("dropped_unanchored_fallback_rows", -1)
+    )
+    dropped_discontinuous_fallback_rows = int(
+        summary.get("dropped_discontinuous_fallback_rows", -1)
+    )
     actual_fallback_reason_rows = 0
     actual_normalized_zero_rows = 0
+    actual_normalized_fallback_rows = 0
     actual_return_quarantined_rows = 0
     actual_lifecycle_episode_quarantined_rows = 0
     actual_listing_boundary_quarantined_rows = 0
@@ -1528,6 +1670,8 @@ def audit_official_symbol_build(
             required_lineage_columns = {
                 "fallback_reason",
                 "ohlc_normalization",
+                "raw_ohlc_scale_factor",
+                "raw_ohlc_scale_reference_date",
                 "return_quarantined",
                 "return_quarantine_reason",
             }
@@ -1547,6 +1691,15 @@ def audit_official_symbol_build(
             actual_normalized_zero_rows += int(
                 lineage.select(
                     (pl.col("ohlc_normalization") == "official_close_flat_bar").sum()
+                ).item()
+                or 0
+            )
+            actual_normalized_fallback_rows += int(
+                lineage.select(
+                    (
+                        pl.col("ohlc_normalization")
+                        == YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION
+                    ).sum()
                 ).item()
                 or 0
             )
@@ -1630,8 +1783,17 @@ def audit_official_symbol_build(
         "fallback_converter_receipts": fallback_converter_receipts_valid,
         "fallback_usage_counts": (
             fallback_rows >= 0
+            and input_fallback_rows >= 0
             and fallback_adjustment_rows >= 0
             and fallback_symbols >= 0
+            and dropped_unanchored_fallback_rows >= 0
+            and dropped_discontinuous_fallback_rows >= 0
+            and input_fallback_rows
+            == fallback_rows
+            + dropped_unanchored_fallback_rows
+            + dropped_discontinuous_fallback_rows
+            and normalized_fallback_rows == fallback_rows
+            and actual_normalized_fallback_rows == fallback_rows
             and fallback_symbols == manifest_fallback_symbols
             and uses_fallback == (fallback_symbols > 0)
             and (bool(fallback_receipts) or not uses_fallback)
@@ -1642,8 +1804,12 @@ def audit_official_symbol_build(
             and unfilled_unusable_rows >= 0
             and official_unusable_rows
             == fallback_replaced_unusable_rows + unfilled_unusable_rows
-            and fallback_replaced_unusable_rows <= fallback_rows
-            and fallback_replaced_unusable_rows == actual_fallback_reason_rows
+            and fallback_replaced_unusable_rows <= input_fallback_rows
+            and fallback_replaced_unusable_rows
+            >= actual_fallback_reason_rows
+            and fallback_replaced_unusable_rows - actual_fallback_reason_rows
+            <= dropped_unanchored_fallback_rows
+            + dropped_discontinuous_fallback_rows
             and normalized_zero_rows == actual_normalized_zero_rows
             and lineage_columns_valid
         ),
@@ -2499,6 +2665,12 @@ def audit_source_receipts(
         "public_download_summary": str(public_path),
         "public_download_mode": public_receipt.get("mode") if public_receipt else None,
         "public_download_failed_count": public_receipt.get("failed_count") if public_receipt else None,
+        "public_download_allowed_failed_count": (
+            public_receipt.get("allowed_failed_count") if public_receipt else None
+        ),
+        "public_download_blocking_failed_count": (
+            public_receipt.get("blocking_failed_count") if public_receipt else None
+        ),
         "public_download_coverage_complete": (
             public_receipt.get("coverage_complete") if public_receipt else None
         ),
@@ -2517,16 +2689,42 @@ def audit_source_receipts(
         )
     else:
         failed_count = int(public_receipt.get("failed_count", -1))
-        if failed_count != 0:
+        allowed_failed_count = int(public_receipt.get("allowed_failed_count", -1))
+        blocking_failed_count = int(
+            public_receipt.get("blocking_failed_count", -1)
+        )
+        allowed_failed_datasets = public_receipt.get("allowed_failed_datasets")
+        configured_allowed_failed_datasets = public_receipt.get(
+            "configured_allowed_failed_datasets"
+        )
+        declared_nonblocking_failures = (
+            public_receipt.get("coverage_complete") is True
+            and failed_count >= 0
+            and failed_count == allowed_failed_count
+            and blocking_failed_count == 0
+            and isinstance(allowed_failed_datasets, list)
+            and isinstance(configured_allowed_failed_datasets, list)
+            and len(allowed_failed_datasets) == allowed_failed_count
+            and set(map(str, allowed_failed_datasets))
+            <= set(map(str, configured_allowed_failed_datasets))
+        )
+        receipt_summary["public_download_nonblocking_failures_valid"] = (
+            declared_nonblocking_failures
+        )
+        if failed_count != 0 and not declared_nonblocking_failures:
             findings.append(
                 Finding(
                     "critical",
                     "public_download_failures",
                     "source_receipt",
                     str(public_path),
-                    f"failed_count={failed_count}",
-                    "At least one requested public source failed or the receipt is malformed.",
-                    "Repair every failed dataset before rebuilding features.",
+                    (
+                        f"failed_count={failed_count}, "
+                        f"allowed_failed_count={allowed_failed_count}, "
+                        f"blocking_failed_count={blocking_failed_count}"
+                    ),
+                    "At least one requested public source failed outside the declared nonblocking allowlist or the receipt is malformed.",
+                    "Repair every blocking/undeclared failed dataset before rebuilding features.",
                 )
             )
         legacy_full_receipt = (

@@ -1,7 +1,7 @@
 experiment_name: tw-stock-transformer-market-public-data-all-available
 
 runner:
-  # The all-available feature schema is checkpoint-incompatible with the old
+  # The snapshot-safe feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
   output_dir: artifacts/markets/tw_public_lantent
   mode: train
@@ -36,7 +36,7 @@ data:
   use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
-  # Use every engineered base and TW-public feature. Each external value is
+  # Use every engineered base and non-snapshot TW-public feature. Each external value is
   # overlaid only on its point-in-time availability date; state-like features
   # are forward-filled from their first known observation. Before first
   # availability (and for unresolved missing cells), panel construction fills
@@ -96,20 +96,20 @@ data:
     - twpub_institutional_net_buy_flow
 
     # TDCC shareholding distribution
-    - twpub_tdcc_retail_holder_ratio
-    - twpub_tdcc_large_holder_ratio
-    - twpub_tdcc_holder_count_log
+    # - twpub_tdcc_retail_holder_ratio  # permanently disabled: snapshot-only
+    # - twpub_tdcc_large_holder_ratio  # permanently disabled: snapshot-only
+    # - twpub_tdcc_holder_count_log  # permanently disabled: snapshot-only
 
     # Company profile and categorical identity
-    - twpub_company_paidin_capital_log
-    - twpub_company_issued_shares_log
-    - twpub_company_private_shares_log
-    - twpub_company_age_years
-    - twpub_company_listed_age_years
-    - twpub_company_par_value_log
-    - twpub_company_industry_code
-    - twpub_company_is_foreign
-    - twpub_company_has_preferred_stock
+    # - twpub_company_paidin_capital_log  # permanently disabled: snapshot-only
+    # - twpub_company_issued_shares_log  # permanently disabled: snapshot-only
+    # - twpub_company_private_shares_log  # permanently disabled: snapshot-only
+    # - twpub_company_age_years  # permanently disabled: snapshot-only
+    # - twpub_company_listed_age_years  # permanently disabled: snapshot-only
+    # - twpub_company_par_value_log  # permanently disabled: snapshot-only
+    # - twpub_company_industry_code  # permanently disabled: snapshot-only
+    # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+    # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
 
     # Dividend announcements and ex-dividend information
     - twpub_dividend_cash_per_share
@@ -134,33 +134,33 @@ data:
     - twpub_disposal_count_log
 
     # Point-in-time monthly revenue
-    - twpub_monthly_revenue_log
-    - twpub_monthly_revenue_mom
-    - twpub_monthly_revenue_yoy
-    - twpub_cumulative_revenue_yoy
+    # - twpub_monthly_revenue_log  # permanently disabled: snapshot-only
+    # - twpub_monthly_revenue_mom  # permanently disabled: snapshot-only
+    # - twpub_monthly_revenue_yoy  # permanently disabled: snapshot-only
+    # - twpub_cumulative_revenue_yoy  # permanently disabled: snapshot-only
 
     # Point-in-time income statement and balance sheet
-    - twpub_financial_eps
-    - twpub_financial_revenue_log
-    - twpub_financial_net_income_asinh
-    - twpub_financial_gross_margin
-    - twpub_financial_operating_margin
-    - twpub_financial_net_margin
-    - twpub_financial_assets_log
-    - twpub_financial_debt_ratio
-    - twpub_financial_current_ratio
-    - twpub_financial_equity_ratio
-    - twpub_financial_book_value_per_share_log
+    # - twpub_financial_eps  # permanently disabled: snapshot-only
+    # - twpub_financial_revenue_log  # permanently disabled: snapshot-only
+    # - twpub_financial_net_income_asinh  # permanently disabled: snapshot-only
+    # - twpub_financial_gross_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_operating_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_net_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_assets_log  # permanently disabled: snapshot-only
+    # - twpub_financial_debt_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_current_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_equity_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_book_value_per_share_log  # permanently disabled: snapshot-only
 
     # Insider ownership and announced transfers
-    - twpub_insider_holdings_log
-    - twpub_insider_pledge_ratio
-    - twpub_insider_transfer_shares_log
+    # - twpub_insider_holdings_log  # permanently disabled: snapshot-only
+    # - twpub_insider_pledge_ratio  # permanently disabled: snapshot-only
+    # - twpub_insider_transfer_shares_log  # permanently disabled: snapshot-only
 
     # Securities borrowing and short-sale availability
-    - twpub_borrow_available_log
-    - twpub_sbl_balance_log
-    - twpub_short_sale_available_log
+    # - twpub_borrow_available_log  # permanently disabled: snapshot-only
+    # - twpub_sbl_balance_log  # permanently disabled: snapshot-only
+    # - twpub_short_sale_available_log  # permanently disabled: snapshot-only
 
     # TAIEX and USD/TWD market state
     - twpub_twse_taiex_log
@@ -217,7 +217,26 @@ data:
   # registered historical lineage. Keep their schema slots deterministic while
   # preventing present-day snapshots from leaking into historical training.
   feature_zero_fill:
-    - twpub_cumulative_revenue_yoy
+    # Current snapshots without an immutable historical vintage archive.
+    # - twpub_monthly_revenue_*  # permanently disabled: snapshot-only
+    # - twpub_cumulative_revenue_yoy  # permanently disabled: snapshot-only
+    # - twpub_financial_*  # permanently disabled: snapshot-only
+    # - twpub_insider_*  # permanently disabled: snapshot-only
+    # - twpub_borrow_*  # permanently disabled: snapshot-only
+    # - twpub_sbl_*  # permanently disabled: snapshot-only
+    # - twpub_short_sale_available_*  # permanently disabled: snapshot-only
+    # - twpub_tdcc_*  # permanently disabled: snapshot-only
+    # - twpub_company_*  # permanently disabled: snapshot-only
+
+    # Official history exists, but its changing cross-sectional coverage lets
+    # the model identify the source/calendar regime. Keep fail-closed until a
+    # causal availability channel or complete backfill is implemented.
+    - twpub_pe_log
+    - twpub_pb_log
+    - twpub_foreign_net_buy_flow
+    - twpub_institutional_net_buy_flow
+
+    # Unregistered or single-vintage market/macro/event families.
     - twpub_cbc_*
     - twpub_dgbas_*
     - twpub_mof_*
@@ -338,7 +357,6 @@ training:
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
-  explain_first_test_year_only: true
   explain_max_rows: 32
   explain_ig_steps: 0
   # 5070 Ti fold21: keep this automatic so one date uses 8 IG alphas while the
@@ -617,9 +635,9 @@ training:
     return_aux_details: false
     # Categorical features are embedded by name only when the feature is enabled above.
     categorical_feature_names:
-      - twpub_company_industry_code
-      - twpub_company_is_foreign
-      - twpub_company_has_preferred_stock
+      # - twpub_company_industry_code  # permanently disabled: snapshot-only
+      # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+      # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
     categorical_embedding_dim: 4
     categorical_embedding_cardinality: 512
     # return_aux_details returns attention/factor internals; keep false for training speed.

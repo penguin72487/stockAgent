@@ -54,7 +54,7 @@ def test_daily_downloader_keeps_tw_out_of_legacy_yahoo_tree() -> None:
 
 def test_discord_daily_markets_use_canonical_downloaders_without_audit() -> None:
     expected_downloaders = {
-        "us": "downloader/download_cboe_us_ohlcv.py",
+        "us": "downloader/download_alpaca_us_ohlcv.py",
         "forex": "downloader/download_forex_frankfurter.py",
     }
     for market, downloader in expected_downloaders.items():

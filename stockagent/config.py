@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from datetime import date
+import fnmatch
 from pathlib import Path
 from typing import Any, get_args, get_type_hints
 
@@ -20,6 +21,21 @@ from stockagent.portfolio_contract import (
 )
 
 _CONFIG_INHERITANCE_KEYS = ("base_config", "base_configs", "extends", "inherits")
+
+# Permanent model-input denylist. These TW public families are current snapshots
+# without an immutable point-in-time archive. Keep their source columns for data
+# provenance, but never allow them into a model feature schema.
+FORBIDDEN_SNAPSHOT_ONLY_FEATURE_PATTERNS = (
+    "twpub_monthly_revenue_*",
+    "twpub_cumulative_revenue_yoy",
+    "twpub_financial_*",
+    "twpub_insider_*",
+    "twpub_borrow_*",
+    "twpub_sbl_*",
+    "twpub_short_sale_available_*",
+    "twpub_tdcc_*",
+    "twpub_company_*",
+)
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -761,7 +777,6 @@ class TrainingConfig:
     defer_epoch_curve_plot_until_end: bool = True
     debug_timing_sync: bool = False
     explain_after_each_fold: bool = False
-    explain_first_test_year_only: bool = True
     explain_top_k: int = 20
     explain_max_rows: int = 32
     explain_ig_steps: int = 0
@@ -1493,6 +1508,19 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or tw_public_market_symbol_default
     )
     data["feature_include"] = _normalize_string_list(data["feature_include"], field_name="data.feature_include")
+    forbidden_snapshot_features = [
+        feature
+        for feature in data["feature_include"]
+        if any(
+            fnmatch.fnmatchcase(feature, pattern)
+            for pattern in FORBIDDEN_SNAPSHOT_ONLY_FEATURE_PATTERNS
+        )
+    ]
+    if forbidden_snapshot_features:
+        raise ValueError(
+            "data.feature_include contains permanently disabled snapshot-only "
+            f"features: {forbidden_snapshot_features}"
+        )
     data["feature_exclude"] = _normalize_string_list(data["feature_exclude"], field_name="data.feature_exclude")
     data["feature_zero_fill"] = _normalize_string_list(
         data["feature_zero_fill"], field_name="data.feature_zero_fill"
@@ -1808,7 +1836,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
             defer_epoch_curve_plot_until_end=training_raw["defer_epoch_curve_plot_until_end"],
             debug_timing_sync=training_raw["debug_timing_sync"],
             explain_after_each_fold=training_raw["explain_after_each_fold"],
-            explain_first_test_year_only=training_raw["explain_first_test_year_only"],
             explain_top_k=training_raw["explain_top_k"],
             explain_max_rows=training_raw["explain_max_rows"],
             explain_ig_steps=training_raw["explain_ig_steps"],

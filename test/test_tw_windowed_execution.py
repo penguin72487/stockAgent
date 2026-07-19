@@ -6,7 +6,7 @@ import torch
 
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
-from stockagent.explainability import _dataset_for_split
+from stockagent.explainability import _first_test_year_dataset
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.trainer import (
     _PanelSlabForwardWrapper,
@@ -156,10 +156,9 @@ def test_explainability_dataset_uses_real_execution_alignment(
         test_years=[1970],
     )
 
-    dataset = _dataset_for_split(
+    dataset = _first_test_year_dataset(
         panel,
         fold,
-        "train",
         lookback=2,
         execution_mode=execution_mode,
     )

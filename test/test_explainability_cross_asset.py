@@ -24,8 +24,8 @@ from stockagent.models.transformer_base_portfolio import TransformerBasePortfoli
 def test_standalone_cross_asset_cli_uses_independent_complete_first_year_defaults() -> None:
     args = parse_cross_asset_args(["--config", "configs/markets/tw_public.yaml"])
 
-    assert args.first_test_year_only is True
-    assert args.max_rows == 0
+    assert not hasattr(args, "first_test_year_only")
+    assert not hasattr(args, "max_rows")
     assert args.max_sources == 0
     assert args.max_targets == 0
     assert args.progress is True

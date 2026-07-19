@@ -206,13 +206,18 @@ def test_candle_encoder_jointly_embeds_categorical_features() -> None:
     assert not torch.equal(base_aux["candle_embedding"], changed_aux["candle_embedding"])
 
 
-def test_all_experiment_configs_define_matching_financial_transformer() -> None:
+def test_all_resolved_experiment_configs_define_matching_financial_transformer() -> None:
     config_paths = [Path("configs/experiment_baseline.yaml")]
     config_paths.extend(sorted(Path("configs/markets").glob("*.yaml")))
 
     for path in config_paths:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        assert "financial_transformer" in raw["training"], path
+        if "training" in raw:
+            assert "financial_transformer" in raw["training"], path
+        else:
+            # Thin market variants inherit the complete training contract from
+            # base_config; validate the resolved config below.
+            assert raw.get("base_config"), path
 
         config = load_config(path)
         transformer_base = config.training.transformer_base_portfolio

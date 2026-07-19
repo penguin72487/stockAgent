@@ -97,6 +97,33 @@ def test_panel_start_date_rejects_mismatched_walk_forward_year(tmp_path: Path) -
         load_config(config_path)
 
 
+@pytest.mark.parametrize(
+    "feature",
+    [
+        "twpub_monthly_revenue_log",
+        "twpub_cumulative_revenue_yoy",
+        "twpub_financial_eps",
+        "twpub_insider_holdings_log",
+        "twpub_borrow_available_log",
+        "twpub_sbl_balance_log",
+        "twpub_short_sale_available_log",
+        "twpub_tdcc_holder_count_log",
+        "twpub_company_industry_code",
+    ],
+)
+def test_load_config_rejects_permanently_disabled_snapshot_features(
+    tmp_path: Path,
+    feature: str,
+) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["feature_include"] = [feature]
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="permanently disabled snapshot-only"):
+        load_config(config_path)
+
+
 def test_load_config_migrates_legacy_leverage_to_reporting_leverage(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -667,11 +694,11 @@ def test_tw_public_select_uses_full_gross_long_short_l1_contract() -> None:
     assert config.trading.portfolio_activation == "pre_normalized"
 
 
-def test_tw_public_candles_select_uses_dual_5090_research_contract() -> None:
+def test_tw_public_candles_select_uses_dual_5090_tw_cash_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles_select.yaml")
 
     model = config.training.financial_transformer
-    assert config.trading.execution_mode == "naive"
+    assert config.trading.execution_mode == "tw_cash"
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.trading.long_only is False
@@ -686,20 +713,19 @@ def test_tw_public_candles_select_uses_dual_5090_research_contract() -> None:
     assert config.environment.torch_compile_threads == 16
 
 
-def test_tw_public_candles_all_folds_uses_runnable_research_contract() -> None:
+def test_tw_public_candles_all_folds_uses_runnable_tw_cash_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles.yaml")
 
-    assert config.trading.execution_mode == "naive"
+    assert config.trading.execution_mode == "tw_cash"
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.training.financial_transformer.portfolio_output_mode == "l1"
-    assert config.training.transformer_base_portfolio.portfolio_output_mode == "l1"
     assert config.training.multi_gpu_strategy == "auto"
     assert config.training.batch_size_train == 128
     assert config.training.batch_size_eval == 128
     assert config.environment.cpu_threads == 128
     assert config.environment.torch_compile_threads == 16
-    assert config.runner.resume is False
+    assert config.runner.resume is True
 
 
 def test_tw_rule_switch_is_independent_from_tw_model_features() -> None:

@@ -512,7 +512,11 @@ def _manifest_metadata(
     return output
 
 
-def _terminal_unavailable_codes(path: Path) -> set[str]:
+def _terminal_unavailable_codes(
+    path: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> set[str]:
     if not path.is_file():
         return set()
     try:
@@ -523,9 +527,13 @@ def _terminal_unavailable_codes(path: Path) -> set[str]:
         return set()
     accepted_statuses = {"not_found", "delisted_no_history", "delisted_removed"}
     codes: set[str] = set()
+    unavailable_yahoo_symbols: set[str] = set()
     for row in frame.iter_rows(named=True):
         if str(row.get("status") or "").strip() not in accepted_statuses:
             continue
+        yahoo_symbol = str(row.get("yahoo_symbol") or "").strip().upper()
+        if yahoo_symbol:
+            unavailable_yahoo_symbols.add(yahoo_symbol)
         raw_code = str(row.get("code") or "").strip().upper()
         match = re.fullmatch(
             r"(?P<symbol>[0-9A-Z]{4,6})(?:_(?P<venue>TW|TWO))?",
@@ -539,6 +547,36 @@ def _terminal_unavailable_codes(path: Path) -> set[str]:
             if venue is None
             else f"{match.group('symbol')}_{venue}"
         )
+    # Active and venue-suffixed delisted manifest rows may intentionally share
+    # the exact same Yahoo provider symbol.  A fresh terminal response applies
+    # to that provider identifier, not merely to the local alias that happened
+    # to issue the request.  Propagate only exact yahoo_symbol matches; never
+    # infer that .TW and .TWO are interchangeable.
+    if manifest_path is not None and unavailable_yahoo_symbols and manifest_path.is_file():
+        try:
+            manifest = pl.read_csv(manifest_path, infer_schema_length=10000)
+        except Exception:
+            manifest = pl.DataFrame()
+        if {"code", "yahoo_symbol"} <= set(manifest.columns):
+            for row in manifest.iter_rows(named=True):
+                if (
+                    str(row.get("yahoo_symbol") or "").strip().upper()
+                    not in unavailable_yahoo_symbols
+                ):
+                    continue
+                raw_code = str(row.get("code") or "").strip().upper()
+                match = re.fullmatch(
+                    r"(?P<symbol>[0-9A-Z]{4,6})(?:_(?P<venue>TW|TWO))?",
+                    raw_code,
+                )
+                if match is None or classify_tw_stock_or_etf(match.group("symbol")) is None:
+                    continue
+                venue = match.group("venue")
+                codes.add(
+                    match.group("symbol")
+                    if venue is None
+                    else f"{match.group('symbol')}_{venue}"
+                )
     return codes
 
 
@@ -979,7 +1017,10 @@ def main() -> None:
         for symbol, sources in groups.items()
         for _path, venue in sources
     }
-    terminal_unavailable_codes = _terminal_unavailable_codes(terminal_report_path)
+    terminal_unavailable_codes = _terminal_unavailable_codes(
+        terminal_report_path,
+        manifest_path=symbol_manifest_path,
+    )
     unaccounted_codes = manifest_codes - available_codes - terminal_unavailable_codes
     if unaccounted_codes:
         examples = ", ".join(sorted(unaccounted_codes)[:20])

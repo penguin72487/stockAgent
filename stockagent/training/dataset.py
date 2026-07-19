@@ -52,6 +52,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             if panel.unresolved_corporate_action_mask is None
             else np.asarray(panel.unresolved_corporate_action_mask, dtype=bool)
         )
+        all_corporate_action_avoidance = (
+            None
+            if getattr(panel, "corporate_action_avoidance_mask", None) is None
+            else np.asarray(panel.corporate_action_avoidance_mask, dtype=bool)
+        )
         cash_dividend_yield = getattr(panel, "cash_dividend_yield", None)
         cash_dividend_delay = getattr(
             panel, "cash_dividend_payment_delay_sessions", None
@@ -77,12 +82,20 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     "exact tw_cash requires a receipt-verified MOPS cash-dividend "
                     "amount/payment archive"
                 )
-        elif unresolved_corporate_action is not None and cash_dividend_yield is not None:
-            # Avoid mode must liquidate for events that the panel's exact mode
-            # removed from the unresolved-action mask.
-            unresolved_corporate_action = (
-                unresolved_corporate_action | (cash_dividend_yield > 0.0)
-            )
+        elif self.execution_mode == "tw_cash":
+            # Avoid mode needs the full interval beginning at the last close
+            # where both a long and short can be flattened. A single exact
+            # yield cell at the last cum-right close is insufficient when that
+            # close is limit-blocked or halted.
+            if all_corporate_action_avoidance is not None:
+                unresolved_corporate_action = all_corporate_action_avoidance
+            elif cash_dividend_yield is not None and bool(
+                (cash_dividend_yield > 0.0).any()
+            ):
+                raise ValueError(
+                    "avoid tw_cash requires PanelData.corporate_action_avoidance_mask "
+                    "when exact entitlement events are present"
+                )
             cash_dividend_yield = None
             cash_dividend_delay = None
         if self.execution_mode == "tw_cash" and unresolved_corporate_action is None:
@@ -97,6 +110,14 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         ):
             raise ValueError(
                 "PanelData.unresolved_corporate_action_mask must match "
+                "tradable_mask shape"
+            )
+        if (
+            all_corporate_action_avoidance is not None
+            and all_corporate_action_avoidance.shape != panel.tradable_mask.shape
+        ):
+            raise ValueError(
+                "PanelData.corporate_action_avoidance_mask must match "
                 "tradable_mask shape"
             )
         if self.execution_mode == "tw_day_trade":
