@@ -212,23 +212,52 @@ data:
     - twpub_taifex_tx_top10_long_ratio
     - twpub_taifex_tx_large_oi_log
     - twpub_taifex_tx_final_settlement_logret
-  feature_exclude: []
-  # These selected families do not yet have a point-in-time vintage archive or
-  # registered historical lineage. Keep their schema slots deterministic while
-  # preventing present-day snapshots from leaking into historical training.
-  feature_zero_fill:
-    - twpub_cumulative_revenue_yoy
-    - twpub_cbc_*
-    - twpub_dgbas_*
-    - twpub_mof_*
+  # Current-only snapshots are retained in the raw/public archive for lineage
+  # and future vintage accumulation, but they are not model inputs.  Only
+  # sources with a genuine date-addressable history may enter the panel.
+  feature_exclude:
+    - twpub_tdcc_*
+    - twpub_company_*
     - twpub_dividend_*
     - twpub_exdiv_*
     - twpub_material_*
     - twpub_attention_*
     - twpub_disposal_*
+    - twpub_monthly_revenue_*
+    - twpub_cumulative_revenue_yoy
+    - twpub_financial_*
+    - twpub_insider_*
+    - twpub_borrow_*
+    - twpub_sbl_*
+    - twpub_short_sale_available_*
+    - twpub_taifex_*
+  # These selected families do not yet have a point-in-time vintage archive or
+  # registered historical lineage. Keep their schema slots deterministic while
+  # preventing present-day snapshots from leaking into historical training.
+  feature_zero_fill:
+    # Official histories begin part-way through the 2005-2026 panel.  Until a
+    # provenance-backed pre-onset archive exists, quarantine the source-regime
+    # jump instead of letting the model identify the calendar from coverage.
+    - twpub_pe_log
+    - twpub_pb_log
+    - twpub_foreign_net_buy_flow
+    - twpub_institutional_net_buy_flow
+
+    # Single-vintage or current-only external archives.
+    - twpub_cbc_*
+    - twpub_dgbas_*
+    - twpub_mof_*
     - twpub_twse_taiex_*
     - twpub_usdtwd_*
-    - twpub_taifex_*
+
+  # Research approximation: the naive ledger treats the final regular-close
+  # price as the execution price and also permits final session-t OHLCV/daily
+  # aggregates in the signal. This is intentionally not a realizable closing-
+  # auction timing contract. Keep it explicit so a future execution-aware
+  # implementation can replace it without confusing it with point-in-time
+  # correctness. Post-close margin/institutional data remains source-shifted.
+  feature_shift_next_session: []
+  allow_same_close_feature_approximation: true
   # tradable_mode: tradable
 
 walk_forward:

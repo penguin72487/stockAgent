@@ -26,7 +26,9 @@ from stockagent.data.panel import build_panel, load_cached_panel
 from stockagent.data.walkforward import build_expanding_year_folds
 from stockagent.data.tw_public_features import (
     FEATURE_COLUMNS,
+    POST_CLOSE_CHIP_FEATURE_COLUMNS,
     RULE_COLUMNS,
+    TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION,
     _date_column_expr,
     _file_content_receipt,
     _source_content_receipts,
@@ -66,6 +68,36 @@ BASE_FEATURES = {
     "lower_shadow",
     "shadow_imbalance",
 }
+
+# Availability classes are stated relative to a regular-close portfolio
+# decision.  The opening price is observable before that decision.  All other
+# fields below use final session aggregates and therefore cannot be used to
+# establish a position at that same regular close.
+PRE_CLOSE_FEATURE_COLUMNS = ("open_logret_1d",)
+CLOSE_COMPLETION_FEATURE_COLUMNS = (
+    "max_logret_1d",
+    "min_logret_1d",
+    "close_logret_1d",
+    "trading_volume_logret_1d",
+    "signed_vol",
+    "body_ratio",
+    "signed_body_ratio",
+    "delta_body_ratio",
+    "clv",
+    "clv_centered",
+    "delta_clv",
+    "upper_shadow",
+    "lower_shadow",
+    "shadow_imbalance",
+    "twpub_official_close_logret_1d",
+    "twpub_official_trading_volume_log",
+    "twpub_official_trading_value_log",
+    "twpub_official_trades_log",
+    "twpub_official_turnover_ratio",
+    "twpub_official_intraday_range",
+    "twpub_official_close_to_high",
+    "twpub_official_close_to_low",
+)
 
 MARKET_FEATURE_PREFIXES = (
     "twpub_twse_",
@@ -255,7 +287,9 @@ def _is_zero_filled(feature: str, config: ExperimentConfig) -> bool:
 
 
 def _selected_features(config: ExperimentConfig) -> list[str]:
-    return list(dict.fromkeys(str(name) for name in config.data.feature_include))
+    included = list(dict.fromkeys(str(name) for name in config.data.feature_include))
+    excluded = tuple(str(pattern) for pattern in config.data.feature_exclude)
+    return [feature for feature in included if not _matches(feature, excluded)]
 
 
 def _source_selected_features(
@@ -2222,6 +2256,143 @@ def audit_feature_lineage_registry(config: ExperimentConfig) -> list[Finding]:
     ]
 
 
+def audit_feature_availability_contract(
+    config: ExperimentConfig,
+) -> tuple[dict[str, Any], list[Finding]]:
+    """Prove every live feature is usable at its configured decision time."""
+
+    selected = _selected_features(config)
+    selected_set = set(selected)
+    zero_filled = {
+        feature for feature in selected if _is_zero_filled(feature, config)
+    }
+    active = selected_set - zero_filled
+    pre_close = active & set(PRE_CLOSE_FEATURE_COLUMNS)
+    close_completion = active & set(CLOSE_COMPLETION_FEATURE_COLUMNS)
+    post_close = active & set(POST_CLOSE_CHIP_FEATURE_COLUMNS)
+    classified = pre_close | close_completion | post_close
+    unclassified = active - classified
+    overlaps = sorted(
+        (pre_close & close_completion)
+        | (pre_close & post_close)
+        | (close_completion & post_close)
+    )
+    configured_panel_shift = {
+        feature
+        for feature in selected
+        if _matches(feature, config.data.feature_shift_next_session)
+    }
+    missing_close_shift = close_completion - configured_panel_shift
+    unexpected_panel_shift = configured_panel_shift - close_completion
+    execution_mode = str(config.trading.execution_mode).strip().lower()
+    allow_same_close_approximation = bool(
+        config.data.allow_same_close_feature_approximation
+    )
+
+    summary = {
+        "execution_mode": execution_mode,
+        "decision_time_contract": "regular_close",
+        "allow_same_close_feature_approximation": (
+            allow_same_close_approximation
+        ),
+        "selected_features": len(selected),
+        "zero_filled_features": sorted(zero_filled),
+        "active_features": len(active),
+        "pre_close_active_features": sorted(pre_close),
+        "close_completion_active_features": sorted(close_completion),
+        "post_close_active_features": sorted(post_close),
+        "post_close_selected_features": sorted(
+            selected_set & set(POST_CLOSE_CHIP_FEATURE_COLUMNS)
+        ),
+        "configured_panel_shift_features": sorted(configured_panel_shift),
+        "unclassified_active_features": sorted(unclassified),
+        "classification_overlaps": overlaps,
+        "missing_close_completion_shifts": sorted(missing_close_shift),
+        "unexpected_panel_shifts": sorted(unexpected_panel_shift),
+    }
+    findings: list[Finding] = []
+    if unclassified:
+        findings.append(
+            Finding(
+                "critical",
+                "unclassified_feature_availability",
+                "feature_availability",
+                "active_model_features",
+                f"unclassified={sorted(unclassified)}",
+                "A live feature has no machine-checked earliest-use timestamp.",
+                "Classify its publication/observation time before training.",
+            )
+        )
+    if overlaps:
+        findings.append(
+            Finding(
+                "critical",
+                "overlapping_feature_availability",
+                "feature_availability",
+                "active_model_features",
+                f"overlaps={overlaps}",
+                "Conflicting availability classes make the feature lag ambiguous.",
+                "Assign exactly one availability class to each active feature.",
+            )
+        )
+    if execution_mode == "naive":
+        if missing_close_shift:
+            findings.append(
+                Finding(
+                    "medium" if allow_same_close_approximation else "high",
+                    (
+                        "same_close_feature_approximation"
+                        if allow_same_close_approximation
+                        else "same_close_feature_leakage"
+                    ),
+                    "feature_availability",
+                    "regular_close_inputs",
+                    f"missing_next_session_shift={sorted(missing_close_shift)}",
+                    (
+                        "Final session values are deliberately used with the same final close as an approximate execution price; "
+                        "the research backtest is not a realizable closing-auction timing simulation."
+                        if allow_same_close_approximation
+                        else "Final session values would be used to establish a position at that same regular close."
+                    ),
+                    (
+                        "Replace the approximation with an explicit order cutoff and executable price model; "
+                        "until then keep the opt-in and caveat in every result."
+                        if allow_same_close_approximation
+                        else "Add every final-session aggregate to data.feature_shift_next_session and rebuild the panel."
+                    ),
+                )
+            )
+        if unexpected_panel_shift:
+            findings.append(
+                Finding(
+                    "high",
+                    "unexpected_feature_availability_shift",
+                    "feature_availability",
+                    "regular_close_inputs",
+                    f"unexpected_next_session_shift={sorted(unexpected_panel_shift)}",
+                    "A feature is delayed without a registered availability reason.",
+                    "Remove the shift or register the feature in the correct availability class.",
+                )
+            )
+    elif configured_panel_shift or post_close or allow_same_close_approximation:
+        findings.append(
+            Finding(
+                "high",
+                "availability_shift_execution_conflict",
+                "feature_availability",
+                "execution_mode",
+                (
+                    f"execution_mode={execution_mode}, panel_shifted={len(configured_panel_shift)}, "
+                    f"source_shifted_post_close={len(post_close)}, "
+                    f"same_close_approximation={allow_same_close_approximation}"
+                ),
+                "Taiwan execution modes already lag the model window by one completed session, so availability-shifted inputs would be delayed twice.",
+                "Use the regular-close naive contract or redesign the dataset to consume per-feature availability timestamps exactly once.",
+            )
+        )
+    return summary, findings
+
+
 def _read_json_object(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -2499,6 +2670,12 @@ def audit_source_receipts(
         "public_download_summary": str(public_path),
         "public_download_mode": public_receipt.get("mode") if public_receipt else None,
         "public_download_failed_count": public_receipt.get("failed_count") if public_receipt else None,
+        "public_download_blocking_failed_count": (
+            public_receipt.get("blocking_failed_count") if public_receipt else None
+        ),
+        "public_download_allowed_failed_datasets": (
+            public_receipt.get("allowed_failed_datasets") if public_receipt else None
+        ),
         "public_download_coverage_complete": (
             public_receipt.get("coverage_complete") if public_receipt else None
         ),
@@ -2517,15 +2694,21 @@ def audit_source_receipts(
         )
     else:
         failed_count = int(public_receipt.get("failed_count", -1))
-        if failed_count != 0:
+        blocking_failed_count = int(
+            public_receipt.get("blocking_failed_count", failed_count)
+        )
+        if blocking_failed_count != 0:
             findings.append(
                 Finding(
                     "critical",
                     "public_download_failures",
                     "source_receipt",
                     str(public_path),
-                    f"failed_count={failed_count}",
-                    "At least one requested public source failed or the receipt is malformed.",
+                    (
+                        f"failed_count={failed_count}, "
+                        f"blocking_failed_count={blocking_failed_count}"
+                    ),
+                    "At least one required public source failed or the receipt is malformed.",
                     "Repair every failed dataset before rebuilding features.",
                 )
             )
@@ -2801,6 +2984,10 @@ def audit_feature_build_receipt(
     checks: dict[str, bool] = {}
     checks["feature_schema"] = summary.get("feature_columns") == list(FEATURE_COLUMNS)
     checks["rule_schema"] = summary.get("rule_columns") == list(RULE_COLUMNS)
+    checks["availability_contract"] = (
+        int(summary.get("availability_contract_version", -1))
+        == TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION
+    )
     checks["source_bytes"] = summary.get("source_receipts") == _source_content_receipts(public_dir)
     checks["symbol_universe"] = summary.get("symbol_universe_receipt") == _symbol_universe_receipt(
         parquet_root
@@ -2997,6 +3184,7 @@ def _panel_kwargs(config: ExperimentConfig, public_feature_path: Path) -> dict[s
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
 
@@ -3384,6 +3572,7 @@ def _write_report(
     universe_profiles: list[dict[str, Any]],
     quote_summary: dict[str, Any],
     return_price_summary: dict[str, Any],
+    availability_summary: dict[str, Any],
     feature_profiles: list[FeatureProfile],
     findings: list[Finding],
     panel_summary: dict[str, Any],
@@ -3501,6 +3690,20 @@ def _write_report(
     lines.extend(
         [
             "",
+            "## Feature Availability",
+            "",
+            f"Decision time: {availability_summary.get('decision_time_contract')}; "
+            f"execution mode: {availability_summary.get('execution_mode')}; "
+            f"same-close approximation: {availability_summary.get('allow_same_close_feature_approximation')}; "
+            f"selected/active/zero-filled: {availability_summary.get('selected_features', 0)}/"
+            f"{availability_summary.get('active_features', 0)}/"
+            f"{len(availability_summary.get('zero_filled_features', []))}.",
+            "",
+            f"- Pre-close usable: {availability_summary.get('pre_close_active_features', [])}",
+            f"- Shifted after close completion: {availability_summary.get('close_completion_active_features', [])}",
+            f"- Source-shifted post-close: {availability_summary.get('post_close_active_features', [])}",
+            f"- Unclassified active: {availability_summary.get('unclassified_active_features', [])}",
+            "",
             "## Model Features",
             "",
             "| feature | scope | zero fill | raw count | raw range | panel nonzero | std | first year | max annual jump |",
@@ -3586,6 +3789,9 @@ def main() -> None:
     )
     snapshot_findings = audit_snapshot_contract(public_dir, config)
     non_vintage_findings = audit_non_vintage_archive_contract(public_dir, config)
+    availability_summary, availability_findings = (
+        audit_feature_availability_contract(config)
+    )
     if args.require_live_selected_features:
         for finding in [*source_findings, *snapshot_findings, *non_vintage_findings]:
             if finding.severity in {"low", "medium"}:
@@ -3602,6 +3808,7 @@ def main() -> None:
     findings.extend(snapshot_findings)
     findings.extend(non_vintage_findings)
     findings.extend(audit_feature_lineage_registry(config))
+    findings.extend(availability_findings)
 
     selected = _selected_features(config)
     raw_stats, raw_annual_rows, table_findings = audit_public_feature_table(
@@ -3663,6 +3870,7 @@ def main() -> None:
         "quote_sources": quote_summary,
         "official_symbol_build": official_build_summary,
         "return_price_provenance": return_price_summary,
+        "feature_availability": availability_summary,
         "universe": universe_profiles,
         "finding_counts": {
             severity: sum(item.severity == severity for item in findings)
@@ -3683,6 +3891,7 @@ def main() -> None:
         universe_profiles=universe_profiles,
         quote_summary=quote_summary,
         return_price_summary=return_price_summary,
+        availability_summary=availability_summary,
         feature_profiles=feature_profiles,
         findings=findings,
         panel_summary=panel_summary,

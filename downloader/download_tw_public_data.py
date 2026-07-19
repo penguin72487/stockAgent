@@ -960,6 +960,15 @@ def parse_args() -> argparse.Namespace:
             "published yet. All other dataset failures remain fatal."
         ),
     )
+    parser.add_argument(
+        "--allow-failed-datasets",
+        nargs="*",
+        default=[],
+        help=(
+            "Dataset names whose refresh failure is recorded but does not fail "
+            "the run. Use only for inputs excluded or zero-filled by the model."
+        ),
+    )
     parser.add_argument("--output-dir", default="data_tw_public", help="Output directory.")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent historical dataset workers.")
     parser.add_argument(
@@ -1036,6 +1045,12 @@ def parse_args() -> argparse.Namespace:
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _snapshot_as_of_date() -> str:
+    """Return the local Taiwan date that owns a current-only snapshot."""
+
+    return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 
 
 def _safe_name(value: str, default: str = "resource") -> str:
@@ -2778,10 +2793,14 @@ def _append_common_columns(
         pl.lit(fetched_at).alias("_downloaded_at_utc"),
         pl.lit(url).alias("_url"),
     ]
-    if as_of_date is not None and DATE_COLUMN not in frame.columns:
-        expressions.append(pl.lit(as_of_date).alias(DATE_COLUMN))
-    elif as_of_date is not None:
+    if as_of_date is not None:
+        # Every current-only snapshot needs an explicit vintage key even when
+        # the provider also supplies a report/data date. The provider date
+        # identifies the subject period; _as_of_date records when these exact
+        # bytes first became observable to this archive.
         expressions.append(pl.lit(as_of_date).alias("_as_of_date"))
+        if DATE_COLUMN not in frame.columns:
+            expressions.append(pl.lit(as_of_date).alias(DATE_COLUMN))
     if resource is not None:
         expressions.append(pl.lit(resource).alias("_resource"))
     return frame.with_columns(expressions)
@@ -4346,6 +4365,18 @@ def _merge_frames(existing: pl.DataFrame, incoming: pl.DataFrame, *, refresh: bo
         return incoming
     if incoming.is_empty():
         return existing
+    # Snapshot files are daily vintages. Re-running one day may replace that
+    # day's parsed snapshot, but must never erase an older day's bytes merely
+    # because the provider repeats the same report/data date.
+    if "_as_of_date" in incoming.columns and "_as_of_date" in existing.columns:
+        incoming_vintages = (
+            incoming.select(pl.col("_as_of_date").unique()).to_series().to_list()
+        )
+        kept = existing.filter(~pl.col("_as_of_date").is_in(incoming_vintages))
+        sort_columns = ["_as_of_date"]
+        if DATE_COLUMN in incoming.columns and DATE_COLUMN in existing.columns:
+            sort_columns.append(DATE_COLUMN)
+        return pl.concat([kept, incoming], how="diagonal_relaxed").sort(sort_columns)
     key_columns = [column for column in (DATE_COLUMN, "_dataset", "_resource", "_table_index", "_row_index") if column in incoming.columns]
     if DATE_COLUMN in incoming.columns and DATE_COLUMN in existing.columns:
         incoming_dates = incoming.select(pl.col(DATE_COLUMN).unique()).to_series().to_list()
@@ -5551,14 +5582,28 @@ def _download_snapshot_url(spec: DatasetSpec, args: argparse.Namespace, output_d
         retries=int(args.retries),
         retry_backoff=float(args.retry_backoff),
     )
+    as_of_date = _snapshot_as_of_date()
     raw_path: Path | None = None
     if not args.skip_raw:
         suffix = _suffix_from_url(spec.url, response.headers.get("content-type", ""))
-        raw_path = _write_raw(response.content, output_dir / "raw" / spec.name, spec.name, suffix)
+        digest = hashlib.sha256(response.content).hexdigest()
+        raw_path = _write_immutable_raw(
+            response.content,
+            output_dir / "raw" / spec.name,
+            spec.name,
+            suffix,
+            stem=f"{as_of_date}.{digest[:16]}",
+        )
     frame = _parse_resource_bytes(response.content, url=spec.url)
     if frame.is_empty():
         return DownloadResult(spec.name, "empty", 0, None, raw_path=str(raw_path) if raw_path else None)
-    frame = _append_common_columns(frame, spec, fetched_at=fetched_at, url=spec.url, as_of_date=date.today().isoformat())
+    frame = _append_common_columns(
+        frame,
+        spec,
+        fetched_at=fetched_at,
+        url=spec.url,
+        as_of_date=as_of_date,
+    )
     parquet_path = output_dir / f"{spec.name}.parquet"
     rows = _write_parquet_merged(
         parquet_path,
@@ -5925,6 +5970,18 @@ def main() -> None:
     request_interval = _configure_tw_public_rate_limiter(args.request_interval)
     print(f"[tw-public] {describe_rate_limit('tw_public', request_interval)}", flush=True)
     specs = _select_specs(args.datasets)
+    selected_names = {spec.name for spec in specs}
+    allowed_failure_names = {
+        str(name).strip().lower()
+        for name in args.allow_failed_datasets
+        if str(name).strip()
+    }
+    unknown_allowed_failures = sorted(allowed_failure_names - selected_names)
+    if unknown_allowed_failures:
+        raise ValueError(
+            "--allow-failed-datasets contains unselected or unknown datasets: "
+            + ", ".join(unknown_allowed_failures)
+        )
     if args.mode == "list":
         _print_dataset_list(specs)
         return
@@ -5978,7 +6035,14 @@ def main() -> None:
     blocking_failures = [
         row
         for row in results
-        if row.status in failed_statuses and row.dataset not in publication_lag_names
+        if row.status in failed_statuses
+        and row.dataset not in publication_lag_names
+        and row.dataset not in allowed_failure_names
+    ]
+    allowed_failures = [
+        row
+        for row in results
+        if row.status in failed_statuses and row.dataset in allowed_failure_names
     ]
     summary = {
         "schema_version": 3,
@@ -6000,6 +6064,9 @@ def main() -> None:
         "up_to_date_count": sum(row.status == "up_to_date" for row in results),
         "failed_count": sum(row.status in failed_statuses for row in results),
         "blocking_failed_count": len(blocking_failures),
+        "allowed_failed_count": len(allowed_failures),
+        "allowed_failed_datasets": sorted(row.dataset for row in allowed_failures),
+        "configured_allowed_failed_datasets": sorted(allowed_failure_names),
         "publication_lag_count": len(publication_lag_results),
         "publication_lag_datasets": sorted(publication_lag_names),
         "daily_close_ready": bool(

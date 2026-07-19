@@ -131,8 +131,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--request-interval",
         type=float,
-        default=0.1,
-        help="Provider-global request interval; default follows project 10 req/s policy.",
+        default=None,
+        help="Provider-global request interval; default follows project 8 req/s policy.",
     )
     parser.add_argument(
         "--max-list-requests",
