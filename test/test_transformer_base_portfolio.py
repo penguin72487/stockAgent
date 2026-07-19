@@ -5,6 +5,7 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -33,6 +34,7 @@ from stockagent.training.trainer import (
     _maybe_compact_train_windowed_symbols,
     _PanelSlabForwardWrapper,
     _panel_slab_dynamic_symbol_bounds,
+    _train_symbol_compaction_upper_bound,
 )
 from stockagent.training.windowed import WindowedSplitTensors
 
@@ -905,6 +907,43 @@ def test_fixed_symbol_position_capacity_supports_full_runtime_universe() -> None
     assert torch.isfinite(weights).all()
 
 
+def test_dynamic_symbol_upper_bound_uses_train_groups_not_future_panel_symbols() -> None:
+    dates = 10
+    symbols = 8
+    tradable = np.zeros((dates, symbols), dtype=bool)
+    tradable[:5, :2] = True
+    tradable[5:8, :5] = True
+    # These newly listed symbols exist only in validation/test dates and must
+    # not widen the compiled training ABI.
+    tradable[8:, :] = True
+    panel = SimpleNamespace(
+        num_symbols=symbols,
+        tradable_mask=tradable,
+        returns_1d=np.zeros((dates, symbols), dtype=np.float32),
+        alive_mask=tradable.copy(),
+        day_trade_eligible_mask=None,
+    )
+    grouped_folds = {
+        (2001,): [SimpleNamespace(train_indices=np.arange(0, 5))],
+        (2001, 2002): [SimpleNamespace(train_indices=np.arange(0, 8))],
+    }
+    config = SimpleNamespace(
+        trading=SimpleNamespace(execution_mode="naive"),
+        training=SimpleNamespace(
+            lookback=2,
+            train_symbol_compaction="train_union",
+            train_symbol_compaction_bucket_size=0,
+        ),
+    )
+
+    assert _train_symbol_compaction_upper_bound(panel, grouped_folds, config) == 5
+
+    # Universe changes are re-derived from the current run's data, not retained
+    # from the previous shape or hard-coded to a historical market size.
+    tradable[7, 5] = True
+    assert _train_symbol_compaction_upper_bound(panel, grouped_folds, config) == 6
+
+
 def test_train_union_bucket_padding_preserves_output_loss_grad_and_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1413,15 +1452,20 @@ def test_large_temporal_batch_uses_chunked_sdpa_without_cuda_invalid_argument() 
     assert torch.isfinite(out["weights"]).all()
 
 
-def test_long_only_mode_rejects_empty_rows() -> None:
+def test_long_only_mode_empty_row_is_finite_and_zero() -> None:
     device = _device()
     model = _make_model(portfolio_mode="long_only").eval()
     x = torch.randn(2, 6, 13, 11, device=device)
     mask = torch.ones(2, 13, dtype=torch.bool, device=device)
     mask[0, :] = False
 
-    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
-        model(x, mask, return_aux=True)
+    with torch.no_grad():
+        weights, scores, aux = model(x, mask, return_aux=True)
+
+    assert torch.isfinite(weights).all()
+    assert torch.isfinite(scores).all()
+    assert torch.isfinite(aux["market_tokens"]).all()
+    torch.testing.assert_close(weights[0], torch.zeros_like(weights[0]))
 
 
 def test_portfolio_output_mode_l1_uses_identity_l1_weights() -> None:

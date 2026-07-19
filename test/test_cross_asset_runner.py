@@ -32,8 +32,8 @@ def _fold(
 def test_cli_exposes_no_alternate_fold_split_or_date_coverage_paths() -> None:
     args = runner.parse_args(["--config", "configs/markets/tw_public_lanten_market.yaml"])
 
-    assert args.first_test_year_only is True
-    assert args.max_rows == 0
+    assert not hasattr(args, "first_test_year_only")
+    assert not hasattr(args, "max_rows")
     for removed in (
         "--fold",
         "--checkpoint",
@@ -185,20 +185,15 @@ def test_run_fold_forces_first_test_year_all_dates_and_lazy_source(
         lambda *values, **kwargs: (torch.nn.Identity(), {"checkpoint_epoch": 7}),
     )
 
-    def fake_dataset_for_split(
+    def fake_first_test_year_dataset(
         received_panel: Any,
         received_fold: Any,
-        split: str,
         lookback: int,
-        *,
-        first_test_year_only: bool,
     ) -> Any:
         calls["dataset"] = (
             received_panel,
             received_fold,
-            split,
             lookback,
-            first_test_year_only,
         )
         return dataset
 
@@ -215,7 +210,7 @@ def test_run_fold_forces_first_test_year_all_dates_and_lazy_source(
         calls["dates"] = kwargs["dates"]
         return {"sources": 2, "targets": 2}
 
-    monkeypatch.setattr(runner, "_dataset_for_split", fake_dataset_for_split)
+    monkeypatch.setattr(runner, "_first_test_year_dataset", fake_first_test_year_dataset)
     monkeypatch.setattr(runner, "_sample_dataset_source", fake_sample_dataset_source)
     monkeypatch.setattr(runner, "abstract_cross_asset_transmission", fake_cross_asset)
     monkeypatch.setattr(runner, "_clear_explainability_runtime_cache", lambda: None)
@@ -234,7 +229,7 @@ def test_run_fold_forces_first_test_year_all_dates_and_lazy_source(
         amp_dtype_name="none",
     )
 
-    assert calls["dataset"][2:] == ("test", 2, True)
+    assert calls["dataset"][2:] == (2,)
     assert calls["sample"] == (dataset, 0, "even")
     assert calls["batch"] is source
     assert calls["dates"] == ["2020-01-03", "2020-01-06"]

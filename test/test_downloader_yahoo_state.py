@@ -131,6 +131,90 @@ def test_targeted_incremental_resolution_reuses_known_provider_candidates(tmp_pa
     assert resolution.manifest_records[0].yahoo_symbol == "3303.TW"
 
 
+def test_targeted_repair_preserves_full_cached_manifest(tmp_path, monkeypatch):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    pl.DataFrame(
+        [
+            {"code": "3303", "name": "existing", "market": "tw_stocks", "yahoo_symbol": "3303.TWO"},
+            {"code": "2330", "name": "TSMC", "market": "tw_stocks", "yahoo_symbol": "2330.TW"},
+        ]
+    ).write_csv(output_dir / "symbols.csv")
+    args = _base_args(tmp_path, mode="repair", symbols=["3303"])
+
+    resolution = yahoo._resolve_symbol_resolution("tw_stocks", args)
+
+    assert [record.code for record in resolution.scheduled_records] == ["3303"]
+    assert resolution.scheduled_records[0].yahoo_symbol == "3303.TWO"
+    assert [record.code for record in resolution.manifest_records] == ["3303", "2330"]
+
+
+def test_targeted_refresh_preserves_full_cached_manifest(tmp_path):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    pl.DataFrame(
+        [
+            {"code": "3303", "name": "existing", "market": "tw_stocks", "yahoo_symbol": "3303.TWO"},
+            {"code": "2330", "name": "TSMC", "market": "tw_stocks", "yahoo_symbol": "2330.TW"},
+        ]
+    ).write_csv(output_dir / "symbols.csv")
+
+    resolution = yahoo._resolve_symbol_resolution(
+        "tw_stocks",
+        _base_args(tmp_path, mode="download", symbols=["3303"]),
+    )
+
+    assert [record.code for record in resolution.scheduled_records] == ["3303"]
+    assert resolution.scheduled_records[0].yahoo_symbol == "3303.TWO"
+    assert [record.code for record in resolution.manifest_records] == ["3303", "2330"]
+
+
+def test_targeted_tw_delisted_archive_alias_resolves_provider_symbol():
+    record = yahoo._record_from_input("tw_stocks", "9801_TW")
+
+    assert record == yahoo.SymbolRecord(
+        code="9801_TW",
+        name="9801 (delisted)",
+        market="tw_delisted",
+        yahoo_symbol="9801.TW",
+    )
+
+
+def test_targeted_download_report_preserves_other_manifest_terminal_rows(tmp_path):
+    old_result = yahoo.DownloadResult(
+        asset_class="tw_stocks",
+        code="2833",
+        yahoo_symbol="2833.TW",
+        market="tw_delisted",
+        status="not_found",
+        rows=0,
+        output_path=None,
+    )
+    yahoo._write_download_artifacts(tmp_path, "tw_stocks", [old_result])
+
+    refreshed = yahoo.DownloadResult(
+        asset_class="tw_stocks",
+        code="2330",
+        yahoo_symbol="2330.TW",
+        market="listed",
+        status="updated",
+        rows=10,
+        output_path="2330_features.parquet",
+    )
+    yahoo._write_download_artifacts(
+        tmp_path,
+        "tw_stocks",
+        [refreshed],
+        manifest_codes={"2330", "2833"},
+    )
+
+    report = pl.read_csv(tmp_path / "download_report.csv")
+    assert dict(zip(report["code"].cast(pl.String), report["status"], strict=True)) == {
+        "2833": "not_found",
+        "2330": "updated",
+    }
+
+
 def test_tw_exchange_parser_excludes_warrant_like_listings(monkeypatch):
     def fake_read_html_table_rows(url):
         if "strMode=2" not in url:
@@ -271,6 +355,53 @@ def test_tw_repair_unions_live_cached_repo_and_tracked_symbols(
     assert resolution.scheduled_records[0].name == (
         "stale cached name" if exchange_fails else "live name"
     )
+
+
+def test_tw_repair_reconciles_cached_plain_code_with_official_delisting(
+    tmp_path,
+    monkeypatch,
+):
+    output_dir = tmp_path / "tw_stocks"
+    output_dir.mkdir()
+    cached = [
+        yahoo.SymbolRecord("2833", "台壽保", "tw_stocks", "2833.TW"),
+    ]
+    monkeypatch.setattr(
+        yahoo,
+        "_load_tw_symbols_from_exchange",
+        lambda: [yahoo.SymbolRecord("2330", "台積電", "listed", "2330.TW")],
+    )
+    monkeypatch.setattr(yahoo, "_load_repo_symbol_fallback", lambda _asset: [])
+    monkeypatch.setattr(yahoo, "_load_tw_symbols_from_local_manifest", lambda: [])
+    monkeypatch.setattr(yahoo, "_load_tw_symbols_from_local_parquet", lambda: [])
+    monkeypatch.setattr(yahoo, "_load_local_tracked_records", lambda *_args: [])
+    monkeypatch.setattr(
+        yahoo,
+        "_load_tw_delisted_symbols_from_parquet",
+        lambda _root: [
+            yahoo.SymbolRecord("2833_TW", "台壽保", "tw_delisted", "2833.TW")
+        ],
+    )
+    monkeypatch.setattr(yahoo, "_load_tw_delisted_symbols", lambda: [])
+    monkeypatch.setattr(
+        yahoo,
+        "_fetch_with_hard_timeout",
+        lambda function, timeout: function(),
+    )
+
+    records = yahoo._resolve_tw_symbols(
+        _base_args(
+            tmp_path,
+            mode="repair",
+            include_tw_delisted=True,
+            tw_delisted_dir=tmp_path,
+        ),
+        cached,
+    )
+
+    by_code = {record.code: record for record in records}
+    assert by_code["2330"].market == "listed"
+    assert by_code["2833"].market == "tw_delisted"
 
 
 def test_strict_no_fallback_rejects_tw_symbol_discovery_failure(tmp_path, monkeypatch):
@@ -841,6 +972,25 @@ def test_normalize_preserves_zero_volume_for_stock_like_assets():
 
     assert "Trading_Volume" in normalized.columns
     assert normalized["Trading_Volume"].to_list() == [0.0, 0.0]
+
+
+def test_daily_normalization_deduplicates_wall_clock_variants_of_one_session():
+    frame = pl.DataFrame(
+        {
+            "Date": ["2018-07-03 00:00:00", "2018-07-03 13:30:00"],
+            "Open": [13.8, 13.8],
+            "High": [13.8, 13.8],
+            "Low": [13.8, 13.8],
+            "Close": [13.8, 13.8],
+            "Adj Close": [13.8, 13.8],
+            "Volume": [0, 0],
+        }
+    )
+
+    normalized = yahoo._normalize_download_frame(frame, daily=True)
+
+    assert normalized.height == 1
+    assert normalized["date"].dt.date().to_list() == [datetime(2018, 7, 3).date()]
 
 
 def test_normalize_can_drop_zero_volume_for_assets_without_meaningful_volume():

@@ -1,16 +1,16 @@
 experiment_name: tw-financial-transformer-candles-full-gross-naive-dual5090
 
 runner:
-  # The all-available feature schema is checkpoint-incompatible with the old
+  # The snapshot-safe feature schema is checkpoint-incompatible with the old
   # 64-slot/53-zero-filled experiment, so it must use a fresh artifact root.
-  output_dir: artifacts/markets/tw_public_candles_full_gross_naive_dual5090
+  output_dir: artifacts/markets/tw_public_candles_select_full_gross_tw_cash_dual5090
   mode: train
   # The execution and allocation contracts below differ from the historical
   # naive/projection run.  Never resume that optimizer trajectory here.
   resume: false
   post_train_infer: true
   # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
-  start_fold: 20
+  start_fold: 1
 environment:
   device: cuda
   use_tensor_cores: true
@@ -38,11 +38,22 @@ data:
   use_tw_public_rules: true
   tw_public_feature_path: data_tw_public/features/tw_public_stock_daily.parquet
   tw_public_market_symbol: "__MARKET__"
-  # Use every engineered base and TW-public feature. Each external value is
+  # Start from the screened non-snapshot base and TW-public features. Each external value is
   # overlaid only on its point-in-time availability date; state-like features
   # are forward-filled from their first known observation. Before first
   # availability (and for unresolved missing cells), panel construction fills
   # the value with 0 instead of deleting the entire feature family.
+  # Feature-screening contract (latest run: 2026-07-18 16:04 UTC): evaluate all
+  # 21 folds using only the first calendar year of each fold's test split. Keep
+  # a feature when Gradient x Input or IG is non-zero in at least one fold;
+  # disable only features that are exactly zero for both methods in every fold.
+  # The historical screen kept 73/131 features and disabled 58. The permanent
+  # snapshot-only denylist additionally removes twpub_insider_transfer_shares_log,
+  # so this legacy selection currently has 72 live features. Re-screen from the
+  # 98-feature snapshot-safe full run before using it for a new experiment.
+  # Historical evidence is recorded under:
+  # artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds/
+  # feature_screening_first_test_year/feature_importance_21folds.csv
   feature_include:
     # Base price log returns
     - open_logret_1d
@@ -98,20 +109,20 @@ data:
     - twpub_institutional_net_buy_flow
 
     # TDCC shareholding distribution
-    - twpub_tdcc_retail_holder_ratio
-    - twpub_tdcc_large_holder_ratio
-    - twpub_tdcc_holder_count_log
+    # - twpub_tdcc_retail_holder_ratio  # disabled: 21-fold zero
+    # - twpub_tdcc_large_holder_ratio  # disabled: 21-fold zero
+    # - twpub_tdcc_holder_count_log  # disabled: 21-fold zero
 
     # Company profile and categorical identity
-    - twpub_company_paidin_capital_log
-    - twpub_company_issued_shares_log
-    - twpub_company_private_shares_log
-    - twpub_company_age_years
-    - twpub_company_listed_age_years
-    - twpub_company_par_value_log
-    - twpub_company_industry_code
-    - twpub_company_is_foreign
-    - twpub_company_has_preferred_stock
+    # - twpub_company_paidin_capital_log  # disabled: 21-fold zero
+    # - twpub_company_issued_shares_log  # disabled: 21-fold zero
+    # - twpub_company_private_shares_log  # disabled: 21-fold zero
+    # - twpub_company_age_years  # disabled: 21-fold zero
+    # - twpub_company_listed_age_years  # disabled: 21-fold zero
+    # - twpub_company_par_value_log  # disabled: 21-fold zero
+    # - twpub_company_industry_code  # disabled: 21-fold zero
+    # - twpub_company_is_foreign  # disabled: 21-fold zero
+    # - twpub_company_has_preferred_stock  # disabled: 21-fold zero
 
     # Dividend announcements and ex-dividend information
     - twpub_dividend_cash_per_share
@@ -120,49 +131,49 @@ data:
     - twpub_dividend_total_stock_log
     - twpub_dividend_confirmed
     - twpub_dividend_board_approved
-    - twpub_exdiv_known
-    - twpub_exdiv_cash_dividend
-    - twpub_exdiv_stock_dividend_ratio
-    - twpub_exdiv_subscription_ratio
-    - twpub_exdiv_subscription_price_log
+    # - twpub_exdiv_known  # disabled: 21-fold zero
+    # - twpub_exdiv_cash_dividend  # disabled: 21-fold zero
+    # - twpub_exdiv_stock_dividend_ratio  # disabled: 21-fold zero
+    # - twpub_exdiv_subscription_ratio  # disabled: 21-fold zero
+    # - twpub_exdiv_subscription_price_log  # disabled: 21-fold zero
 
     # Material events, attention stocks, and disposal stocks
-    - twpub_material_event_count_log
-    - twpub_material_clause_log
-    - twpub_material_fact_lag_days
-    - twpub_attention_count_log
-    - twpub_attention_close_log
-    - twpub_attention_pe_log
+    # - twpub_material_event_count_log  # disabled: 21-fold zero
+    # - twpub_material_clause_log  # disabled: 21-fold zero
+    # - twpub_material_fact_lag_days  # disabled: 21-fold zero
+    # - twpub_attention_count_log  # disabled: 21-fold zero
+    # - twpub_attention_close_log  # disabled: 21-fold zero
+    # - twpub_attention_pe_log  # disabled: 21-fold zero
     - twpub_disposal_count_log
 
     # Point-in-time monthly revenue
-    - twpub_monthly_revenue_log
-    - twpub_monthly_revenue_mom
-    - twpub_monthly_revenue_yoy
-    - twpub_cumulative_revenue_yoy
+    # - twpub_monthly_revenue_log  # disabled: 21-fold zero
+    # - twpub_monthly_revenue_mom  # disabled: 21-fold zero
+    # - twpub_monthly_revenue_yoy  # disabled: 21-fold zero
+    # - twpub_cumulative_revenue_yoy  # disabled: 21-fold zero
 
     # Point-in-time income statement and balance sheet
-    - twpub_financial_eps
-    - twpub_financial_revenue_log
-    - twpub_financial_net_income_asinh
-    - twpub_financial_gross_margin
-    - twpub_financial_operating_margin
-    - twpub_financial_net_margin
-    - twpub_financial_assets_log
-    - twpub_financial_debt_ratio
-    - twpub_financial_current_ratio
-    - twpub_financial_equity_ratio
-    - twpub_financial_book_value_per_share_log
+    # - twpub_financial_eps  # disabled: 21-fold zero
+    # - twpub_financial_revenue_log  # disabled: 21-fold zero
+    # - twpub_financial_net_income_asinh  # disabled: 21-fold zero
+    # - twpub_financial_gross_margin  # disabled: 21-fold zero
+    # - twpub_financial_operating_margin  # disabled: 21-fold zero
+    # - twpub_financial_net_margin  # disabled: 21-fold zero
+    # - twpub_financial_assets_log  # disabled: 21-fold zero
+    # - twpub_financial_debt_ratio  # disabled: 21-fold zero
+    # - twpub_financial_current_ratio  # disabled: 21-fold zero
+    # - twpub_financial_equity_ratio  # disabled: 21-fold zero
+    # - twpub_financial_book_value_per_share_log  # disabled: 21-fold zero
 
     # Insider ownership and announced transfers
-    - twpub_insider_holdings_log
-    - twpub_insider_pledge_ratio
-    - twpub_insider_transfer_shares_log
+    # - twpub_insider_holdings_log  # disabled: 21-fold zero
+    # - twpub_insider_pledge_ratio  # disabled: 21-fold zero
+    # - twpub_insider_transfer_shares_log  # permanently disabled: snapshot-only
 
     # Securities borrowing and short-sale availability
-    - twpub_borrow_available_log
-    - twpub_sbl_balance_log
-    - twpub_short_sale_available_log
+    # - twpub_borrow_available_log  # disabled: 21-fold zero
+    # - twpub_sbl_balance_log  # disabled: 21-fold zero
+    # - twpub_short_sale_available_log  # disabled: 21-fold zero
 
     # TAIEX and USD/TWD market state
     - twpub_twse_taiex_log
@@ -198,21 +209,21 @@ data:
     - twpub_mof_business_tax_log
 
     # TAIFEX futures and options market activity
-    - twpub_taifex_tx_volume_log
-    - twpub_taifex_tx_open_interest_log
-    - twpub_taifex_tx_settlement_logret_1d
-    - twpub_taifex_txo_call_volume_log
-    - twpub_taifex_txo_put_volume_log
-    - twpub_taifex_txo_put_call_volume_ratio
-    - twpub_taifex_txo_call_oi_log
-    - twpub_taifex_txo_put_oi_log
-    - twpub_taifex_txo_put_call_oi_ratio
-    - twpub_taifex_dealer_net_oi_asinh
-    - twpub_taifex_foreign_net_oi_asinh
-    - twpub_taifex_trust_net_oi_asinh
-    - twpub_taifex_tx_top5_long_ratio
-    - twpub_taifex_tx_top10_long_ratio
-    - twpub_taifex_tx_large_oi_log
+    # - twpub_taifex_tx_volume_log  # disabled: 21-fold zero
+    # - twpub_taifex_tx_open_interest_log  # disabled: 21-fold zero
+    # - twpub_taifex_tx_settlement_logret_1d  # disabled: 21-fold zero
+    # - twpub_taifex_txo_call_volume_log  # disabled: 21-fold zero
+    # - twpub_taifex_txo_put_volume_log  # disabled: 21-fold zero
+    # - twpub_taifex_txo_put_call_volume_ratio  # disabled: 21-fold zero
+    # - twpub_taifex_txo_call_oi_log  # disabled: 21-fold zero
+    # - twpub_taifex_txo_put_oi_log  # disabled: 21-fold zero
+    # - twpub_taifex_txo_put_call_oi_ratio  # disabled: 21-fold zero
+    # - twpub_taifex_dealer_net_oi_asinh  # disabled: 21-fold zero
+    # - twpub_taifex_foreign_net_oi_asinh  # disabled: 21-fold zero
+    # - twpub_taifex_trust_net_oi_asinh  # disabled: 21-fold zero
+    # - twpub_taifex_tx_top5_long_ratio  # disabled: 21-fold zero
+    # - twpub_taifex_tx_top10_long_ratio  # disabled: 21-fold zero
+    # - twpub_taifex_tx_large_oi_log  # disabled: 21-fold zero
     - twpub_taifex_tx_final_settlement_logret
   feature_exclude: []
   feature_zero_fill: []
@@ -237,7 +248,7 @@ trading:
   # and the available action calendar cannot guarantee that every mandatory
   # pre-action short cover is executable.  Use the research-only naive executor
   # instead of fabricating exact cash entitlements or executable covers.
-  execution_mode: naive
+  execution_mode: tw_cash
   # Kept explicit for any later tw_cash re-enable. Historical demonstrated
   # short-capacity data is intentionally omitted because of its acquisition
   # cost, so this run does not cap shorts by point-in-time borrow inventory.
@@ -271,8 +282,11 @@ training:
   cuda_cache_path: ~/.cache/nv_cuda
   compile_loss: true
   # Expanding train_union folds change S each year. Keep the per-rank batch
-  # axis fixed at 64 and make only S symbolic, so remaining folds reuse one
-  # canonical-loss graph without padding assets or changing trading semantics.
+  # axis fixed at 64 and make only S symbolic in both model and loss, so all
+  # folds reuse bounded graphs without padding assets or changing trading
+  # semantics. Leaving the model static hits Dynamo's default 8-graph limit
+  # when fold 9 introduces the ninth distinct symbol count.
+  compile_model_dynamic_symbols: true
   compile_loss_dynamic_symbols: true
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
@@ -321,7 +335,6 @@ training:
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
-  explain_first_test_year_only: true
   explain_top_k: 20
   explain_max_rows: 32
   explain_ig_steps: 0
@@ -589,9 +602,9 @@ training:
     return_aux_details: false
     # Categorical features are embedded by name only when the feature is enabled above.
     categorical_feature_names:
-      - twpub_company_industry_code
-      - twpub_company_is_foreign
-      - twpub_company_has_preferred_stock
+      # - twpub_company_industry_code  # permanently disabled: snapshot-only
+      # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+      # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
     categorical_embedding_dim: 4
     categorical_embedding_cardinality: 512
     # return_aux_details returns attention/factor internals; keep false for training speed.

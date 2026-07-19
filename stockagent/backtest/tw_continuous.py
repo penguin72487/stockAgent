@@ -1230,12 +1230,52 @@ def _run_tw_cash_continuous_impl(
             ~sell_mask[idx],
             ~buy_mask[idx],
         )
-        torch._assert_async(
-            ~blocked_action_exit.any(),
-            "tw_cash cannot liquidate a held position before an official "
-            "corporate action because the sell side is unavailable (or the "
-            "buy side is unavailable for a short position)",
+        current_long = risky_before.clamp_min(0.0)
+        current_short = (-risky_before).clamp_min(0.0)
+        requested_mandatory_short_cover = torch.where(
+            terminal[idx] | action_avoidance | forced_cover[idx],
+            current_short,
+            torch.zeros_like(current_short),
         )
+        blocked_mandatory_short_cover = (
+            requested_mandatory_short_cover > 1.0e-12
+        ) & ~buy_mask[idx]
+        # A data-contract breach must never become a CUDA device assertion:
+        # one poisoned context kills NCCL on every rank.  If an official
+        # mandatory exit is impossible, do not fabricate a fill; conservatively
+        # mark the whole account ruined and let the existing absorbing-default
+        # recurrence record the loss.
+        execution_contract_default = (
+            blocked_action_exit.any() | blocked_mandatory_short_cover.any()
+        )
+        execution_contract_default = (
+            advance & alive_after_settlement & execution_contract_default
+        )
+        default_now = default_now | execution_contract_default
+        alive_after_settlement = (
+            alive_after_settlement & ~execution_contract_default
+        )
+        cash = torch.where(alive_after_settlement, cash, torch.zeros_like(cash))
+        payables = torch.where(
+            alive_after_settlement, payables, torch.zeros_like(payables)
+        )
+        receivables = torch.where(
+            alive_after_settlement, receivables, torch.zeros_like(receivables)
+        )
+        risky_before = torch.where(
+            alive_after_settlement, risky_before, torch.zeros_like(risky_before)
+        )
+        short_sale_collateral = torch.where(
+            alive_after_settlement,
+            short_sale_collateral,
+            torch.zeros_like(short_sale_collateral),
+        )
+        short_margin_collateral = torch.where(
+            alive_after_settlement,
+            short_margin_collateral,
+            torch.zeros_like(short_margin_collateral),
+        )
+        action_avoidance = action_avoidance & alive_after_settlement
         mandatory_exit = terminal[idx] | action_avoidance
         current_long = risky_before.clamp_min(0.0)
         current_short = (-risky_before).clamp_min(0.0)
@@ -1248,14 +1288,6 @@ def _run_tw_cash_continuous_impl(
             mandatory_exit | forced_cover[idx],
             current_short,
             torch.zeros_like(current_short),
-        )
-        blocked_mandatory_short_cover = (
-            mandatory_short_cover > 1.0e-12
-        ) & ~buy_mask[idx]
-        torch._assert_async(
-            ~blocked_mandatory_short_cover.any(),
-            "tw_cash mandatory short cover cannot execute because the buy "
-            "side is unavailable",
         )
         base = risky_before - mandatory_long_sell + mandatory_short_cover
         desired = torch.where(
@@ -1446,8 +1478,21 @@ def _run_tw_cash_continuous_impl(
         required_remaining_collateral = (
             maintenance_ratio * remaining_short_total
         )
+        maintenance_tolerance = target_weights.new_tensor(
+            torch.finfo(target_weights.dtype).eps * 16.0
+        ) * torch.maximum(
+            torch.ones_like(required_remaining_collateral),
+            required_remaining_collateral.abs(),
+        )
+        # Article 56 constrains collateral released by this cover; it does not
+        # invent a same-day margin-call cure for an account that was already
+        # below maintenance before the cover.  Leave a small represented-value
+        # buffer when the floor is fundable, matching the conservative float64
+        # correction in the integer-share oracle.
         max_maintenance_release = (
-            collateral_before_release - required_remaining_collateral
+            collateral_before_release
+            - required_remaining_collateral
+            - maintenance_tolerance
         ).clamp_min(0.0)
         release_scale = torch.minimum(
             torch.ones_like(candidate_release_total),
@@ -1503,26 +1548,6 @@ def _run_tw_cash_continuous_impl(
             allocated_margin,
             raw_next_short_margin_collateral,
         )
-        partial_cover = (short_cover.sum() > 1.0e-12) & ~all_shorts_covered
-        retained_collateral = (
-            next_short_sale_collateral.sum()
-            + next_short_margin_collateral.sum()
-        )
-        maintenance_tolerance = target_weights.new_tensor(
-            torch.finfo(target_weights.dtype).eps * 16.0
-        ) * torch.maximum(
-            torch.ones_like(required_remaining_collateral),
-            required_remaining_collateral.abs(),
-        )
-        torch._assert_async(
-            ~partial_cover
-            | (
-                retained_collateral + maintenance_tolerance
-                >= required_remaining_collateral
-            ),
-            "tw_cash partial short cover cannot leave whole-account "
-            "restricted collateral below short_maintenance_ratio",
-        )
         net_claim = (
             (long_sell * (1.0 - sell_fees)).sum()
             - (long_buy * (1.0 + buy_fees)).sum()
@@ -1575,22 +1600,44 @@ def _run_tw_cash_continuous_impl(
         )
 
         residual_action_position = (executed.abs() > 1.0e-12) & action_avoidance
-        torch._assert_async(
-            ~residual_action_position.any(),
-            "tw_cash official corporate-action avoidance liquidation did not "
-            "finish at the preceding close",
-        )
-
         active_return = (
             advance
             & alive_after_settlement
             & (executed.abs() > 1.0e-12)
         )
         invalid_active_return = active_return & ~valid_asset_return[idx]
-        torch._assert_async(
-            ~invalid_active_return.any(),
-            "tw_cash has a non-finite close-to-next-close return for an "
-            "executed holding",
+        post_trade_contract_default = (
+            residual_action_position.any() | invalid_active_return.any()
+        )
+        post_trade_contract_default = (
+            advance & alive_after_settlement & post_trade_contract_default
+        )
+        default_now = default_now | post_trade_contract_default
+        alive_after_settlement = (
+            alive_after_settlement & ~post_trade_contract_default
+        )
+        cash = torch.where(alive_after_settlement, cash, torch.zeros_like(cash))
+        payables = torch.where(
+            alive_after_settlement, payables, torch.zeros_like(payables)
+        )
+        receivables = torch.where(
+            alive_after_settlement, receivables, torch.zeros_like(receivables)
+        )
+        executed = torch.where(
+            alive_after_settlement, executed, torch.zeros_like(executed)
+        )
+        short_sale_collateral = torch.where(
+            alive_after_settlement,
+            short_sale_collateral,
+            torch.zeros_like(short_sale_collateral),
+        )
+        short_margin_collateral = torch.where(
+            alive_after_settlement,
+            short_margin_collateral,
+            torch.zeros_like(short_margin_collateral),
+        )
+        turnover = torch.where(
+            alive_after_settlement, turnover, torch.zeros_like(turnover)
         )
 
         effective_asset_return = torch.where(
@@ -2965,17 +3012,14 @@ def run_tw_day_trade_continuous(
             buy[idx],
             sell[idx],
         )
-        blocked_close = (signed_target != 0.0) & ~close_available
-        torch._assert_async(
-            ~blocked_close.any(),
-            "tw_day_trade mandatory close leg is unavailable after open entry; "
-            "daily data cannot carry or price the unresolved position exactly",
-        )
-        invalid_active_return = (signed_target != 0.0) & ~valid_intraday_return[idx]
-        torch._assert_async(
-            ~invalid_active_return.any(),
-            "tw_day_trade has a non-finite open-to-close return for an "
-            "executed round trip",
+        # A daily round trip exists only when both legs and its valuation are
+        # observed. Gate the simulated fill instead of emitting a device-side
+        # assert that would poison CUDA/NCCL for the entire training job.
+        executable_round_trip = close_available & valid_intraday_return[idx]
+        signed_target = torch.where(
+            executable_round_trip,
+            signed_target,
+            torch.zeros_like(signed_target),
         )
 
         short_signed, long_entry = _split_signed(signed_target)

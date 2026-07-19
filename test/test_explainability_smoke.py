@@ -7,6 +7,7 @@ import warnings
 from types import SimpleNamespace
 
 import numpy as np
+import polars as pl
 import pytest
 import torch
 
@@ -25,8 +26,13 @@ from stockagent.explainability import (
     _plot_all_explanation_figures,
     _representation_aux_summary,
     _save_matplotlib_figure,
+    _score_head_surrogate_shap,
+    _score_head_surrogate_shap_chunked,
+    _streaming_aux_umap_samples,
+    _write_decision_inventory_streaming,
     _with_numeric,
     _feature_correlations,
+    _feature_correlations_chunked,
     explain_batch,
     run_loaded_model_explanation,
     write_fold_stability_outputs,
@@ -108,6 +114,47 @@ def test_portfolio_j_lens_is_complete_and_faithfulness_checked() -> None:
     assert completeness["top_k_truncation"] is False
 
 
+def test_portfolio_j_lens_batched_vjp_matches_scalar_vjp() -> None:
+    torch.manual_seed(91)
+    model = _TinyJLensePortfolio()
+    x = torch.randn(2, 3, 5, 3)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+    kwargs = {
+        "dates": ["2026-01-01", "2026-01-02"],
+        "symbols": [f"S{i}" for i in range(5)],
+        "enabled": True,
+        "intervention_fraction": 0.01,
+        "progress_enabled": False,
+    }
+
+    scalar_frames, scalar_summary, _ = _portfolio_j_lens(
+        model,
+        x,
+        mask,
+        vjp_batch_size=1,
+        **kwargs,
+    )
+    batched_frames, batched_summary, _ = _portfolio_j_lens(
+        model,
+        x,
+        mask,
+        vjp_batch_size=4,
+        **kwargs,
+    )
+
+    scalar = scalar_frames["j_lens_transport"].sort(["layer_order", "output_dim", "input_dim"])
+    batched = batched_frames["j_lens_transport"].sort(["layer_order", "output_dim", "input_dim"])
+    np.testing.assert_allclose(
+        scalar.get_column("jacobian").to_numpy(),
+        batched.get_column("jacobian").to_numpy(),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    assert scalar_summary["vjp_passes"] == batched_summary["vjp_passes"] == 4
+    assert scalar_summary["autograd_calls"] == 4
+    assert batched_summary["autograd_calls"] == 1
+
+
 def test_portfolio_j_lens_chunk_aggregation_preserves_complete_cells() -> None:
     torch.manual_seed(10)
     model = _TinyJLensePortfolio()
@@ -177,6 +224,44 @@ class _BatchShapeSensitiveExplainModel(torch.nn.Module):
         scores = x.sum(dim=(1, 3)) + float(x.size(0)) * 0.01
         scores = scores.masked_fill(~mask, 0.0)
         return scores, scores, {}
+
+
+class _CountingExplainModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, x, mask, return_aux=None):
+        self.forward_calls += 1
+        scores = x.sum(dim=(1, 3)).masked_fill(~mask, 0.0)
+        return scores, scores, {}
+
+
+def test_zero_identity_perturbations_preserve_grid_without_model_forward() -> None:
+    x = torch.zeros(2, 3, 4, 5)
+    mask = torch.ones(2, 4, dtype=torch.bool)
+    model = _CountingExplainModel()
+    base_weights = torch.zeros(2, 4)
+    base_scores = torch.zeros(2, 4)
+
+    feature_time, summary, diagnostics = _perturbation_importance(
+        model,
+        x,
+        mask,
+        base_weights,
+        base_scores,
+        [f"f{i}" for i in range(5)],
+        progress_enabled=False,
+    )
+
+    assert model.forward_calls == 0
+    assert feature_time.height == 3 * 5
+    assert summary.height == 5
+    assert feature_time.get_column("weight_abs_delta").max() == 0.0
+    assert feature_time.get_column("score_abs_delta").max() == 0.0
+    assert diagnostics["num_perturbations"] == 15
+    assert diagnostics["forwarded_perturbations"] == 0
+    assert diagnostics["zero_identity_perturbations"] == 15
 
 
 class _BFloat16PerturbationModel(torch.nn.Module):
@@ -410,6 +495,108 @@ def test_feature_correlations_zero_variance_without_runtime_warning() -> None:
     assert not any("invalid value encountered in divide" in message for message in runtime_messages)
     assert frame["score_corr"].to_list() == [0.0, 0.0, 0.0, 0.0]
     assert frame["weight_corr"].to_list() == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_streaming_global_diagnostics_match_materialized_algorithms() -> None:
+    torch.manual_seed(113)
+    x = torch.randn(8, 3, 7, 3)
+    scores = torch.randn(8, 7)
+    weights = torch.randn(8, 7)
+    mask = torch.rand(8, 7) > 0.1
+    feature_names = ["f0", "f1", "f2"]
+    chunks = [x[:3], x[3:6], x[6:]]
+
+    corr_full = _feature_correlations(x, scores, weights, mask, feature_names).sort(["source", "feature"])
+    corr_stream = _feature_correlations_chunked(
+        chunks, scores, weights, mask, feature_names
+    ).sort(["source", "feature"])
+    np.testing.assert_allclose(
+        corr_stream.select(["score_corr", "weight_corr"]).to_numpy(),
+        corr_full.select(["score_corr", "weight_corr"]).to_numpy(),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+    shap_full, components_full, info_full, _ = _score_head_surrogate_shap(
+        x,
+        scores,
+        mask,
+        feature_names,
+        enabled=True,
+        mode="score_head_surrogate",
+        progress_enabled=False,
+    )
+    shap_stream, components_stream, info_stream, _ = _score_head_surrogate_shap_chunked(
+        chunks,
+        scores,
+        mask,
+        feature_names,
+        enabled=True,
+        mode="score_head_surrogate",
+        progress_enabled=False,
+    )
+    components_full = components_full.sort(["source", "feature"])
+    components_stream = components_stream.sort(["source", "feature"])
+    np.testing.assert_allclose(
+        components_stream.select(["shap_abs", "surrogate_coef"]).to_numpy(),
+        components_full.select(["shap_abs", "surrogate_coef"]).to_numpy(),
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    assert shap_stream.height == shap_full.height == len(feature_names)
+    assert info_stream["valid_rows"] == info_full["valid_rows"]
+    assert info_stream["surrogate_r2"] == pytest.approx(info_full["surrogate_r2"], rel=1e-6)
+
+
+def test_streaming_umap_capture_matches_global_flat_sample() -> None:
+    full = torch.arange(6 * 4 * 3, dtype=torch.float32).reshape(6, 4, 3)
+    max_points = 8
+    captured = []
+    for start, end in ((0, 2), (2, 5), (5, 6)):
+        samples, _ = _streaming_aux_umap_samples(
+            {"z_stock": full[start:end]},
+            global_rows=6,
+            row_offset=start,
+            max_points=max_points,
+        )
+        captured.append(samples["z_stock"])
+    values = torch.cat([item["values"] for item in captured], dim=0)
+    flat_indices = torch.cat([item["flat_indices"] for item in captured], dim=0)
+    expected_indices = _evenly_spaced_sample_indices(
+        6 * 4, max_points, device=torch.device("cpu")
+    )
+    expected_values = full.reshape(-1, 3).index_select(0, expected_indices)
+    torch.testing.assert_close(flat_indices, expected_indices)
+    torch.testing.assert_close(values, expected_values)
+
+
+def test_streaming_decision_inventory_matches_full_table(tmp_path: Path) -> None:
+    torch.manual_seed(127)
+    weights = torch.randn(5, 4)
+    scores = torch.randn(5, 4)
+    returns = torch.randn(5, 4)
+    mask = torch.rand(5, 4) > 0.2
+    selected = mask & weights.ne(0.0)
+    dates = [f"2026-01-{idx + 1:02d}" for idx in range(5)]
+    symbols = [f"S{idx}" for idx in range(4)]
+    output = tmp_path / "decision_inventory.csv"
+    written = _write_decision_inventory_streaming(
+        {
+            "weights": weights,
+            "scores": scores,
+            "returns": returns,
+            "mask": mask,
+            "selected": selected,
+            "dates": dates,
+            "symbols": symbols,
+        },
+        output,
+        row_chunk_size=2,
+    )
+    streamed = pl.read_csv(output)
+    assert written == streamed.height == weights.numel()
+    assert streamed.get_column("date").to_list() == np.repeat(dates, len(symbols)).tolist()
+    assert streamed.get_column("symbol").to_list() == np.tile(symbols, len(dates)).tolist()
 
 
 def test_explainability_chunked_attribution_matches_serial_with_fewer_forwards() -> None:
@@ -656,7 +843,6 @@ def test_run_loaded_model_explanation_writes_same_runner_outputs(tmp_path: Path)
         model=ToyExplainableModel(features),
         checkpoint_path=tmp_path / "fold_01" / "checkpoint_best.pt",
         output_dir=tmp_path,
-        split="test",
         explain_output_dir=None,
         settings=settings,
         write_plots=False,

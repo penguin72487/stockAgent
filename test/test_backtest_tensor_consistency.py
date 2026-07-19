@@ -1213,6 +1213,10 @@ def test_compiled_loss_dynamic_symbols_marks_only_asset_axes() -> None:
         )
         initial = kwargs["aux_outputs"]["initial_weights"]
         observed["initial"] = set(getattr(initial, "_dynamo_dynamic_indices", set()))
+        symbol_indices = kwargs["symbol_indices"]
+        observed["symbol_indices"] = set(
+            getattr(symbol_indices, "_dynamo_dynamic_indices", set())
+        )
         return weights.sum()
 
     wrapped = _CompiledLossFallback(
@@ -1234,6 +1238,7 @@ def test_compiled_loss_dynamic_symbols_marks_only_asset_axes() -> None:
         tradable,
         benchmark_returns=benchmark,
         can_buy_mask=tradable.clone(),
+        symbol_indices=torch.arange(13),
         aux_outputs={"initial_weights": initial},
     )
 
@@ -1243,6 +1248,7 @@ def test_compiled_loss_dynamic_symbols_marks_only_asset_axes() -> None:
         "tradable": {1},
         "benchmark": set(),
         "initial": {0},
+        "symbol_indices": {0},
     }
 
 
@@ -1258,9 +1264,17 @@ def test_compiled_loss_dynamic_symbols_reuses_one_graph_across_symbol_counts() -
         weights: torch.Tensor,
         returns: torch.Tensor,
         tradable: torch.Tensor,
-        **_kwargs,
+        **kwargs,
     ) -> torch.Tensor:
-        return torch.where(tradable, weights * returns, 0.0).sum()
+        symbol_indices = kwargs["symbol_indices"]
+        initial_weights = kwargs["aux_outputs"]["initial_weights"]
+        if tuple(symbol_indices.shape) != (int(weights.size(1)),):
+            raise ValueError("symbol_indices must contain one index per active symbol")
+        # Couple every [S] input to the [T,S] graph exactly as the canonical
+        # backtest's shape checks/index projection do.
+        projected = weights + symbol_indices.to(weights.dtype).unsqueeze(0)
+        projected = projected + initial_weights.unsqueeze(0)
+        return torch.where(tradable, projected * returns, 0.0).sum()
 
     compiled = torch.compile(
         loss_fn,
@@ -1285,6 +1299,7 @@ def test_compiled_loss_dynamic_symbols_reuses_one_graph_across_symbol_counts() -
             returns,
             tradable,
             benchmark_returns=torch.zeros(8),
+            symbol_indices=torch.arange(symbols),
             aux_outputs={"initial_weights": torch.zeros(symbols)},
         )
 
@@ -3532,8 +3547,10 @@ def test_final_group_checkpoint_collective_precedes_rank0_best_model_artifacts()
     # with the shared final optimizer/scheduler state and mismatch DDP collectives.
     assert "_save_group_checkpoint(" not in after_rank0_artifacts
     assert after_rank0_artifacts.index("_load_state_dict(model, checkpoint") > 0
-    assert '_raise_if_distributed_phase_failed("final_fold_artifacts"' in source
-    assert '_raise_if_distributed_phase_failed("final_postprocess"' in source
+    assert '_begin_rank0_store_synchronized_phase(\n            "final_fold_artifacts"' in source
+    assert "final_artifact_sync.finish(final_artifact_error)" in source
+    assert '_begin_rank0_store_synchronized_phase(\n            "final_postprocess"' in source
+    assert "final_postprocess_sync.finish(final_postprocess_error)" in source
 
 
 def test_final_fold_validation_is_recomputed_after_each_best_checkpoint_load() -> None:

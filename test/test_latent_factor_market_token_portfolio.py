@@ -131,7 +131,7 @@ def test_dynamic_symbols_and_token_counts() -> None:
     assert torch.all(weights.abs().sum(dim=1) <= 1.0 + 1e-5)
 
 
-def test_long_only_rejects_empty_mask_rows() -> None:
+def test_long_only_empty_mask_row_is_finite_and_zero() -> None:
     device = _device()
     model = _make_model(portfolio_mode="long_only").eval()
     x = torch.randn(2, 10, 100, 21, device=device)
@@ -139,8 +139,14 @@ def test_long_only_rejects_empty_mask_rows() -> None:
     mask[0, :] = False
     mask[1, 50:] = False
 
-    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
-        model(x, mask, return_aux=True)
+    with torch.no_grad():
+        weights, scores, aux = model(x, mask, return_aux=True)
+
+    assert torch.isfinite(weights).all()
+    assert torch.isfinite(scores).all()
+    assert torch.isfinite(aux["latent_factors"]).all()
+    torch.testing.assert_close(weights[0], torch.zeros_like(weights[0]))
+    assert weights[1, 50:].abs().max().item() == pytest.approx(0.0)
 
 
 def test_factory_builds_latent_factor_market_token_model() -> None:
@@ -157,6 +163,6 @@ if __name__ == "__main__":
     test_default_output_is_trainer_compatible()
     test_shapes_mask_and_backward()
     test_dynamic_symbols_and_token_counts()
-    test_long_only_rejects_empty_mask_rows()
+    test_long_only_empty_mask_row_is_finite_and_zero()
     test_factory_builds_latent_factor_market_token_model()
     print("SUCCESS")

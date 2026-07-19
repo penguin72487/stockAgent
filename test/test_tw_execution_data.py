@@ -24,6 +24,7 @@ from stockagent.data.panel import (
     _load_symbol_arrays_polars_lazy,
     _load_symbol_arrays_pyarrow,
     _load_exact_cash_entitlements,
+    _load_corporate_action_reference,
     _panel_from_cache_payload,
 )
 from stockagent.data.panel_cache import load_panel_cache_v2, save_panel_cache_v2
@@ -35,6 +36,8 @@ def _write_corporate_action_reference(
     *,
     rows: list[dict[str, object]],
     receipt_sha256: str | None = None,
+    requested_start_year: int = 2024,
+    coverage_start_year: int | None = None,
 ) -> None:
     path = public_dir / "tw_corporate_action_reference.parquet"
     table = pa.Table.from_pylist(
@@ -59,8 +62,13 @@ def _write_corporate_action_reference(
         "coverage_complete": True,
         "failure_count": 0,
         "schema_version": 3,
-        "requested_start_year": 2024,
-        "end_date": "2024-12-31",
+        "requested_start_year": requested_start_year,
+        "coverage_start_year": (
+            requested_start_year
+            if coverage_start_year is None
+            else coverage_start_year
+        ),
+        "end_date": f"{requested_start_year:04d}-12-31",
         "rows": len(rows),
         "output_receipt": {
             "path": str(path),
@@ -71,6 +79,38 @@ def _write_corporate_action_reference(
     path.with_suffix(".summary.json").write_text(
         json.dumps(summary), encoding="utf-8"
     )
+
+
+def test_corporate_action_reference_uses_cumulative_coverage_start(tmp_path) -> None:
+    public_dir = tmp_path / "data_tw_public"
+    public_dir.mkdir()
+    _write_corporate_action_reference(
+        public_dir,
+        rows=[
+            {
+                "date": datetime(2025, 1, 2).date(),
+                "symbol": "2330",
+                "market": "twse",
+                "reference_price": 100.0,
+                "opening_reference_price": 100.0,
+                "previous_close": 100.0,
+                "event_type": "除息",
+                "source_url": "https://example.invalid/official",
+            }
+        ],
+        requested_start_year=2025,
+        coverage_start_year=2000,
+    )
+    parquet = public_dir / "tw_corporate_action_reference.parquet"
+    reference = _load_corporate_action_reference(
+        _CorporateActionReferencePaths(
+            parquet=parquet,
+            summary=parquet.with_suffix(".summary.json"),
+        )
+    )
+
+    assert reference is not None
+    assert reference.coverage_start == np.datetime64("2000-01-01")
 
 
 def _make_panel(*, include_day_trade_inputs: bool = True) -> PanelData:
@@ -117,6 +157,7 @@ def _make_panel(*, include_day_trade_inputs: bool = True) -> PanelData:
             np.flip(eligible, axis=1).copy() if include_day_trade_inputs else None
         ),
         raw_close_returns_1d=returns + np.float32(0.20),
+        corporate_action_avoidance_mask=np.zeros_like(eligible),
         unresolved_corporate_action_mask=np.zeros_like(eligible),
     )
 
@@ -732,6 +773,10 @@ def test_execution_arrays_round_trip_panel_cache(tmp_path) -> None:
         panel.raw_close_returns_1d,
     )
     np.testing.assert_array_equal(
+        restored.corporate_action_avoidance_mask,
+        panel.corporate_action_avoidance_mask,
+    )
+    np.testing.assert_array_equal(
         restored.unresolved_corporate_action_mask,
         panel.unresolved_corporate_action_mask,
     )
@@ -997,6 +1042,7 @@ def test_exact_cash_entitlement_replaces_avoidance_with_payment_claim() -> None:
 
     result = _apply_corporate_action_avoidance_transitions(panel, reference)
 
+    assert result.corporate_action_avoidance_mask[0, 0]
     assert not result.unresolved_corporate_action_mask.any()
     assert result.cash_dividend_yield[0, 0] == pytest.approx(0.1)
     assert result.cash_dividend_payment_delay_sessions[0, 0] == 3
@@ -1004,6 +1050,71 @@ def test_exact_cash_entitlement_replaces_avoidance_with_payment_claim() -> None:
 
     result = _attach_raw_close_forward_returns(result)
     assert result.raw_close_returns_1d[0, 0] == pytest.approx(np.log(0.9))
+
+
+def test_avoid_mode_keeps_full_exact_action_exit_interval() -> None:
+    dates = np.asarray(
+        ["2024-06-28", "2024-07-01", "2024-07-02", "2024-07-03", "2024-07-05"],
+        dtype="datetime64[D]",
+    )
+    mask = np.ones((dates.size, 1), dtype=np.bool_)
+    can_sell = mask.copy()
+    can_sell[2, 0] = False
+    panel = PanelData(
+        dates=dates,
+        symbols=["2330"],
+        feature_names=["x"],
+        features=np.zeros((dates.size, 1, 1), dtype=np.float32),
+        returns_1d=np.zeros((dates.size, 1), dtype=np.float32),
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=can_sell,
+        alive_mask=mask.copy(),
+        benchmark_returns=np.zeros(dates.size, dtype=np.float32),
+        close_prices=np.full((dates.size, 1), 100.0, dtype=np.float32),
+    )
+    reference = _CorporateActionReference(
+        event_dates_by_symbol={
+            "2330": np.asarray(["2024-07-03"], dtype="datetime64[D]")
+        },
+        coverage_start=np.datetime64("2024-01-01", "D"),
+        coverage_end=np.datetime64("2024-12-31", "D"),
+        exact_cash_terms_by_symbol={
+            "2330": (
+                np.asarray(["2024-07-03"], dtype="datetime64[D]"),
+                np.asarray([2.0], dtype=np.float64),
+                np.asarray(["2024-07-05"], dtype="datetime64[D]"),
+            )
+        },
+        exact_coverage_start=np.datetime64("2024-01-01", "D"),
+        exact_coverage_end=np.datetime64("2024-12-31", "D"),
+    )
+
+    result = _attach_raw_close_forward_returns(
+        _apply_corporate_action_avoidance_transitions(panel, reference)
+    )
+    assert np.flatnonzero(result.corporate_action_avoidance_mask[:, 0]).tolist() == [1, 2]
+    assert not result.unresolved_corporate_action_mask.any()
+
+    avoid = CrossSectionalDataset(
+        result,
+        np.arange(result.num_dates),
+        lookback=1,
+        execution_mode="tw_cash",
+        tw_corporate_action_mode="avoid",
+    )
+    exact = CrossSectionalDataset(
+        result,
+        np.arange(result.num_dates),
+        lookback=1,
+        execution_mode="tw_cash",
+        tw_corporate_action_mode="exact",
+    )
+    assert np.flatnonzero(
+        avoid.unresolved_corporate_action_mask_t[:, 0].numpy()
+    ).tolist() == [1, 2]
+    assert not exact.unresolved_corporate_action_mask_t.any()
+    assert exact.cash_dividend_yield_t[2, 0] == pytest.approx(0.02)
 
 
 def test_exact_entitlement_loader_verifies_raw_mops_manifest(tmp_path) -> None:
@@ -1454,6 +1565,7 @@ def test_dataset_exact_mode_carries_cash_entitlement_terms() -> None:
         panel.returns_1d, dtype=np.int64
     )
     panel.cash_dividend_payment_delay_sessions[3, 0] = 2
+    panel.corporate_action_avoidance_mask[3, 0] = True
     dataset = CrossSectionalDataset(
         panel,
         np.arange(panel.num_dates),

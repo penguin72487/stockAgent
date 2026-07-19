@@ -79,15 +79,18 @@ def test_long_short_forward_shape_mask_and_normalization() -> None:
     assert weights[:, 60:].abs().max().item() < 1e-7
 
 
-def test_tcn_temporal_option_rejects_empty_mask_row() -> None:
+def test_tcn_temporal_option_empty_mask_row_is_finite_and_zero() -> None:
     device = _device()
     model = _make_model(temporal_type="tcn", d_model=32, z_dim=8, asset_encoder_layers=1).eval()
     x = torch.randn(4, 20, 100, 21, device=device)
     tradable_mask = torch.ones(4, 100, dtype=torch.bool, device=device)
     tradable_mask[0] = False
 
-    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
-        model(x, tradable_mask, return_aux=False)
+    with torch.no_grad():
+        weights = model(x, tradable_mask, return_aux=False)
+
+    assert torch.isfinite(weights).all()
+    torch.testing.assert_close(weights[0], torch.zeros_like(weights[0]))
 
 
 def test_portfolio_autoencoder_loss_backward() -> None:

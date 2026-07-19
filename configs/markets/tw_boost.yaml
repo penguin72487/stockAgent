@@ -91,42 +91,42 @@ data:
     - twpub_institutional_net_buy_flow
 
     # Point-in-time monthly revenue / financial statements
-    - twpub_monthly_revenue_log
-    - twpub_monthly_revenue_mom
-    - twpub_monthly_revenue_yoy
-    - twpub_cumulative_revenue_yoy
-    - twpub_financial_eps
-    - twpub_financial_revenue_log
-    - twpub_financial_net_income_asinh
-    - twpub_financial_gross_margin
-    - twpub_financial_operating_margin
-    - twpub_financial_net_margin
-    - twpub_financial_assets_log
-    - twpub_financial_debt_ratio
-    - twpub_financial_current_ratio
-    - twpub_financial_equity_ratio
-    - twpub_financial_book_value_per_share_log
+    # - twpub_monthly_revenue_log  # permanently disabled: snapshot-only
+    # - twpub_monthly_revenue_mom  # permanently disabled: snapshot-only
+    # - twpub_monthly_revenue_yoy  # permanently disabled: snapshot-only
+    # - twpub_cumulative_revenue_yoy  # permanently disabled: snapshot-only
+    # - twpub_financial_eps  # permanently disabled: snapshot-only
+    # - twpub_financial_revenue_log  # permanently disabled: snapshot-only
+    # - twpub_financial_net_income_asinh  # permanently disabled: snapshot-only
+    # - twpub_financial_gross_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_operating_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_net_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_assets_log  # permanently disabled: snapshot-only
+    # - twpub_financial_debt_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_current_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_equity_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_book_value_per_share_log  # permanently disabled: snapshot-only
 
     # Point-in-time ownership / securities lending
-    - twpub_insider_holdings_log
-    - twpub_insider_pledge_ratio
-    - twpub_insider_transfer_shares_log
-    - twpub_borrow_available_log
-    - twpub_sbl_balance_log
-    - twpub_short_sale_available_log
+    # - twpub_insider_holdings_log  # permanently disabled: snapshot-only
+    # - twpub_insider_pledge_ratio  # permanently disabled: snapshot-only
+    # - twpub_insider_transfer_shares_log  # permanently disabled: snapshot-only
+    # - twpub_borrow_available_log  # permanently disabled: snapshot-only
+    # - twpub_sbl_balance_log  # permanently disabled: snapshot-only
+    # - twpub_short_sale_available_log  # permanently disabled: snapshot-only
 
     # TW public TDCC holders
-    - twpub_tdcc_retail_holder_ratio
-    - twpub_tdcc_large_holder_ratio
-    - twpub_tdcc_holder_count_log
+    # - twpub_tdcc_retail_holder_ratio  # permanently disabled: snapshot-only
+    # - twpub_tdcc_large_holder_ratio  # permanently disabled: snapshot-only
+    # - twpub_tdcc_holder_count_log  # permanently disabled: snapshot-only
 
     # TW public company profile
-    - twpub_company_paidin_capital_log
-    - twpub_company_issued_shares_log
-    - twpub_company_private_shares_log
-    - twpub_company_age_years
-    - twpub_company_listed_age_years
-    - twpub_company_par_value_log
+    # - twpub_company_paidin_capital_log  # permanently disabled: snapshot-only
+    # - twpub_company_issued_shares_log  # permanently disabled: snapshot-only
+    # - twpub_company_private_shares_log  # permanently disabled: snapshot-only
+    # - twpub_company_age_years  # permanently disabled: snapshot-only
+    # - twpub_company_listed_age_years  # permanently disabled: snapshot-only
+    # - twpub_company_par_value_log  # permanently disabled: snapshot-only
     # - twpub_company_industry_code
     # - twpub_company_is_foreign
     # - twpub_company_has_preferred_stock
@@ -273,7 +273,6 @@ training:
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
-  explain_first_test_year_only: true
   explain_top_k: 20
   explain_max_rows: 32
   explain_ig_steps: 0
@@ -507,9 +506,9 @@ training:
     return_aux_details: false
     # Categorical features are embedded by name only when the feature is enabled above.
     categorical_feature_names:
-      - twpub_company_industry_code
-      - twpub_company_is_foreign
-      - twpub_company_has_preferred_stock
+      # - twpub_company_industry_code  # permanently disabled: snapshot-only
+      # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+      # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
     categorical_embedding_dim: 4
     categorical_embedding_cardinality: 512
     # return_aux_details returns attention/factor internals; keep false for training speed.

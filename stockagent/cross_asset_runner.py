@@ -21,9 +21,9 @@ from stockagent.data.walkforward import WalkForwardFold, build_expanding_year_fo
 from stockagent.explainability import (
     _align_panel_to_checkpoint_universe,
     _clear_explainability_runtime_cache,
-    _dataset_for_split,
+    _first_test_year_dataset,
     _device_from_config,
-    _estimated_fold_explain_rows,
+    _estimated_first_test_year_explain_rows,
     _fold_dir,
     _sample_dataset_source,
     load_model_from_checkpoint,
@@ -326,12 +326,10 @@ def _fold_row_weights(
 ) -> dict[int, int]:
     return {
         int(fold_id): int(
-            _estimated_fold_explain_rows(
+            _estimated_first_test_year_explain_rows(
                 folds_by_id[int(fold_id)],
                 panel,
-                split=_FIXED_SPLIT,
                 lookback=int(lookback),
-                first_test_year_only=True,
                 max_rows=0,
             )
         )
@@ -449,12 +447,10 @@ def _run_fold(
         device,
         strict=bool(args.strict),
     )
-    dataset = _dataset_for_split(
+    dataset = _first_test_year_dataset(
         fold_panel,
         fold,
-        _FIXED_SPLIT,
         config.training.lookback,
-        first_test_year_only=True,
     )
     split_rows = len(dataset)
     batch_source = _sample_dataset_source(
@@ -554,10 +550,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph-explainability", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    # Read-only compatibility metadata for code that records the historical
-    # standalone defaults. There are deliberately no CLI actions that can
-    # change these fixed coverage values.
-    parser.set_defaults(first_test_year_only=True, max_rows=0)
     return parser.parse_args(argv)
 
 

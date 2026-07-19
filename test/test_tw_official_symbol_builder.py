@@ -19,6 +19,7 @@ from scripts.build_tw_official_symbol_parquets import (
     _official_frame,
     _legacy_official_frame,
     _normalized_reference_index,
+    _normalize_yahoo_fallback_raw_ohlc,
     _receipt,
     _source_adjustment_factors,
     _validate_download_receipts,
@@ -37,6 +38,144 @@ from scripts.build_tw_yahoo_fallback_archive import (
     main as build_yahoo_fallback_archive,
 )
 from stockagent.data.tw_security import classify_tw_stock_or_etf
+
+
+def _raw_scale_frame(
+    *,
+    dates: list[date],
+    sources: list[str],
+    closes: list[float],
+    yahoo_closes: list[float | None],
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "max": closes,
+            "min": closes,
+            "close": closes,
+            "quote_source": sources,
+            "_lifecycle_episode_id": [0] * len(dates),
+            "_yahoo_fallback_close": yahoo_closes,
+        }
+    )
+
+
+def test_yahoo_fallback_raw_ohlc_uses_latest_causal_official_overlap() -> None:
+    frame = _raw_scale_frame(
+        dates=[date(2007, 12, 31), date(2008, 1, 2), date(2008, 1, 3)],
+        sources=["tpex_official", "yahoo_fallback", "tpex_official"],
+        closes=[6.25, 4343.105469, 5.82],
+        yahoo_closes=[4343.105469, 4343.105469, 4044.299561],
+    )
+
+    normalized, rows, unanchored, discontinuous = (
+        _normalize_yahoo_fallback_raw_ohlc(frame)
+    )
+
+    assert rows == 1
+    assert unanchored == 0
+    assert discontinuous == 0
+    fallback = normalized.filter(pl.col("quote_source") == "yahoo_fallback").row(
+        0, named=True
+    )
+    assert fallback["close"] == pytest.approx(6.25)
+    assert fallback["raw_ohlc_scale_factor"] == pytest.approx(
+        6.25 / 4343.105469
+    )
+    assert fallback["raw_ohlc_scale_reference_date"] == date(2007, 12, 31)
+
+
+def test_yahoo_fallback_raw_ohlc_does_not_backfill_future_anchor() -> None:
+    frame = _raw_scale_frame(
+        dates=[date(2000, 1, 4), date(2004, 2, 11)],
+        sources=["yahoo_fallback", "twse_official"],
+        closes=[999.0, 20.0],
+        yahoo_closes=[999.0, 500.0],
+    )
+
+    normalized, rows, unanchored, discontinuous = (
+        _normalize_yahoo_fallback_raw_ohlc(frame)
+    )
+
+    assert normalized["date"].to_list() == [date(2004, 2, 11)]
+    assert rows == 0
+    assert unanchored == 1
+    assert discontinuous == 0
+
+
+def test_yahoo_fallback_raw_ohlc_drops_post_anchor_scale_discontinuity() -> None:
+    frame = _raw_scale_frame(
+        dates=[date(2024, 1, 2), date(2024, 1, 3)],
+        sources=["twse_official", "yahoo_fallback"],
+        closes=[10.0, 5000.0],
+        yahoo_closes=[100.0, 5000.0],
+    )
+
+    normalized, rows, unanchored, discontinuous = (
+        _normalize_yahoo_fallback_raw_ohlc(frame)
+    )
+
+    assert normalized["date"].to_list() == [date(2024, 1, 2)]
+    assert rows == 0
+    assert unanchored == 0
+    assert discontinuous == 1
+
+
+def test_yahoo_fallback_raw_ohlc_drops_entire_stale_scale_regime() -> None:
+    frame = _raw_scale_frame(
+        dates=[
+            date(2024, 1, 2),
+            date(2024, 1, 3),
+            date(2024, 1, 4),
+            date(2024, 1, 5),
+        ],
+        sources=[
+            "twse_official",
+            "yahoo_fallback",
+            "yahoo_fallback",
+            "twse_official",
+        ],
+        closes=[10.0, 5000.0, 5100.0, 10.2],
+        yahoo_closes=[100.0, 5000.0, 5100.0, 102.0],
+    )
+
+    normalized, rows, unanchored, discontinuous = (
+        _normalize_yahoo_fallback_raw_ohlc(frame)
+    )
+
+    assert normalized["date"].to_list() == [date(2024, 1, 2), date(2024, 1, 5)]
+    assert rows == 0
+    assert unanchored == 0
+    assert discontinuous == 2
+
+
+def test_yahoo_fallback_raw_ohlc_drops_run_that_fails_resuming_official_boundary() -> None:
+    frame = _raw_scale_frame(
+        dates=[
+            date(2024, 1, 2),
+            date(2024, 1, 3),
+            date(2024, 1, 4),
+            date(2024, 1, 5),
+        ],
+        sources=[
+            "twse_official",
+            "yahoo_fallback",
+            "yahoo_fallback",
+            "twse_official",
+        ],
+        closes=[10.0, 10.1, 10.2, 50.0],
+        yahoo_closes=[100.0, 101.0, 102.0, 500.0],
+    )
+
+    normalized, rows, unanchored, discontinuous = (
+        _normalize_yahoo_fallback_raw_ohlc(frame)
+    )
+
+    assert normalized["date"].to_list() == [date(2024, 1, 2), date(2024, 1, 5)]
+    assert rows == 0
+    assert unanchored == 0
+    assert discontinuous == 2
 
 
 def _write_yahoo_source_parquet(
@@ -888,16 +1027,17 @@ def test_yahoo_fallback_archive_cli_writes_a_verifiable_receipt(
     official_dir.mkdir()
     pl.DataFrame(
         {
-            "code": ["2330", "2330_TWO"],
-            "name": ["TSMC", "TSMC legacy OTC record"],
-            "market": ["TWSE", "TPEx"],
-            "yahoo_symbol": ["2330.TW", "2330.TWO"],
+            "code": ["2330", "2330_TW", "2330_TWO"],
+            "name": ["TSMC", "TSMC legacy TW record", "TSMC legacy OTC record"],
+            "market": ["TWSE", "TWSE", "TPEx"],
+            "yahoo_symbol": ["2330.TW", "2330.TW", "2330.TWO"],
         }
     ).write_csv(input_dir / "symbols.csv")
     pl.DataFrame(
         {
-            "code": ["2330_TWO"],
-            "status": ["delisted_no_history"],
+            "code": ["2330", "2330_TWO"],
+            "yahoo_symbol": ["2330.TW", "2330.TWO"],
+            "status": ["not_found", "delisted_no_history"],
         }
     ).write_csv(input_dir / "download_report.csv")
     _write_yahoo_source_parquet(
@@ -947,9 +1087,13 @@ def test_yahoo_fallback_archive_cli_writes_a_verifiable_receipt(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     input_manifest = json.loads(input_manifest_path.read_text(encoding="utf-8"))
     assert summary["manifest_symbol_count"] == 1
-    assert summary["manifest_record_count"] == 2
-    assert summary["terminal_unavailable_record_count"] == 1
-    assert input_manifest["terminal_unavailable_codes"] == ["2330_TWO"]
+    assert summary["manifest_record_count"] == 3
+    assert summary["terminal_unavailable_record_count"] == 3
+    assert input_manifest["terminal_unavailable_codes"] == [
+        "2330",
+        "2330_TW",
+        "2330_TWO",
+    ]
     summary["coverage_receipts_complete"] = False
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
     with pytest.raises(RuntimeError, match="coverage_receipts_complete"):
@@ -1052,16 +1196,15 @@ def test_official_row_wins_over_yahoo_and_mixed_output_keeps_row_lineage(
         dry_run=False,
     )
     assert result.status == "created", result.message
-    assert result.fallback_rows == 1
+    assert result.input_fallback_rows == 1
+    assert result.fallback_rows == 0
+    assert result.dropped_unanchored_fallback_rows == 1
     assert result.missing_adjustment_rows == 0
     output = pl.read_parquet(output_dir / "2330_features.parquet")
-    assert output["data_source"].to_list() == ["yahoo_fallback", "twse_official"]
-    assert output["adjustment_source"].to_list() == [
-        "yahoo_fallback",
-        "twse_official",
-    ]
+    assert output["data_source"].to_list() == ["twse_official"]
+    assert output["adjustment_source"].to_list() == ["twse_official"]
     metadata = pq.read_schema(output_dir / "2330_features.parquet").metadata or {}
-    assert metadata[b"stockagent.source"] == MIXED_FALLBACK_SOURCE_NAME.encode()
+    assert metadata[b"stockagent.source"] == b"twse_tpex_official"
 
 
 def test_yahoo_holiday_row_is_dropped_by_verified_taiex_calendar(
@@ -1185,17 +1328,9 @@ def test_unverified_extreme_adjusted_transition_quarantines_label_not_quote(
         dry_run=False,
     )
 
-    assert result.status == "created", result.message
-    assert result.unverified_extreme_quarantined_rows == 1
-    output = pl.read_parquet(output_dir / "2330_features.parquet").sort("date")
-    assert output.get_column("close").to_list() == [10.0, 10.0, 40.0]
-    assert output.get_column("adjclose").to_list() == [10.0, 10.0, 40.0]
-    assert output.get_column("return_quarantined").to_list() == [False, True, False]
-    assert output.get_column("return_quarantine_reason").to_list() == [
-        None,
-        "unverified_extreme_adjusted_return",
-        None,
-    ]
+    assert result.status == "excluded_unverified_fallback", result.message
+    assert result.dropped_unanchored_fallback_rows == 3
+    assert not (output_dir / "2330_features.parquet").exists()
 
 
 def test_unused_official_reference_does_not_verify_yahoo_extreme(
@@ -1250,16 +1385,9 @@ def test_unused_official_reference_does_not_verify_yahoo_extreme(
         dry_run=False,
     )
 
-    assert result.status == "created", result.message
-    assert result.unverified_extreme_quarantined_rows == 1
-    output = pl.read_parquet(output_dir / "2330_features.parquet").sort("date")
-    assert output.get_column("adjclose").to_list() == [10.0, 10.0, 40.0]
-    assert output.get_column("return_quarantined").to_list() == [False, True, False]
-    assert output.get_column("return_quarantine_reason").to_list() == [
-        None,
-        "unverified_extreme_adjusted_return",
-        None,
-    ]
+    assert result.status == "excluded_unverified_fallback", result.message
+    assert result.dropped_unanchored_fallback_rows == 3
+    assert not (output_dir / "2330_features.parquet").exists()
 
 
 def test_official_listing_boundary_quarantines_prelisting_to_listing_label(
@@ -1330,13 +1458,11 @@ def test_official_listing_boundary_quarantines_prelisting_to_listing_label(
     )
 
     assert result.status == "created", result.message
-    assert result.listing_boundary_quarantined_rows == 1
+    assert result.listing_boundary_quarantined_rows == 0
+    assert result.dropped_unanchored_fallback_rows == 1
     output = pl.read_parquet(output_dir / "2330_features.parquet").sort("date")
-    assert output.get_column("close").to_list() == [10.0, 40.0]
-    assert output.get_column("return_quarantine_reason").to_list() == [
-        "official_listing_boundary",
-        None,
-    ]
+    assert output.get_column("close").to_list() == [40.0]
+    assert output.get_column("return_quarantine_reason").to_list() == [None]
 
 
 def test_yahoo_rows_after_terminal_delisting_are_excluded_without_relisting(
@@ -1499,13 +1625,11 @@ def test_verified_relisting_reopens_new_episode_and_resets_adjusted_index(
     )
     assert result.status == "created", result.message
     output = pl.read_parquet(output_dir / "9801_features.parquet").sort("date")
-    assert output.get_column("adjclose").to_list() == [10.0, 10.0]
-    assert output.get_column("lifecycle_episode_id").to_list() == [0, 1]
-    assert output.get_column("return_quarantined").to_list() == [True, False]
-    assert output.get_column("return_quarantine_reason").to_list() == [
-        "official_lifecycle_episode_boundary",
-        None,
-    ]
+    assert output.get_column("adjclose").to_list() == [10.0]
+    assert output.get_column("lifecycle_episode_id").to_list() == [0]
+    assert output.get_column("return_quarantined").to_list() == [False]
+    assert output.get_column("return_quarantine_reason").to_list() == [None]
+    assert result.dropped_unanchored_fallback_rows == 1
 
 
 def test_next_official_session_tpex_to_twse_transfer_is_not_terminal(
@@ -1773,11 +1897,9 @@ def test_unusable_official_bar_uses_yahoo_with_explicit_reason(
         requested_end_date="2007-01-02",
         dry_run=False,
     )
-    assert result.status == "created"
-    output = pl.read_parquet(output_dir / "4801_features.parquet")
-    assert output.get_column("fallback_reason").to_list() == [
-        "official_ohlcv_unusable"
-    ]
+    assert result.status == "excluded_unverified_fallback"
+    assert result.dropped_unanchored_fallback_rows == 1
+    assert not (output_dir / "4801_features.parquet").exists()
 
 
 def test_unusable_official_bar_without_fallback_is_counted_and_omitted(
@@ -1925,14 +2047,15 @@ def test_official_ohlcv_can_use_yahoo_factor_only_when_official_factor_is_missin
             "min": [99.0, 104.0],
             "close": [100.0, 105.0],
             "Trading_Volume": [1000.0, 1200.0],
-            "signed_change": [None, None],
+            "signed_change": [0.0, None],
             "source_reference": [None, None],
-            "source_adjclose": [50.0, None],
-            "source_factor": [None, None],
-            "quote_source": ["yahoo_fallback", "twse_official"],
-            "_legacy_source_id": [0, -1],
-            "_source_priority": [0, 2],
+            "source_adjclose": [None, None],
+            "source_factor": [1.0, None],
+            "quote_source": ["twse_official", "twse_official"],
+            "_legacy_source_id": [-1, -1],
+            "_source_priority": [2, 2],
             "_yahoo_fallback_factor": [None, 1.05],
+            "_yahoo_fallback_close": [100.0, 105.0],
             "reference_override": [None, None],
             "security_type": ["stock", "stock"],
         }
@@ -1949,9 +2072,9 @@ def test_official_ohlcv_can_use_yahoo_factor_only_when_official_factor_is_missin
 
     assert result.missing_adjustment_rows == 0
     assert result.fallback_adjustment_rows == 1
-    assert output["data_source"].to_list() == ["yahoo_fallback", "twse_official"]
+    assert output["data_source"].to_list() == ["twse_official", "twse_official"]
     assert output["adjustment_source"].to_list() == [
-        "yahoo_fallback",
+        "twse_official",
         "yahoo_fallback",
     ]
     assert math.isclose(output["adjclose"][1] / output["adjclose"][0], 1.05)
@@ -1999,3 +2122,39 @@ def test_daily_close_receipt_allows_only_certified_margin_publication_lag(
             allow_incomplete=False,
             allow_daily_publication_lag=True,
         )
+
+
+def test_complete_receipt_accepts_only_declared_nonblocking_failures(
+    tmp_path: Path,
+) -> None:
+    corporate_path = tmp_path / "tw_corporate_action_reference.parquet"
+    corporate_path.write_bytes(b"certified-corporate-reference")
+    (tmp_path / "tw_corporate_action_reference.summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "coverage_complete": True,
+                "failure_count": 0,
+                "output_receipt": _receipt(corporate_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    public_summary_path = tmp_path / "download_summary.json"
+    public_summary = {
+        "mode": "daily",
+        "coverage_complete": True,
+        "failed_count": 1,
+        "allowed_failed_count": 1,
+        "blocking_failed_count": 0,
+        "allowed_failed_datasets": ["mof_tax_revenue"],
+        "configured_allowed_failed_datasets": ["mof_tax_revenue"],
+    }
+    public_summary_path.write_text(json.dumps(public_summary), encoding="utf-8")
+
+    _validate_download_receipts(tmp_path, allow_incomplete=False)
+
+    public_summary["blocking_failed_count"] = 1
+    public_summary_path.write_text(json.dumps(public_summary), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="public failed_count=1"):
+        _validate_download_receipts(tmp_path, allow_incomplete=False)
