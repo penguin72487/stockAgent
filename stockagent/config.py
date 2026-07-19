@@ -293,6 +293,13 @@ class DataConfig:
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
     feature_zero_fill: list[str] = field(default_factory=list)
+    # Features whose session-t value is not available early enough for a
+    # session-t decision.  Panel construction exposes that value on the next
+    # panel session while preserving the source's original dated archive.
+    feature_shift_next_session: list[str] = field(default_factory=list)
+    # Explicit research-only opt-in for using final session-t aggregates in a
+    # model that approximates execution at that same close.
+    allow_same_close_feature_approximation: bool = False
 
 
 @dataclass(slots=True)
@@ -1496,6 +1503,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     data["feature_exclude"] = _normalize_string_list(data["feature_exclude"], field_name="data.feature_exclude")
     data["feature_zero_fill"] = _normalize_string_list(
         data["feature_zero_fill"], field_name="data.feature_zero_fill"
+    )
+    data["feature_shift_next_session"] = _normalize_string_list(
+        data["feature_shift_next_session"],
+        field_name="data.feature_shift_next_session",
+    )
+    data["allow_same_close_feature_approximation"] = bool(
+        data["allow_same_close_feature_approximation"]
     )
     plot_backend = str(training["plot_backend"]).strip().lower()
     valid_plot_backends = {"auto", "matplotlib", "rapids_datashader"}

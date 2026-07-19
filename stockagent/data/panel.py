@@ -3055,6 +3055,7 @@ def build_tail_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData:
     """Build a panel from only the last rows of each symbol file for live inference."""
@@ -3076,6 +3077,9 @@ def build_tail_panel(
     feature_exclude_patterns = _normalize_feature_patterns(feature_exclude, label="feature_exclude")
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
+    )
+    feature_shift_next_session_patterns = _normalize_feature_patterns(
+        feature_shift_next_session, label="feature_shift_next_session"
     )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
@@ -3162,6 +3166,10 @@ def build_tail_panel(
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _shift_panel_features_to_next_session(
+        panel,
+        feature_shift_next_session_patterns,
+    )
     panel = _slice_panel_start(panel, normalized_panel_start_date)
     panel = _apply_corporate_action_avoidance_transitions(
         panel,
@@ -3194,6 +3202,7 @@ def load_cached_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData | None:
     del panel_load_workers
@@ -3214,7 +3223,15 @@ def load_cached_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    feature_shift_next_session_patterns = _normalize_feature_patterns(
+        feature_shift_next_session, label="feature_shift_next_session"
+    )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
+    feature_shift_key = (
+        f"feature_shift_next_session={list(feature_shift_next_session_patterns)!r}|"
+        if feature_shift_next_session_patterns
+        else ""
+    )
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         return None
@@ -3271,6 +3288,7 @@ def load_cached_panel(
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
     source_paths = [*parquet_paths, *security_metadata_paths]
@@ -4243,6 +4261,40 @@ def _zero_fill_panel_features(
     return panel
 
 
+def _shift_panel_features_to_next_session(
+    panel: PanelData,
+    feature_shift_next_session: tuple[str, ...] = (),
+) -> PanelData:
+    """Expose session-t feature values on the next verified panel session.
+
+    This is an availability transform, not an ordinary row lag: the source
+    archive keeps its real observation date while the model panel records the
+    earliest session on which the completed value may be used.  Applying the
+    shift before ``panel_start_date`` slicing preserves the prior source
+    session at the configured model boundary.
+    """
+
+    if not feature_shift_next_session:
+        return panel
+    selected = _feature_pattern_indices(
+        panel.feature_names,
+        feature_shift_next_session,
+        label="feature_shift_next_session",
+    )
+    if panel.num_dates == 0:
+        return panel
+    for feature_idx in selected:
+        previous = panel.features[:-1, :, feature_idx].copy()
+        panel.features[1:, :, feature_idx] = previous
+        panel.features[0, :, feature_idx] = 0.0
+    print(
+        f"[panel] shifted {len(selected)}/{len(panel.feature_names)} retained features "
+        "to the next panel session "
+        f"(patterns={list(feature_shift_next_session)})"
+    )
+    return panel
+
+
 def _check_cache_valid(cache_path: Path, meta_path: Path, parquet_paths: list[Path], backend_key: str) -> bool:
     """Check if cache is valid based on source hash and mtime."""
     if (not cache_path.exists()) or (not meta_path.exists()):
@@ -4327,6 +4379,7 @@ def build_panel(
     feature_include: Any = None,
     feature_exclude: Any = None,
     feature_zero_fill: Any = None,
+    feature_shift_next_session: Any = None,
     panel_start_date: str | date | np.datetime64 | None = None,
 ) -> PanelData:
     parquet_root = Path(parquet_root)
@@ -4348,7 +4401,15 @@ def build_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    feature_shift_next_session_patterns = _normalize_feature_patterns(
+        feature_shift_next_session, label="feature_shift_next_session"
+    )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
+    feature_shift_key = (
+        f"feature_shift_next_session={list(feature_shift_next_session_patterns)!r}|"
+        if feature_shift_next_session_patterns
+        else ""
+    )
     parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
@@ -4432,6 +4493,7 @@ def build_panel(
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
     source_paths = [*parquet_paths, *security_metadata_paths]
@@ -4517,6 +4579,10 @@ def build_panel(
     )
     panel = _apply_external_rule_masks(panel, external_features)
     panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _shift_panel_features_to_next_session(
+        panel,
+        feature_shift_next_session_patterns,
+    )
     panel = _slice_panel_start(panel, normalized_panel_start_date)
     panel = _apply_corporate_action_avoidance_transitions(
         panel,

@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Host-global minimum seconds between TW public HTTP requests. "
-            "Unspecified endpoints default to the stockAgent 10 req/s policy."
+            "Unspecified endpoints default to the stockAgent 8 req/s policy."
         ),
     )
     parser.add_argument("--skip-raw", action="store_true")

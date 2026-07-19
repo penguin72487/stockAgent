@@ -17,9 +17,11 @@ from stockagent.data.tw_public_features import (
     DEFAULT_MARKET_SYMBOL,
     FEATURE_COLUMNS,
     RULE_COLUMNS,
+    _build_institutional_features,
     _build_margin_features,
     _build_official_ohlcv_features,
     _build_twse_market_index_features,
+    _snapshot_date_expr,
     build_tw_public_training_features,
 )
 
@@ -76,6 +78,66 @@ def test_margin_short_rules_convert_official_lots_to_exact_shares_and_fail_close
     for symbol in ("2317", "1301", "5347"):
         assert by_symbol[symbol]["_twpub_margin_short_evidence_next_session"] == 0.0
         assert by_symbol[symbol]["_twpub_short_capacity_shares_next_session"] == 0.0
+
+
+def test_post_close_chip_history_moves_to_next_verified_exchange_session(
+    tmp_path: Path,
+) -> None:
+    pl.DataFrame(
+        {
+            "date": ["2024-01-05", "2024-01-08", "2024-01-09"],
+            "opening_index": [100.0, 101.0, 102.0],
+            "highest_index": [101.0, 102.0, 103.0],
+            "lowest_index": [99.0, 100.0, 101.0],
+            "closing_index": [100.5, 101.5, 102.5],
+        }
+    ).write_parquet(tmp_path / "twse_taiex_ohlc.parquet")
+    pl.DataFrame(
+        {
+            "代號": ["2330"],
+            "前日餘額": ["100"],
+            "今日餘額": ["120"],
+            "前日餘額_2": ["10"],
+            "今日餘額_2": ["12"],
+            "次一營業日限額_2": ["100"],
+            "買進": ["30"],
+            "賣出": ["10"],
+            "賣出_2": ["4"],
+            "買進_2": ["2"],
+            "註記": [""],
+            "date": ["2024-01-05"],
+        }
+    ).write_parquet(tmp_path / "twse_margin_balance.parquet")
+    pl.DataFrame(
+        {
+            "證券代號": ["2330"],
+            "外陸資買賣超股數(不含外資自營商)": ["1000"],
+            "投信買賣超股數": ["200"],
+            "自營商買賣超股數": ["-50"],
+            "三大法人買賣超股數": ["1150"],
+            "date": ["2024-01-05"],
+        }
+    ).write_parquet(tmp_path / "twse_institutional_trades.parquet")
+
+    margin = _build_margin_features(tmp_path).sort("date")
+    institutional = _build_institutional_features(tmp_path).sort("date")
+
+    margin_source = margin.filter(pl.col("date") == date(2024, 1, 5)).row(
+        0, named=True
+    )
+    margin_available = margin.filter(pl.col("date") == date(2024, 1, 8)).row(
+        0, named=True
+    )
+    assert margin_source["twpub_margin_balance_log"] is None
+    assert margin_source["_twpub_margin_short_evidence_next_session"] == 1.0
+    assert margin_available["twpub_margin_balance_log"] == pytest.approx(
+        np.log1p(120)
+    )
+    assert margin_available["_twpub_margin_short_evidence_next_session"] is None
+    assert institutional.get_column("date").to_list() == [date(2024, 1, 8)]
+    assert institutional.row(0, named=True)[
+        "twpub_investment_trust_net_buy_flow"
+    ] == pytest.approx(np.arcsinh(200 / 1000.0))
 
 
 def test_margin_short_capacity_is_exactly_next_session_and_never_forward_filled(
@@ -232,6 +294,15 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     symbols_root = tmp_path / "symbols"
     symbols_root.mkdir()
     _write_symbol(symbols_root / "2330_features.parquet", [10.0, 11.0])
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03"],
+            "opening_index": [100.0, 101.0],
+            "highest_index": [101.0, 102.0],
+            "lowest_index": [99.0, 100.0],
+            "closing_index": [100.5, 101.5],
+        }
+    ).write_parquet(input_dir / "twse_taiex_ohlc.parquet")
 
     pl.DataFrame(
         {
@@ -278,15 +349,19 @@ def test_tw_public_feature_builder_outputs_sparse_stock_and_market_rows(tmp_path
     result = build_tw_public_training_features(input_dir, output_path, symbols_root=symbols_root)
     out = pl.read_parquet(output_path)
 
-    assert result.rows == 3
+    assert result.rows == 4
     assert set(out["symbol"].to_list()) == {"2330", DEFAULT_MARKET_SYMBOL}
     assert "9999" not in set(out["symbol"].to_list())
     assert set(FEATURE_COLUMNS).issubset(set(out.columns))
     assert set(RULE_COLUMNS).issubset(set(out.columns))
     assert "_twpub_force_cover_delisting_ordinal" not in out.columns
-    stock = out.filter(pl.col("symbol") == "2330").row(0, named=True)
-    assert stock["twpub_pe_log"] is not None
-    assert stock["twpub_margin_balance_log"] is not None
+    stock = out.filter(pl.col("symbol") == "2330").sort("date")
+    assert stock.filter(pl.col("date") == date(2024, 1, 2)).row(0, named=True)[
+        "twpub_pe_log"
+    ] is not None
+    assert stock.filter(pl.col("date") == date(2024, 1, 3)).row(0, named=True)[
+        "twpub_margin_balance_log"
+    ] is not None
     market = out.filter(pl.col("symbol") == DEFAULT_MARKET_SYMBOL).sort("date")
     assert market.height == 2
     assert market["twpub_usdtwd_logret_1d"][1] is not None
@@ -1639,3 +1714,18 @@ def test_point_in_time_financial_features_forward_fill_only_after_publication(tm
     assert panel.features[0, symbol_idx, feature_idx] == np.float32(0.0)
     assert panel.features[1, symbol_idx, feature_idx] == np.float32(0.25)
     assert panel.features[2, symbol_idx, feature_idx] == np.float32(0.25)
+
+
+def test_snapshot_date_never_precedes_archived_vintage() -> None:
+    frame = pl.DataFrame(
+        {
+            "出表日期": ["2024-05-10", "2024-07-12"],
+            "_as_of_date": ["2024-07-11", "2024-07-11"],
+        }
+    )
+
+    dates = frame.select(
+        _snapshot_date_expr(set(frame.columns)).alias("available_date")
+    ).get_column("available_date")
+
+    assert dates.to_list() == [date(2024, 7, 11), date(2024, 7, 12)]

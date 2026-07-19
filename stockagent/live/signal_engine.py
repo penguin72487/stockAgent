@@ -164,6 +164,7 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
         "feature_include": config.data.feature_include,
         "feature_exclude": config.data.feature_exclude,
         "feature_zero_fill": config.data.feature_zero_fill,
+        "feature_shift_next_session": config.data.feature_shift_next_session,
         "panel_start_date": config.data.panel_start_date,
     }
     if live_tail and not _is_intraday_frequency(getattr(config.trading, "frequency", "")):
@@ -195,6 +196,7 @@ def _build_panel(config: ExperimentConfig, *, live_tail: bool = False) -> PanelD
             feature_include=config.data.feature_include,
             feature_exclude=config.data.feature_exclude,
             feature_zero_fill=config.data.feature_zero_fill,
+            feature_shift_next_session=config.data.feature_shift_next_session,
             panel_start_date=config.data.panel_start_date,
         )
     return build_panel(
