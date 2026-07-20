@@ -114,9 +114,9 @@ data:
     # - twpub_company_age_years
     # - twpub_company_listed_age_years
     # - twpub_company_par_value_log
-    - twpub_company_industry_code
-    - twpub_company_is_foreign
-    - twpub_company_has_preferred_stock
+    # - twpub_company_industry_code  # permanently disabled: snapshot-only
+    # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+    # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
 
     # Dividend announcements and ex-dividend information (disabled)
     # - twpub_dividend_cash_per_share
@@ -160,8 +160,8 @@ data:
     # - twpub_financial_book_value_per_share_log
 
     # Insider ownership
-    - twpub_insider_holdings_log
-    - twpub_insider_pledge_ratio
+    # - twpub_insider_holdings_log  # permanently disabled: snapshot-only
+    # - twpub_insider_pledge_ratio  # permanently disabled: snapshot-only
     # - twpub_insider_transfer_shares_log
 
     # Securities borrowing and short-sale availability (disabled)
@@ -313,7 +313,6 @@ training:
   epoch_test_curve: true
   defer_epoch_curve_plot_until_end: false
   explain_after_each_fold: false
-  explain_first_test_year_only: true
   explain_max_rows: 32
   explain_ig_steps: 0
   explain_ig_batch_size: 1
@@ -585,9 +584,9 @@ training:
     return_aux_details: false
     # Categorical features are embedded by name only when the feature is enabled above.
     categorical_feature_names:
-      - twpub_company_industry_code
-      - twpub_company_is_foreign
-      - twpub_company_has_preferred_stock
+      # - twpub_company_industry_code  # permanently disabled: snapshot-only
+      # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+      # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
     categorical_embedding_dim: 4
     categorical_embedding_cardinality: 512
     # return_aux_details returns attention/factor internals; keep false for training speed.

@@ -40,6 +40,7 @@ OPTIONAL_ARRAY_NAMES = (
     "day_trade_can_buy_open_mask",
     "day_trade_can_sell_open_mask",
     "raw_close_returns_1d",
+    "corporate_action_avoidance_mask",
     "unresolved_corporate_action_mask",
     "cash_dividend_yield",
     "cash_dividend_payment_delay_sessions",

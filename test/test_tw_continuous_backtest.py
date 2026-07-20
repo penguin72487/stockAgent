@@ -237,6 +237,47 @@ def test_tw_cash_partial_cover_retains_whole_account_maintenance_collateral() ->
     _assert_tw_cash_margin_identity(result)
 
 
+def test_tw_cash_undermaintenance_partial_cover_releases_no_collateral() -> None:
+    # A pre-existing maintenance deficit is not an instruction to fabricate a
+    # same-day margin-call cure.  The cover may execute, but Article 56 permits
+    # no collateral release until the remaining account is above its floor.
+    target = torch.tensor([[0.0, -0.5]], dtype=torch.float64)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    result = run_tw_cash_continuous(
+        target,
+        torch.zeros_like(target),
+        mask,
+        mask,
+        mask,
+        torch.zeros(2, dtype=torch.float64),
+        torch.zeros(2, dtype=torch.float64),
+        short_maintenance_ratio=1.30,
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
+        initial_weights=torch.tensor([-0.5, -0.5], dtype=torch.float64),
+        initial_cash=torch.tensor(1.5, dtype=torch.float64),
+        initial_short_sale_collateral=torch.tensor(
+            [0.2, 0.1], dtype=torch.float64
+        ),
+        initial_short_margin_collateral=torch.tensor(
+            [0.1, 0.1], dtype=torch.float64
+        ),
+    )
+
+    torch.testing.assert_close(
+        result.short_sale_collateral_history[0],
+        torch.tensor([0.0, 0.3], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        result.short_margin_collateral_history[0],
+        torch.tensor([0.0, 0.2], dtype=torch.float64),
+    )
+    assert result.receivables_history[0].sum().item() == pytest.approx(0.0)
+    assert result.payables_history[0].sum().item() == pytest.approx(0.5)
+    assert result.final_alive.item()
+    assert not result.settlement_default.any().item()
+    _assert_tw_cash_margin_identity(result)
+
+
 def test_tw_cash_full_cover_releases_all_restricted_short_collateral() -> None:
     target = torch.zeros((1, 2), dtype=torch.float64)
     mask = torch.ones_like(target, dtype=torch.bool)
@@ -272,27 +313,31 @@ def test_tw_cash_full_cover_releases_all_restricted_short_collateral() -> None:
     _assert_tw_cash_margin_identity(result)
 
 
-def test_tw_cash_forced_short_cover_fails_closed_if_buy_is_blocked() -> None:
+def test_tw_cash_forced_short_cover_becomes_absorbing_default_if_buy_is_blocked() -> None:
     target = torch.full((2, 1), -0.5, dtype=torch.float64)
     mask = torch.ones_like(target, dtype=torch.bool)
     can_buy = mask.clone()
     can_buy[1] = False
     force_cover = torch.tensor([[False], [True]])
-    with pytest.raises(RuntimeError, match="mandatory short cover.*buy side"):
-        run_tw_cash_continuous(
-            target,
-            torch.zeros_like(target),
-            mask,
-            can_buy,
-            mask,
-            torch.zeros(1, dtype=torch.float64),
-            torch.zeros(1, dtype=torch.float64),
-            can_short_open_mask=mask,
-            force_short_cover_mask=force_cover,
-            short_margin_rate=0.90,
-            short_capacity_weights=torch.full_like(target, 0.5),
-            unresolved_corporate_action_mask=torch.zeros_like(mask),
-        )
+    result = run_tw_cash_continuous(
+        target,
+        torch.zeros_like(target),
+        mask,
+        can_buy,
+        mask,
+        torch.zeros(1, dtype=torch.float64),
+        torch.zeros(1, dtype=torch.float64),
+        can_short_open_mask=mask,
+        force_short_cover_mask=force_cover,
+        short_margin_rate=0.90,
+        short_capacity_weights=torch.full_like(target, 0.5),
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
+    )
+
+    assert result.settlement_default.tolist() == [False, True]
+    assert result.strategy_returns[1].item() == pytest.approx(math.log(1.0e-6))
+    assert not result.final_alive.item()
+    torch.testing.assert_close(result.final_weights, torch.zeros_like(result.final_weights))
 
 
 def test_tw_cash_margin_short_recurrent_chunk_state_matches_full_run() -> None:
@@ -525,7 +570,7 @@ def test_tw_cash_negative_forced_sale_proceeds_become_a_net_payable() -> None:
 
 
 @pytest.mark.parametrize("bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4])
-def test_tw_cash_rejects_nonfinite_valuation_only_for_executed_holdings(
+def test_tw_cash_defaults_on_nonfinite_valuation_only_for_executed_holdings(
     bad_return: float,
 ) -> None:
     mask = torch.ones((1, 1), dtype=torch.bool)
@@ -544,16 +589,19 @@ def test_tw_cash_rejects_nonfinite_valuation_only_for_executed_holdings(
     )
     assert inactive.strategy_returns[0].item() == pytest.approx(0.0)
 
-    with pytest.raises(RuntimeError, match="non-finite close-to-next-close"):
-        run_tw_cash_continuous(
-            torch.full((1, 1), 0.5, dtype=torch.float64),
-            torch.tensor([[bad_return]], dtype=torch.float64),
-            **common,
-        )
+    active = run_tw_cash_continuous(
+        torch.full((1, 1), 0.5, dtype=torch.float64),
+        torch.tensor([[bad_return]], dtype=torch.float64),
+        **common,
+    )
+    assert active.settlement_default[0].item()
+    assert active.strategy_returns[0].item() == pytest.approx(math.log(1.0e-6))
+    assert not active.final_alive.item()
+    torch.testing.assert_close(active.final_weights, torch.zeros_like(active.final_weights))
 
 
 @pytest.mark.parametrize("bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4])
-def test_tw_day_trade_rejects_nonfinite_return_only_for_an_opened_trade(
+def test_tw_day_trade_cancels_entry_when_round_trip_valuation_is_nonfinite(
     bad_return: float,
 ) -> None:
     mask = torch.ones((1, 1), dtype=torch.bool)
@@ -575,11 +623,13 @@ def test_tw_day_trade_rejects_nonfinite_return_only_for_an_opened_trade(
     )
     assert inactive.strategy_returns[0].item() == pytest.approx(0.0)
 
-    with pytest.raises(RuntimeError, match="non-finite open-to-close"):
-        run_tw_day_trade_continuous(
-            torch.ones((1, 1), dtype=torch.float64),
-            **common,
-        )
+    active = run_tw_day_trade_continuous(
+        torch.ones((1, 1), dtype=torch.float64),
+        **common,
+    )
+    assert active.strategy_returns[0].item() == pytest.approx(0.0)
+    assert active.turnovers[0].item() == pytest.approx(0.0)
+    assert not active.settlement_default[0].item()
 
 
 def test_tw_day_trade_open_sizing_is_invariant_to_the_later_close() -> None:
@@ -844,23 +894,26 @@ def test_tw_cash_official_action_transition_liquidates_then_allows_reentry() -> 
     assert result.weights_history[2, 0].item() > 0.0
 
 
-def test_tw_cash_official_action_transition_fails_if_held_sale_is_blocked() -> None:
+def test_tw_cash_blocked_official_action_exit_becomes_absorbing_default() -> None:
     weights = torch.tensor([[0.5], [0.5]], dtype=torch.float64)
     mask = _mask_like(weights)
     can_sell = torch.tensor([[True], [False]])
     actions = torch.tensor([[False], [True]])
 
-    with pytest.raises(RuntimeError, match="sell side is unavailable"):
-        run_tw_cash_continuous(
-            weights,
-            torch.zeros_like(weights),
-            mask,
-            mask,
-            can_sell,
-            torch.zeros(1, dtype=torch.float64),
-            torch.zeros(1, dtype=torch.float64),
-            unresolved_corporate_action_mask=actions,
-        )
+    result = run_tw_cash_continuous(
+        weights,
+        torch.zeros_like(weights),
+        mask,
+        mask,
+        can_sell,
+        torch.zeros(1, dtype=torch.float64),
+        torch.zeros(1, dtype=torch.float64),
+        unresolved_corporate_action_mask=actions,
+    )
+
+    assert result.settlement_default.tolist() == [False, True]
+    assert result.strategy_returns[1].item() == pytest.approx(math.log(1.0e-6))
+    assert not result.final_alive.item()
 
 
 def test_tw_cash_prior_alive_selection_mask_does_not_block_current_exit() -> None:
@@ -971,25 +1024,28 @@ def test_tw_cash_exact_cash_dividend_rejects_unrepresentable_payment_delay() -> 
         )
 
 
-def test_tw_day_trade_open_fill_with_blocked_close_fails_instead_of_cancelling() -> None:
+def test_tw_day_trade_blocked_close_prevents_round_trip_entry() -> None:
     weights = torch.tensor([[1.0]], dtype=torch.float64)
     open_mask = _mask_like(weights)
     close_sell_mask = torch.zeros_like(open_mask)
 
-    with pytest.raises(RuntimeError, match="mandatory close leg"):
-        run_tw_day_trade_continuous(
-            weights,
-            torch.zeros_like(weights),
-            open_mask,
-            open_mask,
-            close_sell_mask,
-            open_mask,
-            open_mask,
-            torch.zeros(1, dtype=torch.float64),
-            torch.zeros(1, dtype=torch.float64),
-            day_trade_can_buy_open_mask=open_mask,
-            day_trade_can_sell_open_mask=open_mask,
-        )
+    result = run_tw_day_trade_continuous(
+        weights,
+        torch.zeros_like(weights),
+        open_mask,
+        open_mask,
+        close_sell_mask,
+        open_mask,
+        open_mask,
+        torch.zeros(1, dtype=torch.float64),
+        torch.zeros(1, dtype=torch.float64),
+        day_trade_can_buy_open_mask=open_mask,
+        day_trade_can_sell_open_mask=open_mask,
+    )
+
+    assert result.strategy_returns[0].item() == pytest.approx(0.0)
+    assert result.turnovers[0].item() == pytest.approx(0.0)
+    assert not result.settlement_default[0].item()
 
 
 @pytest.mark.parametrize("mode", ["tw_cash", "tw_day_trade"])
@@ -3003,7 +3059,7 @@ def test_compiled_canonical_loss_returns_carried_equity_scale() -> None:
     ["log_utility", "portfolio_autoencoder", "factor_generalization"],
 )
 @pytest.mark.parametrize("bad_return", [float("nan"), float("inf"), float("-inf"), 1.0e4])
-def test_taiwan_loss_preserves_active_invalid_return_for_executor_validation(
+def test_taiwan_loss_handles_active_invalid_return_without_device_assertion(
     execution_mode: str,
     objective: str,
     bad_return: float,
@@ -3036,8 +3092,11 @@ def test_taiwan_loss_preserves_active_invalid_return_for_executor_validation(
             day_trade_can_sell_open_mask=mask,
         )
 
-    with pytest.raises(RuntimeError, match="non-finite"):
-        risk_aware_loss(weights, returns, mask, **kwargs)
+    loss = risk_aware_loss(weights, returns, mask, **kwargs)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert weights.grad is not None
+    assert torch.isfinite(weights.grad).all()
 
 
 @pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_day_trade"])

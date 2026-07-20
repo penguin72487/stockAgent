@@ -142,6 +142,18 @@ def test_tw_public_candle_fold20_uses_one_fixed_train_and_eval_abi() -> None:
     assert config.trading.tw_short_capacity_limit_enabled is False
 
 
+def test_tw_public_candle_select_uses_bounded_dynamic_symbol_compile() -> None:
+    config = train_entry.load_config(
+        "configs/markets/tw_public_lanten_market_candles_select.yaml"
+    )
+    assert config.training.train_symbol_compaction == "train_union"
+    assert config.training.train_symbol_compaction_bucket_size == 0
+    assert config.training.compile_model_dynamic_symbols is True
+    assert config.training.compile_loss_dynamic_symbols is True
+    assert config.training.batch_size_train == 128
+    assert config.training.batch_size_eval == 128
+
+
 def test_local_world_size_uses_local_not_global_rank_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

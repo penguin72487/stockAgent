@@ -374,7 +374,8 @@ training:
 ```yaml
 training:
   explain_after_each_fold: true
-  explain_first_test_year_only: true
+  # Explainability is unconditionally restricted to the first calendar year
+  # of every fold's test split; there is no setting that can widen this range.
   explain_umap_enabled: true
   explain_umap_max_points: 10000
   plot_backend: auto

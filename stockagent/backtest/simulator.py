@@ -40,10 +40,12 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
-# v7 separates TW cash's prior-session model-selection mask from current-close
-# buy/sell execution facts.  Old checkpoints must not silently resume through
-# the resulting turnover/return semantics change.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 7
+# v8 replaces data-dependent CUDA assertions in the TW continuous executor
+# with deterministic execution semantics: impossible mandatory exits produce
+# an absorbing account default, invalid day-trade round trips do not open, and
+# pre-existing maintenance deficits release no collateral. Old checkpoints
+# must not silently resume an optimizer trajectory across this return change.
+CANONICAL_BACKTEST_CONTRACT_VERSION = 8
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[

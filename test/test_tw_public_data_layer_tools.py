@@ -48,6 +48,7 @@ from scripts.build_tw_official_symbol_parquets import (
     OFFICIAL_CORE_SOURCE_FILENAMES,
     OFFICIAL_SYMBOL_ADJUSTED_PRICE_METHOD,
     OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION,
+    YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION,
     _receipt,
     _write_official_quote_parquet,
 )
@@ -243,7 +244,7 @@ def _write_verified_taiex_calendar(
     return str(receipt["sha256"])
 
 
-def test_snapshot_only_cumulative_revenue_is_quarantined() -> None:
+def test_snapshot_only_features_are_absent_from_model_schema() -> None:
     config = load_config("configs/markets/tw_public.yaml")
     config.data.feature_exclude = [
         pattern
@@ -252,22 +253,24 @@ def test_snapshot_only_cumulative_revenue_is_quarantined() -> None:
     ]
     config.data.feature_zero_fill.append("twpub_cumulative_revenue_yoy")
     findings = audit_snapshot_contract(Path("/does/not/need/to/exist"), config)
-    cumulative = next(
-        item for item in findings if item.item == "twpub_cumulative_revenue_yoy"
-    )
-    assert cumulative.severity == "low"
-    assert "all_zero_filled=True" in cumulative.evidence
 
-    config.data.feature_zero_fill = [
-        pattern
-        for pattern in config.data.feature_zero_fill
-        if pattern != "twpub_cumulative_revenue_yoy"
-    ]
-    findings = audit_snapshot_contract(Path("/does/not/need/to/exist"), config)
-    cumulative = next(
-        item for item in findings if item.item == "twpub_cumulative_revenue_yoy"
+    assert findings == []
+    assert "twpub_cumulative_revenue_yoy" not in config.data.feature_include
+    assert not any(
+        feature.startswith(
+            (
+                "twpub_monthly_revenue_",
+                "twpub_financial_",
+                "twpub_insider_",
+                "twpub_borrow_",
+                "twpub_sbl_",
+                "twpub_short_sale_available_",
+                "twpub_tdcc_",
+                "twpub_company_",
+            )
+        )
+        for feature in config.data.feature_include
     )
-    assert cumulative.severity == "critical"
 
 
 def test_excluded_snapshot_families_are_not_audited_as_model_inputs() -> None:
@@ -320,10 +323,10 @@ def test_all_active_tw_features_have_machine_checked_availability() -> None:
     approximation = findings[0]
     assert approximation.code == "same_close_feature_approximation"
     assert approximation.severity == "medium"
-    assert summary["selected_features"] == 62
+    assert summary["selected_features"] == 98
     assert summary["active_features"] == 33
     assert summary["allow_same_close_feature_approximation"] is True
-    assert len(summary["zero_filled_features"]) == 29
+    assert len(summary["zero_filled_features"]) == 65
     assert summary["pre_close_active_features"] == ["open_logret_1d"]
     assert len(summary["close_completion_active_features"]) == 22
     assert len(summary["post_close_active_features"]) == 10
@@ -365,6 +368,59 @@ def test_close_completion_feature_moves_to_next_panel_session() -> None:
     assert shifted is panel
     assert shifted.features[:, 0, 0].tolist() == [0.0, 1.0, 2.0]
     np.testing.assert_array_equal(shifted.returns_1d, original_returns)
+
+
+def test_declared_nonblocking_public_download_failure_is_accepted(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    (tmp_path / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "repair",
+                "coverage_complete": True,
+                "failed_count": 1,
+                "allowed_failed_count": 1,
+                "blocking_failed_count": 0,
+                "allowed_failed_datasets": ["mof_tax_revenue"],
+                "configured_allowed_failed_datasets": [
+                    "mof_tax_revenue",
+                    "optional_future_source",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, findings = audit_source_receipts(tmp_path, config)
+
+    assert summary["public_download_nonblocking_failures_valid"] is True
+    assert not any(item.code == "public_download_failures" for item in findings)
+
+
+def test_undeclared_public_download_failure_remains_critical(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    (tmp_path / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "repair",
+                "coverage_complete": True,
+                "failed_count": 1,
+                "allowed_failed_count": 1,
+                "blocking_failed_count": 0,
+                "allowed_failed_datasets": ["undeclared_source"],
+                "configured_allowed_failed_datasets": ["mof_tax_revenue"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, findings = audit_source_receipts(tmp_path, config)
+
+    assert summary["public_download_nonblocking_failures_valid"] is False
+    assert any(item.code == "public_download_failures" for item in findings)
 
 
 def test_rule_receipt_is_required_and_machine_checked(tmp_path: Path) -> None:
@@ -449,7 +505,9 @@ def test_nonblocking_failure_receipt_does_not_fail_model_source_audit(
                 "mode": "daily",
                 "failed_count": 1,
                 "blocking_failed_count": 0,
+                "allowed_failed_count": 1,
                 "allowed_failed_datasets": ["mof_tax_revenue"],
+                "configured_allowed_failed_datasets": ["mof_tax_revenue"],
                 "coverage_complete": True,
             }
         ),
@@ -986,7 +1044,15 @@ def test_quote_source_audit_accepts_audited_yahoo_fallback_lineage(tmp_path: Pat
             "data_source": ["yahoo_fallback", "twse_official"],
             "adjustment_source": ["yahoo_fallback", "twse_official"],
             "fallback_reason": ["official_ohlcv_unusable", None],
-            "ohlc_normalization": [None, None],
+            "ohlc_normalization": [
+                YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION,
+                None,
+            ],
+            "raw_ohlc_scale_factor": [1.0, None],
+            "raw_ohlc_scale_reference_date": [
+                date(2000, 1, 3),
+                None,
+            ],
             "adjclose": [10.0, 10.5],
         }
     )
@@ -1011,7 +1077,54 @@ def test_quote_source_audit_accepts_audited_yahoo_fallback_lineage(tmp_path: Pat
     assert summary["fallback_reason_rows"] == 1
     assert summary["fallback_reason_lineage_mismatch"] == 0
     assert summary["unapproved_ohlc_normalization_rows"] == 0
+    assert summary["invalid_fallback_raw_scale_rows"] == 0
+    assert summary["fallback_raw_scale_schema_mismatch"] == 0
     assert not any("source" in finding.code for finding in findings)
+
+
+def test_quote_source_audit_blocks_raw_scale_jump_touching_yahoo(
+    tmp_path: Path,
+) -> None:
+    frame = pl.DataFrame(
+        {
+            "date": [date(2024, 1, 2), date(2024, 1, 3)],
+            "open": [10.0, 1000.0],
+            "max": [10.0, 1000.0],
+            "min": [10.0, 1000.0],
+            "close": [10.0, 1000.0],
+            "Trading_Volume": [1000.0, 0.0],
+            "data_source": ["twse_official", "yahoo_fallback"],
+            "adjustment_source": ["twse_official", "yahoo_fallback"],
+            "fallback_reason": [None, "official_ohlcv_unusable"],
+            "ohlc_normalization": [
+                None,
+                YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION,
+            ],
+            "raw_ohlc_scale_factor": [None, 1.0],
+            "raw_ohlc_scale_reference_date": [None, date(2024, 1, 2)],
+            "adjclose": [10.0, 10.0],
+        }
+    )
+    _write_official_quote_parquet(
+        frame,
+        tmp_path / "2330_features.parquet",
+        checked_through="2024-01-03",
+        source=MIXED_FALLBACK_SOURCE_NAME,
+    )
+
+    _, summary, findings = audit_quote_source_files(
+        tmp_path,
+        np.asarray(["2024-01-02", "2024-01-03"], dtype="datetime64[D]"),
+        workers=1,
+        require_official=True,
+    )
+
+    assert summary["raw_close_jumps_touching_yahoo"] == 1
+    assert any(
+        item.code == "unresolved_yahoo_raw_price_scale_jump"
+        and item.severity == "critical"
+        for item in findings
+    )
 
 
 def test_quote_source_audit_keeps_pre_horizon_rows_in_full_source_calendar(
@@ -1238,8 +1351,12 @@ def test_official_symbol_build_audit_accepts_relocated_yahoo_receipt(
                 "Trading_Volume": [1000.0],
                 "data_source": ["yahoo_fallback"],
                 "adjustment_source": ["yahoo_fallback"],
-                "fallback_reason": ["official_ohlcv_unusable"],
-                "ohlc_normalization": [None],
+                    "fallback_reason": ["official_ohlcv_unusable"],
+                    "ohlc_normalization": [
+                        YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION
+                    ],
+                    "raw_ohlc_scale_factor": [1.0],
+                    "raw_ohlc_scale_reference_date": [date(2000, 1, 3)],
                 "adjclose": [10.0],
                 "return_quarantined": [False],
                 "return_quarantine_reason": [None],
@@ -1291,10 +1408,14 @@ def test_official_symbol_build_audit_accepts_relocated_yahoo_receipt(
                 ),
                 "dropped_off_calendar_fallback_rows": 0,
                 "dropped_off_calendar_fallback_examples": [],
-                "fallback_rows": 1,
-                "fallback_adjustment_rows": 0,
-                "fallback_symbols": 1,
-                "normalized_zero_ohlc_rows": 0,
+                    "fallback_rows": 1,
+                    "input_fallback_rows": 1,
+                    "fallback_adjustment_rows": 0,
+                    "fallback_symbols": 1,
+                    "normalized_zero_ohlc_rows": 0,
+                    "normalized_fallback_ohlc_rows": 1,
+                    "dropped_unanchored_fallback_rows": 0,
+                    "dropped_discontinuous_fallback_rows": 0,
                 "return_quarantined_rows": 0,
                 "lifecycle_episode_quarantined_rows": 0,
                 "listing_boundary_quarantined_rows": 0,

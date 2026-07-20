@@ -1209,7 +1209,11 @@ def _write_feature_parquet_atomic(
     requested_start_date: str | None = None,
     source: str = "yahoo",
 ) -> tuple[str | None, str | None]:
-    frame = _canonicalize_feature_frame(frame, keep_zero_volume=asset_class != "forex")
+    frame = _canonicalize_feature_frame(
+        frame,
+        keep_zero_volume=asset_class != "forex",
+        daily=asset_class != "crypto",
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     first_date, last_date = _frame_date_bounds(frame)
     handle = tempfile.NamedTemporaryFile(
@@ -1372,7 +1376,12 @@ def _yahoo_frame_to_polars(frame: object) -> object:
     raise TypeError(f"Unsupported Yahoo frame type for Polars conversion: {type(frame).__name__}")
 
 
-def _canonicalize_feature_frame(frame: object, *, keep_zero_volume: bool = True) -> object:
+def _canonicalize_feature_frame(
+    frame: object,
+    *,
+    keep_zero_volume: bool = True,
+    daily: bool = True,
+) -> object:
     _require_polars()
     if frame.is_empty():
         return _empty_feature_frame()
@@ -1383,7 +1392,19 @@ def _canonicalize_feature_frame(frame: object, *, keep_zero_volume: bool = True)
     ordered_columns = [column for column in BASE_OUTPUT_COLUMNS if column in frame.columns] + extra_columns
     normalized = frame.select(ordered_columns)
     numeric_columns = [column for column in normalized.columns if column != "date"]
-    expressions = [_datetime_expression(normalized)]
+    date_expression = _datetime_expression(normalized)
+    if daily:
+        # Yahoo's daily endpoints have emitted the same trading session with
+        # both midnight and exchange-close timestamps across API generations.
+        # A daily bar is keyed by session date, not wall-clock time; normalize
+        # before deduplication so incremental merges cannot create two returns
+        # for one market session.
+        date_expression = (
+            date_expression.cast(pl.Date, strict=False)
+            .cast(pl.Datetime("us"), strict=False)
+            .alias("date")
+        )
+    expressions = [date_expression]
     expressions.extend(
         pl.col(column).cast(pl.Float64, strict=False).fill_nan(None).alias(column)
         for column in numeric_columns
@@ -1418,7 +1439,12 @@ def _canonicalize_feature_frame(frame: object, *, keep_zero_volume: bool = True)
     return normalized.select(ordered_columns)
 
 
-def _normalize_download_frame(frame: object, *, keep_zero_volume: bool = True) -> object:
+def _normalize_download_frame(
+    frame: object,
+    *,
+    keep_zero_volume: bool = True,
+    daily: bool = True,
+) -> object:
     raw = _yahoo_frame_to_polars(frame)
     if raw.is_empty():
         return _empty_feature_frame()
@@ -1436,13 +1462,27 @@ def _normalize_download_frame(frame: object, *, keep_zero_volume: bool = True) -
         "Volume": "Trading_Volume",
     }
     renamed = raw.rename({source: target for source, target in rename_map.items() if source in raw.columns})
-    return _canonicalize_feature_frame(renamed, keep_zero_volume=keep_zero_volume)
+    return _canonicalize_feature_frame(
+        renamed,
+        keep_zero_volume=keep_zero_volume,
+        daily=daily,
+    )
 
 
-def _merge_feature_frames(existing_frame: object, fresh_frame: object, *, keep_zero_volume: bool = True) -> object:
+def _merge_feature_frames(
+    existing_frame: object,
+    fresh_frame: object,
+    *,
+    keep_zero_volume: bool = True,
+    daily: bool = True,
+) -> object:
     _require_polars()
     merged = pl.concat([existing_frame, fresh_frame], how="diagonal_relaxed")
-    return _canonicalize_feature_frame(merged, keep_zero_volume=keep_zero_volume)
+    return _canonicalize_feature_frame(
+        merged,
+        keep_zero_volume=keep_zero_volume,
+        daily=daily,
+    )
 
 
 def _frame_matches_expected_interval(frame: object, expected_seconds: int) -> bool:
@@ -1861,6 +1901,20 @@ def _record_from_input(asset_class: str, raw_symbol: str) -> SymbolRecord:
         raise ValueError("Symbol cannot be empty")
 
     upper_value = value.upper()
+    if asset_class == "tw_stocks":
+        delisted_match = re.fullmatch(
+            r"(?P<symbol>[0-9A-Z]{4,6})_(?P<venue>TW|TWO)",
+            upper_value,
+        )
+        if delisted_match is not None:
+            symbol = delisted_match.group("symbol")
+            venue = delisted_match.group("venue")
+            return SymbolRecord(
+                code=upper_value,
+                name=f"{symbol} (delisted)",
+                market="tw_delisted",
+                yahoo_symbol=f"{symbol}.{venue}",
+            )
     if asset_class == "crypto":
         if upper_value.endswith("-USD"):
             yahoo_symbol = upper_value
@@ -2479,6 +2533,7 @@ def _resolve_tw_symbols(
         return cached_incremental
 
     records: list[SymbolRecord] = []
+    live_records: list[SymbolRecord] = []
     output_dir = _resolve_asset_output_dir(args, "tw_stocks")
     local_manifest_records = _load_tw_symbols_from_local_manifest()
     local_parquet_records = _load_tw_symbols_from_local_parquet()
@@ -2498,13 +2553,14 @@ def _resolve_tw_symbols(
     official_delisted_records = (
         official_delisted_lifecycle_records if args.include_tw_delisted else []
     )
-    live_discovery_records: list[SymbolRecord] = []
     try:
         print(f"[symbols] fetching tw_stocks from exchange (timeout=60s)…")
-        fetched = _fetch_with_hard_timeout(_load_tw_symbols_from_exchange, timeout=60)
-        live_discovery_records = list(fetched)
-        records.extend(fetched)
-        print(f"[symbols] loaded {len(fetched)} tw_stocks symbols from exchange")
+        live_records = _fetch_with_hard_timeout(
+            _load_tw_symbols_from_exchange,
+            timeout=60,
+        )
+        records.extend(live_records)
+        print(f"[symbols] loaded {len(live_records)} tw_stocks symbols from exchange")
     except Exception as exc:
         if _strict_no_fallback(args):
             raise RuntimeError(
@@ -2527,7 +2583,7 @@ def _resolve_tw_symbols(
         records.extend(official_delisted_records)
         active_symbol_keys = {
             key
-            for record in live_discovery_records
+            for record in live_records
             for key in _candidate_symbol_keys("tw_stocks", record)
         }
         delisted_symbol_keys = {
@@ -2583,6 +2639,7 @@ def _resolve_tw_symbols(
             excluded_records=excluded_records,
         )
 
+    discovered_delisted_records: list[SymbolRecord] = []
     if args.include_tw_delisted:
         if official_delisted_records:
             print(
@@ -2590,9 +2647,34 @@ def _resolve_tw_symbols(
                 "venue records from canonical official parquet"
             )
         try:
-            records.extend(_fetch_with_hard_timeout(_load_tw_delisted_symbols, timeout=60))
+            discovered_delisted_records = _fetch_with_hard_timeout(
+                _load_tw_delisted_symbols,
+                timeout=60,
+            )
+            records.extend(discovered_delisted_records)
         except Exception as exc:
             print(f"[symbols] failed to load tw delisted list: {exc}")
+    # Cached manifests predate listing-state tracking and can label an old,
+    # now-delisted plain code as active.  Reconcile by provider symbol before
+    # the final dedupe: current exchange discovery wins if a code was reused;
+    # otherwise durable official/scraped delisting evidence wins.  Without
+    # this step valid empty Yahoo histories become hard failures forever and a
+    # targeted repair cannot certify the fallback manifest.
+    active_symbol_keys: set[str] = set()
+    for record in live_records:
+        active_symbol_keys.update(_candidate_symbol_keys("tw_stocks", record))
+    delisted_symbol_keys: set[str] = set()
+    for record in [
+        *official_delisted_lifecycle_records,
+        *discovered_delisted_records,
+    ]:
+        delisted_symbol_keys.update(_candidate_symbol_keys("tw_stocks", record))
+    records = _apply_daily_listing_state(
+        "tw_stocks",
+        records,
+        active_symbol_keys,
+        delisted_symbol_keys,
+    )
     return _filter_tw_records_for_supported_universe(
         records,
         excluded_records=excluded_records,
@@ -2779,22 +2861,16 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         if args.limit is not None:
             deduped = deduped[: args.limit]
         manifest_records = list(deduped)
+        output_dir = _resolve_asset_output_dir(args, asset_class)
+        cached = _resolve_cached_manifest(output_dir, asset_class)
+        known_records = list(cached)
         if _is_incremental_mode(args):
-            output_dir = _resolve_asset_output_dir(args, asset_class)
-            cached = _resolve_cached_manifest(output_dir, asset_class)
-            known = {
-                record.code: record
-                for record in [
-                    *cached,
-                    *_load_repo_symbol_fallback(asset_class),
-                ]
-            }
-            deduped = [known.get(record.code, record) for record in deduped]
-            # A targeted repair limits the scheduled request set; it must not
-            # replace the durable universe manifest with that subset.
-            manifest_records = _dedupe_records_by_code(
-                [*cached, *manifest_records]
-            )
+            known_records.extend(_load_repo_symbol_fallback(asset_class))
+        known = {record.code: record for record in known_records}
+        deduped = [known.get(record.code, record) for record in deduped]
+        # A targeted run limits only the scheduled request set; it must not
+        # replace the durable universe manifest with that subset.
+        manifest_records = _dedupe_records_by_code([*cached, *manifest_records])
         return SymbolResolution(
             scheduled_records=deduped,
             manifest_records=manifest_records,
@@ -2812,22 +2888,16 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         if args.limit is not None:
             deduped = deduped[: args.limit]
         manifest_records = list(deduped)
+        output_dir = _resolve_asset_output_dir(args, asset_class)
+        cached = _resolve_cached_manifest(output_dir, asset_class)
+        known_records = list(cached)
         if _is_incremental_mode(args):
-            output_dir = _resolve_asset_output_dir(args, asset_class)
-            cached = _resolve_cached_manifest(output_dir, asset_class)
-            known = {
-                record.code: record
-                for record in [
-                    *cached,
-                    *_load_repo_symbol_fallback(asset_class),
-                ]
-            }
-            deduped = [known.get(record.code, record) for record in deduped]
-            # Preserve the full cached manifest while scheduling only the
-            # caller-requested symbols for repair.
-            manifest_records = _dedupe_records_by_code(
-                [*cached, *manifest_records]
-            )
+            known_records.extend(_load_repo_symbol_fallback(asset_class))
+        known = {record.code: record for record in known_records}
+        deduped = [known.get(record.code, record) for record in deduped]
+        # Preserve the full cached manifest while scheduling only the
+        # caller-requested symbols.
+        manifest_records = _dedupe_records_by_code([*cached, *manifest_records])
         return SymbolResolution(
             scheduled_records=deduped,
             manifest_records=manifest_records,
@@ -3175,7 +3245,11 @@ def _download_symbol(
                 )
                 existing_frame = None
             elif "date" in existing_frame.columns:
-                existing_frame = _canonicalize_feature_frame(existing_frame, keep_zero_volume=asset_class != "forex")
+                existing_frame = _canonicalize_feature_frame(
+                    existing_frame,
+                    keep_zero_volume=asset_class != "forex",
+                    daily=asset_class != "crypto",
+                )
         except Exception as exc:
             existing_frame = None
             print(f"[download] merge-existing read failed for {output_path.name}: {exc}")
@@ -3265,7 +3339,11 @@ def _download_symbol(
                     _download_frame,
                     timeout=YF_DOWNLOAD_HARD_TIMEOUT_SECONDS,
                 )
-                normalized = _normalize_download_frame(frame, keep_zero_volume=asset_class != "forex")
+                normalized = _normalize_download_frame(
+                    frame,
+                    keep_zero_volume=asset_class != "forex",
+                    daily=asset_class != "crypto",
+                )
                 captured = ""
                 captured_rate_limit = any(
                     marker in captured
@@ -3320,6 +3398,7 @@ def _download_symbol(
                         existing_frame,
                         normalized,
                         keep_zero_volume=asset_class != "forex",
+                        daily=asset_class != "crypto",
                     )
 
                 first_date, last_date = _write_feature_parquet_atomic(
@@ -3456,7 +3535,13 @@ def _report_frame_from_rows(rows: list[dict[str, object]], columns: list[str]) -
     return pl.DataFrame(rows, infer_schema_length=None).select(columns)
 
 
-def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[DownloadResult]) -> None:
+def _write_download_artifacts(
+    output_dir: Path,
+    asset_class: str,
+    results: list[DownloadResult],
+    *,
+    manifest_codes: set[str] | None = None,
+) -> None:
     report_path = output_dir / "download_report.csv"
     _require_polars()
     report_columns = [
@@ -3474,13 +3559,28 @@ def _write_download_artifacts(output_dir: Path, asset_class: str, results: list[
     ]
     report_rows = [asdict(result) for result in results]
     report_frame = _report_frame_from_rows(report_rows, report_columns)
+    if manifest_codes is not None and report_path.is_file():
+        try:
+            previous = pl.read_csv(report_path, infer_schema_length=10000)
+            if set(report_columns) <= set(previous.columns):
+                previous = previous.select(report_columns).filter(
+                    pl.col("code").cast(pl.String).is_in(sorted(manifest_codes))
+                )
+                report_frame = (
+                    pl.concat([previous, report_frame], how="diagonal_relaxed")
+                    .unique(subset=["code"], keep="last", maintain_order=True)
+                )
+        except Exception:
+            # A malformed old report must not block a fresh complete write.
+            pass
     report_frame.write_csv(report_path)
 
     counts: dict[str, int] = {}
     total_rows = 0
-    for result in results:
-        counts[result.status] = counts.get(result.status, 0) + 1
-        total_rows += result.rows
+    for row in report_frame.iter_rows(named=True):
+        status = str(row.get("status") or "")
+        counts[status] = counts.get(status, 0) + 1
+        total_rows += int(row.get("rows") or 0)
 
     summary = {
         "asset_class": asset_class,
@@ -4229,7 +4329,12 @@ def _repair_asset_class(asset_class: str, args: argparse.Namespace) -> dict[str,
     )
 
     if results:
-        _write_download_artifacts(output_dir, asset_class, results)
+        _write_download_artifacts(
+            output_dir,
+            asset_class,
+            results,
+            manifest_codes={record.code for record in resolution.manifest_records},
+        )
     repair_report_path = output_dir / "repair_report.csv"
     repair_report_columns = [
         "code",
@@ -4312,7 +4417,12 @@ def _download_asset_class(asset_class: str, args: argparse.Namespace) -> dict[st
     )
 
     results.sort(key=lambda item: item.code)
-    _write_download_artifacts(output_dir, asset_class, results)
+    _write_download_artifacts(
+        output_dir,
+        asset_class,
+        results,
+        manifest_codes={record.code for record in resolution.manifest_records},
+    )
 
     counts: dict[str, int] = {}
     for result in results:

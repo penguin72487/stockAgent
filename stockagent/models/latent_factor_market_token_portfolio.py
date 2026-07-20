@@ -18,16 +18,15 @@ from stockagent.portfolio_contract import normalize_portfolio_mode
 
 def _safe_attention_mask(mask: torch.Tensor) -> torch.Tensor:
     safe_mask = mask.to(dtype=torch.bool)
-    condition = safe_mask.any(dim=1).all()
-    message = "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row"
-    if torch.compiler.is_compiling():
-        # Avoid a host scalar extraction/graph break while Dynamo is tracing.
-        torch._assert_async(condition, message)
-    else:
-        # Keep eager validation synchronous so a device-side assertion cannot
-        # poison the CUDA context used by the rest of the process.
-        torch._assert(condition, message)
-    return safe_mask
+    # Attention kernels cannot consume an all-masked row. Add one internal
+    # dummy key for those rows; callers retain the original mask and zero every
+    # output afterward, so this changes no portfolio weight and cannot poison
+    # CUDA/NCCL with a device-side assertion.
+    empty = ~safe_mask.any(dim=1, keepdim=True)
+    first_symbol = torch.arange(
+        safe_mask.size(1), device=safe_mask.device
+    ).unsqueeze(0) == 0
+    return safe_mask | (empty & first_symbol)
 
 
 class LatentFactorMarketTokenPortfolioModel(nn.Module):

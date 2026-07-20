@@ -82,6 +82,7 @@ PAPER_TOKENS = {
 _MATPLOTLIB_TRANSFORM_DOT_WARNING = r".*invalid value encountered in dot.*"
 _DEFAULT_MARKET_ARTIFACTS_ROOT = Path("artifacts/markets")
 _DEFAULT_MARKET_CONFIG_ROOT = Path("configs/markets")
+_EXPLAINABILITY_SPLIT = "test"
 _PLOT_ASPECT_RATIO = 17.0 / 6.0
 _DEFAULT_PLOT_HEIGHT = 6.0
 _DEFAULT_PLOT_HEIGHT_PX = 600
@@ -209,7 +210,6 @@ class ExplainabilitySettings:
     perturb_max_input_elements: int = 576_000_000
     counterfactual_compile: bool = True
     sample_method: str = "even"
-    first_test_year_only: bool = False
     report_style: str = "paper"
     plot_theme: str = "paper"
     standard_plots: bool = True
@@ -218,6 +218,7 @@ class ExplainabilitySettings:
     shap_mode: str = "score_head_surrogate"
     j_lens_enabled: bool = True
     j_lens_intervention_fraction: float = 0.01
+    j_lens_vjp_batch_size: int = 1
     regime_analysis: bool = True
     fold_stability: bool = True
     umap_enabled: bool = True
@@ -234,7 +235,6 @@ class LoadedExplanationContext:
     panel: PanelData
     folds: list[WalkForwardFold]
     fold: WalkForwardFold
-    split: str
     checkpoint_path: Path
     output_dir: Path
 
@@ -313,7 +313,6 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         perturb_max_input_elements=int(getattr(training, "explain_perturb_max_input_elements", 8_000_000)),
         counterfactual_compile=bool(getattr(training, "explain_counterfactual_compile", False)),
         sample_method=str(getattr(training, "explain_sample_method", "even")),
-        first_test_year_only=bool(getattr(training, "explain_first_test_year_only", True)),
         report_style=str(getattr(training, "explain_report_style", "none")),
         plot_theme=str(getattr(training, "explain_plot_theme", "paper")),
         standard_plots=bool(getattr(training, "explain_standard_plots", False)),
@@ -323,6 +322,10 @@ def settings_from_training_config(training: Any) -> ExplainabilitySettings:
         j_lens_enabled=bool(getattr(training, "explain_j_lens_enabled", False)),
         j_lens_intervention_fraction=float(
             getattr(training, "explain_j_lens_intervention_fraction", 0.01)
+        ),
+        j_lens_vjp_batch_size=max(
+            1,
+            int(getattr(training, "explain_j_lens_vjp_batch_size", 1)),
         ),
         regime_analysis=bool(getattr(training, "explain_regime_analysis", False)),
         fold_stability=bool(getattr(training, "explain_fold_stability", False)),
@@ -414,6 +417,7 @@ def _normalize_shap_mode(value: str | None) -> str:
     return normalized
 
 
+@lru_cache(maxsize=4096)
 def _feature_group(feature: str) -> str:
     lowered = str(feature).lower()
     for group, patterns in FEATURE_GROUP_PATTERNS:
@@ -422,6 +426,7 @@ def _feature_group(feature: str) -> str:
     return "Other"
 
 
+@lru_cache(maxsize=4096)
 def _feature_label(feature: str) -> str:
     return f"{_feature_group(feature)} / {feature}"
 
@@ -511,6 +516,47 @@ def _with_feature_labels(frame: pl.DataFrame, feature_col: str = "feature") -> p
 def _write_csv(frame: pl.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.write_csv(path)
+
+
+def _write_decision_inventory_streaming(
+    spec: dict[str, Any],
+    path: Path,
+    *,
+    row_chunk_size: int = 64,
+    progress_enabled: bool = False,
+) -> int:
+    weights = spec["weights"]
+    scores = spec["scores"]
+    returns = spec["returns"]
+    mask = spec["mask"]
+    selected = spec["selected"]
+    dates = list(spec["dates"])
+    symbols = list(spec["symbols"])
+    total_rows = int(weights.size(0))
+    row_chunk_size = max(1, int(row_chunk_size))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with path.open("wb") as handle:
+        for start in tqdm(
+            range(0, total_rows, row_chunk_size),
+            desc="Write decision inventory",
+            unit="chunk",
+            leave=False,
+            disable=not progress_enabled,
+        ):
+            end = min(total_rows, start + row_chunk_size)
+            frame = _decision_inventory(
+                weights[start:end],
+                scores[start:end],
+                returns[start:end],
+                mask[start:end],
+                dates[start:end],
+                symbols,
+                selected[start:end],
+            )
+            frame.write_csv(handle, include_header=(start == 0))
+            written += int(frame.height)
+    return written
 
 
 def _frame_to_dict(frame: pl.DataFrame) -> dict[str, list[Any]]:
@@ -1002,12 +1048,13 @@ def _portfolio_j_lens(
     enabled: bool,
     intervention_fraction: float,
     progress_enabled: bool,
+    vjp_batch_size: int = 1,
 ) -> tuple[dict[str, pl.DataFrame], dict[str, Any], list[str]]:
     """Compute a complete corpus-averaged Jacobian lens for portfolio models.
 
     The lens transports every residual-width activation to the final stock
-    embedding.  It follows the original J-lens construction: one VJP per
-    output dimension, averaged over positions and examples.  Since this
+    embedding. It evaluates the complete output-dimension basis with batched
+    VJPs, then averages over positions and examples. Since this
     portfolio model has a scalar shared score head rather than a vocabulary,
     the readable direction is signed bullish/bearish score influence.
     """
@@ -1089,27 +1136,34 @@ def _portfolio_j_lens(
         name: int(position_masks[name].sum().detach().cpu())
         for name in layer_names
     }
+    vjp_batch_size = max(1, min(d_model, int(vjp_batch_size)))
+    z_sum = z_stock.sum(dim=(0, 1))
+    vjp_starts = range(0, d_model, vjp_batch_size)
     vjp_progress = tqdm(
-        range(d_model),
+        vjp_starts,
+        total=math.ceil(d_model / vjp_batch_size),
         desc="J-Lens output dimensions",
-        unit="dim",
+        unit="batch",
         leave=False,
         disable=not progress_enabled,
     )
-    for output_dim in vjp_progress:
-        target = z_stock[..., output_dim].sum()
+    identity = torch.eye(d_model, device=x.device, dtype=z_sum.dtype)
+    for output_start in vjp_progress:
+        output_end = min(d_model, output_start + vjp_batch_size)
         gradients = torch.autograd.grad(
-            target,
+            z_sum,
             tensors,
-            retain_graph=output_dim + 1 < d_model,
+            grad_outputs=identity[output_start:output_end],
+            is_grads_batched=True,
+            retain_graph=output_end < d_model,
             allow_unused=True,
         )
         for layer_name, gradient in zip(layer_names, gradients, strict=True):
             if gradient is None:
                 continue
-            gradient_rows = gradient.float().reshape(-1, d_model)
+            gradient_rows = gradient.float().reshape(output_end - output_start, -1, d_model)
             valid_positions = position_masks[layer_name].reshape(-1)
-            matrices[layer_name][output_dim] = gradient_rows[valid_positions].mean(dim=0)
+            matrices[layer_name][output_start:output_end] = gradient_rows[:, valid_positions].mean(dim=1)
 
     transport_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
@@ -1320,6 +1374,8 @@ def _portfolio_j_lens(
         "layers": len(layer_names),
         "d_model": d_model,
         "vjp_passes": d_model,
+        "vjp_batch_size": vjp_batch_size,
+        "autograd_calls": math.ceil(d_model / vjp_batch_size),
         "intervention_fraction": fraction,
         "faithfulness_layers": len(faithfulness_rows),
         "complete_no_top_k": True,
@@ -1566,20 +1622,46 @@ def _feature_time_frame(
     metric_name: str,
 ) -> pl.DataFrame:
     values = attribution.detach().abs().mean(dim=(0, 2)).cpu().numpy()
-    rows: list[dict[str, Any]] = []
-    for time_idx in range(values.shape[0]):
-        for feat_idx, feature in enumerate(feature_names):
-            rows.append(
-                {
-                    "lookback_index": int(time_idx),
-                    "lookback_from_end": int(values.shape[0] - 1 - time_idx),
-                    "feature": feature,
-                    "feature_group": _feature_group(feature),
-                    "feature_label": _feature_label(feature),
-                    metric_name: float(values[time_idx, feat_idx]),
-                }
+    return _feature_time_values_frame(
+        values.shape[0],
+        feature_names,
+        {metric_name: values},
+    )
+
+
+def _feature_time_values_frame(
+    lookback: int,
+    feature_names: list[str],
+    metrics: dict[str, np.ndarray],
+) -> pl.DataFrame:
+    lookback = max(0, int(lookback))
+    feature_count = len(feature_names)
+    if lookback == 0 or feature_count == 0:
+        return pl.DataFrame()
+    feature_values = np.asarray(feature_names, dtype=object)
+    data: dict[str, Any] = {
+        "lookback_index": np.repeat(np.arange(lookback, dtype=np.int64), feature_count),
+        "lookback_from_end": np.repeat(
+            np.arange(lookback - 1, -1, -1, dtype=np.int64), feature_count
+        ),
+        "feature": np.tile(feature_values, lookback),
+        "feature_group": np.tile(
+            np.asarray([_feature_group(name) for name in feature_names], dtype=object),
+            lookback,
+        ),
+        "feature_label": np.tile(
+            np.asarray([_feature_label(name) for name in feature_names], dtype=object),
+            lookback,
+        ),
+    }
+    for name, values in metrics.items():
+        array = np.asarray(values)
+        if tuple(array.shape) != (lookback, feature_count):
+            raise ValueError(
+                f"feature-time metric {name!r} must have shape {(lookback, feature_count)}, got {array.shape}"
             )
-    return pl.DataFrame(rows)
+        data[name] = array.astype(np.float64, copy=False).reshape(-1)
+    return pl.DataFrame(data)
 
 
 
@@ -1623,14 +1705,31 @@ def _perturbation_importance(
     compile_forward: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any]]:
     stage_start = time.perf_counter()
-    rows: list[dict[str, Any]] = []
-    perturbations = [
+    lookback = int(x.size(1))
+    feature_count = len(feature_names)
+    weight_delta_values = np.zeros((lookback, feature_count), dtype=np.float64)
+    score_delta_values = np.zeros((lookback, feature_count), dtype=np.float64)
+    all_perturbations = [
         (time_idx, feat_idx, feature)
-        for time_idx in range(int(x.size(1)))
+        for time_idx in range(lookback)
         for feat_idx, feature in enumerate(feature_names)
     ]
+    # A zero->zero intervention is the identity function. Detect those cells
+    # across the complete date/symbol microbatch and emit their exact zero
+    # result without paying for a Transformer forward. This preserves the full
+    # L*F output grid and is especially valuable for point-in-time features
+    # before their first observation.
+    nonzero_cells = torch.count_nonzero(x.detach(), dim=(0, 2)).ne(0).cpu().numpy()
+    perturbations = [
+        item for item in all_perturbations if bool(nonzero_cells[item[0], item[1]])
+    ]
+    zero_perturbations = [
+        item for item in all_perturbations if not bool(nonzero_cells[item[0], item[1]])
+    ]
     diagnostics: dict[str, Any] = {
-        "num_perturbations": int(len(perturbations)),
+        "num_perturbations": int(len(all_perturbations)),
+        "forwarded_perturbations": int(len(perturbations)),
+        "zero_identity_perturbations": int(len(zero_perturbations)),
         "requested_batch_size": int(batch_size),
         "max_auto_batch_size": int(max_auto_batch_size),
         "max_input_elements": int(max_input_elements),
@@ -1649,9 +1748,28 @@ def _perturbation_importance(
         "embedded_fast_path": False,
         "compiled_forward": False,
     }
+    if not all_perturbations:
+        return pl.DataFrame(), pl.DataFrame(), diagnostics
     if not perturbations:
-        frame = pl.DataFrame(rows)
-        return frame, pl.DataFrame(), diagnostics
+        elapsed_s = float(time.perf_counter() - stage_start)
+        diagnostics["elapsed_s"] = elapsed_s
+        diagnostics["perturbations_per_s"] = float(len(all_perturbations)) / max(elapsed_s, 1e-9)
+        frame = _feature_time_values_frame(
+            lookback,
+            feature_names,
+            {
+                "weight_abs_delta": weight_delta_values,
+                "score_abs_delta": score_delta_values,
+            },
+        )
+        summary = frame.group_by("feature").agg(
+            [
+                pl.col("weight_abs_delta").sum(),
+                pl.col("score_abs_delta").sum(),
+            ]
+        )
+        summary = _with_feature_labels(summary).with_columns(pl.lit(0.0).alias("weight_delta_share"))
+        return frame, summary, diagnostics
     chunk_size = _auto_repeat_chunk_size(
         x,
         len(perturbations),
@@ -1683,12 +1801,13 @@ def _perturbation_importance(
             and callable(getattr(embedded_api, "forward_from_embedded_explainability_compiled", None))
         )
     progress = tqdm(
-        total=len(perturbations),
+        total=len(all_perturbations),
         desc="Feature-time perturbation",
         unit="cell",
         leave=False,
         disable=not progress_enabled,
     )
+    progress.update(len(zero_perturbations))
     with torch.no_grad():
         start = 0
         while start < len(perturbations):
@@ -1814,26 +1933,25 @@ def _perturbation_importance(
                 continue
             diagnostics["forward_batches"] = int(diagnostics["forward_batches"]) + 1
             diagnostics["final_chunk_size"] = int(chunk_size)
-            for local_idx, (time_idx, _, feature) in enumerate(chunk):
-                rows.append(
-                    {
-                        "lookback_index": int(time_idx),
-                        "lookback_from_end": int(x.size(1) - 1 - time_idx),
-                        "feature": feature,
-                        "feature_group": _feature_group(feature),
-                        "feature_label": _feature_label(feature),
-                        "weight_abs_delta": float(weight_deltas[local_idx]),
-                        "score_abs_delta": float(score_deltas[local_idx]),
-                    }
-                )
+            for local_idx, (time_idx, feat_idx, _feature) in enumerate(chunk):
+                weight_delta_values[time_idx, feat_idx] = float(weight_deltas[local_idx])
+                score_delta_values[time_idx, feat_idx] = float(score_deltas[local_idx])
             start += repeats
             progress.update(repeats)
             progress.set_postfix(forwards=diagnostics["forward_batches"], batch=chunk_size, refresh=False)
     progress.close()
     elapsed_s = float(time.perf_counter() - stage_start)
     diagnostics["elapsed_s"] = elapsed_s
-    diagnostics["perturbations_per_s"] = float(len(perturbations)) / max(elapsed_s, 1e-9)
-    frame = pl.DataFrame(rows)
+    diagnostics["perturbations_per_s"] = float(len(all_perturbations)) / max(elapsed_s, 1e-9)
+    diagnostics["forwarded_perturbations_per_s"] = float(len(perturbations)) / max(elapsed_s, 1e-9)
+    frame = _feature_time_values_frame(
+        lookback,
+        feature_names,
+        {
+            "weight_abs_delta": weight_delta_values,
+            "score_abs_delta": score_delta_values,
+        },
+    )
     if frame.is_empty():
         return frame, pl.DataFrame(), diagnostics
     summary = frame.group_by("feature").agg(
@@ -1867,22 +1985,76 @@ def _feature_correlations(
     rows: list[dict[str, Any]] = []
     for source_name, values in (("last", x_last), ("lookback_mean", x_mean)):
         values_np = values.reshape(-1, values.size(-1)).cpu().numpy()
-        for feat_idx, feature in tqdm(
-            enumerate(feature_names),
-            total=len(feature_names),
-            desc=f"Feature correlations: {source_name}",
-            unit="feature",
-            leave=False,
-            disable=not progress_enabled,
-        ):
-            feat = values_np[:, feat_idx]
-            valid = mask_flat & np.isfinite(feat) & np.isfinite(score_np) & np.isfinite(weight_np)
-            if valid.sum() < 3:
-                score_corr = 0.0
-                weight_corr = 0.0
+        common_valid = mask_flat & np.isfinite(score_np) & np.isfinite(weight_np)
+        if bool(np.isfinite(values_np).all()):
+            valid_indices = np.flatnonzero(common_valid)
+            count = int(valid_indices.size)
+            feature_count = int(values_np.shape[1])
+            sum_x = np.zeros(feature_count, dtype=np.float64)
+            sum_x2 = np.zeros(feature_count, dtype=np.float64)
+            sum_xy_score = np.zeros(feature_count, dtype=np.float64)
+            sum_xy_weight = np.zeros(feature_count, dtype=np.float64)
+            sum_score = 0.0
+            sum_score2 = 0.0
+            sum_weight = 0.0
+            sum_weight2 = 0.0
+            block_size = 65_536
+            for start in tqdm(
+                range(0, count, block_size),
+                total=math.ceil(count / block_size) if count else 0,
+                desc=f"Feature correlations: {source_name}",
+                unit="block",
+                leave=False,
+                disable=not progress_enabled,
+            ):
+                idx = valid_indices[start : start + block_size]
+                block = values_np[idx].astype(np.float64, copy=False)
+                score_block = score_np[idx].astype(np.float64, copy=False)
+                weight_block = weight_np[idx].astype(np.float64, copy=False)
+                sum_x += block.sum(axis=0, dtype=np.float64)
+                sum_x2 += np.square(block).sum(axis=0, dtype=np.float64)
+                sum_xy_score += block.T @ score_block
+                sum_xy_weight += block.T @ weight_block
+                sum_score += float(score_block.sum(dtype=np.float64))
+                sum_score2 += float(np.square(score_block).sum(dtype=np.float64))
+                sum_weight += float(weight_block.sum(dtype=np.float64))
+                sum_weight2 += float(np.square(weight_block).sum(dtype=np.float64))
+            if count >= 3:
+                inv_count = 1.0 / float(count)
+                var_x = np.maximum(sum_x2 - np.square(sum_x) * inv_count, 0.0)
+                var_score = max(sum_score2 - sum_score * sum_score * inv_count, 0.0)
+                var_weight = max(sum_weight2 - sum_weight * sum_weight * inv_count, 0.0)
+                score_den = np.sqrt(var_x * var_score)
+                weight_den = np.sqrt(var_x * var_weight)
+                score_corrs = np.divide(
+                    sum_xy_score - sum_x * sum_score * inv_count,
+                    score_den,
+                    out=np.zeros_like(sum_x),
+                    where=score_den > 0.0,
+                )
+                weight_corrs = np.divide(
+                    sum_xy_weight - sum_x * sum_weight * inv_count,
+                    weight_den,
+                    out=np.zeros_like(sum_x),
+                    where=weight_den > 0.0,
+                )
             else:
-                score_corr = _safe_corrcoef(feat[valid], score_np[valid])
-                weight_corr = _safe_corrcoef(feat[valid], weight_np[valid])
+                score_corrs = np.zeros(feature_count, dtype=np.float64)
+                weight_corrs = np.zeros(feature_count, dtype=np.float64)
+        else:
+            # Sanitized explainability inputs take the vectorized path. Keep a
+            # rare per-feature fallback for direct callers with NaN/Inf data.
+            score_corrs = np.zeros(len(feature_names), dtype=np.float64)
+            weight_corrs = np.zeros(len(feature_names), dtype=np.float64)
+            for feat_idx in range(len(feature_names)):
+                feat = values_np[:, feat_idx]
+                valid = common_valid & np.isfinite(feat)
+                if valid.sum() >= 3:
+                    score_corrs[feat_idx] = _safe_corrcoef(feat[valid], score_np[valid])
+                    weight_corrs[feat_idx] = _safe_corrcoef(feat[valid], weight_np[valid])
+        for feat_idx, feature in enumerate(feature_names):
+            score_corr = float(score_corrs[feat_idx])
+            weight_corr = float(weight_corrs[feat_idx])
             rows.append(
                 {
                     "source": source_name,
@@ -1894,6 +2066,93 @@ def _feature_correlations(
                 }
             )
     frame = pl.DataFrame(rows)
+    return frame.sort(["abs_score_corr", "abs_weight_corr"], descending=[True, True]) if not frame.is_empty() else frame
+
+
+def _feature_correlations_chunked(
+    x_chunks: list[torch.Tensor],
+    scores: torch.Tensor,
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+    feature_names: list[str],
+    *,
+    progress_enabled: bool = False,
+) -> pl.DataFrame:
+    """Compute exact correlations from additive moments without concatenating X."""
+    feature_count = len(feature_names)
+    rows_out: list[dict[str, Any]] = []
+    for source_name in ("last", "lookback_mean"):
+        count = np.zeros(feature_count, dtype=np.float64)
+        sum_x = np.zeros(feature_count, dtype=np.float64)
+        sum_x2 = np.zeros(feature_count, dtype=np.float64)
+        sum_score = np.zeros(feature_count, dtype=np.float64)
+        sum_score2 = np.zeros(feature_count, dtype=np.float64)
+        sum_weight = np.zeros(feature_count, dtype=np.float64)
+        sum_weight2 = np.zeros(feature_count, dtype=np.float64)
+        sum_xy_score = np.zeros(feature_count, dtype=np.float64)
+        sum_xy_weight = np.zeros(feature_count, dtype=np.float64)
+        row_offset = 0
+        for x_chunk in tqdm(
+            x_chunks,
+            desc=f"Feature correlations: {source_name}",
+            unit="chunk",
+            leave=False,
+            disable=not progress_enabled,
+        ):
+            chunk_rows = int(x_chunk.size(0))
+            values = x_chunk[:, -1] if source_name == "last" else x_chunk.float().mean(dim=1)
+            values_np = values.reshape(-1, int(values.size(-1))).float().cpu().numpy()
+            score_np = scores[row_offset : row_offset + chunk_rows].reshape(-1).float().cpu().numpy()
+            weight_np = weights[row_offset : row_offset + chunk_rows].reshape(-1).float().cpu().numpy()
+            mask_np = mask[row_offset : row_offset + chunk_rows].reshape(-1).bool().cpu().numpy()
+            base_valid = mask_np & np.isfinite(score_np) & np.isfinite(weight_np)
+            finite_x = np.isfinite(values_np)
+            valid = finite_x & base_valid.reshape(-1, 1)
+            safe_x = np.where(valid, values_np, 0.0).astype(np.float64, copy=False)
+            score_matrix = np.where(valid, score_np.reshape(-1, 1), 0.0).astype(np.float64, copy=False)
+            weight_matrix = np.where(valid, weight_np.reshape(-1, 1), 0.0).astype(np.float64, copy=False)
+            count += valid.sum(axis=0, dtype=np.float64)
+            sum_x += safe_x.sum(axis=0, dtype=np.float64)
+            sum_x2 += np.square(safe_x).sum(axis=0, dtype=np.float64)
+            sum_score += score_matrix.sum(axis=0, dtype=np.float64)
+            sum_score2 += np.square(score_matrix).sum(axis=0, dtype=np.float64)
+            sum_weight += weight_matrix.sum(axis=0, dtype=np.float64)
+            sum_weight2 += np.square(weight_matrix).sum(axis=0, dtype=np.float64)
+            sum_xy_score += (safe_x * score_matrix).sum(axis=0, dtype=np.float64)
+            sum_xy_weight += (safe_x * weight_matrix).sum(axis=0, dtype=np.float64)
+            row_offset += chunk_rows
+        safe_count = np.maximum(count, 1.0)
+        var_x = np.maximum(sum_x2 - np.square(sum_x) / safe_count, 0.0)
+        var_score = np.maximum(sum_score2 - np.square(sum_score) / safe_count, 0.0)
+        var_weight = np.maximum(sum_weight2 - np.square(sum_weight) / safe_count, 0.0)
+        score_den = np.sqrt(var_x * var_score)
+        weight_den = np.sqrt(var_x * var_weight)
+        score_corrs = np.divide(
+            sum_xy_score - sum_x * sum_score / safe_count,
+            score_den,
+            out=np.zeros(feature_count, dtype=np.float64),
+            where=(count >= 3.0) & (score_den > 0.0),
+        )
+        weight_corrs = np.divide(
+            sum_xy_weight - sum_x * sum_weight / safe_count,
+            weight_den,
+            out=np.zeros(feature_count, dtype=np.float64),
+            where=(count >= 3.0) & (weight_den > 0.0),
+        )
+        for feat_idx, feature in enumerate(feature_names):
+            score_corr = float(score_corrs[feat_idx])
+            weight_corr = float(weight_corrs[feat_idx])
+            rows_out.append(
+                {
+                    "source": source_name,
+                    "feature": feature,
+                    "score_corr": score_corr,
+                    "weight_corr": weight_corr,
+                    "abs_score_corr": abs(score_corr),
+                    "abs_weight_corr": abs(weight_corr),
+                }
+            )
+    frame = pl.DataFrame(rows_out)
     return frame.sort(["abs_score_corr", "abs_weight_corr"], descending=[True, True]) if not frame.is_empty() else frame
 
 
@@ -1940,6 +2199,49 @@ def _decision_inventory(
             "selected_for_attribution": selected_cpu.numpy().reshape(-1),
         }
     )
+
+
+def _decision_exposure_by_side_frame(weights: torch.Tensor, dates: list[str]) -> pl.DataFrame:
+    safe = torch.nan_to_num(weights.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    long_values = safe.clamp_min(0.0).sum(dim=1).numpy()
+    short_values = (-safe.clamp_max(0.0)).sum(dim=1).numpy()
+    flat_values = np.zeros_like(long_values)
+    return pl.DataFrame(
+        {
+            "date": np.repeat(np.asarray(dates, dtype=object), 3),
+            "side": np.tile(np.asarray(["long", "short", "flat"], dtype=object), len(dates)),
+            "weight": np.stack((long_values, short_values, flat_values), axis=1).reshape(-1),
+        }
+    )
+
+
+def _position_distribution_from_tensors(
+    weights: torch.Tensor,
+    mask: torch.Tensor,
+) -> pl.DataFrame:
+    weight_np = torch.nan_to_num(
+        weights.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0
+    ).numpy()
+    valid = mask.detach().bool().cpu().numpy() & (weight_np != 0.0)
+    rows: list[dict[str, Any]] = []
+    for side in ("all_nonzero", "long", "short"):
+        side_valid = valid
+        if side == "long":
+            side_valid = valid & (weight_np > 0.0)
+        elif side == "short":
+            side_valid = valid & (weight_np < 0.0)
+        values = np.abs(weight_np[side_valid])
+        if values.size == 0:
+            continue
+        row: dict[str, Any] = {
+            "side": side,
+            "count": int(values.size),
+            "mean_abs_weight": float(values.mean()),
+        }
+        for quantile in (0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0):
+            row[f"q{int(quantile * 100):02d}"] = float(np.quantile(values, quantile))
+        rows.append(row)
+    return pl.DataFrame(rows)
 
 
 def _exposure_coverage_curve(
@@ -2005,7 +2307,8 @@ def _completeness_frame(
     weights: torch.Tensor,
     mask: torch.Tensor,
     selected: torch.Tensor,
-    inventory: pl.DataFrame,
+    inventory: pl.DataFrame | None,
+    decision_inventory_rows: int | None = None,
     lookback: int,
     feature_count: int,
     grad_ft: pl.DataFrame,
@@ -2023,7 +2326,11 @@ def _completeness_frame(
             {
                 "sample_rows": int(weights.size(0)),
                 "symbols_per_row": int(weights.size(1)),
-                "decision_inventory_rows": int(len(inventory)),
+                "decision_inventory_rows": int(
+                    decision_inventory_rows
+                    if decision_inventory_rows is not None
+                    else (len(inventory) if inventory is not None else 0)
+                ),
                 "expected_decision_inventory_rows": int(weights.numel()),
                 "eligible_nonzero_positions": int(eligible.sum().cpu()),
                 "attributed_positions": int(selected.sum().cpu()),
@@ -2193,6 +2500,107 @@ def _evenly_spaced_sample_indices(
     return torch.div(numerators, max_points - 1, rounding_mode="floor")
 
 
+@lru_cache(maxsize=128)
+def _cached_evenly_spaced_sample_indices(n_points: int, max_points: int) -> np.ndarray:
+    """CPU index plan shared by every row chunk of the same aux shape."""
+    n_points = max(0, int(n_points))
+    max_points = max(0, int(max_points))
+    if n_points == 0:
+        result = np.empty(0, dtype=np.int64)
+    elif max_points <= 0 or n_points <= max_points:
+        result = np.arange(n_points, dtype=np.int64)
+    elif max_points == 1:
+        result = np.zeros(1, dtype=np.int64)
+    else:
+        result = np.arange(max_points, dtype=np.int64)
+        result *= n_points - 1
+        result //= max_points - 1
+    result.setflags(write=False)
+    return result
+
+
+def _streaming_aux_umap_samples(
+    aux: dict[str, torch.Tensor],
+    *,
+    global_rows: int,
+    row_offset: int,
+    max_points: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Capture the exact global UMAP sample without retaining full aux tensors.
+
+    Sampling is planned in the flattened, fully concatenated coordinate space,
+    so concatenating these per-row-chunk samples is identical to concatenating
+    every aux tensor first and sampling afterward.
+    """
+    samples: dict[str, dict[str, Any]] = {}
+    aliases: dict[str, str] = {}
+    storage_owner: dict[tuple[int, int, int, int], str] = {}
+    global_rows = max(1, int(global_rows))
+    row_offset = max(0, int(row_offset))
+    max_points = max(1, int(max_points))
+    for name, value in sorted(aux.items()):
+        if not torch.is_tensor(value) or value.ndim < 3 or int(value.shape[-1]) < 2:
+            continue
+        tensor = value.detach()
+        chunk_rows = int(tensor.size(0))
+        per_row = int(tensor.numel() // max(1, chunk_rows * int(tensor.size(-1))))
+        original_shape = (global_rows, *(int(dim) for dim in tensor.shape[1:]))
+        n_points = global_rows * per_row
+        global_indices = _cached_evenly_spaced_sample_indices(n_points, max_points)
+        flat_start = row_offset * per_row
+        flat_end = (row_offset + chunk_rows) * per_row
+        lo = int(np.searchsorted(global_indices, flat_start, side="left"))
+        hi = int(np.searchsorted(global_indices, flat_end, side="left"))
+        selected_global = np.asarray(global_indices[lo:hi], dtype=np.int64)
+        selected_local = torch.from_numpy(
+            np.asarray(selected_global - flat_start, dtype=np.int64).copy()
+        ).to(device=tensor.device)
+        flat = tensor.reshape(-1, int(tensor.size(-1)))
+        values = flat.index_select(0, selected_local).float().cpu()
+        samples[str(name)] = {
+            "values": values,
+            "flat_indices": torch.from_numpy(selected_global.copy()),
+            "original_shape": original_shape,
+            "original_points": int(n_points),
+        }
+        if tensor.is_contiguous():
+            storage_key = (
+                int(tensor.untyped_storage().data_ptr()),
+                int(tensor.storage_offset()),
+                int(tensor.numel()),
+                int(tensor.size(-1)),
+            )
+            owner = storage_owner.get(storage_key)
+            if owner is None:
+                storage_owner[storage_key] = str(name)
+            else:
+                aliases[str(name)] = owner
+    return samples, aliases
+
+
+def _aux_storage_aliases(aux: dict[str, torch.Tensor]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    storage_owner: dict[tuple[int, int, int, int], str] = {}
+    for name, value in sorted(aux.items()):
+        if not torch.is_tensor(value) or value.ndim < 3 or int(value.shape[-1]) < 2:
+            continue
+        tensor = value.detach()
+        if not tensor.is_contiguous():
+            continue
+        key = (
+            int(tensor.untyped_storage().data_ptr()),
+            int(tensor.storage_offset()),
+            int(tensor.numel()),
+            int(tensor.size(-1)),
+        )
+        owner = storage_owner.get(key)
+        if owner is None:
+            storage_owner[key] = str(name)
+        else:
+            aliases[str(name)] = owner
+    return aliases
+
+
 def _aux_umap_projection_frames(
     aux: dict[str, torch.Tensor],
     *,
@@ -2200,6 +2608,8 @@ def _aux_umap_projection_frames(
     dates: list[str],
     settings: ExplainabilitySettings,
     device: torch.device,
+    preselected_aux: dict[str, dict[str, Any]] | None = None,
+    aliases: dict[str, str] | None = None,
 ) -> tuple[dict[str, pl.DataFrame], list[dict[str, Any]], list[str], dict[str, Any]]:
     timing: dict[str, Any] = {
         "enabled": bool(settings.umap_enabled),
@@ -2235,14 +2645,23 @@ def _aux_umap_projection_frames(
         "dynamic_latent_delta",
     )
     preferred_names = set(preferred_order)
-    eligible: list[tuple[str, torch.Tensor]] = []
+    eligible: list[tuple[str, torch.Tensor | None]] = []
+    preselected_aux = preselected_aux or {}
+    aliases = aliases or {}
     for name in preferred_order:
         value = aux.get(name)
-        if torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[-1]) >= 2:
+        if name in preselected_aux:
+            eligible.append((name, None))
+        elif torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[-1]) >= 2:
             eligible.append((name, value))
-    for name, value in sorted(aux.items()):
+    remaining_names = sorted(set(aux) | set(preselected_aux))
+    for name in remaining_names:
         if name in preferred_names:
             continue
+        if name in preselected_aux:
+            eligible.append((name, None))
+            continue
+        value = aux[name]
         if not torch.is_tensor(value) or value.ndim < 3 or int(value.shape[-1]) < 2:
             continue
         eligible.append((name, value))
@@ -2257,6 +2676,22 @@ def _aux_umap_projection_frames(
             + ("..." if len(skipped_names) > 8 else "")
         )
         eligible = eligible[:max_projections]
+    eligible_names = [name for name, _ in eligible]
+    eligible_position = {name: idx for idx, name in enumerate(eligible_names)}
+    alias_groups: dict[str, set[str]] = {}
+    for alias_name, owner_name in aliases.items():
+        if alias_name not in eligible_position or owner_name not in eligible_position:
+            continue
+        group = alias_groups.setdefault(owner_name, {owner_name})
+        group.add(alias_name)
+    normalized_aliases: dict[str, str] = {}
+    for members in alias_groups.values():
+        canonical = min(members, key=lambda item: eligible_position[item])
+        for member in members:
+            if member != canonical:
+                normalized_aliases[member] = canonical
+    timing["reused_alias_projections"] = 0
+    embedded_by_name: dict[str, np.ndarray] = {}
     for name, value in tqdm(
         eligible,
         total=len(eligible),
@@ -2266,36 +2701,53 @@ def _aux_umap_projection_frames(
         disable=not bool(settings.progress_enabled),
     ):
         projection_start = time.perf_counter()
-        tensor = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-        original_shape = tuple(int(dim) for dim in tensor.shape)
-        flat = tensor.reshape(-1, original_shape[-1])
-        n_points = int(flat.size(0))
+        sample_spec = preselected_aux.get(name)
+        if sample_spec is not None:
+            original_shape = tuple(int(dim) for dim in sample_spec["original_shape"])
+            n_points = int(sample_spec.get("original_points", math.prod(original_shape[:-1])))
+            flat_sample = torch.nan_to_num(
+                sample_spec["values"].detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            sample_idx = sample_spec["flat_indices"].detach().to(dtype=torch.long)
+        else:
+            if value is None:
+                continue
+            tensor = torch.nan_to_num(value.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            original_shape = tuple(int(dim) for dim in tensor.shape)
+            flat = tensor.reshape(-1, original_shape[-1])
+            n_points = int(flat.size(0))
+            sample_idx = _evenly_spaced_sample_indices(
+                n_points,
+                max_points,
+                device=flat.device,
+            )
+            flat_sample = flat.index_select(0, sample_idx)
         if n_points < 4:
             warnings.append(f"{name}: fewer than 4 vectors; cuML UMAP skipped.")
             continue
-        sample_idx = _evenly_spaced_sample_indices(
-            n_points,
-            max_points,
-            device=flat.device,
-        )
-        flat_sample = flat.index_select(0, sample_idx)
         if flat_sample.device.type != "cuda":
             flat_sample = flat_sample.to(device=device, non_blocking=True)
             sample_idx = sample_idx.to(device=device, non_blocking=True)
-        try:
-            embedding = run_cuml_umap(
-                flat_sample,
-                n_neighbors=int(settings.umap_n_neighbors),
-                min_dist=float(settings.umap_min_dist),
-                random_state=42,
-                verbose=bool(settings.progress_enabled),
-            )
-        except Exception as exc:
-            warnings.append(f"{name}: cuML UMAP failed: {type(exc).__name__}: {exc}")
-            timing["per_projection_s"][name] = float(time.perf_counter() - projection_start)
-            continue
         sample_idx_cpu = sample_idx.detach().cpu().numpy().astype(np.int64, copy=False)
-        embedding_cpu = embedding.get()
+        alias_of = normalized_aliases.get(name)
+        embedding_cpu = embedded_by_name.get(alias_of or "")
+        if embedding_cpu is None:
+            try:
+                embedding = run_cuml_umap(
+                    flat_sample,
+                    n_neighbors=int(settings.umap_n_neighbors),
+                    min_dist=float(settings.umap_min_dist),
+                    random_state=42,
+                    verbose=bool(settings.progress_enabled),
+                )
+            except Exception as exc:
+                warnings.append(f"{name}: cuML UMAP failed: {type(exc).__name__}: {exc}")
+                timing["per_projection_s"][name] = float(time.perf_counter() - projection_start)
+                continue
+            embedding_cpu = embedding.get()
+        else:
+            timing["reused_alias_projections"] = int(timing["reused_alias_projections"]) + 1
+        embedded_by_name[name] = embedding_cpu
         meta = _aux_point_metadata(
             name=name,
             shape=original_shape,
@@ -2570,6 +3022,67 @@ def _case_study_frame(decisions: pl.DataFrame, daily: pl.DataFrame) -> pl.DataFr
     return _concat_frames(pieces)
 
 
+def _case_study_frame_from_tensors(
+    weights: torch.Tensor,
+    scores: torch.Tensor,
+    returns: torch.Tensor,
+    mask: torch.Tensor,
+    dates: list[str],
+    symbols: list[str],
+    selected_mask: torch.Tensor,
+    daily: pl.DataFrame,
+) -> pl.DataFrame:
+    if _is_empty_frame(daily):
+        return pl.DataFrame()
+    candidates: list[tuple[str, str]] = []
+    for case_type, column, descending in (
+        ("best_strategy_day", "strategy_log_return", True),
+        ("worst_strategy_day", "strategy_log_return", False),
+        ("highest_turnover_day", "turnover_proxy", True),
+        ("highest_gross_exposure_day", "gross_exposure", True),
+    ):
+        if column not in daily.columns:
+            continue
+        row = _first_row(_with_numeric(daily, column).sort(column, descending=descending).head(1))
+        if row:
+            candidates.append((case_type, str(row.get("date"))))
+    date_to_index = {str(date): idx for idx, date in enumerate(dates)}
+    pieces: list[pl.DataFrame] = []
+    seen: set[tuple[str, str]] = set()
+    daily_rows = {str(row.get("date")): row for row in daily.to_dicts()}
+    for case_type, date in candidates:
+        key = (case_type, date)
+        if key in seen or date not in date_to_index:
+            continue
+        seen.add(key)
+        idx = date_to_index[date]
+        inventory = _decision_inventory(
+            weights[idx : idx + 1],
+            scores[idx : idx + 1],
+            returns[idx : idx + 1],
+            mask[idx : idx + 1],
+            [date],
+            symbols,
+            selected_mask[idx : idx + 1],
+        )
+        inventory = inventory.sort("abs_weight", descending=True).with_columns(
+            pl.lit(case_type).alias("case_type")
+        )
+        daily_row = daily_rows.get(date, {})
+        for col in (
+            "strategy_log_return",
+            "market_log_return",
+            "turnover_proxy",
+            "gross_exposure",
+            "net_exposure",
+        ):
+            inventory = inventory.with_columns(pl.lit(daily_row.get(col)).alias(f"case_{col}"))
+        pieces.append(
+            inventory.select(["case_type", *[col for col in inventory.columns if col != "case_type"]])
+        )
+    return _concat_frames(pieces)
+
+
 
 def _trust_check_frame(
     portfolio: dict[str, float],
@@ -2770,6 +3283,171 @@ def _score_head_surrogate_shap(
     return summary.sort("shap_abs", descending=True), component_frame, info, warnings
 
 
+def _iter_surrogate_design_blocks(
+    x_chunks: list[torch.Tensor],
+    scores: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    block_size: int,
+):
+    row_offset = 0
+    for x_chunk in x_chunks:
+        rows = int(x_chunk.size(0))
+        scores_chunk = scores[row_offset : row_offset + rows].detach().float().cpu()
+        mask_chunk = mask[row_offset : row_offset + rows].detach().bool().cpu()
+        x_cpu = x_chunk.detach().float().cpu()
+        aggregates = [x_cpu[:, -1], x_cpu.mean(dim=1)]
+        if int(x_cpu.size(1)) > 1:
+            aggregates.append(x_cpu[:, -1] - x_cpu[:, 0])
+        design = np.concatenate([value.numpy() for value in aggregates], axis=-1).reshape(
+            -1, len(aggregates) * int(x_cpu.size(-1))
+        )
+        target = scores_chunk.reshape(-1).numpy()
+        valid = mask_chunk.reshape(-1).numpy().astype(bool)
+        finite = valid & np.isfinite(target) & np.isfinite(design).all(axis=1)
+        design = design[finite]
+        target = target[finite]
+        for start in range(0, int(design.shape[0]), block_size):
+            end = min(int(design.shape[0]), start + block_size)
+            yield design[start:end], target[start:end]
+        row_offset += rows
+
+
+def _score_head_surrogate_shap_chunked(
+    x_chunks: list[torch.Tensor],
+    scores: torch.Tensor,
+    mask: torch.Tensor,
+    feature_names: list[str],
+    *,
+    enabled: bool,
+    mode: str,
+    progress_enabled: bool = True,
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, Any], list[str]]:
+    """Exact full-data linear SHAP with bounded peak host memory."""
+    mode = _normalize_shap_mode(mode)
+    if not enabled or mode in {"off", "none"}:
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": bool(enabled), "method": "skipped"}, []
+    if not x_chunks:
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": 0}, [
+            "SHAP skipped because no surrogate input chunks were available."
+        ]
+    sources = ["last", "lookback_mean"]
+    if int(x_chunks[0].size(1)) > 1:
+        sources.append("lookback_delta")
+    component_meta = [(source, feature) for source in sources for feature in feature_names]
+    component_count = len(component_meta)
+    block_size = 65_536
+    feature_sum = np.zeros(component_count, dtype=np.float64)
+    feature_sum_sq = np.zeros(component_count, dtype=np.float64)
+    target_sum = 0.0
+    target_sum_sq = 0.0
+    row_count = 0
+    for design_block, target_block in tqdm(
+        _iter_surrogate_design_blocks(x_chunks, scores, mask, block_size=block_size),
+        desc="SHAP streaming statistics",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        feature_sum += design_block.sum(axis=0, dtype=np.float64)
+        feature_sum_sq += np.square(design_block).sum(axis=0, dtype=np.float64)
+        target_sum += float(target_block.sum(dtype=np.float64))
+        target_sum_sq += float(np.square(target_block).sum(dtype=np.float64))
+        row_count += int(design_block.shape[0])
+    if row_count < max(20, 2 * component_count):
+        message = "SHAP skipped because there are too few valid stock-date observations for a surrogate model."
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": row_count}, [message]
+
+    mean = feature_sum / float(row_count)
+    variance = np.maximum(feature_sum_sq / float(row_count) - np.square(mean), 0.0)
+    std = np.sqrt(variance)
+    std = np.where(std < 1e-8, 1.0, std)
+    target_mean = target_sum / float(row_count)
+    target_variance = max(target_sum_sq / float(row_count) - target_mean * target_mean, 0.0)
+    if math.sqrt(target_variance) < 1e-10:
+        message = "SHAP skipped because score targets are nearly constant."
+        return pl.DataFrame(), pl.DataFrame(), {"enabled": True, "method": "skipped", "valid_rows": row_count}, [message]
+
+    xtx = np.zeros((component_count, component_count), dtype=np.float64)
+    rhs = np.zeros(component_count, dtype=np.float64)
+    for design_block, target_block in tqdm(
+        _iter_surrogate_design_blocks(x_chunks, scores, mask, block_size=block_size),
+        desc="SHAP streaming ridge fit",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        z_block = (design_block - mean) / std
+        xtx += z_block.T @ z_block
+        rhs += z_block.T @ (target_block - target_mean)
+    alpha = 1e-3
+    regularized = xtx + alpha * np.eye(component_count, dtype=np.float64)
+    try:
+        coef = np.linalg.solve(regularized, rhs)
+    except np.linalg.LinAlgError:
+        coef = np.linalg.lstsq(regularized, rhs, rcond=None)[0]
+
+    ss_res = 0.0
+    abs_sum = np.zeros(component_count, dtype=np.float64)
+    for design_block, target_block in tqdm(
+        _iter_surrogate_design_blocks(x_chunks, scores, mask, block_size=block_size),
+        desc="SHAP streaming attribution",
+        unit="block",
+        leave=False,
+        disable=not progress_enabled,
+    ):
+        z_block = (design_block - mean) / std
+        pred_block = z_block @ coef + target_mean
+        ss_res += float(np.square(target_block - pred_block).sum(dtype=np.float64))
+        abs_sum += np.abs(z_block * coef.reshape(1, -1)).sum(axis=0, dtype=np.float64)
+    ss_tot = max(target_sum_sq - target_sum * target_sum / float(row_count), 0.0)
+    r2 = _safe_float(1.0 - ss_res / ss_tot if ss_tot > 1e-20 else 0.0)
+    abs_values = abs_sum / float(row_count)
+    component_rows = [
+        {
+            "source": source,
+            "feature": feature,
+            "feature_group": _feature_group(feature),
+            "feature_label": _feature_label(feature),
+            "shap_abs": float(abs_values[idx]),
+            "surrogate_coef": float(coef[idx]),
+        }
+        for idx, (source, feature) in enumerate(component_meta)
+    ]
+    component_frame = pl.DataFrame(component_rows).sort("shap_abs", descending=True)
+    summary = component_frame.group_by("feature").agg(pl.col("shap_abs").sum().alias("shap_abs"))
+    summary = _with_feature_labels(summary)
+    total = _numeric_sum(summary, "shap_abs")
+    summary = summary.with_columns(
+        ((pl.col("shap_abs") / total) if total > 0.0 else pl.lit(0.0)).alias("share")
+    )
+    top_source = (
+        component_frame.unique(subset=["feature"], keep="first", maintain_order=True)
+        .select(["feature", pl.col("source").alias("top_source")])
+    )
+    method = "linear_surrogate_closed_form_streaming"
+    summary = summary.join(top_source, on="feature", how="left").with_columns(
+        [pl.lit(r2).alias("surrogate_r2"), pl.lit(method).alias("method")]
+    )
+    info = {
+        "enabled": True,
+        "method": method,
+        "mode": mode,
+        "valid_rows": row_count,
+        "fit_rows": row_count,
+        "sample_rows": row_count,
+        "num_components": component_count,
+        "surrogate_r2": r2,
+        "streaming_chunks": len(x_chunks),
+    }
+    warnings_out: list[str] = []
+    if r2 < 0.20:
+        warnings_out.append(
+            f"Score-head surrogate SHAP has low R2 ({r2:.3f}); use it as a rough global diagnostic, not a faithful local explanation."
+        )
+    return summary.sort("shap_abs", descending=True), component_frame, info, warnings_out
+
+
 
 def explain_batch(
     model: nn.Module,
@@ -2780,6 +3458,9 @@ def explain_batch(
     dates: list[str],
     settings: ExplainabilitySettings | None = None,
     device: torch.device | None = None,
+    umap_global_rows: int = 0,
+    umap_row_offset: int = 0,
+    defer_decision_inventory: bool = False,
 ) -> dict[str, Any]:
     total_start = time.perf_counter()
     timing: dict[str, float] = {}
@@ -2836,6 +3517,7 @@ def explain_batch(
             symbols=symbols,
             enabled=bool(settings.j_lens_enabled),
             intervention_fraction=float(settings.j_lens_intervention_fraction),
+            vjp_batch_size=int(settings.j_lens_vjp_batch_size),
             progress_enabled=bool(settings.progress_enabled),
         )
     if j_lens_summary.get("status") == "ok":
@@ -2938,7 +3620,6 @@ def explain_batch(
         feature_names,
         progress_enabled=bool(settings.progress_enabled),
     )
-    decision_inventory = _decision_inventory(weights, scores, returns, mask, dates, symbols, selected)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
@@ -2947,9 +3628,20 @@ def explain_batch(
         mask,
         progress_enabled=bool(settings.progress_enabled),
     )
-    position_distribution = _position_distribution_frame(decision_inventory)
+    decision_exposure = _decision_exposure_by_side_frame(weights, dates)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
-    case_studies = _case_study_frame(decision_inventory, daily)
+    if defer_decision_inventory:
+        decision_inventory = pl.DataFrame()
+        position_distribution = _position_distribution_from_tensors(weights, mask)
+        case_studies = _case_study_frame_from_tensors(
+            weights, scores, returns, mask, dates, symbols, selected, daily
+        )
+    else:
+        decision_inventory = _decision_inventory(
+            weights, scores, returns, mask, dates, symbols, selected
+        )
+        position_distribution = _position_distribution_frame(decision_inventory)
+        case_studies = _case_study_frame(decision_inventory, daily)
     _mark_elapsed(timing, "tabular_diagnostics_s", stage_start)
     complete_stage("aux_diagnostics", "tabular_diagnostics_s")
 
@@ -2982,6 +3674,7 @@ def explain_batch(
         mask=mask,
         selected=selected,
         inventory=decision_inventory,
+        decision_inventory_rows=(int(weights.numel()) if defer_decision_inventory else None),
         lookback=int(x.size(1)),
         feature_count=len(feature_names),
         grad_ft=grad_ft,
@@ -2992,6 +3685,30 @@ def explain_batch(
     complete_stage("complete", "postprocess_s")
     stage_progress.close()
     timing["total_s"] = float(time.perf_counter() - total_start)
+
+    stream_umap_samples = int(umap_global_rows) > 0 and int(settings.umap_max_points) > 0
+    if stream_umap_samples:
+        aux_core: dict[str, torch.Tensor] = {}
+        aux_samples, aux_aliases = _streaming_aux_umap_samples(
+            aux,
+            global_rows=int(umap_global_rows),
+            row_offset=int(umap_row_offset),
+            max_points=int(settings.umap_max_points),
+        )
+    else:
+        aux_core = {
+            str(name): value.detach().float().cpu()
+            for name, value in aux.items()
+            if torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[-1]) >= 2
+        }
+        aux_samples = {}
+        aux_aliases = _aux_storage_aliases(aux)
+
+    weights_cpu = weights.detach().cpu()
+    scores_cpu = scores.detach().cpu()
+    returns_cpu = returns.detach().cpu()
+    mask_cpu = mask.detach().cpu()
+    selected_cpu = selected.detach().cpu()
 
     return {
         "summary": {
@@ -3037,6 +3754,7 @@ def explain_batch(
             "shap_components": shap_components,
             "feature_correlations": corr,
             "decision_inventory": decision_inventory,
+            "decision_exposure_by_side": decision_exposure,
             "explainability_completeness": completeness,
             "exposure_coverage_curve": exposure_coverage,
             "position_distribution": position_distribution,
@@ -3050,17 +3768,30 @@ def explain_batch(
         },
         "aux_dim_frames": aux_dim_frames,
         "aux_projection_frames": aux_projection_frames,
+        "_streaming_tables": (
+            {
+                "decision_inventory": {
+                    "weights": weights_cpu,
+                    "scores": scores_cpu,
+                    "returns": returns_cpu,
+                    "mask": mask_cpu,
+                    "selected": selected_cpu,
+                    "dates": dates,
+                    "symbols": symbols,
+                }
+            }
+            if defer_decision_inventory
+            else {}
+        ),
         "_core": {
-            "weights": weights.detach().cpu(),
-            "scores": scores.detach().cpu(),
-            "returns": returns.detach().cpu(),
-            "mask": mask.detach().cpu(),
+            "weights": weights_cpu,
+            "scores": scores_cpu,
+            "returns": returns_cpu,
+            "mask": mask_cpu,
             "x_summary": _surrogate_input_summary(x),
-            "aux": {
-                str(name): value.detach().float().cpu()
-                for name, value in aux.items()
-                if torch.is_tensor(value) and value.ndim >= 3 and int(value.shape[-1]) >= 2
-            },
+            "aux": aux_core,
+            "aux_samples": aux_samples,
+            "aux_aliases": aux_aliases,
         },
     }
 
@@ -3071,19 +3802,59 @@ def _weighted_feature_time_from_chunks(
     metric_names: tuple[str, ...],
     total_rows: int,
 ) -> pl.DataFrame:
+    group_cols: list[str] = []
+    template: pl.DataFrame | None = None
+    accumulators: dict[str, np.ndarray] = {}
+    fast_path = True
+    for result, rows in chunk_results:
+        frame = result.get("frames", {}).get(frame_name, pl.DataFrame())
+        if _is_empty_frame(frame):
+            continue
+        if template is None:
+            group_cols = [
+                col
+                for col in (
+                    "lookback_index",
+                    "lookback_from_end",
+                    "feature",
+                    "feature_group",
+                    "feature_label",
+                )
+                if col in frame.columns
+            ]
+            value_cols = [col for col in metric_names if col in frame.columns]
+            if not group_cols or not value_cols:
+                fast_path = False
+                break
+            template = frame.select(group_cols)
+            accumulators = {
+                col: np.zeros(frame.height, dtype=np.float64)
+                for col in value_cols
+            }
+        elif frame.height != template.height or not frame.select(group_cols).equals(template):
+            fast_path = False
+            break
+        for col in accumulators:
+            accumulators[col] += np.nan_to_num(
+                _numeric_numpy(frame, col), nan=0.0, posinf=0.0, neginf=0.0
+            ) * float(rows)
+    if fast_path and template is not None:
+        denom = max(1.0, float(total_rows))
+        return template.with_columns(
+            [pl.Series(col, values / denom) for col, values in accumulators.items()]
+        )
+
     pieces: list[pl.DataFrame] = []
     for result, rows in chunk_results:
         frame = result.get("frames", {}).get(frame_name, pl.DataFrame())
         if _is_empty_frame(frame):
             continue
-        data = frame.clone()
-        expressions = []
-        for metric_name in metric_names:
-            if metric_name in data.columns:
-                expressions.append((_numeric_expr(metric_name).fill_null(0.0) * float(rows)).alias(metric_name))
-        if expressions:
-            data = data.with_columns(expressions)
-        pieces.append(data)
+        expressions = [
+            (_numeric_expr(col).fill_null(0.0) * float(rows)).alias(col)
+            for col in metric_names
+            if col in frame.columns
+        ]
+        pieces.append(frame.with_columns(expressions) if expressions else frame)
     if not pieces:
         return pl.DataFrame()
     combined = _concat_frames(pieces)
@@ -3221,6 +3992,8 @@ def _sum_chunk_timings(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[
 def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) -> dict[str, Any]:
     merged = {
         "num_perturbations": 0,
+        "forwarded_perturbations": 0,
+        "zero_identity_perturbations": 0,
         "requested_batch_size": 0,
         "max_auto_batch_size": 0,
         "max_input_elements": 0,
@@ -3240,6 +4013,8 @@ def _merge_perturb_diagnostics(chunk_results: list[tuple[dict[str, Any], int]]) 
     for result, _ in chunk_results:
         diag = result.get("summary", {}).get("perturb_diagnostics", {})
         merged["num_perturbations"] = max(int(merged["num_perturbations"]), int(diag.get("num_perturbations", 0) or 0))
+        for key in ("forwarded_perturbations", "zero_identity_perturbations"):
+            merged[key] = int(merged[key]) + int(diag.get(key, 0) or 0)
         for key in ("requested_batch_size", "max_auto_batch_size", "max_input_elements", "chunk_size", "final_chunk_size"):
             merged[key] = max(int(merged[key]), int(diag.get(key, 0) or 0))
         for key in ("forward_batches", "attempted_forward_batches", "oom_retries"):
@@ -3422,11 +4197,20 @@ def _combine_j_lens_frames_from_chunks(
     }
     frames["j_lens_completeness"] = _j_lens_completeness_frame(frames)
     first = dict(valid_results[0][0]["summary"]["j_lens"])
+    autograd_calls_per_chunk = max(
+        int(result.get("summary", {}).get("j_lens", {}).get("autograd_calls", 0) or 0)
+        for result, _ in valid_results
+    )
     first.update(
         {
             "status": "ok",
             "chunks_aggregated": len(valid_results),
             "layers": int(frames["j_lens_layer_summary"].height),
+            "autograd_calls": sum(
+                int(result.get("summary", {}).get("j_lens", {}).get("autograd_calls", 0) or 0)
+                for result, _ in valid_results
+            ),
+            "autograd_calls_per_chunk": autograd_calls_per_chunk,
             "complete_no_top_k": True,
         }
     )
@@ -3473,11 +4257,13 @@ def _combine_chunked_explainability_results(
     scores = torch.cat([result["_core"].pop("scores") for result, _ in chunk_results], dim=0)
     returns = torch.cat([result["_core"].pop("returns") for result, _ in chunk_results], dim=0)
     mask = torch.cat([result["_core"].pop("mask") for result, _ in chunk_results], dim=0).bool()
-    x_cpu = torch.cat([result["_core"].pop("x_summary") for result, _ in chunk_results], dim=0)
-    x_cpu = torch.nan_to_num(x_cpu.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    x_chunks = [
+        torch.nan_to_num(result["_core"].pop("x_summary").float(), nan=0.0, posinf=0.0, neginf=0.0)
+        for result, _ in chunk_results
+    ]
 
-    shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap(
-        x_cpu,
+    shap_feature, shap_components, shap_info, shap_warnings = _score_head_surrogate_shap_chunked(
+        x_chunks,
         scores,
         mask,
         feature_names,
@@ -3486,19 +4272,19 @@ def _combine_chunked_explainability_results(
         progress_enabled=bool(settings.progress_enabled),
     )
 
-    corr = _feature_correlations(
-        x_cpu,
+    corr = _feature_correlations_chunked(
+        x_chunks,
         scores,
         weights,
         mask,
         feature_names,
         progress_enabled=bool(settings.progress_enabled),
     )
+    del x_chunks
     selected, _, _ = _selection_from_weights(
         weights,
         mask,
     )
-    decision_inventory = _decision_inventory(weights, scores, returns, mask, dates, symbols, selected)
     stock_contrib = _stock_contribution_frame(weights, returns, mask, symbols)
     portfolio = _portfolio_summary(weights, returns, mask)
     daily = _daily_portfolio_frame(weights, returns, mask, dates)
@@ -3507,11 +4293,25 @@ def _combine_chunked_explainability_results(
         mask,
         progress_enabled=bool(settings.progress_enabled),
     )
-    position_distribution = _position_distribution_frame(decision_inventory)
+    decision_exposure = _decision_exposure_by_side_frame(weights, dates)
+    position_distribution = _position_distribution_from_tensors(weights, mask)
     regime = _regime_analysis_frame(daily) if bool(settings.regime_analysis) else pl.DataFrame()
-    case_studies = _case_study_frame(decision_inventory, daily)
+    case_studies = _case_study_frame_from_tensors(
+        weights,
+        scores,
+        returns,
+        mask,
+        dates,
+        symbols,
+        selected,
+        daily,
+    )
     aux_frame = _combine_aux_summary_from_chunks(chunk_results)
     aux_dim_frames = _combine_aux_dim_frames_from_chunks(chunk_results)
+    aux_aliases: dict[str, str] = {}
+    for result, _ in chunk_results:
+        for name, owner in result.get("_core", {}).get("aux_aliases", {}).items():
+            aux_aliases.setdefault(str(name), str(owner))
     combined_aux: dict[str, torch.Tensor] = {}
     aux_names = sorted(
         {
@@ -3538,8 +4338,42 @@ def _combine_chunked_explainability_results(
         if tensors and all(tensor.ndim == tensors[0].ndim and tensor.shape[1:] == tensors[0].shape[1:] for tensor in tensors):
             combined_aux[name] = torch.cat(tensors, dim=0)
     aux_combine_progress.close()
+
+    sample_names = sorted(
+        {
+            name
+            for result, _ in chunk_results
+            for name in result.get("_core", {}).get("aux_samples", {})
+        }
+    )
+    combined_aux_samples: dict[str, dict[str, Any]] = {}
+    for name in sample_names:
+        specs = [
+            result["_core"]["aux_samples"][name]
+            for result, _ in chunk_results
+            if name in result.get("_core", {}).get("aux_samples", {})
+        ]
+        if not specs:
+            continue
+        original_shape = tuple(int(dim) for dim in specs[0]["original_shape"])
+        if any(tuple(int(dim) for dim in spec["original_shape"]) != original_shape for spec in specs):
+            continue
+        values = torch.cat([spec["values"] for spec in specs], dim=0)
+        flat_indices = torch.cat([spec["flat_indices"] for spec in specs], dim=0).long()
+        if int(flat_indices.numel()) > 1 and not bool(torch.all(flat_indices[1:] >= flat_indices[:-1])):
+            order = torch.argsort(flat_indices)
+            flat_indices = flat_indices.index_select(0, order)
+            values = values.index_select(0, order)
+        combined_aux_samples[name] = {
+            "values": values,
+            "flat_indices": flat_indices,
+            "original_shape": original_shape,
+            "original_points": int(specs[0].get("original_points", math.prod(original_shape[:-1]))),
+        }
     for result, _ in chunk_results:
         result.get("_core", {}).pop("aux", None)
+        result.get("_core", {}).pop("aux_samples", None)
+        result.get("_core", {}).pop("aux_aliases", None)
     aux_projection_frames, aux_projection_summary, aux_projection_warnings, aux_projection_timing = (
         _aux_umap_projection_frames(
             combined_aux,
@@ -3547,6 +4381,8 @@ def _combine_chunked_explainability_results(
             dates=dates,
             settings=settings,
             device=device,
+            preselected_aux=combined_aux_samples,
+            aliases=aux_aliases,
         )
     )
 
@@ -3574,7 +4410,8 @@ def _combine_chunked_explainability_results(
         weights=weights,
         mask=mask,
         selected=selected,
-        inventory=decision_inventory,
+        inventory=None,
+        decision_inventory_rows=int(weights.numel()),
         lookback=int(lookback),
         feature_count=len(feature_names),
         grad_ft=grad_ft,
@@ -3633,7 +4470,8 @@ def _combine_chunked_explainability_results(
             "feature_importance_shap": shap_feature,
             "shap_components": shap_components,
             "feature_correlations": corr,
-            "decision_inventory": decision_inventory,
+            "decision_inventory": pl.DataFrame(),
+            "decision_exposure_by_side": decision_exposure,
             "explainability_completeness": completeness,
             "exposure_coverage_curve": exposure_coverage,
             "position_distribution": position_distribution,
@@ -3647,6 +4485,17 @@ def _combine_chunked_explainability_results(
         },
         "aux_dim_frames": aux_dim_frames,
         "aux_projection_frames": aux_projection_frames,
+        "_streaming_tables": {
+            "decision_inventory": {
+                "weights": weights,
+                "scores": scores,
+                "returns": returns,
+                "mask": mask,
+                "selected": selected,
+                "dates": dates,
+                "symbols": symbols,
+            }
+        },
     }
 
 
@@ -3715,6 +4564,14 @@ def explain_batch_row_chunked(
                     dates=chunk_dates,
                     settings=chunk_settings,
                     device=device,
+                    umap_global_rows=(
+                        n_rows
+                        if bool(effective_settings.umap_enabled)
+                        and int(effective_settings.umap_max_points) > 0
+                        else 0
+                    ),
+                    umap_row_offset=start,
+                    defer_decision_inventory=True,
                 )
                 chunk_results.append((result, end - start))
                 del chunk, result
@@ -3782,6 +4639,7 @@ def _compact_explain_chunk_result(result: dict[str, Any]) -> None:
         if name in required_frames
     }
     result["aux_projection_frames"] = {}
+    result["_streaming_tables"] = {}
 
 
 def explain_batch_source_chunked(
@@ -3840,6 +4698,13 @@ def explain_batch_source_chunked(
                 dates=dates[start:end],
                 settings=chunk_settings,
                 device=device,
+                umap_global_rows=(
+                    n_rows
+                    if bool(settings.umap_enabled) and int(settings.umap_max_points) > 0
+                    else 0
+                ),
+                umap_row_offset=start,
+                defer_decision_inventory=True,
             )
         except RuntimeError as exc:
             if not _is_cuda_oom(exc) or row_chunk_size <= 1:
@@ -3860,7 +4725,11 @@ def explain_batch_source_chunked(
         chunk_results.append((result, end - start))
         del batch, result
         start = end
-        _clear_explainability_runtime_cache()
+        # Keep the CUDA caching allocator and Python generations warm across
+        # equal-shaped chunks. A full gc/empty_cache/ipc_collect cycle here
+        # forces a device synchronization for every date microbatch and turns
+        # allocator reuse into repeated cudaMalloc work. OOM retries and the
+        # fold boundary still perform an explicit cleanup.
         progress.update(end - progress.n)
         progress.set_postfix(chunk=row_chunk_size, refresh=False)
     progress.close()
@@ -5233,7 +6102,7 @@ def _expected_explainability_plot_paths(
             )
         add_if("feature_correlations", "plots/feature_correlations.png", ("feature", "score_corr", "weight_corr"))
         add_if(
-            "decision_inventory",
+            "decision_exposure_by_side",
             "plots/decision_inventory_exposure_by_side.png",
             ("weight", "side"),
         )
@@ -5569,7 +6438,7 @@ def _cross_fold_figure_spec(relative_path: str) -> _CrossFoldFigureSpec | None:
     exact: dict[str, _CrossFoldFigureSpec] = {
         "aux_summary_mean_abs.png": _CrossFoldFigureSpec("aux_summary.csv", ("name",), ("mean_abs",)),
         "aux_token_diagnostics.png": _CrossFoldFigureSpec("aux_summary.csv", ("name",), ("mean_abs",)),
-        "decision_inventory_exposure_by_side.png": _CrossFoldFigureSpec("decision_inventory.csv", ("side",), ("weight",), "group_abs"),
+        "decision_inventory_exposure_by_side.png": _CrossFoldFigureSpec("decision_exposure_by_side.csv", ("side",), ("weight",), "group_abs"),
         "decision_case_studies.png": _CrossFoldFigureSpec("decision_case_studies.csv", ("case_type",), ("gross_contribution", "abs_weight"), "group_mean_abs"),
         "feature_correlations.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
         "feature_correlations_shortcut_checks.png": _CrossFoldFigureSpec("feature_correlations.csv", ("source", "feature"), ("score_corr", "weight_corr")),
@@ -6558,7 +7427,7 @@ _SAVED_EXPLAINABILITY_FRAME_NAMES = (
     "feature_time_integrated_gradients", "feature_importance_integrated_gradients",
     "time_importance_integrated_gradients", "feature_time_perturbation",
     "feature_importance_perturbation", "feature_importance_shap", "shap_components",
-    "feature_correlations", "decision_inventory", "explainability_completeness",
+    "feature_correlations", "decision_inventory", "decision_exposure_by_side", "explainability_completeness",
     "exposure_coverage_curve", "position_distribution", "daily_portfolio",
     "regime_analysis", "decision_case_studies", "trust_checks",
     "aux_summary", "j_lens_transport", "j_lens_layer_summary",
@@ -6574,7 +7443,7 @@ def _load_saved_explainability_fold(
     frames = {
         name: (
             pl.read_csv(fold_dir / f"{name}.csv", infer_schema_length=None)
-            if (fold_dir / f"{name}.csv").exists()
+            if name != "decision_inventory" and (fold_dir / f"{name}.csv").exists()
             else pl.DataFrame()
         )
         for name in _SAVED_EXPLAINABILITY_FRAME_NAMES
@@ -7444,7 +8313,9 @@ def _plot_all_explanation_figures(
 
     stage_start = time.perf_counter()
     out = plot_dir / "decision_inventory_exposure_by_side.png"
-    decision_frame = frames.get("decision_inventory", pl.DataFrame())
+    decision_frame = frames.get("decision_exposure_by_side", pl.DataFrame())
+    if _is_empty_frame(decision_frame):
+        decision_frame = frames.get("decision_inventory", pl.DataFrame())
     if use_datashader:
         try:
             _plot_decision_exposure_datashader(decision_frame, out)
@@ -7611,8 +8482,9 @@ def write_explanation_outputs(
     frames: dict[str, pl.DataFrame] = result["frames"]
     aux_dim_frames: dict[str, pl.DataFrame] = result.get("aux_dim_frames", {})
     aux_projection_frames: dict[str, pl.DataFrame] = result.get("aux_projection_frames", {})
+    streaming_tables: dict[str, dict[str, Any]] = result.get("_streaming_tables", {})
     table_progress = tqdm(
-        total=len(frames) + len(aux_dim_frames) + len(aux_projection_frames),
+        total=len(frames) + len(aux_dim_frames) + len(aux_projection_frames) + len(streaming_tables),
         desc="Write tables",
         unit="table",
         leave=False,
@@ -7630,6 +8502,18 @@ def write_explanation_outputs(
                 frame.write_parquet(output_dir / f"{name}.parquet")
         table_progress.update(1)
         table_progress.set_postfix(table=name, rows=len(frame), refresh=False)
+    decision_spec = streaming_tables.get("decision_inventory")
+    if decision_spec is not None:
+        inventory_rows = _write_decision_inventory_streaming(
+            decision_spec,
+            output_dir / "decision_inventory.csv",
+            row_chunk_size=64,
+            progress_enabled=progress_enabled,
+        )
+        write_timing["decision_inventory_rows"] = int(inventory_rows)
+        write_timing["decision_inventory_streamed"] = True
+        table_progress.update(1)
+        table_progress.set_postfix(table="decision_inventory", rows=inventory_rows, refresh=False)
     aux_dir = output_dir / "aux_dims"
     for name, frame in aux_dim_frames.items():
         aux_dir.mkdir(parents=True, exist_ok=True)
@@ -8118,28 +9002,20 @@ def _first_year_indices(panel: PanelData, indices: np.ndarray) -> np.ndarray:
     return indices[years == first_year]
 
 
-def _dataset_for_split(
+def _first_test_year_dataset(
     panel: PanelData,
     fold: WalkForwardFold,
-    split: str,
     lookback: int,
     *,
-    first_test_year_only: bool = True,
     execution_mode: str = "naive",
     short_capacity_limit_enabled: bool = True,
     tw_corporate_action_mode: str = "avoid",
 ) -> CrossSectionalDataset:
-    split_norm = split.strip().lower()
-    if split_norm == "train":
-        indices = fold.train_indices
-    elif split_norm == "val":
-        indices = fold.val_indices
-    elif split_norm == "test":
-        indices = fold.test_indices
-        if first_test_year_only:
-            indices = _first_year_indices(panel, indices)
-    else:
-        raise ValueError("split must be one of: train, val, test")
+    # Explainability has one fixed comparison window: the first calendar year
+    # of every fold's test split. There is intentionally no split argument or
+    # all-test-years branch because either changes fold weighting and feature-
+    # selection semantics.
+    indices = _first_year_indices(panel, fold.test_indices)
     return CrossSectionalDataset(
         panel,
         indices,
@@ -8208,7 +9084,6 @@ def load_explanation_context(
     output_dir: Path | None,
     fold_id: int | None,
     checkpoint: Path | None,
-    split: str,
 ) -> LoadedExplanationContext:
     config = load_config(config_path)
     resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
@@ -8252,7 +9127,6 @@ def load_explanation_context(
         panel=panel,
         folds=folds,
         fold=fold,
-        split=split,
         checkpoint_path=checkpoint_path,
         output_dir=resolved_output_dir,
     )
@@ -8266,7 +9140,6 @@ def run_loaded_model_explanation(
     model: nn.Module,
     checkpoint_path: Path,
     output_dir: Path,
-    split: str,
     explain_output_dir: Path | None,
     settings: ExplainabilitySettings,
     write_plots: bool = True,
@@ -8287,7 +9160,7 @@ def run_loaded_model_explanation(
         torch.set_float32_matmul_precision("high")
     resolved_amp_dtype = _normalize_explain_amp_dtype(settings.amp_dtype, config)
     settings = replace(settings, amp_dtype=resolved_amp_dtype)
-    split_norm = split.strip().lower()
+    split_norm = _EXPLAINABILITY_SPLIT
     runner_timing: dict[str, float | str | int | bool] = {
         "fold_id": int(fold.fold_id),
         "split": split_norm,
@@ -8305,12 +9178,10 @@ def run_loaded_model_explanation(
     )
     runner_progress.set_postfix(stage="dataset", refresh=True)
     sample_start = time.perf_counter()
-    dataset = _dataset_for_split(
+    dataset = _first_test_year_dataset(
         panel,
         fold,
-        split_norm,
         config.training.lookback,
-        first_test_year_only=settings.first_test_year_only,
         execution_mode=getattr(
             getattr(config, "trading", None),
             "execution_mode",
@@ -8401,7 +9272,7 @@ def run_loaded_model_explanation(
         "sample_rows": int(len(dates)),
         "split_rows": int(len(dataset)),
         "sampled_date_coverage": float(len(dates)) / max(1, int(len(dataset))),
-        "first_test_year_only": bool(settings.first_test_year_only),
+        "first_test_year_only": True,
         "train_years": list(fold.train_years),
         "validation_years": list(fold.val_years),
         "test_years": list(fold.test_years),
@@ -8480,7 +9351,6 @@ def run_checkpoint_explanation(
     output_dir: Path | None,
     fold_id: int | None,
     checkpoint: Path | None,
-    split: str,
     explain_output_dir: Path | None,
     settings: ExplainabilitySettings,
     device_override: str | None = None,
@@ -8493,7 +9363,6 @@ def run_checkpoint_explanation(
         output_dir=output_dir,
         fold_id=fold_id,
         checkpoint=checkpoint,
-        split=split,
     )
     device = _device_from_config(context.config, device_override)
     if device.type == "cuda":
@@ -8514,7 +9383,6 @@ def run_checkpoint_explanation(
         model=model,
         checkpoint_path=context.checkpoint_path,
         output_dir=context.output_dir,
-        split=split,
         explain_output_dir=explain_output_dir,
         settings=settings,
         write_plots=write_plots,
@@ -8613,24 +9481,14 @@ def _discover_market_runs(
     return runs
 
 
-def _estimated_fold_explain_rows(
+def _estimated_first_test_year_explain_rows(
     fold: WalkForwardFold,
     panel: PanelData,
     *,
-    split: str,
     lookback: int,
-    first_test_year_only: bool,
     max_rows: int,
 ) -> int:
-    split_norm = split.strip().lower()
-    if split_norm == "train":
-        indices = fold.train_indices
-    elif split_norm == "val":
-        indices = fold.val_indices
-    else:
-        indices = fold.test_indices
-        if first_test_year_only:
-            indices = _first_year_indices(panel, indices)
+    indices = _first_year_indices(panel, fold.test_indices)
     rows = max(0, int(len(indices)) - max(1, int(lookback)) + 1)
     if int(max_rows) > 0:
         rows = min(rows, int(max_rows))
@@ -8643,9 +9501,7 @@ def _balanced_fold_assignments(
     panel: PanelData,
     *,
     world_size: int,
-    split: str,
     lookback: int,
-    first_test_year_only: bool,
     max_rows: int,
 ) -> tuple[list[list[int]], list[int]]:
     world_size = max(1, int(world_size))
@@ -8654,12 +9510,10 @@ def _balanced_fold_assignments(
     weighted = [
         (
             int(fold_id),
-            _estimated_fold_explain_rows(
+            _estimated_first_test_year_explain_rows(
                 folds_by_id[int(fold_id)],
                 panel,
-                split=split,
                 lookback=lookback,
-                first_test_year_only=first_test_year_only,
                 max_rows=max_rows,
             ),
         )
@@ -8755,9 +9609,7 @@ def _run_explainability_for_config(
             folds_by_id,
             panel,
             world_size=world_size,
-            split=args.split,
             lookback=config.training.lookback,
-            first_test_year_only=bool(settings.first_test_year_only),
             max_rows=int(settings.max_rows),
         )
         local_fold_ids = assignments[rank]
@@ -8783,7 +9635,7 @@ def _run_explainability_for_config(
             fold_stage.set_postfix(stage="load_checkpoint", refresh=True)
             fold_output_dir = explain_output_dir
             if fold_output_dir is not None:
-                fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{args.split.strip().lower()}"
+                fold_output_dir = Path(fold_output_dir) / f"fold_{int(fold_id):02d}_{_EXPLAINABILITY_SPLIT}"
             checkpoint_path = _fold_dir(resolved_output_dir, fold_id) / "checkpoint_best.pt"
             model: nn.Module | None = None
             try:
@@ -8809,7 +9661,6 @@ def _run_explainability_for_config(
                     model=model,
                     checkpoint_path=checkpoint_path,
                     output_dir=resolved_output_dir,
-                    split=args.split,
                     explain_output_dir=fold_output_dir,
                     settings=rank_settings,
                     write_plots=bool(args.plots),
@@ -8848,7 +9699,6 @@ def _run_explainability_for_config(
             output_dir=output_dir,
             fold_id=args.fold,
             checkpoint=args.checkpoint,
-            split=args.split,
             explain_output_dir=explain_output_dir,
             settings=rank_settings,
             device_override=args.device,
@@ -8876,7 +9726,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None, type=Path)
     parser.add_argument("--fold", default=None, type=int, help="Fold id. If omitted, explains all folds with checkpoint_best.pt.")
     parser.add_argument("--checkpoint", default=None, type=Path, help="Optional explicit checkpoint path.")
-    parser.add_argument("--split", default="test", choices=("train", "val", "test"))
     parser.add_argument("--explain-output-dir", default=None, type=Path)
     parser.add_argument(
         "--reports-only",
@@ -8929,18 +9778,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ig-steps", default=8, type=int)
     parser.add_argument("--ig-batch-size", default=0, type=int, help="Batch IG alpha steps together; 0 selects an automatic safe chunk size.")
     parser.add_argument("--sample-method", default="even", choices=("even", "first", "last"))
-    parser.add_argument(
-        "--first-test-year-only",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Restrict test explanation to its first year; disabled by default so all configured test years are covered.",
-    )
-    parser.add_argument(
-        "--all-test-years",
-        dest="first_test_year_only",
-        action="store_false",
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument(
         "--perturb",
         action=argparse.BooleanOptionalAction,
@@ -8999,6 +9836,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.01,
         type=float,
         help="Fractional layer ablation used to validate J-Lens linearization faithfulness (0 disables interventions).",
+    )
+    parser.add_argument(
+        "--j-lens-vjp-batch-size",
+        default=1,
+        type=int,
+        help="J-Lens output dimensions per batched VJP autograd call; preserves the complete Jacobian.",
     )
     parser.add_argument(
         "--regime-analysis",
@@ -9079,7 +9922,6 @@ def main(argv: list[str] | None = None) -> None:
         perturb_max_input_elements=args.perturb_max_input_elements,
         counterfactual_compile=bool(args.counterfactual_compile),
         sample_method=args.sample_method,
-        first_test_year_only=bool(args.first_test_year_only),
         report_style=args.report_style,
         plot_theme=args.plot_theme,
         standard_plots=bool(args.standard_plots),
@@ -9088,6 +9930,7 @@ def main(argv: list[str] | None = None) -> None:
         shap_mode=args.shap_mode,
         j_lens_enabled=bool(args.j_lens),
         j_lens_intervention_fraction=float(args.j_lens_intervention_fraction),
+        j_lens_vjp_batch_size=max(1, int(args.j_lens_vjp_batch_size)),
         regime_analysis=bool(args.regime_analysis),
         fold_stability=bool(args.fold_stability),
         umap_enabled=bool(args.umap),
@@ -9103,7 +9946,7 @@ def main(argv: list[str] | None = None) -> None:
             f"dates={'all' if settings.max_rows <= 0 else settings.max_rows}, "
             f"row_chunk={'auto' if settings.row_chunk_size <= 0 else settings.row_chunk_size}, "
             f"amp={settings.amp_dtype}, compile_model={settings.compile_model}, "
-            f"test_years={'first_only' if settings.first_test_year_only else 'all'}, "
+            "test_years=first_only, "
             f"IG={settings.ig_steps}, perturb={settings.perturb}, SHAP={settings.shap_enabled}, "
             f"J-Lens={settings.j_lens_enabled}, "
             f"UMAP={'disabled' if not settings.umap_enabled else ('all_points' if settings.umap_max_points <= 0 else settings.umap_max_points)}, "
