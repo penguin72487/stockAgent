@@ -513,6 +513,27 @@ Rules:
   they must not influence training, validation, test, inference, or feature
   importance.
 
+### TW Day-Trade Open-Aware Feature Contract
+
+- The only model-visible session-`t` opening quote is the opt-in normalized
+  feature `next_session_open_gap_logret`. Panel row `r` stores
+  `log(open[r+1] / close[r])`; because `tw_day_trade` keeps its ordinary
+  execution feature lag at one, the final row of a target-`t` window exposes
+  exactly `log(open[t] / close[t-1])`.
+- Do not replace this with a raw nominal opening-price feature. The normalized
+  gap is invariant to stock price scale and does not let the model identify a
+  symbol merely from its price level.
+- This feature is opt-in and legal only with `trading.execution_mode:
+  tw_day_trade`. Empty/wildcard panel feature selection must retain the
+  close-complete schema and must not silently include a next-session quote.
+- No session-`t` high, low, close, or volume may enter the model window used to
+  submit its opening order. Same-session full-day volume is future information.
+  Execution participation limits must continue to use completed session `t-1`
+  share volume as their causal proxy and keep that volume in the execution
+  layer, not in the model input.
+- Historical 98-feature close-complete checkpoints remain a separate schema.
+  Use a new artifact root and retrain for the 99-feature open-aware model.
+
 ## TW Public Execution-Rule Contract
 
 - Never put a data-dependent `torch._assert_async` in a compiled model,
