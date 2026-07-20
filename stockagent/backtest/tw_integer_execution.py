@@ -2831,22 +2831,33 @@ def run_tw_day_trade_integer(
             _record_ruin(arrays, t, payable=payable, receivable=receivable)
             continue
 
-        # The account is flat at both session boundaries: terminal exits block
-        # all new entries, while a forced-cover event blocks only sell-first.
+        # The account is flat at both session boundaries. A daily round trip is
+        # representable only when the direction-specific close leg and a valid
+        # close mark both exist. Gate the fill before reading the open quote or
+        # rounding shares; never open an unresolved position that daily data
+        # cannot carry. Only close *availability* participates in this gate --
+        # the close value must not influence opening quantity.
         entry_enabled = eligible[t] & ~force_exit[t]
-        long_enabled = entry_enabled & can_buy_open[t]
+        close_price_available = np.isfinite(raw_closes[t]) & (raw_closes[t] > 0.0)
+        long_enabled = (
+            entry_enabled
+            & can_buy_open[t]
+            & can_sell[t]
+            & close_price_available
+        )
         short_enabled = (
             entry_enabled
             & can_sell_open[t]
             & can_short_open[t]
+            & can_buy[t]
+            & close_price_available
             & ~force_short_cover[t]
         )
         enabled = np.where(targets[t] < 0.0, short_enabled, long_enabled)
         # Only a direction that can actually enter at the open requires an open
-        # quote.  Empty lifecycle masks must not make an otherwise inactive,
-        # unquoted symbol observable.  The close is deliberately not read here:
-        # opening quantity must be invariant to information revealed later in
-        # the session.
+        # quote. Empty lifecycle masks must not make an otherwise inactive,
+        # unquoted symbol observable. Opening quantity remains invariant to the
+        # later close value.
         open_required = enabled & (targets[t] != 0.0)
         open_row = _safe_execution_price_row(
             "open_prices", raw_opens, t, open_required
@@ -2903,14 +2914,6 @@ def run_tw_day_trade_integer(
         long_mask = signed_positions > 0
         short_mask = signed_positions < 0
         absolute_quantities = np.abs(signed_positions)
-        blocked_close = (long_mask & ~can_sell[t]) | (short_mask & ~can_buy[t])
-        if np.any(blocked_close):
-            blocked_symbols = np.flatnonzero(blocked_close).tolist()
-            raise RuntimeError(
-                "tw_day_trade mandatory close leg is unavailable after open entry; "
-                f"time_index={t}, symbol_indices={blocked_symbols}. Daily data "
-                "cannot carry or price the unresolved position exactly."
-            )
         close_required = signed_positions != 0
         close_row = _safe_execution_price_row(
             "close_prices", raw_closes, t, close_required

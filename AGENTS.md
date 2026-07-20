@@ -324,6 +324,19 @@ Rules:
 
 ## Intentional Walk-Forward Semantics
 
+- TW day-trade point-in-time eligibility is absent before 2014 in the verified
+  public data and first becomes executable on 2014-01-06 (sell-first coverage
+  begins 2014-06-30). A `tw_day_trade` experiment must not start its training
+  panel in 2005 or project today's eligibility backward. The trainer's execution-
+  coverage preflight must reject any train/validation split with zero executable
+  round trips because its canonical loss is constant and all model gradients are
+  exactly zero. The active public day-trade config therefore starts in 2014.
+- A TW day-trade strategy row executes open[t] to close[t]. Its configured
+  symbol benchmark is buy-and-hold over the same wall-clock session, using the
+  panel's adjusted-close forward label shifted one row: close[t-1] to close[t].
+  Do not replace it with a cross-sectional mean of intraday returns or use the
+  unshifted close[t] to close[t+1] label. The active public benchmark is 2330.
+
 - When `walk_forward.require_future_test_year: false`, the final experimental fold
   deliberately reuses its validation window as its test window. Keep that overlap;
   label it as latest-year experimentation rather than unbiased model selection.
