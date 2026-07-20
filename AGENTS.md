@@ -440,6 +440,29 @@ Compile/runtime rules:
   Inductor workers. The canonical-loss probe is intentionally collective: it
   must reproduce the real autograd all-gather input on all ranks, otherwise the
   first train step compiles the same loss again.
+- After DDP training, run the saved-model inference/plot artifact pass on rank
+  0 only. Other ranks must wait through a dedicated CPU/Gloo process group with
+  a long artifact-I/O timeout; do not use the default NCCL group for this wait.
+  A measured XFS discard stall exceeded NCCL's 600-second watchdog even though
+  no GPU work was wrong, while the Gloo wait completed normally and avoided a
+  duplicate inference pass and artifact write race.
+- The TW public open-aware `tw_day_trade` executor now uses the same bounded
+  compiled-settlement pattern as `tw_cash`. Keep the eager ledger as the
+  semantic oracle, compile fixed 32-row chunks with CUDA graphs disabled, and
+  carry `cash`, `payables`, `receivables`, `alive`, and `equity_scale`
+  differentiably between chunks. A non-aligned tail stays on the exact eager
+  implementation. Do not replace this state machine with independent daily
+  returns: T+2 default is absorbing and volume caps depend on carried equity.
+  The DDP canonical-loss probe must report `tw_day_trade_chunked=true`, at
+  least one compiled chunk call, and zero eager fallbacks before epoch 1.
+- Measured on dual RTX 5090 with the open-aware public config, `T=128`,
+  `S=2738`, and chunk/horizon 32: settlement forward+backward improved from
+  `546.7ms` eager to `114.1ms` compiled in an isolated actual-shape probe; a
+  no-grad `T=512` evaluation improved from `950.0ms` to `68.5ms`. The complete
+  fold-1 epoch-2/3 median improved from the prior `2.213s` baseline to
+  `0.439s`, including validation, sampled test curve, plotting, and checkpoint
+  work. Cold compile remains material (roughly 100 seconds per grad/no-grad
+  contract), so preserve stable caches and judge throughput only after epoch 1.
 - Expanding `train_union` folds change their symbol count. When
   `training.compile_loss_dynamic_symbols: true`, keep the time/batch axis static,
   mark only the canonical loss symbol axis dynamic, and reuse one compiled loss

@@ -42,6 +42,8 @@ _TW_CASH_COMPILE_STATS: dict[str, int] = {
     "compile_constructors": 0,
     "compiled_chunk_calls": 0,
     "eager_fallback_calls": 0,
+    "tw_cash_compiled_chunk_calls": 0,
+    "tw_day_trade_compiled_chunk_calls": 0,
 }
 
 
@@ -2633,6 +2635,7 @@ def run_tw_cash_continuous(
             alive = result.final_alive
             equity_scale = result.final_equity_scale
             _TW_CASH_COMPILE_STATS["compiled_chunk_calls"] += 1
+            _TW_CASH_COMPILE_STATS["tw_cash_compiled_chunk_calls"] += 1
 
         if full_stop < total_rows:
             if (
@@ -2798,7 +2801,7 @@ def run_tw_cash_continuous(
     )
 
 
-def run_tw_day_trade_continuous(
+def _run_tw_day_trade_continuous_impl(
     target_weights: torch.Tensor,
     intraday_log_returns: torch.Tensor,
     tradable_mask: torch.Tensor,
@@ -2823,6 +2826,7 @@ def run_tw_day_trade_continuous(
     initial_receivables: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     initial_equity_scale: torch.Tensor | None = None,
+    _detach_initial_state: bool = True,
 ) -> TaiwanContinuousResult:
     """Open-entry/close-exit execution with T+2 net-difference settlement.
 
@@ -2866,11 +2870,13 @@ def run_tw_day_trade_continuous(
         initial_receivables=initial_receivables,
         initial_alive=initial_alive,
         state_advance_mask=state_advance_mask,
+        detach_initial_state=_detach_initial_state,
     )
     equity_scale = _prepare_equity_scale(
         target_weights,
         initial_equity_scale=initial_equity_scale,
         alive=alive,
+        detach_initial_state=_detach_initial_state,
     )
     raw_intraday_log_returns = intraday_log_returns.to(
         device=target_weights.device,
@@ -3098,6 +3104,541 @@ def run_tw_day_trade_continuous(
         final_receivables=receivables,
         final_alive=alive,
         final_equity_scale=equity_scale,
+    )
+
+
+def _tw_day_trade_result_tuple(
+    result: TaiwanContinuousResult,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        result.strategy_returns,
+        result.turnovers,
+        result.weights_history,
+        result.cash_history,
+        result.payables_history,
+        result.receivables_history,
+        result.settlement_default,
+        result.equity_scale_history,
+        result.final_weights,
+        result.final_cash,
+        result.final_payables,
+        result.final_receivables,
+        result.final_alive,
+        result.final_equity_scale,
+    )
+
+
+def _tw_day_trade_result_from_tuple(
+    values: tuple[torch.Tensor, ...],
+) -> TaiwanContinuousResult:
+    return TaiwanContinuousResult(
+        strategy_returns=values[0],
+        turnovers=values[1],
+        weights_history=values[2],
+        cash_history=values[3],
+        payables_history=values[4],
+        receivables_history=values[5],
+        settlement_default=values[6],
+        equity_scale_history=values[7],
+        final_weights=values[8],
+        final_cash=values[9],
+        final_payables=values[10],
+        final_receivables=values[11],
+        final_alive=values[12],
+        final_equity_scale=values[13],
+    )
+
+
+def _tw_day_trade_compiled_chunk_runner(
+    *,
+    target_weights: torch.Tensor,
+    chunk_rows: int,
+    settlement_lag_sessions: int,
+    max_turnover_ratio: float,
+    has_volume_limit: bool,
+    return_weights_history: bool,
+    requires_state_grad: bool,
+    min_symbols: int,
+    max_symbols: int,
+) -> tuple[tuple[object, ...], Callable[..., tuple[torch.Tensor, ...]]]:
+    device_index = (
+        target_weights.device.index
+        if target_weights.device.index is not None
+        else torch.cuda.current_device()
+    )
+    key: tuple[object, ...] = (
+        "tw_day_trade",
+        int(device_index),
+        str(target_weights.dtype),
+        int(chunk_rows),
+        int(settlement_lag_sessions),
+        float(max_turnover_ratio),
+        bool(has_volume_limit),
+        bool(return_weights_history),
+        bool(torch.is_grad_enabled()),
+        bool(target_weights.requires_grad),
+        bool(requires_state_grad),
+        bool(torch.is_inference_mode_enabled()),
+        int(min_symbols),
+        int(max_symbols),
+    )
+    cached = _TW_CASH_COMPILED_CHUNK_CACHE.get(key)
+    if cached is not None:
+        return key, cached
+
+    def run_chunk(
+        chunk_target_weights: torch.Tensor,
+        chunk_intraday_log_returns: torch.Tensor,
+        chunk_tradable_mask: torch.Tensor,
+        chunk_can_buy_mask: torch.Tensor,
+        chunk_can_sell_mask: torch.Tensor,
+        chunk_can_short_open_mask: torch.Tensor,
+        chunk_day_trade_eligible_mask: torch.Tensor,
+        chunk_day_trade_can_buy_open_mask: torch.Tensor,
+        chunk_day_trade_can_sell_open_mask: torch.Tensor,
+        buy_fee_rates: torch.Tensor,
+        sell_fee_rates: torch.Tensor,
+        chunk_volume_limit_weights: torch.Tensor,
+        chunk_force_short_cover_mask: torch.Tensor,
+        chunk_force_exit_mask: torch.Tensor,
+        chunk_state_advance_mask: torch.Tensor,
+        initial_cash: torch.Tensor,
+        initial_payables: torch.Tensor,
+        initial_receivables: torch.Tensor,
+        initial_alive: torch.Tensor,
+        initial_equity_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        result = _run_tw_day_trade_continuous_impl(
+            chunk_target_weights,
+            chunk_intraday_log_returns,
+            chunk_tradable_mask,
+            chunk_can_buy_mask,
+            chunk_can_sell_mask,
+            chunk_can_short_open_mask,
+            chunk_day_trade_eligible_mask,
+            buy_fee_rates,
+            sell_fee_rates,
+            day_trade_can_buy_open_mask=chunk_day_trade_can_buy_open_mask,
+            day_trade_can_sell_open_mask=chunk_day_trade_can_sell_open_mask,
+            settlement_lag_sessions=settlement_lag_sessions,
+            max_turnover_ratio=max_turnover_ratio,
+            volume_limit_weights=(
+                chunk_volume_limit_weights if has_volume_limit else None
+            ),
+            force_short_cover_mask=chunk_force_short_cover_mask,
+            force_exit_mask=chunk_force_exit_mask,
+            state_advance_mask=chunk_state_advance_mask,
+            return_weights_history=return_weights_history,
+            initial_cash=initial_cash,
+            initial_payables=initial_payables,
+            initial_receivables=initial_receivables,
+            initial_alive=initial_alive,
+            initial_equity_scale=initial_equity_scale,
+            _detach_initial_state=False,
+        )
+        return _tw_day_trade_result_tuple(result)
+
+    compiled = torch.compile(
+        run_chunk,
+        fullgraph=True,
+        dynamic=None,
+        options={"triton.cudagraphs": False},
+    )
+    _TW_CASH_COMPILED_CHUNK_CACHE[key] = compiled
+    _TW_CASH_COMPILE_STATS["compile_constructors"] += 1
+    return key, compiled
+
+
+def run_tw_day_trade_continuous(
+    target_weights: torch.Tensor,
+    intraday_log_returns: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    can_buy_mask: torch.Tensor,
+    can_sell_mask: torch.Tensor,
+    can_short_open_mask: torch.Tensor,
+    day_trade_eligible_mask: torch.Tensor,
+    buy_fee_rates: torch.Tensor,
+    sell_fee_rates: torch.Tensor,
+    *,
+    day_trade_can_buy_open_mask: torch.Tensor | None = None,
+    day_trade_can_sell_open_mask: torch.Tensor | None = None,
+    settlement_lag_sessions: int = 2,
+    max_turnover_ratio: float = 0.0,
+    volume_limit_weights: torch.Tensor | None = None,
+    force_short_cover_mask: torch.Tensor | None = None,
+    force_exit_mask: torch.Tensor | None = None,
+    state_advance_mask: torch.Tensor | None = None,
+    return_weights_history: bool = True,
+    initial_cash: torch.Tensor | None = None,
+    initial_payables: torch.Tensor | None = None,
+    initial_receivables: torch.Tensor | None = None,
+    initial_alive: torch.Tensor | None = None,
+    initial_equity_scale: torch.Tensor | None = None,
+) -> TaiwanContinuousResult:
+    """Run the exact day-trade ledger in bounded compiled CUDA chunks.
+
+    The eager implementation remains the semantic oracle.  Compiled chunks
+    only change executor granularity: cash, T+2 claims, ruin state, and the
+    reference-equity scale stay differentiably connected across chunks.
+    """
+
+    def eager() -> TaiwanContinuousResult:
+        return _run_tw_day_trade_continuous_impl(
+            target_weights,
+            intraday_log_returns,
+            tradable_mask,
+            can_buy_mask,
+            can_sell_mask,
+            can_short_open_mask,
+            day_trade_eligible_mask,
+            buy_fee_rates,
+            sell_fee_rates,
+            day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
+            day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
+            settlement_lag_sessions=settlement_lag_sessions,
+            max_turnover_ratio=max_turnover_ratio,
+            volume_limit_weights=volume_limit_weights,
+            force_short_cover_mask=force_short_cover_mask,
+            force_exit_mask=force_exit_mask,
+            state_advance_mask=state_advance_mask,
+            return_weights_history=return_weights_history,
+            initial_cash=initial_cash,
+            initial_payables=initial_payables,
+            initial_receivables=initial_receivables,
+            initial_alive=initial_alive,
+            initial_equity_scale=initial_equity_scale,
+        )
+
+    try:
+        chunk_rows = int(
+            os.environ.get("STOCKAGENT_TW_CONTINUOUS_COMPILE_CHUNK_ROWS", "8")
+        )
+    except ValueError:
+        chunk_rows = 0
+    gradient_horizon = _settlement_gradient_horizon_rows()
+    gradient_boundaries_align = bool(
+        gradient_horizon <= 0
+        or chunk_rows % gradient_horizon == 0
+        or gradient_horizon % chunk_rows == 0
+    ) if chunk_rows > 0 else False
+    compile_chunks = bool(
+        chunk_rows > 0
+        and gradient_boundaries_align
+        and target_weights.device.type == "cuda"
+        and hasattr(torch, "compile")
+        and _tw_env_truthy("STOCKAGENT_BACKTEST_COMPILE", "1")
+        and not torch.compiler.is_compiling()
+        and int(target_weights.size(0)) >= chunk_rows
+    )
+    if not compile_chunks:
+        return eager()
+
+    if day_trade_can_buy_open_mask is None or day_trade_can_sell_open_mask is None:
+        return eager()
+    expected_shape = tuple(target_weights.shape)
+    for name, value in (
+        ("intraday_log_returns", intraday_log_returns),
+        ("tradable_mask", tradable_mask),
+        ("can_buy_mask", can_buy_mask),
+        ("can_sell_mask", can_sell_mask),
+        ("can_short_open_mask", can_short_open_mask),
+        ("day_trade_eligible_mask", day_trade_eligible_mask),
+        ("day_trade_can_buy_open_mask", day_trade_can_buy_open_mask),
+        ("day_trade_can_sell_open_mask", day_trade_can_sell_open_mask),
+    ):
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(f"{name} shape must match target_weights")
+    for name, value in (
+        ("volume_limit_weights", volume_limit_weights),
+        ("force_short_cover_mask", force_short_cover_mask),
+        ("force_exit_mask", force_exit_mask),
+    ):
+        if value is not None and tuple(value.shape) != expected_shape:
+            raise ValueError(f"{name} shape must match target_weights")
+
+    buy_fees = _as_fee_vector(
+        buy_fee_rates,
+        reference=target_weights,
+        name="buy_fee_rates",
+    )
+    sell_fees = _as_fee_vector(
+        sell_fee_rates,
+        reference=target_weights,
+        name="sell_fee_rates",
+    )
+    zero_initial_weights = torch.zeros_like(target_weights[0])
+    _, cash, payables, receivables, alive, advance = _prepare_common_state(
+        target_weights,
+        settlement_lag_sessions=settlement_lag_sessions,
+        initial_weights=zero_initial_weights,
+        initial_cash=initial_cash,
+        initial_payables=initial_payables,
+        initial_receivables=initial_receivables,
+        initial_alive=initial_alive,
+        state_advance_mask=state_advance_mask,
+        detach_initial_state=True,
+    )
+    equity_scale = _prepare_equity_scale(
+        target_weights,
+        initial_equity_scale=initial_equity_scale,
+        alive=alive,
+        detach_initial_state=True,
+    )
+    tradable = tradable_mask.to(device=target_weights.device, dtype=torch.bool)
+    buy = can_buy_mask.to(device=target_weights.device, dtype=torch.bool) & tradable
+    sell = can_sell_mask.to(device=target_weights.device, dtype=torch.bool) & tradable
+    buy_open = day_trade_can_buy_open_mask.to(
+        device=target_weights.device,
+        dtype=torch.bool,
+    )
+    sell_open = day_trade_can_sell_open_mask.to(
+        device=target_weights.device,
+        dtype=torch.bool,
+    )
+    short_open = (
+        can_short_open_mask.to(device=target_weights.device, dtype=torch.bool)
+        & sell_open
+    )
+    eligible = day_trade_eligible_mask.to(
+        device=target_weights.device,
+        dtype=torch.bool,
+    )
+    force_cover = (
+        torch.zeros_like(tradable)
+        if force_short_cover_mask is None
+        else force_short_cover_mask.to(
+            device=target_weights.device,
+            dtype=torch.bool,
+        )
+    )
+    terminal = (
+        torch.zeros_like(tradable)
+        if force_exit_mask is None
+        else force_exit_mask.to(device=target_weights.device, dtype=torch.bool)
+    )
+    has_volume_limit = volume_limit_weights is not None
+    volume_limits = (
+        torch.zeros_like(target_weights)
+        if volume_limit_weights is None
+        else volume_limit_weights.to(
+            device=target_weights.device,
+            dtype=target_weights.dtype,
+        )
+    )
+    requires_state_grad = bool(
+        torch.is_grad_enabled()
+        and any(
+            value.requires_grad
+            for value in (
+                target_weights,
+                intraday_log_returns,
+                buy_fees,
+                sell_fees,
+                volume_limits,
+            )
+        )
+    )
+    if requires_state_grad:
+        cash = cash.detach().clone().requires_grad_(True)
+        payables = payables.detach().clone().requires_grad_(True)
+        receivables = receivables.detach().clone().requires_grad_(True)
+        equity_scale = equity_scale.detach().clone().requires_grad_(True)
+
+    symbols = int(target_weights.size(1))
+    min_symbols, max_symbols = _tw_cash_compile_symbol_bounds(symbols)
+    try:
+        key, compiled_chunk = _tw_day_trade_compiled_chunk_runner(
+            target_weights=target_weights,
+            chunk_rows=chunk_rows,
+            settlement_lag_sessions=settlement_lag_sessions,
+            max_turnover_ratio=max_turnover_ratio,
+            has_volume_limit=has_volume_limit,
+            return_weights_history=return_weights_history,
+            requires_state_grad=requires_state_grad,
+            min_symbols=min_symbols,
+            max_symbols=max_symbols,
+        )
+    except Exception as exc:
+        if _tw_env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0"):
+            raise RuntimeError(
+                "failed to construct compiled Taiwan day-trade chunk runner"
+            ) from exc
+        _TW_CASH_COMPILE_STATS["eager_fallback_calls"] += 1
+        print(
+            "[tw day trade compile] chunk constructor failed; using the exact "
+            f"eager ledger: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return eager()
+    if key in _TW_CASH_FAILED_COMPILE_KEYS:
+        if _tw_env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0"):
+            raise RuntimeError(
+                "compiled Taiwan day-trade chunk previously failed for this "
+                "contract; strict fallback is enabled"
+            )
+        _TW_CASH_COMPILE_STATS["eager_fallback_calls"] += 1
+        return eager()
+
+    chunks: list[TaiwanContinuousResult] = []
+    try:
+        total_rows = int(target_weights.size(0))
+        full_stop = total_rows - total_rows % chunk_rows
+        for start in range(0, full_stop, chunk_rows):
+            if (
+                gradient_horizon > 0
+                and start > 0
+                and start % gradient_horizon == 0
+            ):
+                cash = _restart_recurrent_gradient(
+                    cash,
+                    requires_grad=requires_state_grad,
+                )
+                payables = _restart_recurrent_gradient(
+                    payables,
+                    requires_grad=requires_state_grad,
+                )
+                receivables = _restart_recurrent_gradient(
+                    receivables,
+                    requires_grad=requires_state_grad,
+                )
+                alive = _restart_recurrent_gradient(alive, requires_grad=False)
+                equity_scale = _restart_recurrent_gradient(
+                    equity_scale,
+                    requires_grad=requires_state_grad,
+                )
+            stop = start + chunk_rows
+            chunk_tensors_2d = (
+                target_weights[start:stop],
+                intraday_log_returns[start:stop],
+                tradable[start:stop],
+                buy[start:stop],
+                sell[start:stop],
+                short_open[start:stop],
+                eligible[start:stop],
+                buy_open[start:stop],
+                sell_open[start:stop],
+                volume_limits[start:stop],
+                force_cover[start:stop],
+                terminal[start:stop],
+            )
+            _mark_tw_cash_chunk_symbol_axes(
+                chunk_tensors_2d,
+                (buy_fees, sell_fees),
+                symbols=symbols,
+                min_symbols=min_symbols,
+                max_symbols=max_symbols,
+            )
+            values = compiled_chunk(
+                *chunk_tensors_2d[:9],
+                buy_fees,
+                sell_fees,
+                *chunk_tensors_2d[9:],
+                advance[start:stop],
+                cash,
+                payables,
+                receivables,
+                alive,
+                equity_scale,
+            )
+            result = _tw_day_trade_result_from_tuple(values)
+            chunks.append(result)
+            cash = result.final_cash
+            payables = result.final_payables
+            receivables = result.final_receivables
+            alive = result.final_alive
+            equity_scale = result.final_equity_scale
+            _TW_CASH_COMPILE_STATS["compiled_chunk_calls"] += 1
+            _TW_CASH_COMPILE_STATS["tw_day_trade_compiled_chunk_calls"] += 1
+
+        if full_stop < total_rows:
+            if (
+                gradient_horizon > 0
+                and full_stop > 0
+                and full_stop % gradient_horizon == 0
+            ):
+                cash = _restart_recurrent_gradient(
+                    cash,
+                    requires_grad=requires_state_grad,
+                )
+                payables = _restart_recurrent_gradient(
+                    payables,
+                    requires_grad=requires_state_grad,
+                )
+                receivables = _restart_recurrent_gradient(
+                    receivables,
+                    requires_grad=requires_state_grad,
+                )
+                alive = _restart_recurrent_gradient(alive, requires_grad=False)
+                equity_scale = _restart_recurrent_gradient(
+                    equity_scale,
+                    requires_grad=requires_state_grad,
+                )
+            tail = _run_tw_day_trade_continuous_impl(
+                target_weights[full_stop:],
+                intraday_log_returns[full_stop:],
+                tradable[full_stop:],
+                buy[full_stop:],
+                sell[full_stop:],
+                short_open[full_stop:],
+                eligible[full_stop:],
+                buy_fees,
+                sell_fees,
+                day_trade_can_buy_open_mask=buy_open[full_stop:],
+                day_trade_can_sell_open_mask=sell_open[full_stop:],
+                settlement_lag_sessions=settlement_lag_sessions,
+                max_turnover_ratio=max_turnover_ratio,
+                volume_limit_weights=(
+                    volume_limits[full_stop:] if has_volume_limit else None
+                ),
+                force_short_cover_mask=force_cover[full_stop:],
+                force_exit_mask=terminal[full_stop:],
+                state_advance_mask=advance[full_stop:],
+                return_weights_history=return_weights_history,
+                initial_cash=cash,
+                initial_payables=payables,
+                initial_receivables=receivables,
+                initial_alive=alive,
+                initial_equity_scale=equity_scale,
+                _detach_initial_state=False,
+            )
+            chunks.append(tail)
+    except Exception as exc:
+        _TW_CASH_FAILED_COMPILE_KEYS.add(key)
+        if _tw_env_truthy("STOCKAGENT_STRICT_NO_FALLBACK", "0"):
+            raise RuntimeError(
+                "compiled Taiwan day-trade chunk failed and strict fallback "
+                "is enabled"
+            ) from exc
+        _TW_CASH_COMPILE_STATS["eager_fallback_calls"] += 1
+        print(
+            "[tw day trade compile] chunk runner failed; using the exact eager "
+            f"ledger for this shape: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return eager()
+
+    final = chunks[-1]
+    return TaiwanContinuousResult(
+        strategy_returns=torch.cat([chunk.strategy_returns for chunk in chunks]),
+        turnovers=torch.cat([chunk.turnovers for chunk in chunks]),
+        weights_history=torch.cat([chunk.weights_history for chunk in chunks]),
+        cash_history=torch.cat([chunk.cash_history for chunk in chunks]),
+        payables_history=torch.cat([chunk.payables_history for chunk in chunks]),
+        receivables_history=torch.cat(
+            [chunk.receivables_history for chunk in chunks]
+        ),
+        settlement_default=torch.cat(
+            [chunk.settlement_default for chunk in chunks]
+        ),
+        equity_scale_history=torch.cat(
+            [chunk.equity_scale_history for chunk in chunks]
+        ),
+        final_weights=final.final_weights,
+        final_cash=final.final_cash,
+        final_payables=final.final_payables,
+        final_receivables=final.final_receivables,
+        final_alive=final.final_alive,
+        final_equity_scale=final.final_equity_scale,
     )
 
 
