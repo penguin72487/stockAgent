@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -1052,14 +1053,38 @@ def main() -> None:
             deployment_folds=all_folds,
         )
         if post_train_infer:
-            print("[post-train] running inference+plot pass on saved models...")
-            results = run_inference(
-                panel,
-                folds,
-                config,
-                output_dir,
-                deployment_folds=all_folds,
+            post_train_dist_ready = (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
             )
+            post_train_is_rank0 = (
+                not post_train_dist_ready
+                or int(torch.distributed.get_rank()) == 0
+            )
+            post_train_wait_group = (
+                torch.distributed.new_group(
+                    backend="gloo",
+                    timeout=timedelta(hours=24),
+                )
+                if post_train_dist_ready
+                else None
+            )
+            if post_train_is_rank0:
+                print("[post-train] running inference+plot pass on saved models...")
+                results = run_inference(
+                    panel,
+                    folds,
+                    config,
+                    output_dir,
+                    deployment_folds=all_folds,
+                )
+            if post_train_dist_ready:
+                # Every rank must remain alive until rank 0 finishes the
+                # one-copy artifact pass. Use a CPU group because slow XFS
+                # artifact writes must not occupy a GPU or trip NCCL's
+                # collective watchdog.
+                torch.distributed.barrier(group=post_train_wait_group)
+                torch.distributed.destroy_process_group(post_train_wait_group)
 
     dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
     is_rank0 = (not dist_ready) or int(torch.distributed.get_rank()) == 0

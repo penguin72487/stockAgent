@@ -2034,6 +2034,163 @@ def test_tw_cash_compiled_chunks_preserve_cross_chunk_gradient(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA chunk compile test")
+def test_tw_day_trade_compiled_chunks_match_eager_and_preserve_gradient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_compile = torch.compile
+    graph_count = 0
+
+    def counting_backend(graph_module, _example_inputs):
+        nonlocal graph_count
+        graph_count += 1
+        return graph_module.forward
+
+    def compile_with_eager_backend(fn, **kwargs):
+        kwargs.pop("options", None)
+        return real_compile(fn, backend=counting_backend, **kwargs)
+
+    weights_eager = torch.tensor(
+        [
+            [0.35, -0.20],
+            [0.15, 0.30],
+            [-0.40, 0.10],
+            [0.20, -0.30],
+            [0.25, 0.15],
+        ],
+        device="cuda",
+        requires_grad=True,
+    )
+    returns_eager = torch.tensor(
+        [
+            [0.02, -0.01],
+            [0.03, 0.01],
+            [-0.02, 0.04],
+            [0.01, 0.03],
+            [-0.01, 0.02],
+        ],
+        device="cuda",
+        requires_grad=True,
+    )
+    mask = torch.ones_like(weights_eager, dtype=torch.bool)
+    fees = torch.tensor([0.000855, 0.001855], device="cuda")
+    volume_limits = torch.tensor(
+        [
+            [10.0, 10.0],
+            [10.0, 10.0],
+            [0.20, 0.20],
+            [0.20, 0.20],
+            [0.20, 0.20],
+        ],
+        device="cuda",
+    )
+    initial_cash = torch.ones((), device="cuda", requires_grad=True)
+    initial_payables = torch.zeros(2, device="cuda", requires_grad=True)
+    initial_receivables = torch.zeros(2, device="cuda", requires_grad=True)
+    initial_equity_scale = torch.ones((), device="cuda", requires_grad=True)
+    initial_state = {
+        "initial_cash": initial_cash,
+        "initial_payables": initial_payables,
+        "initial_receivables": initial_receivables,
+        "initial_equity_scale": initial_equity_scale,
+    }
+    common = {
+        "tradable_mask": mask,
+        "can_buy_mask": mask,
+        "can_sell_mask": mask,
+        "can_short_open_mask": mask,
+        "day_trade_eligible_mask": mask,
+        "buy_fee_rates": fees,
+        "sell_fee_rates": fees,
+        "day_trade_can_buy_open_mask": mask,
+        "day_trade_can_sell_open_mask": mask,
+        "volume_limit_weights": volume_limits,
+        **initial_state,
+    }
+
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_COMPILE", "0")
+    monkeypatch.setenv("STOCKAGENT_TW_CONTINUOUS_GRADIENT_HORIZON_ROWS", "4")
+    reference = run_tw_day_trade_continuous(
+        weights_eager,
+        returns_eager,
+        **common,
+    )
+    reference_objective = (
+        reference.strategy_returns[2:].sum()
+        + reference.final_equity_scale * 0.3
+    )
+    reference_objective.backward()
+    reference_weight_grad = weights_eager.grad.detach().clone()
+    reference_return_grad = returns_eager.grad.detach().clone()
+
+    torch._dynamo.reset()
+    tw_continuous_module._TW_CASH_COMPILED_CHUNK_CACHE.clear()
+    tw_continuous_module._TW_CASH_FAILED_COMPILE_KEYS.clear()
+    tw_continuous_module.get_tw_continuous_compile_stats(reset=True)
+    monkeypatch.setattr(torch, "compile", compile_with_eager_backend)
+    monkeypatch.setenv("STOCKAGENT_BACKTEST_COMPILE", "1")
+    monkeypatch.setenv("STOCKAGENT_TW_CONTINUOUS_COMPILE_CHUNK_ROWS", "2")
+    monkeypatch.setenv("STOCKAGENT_TW_COMPILE_SYMBOL_MAX", "2")
+
+    weights_chunked = weights_eager.detach().clone().requires_grad_(True)
+    returns_chunked = returns_eager.detach().clone().requires_grad_(True)
+    chunked = run_tw_day_trade_continuous(
+        weights_chunked,
+        returns_chunked,
+        **common,
+    )
+    chunked_objective = (
+        chunked.strategy_returns[2:].sum()
+        + chunked.final_equity_scale * 0.3
+    )
+    chunked_objective.backward()
+
+    for field in (
+        "strategy_returns",
+        "turnovers",
+        "weights_history",
+        "cash_history",
+        "payables_history",
+        "receivables_history",
+        "settlement_default",
+        "equity_scale_history",
+        "final_cash",
+        "final_payables",
+        "final_receivables",
+        "final_alive",
+        "final_equity_scale",
+    ):
+        torch.testing.assert_close(
+            getattr(chunked, field),
+            getattr(reference, field),
+            rtol=2e-6,
+            atol=2e-7,
+        )
+    torch.testing.assert_close(
+        weights_chunked.grad,
+        reference_weight_grad,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    torch.testing.assert_close(
+        returns_chunked.grad,
+        reference_return_grad,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    assert reference_weight_grad[:2].abs().sum().item() > 0.0
+    assert graph_count == 1
+    for state_tensor in initial_state.values():
+        assert state_tensor.grad is None
+    stats = tw_continuous_module.get_tw_continuous_compile_stats()
+    assert stats["compiled_chunk_calls"] == 2
+    assert stats["tw_day_trade_compiled_chunk_calls"] == 2
+    assert stats["eager_fallback_calls"] == 0
+
+    torch._dynamo.reset()
+    tw_continuous_module._TW_CASH_COMPILED_CHUNK_CACHE.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA chunk compile test")
 def test_tw_cash_exact_dividend_compiled_chunks_match_eager_and_queue_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
