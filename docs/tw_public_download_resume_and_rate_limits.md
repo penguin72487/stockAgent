@@ -28,7 +28,7 @@ they are used in an approved manner. Operators are responsible for ensuring
 their use is authorized. A client-side rate limit does not itself grant that
 authorization.
 
-Therefore, the default `10 req/s` is a stockAgent client-side safety policy, not
+Therefore, the default `8 req/s` is a stockAgent client-side safety policy, not
 an official upstream allowance. A `403`, `429`, `Retry-After`, or observed WAF
 response always takes precedence over the configured default. In environments
 that receive such responses, set a slower explicit interval, for example
@@ -36,7 +36,7 @@ that receive such responses, set a slower explicit interval, for example
 
 TWSE may return an HTTP `307` security page instead of JSON after a request
 burst. The downloader recognizes that body, applies a 30-second provider-global
-cooldown, and retries. The configured 10 req/s remains a peak client policy; it
+cooldown, and retries. The configured 8 req/s remains a peak client policy; it
 does not override an observed upstream block.
 
 ## Global limiter semantics
@@ -48,14 +48,14 @@ does not override an observed upstream block.
 
 The host-global state defaults to the operating system temporary directory
 under `stockagent-rate-limits-<uid>`. Set `STOCKAGENT_RATE_LIMIT_DIR` to choose a
-different portable state directory. Unregistered providers default to 10 req/s.
+different portable state directory. Unregistered providers default to 8 req/s.
 Explicit intervals faster than the configured policy are clamped; slower
 intervals are accepted. Transient `403`, `429`, `5xx`, and `Retry-After`
 responses defer the shared provider schedule, not only the worker that received
 the response.
 
 Yahoo Finance uses its own `yahoo_finance` provider bucket. A direct
-`download_yahoo_ohlcv.py` invocation therefore defaults to 10 requests/second
+`download_yahoo_ohlcv.py` invocation therefore defaults to 8 requests/second
 when `--request-interval` is omitted and shares that cap with concurrent
 stockAgent Yahoo processes. The canonical first TW fallback bootstrap remains a
 deliberately slower exception: one worker with a 1.5-second interval, because a
@@ -79,7 +79,7 @@ and discards only the current worker thread's persistent HTTP session before the
 route switch or cache-busted retry. It does not add a second provider-global
 defer or sleep, because `_http_get` already enforces status/backoff policy and
 the next call still executes the shared limiter's `wait()`. Thus semantic
-retries remain bounded by the default 10 req/s policy, while WAF, 429,
+retries remain bounded by the default 8 req/s policy, while WAF, 429,
 `Retry-After`, and transport cooldowns remain provider-global.
 
 ## Append-only historical resume

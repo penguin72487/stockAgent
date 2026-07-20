@@ -668,7 +668,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Minimum seconds between Yahoo chart requests across all threads and "
-            "processes. Defaults to the provider policy (10 requests/second)."
+            "processes. Defaults to the provider policy (8 requests/second)."
         ),
     )
     parser.add_argument("--refresh", action="store_true", help="Re-download full history even if parquet exists.")
@@ -2543,12 +2543,15 @@ def _resolve_tw_symbols(
         output_dir,
         cached,
     )
+    # Always load durable official lifecycle evidence when it is available.
+    # ``include_tw_delisted`` controls whether venue-specific archive records
+    # are added to the Yahoo universe; it must not disable classification of
+    # already-tracked generic historical codes.
+    official_delisted_lifecycle_records = _load_tw_delisted_symbols_from_parquet(
+        getattr(args, "tw_delisted_dir", None)
+    )
     official_delisted_records = (
-        _load_tw_delisted_symbols_from_parquet(
-            getattr(args, "tw_delisted_dir", None)
-        )
-        if args.include_tw_delisted
-        else []
+        official_delisted_lifecycle_records if args.include_tw_delisted else []
     )
     try:
         print(f"[symbols] fetching tw_stocks from exchange (timeout=60s)…")
@@ -2578,6 +2581,22 @@ def _resolve_tw_symbols(
         records.extend(local_manifest_records)
         records.extend(local_parquet_records)
         records.extend(official_delisted_records)
+        active_symbol_keys = {
+            key
+            for record in live_records
+            for key in _candidate_symbol_keys("tw_stocks", record)
+        }
+        delisted_symbol_keys = {
+            key
+            for record in official_delisted_lifecycle_records
+            for key in _candidate_symbol_keys("tw_stocks", record)
+        }
+        records = _apply_daily_listing_state(
+            "tw_stocks",
+            records,
+            active_symbol_keys,
+            delisted_symbol_keys,
+        )
         filtered_records = _filter_tw_records_for_supported_universe(
             records,
             excluded_records=excluded_records,
@@ -2645,7 +2664,10 @@ def _resolve_tw_symbols(
     for record in live_records:
         active_symbol_keys.update(_candidate_symbol_keys("tw_stocks", record))
     delisted_symbol_keys: set[str] = set()
-    for record in [*official_delisted_records, *discovered_delisted_records]:
+    for record in [
+        *official_delisted_lifecycle_records,
+        *discovered_delisted_records,
+    ]:
         delisted_symbol_keys.update(_candidate_symbol_keys("tw_stocks", record))
     records = _apply_daily_listing_state(
         "tw_stocks",
@@ -2839,24 +2861,16 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         if args.limit is not None:
             deduped = deduped[: args.limit]
         manifest_records = list(deduped)
+        output_dir = _resolve_asset_output_dir(args, asset_class)
+        cached = _resolve_cached_manifest(output_dir, asset_class)
+        known_records = list(cached)
         if _is_incremental_mode(args):
-            output_dir = _resolve_asset_output_dir(args, asset_class)
-            known = {
-                record.code: record
-                for record in [
-                    *_resolve_cached_manifest(output_dir, asset_class),
-                    *_load_repo_symbol_fallback(asset_class),
-                ]
-            }
-            deduped = [known.get(record.code, record) for record in deduped]
-        else:
-            output_dir = _resolve_asset_output_dir(args, asset_class)
-            cached = _resolve_cached_manifest(output_dir, asset_class)
-            known = {record.code: record for record in cached}
-            deduped = [known.get(record.code, record) for record in deduped]
-            manifest_records = _dedupe_records_by_code(
-                [*cached, *manifest_records]
-            )
+            known_records.extend(_load_repo_symbol_fallback(asset_class))
+        known = {record.code: record for record in known_records}
+        deduped = [known.get(record.code, record) for record in deduped]
+        # A targeted run limits only the scheduled request set; it must not
+        # replace the durable universe manifest with that subset.
+        manifest_records = _dedupe_records_by_code([*cached, *manifest_records])
         return SymbolResolution(
             scheduled_records=deduped,
             manifest_records=manifest_records,
@@ -2874,24 +2888,16 @@ def _resolve_symbol_resolution(asset_class: str, args: argparse.Namespace) -> Sy
         if args.limit is not None:
             deduped = deduped[: args.limit]
         manifest_records = list(deduped)
+        output_dir = _resolve_asset_output_dir(args, asset_class)
+        cached = _resolve_cached_manifest(output_dir, asset_class)
+        known_records = list(cached)
         if _is_incremental_mode(args):
-            output_dir = _resolve_asset_output_dir(args, asset_class)
-            known = {
-                record.code: record
-                for record in [
-                    *_resolve_cached_manifest(output_dir, asset_class),
-                    *_load_repo_symbol_fallback(asset_class),
-                ]
-            }
-            deduped = [known.get(record.code, record) for record in deduped]
-        else:
-            output_dir = _resolve_asset_output_dir(args, asset_class)
-            cached = _resolve_cached_manifest(output_dir, asset_class)
-            known = {record.code: record for record in cached}
-            deduped = [known.get(record.code, record) for record in deduped]
-            manifest_records = _dedupe_records_by_code(
-                [*cached, *manifest_records]
-            )
+            known_records.extend(_load_repo_symbol_fallback(asset_class))
+        known = {record.code: record for record in known_records}
+        deduped = [known.get(record.code, record) for record in deduped]
+        # Preserve the full cached manifest while scheduling only the
+        # caller-requested symbols.
+        manifest_records = _dedupe_records_by_code([*cached, *manifest_records])
         return SymbolResolution(
             scheduled_records=deduped,
             manifest_records=manifest_records,

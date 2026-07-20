@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import hashlib
 import os
 from pathlib import Path
+from queue import Queue
 import threading
 import tempfile
 import time
@@ -41,7 +43,7 @@ class ProviderRateLimit:
         return 1.0 / self.requests_per_second
 
 
-DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND = 10.0
+DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND = 8.0
 
 
 PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
@@ -76,7 +78,7 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="client-side safety policy; no upstream numeric limit documented",
         source_url="https://openapi.twse.com.tw/",
         note=(
-            "Default 10 req/s is a stockAgent policy, not an official "
+            "Default 8 req/s is a stockAgent policy, not an official "
             "TWSE/TPEx/data.gov.tw limit."
         ),
     ),
@@ -87,7 +89,7 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="client-side safety policy; no upstream numeric limit documented",
         source_url="https://finance.yahoo.com/",
         note=(
-            "CLI default is 10 req/s when no interval is supplied. Large TW "
+            "CLI default is 8 req/s when no interval is supplied. Large TW "
             "fallback bootstraps explicitly use a slower 1.5-second interval."
         ),
     ),
@@ -109,11 +111,44 @@ class SharedRateLimiter:
         *,
         name: str = "rate-limit",
         state_dir: str | Path | None = None,
+        on_claim: Callable[[], None] | None = None,
+        on_caller_claim: Callable[[], None] | None = None,
     ) -> None:
         self.interval_seconds = max(0.0, float(interval_seconds))
         self.name = str(name)
+        self._on_claim = on_claim
+        # The stable dispatcher owns slot timing, while some observers need
+        # the identity/context of the data worker that received that slot.
+        # Keep these callbacks separate so pacing remains single-leader and
+        # request attribution can use worker-local context safely.
+        self._on_caller_claim = on_caller_claim
         self._lock = threading.Lock()
         self._next_time = 0.0
+        # A stable FIFO dispatcher owns the local schedule.  Handing leadership
+        # from one data worker to another after every ticket lets the newly
+        # released worker enter provider parsing/network setup before the next
+        # waiter gets CPU.  Under OpenBB's many blocking portals that GIL/thread
+        # handoff cut independent providers to roughly half their configured
+        # request-start rate.  The dispatcher never performs provider work: it
+        # only claims the host-global slot, records it, and releases one waiter.
+        self._dispatch_condition = threading.Condition()
+        self._dispatch_queue: deque[threading.Event] = deque()
+        self._dispatcher_thread: threading.Thread | None = None
+        # Granted-slot telemetry can persist JSON and contend with hundreds of
+        # provider workers. It must never run in the cadence-owning dispatcher
+        # thread, otherwise an observer lock turns an 8-10 req/s limiter into
+        # an accidental ~4 req/s limiter. A single ordered observer preserves
+        # every claim without delaying tickets or creating one thread per slot.
+        self._claim_observer_queue: Queue[None] = Queue()
+        self._claim_observer_thread: threading.Thread | None = None
+        # Request cadence telemetry must be recorded at the grant boundary,
+        # not when the asynchronous diagnostic observer eventually persists
+        # it.  Under many provider workers that observer may lag while the
+        # dispatcher continues issuing perfectly paced slots; timestamping the
+        # delayed callbacks would falsely report low API utilization.
+        self._grant_session_started_at = time.time()
+        self._grant_times: deque[float] = deque()
+        self._grant_total = 0
 
         root_value = state_dir or os.environ.get("STOCKAGENT_RATE_LIMIT_DIR")
         if root_value is None:
@@ -136,7 +171,7 @@ class SharedRateLimiter:
                 wait_s = max(0.0, self._next_time - now)
                 if wait_s > 0.0:
                     return False, wait_s
-                self._next_time = now + self.interval_seconds
+                self._next_time = self._next_deadline(self._next_time, now)
                 return True, 0.0
 
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +192,7 @@ class SharedRateLimiter:
                 wait_s = max(0.0, next_time - now)
                 claimed = wait_s <= 0.0
                 if claimed:
-                    next_time = now + self.interval_seconds
+                    next_time = self._next_deadline(next_time, now)
                     handle.seek(0)
                     handle.truncate()
                     handle.write(f"{next_time:.9f}\n")
@@ -165,6 +200,21 @@ class SharedRateLimiter:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return claimed, wait_s
+
+    def _next_deadline(self, previous_deadline: float, now: float) -> float:
+        """Advance an absolute schedule without accumulating wake-up jitter.
+
+        Reset after a full missed interval so a suspended process never emits
+        a catch-up burst.  For normal sub-interval scheduler/GIL latency, keep
+        the original cadence: otherwise adding the latency to every ticket
+        permanently lowers an 8 req/s policy to roughly 6 req/s under load.
+        """
+        interval = self.interval_seconds
+        if interval <= 0.0:
+            return now
+        if previous_deadline <= 0.0 or now - previous_deadline >= interval:
+            return now + interval
+        return previous_deadline + interval
 
     def _defer_process_shared(self, seconds: float) -> None:
         if fcntl is None:
@@ -194,15 +244,146 @@ class SharedRateLimiter:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    def _ensure_dispatcher_locked(self) -> None:
+        if self._dispatcher_thread is not None and self._dispatcher_thread.is_alive():
+            return
+        self._dispatcher_thread = threading.Thread(
+            target=self._dispatch_waiters,
+            name=f"{self.name}-dispatcher",
+            daemon=True,
+        )
+        self._dispatcher_thread.start()
+
+    def _ensure_claim_observer_locked(self) -> None:
+        if self._on_claim is None:
+            return
+        if (
+            self._claim_observer_thread is not None
+            and self._claim_observer_thread.is_alive()
+        ):
+            return
+        self._claim_observer_thread = threading.Thread(
+            target=self._observe_claims,
+            name=f"{self.name}-claim-observer",
+            daemon=True,
+        )
+        self._claim_observer_thread.start()
+
+    def _observe_claims(self) -> None:
+        """Record granted slots independently from request-slot cadence."""
+        while True:
+            self._claim_observer_queue.get()
+            try:
+                self._notify_claim()
+            finally:
+                self._claim_observer_queue.task_done()
+
+    def _dispatch_waiters(self) -> None:
+        """Grant local waiters in FIFO order from one scheduling-only thread."""
+        while True:
+            with self._dispatch_condition:
+                while not self._dispatch_queue:
+                    self._dispatch_condition.wait()
+                ticket = self._dispatch_queue[0]
+
+            claimed, wait_s = self._claim_process_shared()
+            if not claimed:
+                if wait_s > 0.0:
+                    time.sleep(wait_s)
+                continue
+
+            with self._dispatch_condition:
+                # Only this dispatcher removes local tickets.  Keeping the
+                # identity check makes a future cancellation extension safe.
+                if not self._dispatch_queue or self._dispatch_queue[0] is not ticket:
+                    continue
+                self._dispatch_queue.popleft()
+                self._record_grant_locked()
+            if self._on_claim is not None:
+                with self._dispatch_condition:
+                    self._ensure_claim_observer_locked()
+                self._claim_observer_queue.put(None)
+            ticket.set()
+
     def wait(self) -> None:
         if self.interval_seconds <= 0.0:
+            with self._dispatch_condition:
+                self._record_grant_locked()
+            self._notify_claim()
+            self._notify_caller_claim()
             return
-        while True:
-            claimed, wait_s = self._claim_process_shared()
-            if claimed:
-                return
-            if wait_s > 0.0:
-                time.sleep(wait_s)
+        ticket = threading.Event()
+        with self._dispatch_condition:
+            self._dispatch_queue.append(ticket)
+            self._ensure_dispatcher_locked()
+            self._dispatch_condition.notify()
+        ticket.wait()
+        self._notify_caller_claim()
+
+    def _notify_claim(self) -> None:
+        """Publish one granted request slot without risking the data request."""
+        if self._on_claim is None:
+            return
+        try:
+            self._on_claim()
+        except Exception:
+            # Rate telemetry is diagnostic. A broken observer must never turn
+            # a successfully paced provider call into a failed data request.
+            return
+
+    def _notify_caller_claim(self) -> None:
+        """Publish a granted slot from the waiting data-worker context."""
+        if self._on_caller_claim is None:
+            return
+        try:
+            self._on_caller_claim()
+        except Exception:
+            # Like dispatcher telemetry, attribution must never fail a data
+            # request that already received its process-shared slot.
+            return
+
+    def pending_waiters(self) -> int:
+        """Return local callers queued for a request-start ticket."""
+        with self._dispatch_condition:
+            return len(self._dispatch_queue)
+
+    def _record_grant_locked(self) -> None:
+        now = time.time()
+        self._grant_times.append(now)
+        self._grant_total += 1
+        cutoff = now - 60.0
+        while self._grant_times and self._grant_times[0] < cutoff:
+            self._grant_times.popleft()
+
+    def grant_activity(self, now: float | None = None) -> dict[str, float | int]:
+        """Return dispatcher-boundary activity without observer timestamp lag."""
+        current = time.time() if now is None else float(now)
+        with self._dispatch_condition:
+            cutoff = current - 60.0
+            while self._grant_times and self._grant_times[0] < cutoff:
+                self._grant_times.popleft()
+            window_seconds = min(
+                60.0,
+                max(0.001, current - self._grant_session_started_at),
+            )
+            return {
+                "grants_total": int(self._grant_total),
+                "grants_last_60s": len(self._grant_times),
+                "window_seconds": window_seconds,
+                "pending_claim_observations": self._claim_observer_queue.qsize(),
+            }
+
+    def flush_claim_observations(self) -> None:
+        """Wait until all already-granted slots have reached telemetry.
+
+        Normal requests never call this method. A provider quota response uses
+        it once so the durable claims-at-limit evidence includes the request
+        that produced that response, while ordinary slot cadence remains fully
+        decoupled from diagnostic persistence.
+        """
+        if threading.current_thread() is self._claim_observer_thread:
+            return
+        self._claim_observer_queue.join()
 
     def defer(self, seconds: float) -> None:
         delay = max(0.0, float(seconds))
@@ -220,7 +401,7 @@ def provider_rate_limit(provider: str) -> ProviderRateLimit:
         seconds=1,
         basis="client-side safety policy; no upstream numeric limit documented",
         source_url="n/a",
-        note="Unregistered providers default to 10 requests per second.",
+        note="Unregistered providers default to 8 requests per second.",
     )
 
 

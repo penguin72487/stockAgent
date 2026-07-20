@@ -19,6 +19,7 @@ from scripts.audit_tw_public_data_layer import (
     _audit_tpex_daily_name_provenance,
     _benchmark_sessions,
     audit_delisted_universe_coverage,
+    audit_feature_availability_contract,
     audit_feature_lineage_registry,
     audit_historical_sources,
     audit_non_vintage_archive_contract,
@@ -52,7 +53,7 @@ from scripts.build_tw_official_symbol_parquets import (
     _write_official_quote_parquet,
 )
 from stockagent.config import load_config
-from stockagent.data.panel import PanelData
+from stockagent.data.panel import PanelData, _shift_panel_features_to_next_session
 from stockagent.data.tw_public_features import _file_content_receipt
 
 
@@ -245,6 +246,12 @@ def _write_verified_taiex_calendar(
 
 def test_snapshot_only_features_are_absent_from_model_schema() -> None:
     config = load_config("configs/markets/tw_public.yaml")
+    config.data.feature_exclude = [
+        pattern
+        for pattern in config.data.feature_exclude
+        if pattern != "twpub_cumulative_revenue_yoy"
+    ]
+    config.data.feature_zero_fill.append("twpub_cumulative_revenue_yoy")
     findings = audit_snapshot_contract(Path("/does/not/need/to/exist"), config)
 
     assert findings == []
@@ -264,6 +271,14 @@ def test_snapshot_only_features_are_absent_from_model_schema() -> None:
         )
         for feature in config.data.feature_include
     )
+
+
+def test_excluded_snapshot_families_are_not_audited_as_model_inputs() -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+
+    findings = audit_snapshot_contract(Path("/does/not/need/to/exist"), config)
+
+    assert findings == []
 
 
 def test_single_vintage_macro_archives_are_quarantined() -> None:
@@ -297,6 +312,62 @@ def test_zero_filled_unregistered_feature_has_no_effective_lineage() -> None:
     assert len(findings) == 1
     assert findings[0].severity == "critical"
     assert "twpub_cbc_overnight_rate" in findings[0].evidence
+
+
+def test_all_active_tw_features_have_machine_checked_availability() -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+
+    summary, findings = audit_feature_availability_contract(config)
+
+    assert len(findings) == 1
+    approximation = findings[0]
+    assert approximation.code == "same_close_feature_approximation"
+    assert approximation.severity == "medium"
+    assert summary["selected_features"] == 98
+    assert summary["active_features"] == 33
+    assert summary["allow_same_close_feature_approximation"] is True
+    assert len(summary["zero_filled_features"]) == 65
+    assert summary["pre_close_active_features"] == ["open_logret_1d"]
+    assert len(summary["close_completion_active_features"]) == 22
+    assert len(summary["post_close_active_features"]) == 10
+    assert len(summary["post_close_selected_features"]) == 12
+    assert summary["configured_panel_shift_features"] == []
+    assert summary["unclassified_active_features"] == []
+    assert len(summary["missing_close_completion_shifts"]) == 22
+    assert summary["unexpected_panel_shifts"] == []
+
+
+def test_availability_audit_rejects_missing_or_unjustified_panel_shift() -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    config.data.allow_same_close_feature_approximation = False
+
+    _, findings = audit_feature_availability_contract(config)
+
+    leak = next(item for item in findings if item.code == "same_close_feature_leakage")
+    assert leak.severity == "high"
+    assert "close_logret_1d" in leak.evidence
+
+    config.data.feature_shift_next_session.append("open_logret_1d")
+    _, findings = audit_feature_availability_contract(config)
+    unexpected = next(
+        item
+        for item in findings
+        if item.code == "unexpected_feature_availability_shift"
+    )
+    assert unexpected.severity == "high"
+    assert "open_logret_1d" in unexpected.evidence
+
+
+def test_close_completion_feature_moves_to_next_panel_session() -> None:
+    panel = _panel(["2026-07-10", "2026-07-13", "2026-07-14"])
+    panel.features[:, 0, 0] = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+    original_returns = panel.returns_1d.copy()
+
+    shifted = _shift_panel_features_to_next_session(panel, ("body_ratio",))
+
+    assert shifted is panel
+    assert shifted.features[:, 0, 0].tolist() == [0.0, 1.0, 2.0]
+    np.testing.assert_array_equal(shifted.returns_1d, original_returns)
 
 
 def test_declared_nonblocking_public_download_failure_is_accepted(
@@ -421,6 +492,33 @@ def test_rule_receipt_is_required_and_machine_checked(tmp_path: Path) -> None:
     )
     _, findings = audit_source_receipts(tmp_path, config)
     assert findings == []
+
+
+def test_nonblocking_failure_receipt_does_not_fail_model_source_audit(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/markets/tw_public.yaml")
+    (tmp_path / "download_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "mode": "daily",
+                "failed_count": 1,
+                "blocking_failed_count": 0,
+                "allowed_failed_count": 1,
+                "allowed_failed_datasets": ["mof_tax_revenue"],
+                "configured_allowed_failed_datasets": ["mof_tax_revenue"],
+                "coverage_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, findings = audit_source_receipts(tmp_path, config)
+
+    assert summary["public_download_failed_count"] == 1
+    assert summary["public_download_blocking_failed_count"] == 0
+    assert not any(item.code == "public_download_failures" for item in findings)
 
 
 def test_tpex_lossy_receipt_requires_every_name_row_to_be_marked(
