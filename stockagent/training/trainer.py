@@ -96,6 +96,9 @@ from stockagent.portfolio_contract import (
 from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.runtime_env import normalize_cuda_env
 from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
+from stockagent.training.execution_coverage import (
+    validate_training_execution_coverage,
+)
 from stockagent.training.loss import _resolve_rank_scores, get_loss_runtime_stats, risk_aware_loss
 from stockagent.training.windowed import WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -4783,6 +4786,28 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 trading.tw_corporate_action_mode
             ),
         }
+        benchmark_sensitive_objectives = {
+            "excess_cvar_drawdown",
+            "cvar",
+            "cvar_drawdown",
+            "excess_cvar",
+            "outperformance_risk_budget",
+            "outperformance_budget",
+            "outperformance_first",
+        }
+        benchmark_affects_optimizer = (
+            _normalize_risk_objective(config.training.loss_type)
+            in benchmark_sensitive_objectives
+            or float(config.training.multitask_loss.volatility_regime_weight) > 0.0
+        )
+        if execution_mode == "tw_day_trade" and benchmark_affects_optimizer:
+            # Reporting-only benchmark repairs are checkpoint-compatible with
+            # objectives such as log_utility that never consume the benchmark.
+            # Benchmark-sensitive objectives must not resume across alignment
+            # semantics because their optimizer trajectories do change.
+            contract["taiwan_execution"]["benchmark_alignment"] = (
+                "prior_adjusted_close_to_execution_close_v1"
+            )
         if str(trading.tw_corporate_action_mode) == "exact":
             contract["taiwan_execution"][
                 "corporate_action_claim_queue_sessions"
@@ -16138,6 +16163,25 @@ def run_training(
         if deployment_folds is None
         else list(deployment_folds)
     )
+    execution_coverage = validate_training_execution_coverage(
+        panel,
+        fold_list_for_run,
+        execution_mode=config.trading.execution_mode,
+        long_only=config.trading.long_only,
+        lookback=config.training.lookback,
+    )
+    if execution_coverage is not None and _distributed_is_rank0():
+        earliest = execution_coverage.first_actionable_date
+        earliest_text = (
+            "none"
+            if earliest is None
+            else str(np.asarray(earliest).astype("datetime64[D]"))
+        )
+        print(
+            "[execution-coverage] tw_day_trade preflight passed "
+            f"folds={len(fold_list_for_run)} earliest_executable={earliest_text}",
+            flush=True,
+        )
     trainer_startup_timing = _PreEpochTimingRecorder(
         Path(output_dir) / "trainer_startup_timing.jsonl",
         train_years=[],

@@ -1,16 +1,16 @@
-experiment_name: tw-financial-transformer-candles-snapshot-safe98-gross-tw-cash-v8-dual5090
+experiment_name: tw-financial-transformer-candles-snapshot-safe98-gross-tw-day-trade-2014plus-v9-dual5090
 
 runner:
   # The 98-slot snapshot-safe schema is checkpoint-incompatible with both the
   # old 64-slot experiment and the existing 131-slot v8 checkpoints.
-  output_dir: artifacts/markets/tw_public_candles_snapshot_safe98_gross_tw_cash
+  output_dir: artifacts/markets/tw_public_candles_snapshot_safe98_gross_tw_day_trade_2014plus
   mode: train
   # Keep all older artifacts for audit, but never resume their optimizer state
   # into this fresh root. Later interruptions within this 98-slot run remain
   # resumable here.
   resume: true
   post_train_infer: true
-  # With the receipt-backed 2005 model horizon, fold18 validates on 2023.
+  # Day-trade eligibility begins in 2014; fold9 validates on 2023.
   start_fold: 1
 environment:
   device: cuda
@@ -25,10 +25,13 @@ data:
   # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
   # Run downloader/download_tw_official_data.py before training.
   parquet_root: data_tw_public/stocks
-  # Official archives plus terminal Yahoo receipts prove that 80 disappeared
-  # securities cannot be reconstructed before 2004-04-29.  Keep those source
-  # rows for provenance, but train only on the first complete calendar year.
-  panel_start_date: "2005-01-01"
+  # Point-in-time day-trade eligibility is identically false before 2014 and
+  # first becomes executable on 2014-01-06. Starting in 2005 makes the loss a
+  # constant zero for the early folds, so those years must not be training rows.
+  panel_start_date: "2014-01-01"
+  # Reporting comparator: 2330 adjusted-close buy-and-hold. For day-trade row
+  # t this is aligned to close[t-1] -> close[t], the same wall-clock session as
+  # the strategy's open[t] -> close[t] position.
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
@@ -222,9 +225,9 @@ data:
 walk_forward:
   min_train_years: 1
   val_years: 1
-  # Fold IDs are part of the experiment identity: fold18/19/20 mean validation
-  # years 2023/2024/2025 when the model panel begins in 2005.
-  expected_first_year: 2005
+  # Fold IDs are part of the experiment identity: fold9/10/11 mean validation
+  # years 2023/2024/2025 when the day-trade panel begins in 2014.
+  expected_first_year: 2014
   require_contiguous_years: true
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
@@ -235,7 +238,7 @@ trading:
   # The receipt-verified MOPS entitlement archive is incomplete, and avoid-mode
   # mandatory covers are not executable on every historical action date. Use
   # the research-only executor instead of fabricating exact cash entitlements.
-  execution_mode: tw_cash
+  execution_mode: tw_day_trade
   tw_corporate_action_mode: avoid
   tw_short_capacity_limit_enabled: false
   tw_corporate_action_claim_queue_sessions: 256

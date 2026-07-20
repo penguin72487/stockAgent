@@ -221,13 +221,20 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         else:
             tradable = close_tradable
         if self.execution_mode == "tw_day_trade":
-            benchmark_count = close_tradable.sum(axis=1)
-            benchmark_values = np.divide(
-                np.where(close_tradable, target_returns, 0.0).sum(axis=1),
-                benchmark_count,
-                out=np.zeros(panel.num_dates, dtype=np.float64),
-                where=benchmark_count > 0,
-            ).astype(np.float32, copy=False)
+            # A session-t day trade is held from open[t] to close[t].  Its
+            # buy-and-hold comparator must cover the same wall-clock session:
+            # adjusted close[t-1] to adjusted close[t].  Panel benchmark labels
+            # are forward returns close[t] -> close[t+1], so shift them by one
+            # row instead of comparing with a future session or an unrelated
+            # cross-sectional average of intraday returns.
+            benchmark_values = np.zeros(panel.num_dates, dtype=np.float32)
+            if panel.num_dates > 1:
+                benchmark_values[1:] = np.nan_to_num(
+                    np.asarray(panel.benchmark_returns[:-1], dtype=np.float32),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
         else:
             benchmark_values = panel.benchmark_returns.astype(
                 np.float32, copy=False

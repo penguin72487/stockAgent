@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from stockagent.data.walkforward import (
+    WalkForwardFold,
     build_expanding_year_folds,
     validate_walk_forward_year_contract,
+)
+from stockagent.training.execution_coverage import (
+    validate_training_execution_coverage,
 )
 
 
@@ -71,3 +77,75 @@ def test_walk_forward_year_contract_rejects_missing_whole_year() -> None:
             expected_first_year=2000,
             require_contiguous_years=True,
         )
+
+
+def _day_trade_panel(actionable: bool) -> SimpleNamespace:
+    shape = (8, 2)
+    eligible = np.zeros(shape, dtype=bool)
+    if actionable:
+        eligible[:, 0] = True
+    return SimpleNamespace(
+        dates=np.asarray(
+            [
+                "2020-01-02",
+                "2020-01-03",
+                "2020-01-06",
+                "2020-01-07",
+                "2021-01-04",
+                "2021-01-05",
+                "2021-01-06",
+                "2021-01-07",
+            ],
+            dtype="datetime64[D]",
+        ),
+        num_dates=shape[0],
+        tradable_mask=np.ones(shape, dtype=bool),
+        intraday_returns=np.full(shape, 0.01, dtype=np.float32),
+        day_trade_eligible_mask=eligible,
+        day_trade_can_buy_open_mask=np.ones(shape, dtype=bool),
+        day_trade_can_sell_open_mask=np.ones(shape, dtype=bool),
+        day_trade_can_short_open_mask=np.ones(shape, dtype=bool),
+        can_buy_mask=np.ones(shape, dtype=bool),
+        can_sell_mask=np.ones(shape, dtype=bool),
+        force_exit_mask=np.zeros(shape, dtype=bool),
+    )
+
+
+def _single_day_trade_fold() -> WalkForwardFold:
+    return WalkForwardFold(
+        fold_id=1,
+        train_indices=np.arange(0, 4, dtype=np.int64),
+        val_indices=np.arange(4, 8, dtype=np.int64),
+        test_indices=np.arange(4, 8, dtype=np.int64),
+        train_years=[2020],
+        val_years=[2021],
+        test_years=[2021],
+    )
+
+
+def test_day_trade_execution_coverage_rejects_constant_loss_fold() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"zero executable round trips.*gradients would be exactly zero",
+    ):
+        validate_training_execution_coverage(
+            _day_trade_panel(actionable=False),
+            [_single_day_trade_fold()],
+            execution_mode="tw_day_trade",
+            long_only=False,
+            lookback=1,
+        )
+
+
+def test_day_trade_execution_coverage_accepts_supported_fold() -> None:
+    coverage = validate_training_execution_coverage(
+        _day_trade_panel(actionable=True),
+        [_single_day_trade_fold()],
+        execution_mode="tw_day_trade",
+        long_only=False,
+        lookback=1,
+    )
+
+    assert coverage is not None
+    assert str(coverage.first_actionable_date) == "2020-01-02"
+    assert int(coverage.actionable_cells_by_row.sum()) == 8

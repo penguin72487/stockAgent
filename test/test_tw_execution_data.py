@@ -342,6 +342,12 @@ def test_day_trade_uses_only_t_minus_one_features_and_same_day_return() -> None:
 
 def test_day_trade_open_inputs_do_not_leak_close_label_or_full_day_volume() -> None:
     panel = _make_panel()
+    panel.benchmark_returns[:] = np.arange(
+        0.01,
+        0.07,
+        0.01,
+        dtype=np.float32,
+    )
     panel.daily_volumes[:, 0] = np.arange(10.0, 16.0, dtype=np.float32)
     panel.open_prices[:, 0] = np.arange(100.0, 106.0, dtype=np.float32)
     # Row 2 deliberately has no close-side tradability in _make_panel.  We also
@@ -377,6 +383,9 @@ def test_day_trade_open_inputs_do_not_leak_close_label_or_full_day_volume() -> N
     assert first["volume_notional"][0].item() == pytest.approx(11.0 * 102.0)
     assert first["volume_notional"][1].item() == pytest.approx(0.0)
     assert dataset.benchmark_t[2].item() == pytest.approx(
+        float(panel.benchmark_returns[1])
+    )
+    assert dataset.benchmark_t[2].item() != pytest.approx(
         float(panel.intraday_returns[2, 1])
     )
 
@@ -597,31 +606,26 @@ def test_short_margin_rate_uses_non_contiguous_official_historical_floors() -> N
     assert torch.isfinite(dataset.short_margin_rate_t).all()
 
 
-def test_day_trade_benchmark_uses_same_session_intraday_window() -> None:
+def test_day_trade_benchmark_uses_same_session_buy_and_hold_window() -> None:
     panel = _make_panel()
-    panel.benchmark_returns[:] = np.float32(123.0)
+    panel.benchmark_returns[:] = np.asarray(
+        [0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
+        dtype=np.float32,
+    )
     dataset = CrossSectionalDataset(
         panel,
         np.arange(panel.num_dates),
         lookback=2,
         execution_mode="tw_day_trade",
     )
-    benchmark_mask = (
-        panel.tradable_mask
-        & panel.day_trade_eligible_mask
-        & np.isfinite(panel.intraday_returns)
+    expected = np.asarray(
+        [0.0, 0.01, 0.02, 0.03, 0.04, 0.05],
+        dtype=np.float32,
     )
-    counts = benchmark_mask.sum(axis=1)
-    expected = np.divide(
-        np.where(benchmark_mask, panel.intraday_returns, 0.0).sum(axis=1),
-        counts,
-        out=np.zeros(panel.num_dates, dtype=np.float64),
-        where=counts > 0,
-    ).astype(np.float32)
 
     np.testing.assert_allclose(dataset.benchmark_t.numpy(), expected)
     assert dataset[0]["benchmark"].item() == pytest.approx(float(expected[2]))
-    assert dataset[0]["benchmark"].item() != pytest.approx(123.0)
+    assert dataset[0]["benchmark"].item() == pytest.approx(0.02)
 
 
 @pytest.mark.parametrize(
