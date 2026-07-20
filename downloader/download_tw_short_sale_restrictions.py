@@ -1734,7 +1734,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Host-global minimum seconds between TW public HTTP requests. "
-            "Unspecified endpoints default to the stockAgent 10 req/s policy."
+            "Unspecified endpoints default to the stockAgent 8 req/s policy."
         ),
     )
     parser.add_argument(

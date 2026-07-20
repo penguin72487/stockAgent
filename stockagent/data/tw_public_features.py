@@ -149,6 +149,20 @@ MARKET_FEATURE_COLUMNS = (
 )
 
 FEATURE_COLUMNS = (*STOCK_FEATURE_COLUMNS, *MARKET_FEATURE_COLUMNS)
+POST_CLOSE_CHIP_FEATURE_COLUMNS = (
+    "twpub_margin_balance_log",
+    "twpub_margin_balance_chg",
+    "twpub_short_balance_log",
+    "twpub_short_balance_chg",
+    "twpub_margin_buy_flow",
+    "twpub_margin_sell_flow",
+    "twpub_short_sell_flow",
+    "twpub_short_buy_flow",
+    "twpub_foreign_net_buy_flow",
+    "twpub_investment_trust_net_buy_flow",
+    "twpub_dealer_net_buy_flow",
+    "twpub_institutional_net_buy_flow",
+)
 RULE_COLUMNS = (
     "_twpub_official_traded",
     "_twpub_delisted",
@@ -170,8 +184,13 @@ RULE_COLUMNS = (
 )
 OUTPUT_COLUMNS = (*FEATURE_COLUMNS, *RULE_COLUMNS)
 KEY_COLUMNS = ("date", "symbol")
+TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION = 2
 AVAILABILITY_POLICY = {
-    "historical_daily": "official session/trading date; usable for next-session labels",
+    "historical_daily": "official session/trading date with source-specific publication timing",
+    "post_close_chip_daily": (
+        "official margin and institutional values for session t are published after "
+        "the close and mapped to the next receipt-verified TAIEX session before model use"
+    ),
     "tdcc_shareholding": "TDCC data date plus 7 calendar days as a conservative availability date",
     "monthly_macro": "period end plus 45 calendar days when no explicit release date is provided",
     "quarterly_macro": "quarter end plus 90 calendar days when no explicit release date is provided",
@@ -349,6 +368,7 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "feature_columns": list(FEATURE_COLUMNS),
         "rule_columns": list(RULE_COLUMNS),
         "market_symbol": result.market_symbol,
+        "availability_contract_version": TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION,
         "availability_policy": AVAILABILITY_POLICY,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -370,6 +390,63 @@ def _read_optional(input_dir: Path, name: str) -> pl.DataFrame:
     if not path.exists():
         return pl.DataFrame()
     return pl.read_parquet(path)
+
+
+def _next_exchange_session_lookup(input_dir: Path) -> pl.DataFrame:
+    """Map a completed exchange session to the next verified TAIEX session."""
+
+    calendar = _read_optional(input_dir, "twse_taiex_ohlc")
+    if calendar.is_empty() or "date" not in calendar.columns:
+        return pl.DataFrame(
+            schema={"_source_date": pl.Date, "_available_date": pl.Date}
+        )
+    sessions = (
+        calendar.select(_date_column_expr("date").alias("_source_date"))
+        .drop_nulls("_source_date")
+        .unique("_source_date")
+        .sort("_source_date")
+    )
+    if sessions.height < 2:
+        return pl.DataFrame(
+            schema={"_source_date": pl.Date, "_available_date": pl.Date}
+        )
+    return (
+        sessions.with_columns(
+            pl.col("_source_date").shift(-1).alias("_available_date")
+        )
+        .drop_nulls("_available_date")
+        .select("_source_date", "_available_date")
+    )
+
+
+def _shift_post_close_features_to_next_session(
+    frame: pl.DataFrame,
+    session_lookup: pl.DataFrame,
+) -> pl.DataFrame:
+    """Move post-close model features without moving same-source rule evidence."""
+
+    feature_columns = [
+        name for name in POST_CLOSE_CHIP_FEATURE_COLUMNS if name in frame.columns
+    ]
+    if frame.is_empty() or session_lookup.is_empty() or not feature_columns:
+        return pl.DataFrame()
+    return (
+        frame.select(
+            [
+                _date_column_expr("date").alias("_source_date"),
+                _symbol_expr("symbol").alias("symbol"),
+                *[pl.col(name) for name in feature_columns],
+            ]
+        )
+        .join(session_lookup, on="_source_date", how="inner", validate="m:1")
+        .select(
+            [
+                pl.col("_available_date").alias("date"),
+                pl.col("symbol"),
+                *[pl.col(name) for name in feature_columns],
+            ]
+        )
+    )
 
 
 def _merge_feature_frames(frames: Iterable[pl.DataFrame]) -> pl.DataFrame:
@@ -744,7 +821,13 @@ def _build_delisted_company_rules(input_dir: Path) -> pl.DataFrame:
 
 def _snapshot_date_expr(columns: set[str]):
     explicit = _first_existing(columns, ("出表日期", "Date", "日期"))
-    return _date_column_expr(explicit) if explicit else _date_column_expr("date")
+    declared = _date_column_expr(explicit) if explicit else _date_column_expr("date")
+    if "_as_of_date" not in columns:
+        return declared
+    # Never project a current snapshot back to the provider's subject/report
+    # date if these exact bytes were only archived later. A future-declared
+    # report date remains future-dated through the horizontal maximum.
+    return pl.max_horizontal(declared, _date_column_expr("_as_of_date"))
 
 
 def _snapshot_symbol_expr(columns: set[str]):
@@ -1668,6 +1751,7 @@ def _build_valuation_features(input_dir: Path) -> pl.DataFrame:
 
 def _build_margin_features(input_dir: Path) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
+    session_lookup = _next_exchange_session_lookup(input_dir)
     twse = _read_optional(input_dir, "twse_margin_balance")
     if not twse.is_empty():
         columns = set(twse.columns)
@@ -1704,26 +1788,35 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
             )
             .otherwise(0.0)
         )
+        source = twse.select(
+            [
+                _date_column_expr("date").alias("date"),
+                _symbol_expr("代號").alias("symbol"),
+                _positive_log1p(margin_today).alias("twpub_margin_balance_log"),
+                _signed_asinh(margin_today - margin_prev).alias("twpub_margin_balance_chg"),
+                _positive_log1p(short_today).alias("twpub_short_balance_log"),
+                _signed_asinh(short_today - short_prev).alias("twpub_short_balance_chg"),
+                _signed_asinh(_num_expr("買進")).alias("twpub_margin_buy_flow"),
+                _signed_asinh(_num_expr("賣出")).alias("twpub_margin_sell_flow"),
+                _signed_asinh(_num_expr("賣出_2")).alias("twpub_short_sell_flow"),
+                _signed_asinh(_num_expr("買進_2")).alias("twpub_short_buy_flow"),
+                valid_short_evidence.cast(pl.Float64).alias(
+                    "_twpub_margin_short_evidence_next_session"
+                ),
+                short_capacity_shares.alias(
+                    "_twpub_short_capacity_shares_next_session"
+                ),
+            ]
+        )
         frames.append(
-            twse.select(
-                [
-                    _date_column_expr("date").alias("date"),
-                    _symbol_expr("代號").alias("symbol"),
-                    _positive_log1p(margin_today).alias("twpub_margin_balance_log"),
-                    _signed_asinh(margin_today - margin_prev).alias("twpub_margin_balance_chg"),
-                    _positive_log1p(short_today).alias("twpub_short_balance_log"),
-                    _signed_asinh(short_today - short_prev).alias("twpub_short_balance_chg"),
-                    _signed_asinh(_num_expr("買進")).alias("twpub_margin_buy_flow"),
-                    _signed_asinh(_num_expr("賣出")).alias("twpub_margin_sell_flow"),
-                    _signed_asinh(_num_expr("賣出_2")).alias("twpub_short_sell_flow"),
-                    _signed_asinh(_num_expr("買進_2")).alias("twpub_short_buy_flow"),
-                    valid_short_evidence.cast(pl.Float64).alias(
-                        "_twpub_margin_short_evidence_next_session"
-                    ),
-                    short_capacity_shares.alias(
-                        "_twpub_short_capacity_shares_next_session"
-                    ),
-                ]
+            _shift_post_close_features_to_next_session(source, session_lookup)
+        )
+        frames.append(
+            source.select(
+                "date",
+                "symbol",
+                "_twpub_margin_short_evidence_next_session",
+                "_twpub_short_capacity_shares_next_session",
             )
         )
 
@@ -1763,65 +1856,99 @@ def _build_margin_features(input_dir: Path) -> pl.DataFrame:
             )
             .otherwise(0.0)
         )
+        source = tpex.select(
+            [
+                _date_column_expr("date").alias("date"),
+                _symbol_expr("代號").alias("symbol"),
+                _positive_log1p(margin_today).alias("twpub_margin_balance_log"),
+                _signed_asinh(margin_today - margin_prev).alias("twpub_margin_balance_chg"),
+                _positive_log1p(short_today).alias("twpub_short_balance_log"),
+                _signed_asinh(short_today - short_prev).alias("twpub_short_balance_chg"),
+                _signed_asinh(_num_expr("資買")).alias("twpub_margin_buy_flow"),
+                _signed_asinh(_num_expr("資賣")).alias("twpub_margin_sell_flow"),
+                _signed_asinh(_num_expr("券賣")).alias("twpub_short_sell_flow"),
+                _signed_asinh(_num_expr("券買")).alias("twpub_short_buy_flow"),
+                valid_short_evidence.cast(pl.Float64).alias(
+                    "_twpub_margin_short_evidence_next_session"
+                ),
+                short_capacity_shares.alias(
+                    "_twpub_short_capacity_shares_next_session"
+                ),
+            ]
+        )
         frames.append(
-            tpex.select(
-                [
-                    _date_column_expr("date").alias("date"),
-                    _symbol_expr("代號").alias("symbol"),
-                    _positive_log1p(margin_today).alias("twpub_margin_balance_log"),
-                    _signed_asinh(margin_today - margin_prev).alias("twpub_margin_balance_chg"),
-                    _positive_log1p(short_today).alias("twpub_short_balance_log"),
-                    _signed_asinh(short_today - short_prev).alias("twpub_short_balance_chg"),
-                    _signed_asinh(_num_expr("資買")).alias("twpub_margin_buy_flow"),
-                    _signed_asinh(_num_expr("資賣")).alias("twpub_margin_sell_flow"),
-                    _signed_asinh(_num_expr("券賣")).alias("twpub_short_sell_flow"),
-                    _signed_asinh(_num_expr("券買")).alias("twpub_short_buy_flow"),
-                    valid_short_evidence.cast(pl.Float64).alias(
-                        "_twpub_margin_short_evidence_next_session"
-                    ),
-                    short_capacity_shares.alias(
-                        "_twpub_short_capacity_shares_next_session"
-                    ),
-                ]
+            _shift_post_close_features_to_next_session(source, session_lookup)
+        )
+        frames.append(
+            source.select(
+                "date",
+                "symbol",
+                "_twpub_margin_short_evidence_next_session",
+                "_twpub_short_capacity_shares_next_session",
             )
         )
-    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+    nonempty = [frame for frame in frames if not frame.is_empty()]
+    return pl.concat(nonempty, how="diagonal_relaxed") if nonempty else pl.DataFrame()
 
 
 def _build_institutional_features(input_dir: Path) -> pl.DataFrame:
     frames: list[pl.DataFrame] = []
+    session_lookup = _next_exchange_session_lookup(input_dir)
     twse = _read_optional(input_dir, "twse_institutional_trades")
     if not twse.is_empty():
+        source = twse.select(
+            [
+                _date_column_expr("date").alias("date"),
+                _symbol_expr("證券代號").alias("symbol"),
+                _signed_asinh(
+                    _num_expr("外陸資買賣超股數(不含外資自營商)")
+                ).alias("twpub_foreign_net_buy_flow"),
+                _signed_asinh(_num_expr("投信買賣超股數")).alias(
+                    "twpub_investment_trust_net_buy_flow"
+                ),
+                _signed_asinh(_num_expr("自營商買賣超股數")).alias(
+                    "twpub_dealer_net_buy_flow"
+                ),
+                _signed_asinh(_num_expr("三大法人買賣超股數")).alias(
+                    "twpub_institutional_net_buy_flow"
+                ),
+            ]
+        )
         frames.append(
-            twse.select(
-                [
-                    _date_column_expr("date").alias("date"),
-                    _symbol_expr("證券代號").alias("symbol"),
-                    _signed_asinh(_num_expr("外陸資買賣超股數(不含外資自營商)")).alias("twpub_foreign_net_buy_flow"),
-                    _signed_asinh(_num_expr("投信買賣超股數")).alias("twpub_investment_trust_net_buy_flow"),
-                    _signed_asinh(_num_expr("自營商買賣超股數")).alias("twpub_dealer_net_buy_flow"),
-                    _signed_asinh(_num_expr("三大法人買賣超股數")).alias("twpub_institutional_net_buy_flow"),
-                ]
-            )
+            _shift_post_close_features_to_next_session(source, session_lookup)
         )
 
     tpex = _read_optional(input_dir, "tpex_institutional_trades")
     if not tpex.is_empty():
         columns = set(tpex.columns)
-        total_col = "三大法人買賣超股數合計" if "三大法人買賣超股數合計" in columns else "三大法人買賣超股數"
-        frames.append(
-            tpex.select(
-                [
-                    _date_column_expr("date").alias("date"),
-                    _symbol_expr("代號").alias("symbol"),
-                    _signed_asinh(_num_expr("外資及陸資淨買股數")).alias("twpub_foreign_net_buy_flow"),
-                    _signed_asinh(_num_expr("投信淨買股數")).alias("twpub_investment_trust_net_buy_flow"),
-                    _signed_asinh(_num_expr("自營淨買股數")).alias("twpub_dealer_net_buy_flow"),
-                    _signed_asinh(_num_expr(total_col)).alias("twpub_institutional_net_buy_flow"),
-                ]
-            )
+        total_col = (
+            "三大法人買賣超股數合計"
+            if "三大法人買賣超股數合計" in columns
+            else "三大法人買賣超股數"
         )
-    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+        source = tpex.select(
+            [
+                _date_column_expr("date").alias("date"),
+                _symbol_expr("代號").alias("symbol"),
+                _signed_asinh(_num_expr("外資及陸資淨買股數")).alias(
+                    "twpub_foreign_net_buy_flow"
+                ),
+                _signed_asinh(_num_expr("投信淨買股數")).alias(
+                    "twpub_investment_trust_net_buy_flow"
+                ),
+                _signed_asinh(_num_expr("自營淨買股數")).alias(
+                    "twpub_dealer_net_buy_flow"
+                ),
+                _signed_asinh(_num_expr(total_col)).alias(
+                    "twpub_institutional_net_buy_flow"
+                ),
+            ]
+        )
+        frames.append(
+            _shift_post_close_features_to_next_session(source, session_lookup)
+        )
+    nonempty = [frame for frame in frames if not frame.is_empty()]
+    return pl.concat(nonempty, how="diagonal_relaxed") if nonempty else pl.DataFrame()
 
 
 def _build_tdcc_features(input_dir: Path) -> pl.DataFrame:
@@ -1845,10 +1972,16 @@ def _build_tdcc_features(input_dir: Path) -> pl.DataFrame:
     tier = _num_expr("持股分級")
     ratio = _num_expr("占集保庫存數比例%") / 100.0
     holder_count = _num_expr("人數")
+    availability_date = _yyyymmdd_expr(date_col).dt.offset_by("7d")
+    if "_as_of_date" in columns:
+        availability_date = pl.max_horizontal(
+            availability_date,
+            _date_column_expr("_as_of_date"),
+        )
     return (
         frame.select(
             [
-                _yyyymmdd_expr(date_col).dt.offset_by("7d").alias("date"),
+                availability_date.alias("date"),
                 _symbol_expr("證券代號").alias("symbol"),
                 tier.alias("_tier"),
                 ratio.alias("_ratio"),
@@ -1921,7 +2054,7 @@ def _build_company_basic_features(input_dir: Path) -> pl.DataFrame:
         if frame.is_empty():
             continue
         columns = set(frame.columns)
-        report_date = pl.coalesce([_date_column_expr(report_date_col), _date_column_expr("date")])
+        report_date = _snapshot_date_expr(columns)
         incorporation = _date_column_expr(incorporation_col)
         listing = _date_column_expr(listing_col)
         selected = frame.select(

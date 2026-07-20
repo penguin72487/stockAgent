@@ -114,6 +114,7 @@ def test_targeted_incremental_resolution_reuses_known_provider_candidates(tmp_pa
     pl.DataFrame(
         [
             {"code": "3303", "name": "existing", "market": "tw_stocks", "yahoo_symbol": "3303.TWO"},
+            {"code": "8111", "name": "untargeted", "market": "tw_stocks", "yahoo_symbol": "8111.TWO"},
         ]
     ).write_csv(output_dir / "symbols.csv")
     monkeypatch.setattr(
@@ -126,9 +127,9 @@ def test_targeted_incremental_resolution_reuses_known_provider_candidates(tmp_pa
     resolution = yahoo._resolve_symbol_resolution("tw_stocks", args)
 
     assert [record.code for record in resolution.scheduled_records] == ["3303"]
-    assert [record.code for record in resolution.manifest_records] == ["3303"]
+    assert [record.code for record in resolution.manifest_records] == ["3303", "8111"]
     assert resolution.scheduled_records[0].yahoo_symbol == "3303.TWO"
-    assert resolution.manifest_records[0].yahoo_symbol == "3303.TW"
+    assert resolution.manifest_records[0].yahoo_symbol == "3303.TWO"
 
 
 def test_targeted_repair_preserves_full_cached_manifest(tmp_path, monkeypatch):
@@ -328,6 +329,18 @@ def test_tw_repair_unions_live_cached_repo_and_tracked_symbols(
     )
     monkeypatch.setattr(yahoo, "_load_tw_symbols_from_local_manifest", lambda: [])
     monkeypatch.setattr(yahoo, "_load_tw_symbols_from_local_parquet", lambda: [])
+    monkeypatch.setattr(
+        yahoo,
+        "_load_tw_delisted_symbols_from_parquet",
+        lambda _root: [
+            yahoo.SymbolRecord(
+                "9999_TW",
+                "official delisted",
+                "tw_delisted",
+                "9999.TW",
+            )
+        ],
+    )
     monkeypatch.setattr(yahoo, "_load_tw_delisted_symbols", lambda: [])
     monkeypatch.setattr(
         yahoo,
@@ -355,6 +368,10 @@ def test_tw_repair_unions_live_cached_repo_and_tracked_symbols(
     assert resolution.scheduled_records[0].name == (
         "stale cached name" if exchange_fails else "live name"
     )
+    by_code = {record.code: record for record in resolution.scheduled_records}
+    # Durable official lifecycle evidence remains authoritative even when the
+    # current exchange discovery is temporarily unavailable.
+    assert by_code["9999"].market == "tw_delisted"
 
 
 def test_tw_repair_reconciles_cached_plain_code_with_official_delisting(

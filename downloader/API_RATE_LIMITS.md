@@ -5,7 +5,7 @@ Rate limits live in `downloader.common.PROVIDER_RATE_LIMITS`; command-line
 `--request-interval` values that exceed the configured request rate are clamped.
 There is no percentage safety margin: documented limits use their exact average
 request rate, and providers without a documented special limit default to
-`10 req/s`.
+`8 req/s`.
 
 ## Provider Profiles
 
@@ -13,10 +13,10 @@ request rate, and providers without a documented special limit default to
 |---|---|---:|---:|---|
 | `okx_history_candles` | OKX `GET /api/v5/market/history-candles` | 20 requests / 2 seconds, IP | 10 req/s | Published average endpoint limit. |
 | `bybit_public_rest` | Bybit public REST IP bucket | 600 requests / 5 seconds, IP | 120 req/s | Published average IP limit. Bybit also returns per-endpoint headers. |
-| `frankfurter_public` | Frankfurter public API | no daily/monthly quota; unspecified anti-abuse throttling | 10 req/s | Uses the project default for an unspecified limit. |
-| `tw_public` | TWSE/TPEx public endpoints | no stable public hard limit found | 10 req/s | Uses the project default; retries still handle WAF/403/429 responses. |
+| `frankfurter_public` | Frankfurter public API | no daily/monthly quota; unspecified anti-abuse throttling | 8 req/s | Uses the project default for an unspecified limit. |
+| `tw_public` | TWSE/TPEx public endpoints | no stable public hard limit found | 8 req/s | Uses the project default; retries still handle WAF/403/429 responses. |
 | `alpaca_market_data_basic` | Alpaca historical market data | 200 requests / minute, account | 3.333333 req/s | Exact Basic plan limit; requests batch many symbols. |
-| unregistered provider | any new provider without a profile | no documented special limit | 10 req/s | Automatic fallback from `provider_rate_limit()`. |
+| unregistered provider | any new provider without a profile | no documented special limit | 8 req/s | Automatic fallback from `provider_rate_limit()`. |
 
 ## Source Notes
 
@@ -27,7 +27,7 @@ request rate, and providers without a documented special limit default to
 - Frankfurter documents no monthly/daily quotas, but states public requests are
   rate-limited to prevent abuse.
 - TWSE OpenAPI publishes Swagger endpoints, but no stable hard request rate was
-  found for the historical web endpoints used here, so the default is `10 req/s`.
+  found for the historical web endpoints used here, so the default is `8 req/s`.
   Runtime `403`/`429` responses still use the downloader retry path.
 - Alpaca Basic allows `200 requests/minute`; Algo Trader Plus allows
   `10,000 requests/minute`. `download_alpaca_us_ohlcv.py` accepts the exact plan
@@ -47,6 +47,6 @@ ALPACA_REQUESTS_PER_MINUTE=200
 ```
 
 Interval overrides only slow a provider down; values above an official limit or
-the `10 req/s` unspecified-provider default are clamped. Alpaca instead accepts
+the `8 req/s` unspecified-provider default are clamped. Alpaca instead accepts
 the exact active account-plan limit (`200` for Basic or `10000` for Algo Trader
 Plus).

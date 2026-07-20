@@ -2489,6 +2489,64 @@ def test_merge_frames_replaces_existing_dates():
     assert merged.sort("date")["value"].to_list() == ["new", "keep"]
 
 
+def test_snapshot_download_preserves_daily_vintages_and_immutable_raw(
+    tmp_path: Path,
+    monkeypatch,
+):
+    spec = twpub.DatasetSpec(
+        name="sample_snapshot",
+        kind="snapshot_url",
+        source="official-test",
+        description="sample",
+        tags=("test", "snapshot"),
+        url="https://example.test/snapshot",
+    )
+    args = SimpleNamespace(
+        timeout=1,
+        verify_ssl=True,
+        retries=0,
+        retry_backoff=0.0,
+        skip_raw=False,
+        refresh=False,
+        mode="daily",
+    )
+    payloads = [
+        b'[{"Code":"2330","value":"old"}]',
+        b'[{"Code":"2330","value":"corrected"}]',
+        b'[{"Code":"2330","value":"next"}]',
+    ]
+
+    class FakeResponse:
+        def __init__(self, content: bytes):
+            self.content = content
+            self.headers = {"content-type": "application/json"}
+
+    monkeypatch.setattr(
+        twpub,
+        "_http_get",
+        lambda *args, **kwargs: FakeResponse(payloads.pop(0)),
+    )
+    snapshot_days = iter(("2024-06-03", "2024-06-03", "2024-06-04"))
+    monkeypatch.setattr(twpub, "_snapshot_as_of_date", lambda: next(snapshot_days))
+
+    twpub._download_snapshot_url(spec, args, tmp_path)
+    twpub._download_snapshot_url(spec, args, tmp_path)
+    twpub._download_snapshot_url(spec, args, tmp_path)
+
+    frame = pl.read_parquet(tmp_path / "sample_snapshot.parquet").sort("_as_of_date")
+    assert frame.select("_as_of_date", "date", "value").to_dicts() == [
+        {
+            "_as_of_date": "2024-06-03",
+            "date": "2024-06-03",
+            "value": "corrected",
+        },
+        {"_as_of_date": "2024-06-04", "date": "2024-06-04", "value": "next"},
+    ]
+    raw_paths = sorted((tmp_path / "raw" / "sample_snapshot").iterdir())
+    assert len(raw_paths) == 3
+    assert all(path.name.startswith("2024-06-0") for path in raw_paths)
+
+
 def test_parse_twse_delisted_company_payload():
     payload = [{"DelistingDate": "114/07/24", "Company": "新光金", "Code": "2888"}]
 

@@ -568,6 +568,10 @@ def _public_command(args: argparse.Namespace, public_dir: Path) -> list[str]:
         command.append("--allow-daily-publication-lag")
     if args.request_interval is not None:
         command.extend(["--request-interval", str(args.request_interval)])
+    if args.allow_failed_public_datasets:
+        command.extend(
+            ["--allow-failed-datasets", *args.allow_failed_public_datasets]
+        )
     if args.skip_raw:
         command.append("--skip-raw")
     return command
@@ -848,6 +852,15 @@ def parse_args() -> argparse.Namespace:
         "--skip-yahoo-download",
         action="store_true",
         help="Use the existing Yahoo fallback directory without contacting Yahoo.",
+    )
+    parser.add_argument(
+        "--allow-failed-public-datasets",
+        nargs="*",
+        default=[],
+        help=(
+            "Public dataset names that may fail refresh without blocking the "
+            "pipeline because their features are excluded or zero-filled."
+        ),
     )
     parser.add_argument("--skip-symbol-build", action="store_true")
     parser.add_argument("--skip-feature-build", action="store_true")

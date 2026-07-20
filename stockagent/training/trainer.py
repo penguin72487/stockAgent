@@ -5202,6 +5202,16 @@ def _checkpoint_manifest(
         "feature_include": list(config.data.feature_include),
         "feature_exclude": list(config.data.feature_exclude),
     }
+    if config.data.feature_zero_fill:
+        preprocessing_contract["feature_zero_fill"] = list(
+            config.data.feature_zero_fill
+        )
+    if config.data.feature_shift_next_session:
+        preprocessing_contract["feature_shift_next_session"] = list(
+            config.data.feature_shift_next_session
+        )
+    if config.data.allow_same_close_feature_approximation:
+        preprocessing_contract["allow_same_close_feature_approximation"] = True
     schema_2_preprocessing_contract = {
         name: value for name, value in preprocessing_contract.items() if name != "use_tw_public_rules"
     }

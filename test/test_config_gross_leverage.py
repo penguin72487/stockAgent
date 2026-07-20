@@ -735,10 +735,13 @@ def test_tw_public_candles_select_uses_dual_5090_tw_cash_contract() -> None:
     assert config.environment.torch_compile_threads == 16
 
 
-def test_tw_public_candles_all_folds_uses_runnable_tw_cash_contract() -> None:
+def test_tw_public_candles_all_folds_uses_runnable_tw_day_trade_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles.yaml")
 
-    assert config.trading.execution_mode == "tw_cash"
+    assert config.trading.execution_mode == "tw_day_trade"
+    assert config.data.panel_start_date == "2014-01-01"
+    assert config.data.benchmark_name == "2330"
+    assert config.walk_forward.expected_first_year == 2014
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.training.financial_transformer.portfolio_output_mode == "l1"
