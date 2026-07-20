@@ -192,7 +192,7 @@ def test_default_can_opt_into_detailed_aux() -> None:
     assert out["market_tokens"].shape == (2, 4, 32)
 
 
-def test_long_only_rejects_empty_mask_rows() -> None:
+def test_long_only_empty_mask_row_is_finite_and_zero() -> None:
     device = _device()
     model = _make_model(portfolio_mode="long_only").eval()
     x = torch.randn(2, 8, 100, 21, device=device)
@@ -200,8 +200,14 @@ def test_long_only_rejects_empty_mask_rows() -> None:
     mask[0, :] = False
     mask[1, 50:] = False
 
-    with torch.no_grad(), pytest.raises(AssertionError, match="all-false row"):
-        model(x, mask, return_aux=True)
+    with torch.no_grad():
+        weights, scores, aux = model(x, mask, return_aux=True)
+
+    assert torch.isfinite(weights).all()
+    assert torch.isfinite(scores).all()
+    assert torch.isfinite(aux["latent_factors"]).all()
+    torch.testing.assert_close(weights[0], torch.zeros_like(weights[0]))
+    assert weights[1, 50:].abs().max().item() == pytest.approx(0.0)
 
 
 def test_factory_builds_low_rank_market_transformer_model() -> None:

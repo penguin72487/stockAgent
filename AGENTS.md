@@ -324,6 +324,19 @@ Rules:
 
 ## Intentional Walk-Forward Semantics
 
+- TW day-trade point-in-time eligibility is absent before 2014 in the verified
+  public data and first becomes executable on 2014-01-06 (sell-first coverage
+  begins 2014-06-30). A `tw_day_trade` experiment must not start its training
+  panel in 2005 or project today's eligibility backward. The trainer's execution-
+  coverage preflight must reject any train/validation split with zero executable
+  round trips because its canonical loss is constant and all model gradients are
+  exactly zero. The active public day-trade config therefore starts in 2014.
+- A TW day-trade strategy row executes open[t] to close[t]. Its configured
+  symbol benchmark is buy-and-hold over the same wall-clock session, using the
+  panel's adjusted-close forward label shifted one row: close[t-1] to close[t].
+  Do not replace it with a cross-sectional mean of intraday returns or use the
+  unshifted close[t] to close[t+1] label. The active public benchmark is 2330.
+
 - When `walk_forward.require_future_test_year: false`, the final experimental fold
   deliberately reuses its validation window as its test window. Keep that overlap;
   label it as latest-year experimentation rather than unbiased model selection.
@@ -371,9 +384,13 @@ Rules:
 - Every epoch should account for train, validation, sampled test loss, curve test, curve plot, checkpoint, scheduler/progress, and any reporting work.
 - Expanding `train_union` folds change the symbol dimension even when the global
   batch dimension is fixed. For compiled canonical loss, mark only the symbol
-  axes dynamic and reuse one compiled loss wrapper across train groups. Bound
-  that dynamic axis by the full panel symbol count; an arbitrary very large
-  upper bound makes Inductor constraint analysis and cold compilation much more
+  axes dynamic, including the direct `symbol_indices [S]` companion and
+  recurrent-state vectors, and reuse one compiled loss wrapper across train
+  groups. Derive the upper bound from the largest symbol width any current
+  walk-forward training group can actually produce after compaction; do not use
+  validation/test-only symbols from the full panel. Recompute it every run so
+  listings and delistings remain runtime data. An arbitrary very large upper
+  bound makes Inductor constraint analysis and cold compilation much more
   expensive and can violate flattened-index guards.
 - Do not hide expensive work behind `val_interval_epochs > 1` or skip curve/test/plot work unless the user explicitly asks.
 - Recent preference: sampled test loss only needs one fold per epoch to reduce epoch-level overhead.
@@ -486,8 +503,42 @@ Rules:
 - Prefer log returns, relative price ratios, rolling normalization, and engineered K-line/volume features.
 - If changing feature schema, update cache/versioning so stale panel caches are not reused.
 - Keep `return_1d`, tradable masks, TW limit guards, and benchmark construction aligned with the canonical backtest.
+- TW public snapshot-only families are permanently forbidden model inputs. Never
+  add them to `data.feature_include`, model categorical-feature lists,
+  explainability selection, or a replacement model schema: `twpub_monthly_revenue_*`,
+  `twpub_cumulative_revenue_yoy`, `twpub_financial_*`, `twpub_insider_*`,
+  `twpub_borrow_*`, `twpub_sbl_*`, `twpub_short_sale_available_*`,
+  `twpub_tdcc_*`, and `twpub_company_*`. Their raw/source columns may remain
+  available solely for provenance, auditing, and future data-quality research;
+  they must not influence training, validation, test, inference, or feature
+  importance.
 
 ## TW Public Execution-Rule Contract
+
+- Never put a data-dependent `torch._assert_async` in a compiled model,
+  settlement, loss, or backtest CUDA hot path. A failed device assertion poisons
+  the CUDA context and causes every DDP/NCCL rank to abort. Validate static input
+  contracts at eager host boundaries. For runtime market facts, use deterministic
+  tensor semantics: an impossible mandatory exit is an absorbing account default;
+  a day-trade round trip with a missing close leg or invalid valuation never opens.
+- `tw_cash.short_maintenance_ratio` limits collateral released by a cover. If an
+  account was already below maintenance before a partial cover, release zero
+  collateral and retain/reassign the existing pools; do not assert and do not
+  invent an unconfigured same-day margin-call cure. A complete cover still
+  releases all collateral. This v8 return/default change is part of
+  `CANONICAL_BACKTEST_CONTRACT_VERSION`.
+- Corporate-action receipt `requested_start_year` is the latest incremental
+  downloader request boundary, not the historical archive boundary. Panel
+  completeness and TW cash avoidance must use cumulative
+  `coverage_start_year` (falling back only for legacy receipts), and that
+  interpretation must remain part of the panel cache contract key.
+- Preserve two distinct receipt-derived corporate-action masks. Avoid mode uses
+  the full interval from the last close where both long and short positions can
+  be flattened through the last cum-right close for every official action.
+  Exact mode uses the unresolved-only interval plus the issuer entitlement and
+  payment ledger. Never reconstruct avoid mode by OR-ing a one-row cash-yield
+  event into the unresolved mask; the event row can be halted or limit-blocked.
+  The effective mode-specific mask is part of the checkpoint data fingerprint.
 
 - Use `downloader/download_tw_official_data.py` as the canonical TWSE/TPEx-first
   data-layer entry point. Its modes are `rebuild` (staged from-zero replacement),
@@ -785,11 +836,25 @@ Expected explainability workflow:
 - Keep `training.explain_after_each_fold: false` by default so training VRAM/time stays focused on train/eval/test artifacts.
 - Generate explainability after training with `run_fintech_python explain_model.py`, which defaults to scanning all folds that have `checkpoint_best.pt`.
 - Only enable `training.explain_after_each_fold: true` for deliberate smoke/debug runs, because paper explainability can be slow and VRAM-heavy.
-- Standalone `run_fintech_python explain_model.py` is the exhaustive offline path:
-  by default it covers all configured test years and every valid date. Positive
-  date/source/target/UMAP limits are explicit reduced runs only. Training-time
-  `explain_after_each_fold` settings may remain lightweight because that is a
-  separate opt-in workflow.
+- All model explainability and feature-screening calculations have one fixed
+  comparison window: the first calendar year of each fold's test split, using
+  every valid date after the in-split lookback. This is a correctness contract,
+  not a default. Explainability has no train/validation split selector and no
+  alternate test-year coverage selector. Do not reintroduce config fields, CLI
+  flags, aliases, or helper branches that allow train/validation rows, later
+  test years, or the complete future test tail into an explainability
+  calculation. Positive within-year date limits remain explicit smoke/debug
+  reductions only. Analyze all folds before making model-level or feature-
+  selection claims so every fold contributes one comparable test year.
+- Feature-selection screening must require every configured fold checkpoint and
+  process every valid date in the fixed first-test-year window. Do not add fold
+  subset or date-sampling CLI options to the screening runner; only reuse saved
+  attribution files after validating identical complete coverage.
+- The active explainability feature-selection rule keeps a feature if either
+  Gradient x Input or Integrated Gradients is non-zero in at least one fold.
+  Disable/comment a feature only when both methods are exactly zero in every
+  configured fold; do not apply a small-contribution threshold unless the user
+  explicitly changes this rule.
 - Standalone `explain_model.py` must enable gradient × input, Integrated
   Gradients, feature-time perturbation, surrogate SHAP, regime analysis, fold
   stability, aux diagnostics, and all eligible cuML UMAP projections. Cross-asset

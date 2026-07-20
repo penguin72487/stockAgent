@@ -219,10 +219,11 @@ class LiteISAB(nn.Module):
             safe_mask = torch.ones(bsz, n_symbols, dtype=torch.bool, device=x.device)
         else:
             safe_mask = mask.to(device=x.device, dtype=torch.bool)
-            torch._assert(
-                safe_mask.any(dim=1).all(),
-                "tradable mask contains an all-false row; no-fallback path requires at least one tradable symbol per row",
-            )
+            empty = ~safe_mask.any(dim=1, keepdim=True)
+            first_symbol = torch.arange(
+                n_symbols, device=x.device
+            ).unsqueeze(0) == 0
+            safe_mask = safe_mask | (empty & first_symbol)
 
         x_masked = x.masked_fill(~safe_mask.unsqueeze(-1), 0.0)
         inducing = self.inducing.expand(bsz, -1, -1)

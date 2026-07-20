@@ -189,7 +189,8 @@ def test_explain_model_cli_has_no_cross_asset_execution_entrypoint() -> None:
     assert args.fold_stability is True
     assert args.umap is True
     assert args.max_rows == 0
-    assert args.first_test_year_only is False
+    assert not hasattr(args, "split")
+    assert not hasattr(args, "first_test_year_only")
     assert args.umap_max_points == 0
     assert not hasattr(args, "top_k")
     assert not hasattr(args, "case_study_top_k")
@@ -197,6 +198,12 @@ def test_explain_model_cli_has_no_cross_asset_execution_entrypoint() -> None:
     assert args.strict_no_fallback is True
 
     assert parse_args(["--no-progress"]).progress is False
+    with pytest.raises(SystemExit):
+        parse_args(["--split", "train"])
+    with pytest.raises(SystemExit):
+        parse_args(["--all-test-years"])
+    with pytest.raises(SystemExit):
+        parse_args(["--no-first-test-year-only"])
     with pytest.raises(SystemExit):
         parse_args(["--cross-asset"])
 
@@ -314,7 +321,7 @@ def test_training_fold_explainability_delegates_to_shared_runner(monkeypatch, tm
     assert output == tmp_path / "explainability" / "fold_01_test"
     assert captured["model"] is model
     assert captured["fold"] is fold
-    assert captured["split"] == "test"
+    assert "split" not in captured
     assert captured["write_plots"] is False
     assert captured["timing_file_name"] == "train_explainability_timing.json"
     settings = captured["settings"]

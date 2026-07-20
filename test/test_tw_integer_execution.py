@@ -567,25 +567,28 @@ def test_empty_lifecycle_masks_do_not_require_inactive_quotes(
     )
 
 
-def test_tw_day_trade_integer_rejects_invalid_close_after_valid_open_entry() -> None:
+def test_tw_day_trade_integer_skips_entry_without_valid_close_mark() -> None:
     targets = np.ones((1, 1))
     mask = np.ones_like(targets, dtype=np.bool_)
-    with pytest.raises(ValueError, match="close_prices.*required prices"):
-        run_tw_day_trade_integer(
-            targets,
-            np.array([[100.0]]),
-            np.array([[np.nan]]),
-            buy_fee_rates=np.zeros(1),
-            sell_fee_rates=np.zeros(1),
-            eligibility_mask=mask,
-            lot_sizes=np.ones(1, dtype=np.int64),
-            tradable_mask=mask,
-            can_buy_mask=mask,
-            can_sell_mask=mask,
-            day_trade_can_buy_open_mask=mask,
-            day_trade_can_sell_open_mask=mask,
-            initial_cash=1_000.0,
-        )
+    result = run_tw_day_trade_integer(
+        targets,
+        np.array([[100.0]]),
+        np.array([[np.nan]]),
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        eligibility_mask=mask,
+        lot_sizes=np.ones(1, dtype=np.int64),
+        tradable_mask=mask,
+        can_buy_mask=mask,
+        can_sell_mask=mask,
+        day_trade_can_buy_open_mask=mask,
+        day_trade_can_sell_open_mask=mask,
+        initial_cash=1_000.0,
+    )
+
+    assert result.positions[0, 0] == 0
+    assert result.turnover[0] == pytest.approx(0.0)
+    assert result.nav_history[0] == pytest.approx(1_000.0)
 
 
 @pytest.mark.parametrize("mode", ["tw_cash", "tw_day_trade"])
@@ -984,21 +987,45 @@ def test_tw_day_trade_rounds_commission_and_tax_components_separately() -> None:
     assert result.settlement_net_history[0] == pytest.approx(1_354.0)
 
 
-def test_tw_day_trade_open_fill_with_blocked_close_errors_without_hindsight_cancel() -> None:
+def test_tw_day_trade_blocked_close_prevents_integer_round_trip_entry() -> None:
     targets = np.array([[1.0]])
 
-    with pytest.raises(RuntimeError, match="mandatory close leg"):
-        run_tw_day_trade_integer(
-            targets,
-            np.array([[100.0]]),
-            np.array([[101.0]]),
-            buy_fee_rates=0.0,
-            sell_fee_rates=0.0,
-            eligibility_mask=np.ones_like(targets, dtype=np.bool_),
-            can_sell_mask=np.zeros_like(targets, dtype=np.bool_),
-            **_open_masks(targets),
-            initial_cash=200_000.0,
-        )
+    result = run_tw_day_trade_integer(
+        targets,
+        np.array([[100.0]]),
+        np.array([[101.0]]),
+        buy_fee_rates=0.0,
+        sell_fee_rates=0.0,
+        eligibility_mask=np.ones_like(targets, dtype=np.bool_),
+        can_sell_mask=np.zeros_like(targets, dtype=np.bool_),
+        **_open_masks(targets),
+        initial_cash=200_000.0,
+    )
+
+    assert result.positions[0, 0] == 0
+    assert result.turnover[0] == pytest.approx(0.0)
+    assert result.nav_history[0] == pytest.approx(200_000.0)
+
+
+def test_tw_day_trade_blocked_buy_close_prevents_short_integer_entry() -> None:
+    targets = np.array([[-1.0]])
+
+    result = run_tw_day_trade_integer(
+        targets,
+        np.array([[100.0]]),
+        np.array([[99.0]]),
+        buy_fee_rates=0.0,
+        sell_fee_rates=0.0,
+        eligibility_mask=np.ones_like(targets, dtype=np.bool_),
+        can_buy_mask=np.zeros_like(targets, dtype=np.bool_),
+        can_short_open_mask=np.ones_like(targets, dtype=np.bool_),
+        **_open_masks(targets),
+        initial_cash=200_000.0,
+    )
+
+    assert result.positions[0, 0] == 0
+    assert result.turnover[0] == pytest.approx(0.0)
+    assert result.nav_history[0] == pytest.approx(200_000.0)
 
 
 def test_tw_day_trade_short_and_per_symbol_lot_override() -> None:

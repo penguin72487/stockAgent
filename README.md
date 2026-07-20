@@ -282,3 +282,95 @@ python=3.12
 pydantic >=2.13.4
 transformers >= 5.12.1
 ```
+
+7z x data_tw_public.7z
+
+sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo snap refresh
+cd /root/stockAgent
+mamba activate fintech
+mamba update --all
+# train
+
+cd /root/stockAgent
+mamba activate fintech
+source scripts/runtime_env.sh
+CUDA_VISIBLE_DEVICES=0,1 run_fintech_python train.py   --config configs/markets/tw_public_lanten_market_candles_select.yaml --multi-gpu-strategy distributed_data_parallel
+
+# explain 只有feature
+cd /root/stockAgent
+source scripts/runtime_env.sh
+
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+
+export CUDA_VISIBLE_DEVICES=0,1
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export POLARS_MAX_THREADS=16
+
+run_fintech_python -m torch.distributed.run \
+  --standalone \
+  --nnodes=1 \
+  --nproc-per-node=2 \
+  scripts/screen_explainability_features.py \
+  --config configs/markets/tw_public_lanten_market_candles.yaml \
+  --output-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds \
+  --screening-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds/feature_screening_first_test_year \
+  --device cuda \
+  --cpu-threads 16 \
+  --row-chunk-size 16 \
+  --amp-dtype bf16 \
+  --ig-steps 8 \
+  --ig-batch-size 2 \
+  --no-reuse-complete-explainability \
+  --progress \
+  --negligible-uniform-fraction 0.1
+
+  # 全出
+  cd /root/stockAgent
+source scripts/runtime_env.sh
+
+run_fintech_python scripts/check_environment.py --require-cuda --strict
+
+export CUDA_VISIBLE_DEVICES=0,1
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export POLARS_MAX_THREADS=16
+
+run_fintech_python -m torch.distributed.run \
+  --standalone \
+  --nnodes=1 \
+  --nproc-per-node=2 \
+  explain_model.py \
+  --config configs/markets/tw_public_lanten_market_candles.yaml \
+  --output-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds \
+  --device cuda \
+  --cpu-threads 16 \
+  --max-rows 0 \
+  --row-chunk-size 16 \
+  --amp-dtype bf16 \
+  --no-compile-model \
+  --ig-steps 8 \
+  --ig-batch-size 2 \
+  --sample-method even \
+  --perturb \
+  --perturb-batch-size 2 \
+  --perturb-max-auto-batch-size 32 \
+  --perturb-max-input-elements 536870912 \
+  --counterfactual-compile \
+  --j-lens \
+  --j-lens-vjp-batch-size 16 \
+  --shap \
+  --regime-analysis \
+  --fold-stability \
+  --umap \
+  --umap-max-points 0 \
+  --umap-max-projections 0 \
+  --umap-n-neighbors 16 \
+  --plot-backend rapids_datashader \
+  --plots \
+  --standard-plots \
+  --plot-theme paper \
+  --report-style paper \
+  --no-interactive-plots \
+  --strict-no-fallback \
+  --progress

@@ -139,10 +139,27 @@ def test_long_only_mode_still_sums_to_one() -> None:
     assert torch.allclose(weights.sum(dim=1), torch.ones(2, device=device), atol=1e-5)
 
 
+def test_long_only_empty_mask_row_is_finite_and_zero() -> None:
+    device = _device()
+    model = _make_model(portfolio_mode="long_only").eval()
+    x = torch.randn(2, 10, 100, 21, device=device)
+    mask = torch.ones(2, 100, dtype=torch.bool, device=device)
+    mask[0] = False
+
+    with torch.no_grad():
+        weights, scores, aux = model(x, mask, return_aux=True)
+
+    assert torch.isfinite(weights).all()
+    assert torch.isfinite(scores).all()
+    assert torch.isfinite(aux["z_set"]).all()
+    torch.testing.assert_close(weights[0], torch.zeros_like(weights[0]))
+
+
 if __name__ == "__main__":
     print(f"Device: {_device()}")
     test_default_output_is_trainer_compatible()
     test_shapes_mask_and_backward()
     test_ablation_modes_and_dynamic_symbols()
     test_long_only_mode_still_sums_to_one()
+    test_long_only_empty_mask_row_is_finite_and_zero()
     print("SUCCESS")

@@ -38,15 +38,20 @@ from stockagent.data.tw_security import (
 OFFICIAL_SOURCE_NAME = "twse_tpex_official"
 MIXED_FALLBACK_SOURCE_NAME = "twse_tpex_official_with_yahoo_fallback"
 YAHOO_FALLBACK_SOURCE_NAME = "yahoo_fallback"
-OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION = 6
+OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION = 7
 OFFICIAL_SYMBOL_ADJUSTED_PRICE_METHOD = (
     "first=10 per official lifecycle episode; next=previous_index*factor; "
     "factor=official/legacy explicit ratio else corporate_action_reference "
     "ratio else close/(close-signed_change) else close/previous official "
-    "session next_reference else Yahoo source-adjusted ratio"
+    "session next_reference else Yahoo source-adjusted ratio; Yahoo fallback "
+    "raw OHLC uses the latest same-episode official/Yahoo overlap scale and "
+    "unanchored or >2x discontinuous fallback rows are excluded"
 )
 PREVIOUS_SESSION_NEXT_REFERENCE_SOURCE_NAME = (
     "tpex_official_previous_session_next_reference"
+)
+YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION = (
+    "yahoo_fallback_official_overlap_scale"
 )
 RETURN_QUARANTINE_REASONS = frozenset(
     {
@@ -127,10 +132,14 @@ class BuildResult:
     last_date: str | None
     output_path: str
     source: str = OFFICIAL_SOURCE_NAME
+    input_fallback_rows: int = 0
     fallback_rows: int = 0
     fallback_adjustment_rows: int = 0
     previous_session_next_reference_adjustment_rows: int = 0
     normalized_zero_ohlc_rows: int = 0
+    normalized_fallback_ohlc_rows: int = 0
+    dropped_unanchored_fallback_rows: int = 0
+    dropped_discontinuous_fallback_rows: int = 0
     return_quarantined_rows: int = 0
     lifecycle_episode_quarantined_rows: int = 0
     listing_boundary_quarantined_rows: int = 0
@@ -249,6 +258,19 @@ def _validate_download_receipts(
             and set(public_summary.get("publication_lag_datasets") or ())
             <= {"twse_margin_balance", "tpex_margin_balance"}
         )
+        allowed_failed_datasets = set(
+            public_summary.get("allowed_failed_datasets") or ()
+        )
+        configured_allowed_failed_datasets = set(
+            public_summary.get("configured_allowed_failed_datasets") or ()
+        )
+        certified_nonblocking_failures = (
+            public_summary.get("coverage_complete") is True
+            and int(public_summary.get("blocking_failed_count", -1)) == 0
+            and int(public_summary.get("failed_count", -1))
+            == int(public_summary.get("allowed_failed_count", -2))
+            and allowed_failed_datasets <= configured_allowed_failed_datasets
+        )
         if (
             public_summary.get("coverage_complete") is not True
             and not legacy_full_receipt
@@ -262,6 +284,7 @@ def _validate_download_receipts(
         if (
             int(public_summary.get("failed_count", -1)) != 0
             and not certified_daily_close
+            and not certified_nonblocking_failures
         ):
             problems.append(f"public failed_count={public_summary.get('failed_count')!r}")
     except Exception as exc:
@@ -968,18 +991,47 @@ def _yahoo_manifest_codes(path: Path) -> set[str] | None:
         return None
 
 
-def _terminal_unavailable_codes(path: Path) -> set[str] | None:
+def _terminal_unavailable_codes(
+    path: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> set[str] | None:
     accepted_statuses = {"not_found", "delisted_no_history", "delisted_removed"}
     try:
         frame = pl.read_csv(path, infer_schema_length=10000)
         if {"code", "status"} - set(frame.columns):
             return None
-        return {
+        codes = {
             code
             for row in frame.select("code", "status").iter_rows(named=True)
             if str(row.get("status") or "").strip() in accepted_statuses
             if (code := _canonical_yahoo_manifest_code(row.get("code"))) is not None
         }
+        if (
+            manifest_path is not None
+            and manifest_path.is_file()
+            and "yahoo_symbol" in frame.columns
+        ):
+            unavailable_yahoo_symbols = {
+                str(row.get("yahoo_symbol") or "").strip().upper()
+                for row in frame.iter_rows(named=True)
+                if str(row.get("status") or "").strip() in accepted_statuses
+                and str(row.get("yahoo_symbol") or "").strip()
+            }
+            manifest = pl.read_csv(manifest_path, infer_schema_length=10000)
+            if {"code", "yahoo_symbol"} - set(manifest.columns):
+                return None
+            for row in manifest.iter_rows(named=True):
+                if (
+                    str(row.get("yahoo_symbol") or "").strip().upper()
+                    not in unavailable_yahoo_symbols
+                ):
+                    continue
+                code = _canonical_yahoo_manifest_code(row.get("code"))
+                if code is None:
+                    return None
+                codes.add(code)
+        return codes
     except Exception:
         return None
 
@@ -1165,7 +1217,10 @@ def _validate_yahoo_fallback_archive(path: Path) -> None:
     )
     terminal_report_path = resolve_path(terminal_report_receipt)
     terminal_report_codes = (
-        _terminal_unavailable_codes(terminal_report_path)
+        _terminal_unavailable_codes(
+            terminal_report_path,
+            manifest_path=symbol_manifest_path,
+        )
         if terminal_report_path is not None
         else None
     )
@@ -1794,13 +1849,15 @@ def _official_frame(
                 "date",
                 "symbol",
                 pl.col("source_factor").alias("_yahoo_fallback_factor"),
+                pl.col("close").alias("_yahoo_fallback_close"),
             )
             .unique(["date", "symbol"], keep="last", maintain_order=True)
         )
         frame = frame.join(fallback_adjustments, on=["date", "symbol"], how="left")
     else:
         frame = frame.with_columns(
-            pl.lit(None, dtype=pl.Float64).alias("_yahoo_fallback_factor")
+            pl.lit(None, dtype=pl.Float64).alias("_yahoo_fallback_factor"),
+            pl.lit(None, dtype=pl.Float64).alias("_yahoo_fallback_close"),
         )
     reference = (
         pl.read_parquet(core_paths[2])
@@ -2238,6 +2295,183 @@ def _source_adjustment_factors(
     return factors
 
 
+def _normalize_yahoo_fallback_raw_ohlc(
+    frame: pl.DataFrame,
+) -> tuple[pl.DataFrame, int, int, int]:
+    """Map Yahoo raw OHLC into the official per-share price scale, causally.
+
+    Yahoo historical ``close`` can be restated onto a vendor-specific split
+    scale that is hundreds of times away from the official TWSE/TPEx quote.
+    Exact-share cash accounting cannot consume that raw level directly.  For
+    every lifecycle episode, this routine learns a scale only on a date where
+    both a selected official close and the archived Yahoo close are available,
+    then carries that already-observed scale forward to later fallback rows.
+
+    It deliberately does not backfill from a future official observation.
+    Unanchored fallback rows and fallback rows participating in a >2x raw-price
+    discontinuity are excluded.  Missing rows are safer than an invented mark:
+    the panel's cash executor carries the last verified close while trading is
+    unavailable and realizes the catch-up return once a verified quote resumes.
+    """
+
+    if frame.is_empty():
+        return frame, 0, 0, 0
+    frame = frame.sort("date")
+    required = {
+        "date",
+        "open",
+        "max",
+        "min",
+        "close",
+        "quote_source",
+        "_lifecycle_episode_id",
+        "_yahoo_fallback_close",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(
+            "Yahoo raw-OHLC normalization is missing columns: "
+            f"{missing}"
+        )
+
+    quote_sources = np.asarray(frame["quote_source"].to_list(), dtype=object)
+    fallback = quote_sources == YAHOO_FALLBACK_SOURCE_NAME
+    close = np.asarray(frame["close"].to_numpy(), dtype=np.float64)
+    yahoo_close = np.asarray(
+        frame["_yahoo_fallback_close"].to_numpy(), dtype=np.float64
+    )
+    episodes = np.asarray(frame["_lifecycle_episode_id"].to_numpy())
+    dates = frame["date"].to_list()
+
+    scales = np.full(frame.height, np.nan, dtype=np.float64)
+    reference_dates: list[date | None] = [None] * frame.height
+    anchored = np.zeros(frame.height, dtype=bool)
+    active_episode: object | None = None
+    active_scale = math.nan
+    active_reference_date: date | None = None
+
+    for index in range(frame.height):
+        episode = episodes[index]
+        if index == 0 or episode != active_episode:
+            active_episode = episode
+            active_scale = math.nan
+            active_reference_date = None
+
+        if (
+            not fallback[index]
+            and math.isfinite(close[index])
+            and close[index] > 0.0
+            and math.isfinite(yahoo_close[index])
+            and yahoo_close[index] > 0.0
+        ):
+            candidate = close[index] / yahoo_close[index]
+            if math.isfinite(candidate) and candidate > 0.0:
+                active_scale = candidate
+                active_reference_date = dates[index]
+
+        if fallback[index] and math.isfinite(active_scale) and active_scale > 0.0:
+            scales[index] = active_scale
+            reference_dates[index] = active_reference_date
+            anchored[index] = True
+
+    unanchored = fallback & ~anchored
+    scale_series = pl.Series(
+        "raw_ohlc_scale_factor", scales, dtype=pl.Float64
+    ).fill_nan(None)
+    anchored_series = pl.Series(
+        "_raw_ohlc_scale_anchored", anchored, dtype=pl.Boolean
+    )
+    frame = frame.with_columns(
+        scale_series,
+        pl.Series(
+            "raw_ohlc_scale_reference_date",
+            reference_dates,
+            dtype=pl.Date,
+        ),
+        anchored_series,
+    ).with_columns(
+        [
+            pl.when(
+                (pl.col("quote_source") == YAHOO_FALLBACK_SOURCE_NAME)
+                & pl.col("_raw_ohlc_scale_anchored")
+            )
+            .then(pl.col(column) * pl.col("raw_ohlc_scale_factor"))
+            .otherwise(pl.col(column))
+            .alias(column)
+            for column in ("open", "max", "min", "close")
+        ]
+    )
+
+    # Reject a fallback mark if the causally scaled level still creates a
+    # discontinuity.  This catches a vendor scale regime change after the last
+    # overlap anchor without using a future quote to manufacture a new scale.
+    normalized_close = np.asarray(frame["close"].to_numpy(), dtype=np.float64)
+    discontinuous = np.zeros(frame.height, dtype=bool)
+
+    def has_jump(left: int, right: int) -> bool:
+        left_close = normalized_close[left]
+        right_close = normalized_close[right]
+        return (
+            episodes[left] == episodes[right]
+            and math.isfinite(left_close)
+            and left_close > 0.0
+            and math.isfinite(right_close)
+            and right_close > 0.0
+            and abs(math.log(right_close / left_close))
+            > math.log(2.0) + 1.0e-9
+        )
+
+    # Validate each complete fallback run against both official boundaries.
+    # A scale regime can look internally smooth yet disagree only when the next
+    # official quote resumes.  In that case the whole run is unverified; merely
+    # dropping its final row would expose the same bad boundary one row earlier.
+    retained = np.flatnonzero(~unanchored)
+    position = 0
+    while position < retained.size:
+        index = int(retained[position])
+        if not fallback[index]:
+            position += 1
+            continue
+        run_start = position
+        episode = episodes[index]
+        while (
+            position + 1 < retained.size
+            and fallback[int(retained[position + 1])]
+            and episodes[int(retained[position + 1])] == episode
+        ):
+            position += 1
+        run_end = position
+        run_indices = retained[run_start : run_end + 1]
+        invalid_run = False
+        if run_start > 0:
+            left = int(retained[run_start - 1])
+            invalid_run = has_jump(left, int(run_indices[0]))
+        if not invalid_run and run_end + 1 < retained.size:
+            right = int(retained[run_end + 1])
+            invalid_run = has_jump(int(run_indices[-1]), right)
+        if not invalid_run and run_indices.size > 1:
+            invalid_run = any(
+                has_jump(int(left), int(right))
+                for left, right in zip(run_indices[:-1], run_indices[1:], strict=True)
+            )
+        if invalid_run:
+            discontinuous[run_indices] = True
+        position += 1
+
+    keep = ~(unanchored | discontinuous)
+    normalized_rows = int(np.count_nonzero(fallback & keep))
+    result = (
+        frame.filter(pl.Series("_keep_verified_raw_ohlc", keep))
+        .drop("_raw_ohlc_scale_anchored")
+    )
+    return (
+        result,
+        normalized_rows,
+        int(np.count_nonzero(unanchored)),
+        int(np.count_nonzero(discontinuous)),
+    )
+
+
 def _write_symbol(
     output_dir: Path,
     symbol: str,
@@ -2271,6 +2505,7 @@ def _write_symbol(
             "_previous_session_next_reference_eligible": pl.lit(False),
             "_official_listing_boundary": pl.lit(False),
             "_official_listing_evidence": pl.lit(None, dtype=pl.String),
+            "_yahoo_fallback_close": pl.lit(None, dtype=pl.Float64),
         }
         missing_optional = [
             expression.alias(column)
@@ -2279,12 +2514,55 @@ def _write_symbol(
         ]
         if missing_optional:
             frame = frame.with_columns(missing_optional)
-        fallback_rows = int(
+        input_fallback_rows = int(
             frame.select(
                 (pl.col("quote_source") == YAHOO_FALLBACK_SOURCE_NAME)
                 .sum()
                 .alias("fallback_rows")
             ).item()
+        )
+        original_market = str(frame["market"][-1])
+        original_name = str(frame["name"][-1] or symbol)
+        original_security_type = str(frame["security_type"][-1])
+        (
+            frame,
+            normalized_fallback_ohlc_rows,
+            dropped_unanchored_fallback_rows,
+            dropped_discontinuous_fallback_rows,
+        ) = _normalize_yahoo_fallback_raw_ohlc(frame)
+        if frame.is_empty():
+            return BuildResult(
+                symbol=symbol,
+                security_type=original_security_type,
+                market=original_market,
+                name=original_name,
+                status="excluded_unverified_fallback",
+                rows=0,
+                adjusted_rows=0,
+                missing_adjustment_rows=0,
+                first_date=None,
+                last_date=None,
+                output_path=str(path),
+                source=OFFICIAL_SOURCE_NAME,
+                input_fallback_rows=input_fallback_rows,
+                fallback_rows=0,
+                normalized_fallback_ohlc_rows=normalized_fallback_ohlc_rows,
+                dropped_unanchored_fallback_rows=(
+                    dropped_unanchored_fallback_rows
+                ),
+                dropped_discontinuous_fallback_rows=(
+                    dropped_discontinuous_fallback_rows
+                ),
+                message=(
+                    "all rows were Yahoo fallback marks without a causal "
+                    "official-overlap raw-price scale"
+                ),
+            )
+        fallback_rows = int(
+            frame.select(
+                (pl.col("quote_source") == YAHOO_FALLBACK_SOURCE_NAME).sum()
+            ).item()
+            or 0
         )
         output_source = (
             MIXED_FALLBACK_SOURCE_NAME if fallback_rows else OFFICIAL_SOURCE_NAME
@@ -2465,6 +2743,8 @@ def _write_symbol(
             pl.col("_lifecycle_evidence").alias("lifecycle_evidence"),
             pl.col("_official_listing_evidence").alias("official_listing_evidence"),
             "_official_zero_ohlc_normalized",
+            "raw_ohlc_scale_factor",
+            "raw_ohlc_scale_reference_date",
         ).with_columns(
             pl.Series("adjustment_source", adjustment_source, dtype=pl.String),
             pl.Series(
@@ -2489,6 +2769,8 @@ def _write_symbol(
             .alias("adjustment_reference_kind"),
             pl.when(pl.col("_official_zero_ohlc_normalized"))
             .then(pl.lit("official_close_flat_bar"))
+            .when(pl.col("data_source") == YAHOO_FALLBACK_SOURCE_NAME)
+            .then(pl.lit(YAHOO_FALLBACK_RAW_OHLC_NORMALIZATION))
             .otherwise(pl.lit(None, dtype=pl.String))
             .alias("ohlc_normalization"),
             pl.Series("adjclose", adjusted),
@@ -2523,12 +2805,20 @@ def _write_symbol(
             last_date=str(last),
             output_path=str(path),
             source=output_source,
+            input_fallback_rows=input_fallback_rows,
             fallback_rows=fallback_rows,
             fallback_adjustment_rows=fallback_adjustment_rows,
             previous_session_next_reference_adjustment_rows=(
                 previous_session_next_reference_adjustment_rows
             ),
             normalized_zero_ohlc_rows=normalized_zero_ohlc_rows,
+            normalized_fallback_ohlc_rows=normalized_fallback_ohlc_rows,
+            dropped_unanchored_fallback_rows=(
+                dropped_unanchored_fallback_rows
+            ),
+            dropped_discontinuous_fallback_rows=(
+                dropped_discontinuous_fallback_rows
+            ),
             return_quarantined_rows=int(np.count_nonzero(return_quarantined)),
             lifecycle_episode_quarantined_rows=quarantine_counts[
                 "official_lifecycle_episode_boundary"
@@ -2627,7 +2917,12 @@ def main() -> None:
             f"{merge_stats.previous_session_next_reference_candidate_rows}"
         )
 
-    target_symbols = {result.symbol for result in results}
+    active_results = [
+        result
+        for result in results
+        if result.status in {"created", "planned"}
+    ]
+    target_symbols = {result.symbol for result in active_results}
     stale_symbols_removed = _remove_stale_official_symbol_files(
         args.output_dir,
         target_symbols,
@@ -2635,11 +2930,11 @@ def main() -> None:
     )
     manifest = pl.DataFrame(
         {
-            "code": [result.symbol for result in results],
-            "name": [result.name for result in results],
-            "market": [result.market for result in results],
-            "security_type": [result.security_type for result in results],
-            "source": [result.source for result in results],
+            "code": [result.symbol for result in active_results],
+            "name": [result.name for result in active_results],
+            "market": [result.market for result in active_results],
+            "security_type": [result.security_type for result in active_results],
+            "source": [result.source for result in active_results],
         }
     ).sort("code")
     if not args.dry_run:
@@ -2651,7 +2946,7 @@ def main() -> None:
         target_symbols,
         fallback_symbols={
             result.symbol
-            for result in results
+            for result in active_results
             if result.fallback_rows > 0 or result.fallback_adjustment_rows > 0
         },
         dry_run=bool(args.dry_run),
@@ -2665,7 +2960,7 @@ def main() -> None:
             MIXED_FALLBACK_SOURCE_NAME
             if any(
                 result.fallback_rows > 0 or result.fallback_adjustment_rows > 0
-                for result in results
+                for result in active_results
             )
             else OFFICIAL_SOURCE_NAME
         ),
@@ -2706,10 +3001,19 @@ def main() -> None:
         "dropped_post_terminal_fallback_examples": (
             merge_stats.dropped_post_terminal_fallback_examples
         ),
-        "rows": int(frame.height),
-        "symbols": len(results),
+        "input_rows": int(frame.height),
+        "rows": sum(result.rows for result in active_results),
+        "input_symbols": len(results),
+        "symbols": len(active_results),
+        "excluded_unverified_fallback_symbols": sum(
+            result.status == "excluded_unverified_fallback"
+            for result in results
+        ),
         "security_type_counts": {
-            security_type: sum(result.security_type == security_type for result in results)
+            security_type: sum(
+                result.security_type == security_type
+                for result in active_results
+            )
             for security_type in ("stock", "etf")
         },
         "stale_symbols_removed": stale_symbols_removed,
@@ -2718,6 +3022,9 @@ def main() -> None:
         "adjusted_rows": sum(result.adjusted_rows for result in results),
         "missing_adjustment_rows": sum(result.missing_adjustment_rows for result in results),
         "fallback_rows": sum(result.fallback_rows for result in results),
+        "input_fallback_rows": sum(
+            result.input_fallback_rows for result in results
+        ),
         "fallback_adjustment_rows": sum(
             result.fallback_adjustment_rows for result in results
         ),
@@ -2732,6 +3039,15 @@ def main() -> None:
         ),
         "normalized_zero_ohlc_rows": sum(
             result.normalized_zero_ohlc_rows for result in results
+        ),
+        "normalized_fallback_ohlc_rows": sum(
+            result.normalized_fallback_ohlc_rows for result in results
+        ),
+        "dropped_unanchored_fallback_rows": sum(
+            result.dropped_unanchored_fallback_rows for result in results
+        ),
+        "dropped_discontinuous_fallback_rows": sum(
+            result.dropped_discontinuous_fallback_rows for result in results
         ),
         "return_quarantined_rows": sum(
             result.return_quarantined_rows for result in results
@@ -2757,7 +3073,7 @@ def main() -> None:
         ),
         "fallback_symbols": sum(
             result.fallback_rows > 0 or result.fallback_adjustment_rows > 0
-            for result in results
+            for result in active_results
         ),
         "status_counts": status_counts,
         "dry_run": bool(args.dry_run),
@@ -2772,7 +3088,7 @@ def main() -> None:
         report_path
     )
     print(
-        f"[tw-official-symbols] rows={frame.height} symbols={len(results)} "
+        f"[tw-official-symbols] rows={frame.height} symbols={len(active_results)} "
         f"missing_adjustments={summary['missing_adjustment_rows']} summary={summary_path}",
         flush=True,
     )

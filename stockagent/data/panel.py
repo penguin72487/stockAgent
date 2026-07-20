@@ -114,6 +114,14 @@ LOG_RETURN_FEATURE_COLUMNS = [
 # v50 resolves that terminal liquidation only after every buy/sell side rule is
 # known, and stores immutable logical-array fingerprints in the panel cache.
 PANEL_CACHE_VERSION = 50
+# v2 distinguishes the cumulative corporate-action archive coverage from the
+# latest incremental downloader request.  Keep this in the backend contract so
+# panels built with the old requested_start_year interpretation are never
+# reused for TW cash execution.
+CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION = 2
+# Separates the full avoidance interval for every official action from the
+# unresolved-only interval used when exact cash entitlements are enabled.
+CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION = 2
 FEATURE_FILE_SUFFIX = "_features.parquet"
 DEFAULT_EXTERNAL_MARKET_SYMBOL = "__MARKET__"
 EPSILON = 1e-8
@@ -272,6 +280,11 @@ class PanelData:
     day_trade_can_buy_open_mask: np.ndarray | None = None
     day_trade_can_sell_open_mask: np.ndarray | None = None
     raw_close_returns_1d: np.ndarray | None = None
+    # Full last-executable-close..last-cum-right-close avoidance interval for
+    # every receipt-verified action. ``avoid`` mode uses this even when an
+    # exact entitlement exists; exact mode uses the unresolved-only mask below
+    # together with the issuer payment ledger.
+    corporate_action_avoidance_mask: np.ndarray | None = None
     # Backward-compatible field name.  This is now a receipt-verified, known
     # corporate-action avoidance transition, not an adjclose-difference guess.
     unresolved_corporate_action_mask: np.ndarray | None = None
@@ -364,6 +377,9 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
         day_trade_can_buy_open_mask=sliced(panel.day_trade_can_buy_open_mask),
         day_trade_can_sell_open_mask=sliced(panel.day_trade_can_sell_open_mask),
         raw_close_returns_1d=sliced(panel.raw_close_returns_1d),
+        corporate_action_avoidance_mask=sliced(
+            panel.corporate_action_avoidance_mask
+        ),
         unresolved_corporate_action_mask=sliced(
             panel.unresolved_corporate_action_mask
         ),
@@ -827,8 +843,21 @@ def _load_corporate_action_reference(
             "TW corporate-action reference contains null/invalid event keys or prices"
         )
     try:
+        requested_start_year = int(summary.get("requested_start_year"))
+        # ``requested_start_year`` is only the lower bound of the most recent
+        # incremental download.  ``coverage_start_year`` is the cumulative,
+        # receipt-verified archive boundary and therefore the only valid
+        # boundary for deciding whether an older panel is fully protected.
+        # Fall back only for older schema-3 receipts that predate this field.
+        coverage_start_year = int(
+            summary.get("coverage_start_year", requested_start_year)
+        )
+        if coverage_start_year > requested_start_year:
+            raise ValueError(
+                "coverage_start_year cannot follow requested_start_year"
+            )
         coverage_start = np.datetime64(
-            f"{int(summary.get('requested_start_year')):04d}-01-01", "D"
+            f"{coverage_start_year:04d}-01-01", "D"
         )
         receipt_end = np.datetime64(str(summary.get("end_date", "")), "D")
     except (TypeError, ValueError) as exc:
@@ -2741,15 +2770,20 @@ def _apply_corporate_action_avoidance_transitions(
     """
 
     if reference is None:
+        panel.corporate_action_avoidance_mask = None
         panel.unresolved_corporate_action_mask = None
         return panel
     panel_dates = np.asarray(panel.dates, dtype="datetime64[D]")
     if panel_dates.size == 0:
+        panel.corporate_action_avoidance_mask = np.zeros(
+            panel.tradable_mask.shape, dtype=bool
+        )
         panel.unresolved_corporate_action_mask = np.zeros(
             panel.tradable_mask.shape, dtype=bool
         )
         return panel
     if panel_dates[0] < reference.coverage_start:
+        panel.corporate_action_avoidance_mask = None
         panel.unresolved_corporate_action_mask = None
         print(
             "[panel] corporate-action avoidance unavailable: panel begins before "
@@ -2758,6 +2792,7 @@ def _apply_corporate_action_avoidance_transitions(
         )
         return panel
     if panel_dates[-1] > reference.coverage_end:
+        panel.corporate_action_avoidance_mask = None
         panel.unresolved_corporate_action_mask = None
         print(
             "[panel] corporate-action avoidance unavailable: panel extends beyond "
@@ -2842,6 +2877,11 @@ def _apply_corporate_action_avoidance_transitions(
             start = avoidance_start(transition, sym_idx)
             avoidance_counts[start : transition + 1, sym_idx] += 1
             applied_events += 1
+    # Preserve the complete interval before exact entitlements remove their
+    # own entries from the unresolved-only counter below. Reconstructing this
+    # later from a single yield cell is unsafe when the last cum-right close is
+    # limit-blocked or halted.
+    panel.corporate_action_avoidance_mask = avoidance_counts > 0
     panel.cash_dividend_yield = None
     panel.cash_dividend_payment_delay_sessions = None
     exact_terms = reference.exact_cash_terms_by_symbol
@@ -3031,7 +3071,9 @@ def _apply_corporate_action_avoidance_transitions(
     panel.unresolved_corporate_action_mask = mask
     print(
         "[panel] applied official corporate-action avoidance transitions "
-        f"events={applied_events} unique_transitions={int(mask.sum())}"
+        f"events={applied_events} "
+        f"all_transitions={int(panel.corporate_action_avoidance_mask.sum())} "
+        f"unresolved_transitions={int(mask.sum())}"
     )
     return panel
 
@@ -3285,6 +3327,8 @@ def load_cached_panel(
         f"external_features={bool(external_include_features)}|"
         f"external_rules={bool(external_include_rules)}|"
         f"corporate_action_reference={corporate_action_key}|"
+        f"corporate_action_coverage_contract=v{CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION}|"
+        f"corporate_action_avoidance_contract=v{CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
@@ -3818,6 +3862,7 @@ def _apply_external_rule_masks(panel: PanelData, external_features: _ExternalFea
         day_trade_can_buy_open_mask=day_trade_can_buy_open,
         day_trade_can_sell_open_mask=day_trade_can_sell_open,
         raw_close_returns_1d=panel.raw_close_returns_1d,
+        corporate_action_avoidance_mask=panel.corporate_action_avoidance_mask,
         unresolved_corporate_action_mask=panel.unresolved_corporate_action_mask,
         cash_dividend_yield=panel.cash_dividend_yield,
         cash_dividend_payment_delay_sessions=(
@@ -4016,6 +4061,11 @@ def _load_panel_cache(cache_path: Path) -> PanelData:
         day_trade_can_buy_open_mask=day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=day_trade_can_sell_open_mask,
         raw_close_returns_1d=raw_close_returns_1d,
+        corporate_action_avoidance_mask=(
+            cached["corporate_action_avoidance_mask"]
+            if "corporate_action_avoidance_mask" in cached_keys
+            else None
+        ),
         unresolved_corporate_action_mask=unresolved_corporate_action_mask,
         cash_dividend_yield=(
             cached["cash_dividend_yield"]
@@ -4072,6 +4122,9 @@ def _panel_from_cache_payload(payload: dict) -> PanelData:
             "day_trade_can_sell_open_mask"
         ),
         raw_close_returns_1d=payload.get("raw_close_returns_1d"),
+        corporate_action_avoidance_mask=payload.get(
+            "corporate_action_avoidance_mask"
+        ),
         unresolved_corporate_action_mask=payload.get(
             "unresolved_corporate_action_mask"
         ),
@@ -4233,6 +4286,7 @@ def _filter_panel_features(
         day_trade_can_buy_open_mask=panel.day_trade_can_buy_open_mask,
         day_trade_can_sell_open_mask=panel.day_trade_can_sell_open_mask,
         raw_close_returns_1d=panel.raw_close_returns_1d,
+        corporate_action_avoidance_mask=panel.corporate_action_avoidance_mask,
         unresolved_corporate_action_mask=panel.unresolved_corporate_action_mask,
         cash_dividend_yield=panel.cash_dividend_yield,
         cash_dividend_payment_delay_sessions=(
@@ -4490,6 +4544,8 @@ def build_panel(
         f"external_features={bool(external_include_features)}|"
         f"external_rules={bool(external_include_rules)}|"
         f"corporate_action_reference={corporate_action_key}|"
+        f"corporate_action_coverage_contract=v{CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION}|"
+        f"corporate_action_avoidance_contract=v{CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION}|"
         f"feature_include={list(feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
         f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
