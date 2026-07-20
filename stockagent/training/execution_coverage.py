@@ -125,7 +125,8 @@ def _valid_split_indices(
     indices = np.sort(np.asarray(date_indices, dtype=np.int64))
     if indices.size == 0:
         return indices
-    # tw_day_trade commits the session-t order from features through t-1, so a
+    # tw_day_trade commits the session-t order from close-complete rows through
+    # t-1 (plus the opt-in open[t] gap stored on that final row), so a
     # lookback-L split first becomes valid at split_start + L.
     first_valid = int(indices[0]) + int(lookback)
     return indices[indices >= first_valid]

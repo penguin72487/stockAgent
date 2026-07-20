@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from stockagent.data.panel import (
+    DAY_TRADE_OPEN_GAP_FEATURE,
     PANEL_CACHE_VERSION,
     PanelData,
     _CorporateActionReference,
@@ -338,6 +339,31 @@ def test_day_trade_uses_only_t_minus_one_features_and_same_day_return() -> None:
     assert not second["day_trade_eligible_mask"].any()
     assert not second["can_buy_mask"].any()
     assert second["session_advance_mask"].item() is True
+
+
+def test_day_trade_window_exposes_current_open_gap_without_current_session_row() -> None:
+    panel = _make_panel()
+    # Row r stores the gap observed at open[r+1].  For target t=2, row 1 is
+    # therefore the one legal current-session input while all other channels
+    # remain close-complete rows 0 and 1.
+    gaps = np.arange(10.0, 16.0, dtype=np.float32)[:, None, None]
+    gaps = np.broadcast_to(gaps, (panel.num_dates, panel.num_symbols, 1)).copy()
+    panel.features = np.concatenate([panel.features, gaps], axis=2)
+    panel.feature_names.append(DAY_TRADE_OPEN_GAP_FEATURE)
+    panel.daily_volumes[2] = np.float32(999_999_999.0)
+    panel.intraday_returns[2] = np.asarray([7.0, -7.0], dtype=np.float32)
+
+    dataset = CrossSectionalDataset(
+        panel,
+        np.arange(panel.num_dates),
+        lookback=2,
+        execution_mode="tw_day_trade",
+    )
+    first = dataset[0]
+
+    torch.testing.assert_close(first["x"][:, 0, 0], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(first["x"][:, 0, 1], torch.tensor([10.0, 11.0]))
+    assert 12.0 not in first["x"][:, 0, 1].tolist()
 
 
 def test_day_trade_open_inputs_do_not_leak_close_label_or_full_day_volume() -> None:
