@@ -10,6 +10,17 @@ INVESTMENT_WARNING = (
     "投資警語：本訊號為量化模型依歷史與當前資料產生之研究/輔助資訊，"
     "不構成投資建議或收益保證；下單前請自行確認價格、流動性、交易成本與風險。"
 )
+MIN_DISPLAY_ABS_WEIGHT = 0.0001
+
+
+def is_display_position_row(row: dict[str, Any]) -> bool:
+    weight = _float_or_none(row.get("target_weight"))
+    if weight is None:
+        weight = _float_or_none(row.get("weight"))
+    delta = _float_or_none(row.get("delta_weight"))
+    if delta is None:
+        delta = _float_or_none(row.get("holding_ratio_delta"))
+    return max(abs(weight or 0.0), abs(delta or 0.0)) >= MIN_DISPLAY_ABS_WEIGHT
 
 
 def _fmt_pct(value: float | int | None, digits: int = 2) -> str:
@@ -126,7 +137,11 @@ def _period_title(summary: dict[str, Any]) -> str:
 def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug: bool = False) -> str:
     """Build a Discord-sized Traditional Chinese live signal message."""
     rebalance = list(summary.get("rebalance", []))[: max(0, int(max_rows))]
-    top_positions = list(summary.get("top_positions", []))[: max(0, int(max_rows))]
+    top_positions = [
+        row
+        for row in summary.get("top_positions", [])
+        if is_display_position_row(row)
+    ][: max(0, int(max_rows))]
     warnings = list(summary.get("risk_warnings", []))
     target_risk = summary.get("target_risk", {}) if isinstance(summary.get("target_risk"), dict) else {}
     recent = summary.get("recent_performance", {}) if isinstance(summary.get("recent_performance"), dict) else {}

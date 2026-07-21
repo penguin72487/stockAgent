@@ -34,12 +34,14 @@ pre_signal_command:
   - "2000-01-01"
   - --skip-raw
 pre_signal_timeout_seconds: 1800
+previous_signal_backfill_limit: 512
 
+model_selection_path: ../models/tw.yaml
+
+# Fallback used only if the model selection file is removed from this config.
 config_path: configs/markets/tw_public.yaml
 output_dir: artifacts/markets/tw_public_lantent
 live_output_dir: artifacts/live_signals/tw
-
-# Pin the full public-data latent model selected for Discord deployment.
 fold_id: 20
 checkpoint_path: artifacts/markets/tw_public_lantent/fold_20/checkpoint_best.pt
 weights_path: artifacts/markets/tw_public_lantent/fold_20/daily_weights.parquet
