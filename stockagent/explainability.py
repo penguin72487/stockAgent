@@ -12,6 +12,7 @@ import time
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -87,6 +88,7 @@ _PLOT_ASPECT_RATIO = 17.0 / 6.0
 _DEFAULT_PLOT_HEIGHT = 6.0
 _DEFAULT_PLOT_HEIGHT_PX = 600
 _DEFAULT_PLOT_WIDTH_PX = int(round(_DEFAULT_PLOT_HEIGHT_PX * _PLOT_ASPECT_RATIO))
+_EXPLAINABILITY_BARRIER_GROUP: Any | None = None
 
 
 def _figsize_17_6(height: float = _DEFAULT_PLOT_HEIGHT) -> tuple[float, float]:
@@ -682,6 +684,13 @@ def _distributed_world_size() -> int:
 def _distributed_barrier() -> None:
     if not _distributed_explainability_ready():
         return
+    if _EXPLAINABILITY_BARRIER_GROUP is not None:
+        # Fold explainability is independent per rank and may legitimately
+        # differ by hours.  Synchronize completion over the long-timeout CPU
+        # group instead of opening a late NCCL communicator that inherits the
+        # short default-store timeout.
+        torch.distributed.barrier(group=_EXPLAINABILITY_BARRIER_GROUP)
+        return
     if torch.distributed.get_backend() == "nccl":
         torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     else:
@@ -689,11 +698,14 @@ def _distributed_barrier() -> None:
 
 
 def _destroy_explainability_process_group() -> None:
+    global _EXPLAINABILITY_BARRIER_GROUP
     if _distributed_explainability_ready():
         torch.distributed.destroy_process_group()
+    _EXPLAINABILITY_BARRIER_GROUP = None
 
 
 def _initialize_explainability_process_group() -> bool:
+    global _EXPLAINABILITY_BARRIER_GROUP
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1 or _distributed_explainability_ready():
         return False
@@ -709,7 +721,26 @@ def _initialize_explainability_process_group() -> bool:
         backend = "nccl"
     else:
         backend = "gloo"
-    torch.distributed.init_process_group(backend=backend)
+    timeout_seconds = float(
+        os.environ.get("STOCKAGENT_EXPLAINABILITY_BARRIER_TIMEOUT_SECONDS", "86400")
+    )
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+        raise ValueError(
+            "STOCKAGENT_EXPLAINABILITY_BARRIER_TIMEOUT_SECONDS must be finite and > 0"
+        )
+    process_group_timeout = timedelta(seconds=timeout_seconds)
+    torch.distributed.init_process_group(
+        backend=backend,
+        timeout=process_group_timeout,
+    )
+    if backend == "nccl":
+        # Create this collectively before any rank starts its independent fold
+        # work.  An idle/empty rank can then wait without holding a CUDA
+        # collective or timing out after the default ten minutes.
+        _EXPLAINABILITY_BARRIER_GROUP = torch.distributed.new_group(
+            backend="gloo",
+            timeout=process_group_timeout,
+        )
     atexit.register(_destroy_explainability_process_group)
     return True
 
@@ -9007,7 +9038,9 @@ def _first_test_year_dataset(
     fold: WalkForwardFold,
     lookback: int,
     *,
+    allow_empty: bool = False,
     execution_mode: str = "naive",
+    lookback_context: str = "split_only",
     short_capacity_limit_enabled: bool = True,
     tw_corporate_action_mode: str = "avoid",
 ) -> CrossSectionalDataset:
@@ -9020,7 +9053,9 @@ def _first_test_year_dataset(
         panel,
         indices,
         lookback,
+        allow_empty=allow_empty,
         execution_mode=execution_mode,
+        lookback_context=lookback_context,
         short_capacity_limit_enabled=short_capacity_limit_enabled,
         tw_corporate_action_mode=tw_corporate_action_mode,
     )
@@ -9119,6 +9154,7 @@ def load_explanation_context(
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
     )
     fold, checkpoint_path = _select_fold_and_checkpoint(folds, resolved_output_dir, fold_id, checkpoint)
     panel = _align_panel_to_checkpoint_universe(panel, resolved_output_dir, fold.fold_id, checkpoint_path)
@@ -9186,6 +9222,11 @@ def run_loaded_model_explanation(
             getattr(config, "trading", None),
             "execution_mode",
             "naive",
+        ),
+        lookback_context=getattr(
+            getattr(config, "walk_forward", None),
+            "lookback_context",
+            "split_only",
         ),
         short_capacity_limit_enabled=bool(
             getattr(
@@ -9487,9 +9528,27 @@ def _estimated_first_test_year_explain_rows(
     *,
     lookback: int,
     max_rows: int,
+    execution_mode: str,
+    lookback_context: str,
+    short_capacity_limit_enabled: bool,
+    tw_corporate_action_mode: str,
 ) -> int:
-    indices = _first_year_indices(panel, fold.test_indices)
-    rows = max(0, int(len(indices)) - max(1, int(lookback)) + 1)
+    # Keep scheduling semantics identical to the actual explanation dataset.
+    # In particular, panel_history owns targets from the first test date while
+    # reading the causal lookback from earlier panel rows.  Subtracting the
+    # lookback from the test-year row count would incorrectly estimate every
+    # short first-year split as empty and assign all folds to rank 0.
+    dataset = _first_test_year_dataset(
+        panel,
+        fold,
+        lookback,
+        allow_empty=True,
+        execution_mode=execution_mode,
+        lookback_context=lookback_context,
+        short_capacity_limit_enabled=short_capacity_limit_enabled,
+        tw_corporate_action_mode=tw_corporate_action_mode,
+    )
+    rows = int(len(dataset))
     if int(max_rows) > 0:
         rows = min(rows, int(max_rows))
     return rows
@@ -9503,6 +9562,10 @@ def _balanced_fold_assignments(
     world_size: int,
     lookback: int,
     max_rows: int,
+    execution_mode: str,
+    lookback_context: str,
+    short_capacity_limit_enabled: bool,
+    tw_corporate_action_mode: str,
 ) -> tuple[list[list[int]], list[int]]:
     world_size = max(1, int(world_size))
     assignments: list[list[int]] = [[] for _ in range(world_size)]
@@ -9515,6 +9578,10 @@ def _balanced_fold_assignments(
                 panel,
                 lookback=lookback,
                 max_rows=max_rows,
+                execution_mode=execution_mode,
+                lookback_context=lookback_context,
+                short_capacity_limit_enabled=short_capacity_limit_enabled,
+                tw_corporate_action_mode=tw_corporate_action_mode,
             ),
         )
         for fold_id in fold_ids
@@ -9591,6 +9658,7 @@ def _run_explainability_for_config(
             min_train_years=config.walk_forward.min_train_years,
             val_years=config.walk_forward.val_years,
             require_future_test_year=config.walk_forward.require_future_test_year,
+            split_start_year=config.walk_forward.split_start_year,
         )
         fold_ids = _available_checkpoint_folds(folds, resolved_output_dir)
         if not fold_ids:
@@ -9611,6 +9679,14 @@ def _run_explainability_for_config(
             world_size=world_size,
             lookback=config.training.lookback,
             max_rows=int(settings.max_rows),
+            execution_mode=str(getattr(config.trading, "execution_mode", "naive")),
+            lookback_context=str(getattr(config.walk_forward, "lookback_context", "split_only")),
+            short_capacity_limit_enabled=bool(
+                getattr(config.trading, "tw_short_capacity_limit_enabled", True)
+            ),
+            tw_corporate_action_mode=str(
+                getattr(config.trading, "tw_corporate_action_mode", "avoid")
+            ),
         )
         local_fold_ids = assignments[rank]
         if rank == 0:

@@ -2000,6 +2000,7 @@ def audit_walk_forward_availability(
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
     )
     start_fold = config.runner.start_fold
     target_ids = (

@@ -7,7 +7,7 @@ import numpy as np
 
 from stockagent.backtest.tw_execution import normalize_execution_mode
 from stockagent.data.panel import PanelData
-from stockagent.data.walkforward import WalkForwardFold
+from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,14 +121,21 @@ def _valid_split_indices(
     date_indices: np.ndarray,
     *,
     lookback: int,
+    lookback_context: str = "split_only",
 ) -> np.ndarray:
     indices = np.sort(np.asarray(date_indices, dtype=np.int64))
     if indices.size == 0:
         return indices
     # tw_day_trade commits the session-t order from close-complete rows through
     # t-1 (plus the opt-in open[t] gap stored on that final row), so a
-    # lookback-L split first becomes valid at split_start + L.
-    first_valid = int(indices[0]) + int(lookback)
+    # lookback-L split first becomes valid at split_start + L unless the split
+    # explicitly borrows already-observed history from the global panel.
+    history_origin = (
+        0
+        if normalize_lookback_context(lookback_context) == "panel_history"
+        else int(indices[0])
+    )
+    first_valid = history_origin + int(lookback)
     return indices[indices >= first_valid]
 
 
@@ -139,6 +146,7 @@ def validate_training_execution_coverage(
     execution_mode: str,
     long_only: bool,
     lookback: int,
+    lookback_context: str = "split_only",
 ) -> DayTradeExecutionCoverage | None:
     """Reject folds whose objective is mathematically constant in model output."""
 
@@ -157,7 +165,11 @@ def validate_training_execution_coverage(
             ("train", fold.train_years, fold.train_indices),
             ("validation", fold.val_years, fold.val_indices),
         ):
-            indices = _valid_split_indices(raw_indices, lookback=lookback)
+            indices = _valid_split_indices(
+                raw_indices,
+                lookback=lookback,
+                lookback_context=lookback_context,
+            )
             eligible_cells = int(
                 coverage.eligible_cells_by_row[indices].sum()
             )

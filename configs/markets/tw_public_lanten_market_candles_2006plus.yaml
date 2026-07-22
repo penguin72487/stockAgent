@@ -1,0 +1,35 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+# Earliest conservative market-wide lookback256 experiment. Some individual
+# TPEx files begin in 2003, but the canonical market panel begins with TWSE and
+# benchmark coverage in 2004. Keeping 2004-2005 context-only makes the first
+# owned 2006 target use exactly the prior 256 exchange sessions without
+# projecting today's universe backward.
+experiment_name: tw-financial-transformer-candles-snapshot-safe98-gross-tw-cash-lookback256-panel-history-2006plus-v1-dual5090
+
+runner:
+  # The target-year contract differs from the active 2014+ experiment, so its
+  # optimizer/checkpoints must live in a separate artifact root.
+  output_dir: artifacts/markets/tw_public_candles_tw_cash_lookback256_panel_history_2006plus
+  resume: true
+  start_fold: 1
+
+data:
+  # Earliest canonical market-panel date. Rows before 2006 provide model context
+  # only and never contribute target returns or settlement state.
+  panel_start_date: "2004-02-11"
+
+walk_forward:
+  expected_first_year: 2004
+  split_start_year: 2006
+  lookback_context: panel_history
+
+training:
+  # Fold 3 exposed the worst-case ragged validation tail: the generic
+  # forward_from_panel fallback materializes Q/K RMS statistics in FP32.  A
+  # 32-row tail needed another 2.67 GiB with only 2.61 GiB free on a 32 GiB
+  # RTX 5090.  Keep training/model/loss semantics unchanged and halve only the
+  # evaluation working set.  Evaluation chunking is deliberately excluded from
+  # the schema-4 checkpoint contract, so completed folds remain resume-safe.
+  eval_model_chunk_rows: 16
+  eval_auto_chunk_rows_cap: 16

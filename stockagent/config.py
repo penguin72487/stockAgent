@@ -14,6 +14,7 @@ from stockagent.backtest.tw_execution import (
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
 )
+from stockagent.data.walkforward import normalize_lookback_context
 from stockagent.portfolio_contract import (
     DEFAULT_PORTFOLIO_ACTIVATION,
     normalize_portfolio_activation,
@@ -329,6 +330,14 @@ class WalkForwardConfig:
     require_future_test_year: bool = True
     expected_first_year: int | None = None
     require_contiguous_years: bool = False
+    # ``split_only`` requires every feature window to begin inside its owned
+    # train/validation/test split. ``panel_history`` keeps target ownership
+    # unchanged while allowing the window to read older, already-observed panel
+    # rows. This is the causal long-lookback mode.
+    lookback_context: str = "split_only"
+    # Optional first year that owns train/validation/test targets. Older panel
+    # years remain available only as lookback context when requested above.
+    split_start_year: int | None = None
 
 
 @dataclass(slots=True)
@@ -998,6 +1007,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
 
     walk_forward = raw.setdefault("walk_forward", {})
     _set_dataclass_defaults(walk_forward, WalkForwardConfig)
+    walk_forward["lookback_context"] = normalize_lookback_context(
+        walk_forward["lookback_context"]
+    )
+    if walk_forward["split_start_year"] is not None:
+        walk_forward["split_start_year"] = int(walk_forward["split_start_year"])
 
     environment = raw.setdefault("environment", {})
     _set_dataclass_defaults(environment, EnvironmentConfig)
@@ -1509,6 +1523,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 "walk_forward.expected_first_year must match the year of "
                 "data.panel_start_date; got "
                 f"{expected_first_year!r} and {data['panel_start_date']!r}"
+            )
+        split_start_year = walk_forward.get("split_start_year")
+        if (
+            split_start_year is not None
+            and int(split_start_year) < parsed_panel_start_date.year
+        ):
+            raise ValueError(
+                "walk_forward.split_start_year cannot precede the panel start year; "
+                f"got {split_start_year!r} and {data['panel_start_date']!r}"
             )
     data["use_tw_public_features"] = bool(data["use_tw_public_features"])
     data["use_tw_public_rules"] = bool(data["use_tw_public_rules"])

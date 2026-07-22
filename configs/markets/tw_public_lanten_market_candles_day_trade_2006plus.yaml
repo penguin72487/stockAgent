@@ -1,0 +1,38 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+# Causal open-aware day-trade experiment with a 256-session lookback. Verified
+# point-in-time day-trade eligibility begins on 2014-01-06, so 2012-2013 may be
+# feature context but can never own train/validation/test targets.
+experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gross-tw-day-trade-lookback256-panel-history-2014plus-v1-dual5090
+
+runner:
+  # The extra open-gap feature and lookback256 sample contract require a fresh
+  # root distinct from both the completed tw_cash run and lookback128 day trade.
+  output_dir: artifacts/markets/tw_public_candles_snapshot_safe99_open_aware_gross_tw_day_trade_lookback256_panel_history_2014plus
+  resume: true
+  start_fold: 1
+
+data:
+  # Stored on the final t-1 model row, this adds only
+  # log(open[t] / close[t-1]); it does not expose session-t high/low/close/volume.
+  day_trade_open_feature: true
+  # Two calendar years provide at least 256 prior exchange sessions for the
+  # first owned 2014 target without projecting eligibility backward.
+  panel_start_date: "2012-01-01"
+
+walk_forward:
+  expected_first_year: 2012
+  split_start_year: 2014
+  lookback_context: panel_history
+
+trading:
+  execution_mode: tw_day_trade
+
+training:
+  # A ragged validation tail can use the generic forward_from_panel fallback,
+  # which materializes Q/K RMS statistics in FP32.  A
+  # 32-row tail needed another 2.67 GiB with only 2.61 GiB free on a 32 GiB
+  # RTX 5090.  Keep training/model/loss semantics unchanged and halve only the
+  # evaluation working set.
+  eval_model_chunk_rows: 16
+  eval_auto_chunk_rows_cap: 16

@@ -54,6 +54,7 @@ def _build_panel_and_folds(config: Any):
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
     )
     return panel, folds
 
@@ -420,6 +421,7 @@ def main() -> None:
             folds_by_id[fold_id],
             config.training.lookback,
             execution_mode=getattr(config.trading, "execution_mode", "naive"),
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=bool(
                 getattr(config.trading, "tw_short_capacity_limit_enabled", True)
             ),

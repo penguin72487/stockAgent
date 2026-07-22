@@ -251,6 +251,18 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         ("trading", lambda cfg: setattr(cfg.trading, "sell_fee_rate", 0.0123)),
         ("walk_forward", lambda cfg: setattr(cfg.walk_forward, "val_years", 2)),
         (
+            "walk_forward",
+            lambda cfg: setattr(
+                cfg.walk_forward,
+                "lookback_context",
+                "panel_history",
+            ),
+        ),
+        (
+            "walk_forward",
+            lambda cfg: setattr(cfg.walk_forward, "split_start_year", 2020),
+        ),
+        (
             "model",
             lambda cfg: setattr(
                 cfg.training.transformer_base_portfolio,
@@ -1137,6 +1149,55 @@ def test_schema_v1_checkpoint_fingerprints_remain_loadable(tmp_path: Path) -> No
         checkpoint_path=tmp_path / "legacy_checkpoint.pt",
         scope="resume",
     )
+
+
+def test_schema_v4_before_lookback_context_remains_compatible_at_defaults(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    config = _config()
+    assert config.walk_forward.lookback_context == "split_only"
+    assert config.walk_forward.split_start_year is None
+    current = _checkpoint_manifest(panel, config)
+    historical = copy.deepcopy(current)
+    historical["schema_version"] = 4
+    historical["contracts"]["walk_forward"].pop("lookback_context")
+    historical["contracts"]["walk_forward"].pop("split_start_year")
+    historical["fingerprints"]["walk_forward"] = trainer_module._stable_fingerprint(
+        historical["contracts"]["walk_forward"]
+    )
+
+    _validate_checkpoint_manifest(
+        {"experiment_manifest": historical},
+        current,
+        checkpoint_path=tmp_path / "schema_v4_pre_lookback_context.pt",
+        scope="resume",
+    )
+
+
+def test_schema_v4_before_lookback_context_cannot_resume_panel_history(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    config = _config()
+    config.walk_forward.lookback_context = "panel_history"
+    config.walk_forward.split_start_year = 2020
+    current = _checkpoint_manifest(panel, config)
+    historical = copy.deepcopy(current)
+    historical["schema_version"] = 4
+    historical["contracts"]["walk_forward"].pop("lookback_context")
+    historical["contracts"]["walk_forward"].pop("split_start_year")
+    historical["fingerprints"]["walk_forward"] = trainer_module._stable_fingerprint(
+        historical["contracts"]["walk_forward"]
+    )
+
+    with pytest.raises(RuntimeError, match="walk_forward"):
+        _validate_checkpoint_manifest(
+            {"experiment_manifest": historical},
+            current,
+            checkpoint_path=tmp_path / "schema_v4_pre_lookback_context.pt",
+            scope="resume",
+        )
 
 
 def test_schema_v1_removed_scheduler_interval_spellings_remain_loadable(tmp_path: Path) -> None:

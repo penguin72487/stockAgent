@@ -313,8 +313,6 @@ run_fintech_python -m torch.distributed.run \
   --nproc-per-node=2 \
   scripts/screen_explainability_features.py \
   --config configs/markets/tw_public_lanten_market_candles.yaml \
-  --output-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds \
-  --screening-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds/feature_screening_first_test_year \
   --device cuda \
   --cpu-threads 16 \
   --row-chunk-size 16 \
@@ -341,8 +339,7 @@ run_fintech_python -m torch.distributed.run \
   --nnodes=1 \
   --nproc-per-node=2 \
   explain_model.py \
-  --config configs/markets/tw_public_lanten_market_candles.yaml \
-  --output-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds \
+  --config configs/markets/tw_public_lanten_market_candles_day_trade_2006plus.yaml/
   --device cuda \
   --cpu-threads 16 \
   --max-rows 0 \
