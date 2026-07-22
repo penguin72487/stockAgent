@@ -1,0 +1,5 @@
+// Node identity and local work files must never cross machines.
+(?d).local-state
+
+// Atomic writer temporaries are not protocol objects.
+(?d)(?i)*.tmp
