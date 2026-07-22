@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import replace
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -50,12 +51,27 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 from downloader.status import command_asset, command_option, first_download_failure
 from stockagent.live.market_config import LiveMarketConfig, load_market_configs
 from stockagent.live.market_status import MarketRuntimeStatus, runtime_status
+from stockagent.live.model_deployment import (
+    ModelDeployment,
+    attempt_model_deployment,
+    load_deployment,
+)
 from stockagent.config import load_config
 from stockagent.live.capital import positive_float_or_none
 from stockagent.live.quote_provider import load_symbol_name_map
 from stockagent.live.portfolio_history import PortfolioHistoryResult, load_portfolio_history
-from stockagent.live.report_formatter import INVESTMENT_WARNING, format_signal_message
-from stockagent.live.signal_engine import LiveSignalResult, generate_live_signal, write_live_weights_history
+from stockagent.live.report_formatter import (
+    INVESTMENT_WARNING,
+    MIN_DISPLAY_ABS_WEIGHT,
+    format_signal_message,
+    is_display_position_row,
+)
+from stockagent.live.signal_engine import (
+    LiveSignalResult,
+    clear_live_panel_memory_cache,
+    generate_live_signal,
+    write_live_weights_history,
+)
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
 
@@ -65,6 +81,7 @@ STATE_PATH = ROOT / "artifacts" / "discord_bot" / "state.json"
 ERROR_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "errors.log"
 AUDIT_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "audit_events.jsonl"
 PYTHON_EXECUTABLE_SENTINEL = "{python}"
+_MODEL_INFERENCE_LOCK = threading.Lock()
 
 
 class BotUserError(RuntimeError):
@@ -546,7 +563,35 @@ def _latest_checkpoint(output_dir: str | None) -> Path | None:
     return sorted(candidates, key=lambda item: item[0])[-1][1]
 
 
+def _effective_market_config(cfg: LiveMarketConfig) -> LiveMarketConfig:
+    effective = cfg
+    if getattr(cfg, "model_auto_deploy", False):
+        manifest_path = getattr(cfg, "model_deployment_manifest", None)
+        deployment = load_deployment(manifest_path, root=ROOT) if manifest_path else None
+        if deployment is not None:
+            effective = replace(
+                cfg,
+                config_path=deployment.config_path,
+                output_dir=deployment.output_dir,
+                fold_id=deployment.fold_id,
+                checkpoint_path=deployment.checkpoint_path,
+                weights_path=deployment.weights_path,
+            )
+    if not getattr(effective, "model_scoped_live_output", False):
+        return effective
+    output_dir = Path(str(effective.output_dir or "")).name
+    fold_id = effective.fold_id
+    if not output_dir or fold_id is None:
+        return effective
+    scope = Path(output_dir) / f"fold_{int(fold_id):02d}"
+    base = Path(effective.live_output_dir or f"artifacts/live_signals/{effective.market}")
+    if tuple(base.parts[-len(scope.parts) :]) != scope.parts:
+        base /= scope
+    return replace(effective, live_output_dir=str(base))
+
+
 def _market_model_checkpoint(cfg: LiveMarketConfig) -> Path | None:
+    cfg = _effective_market_config(cfg)
     explicit = _resolve_repo_path(getattr(cfg, "checkpoint_path", None))
     if explicit is not None:
         return explicit if explicit.exists() else None
@@ -581,7 +626,8 @@ def _unsupported_message(cfg: LiveMarketConfig) -> str:
 
 
 def _runtime_status(cfg: LiveMarketConfig) -> MarketRuntimeStatus:
-    return runtime_status(cfg, root=ROOT, enabled_override=_market_enabled(cfg))
+    effective = _effective_market_config(cfg)
+    return runtime_status(effective, root=ROOT, enabled_override=_market_enabled(cfg))
 
 
 _RUNTIME_STATUS_CACHE: dict[str, tuple[float, MarketRuntimeStatus]] = {}
@@ -836,6 +882,7 @@ def _run_pre_signal_command(cfg: LiveMarketConfig) -> None:
             f"{detail} log=`{_display_path(log_path)}`"
         )
     _validate_pre_signal_download_artifacts(cfg, command, log_path)
+    clear_live_panel_memory_cache()
 
 
 def _pre_signal_failure_detail(cfg: LiveMarketConfig, command: list[str], stdout_tail: str) -> str:
@@ -989,9 +1036,14 @@ def _signal_kwargs(
     progress_callback: Any | None = None,
     progress_label: str | None = None,
 ) -> dict:
-    cfg = _resolve_market(market)
+    cfg = _effective_market_config(_resolve_market(market))
     status = _ensure_signal_ready(cfg, scheduled=scheduled)
-    backfill_limit = max(0, _env_int("STOCKAGENT_SIGNAL_BACKFILL_LIMIT", 32) or 32)
+    configured_backfill = max(0, int(getattr(cfg, "previous_signal_backfill_limit", 32)))
+    backfill_limit = max(
+        0,
+        _env_int("STOCKAGENT_SIGNAL_BACKFILL_LIMIT", configured_backfill)
+        or configured_backfill,
+    )
     overrides = {
         "price_source": price_source if price_source and price_source != "auto" else None,
         "top_n": top_n,
@@ -1036,6 +1088,7 @@ class StockAgentBot(discord.Client):
         self._scheduled_retry_after: dict[str, float] = {}
         self._daily_summary_retry_after: dict[str, float] = {}
         self._artifact_backfill_retry_after: dict[str, float] = {}
+        self._model_deployment_last_check: dict[str, float] = {}
         self._signal_now_background_tasks: dict[str, asyncio.Task[None]] = {}
         self._signal_now_background_waiters: dict[str, set[int]] = {}
         self._synced_guild_id: int | None = None
@@ -1045,6 +1098,7 @@ class StockAgentBot(discord.Client):
         scheduled_signal.start()
         daily_summary.start()
         artifact_backfill.start()
+        model_auto_deployment.start()
 
     async def on_ready(self) -> None:
         print(f"logged in as {self.user} signal_time={self.signal_time} channel_id={self.channel_id}", flush=True)
@@ -1096,7 +1150,8 @@ def _run_market_signal_sync(**kwargs):
         label = str(kwargs.get("progress_label") or f"discord:{market}").strip()
         kwargs["progress_callback"] = _ConsoleProgress(prefix=label)
         kwargs["progress_label"] = label
-    return generate_live_signal(**_signal_kwargs(**kwargs))
+    with _MODEL_INFERENCE_LOCK:
+        return generate_live_signal(**_signal_kwargs(**kwargs))
 
 
 async def _run_market_signal(**kwargs):
@@ -1938,9 +1993,9 @@ def _active_position_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         row
         for row in sorted_rows
-        if _row_abs(row, "current_weight") > 1e-9
-        or _row_abs(row, "target_weight") > 1e-9
-        or _row_abs(row, "delta_weight") > 1e-9
+        if _row_abs(row, "current_weight") >= MIN_DISPLAY_ABS_WEIGHT
+        or _row_abs(row, "target_weight") >= MIN_DISPLAY_ABS_WEIGHT
+        or _row_abs(row, "delta_weight") >= MIN_DISPLAY_ABS_WEIGHT
     ]
 
 
@@ -2109,6 +2164,7 @@ def _find_signal_summary(signal_id: str) -> tuple[Path, dict[str, Any]] | None:
         return None
     roots: list[Path] = []
     for cfg in _market_configs().values():
+        cfg = _effective_market_config(cfg)
         if cfg.live_output_dir:
             roots.append(_resolve_repo_path(cfg.live_output_dir) or Path(cfg.live_output_dir))
     roots.append(ROOT / "artifacts" / "live_signals")
@@ -2141,6 +2197,7 @@ def _summary_signal_id_fast(path: Path) -> str | None:
 
 
 def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] | None:
+    cfg = _effective_market_config(cfg)
     root = _resolve_repo_path(cfg.live_output_dir)
     if root is None or not root.exists():
         return None
@@ -2274,6 +2331,7 @@ def _summary_matches_market_deployment(
     status: MarketRuntimeStatus,
     summary: dict[str, Any],
 ) -> tuple[bool, str | None]:
+    cfg = _effective_market_config(cfg)
     expected_fold = getattr(cfg, "fold_id", None)
     if expected_fold is not None:
         try:
@@ -2344,6 +2402,7 @@ def _signal_now_should_refresh_data(status: MarketRuntimeStatus, *, refresh_data
 
 
 def _market_signals(cfg: LiveMarketConfig) -> list[tuple[Path, dict[str, Any]]]:
+    cfg = _effective_market_config(cfg)
     root = _resolve_repo_path(cfg.live_output_dir)
     if root is None or not root.exists():
         return []
@@ -2359,6 +2418,7 @@ def _market_signals(cfg: LiveMarketConfig) -> list[tuple[Path, dict[str, Any]]]:
 
 
 def _recent_market_signals(cfg: LiveMarketConfig, *, max_summaries: int) -> list[tuple[Path, dict[str, Any]]]:
+    cfg = _effective_market_config(cfg)
     root = _resolve_repo_path(cfg.live_output_dir)
     if root is None or not root.exists():
         return []
@@ -2413,6 +2473,7 @@ def _read_summary_metric_fields(path: Path) -> dict[str, Any]:
 
 
 def _recent_market_signal_metrics(cfg: LiveMarketConfig, *, max_summaries: int) -> list[tuple[Path, dict[str, Any]]]:
+    cfg = _effective_market_config(cfg)
     root = _resolve_repo_path(cfg.live_output_dir)
     if root is None or not root.exists():
         return []
@@ -2470,6 +2531,7 @@ def _market_has_live_signal_for_date(cfg: LiveMarketConfig, date_text: str | Non
 
 
 def _run_artifact_backfill_sync(cfg: LiveMarketConfig) -> LiveSignalResult | None:
+    cfg = _effective_market_config(cfg)
     status = _ensure_signal_ready(cfg)
     resolved_price_source = _auto_signal_price_source(cfg, status, "auto")
     if resolved_price_source:
@@ -2768,6 +2830,11 @@ def _risk_message(
     issues = _signal_sanity_issues(cfg, summary)
     rows = _latest_artifact_rows(summary, summary_path, "weights_path", "top_positions")
     rows = sorted(rows, key=lambda row: abs(_row_weight_value(row, "target_weight", "weight")), reverse=True)
+    rows = [
+        row
+        for row in rows
+        if is_display_position_row(row)
+    ]
     gross_limit, turnover_limit = _config_trading_limits(cfg)
     lines = [
         f"**risk** {cfg.label}",
@@ -4040,12 +4107,17 @@ def _daily_summary_message(cfg: LiveMarketConfig, *, debug: bool = False) -> str
         if warnings:
             lines.append("risk warning: " + " | ".join(str(item) for item in warnings[:3]))
         top = summary.get("top_positions") if isinstance(summary.get("top_positions"), list) else []
+        top = [
+            row
+            for row in top
+            if isinstance(row, dict)
+            and is_display_position_row(row)
+        ]
         if top:
             lines.append("top positions:")
             lines.extend(
                 f"  {index}. {_symbol_label(row)} `{_pct(row.get('weight'))}`"
                 for index, row in enumerate(top[:5], start=1)
-                if isinstance(row, dict)
             )
     _append_investment_warning(lines)
     return "\n".join(lines)
@@ -4611,9 +4683,7 @@ async def positions(
         rows = [
             row
             for row in rows
-            if _row_abs(row, "target_weight") > 1e-9
-            or _row_abs(row, "current_weight") > 1e-9
-            or _row_abs(row, "delta_weight") > 1e-9
+            if is_display_position_row(row)
         ]
     rows = _limit_rows(rows, limit)
     capital = _resolve_current_capital(cfg, current_capital=current_capital)
@@ -5063,6 +5133,82 @@ async def daily_summary_command(interaction: discord.Interaction, market: str = 
     await _send_long_response(interaction, message)
 
 
+def _auto_deploy_smoke_test(
+    cfg: LiveMarketConfig,
+    deployment: ModelDeployment,
+) -> dict[str, Any]:
+    candidate_cfg = replace(
+        cfg,
+        config_path=deployment.config_path,
+        output_dir=deployment.output_dir,
+        fold_id=deployment.fold_id,
+        checkpoint_path=deployment.checkpoint_path,
+        weights_path=deployment.weights_path,
+    )
+    with _MODEL_INFERENCE_LOCK:
+        result = generate_live_signal(
+            **candidate_cfg.signal_kwargs(
+                write=False,
+                ensure_previous_signal=False,
+                top_n=max(MIN_DISCORD_ROWS, min(int(candidate_cfg.top_n), 20)),
+                progress_callback=_ConsoleProgress(prefix=f"model-fit:{cfg.market}"),
+                progress_label=f"model-fit:{cfg.market}",
+            )
+        )
+    if int(result.summary.get("fold_id", -1)) != deployment.fold_id:
+        raise RuntimeError("smoke signal resolved a different fold")
+    if Path(str(result.summary.get("checkpoint_path"))).resolve() != Path(
+        deployment.checkpoint_path
+    ).resolve():
+        raise RuntimeError("smoke signal resolved a different checkpoint")
+    return result.summary
+
+
+def _run_model_auto_deploy_sync(cfg: LiveMarketConfig) -> tuple[str, ModelDeployment | None]:
+    if not cfg.model_deployment_manifest:
+        raise ValueError(f"{cfg.market} model auto-deploy requires model_deployment_manifest")
+    return attempt_model_deployment(
+        market=cfg.market,
+        candidate_roots=cfg.model_candidate_output_dirs,
+        candidate_configs=cfg.model_candidate_config_paths,
+        manifest_path=cfg.model_deployment_manifest,
+        root=ROOT,
+        smoke_test=lambda deployment: _auto_deploy_smoke_test(cfg, deployment),
+    )
+
+
+@tasks.loop(seconds=10)
+async def model_auto_deployment() -> None:
+    now = time.monotonic()
+    for cfg in _market_configs().values():
+        if not cfg.model_auto_deploy or not _market_enabled(cfg):
+            continue
+        interval = max(10, int(cfg.model_auto_deploy_interval_seconds))
+        last_check = bot._model_deployment_last_check.get(cfg.market, 0.0)
+        if now - last_check < interval:
+            continue
+        bot._model_deployment_last_check[cfg.market] = now
+        try:
+            status, deployment = await asyncio.to_thread(_run_model_auto_deploy_sync, cfg)
+            if status == "promoted" and deployment is not None:
+                _clear_runtime_status_cache()
+                print(
+                    f"[model-deploy] market={cfg.market} status=promoted "
+                    f"root={deployment.output_dir} fold={deployment.fold_id} "
+                    f"checkpoint={deployment.checkpoint_path}",
+                    flush=True,
+                )
+            elif status not in {"already_active", "known_failed"}:
+                print(f"[model-deploy] market={cfg.market} status={status}", flush=True)
+        except Exception as exc:
+            _log_exception(f"model_auto_deploy:{cfg.market}", exc)
+            print(
+                f"[model-deploy] market={cfg.market} status=failed "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+
 @tasks.loop(seconds=10)
 async def scheduled_signal() -> None:
     channel = None
@@ -5207,6 +5353,11 @@ async def before_daily_summary() -> None:
 
 @artifact_backfill.before_loop
 async def before_artifact_backfill() -> None:
+    await bot.wait_until_ready()
+
+
+@model_auto_deployment.before_loop
+async def before_model_auto_deployment() -> None:
     await bot.wait_until_ready()
 
 

@@ -14,16 +14,69 @@ from stockagent.live.signal_engine import (
     _daily_bar_timestamp,
     _daily_price_timestamp,
     _date_string,
+    _decision_weights_timestamp,
     _live_weights_has_date,
     _load_previous_weights,
     _previous_usable_panel_date,
     _require_supported_live_execution,
     _resolve_usable_panel_index,
+    _top_position_rows_from_weights,
     _weights_history_has_date,
     write_live_weights_history,
 )
 from stockagent.live.portfolio_history import load_portfolio_history
 from stockagent.live.stock_history import load_stock_history
+
+
+def test_realtime_daily_decision_uses_quote_time_for_weights_history() -> None:
+    assert _decision_weights_timestamp(
+        panel_data_date="2026-07-16",
+        resolved_asof="2026-07-17 11:05:24",
+        uses_realtime_daily_prices=True,
+    ) == "2026-07-17 11:05:24"
+    assert _decision_weights_timestamp(
+        panel_data_date="2026-07-16",
+        resolved_asof="2026-07-17 11:05:24",
+        uses_realtime_daily_prices=False,
+    ) == "2026-07-16"
+
+
+def test_top_positions_hide_weights_below_one_basis_point() -> None:
+    rows = [
+        {"symbol": "VISIBLE", "target_weight": 0.0001},
+        {"symbol": "TINY", "target_weight": -0.000099},
+        {"symbol": "CHANGED", "target_weight": 0.0, "delta_weight": -0.0002},
+        {"symbol": "ZERO", "target_weight": 0.0},
+    ]
+
+    result = _top_position_rows_from_weights(rows, top_n=10)
+
+    assert [row["symbol"] for row in result] == ["VISIBLE", "CHANGED"]
+    assert _top_position_rows_from_weights(rows, top_n=0) == []
+
+
+def test_signal_message_hides_weights_below_one_basis_point() -> None:
+    summary = {
+        "asof_date": "2026-07-17",
+        "panel_date": "2026-07-16",
+        "top_positions": [
+            {"symbol": "VISIBLE", "weight": 0.0001, "current_price": 10.0},
+            {"symbol": "TINY", "weight": 0.000099, "current_price": 20.0},
+            {
+                "symbol": "CHANGED",
+                "weight": 0.0,
+                "delta_weight": 0.0002,
+                "current_price": 30.0,
+            },
+        ],
+    }
+
+    message = format_signal_message(summary, max_rows=10)
+
+    assert "VISIBLE" in message
+    assert "weight=0.01%" in message
+    assert "TINY" not in message
+    assert "CHANGED" in message
 
 
 def test_live_signal_real_execution_modes_fail_closed_without_broker_ledger() -> None:
