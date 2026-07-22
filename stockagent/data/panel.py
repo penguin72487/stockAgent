@@ -98,6 +98,15 @@ LOG_RETURN_FEATURE_COLUMNS = [
     "lower_shadow",
     "shadow_imbalance",
 ]
+DAY_TRADE_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
+# Execution-context features have a later availability timestamp than ordinary
+# end-of-session features.  They are materialized only when named explicitly
+# in feature_include; an empty include or wildcard must not silently expose a
+# next-session value to a non-day-trade model.
+BASE_PANEL_FEATURE_COLUMNS = [
+    *LOG_RETURN_FEATURE_COLUMNS,
+    DAY_TRADE_OPEN_GAP_FEATURE,
+]
 # Version 45 adds point-in-time TW margin-short eligibility/capacity arrays.
 # Version 44 carries raw-close valuation through ordinary symbol halts while
 # resetting the basis at lifecycle/corporate-action boundaries.  Version 43
@@ -1514,6 +1523,11 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
             ),
             return_1d.alias("return_1d"),
             _polars_price_log_return(pl.col("open"), pl.col("open").shift(1), max_abs_price_log_return).alias("open_logret_1d"),
+            _polars_price_log_return(
+                pl.col("open").shift(-1),
+                pl.col("close"),
+                max_abs_price_log_return,
+            ).alias(DAY_TRADE_OPEN_GAP_FEATURE),
             _polars_price_log_return(pl.col("max"), pl.col("max").shift(1), max_abs_price_log_return).alias("max_logret_1d"),
             _polars_price_log_return(pl.col("min"), pl.col("min").shift(1), max_abs_price_log_return).alias("min_logret_1d"),
             _polars_price_log_return(pl.col("close"), pl.col("close").shift(1), max_abs_price_log_return).alias("close_logret_1d"),
@@ -1530,7 +1544,7 @@ def _prepare_symbol_frame(frame: Any, path: Path) -> Any:
             (pl.col("intraday_return_co").sign() * pl.col("trading_volume_logret_1d")).alias("signed_vol"),
         ]
     )
-    for col in LOG_RETURN_FEATURE_COLUMNS:
+    for col in BASE_PANEL_FEATURE_COLUMNS:
         if col not in frame.columns:
             frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias(col))
     return frame
@@ -1955,7 +1969,7 @@ def _symbol_arrays_from_arrow_table(
         return _SymbolPanelArrays(
             symbol=_symbol_name_from_path(path),
             dates=np.empty((0,), dtype="datetime64[ns]"),
-            features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
+            features=np.empty((0, len(BASE_PANEL_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
             open_prices=empty_1d,
@@ -2014,6 +2028,13 @@ def _symbol_arrays_from_arrow_table(
     return_price = adjclose if "adjclose" in table.column_names else close_px
     return_1d = _safe_log_ratio_array(_shift_array(return_price, -1), return_price)
     open_logret_1d = _safe_log_ratio_array(open_px, _shift_array(open_px, 1))
+    # Stored on row t for the decision submitted at open[t+1].  Consequently a
+    # normal Taiwan execution window ending at t sees exactly the next open and
+    # still cannot see any high/low/close/volume value from session t+1.
+    next_session_open_gap_logret = _safe_log_ratio_array(
+        _shift_array(open_px, -1),
+        close_px,
+    )
     max_logret_1d = _safe_log_ratio_array(high_px, _shift_array(high_px, 1))
     min_logret_1d = _safe_log_ratio_array(low_px, _shift_array(low_px, 1))
     close_logret_1d = _safe_log_ratio_array(close_px, _shift_array(close_px, 1))
@@ -2022,6 +2043,10 @@ def _symbol_arrays_from_arrow_table(
         return_quarantined = col("return_quarantined")
         return_1d[np.isfinite(return_quarantined) & (return_quarantined != 0.0)] = np.nan
     open_logret_1d = _sanitize_price_log_return_array(open_logret_1d, max_abs_price_log_return)
+    next_session_open_gap_logret = _sanitize_price_log_return_array(
+        next_session_open_gap_logret,
+        max_abs_price_log_return,
+    )
     max_logret_1d = _sanitize_price_log_return_array(max_logret_1d, max_abs_price_log_return)
     min_logret_1d = _sanitize_price_log_return_array(min_logret_1d, max_abs_price_log_return)
     close_logret_1d = _sanitize_price_log_return_array(close_logret_1d, max_abs_price_log_return)
@@ -2035,6 +2060,7 @@ def _symbol_arrays_from_arrow_table(
 
     feature_map = {
         "open_logret_1d": open_logret_1d,
+        DAY_TRADE_OPEN_GAP_FEATURE: next_session_open_gap_logret,
         "max_logret_1d": max_logret_1d,
         "min_logret_1d": min_logret_1d,
         "close_logret_1d": close_logret_1d,
@@ -2050,7 +2076,9 @@ def _symbol_arrays_from_arrow_table(
         "lower_shadow": lower_shadow,
         "shadow_imbalance": shadow_imbalance,
     }
-    features = np.column_stack([feature_map[name] for name in LOG_RETURN_FEATURE_COLUMNS]).astype(np.float32, copy=False)
+    features = np.column_stack(
+        [feature_map[name] for name in BASE_PANEL_FEATURE_COLUMNS]
+    ).astype(np.float32, copy=False)
 
     close_notna = ~np.isnan(close_px)
     if "Trading_Volume" in table.column_names:
@@ -2204,6 +2232,11 @@ def _load_symbol_arrays_polars_lazy(
             ),
             return_1d.alias("return_1d"),
             _polars_price_log_return(pl.col("_open"), pl.col("_open").shift(1), max_abs_price_log_return).alias("open_logret_1d"),
+            _polars_price_log_return(
+                pl.col("_open").shift(-1),
+                pl.col("_close"),
+                max_abs_price_log_return,
+            ).alias(DAY_TRADE_OPEN_GAP_FEATURE),
             _polars_price_log_return(pl.col("_max"), pl.col("_max").shift(1), max_abs_price_log_return).alias("max_logret_1d"),
             _polars_price_log_return(pl.col("_min"), pl.col("_min").shift(1), max_abs_price_log_return).alias("min_logret_1d"),
             _polars_price_log_return(pl.col("_close"), pl.col("_close").shift(1), max_abs_price_log_return).alias("close_logret_1d"),
@@ -2228,7 +2261,7 @@ def _load_symbol_arrays_polars_lazy(
         pl.col("return_1d"),
         pl.col("intraday_return_co"),
         pl.col("tradable"),
-        *[pl.col(name) for name in LOG_RETURN_FEATURE_COLUMNS],
+        *[pl.col(name) for name in BASE_PANEL_FEATURE_COLUMNS],
     ]
     if eligibility_column is not None:
         selected_columns.append(
@@ -2248,7 +2281,7 @@ def _load_symbol_arrays_polars_lazy(
         return _SymbolPanelArrays(
             symbol=_symbol_name_from_path(path),
             dates=np.empty((0,), dtype="datetime64[ns]"),
-            features=np.empty((0, len(LOG_RETURN_FEATURE_COLUMNS)), dtype=np.float32),
+            features=np.empty((0, len(BASE_PANEL_FEATURE_COLUMNS)), dtype=np.float32),
             returns_1d=empty_1d,
             close_prices=empty_1d,
             open_prices=empty_1d,
@@ -2282,7 +2315,10 @@ def _load_symbol_arrays_polars_lazy(
     )
     tradable = out["tradable"].to_numpy().astype(bool, copy=False)
     features = np.column_stack(
-        [out[name].to_numpy().astype(np.float64, copy=False) for name in LOG_RETURN_FEATURE_COLUMNS]
+        [
+            out[name].to_numpy().astype(np.float64, copy=False)
+            for name in BASE_PANEL_FEATURE_COLUMNS
+        ]
     ).astype(np.float32, copy=False)
     close_notna = ~np.isnan(close_px)
 
@@ -2395,8 +2431,18 @@ def _build_panel_from_symbol_arrays(
     num_dates = int(all_dates.size)
     num_symbols = len(symbol_arrays)
     session_dates = all_dates
-    all_base_feature_names = list(LOG_RETURN_FEATURE_COLUMNS)
+    all_base_feature_names = list(BASE_PANEL_FEATURE_COLUMNS)
     all_external_feature_names = list(external_features.feature_names) if external_features is not None else []
+    # The next-session open is legal only when the caller deliberately opts in
+    # by exact name.  In particular, an empty include and broad wildcards retain
+    # the historical close-complete schema rather than silently acquiring a
+    # later-availability execution feature.
+    effective_feature_exclude = tuple(feature_exclude)
+    if DAY_TRADE_OPEN_GAP_FEATURE not in feature_include:
+        effective_feature_exclude = (
+            *effective_feature_exclude,
+            DAY_TRADE_OPEN_GAP_FEATURE,
+        )
     (
         base_feature_indices,
         base_dest_indices,
@@ -2407,7 +2453,7 @@ def _build_panel_from_symbol_arrays(
         all_base_feature_names,
         all_external_feature_names,
         feature_include=feature_include,
-        feature_exclude=feature_exclude,
+        feature_exclude=effective_feature_exclude,
     )
     num_base_features = len(base_feature_indices)
     num_external_features = len(external_feature_indices)
@@ -3265,6 +3311,20 @@ def load_cached_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    include_day_trade_open_gap = (
+        DAY_TRADE_OPEN_GAP_FEATURE in feature_include_patterns
+        and DAY_TRADE_OPEN_GAP_FEATURE not in feature_exclude_patterns
+    )
+    base_feature_include_patterns = tuple(
+        pattern
+        for pattern in feature_include_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
+    base_feature_zero_fill_patterns = tuple(
+        pattern
+        for pattern in feature_zero_fill_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
     )
@@ -3329,9 +3389,9 @@ def load_cached_panel(
         f"corporate_action_reference={corporate_action_key}|"
         f"corporate_action_coverage_contract=v{CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION}|"
         f"corporate_action_avoidance_contract=v{CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION}|"
-        f"feature_include={list(feature_include_patterns)!r}|"
+        f"feature_include={list(base_feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
-        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"feature_zero_fill={list(base_feature_zero_fill_patterns)!r}|"
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
@@ -3353,6 +3413,13 @@ def load_cached_panel(
     source_hash = _compute_source_hash(source_paths)
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
+        if include_day_trade_open_gap:
+            panel = _append_day_trade_open_gap_feature(panel)
+            if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
+                panel = _zero_fill_panel_features(
+                    panel,
+                    (DAY_TRADE_OPEN_GAP_FEATURE,),
+                )
         _print_feature_overview(panel)
     return panel
 
@@ -4315,6 +4382,83 @@ def _zero_fill_panel_features(
     return panel
 
 
+def _append_day_trade_open_gap_feature(panel: PanelData) -> PanelData:
+    """Append the next opening gap without persisting another full panel cache.
+
+    The cached panel remains the close-complete source of truth.  Row ``t`` of
+    the appended channel is ``log(open[t+1] / close[t])`` so a lag-one Taiwan
+    model deciding at open ``t+1`` sees that quote and nothing else from the
+    new session.  Missing/non-consecutive quotes fail closed to zero.
+    """
+
+    if DAY_TRADE_OPEN_GAP_FEATURE in panel.feature_names:
+        return panel
+    if panel.open_prices is None:
+        raise ValueError(
+            f"{DAY_TRADE_OPEN_GAP_FEATURE} requires PanelData.open_prices"
+        )
+    opens = np.asarray(panel.open_prices, dtype=np.float64)
+    closes = np.asarray(panel.close_prices, dtype=np.float64)
+    if opens.shape != closes.shape or opens.shape != panel.features.shape[:2]:
+        raise ValueError(
+            "open_prices and close_prices must match panel feature [T,S] axes"
+        )
+    gap = np.zeros(opens.shape, dtype=np.float32)
+    if opens.shape[0] > 1:
+        raw = _safe_log_ratio_array(opens[1:], closes[:-1])
+        raw = _sanitize_price_log_return_array(
+            raw,
+            TW_MAX_ABS_DAILY_PRICE_LOG_RETURN,
+        )
+        gap[:-1] = np.nan_to_num(
+            raw,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
+    base_fingerprint = None
+    open_fingerprint = None
+    close_fingerprint = None
+    if isinstance(panel.content_fingerprints, dict):
+        base_fingerprint = panel.content_fingerprints.get("features")
+        open_fingerprint = panel.content_fingerprints.get("open_prices")
+        close_fingerprint = panel.content_fingerprints.get("close_prices")
+    panel.features = np.concatenate((panel.features, gap[:, :, None]), axis=2)
+    panel.feature_names = [*panel.feature_names, DAY_TRADE_OPEN_GAP_FEATURE]
+    if all(
+        isinstance(item, dict) and isinstance(item.get("sha256"), str)
+        for item in (base_fingerprint, open_fingerprint, close_fingerprint)
+    ):
+        derived_sha = hashlib.sha256(
+            json.dumps(
+                {
+                    "contract": "next_session_open_gap_logret_v1",
+                    "base_features": base_fingerprint["sha256"],
+                    "open_prices": open_fingerprint["sha256"],
+                    "close_prices": close_fingerprint["sha256"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        panel.content_fingerprints = dict(panel.content_fingerprints)
+        panel.content_fingerprints["features"] = {
+            "present": True,
+            "shape": [int(size) for size in panel.features.shape],
+            "dtype": str(panel.features.dtype),
+            "sha256": derived_sha,
+        }
+    else:
+        # A synthetic or mutable source has no immutable cache receipt; force
+        # the checkpoint path to hash the actual derived bytes.
+        panel.content_fingerprints = None
+    print(
+        f"[panel] appended causal day-trade feature {DAY_TRADE_OPEN_GAP_FEATURE}; "
+        f"features={len(panel.feature_names)}"
+    )
+    return panel
+
+
 def _shift_panel_features_to_next_session(
     panel: PanelData,
     feature_shift_next_session: tuple[str, ...] = (),
@@ -4455,6 +4599,20 @@ def build_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    include_day_trade_open_gap = (
+        DAY_TRADE_OPEN_GAP_FEATURE in feature_include_patterns
+        and DAY_TRADE_OPEN_GAP_FEATURE not in feature_exclude_patterns
+    )
+    base_feature_include_patterns = tuple(
+        pattern
+        for pattern in feature_include_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
+    base_feature_zero_fill_patterns = tuple(
+        pattern
+        for pattern in feature_zero_fill_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
     )
@@ -4546,9 +4704,9 @@ def build_panel(
         f"corporate_action_reference={corporate_action_key}|"
         f"corporate_action_coverage_contract=v{CORPORATE_ACTION_COVERAGE_CONTRACT_VERSION}|"
         f"corporate_action_avoidance_contract=v{CORPORATE_ACTION_AVOIDANCE_CONTRACT_VERSION}|"
-        f"feature_include={list(feature_include_patterns)!r}|"
+        f"feature_include={list(base_feature_include_patterns)!r}|"
         f"feature_exclude={list(feature_exclude_patterns)!r}|"
-        f"feature_zero_fill={list(feature_zero_fill_patterns)!r}|"
+        f"feature_zero_fill={list(base_feature_zero_fill_patterns)!r}|"
         f"{feature_shift_key}"
         f"panel_start_date={normalized_panel_start_date}"
     )
@@ -4571,6 +4729,13 @@ def build_panel(
 
     panel = _load_valid_panel_cache(parquet_root, source_paths, backend_key, source_hash)
     if panel is not None:
+        if include_day_trade_open_gap:
+            panel = _append_day_trade_open_gap_feature(panel)
+            if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
+                panel = _zero_fill_panel_features(
+                    panel,
+                    (DAY_TRADE_OPEN_GAP_FEATURE,),
+                )
         _print_feature_overview(panel)
         return panel
 
@@ -4630,11 +4795,11 @@ def build_panel(
         valid_arrays,
         benchmark_name=benchmark_name,
         external_features=external_features,
-        feature_include=feature_include_patterns,
+        feature_include=base_feature_include_patterns,
         feature_exclude=feature_exclude_patterns,
     )
     panel = _apply_external_rule_masks(panel, external_features)
-    panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _zero_fill_panel_features(panel, base_feature_zero_fill_patterns)
     panel = _shift_panel_features_to_next_session(
         panel,
         feature_shift_next_session_patterns,
@@ -4649,5 +4814,12 @@ def build_panel(
         panel = _attach_raw_close_forward_returns(panel)
     _save_panel_cache(parquet_root, panel, source_hash, backend_key)
     print(f"[panel] cache v2 saved: {panel_cache_v2_dir(parquet_root)}")
+    if include_day_trade_open_gap:
+        panel = _append_day_trade_open_gap_feature(panel)
+        if DAY_TRADE_OPEN_GAP_FEATURE in feature_zero_fill_patterns:
+            panel = _zero_fill_panel_features(
+                panel,
+                (DAY_TRADE_OPEN_GAP_FEATURE,),
+            )
     _print_feature_overview(panel)
     return panel

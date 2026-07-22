@@ -440,6 +440,23 @@ Compile/runtime rules:
   Inductor workers. The canonical-loss probe is intentionally collective: it
   must reproduce the real autograd all-gather input on all ranks, otherwise the
   first train step compiles the same loss again.
+- The TW public open-aware `tw_day_trade` executor now uses the same bounded
+  compiled-settlement pattern as `tw_cash`. Keep the eager ledger as the
+  semantic oracle, compile fixed 32-row chunks with CUDA graphs disabled, and
+  carry `cash`, `payables`, `receivables`, `alive`, and `equity_scale`
+  differentiably between chunks. A non-aligned tail stays on the exact eager
+  implementation. Do not replace this state machine with independent daily
+  returns: T+2 default is absorbing and volume caps depend on carried equity.
+  The DDP canonical-loss probe must report `tw_day_trade_chunked=true`, at
+  least one compiled chunk call, and zero eager fallbacks before epoch 1.
+- Measured on dual RTX 5090 with the open-aware public config, `T=128`,
+  `S=2738`, and chunk/horizon 32: settlement forward+backward improved from
+  `546.7ms` eager to `114.1ms` compiled in an isolated actual-shape probe; a
+  no-grad `T=512` evaluation improved from `950.0ms` to `68.5ms`. The complete
+  fold-1 epoch-2/3 median improved from the prior `2.213s` baseline to
+  `0.439s`, including validation, sampled test curve, plotting, and checkpoint
+  work. Cold compile remains material (roughly 100 seconds per grad/no-grad
+  contract), so preserve stable caches and judge throughput only after epoch 1.
 - Expanding `train_union` folds change their symbol count. When
   `training.compile_loss_dynamic_symbols: true`, keep the time/batch axis static,
   mark only the canonical loss symbol axis dynamic, and reuse one compiled loss
@@ -512,6 +529,27 @@ Rules:
   available solely for provenance, auditing, and future data-quality research;
   they must not influence training, validation, test, inference, or feature
   importance.
+
+### TW Day-Trade Open-Aware Feature Contract
+
+- The only model-visible session-`t` opening quote is the opt-in normalized
+  feature `next_session_open_gap_logret`. Panel row `r` stores
+  `log(open[r+1] / close[r])`; because `tw_day_trade` keeps its ordinary
+  execution feature lag at one, the final row of a target-`t` window exposes
+  exactly `log(open[t] / close[t-1])`.
+- Do not replace this with a raw nominal opening-price feature. The normalized
+  gap is invariant to stock price scale and does not let the model identify a
+  symbol merely from its price level.
+- This feature is opt-in and legal only with `trading.execution_mode:
+  tw_day_trade`. Empty/wildcard panel feature selection must retain the
+  close-complete schema and must not silently include a next-session quote.
+- No session-`t` high, low, close, or volume may enter the model window used to
+  submit its opening order. Same-session full-day volume is future information.
+  Execution participation limits must continue to use completed session `t-1`
+  share volume as their causal proxy and keep that volume in the execution
+  layer, not in the model input.
+- Historical 98-feature close-complete checkpoints remain a separate schema.
+  Use a new artifact root and retrain for the 99-feature open-aware model.
 
 ## TW Public Execution-Rule Contract
 
@@ -702,26 +740,6 @@ Rules:
   SHA-256 all verify. This receipt is mandatory even with `--skip-raw`; an empty
   outside the declared range or any receipt mismatch remains a failure, while
   nonempty official data inside the range remains data.
-- Daily margin/short balances and TWSE/TPEx institutional flows are post-close
-  histories, not intraday information. Their source row belongs to session `t`,
-  but model features become available only on the next receipt-verified TAIEX
-  session. Preserve margin short-capacity rule evidence on source session `t`
-  because the panel already applies that explicitly next-session rule once;
-  never double-shift it. Current-only SBL/borrow/available-short OpenAPI rows
-  remain snapshot features and must stay excluded until a historical archive is
-  obtained.
-- The current `tw_public` `naive` research baseline deliberately approximates
-  execution at the final regular close while allowing final session-t OHLCV,
-  candlestick geometry, and official daily liquidity aggregates in that same
-  signal. This is not a realizable closing-auction timing contract. Keep
-  `data.allow_same_close_feature_approximation: true` explicit, keep these 22
-  fields out of `data.feature_shift_next_session`, and caveat resulting metrics.
-  A future execution-aware implementation should replace this approximation
-  with an order cutoff plus an executable price model. This exception does not
-  apply to post-close margin/short/institutional histories: they remain shifted
-  to the next verified session. The optional panel-shift mechanism remains part
-  of the preprocessing/checkpoint fingerprint for configurations that use it,
-  and must happen before `panel_start_date` slicing.
 - Keep `tpex_daily_valuation` at parser contract v7. The 2004--2006 archive
   declares its requested day as a labeled ROC date such as
   `交易日期:94年08月08日`; bind that exact date and still fail on missing or

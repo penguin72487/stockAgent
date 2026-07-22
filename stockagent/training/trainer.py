@@ -17267,9 +17267,9 @@ def run_training(
         compile_loss_requested = _env_truthy(
             "STOCKAGENT_COMPILE_LOSS", default_compile_loss
         )
-        tw_cash_chunk_compile = bool(
+        tw_settlement_chunk_compile = bool(
             will_train_epochs
-            and execution_runtime.mode == "tw_cash"
+            and execution_runtime.mode in {"tw_cash", "tw_day_trade"}
             and device.type == "cuda"
             and bool(config.training.backtest_compile)
             and int(
@@ -17286,10 +17286,9 @@ def run_training(
             and compile_loss_requested
             # Never compile an outer Taiwan settlement loss. Its sequential
             # T+2 recurrence is unrolled once per row and creates a
-            # pathological T-proportional graph. Taiwan cash has its bounded
-            # inner chunk kernel; day trade stays exact eager until it gains an
-            # equivalent kernel. Neither may silently fall back to a
-            # full-horizon graph.
+            # pathological T-proportional graph. Both Taiwan execution modes
+            # have bounded inner chunk kernels; neither may silently fall back
+            # to a full-horizon graph.
             and execution_runtime.mode not in {"tw_cash", "tw_day_trade"}
         )
         compile_loss_dynamic_symbols = bool(
@@ -17531,10 +17530,13 @@ def run_training(
                             loss_compile_status = "fallback:eager"
                             print(f"[Train {train_years}] torch.compile loss failed, falling back to eager loss: {e}")
                     else:
-                        if tw_cash_chunk_compile:
-                            loss_compile_status = "enabled:tw_cash_chunked"
+                        if tw_settlement_chunk_compile:
+                            loss_compile_status = (
+                                f"enabled:{execution_runtime.mode}_chunked"
+                            )
                             print(
-                                f"[Train {train_years}] Taiwan cash loss uses "
+                                f"[Train {train_years}] Taiwan "
+                                f"{execution_runtime.mode} loss uses "
                                 "bounded compiled settlement chunks "
                                 f"(rows={int(getattr(config.training, 'tw_continuous_compile_chunk_rows', 8))}); "
                                 "outer fullgraph loss compile disabled"
@@ -17591,8 +17593,8 @@ def run_training(
                 print(f"[Train {train_years}] torch.compile skipped: {reason}")
         elif compile_loss:
             loss_compile_status = "off:model_compile_disabled"
-        elif tw_cash_chunk_compile:
-            loss_compile_status = "enabled:tw_cash_chunked"
+        elif tw_settlement_chunk_compile:
+            loss_compile_status = f"enabled:{execution_runtime.mode}_chunked"
         elif execution_runtime.mode in {"tw_cash", "tw_day_trade"}:
             loss_compile_status = "off:tw_outer_compile_guard:eager"
         else:
@@ -17899,7 +17901,7 @@ def run_training(
                 and compiled_loss_fn.disabled
             )
             tw_compile_stats_after = get_tw_continuous_compile_stats()
-            if tw_cash_chunk_compile:
+            if tw_settlement_chunk_compile:
                 chunk_calls = int(
                     tw_compile_stats_after["compiled_chunk_calls"]
                     - tw_compile_stats_before["compiled_chunk_calls"]
@@ -17966,7 +17968,20 @@ def run_training(
             dynamic_symbol_max=(
                 dynamic_loss_symbol_max if compile_loss_dynamic_symbols else None
             ),
-            tw_cash_chunked=bool(tw_cash_chunk_compile),
+            tw_settlement_chunked=bool(tw_settlement_chunk_compile),
+            tw_settlement_mode=(
+                str(execution_runtime.mode)
+                if tw_settlement_chunk_compile
+                else None
+            ),
+            tw_cash_chunked=bool(
+                tw_settlement_chunk_compile
+                and execution_runtime.mode == "tw_cash"
+            ),
+            tw_day_trade_chunked=bool(
+                tw_settlement_chunk_compile
+                and execution_runtime.mode == "tw_day_trade"
+            ),
             tw_chunk_rows=int(
                 getattr(config.training, "tw_continuous_compile_chunk_rows", 8)
             ),
@@ -18032,7 +18047,7 @@ def run_training(
             f"model_dynamic_symbol_bounds={dynamic_model_symbol_bounds}; "
             f"loss_compile={loss_compile_status}; "
             f"loss_compile_dynamic_symbols={compile_loss_dynamic_symbols}; "
-            f"tw_cash_compile_chunk_rows={int(getattr(config.training, 'tw_continuous_compile_chunk_rows', 8))}; "
+            f"tw_settlement_compile_chunk_rows={int(getattr(config.training, 'tw_continuous_compile_chunk_rows', 8))}; "
             f"backtest_compile={bool(config.training.backtest_compile)}; "
             f"backtest_stateful_compile={bool(config.training.backtest_compile_stateful)}; "
             f"backtest_compile_dynamic={bool(getattr(config.training, 'backtest_compile_dynamic', False))}; "

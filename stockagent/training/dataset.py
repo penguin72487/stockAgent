@@ -15,9 +15,11 @@ def execution_feature_lag(execution_mode: str) -> int:
     """Return the number of complete sessions available before execution.
 
     ``naive`` preserves the historical same-row tensor contract.  Both Taiwan
-    execution modes submit a signal for session ``t`` using information through
-    ``t-1``: cash orders execute in the session-t closing auction and day trades
-    enter at the session-t open.
+    execution modes submit a signal for session ``t`` from close-complete rows
+    through ``t-1``: cash orders execute in the session-t closing auction and
+    day trades enter at the session-t open.  An explicitly enabled day-trade
+    opening-gap channel may carry only the already-observed ``open[t]`` quote on
+    that final row; it does not relax the lag for any other feature.
     """
 
     return 0 if normalize_execution_mode(execution_mode) == "naive" else 1
@@ -251,7 +253,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         else:
             # Keep only indices that have a full lookback window inside this fold.
             fold_start_idx = int(self.date_indices[0])
-            # Real execution for session t may observe only through t-1. Naive
+            # Real Taiwan execution uses close-complete information through
+            # t-1.  The opt-in day-trade open-gap channel is stored on that row
+            # but represents only the already-observed open[t] quote.  Naive
             # preserves the historical same-row feature contract.
             feature_lag = execution_feature_lag(self.execution_mode)
             min_valid_idx = fold_start_idx + self.lookback - 1 + feature_lag

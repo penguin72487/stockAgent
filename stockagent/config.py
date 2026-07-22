@@ -36,6 +36,7 @@ FORBIDDEN_SNAPSHOT_ONLY_FEATURE_PATTERNS = (
     "twpub_tdcc_*",
     "twpub_company_*",
 )
+DAY_TRADE_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -309,6 +310,9 @@ class DataConfig:
     feature_include: list[str] = field(default_factory=list)
     feature_exclude: list[str] = field(default_factory=list)
     feature_zero_fill: list[str] = field(default_factory=list)
+    # Explicitly append the open[t]/close[t-1] execution-context feature.  It
+    # is valid only for tw_day_trade and is never part of the default schema.
+    day_trade_open_feature: bool = False
     # Features whose session-t value is not available early enough for a
     # session-t decision.  Panel construction exposes that value on the next
     # panel session while preserving the source's original dated archive.
@@ -1515,6 +1519,12 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or tw_public_market_symbol_default
     )
     data["feature_include"] = _normalize_string_list(data["feature_include"], field_name="data.feature_include")
+    data["day_trade_open_feature"] = bool(data["day_trade_open_feature"])
+    if (
+        data["day_trade_open_feature"]
+        and DAY_TRADE_OPEN_GAP_FEATURE not in data["feature_include"]
+    ):
+        data["feature_include"].append(DAY_TRADE_OPEN_GAP_FEATURE)
     forbidden_snapshot_features = [
         feature
         for feature in data["feature_include"]
@@ -1654,6 +1664,15 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             )
     _set_dataclass_defaults(trading, TradingConfig)
     trading["execution_mode"] = normalize_execution_mode(trading["execution_mode"])
+    if (
+        DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
+        and trading["execution_mode"] != "tw_day_trade"
+    ):
+        raise ValueError(
+            f"data.feature_include={DAY_TRADE_OPEN_GAP_FEATURE!r} is available "
+            "only with trading.execution_mode='tw_day_trade'; its row t value "
+            "contains the next session's opening quote"
+        )
     taiwan_fee_schedule = TaiwanFeeSchedule(
         commission_rate=trading["tw_commission_rate"],
         commission_discount=trading["tw_commission_discount"],

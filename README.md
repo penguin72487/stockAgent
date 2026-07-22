@@ -374,3 +374,22 @@ run_fintech_python -m torch.distributed.run \
   --no-interactive-plots \
   --strict-no-fallback \
   --progress
+
+
+
+# shioaji
+
+# 查看狀態
+systemctl status stockagent-shioaji-top200.service
+
+# 即時查看 log
+journalctl -u stockagent-shioaji-top200.service -f
+
+# 重新啟動
+systemctl restart stockagent-shioaji-top200.service
+
+# 停止
+systemctl stop stockagent-shioaji-top200.service
+
+# 停止並取消開機啟動
+systemctl disable --now stockagent-shioaji-top200.service
