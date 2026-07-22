@@ -20,6 +20,13 @@ class LiveMarketConfig:
     fold_id: int | None = None
     checkpoint_path: str | None = None
     weights_path: str | None = None
+    model_selection_path: str | None = None
+    model_scoped_live_output: bool = False
+    model_candidate_output_dirs: tuple[str, ...] = ()
+    model_candidate_config_paths: tuple[str, ...] = ()
+    model_deployment_manifest: str | None = None
+    model_auto_deploy: bool = False
+    model_auto_deploy_interval_seconds: int = 60
     panel_date: str = "latest"
     price_source: str = "panel"
     prices_csv: str | None = None
@@ -43,6 +50,7 @@ class LiveMarketConfig:
     history_frequency: str = "daily"
     pre_signal_command: tuple[str, ...] = ()
     pre_signal_timeout_seconds: int = 900
+    previous_signal_backfill_limit: int = 32
     holidays: tuple[str, ...] = ()
     benchmark_window_days: int = 20
     max_turnover_warning: float = 1.5
@@ -77,6 +85,7 @@ class LiveMarketConfig:
             "data_timezone": self.timezone,
             "display_timezone": self.display_timezone,
             "daily_bar_time": self.close_time,
+            "previous_signal_backfill_limit": self.previous_signal_backfill_limit,
             "write": True,
         }
         for key, value in overrides.items():
@@ -155,6 +164,44 @@ def _int_tuple(value: Any) -> tuple[int, ...]:
 
 
 _MARKET_CONFIG_ALIASES = {"id", "config", "checkpoint"}
+_MODEL_SELECTION_KEYS = {
+    "mode",
+    "config_path",
+    "output_dir",
+    "fold_id",
+    "checkpoint_path",
+    "weights_path",
+    "model_scoped_live_output",
+    "model_candidate_output_dirs",
+    "model_candidate_config_paths",
+    "model_deployment_manifest",
+    "model_auto_deploy_interval_seconds",
+}
+
+
+def _apply_model_selection(raw: dict[str, Any], *, market_config_path: Path) -> dict[str, Any]:
+    selection_value = _optional_str(raw.get("model_selection_path"))
+    if selection_value is None:
+        return raw
+    selection_path = Path(selection_value)
+    if not selection_path.is_absolute():
+        selection_path = market_config_path.parent / selection_path
+    with selection_path.open("r", encoding="utf-8") as handle:
+        selection = yaml.safe_load(handle) or {}
+    if not isinstance(selection, dict):
+        raise ValueError(f"Model selection config must be a YAML mapping: {selection_path}")
+    unknown = sorted(str(key) for key in selection if key not in _MODEL_SELECTION_KEYS)
+    if unknown:
+        raise ValueError(
+            f"Unknown model selection key(s) in {selection_path}: " + ", ".join(unknown)
+        )
+    mode = str(selection.pop("mode", "manual")).strip().lower()
+    if mode not in {"manual", "auto"}:
+        raise ValueError(f"Model selection mode must be manual or auto: {selection_path}")
+    merged = dict(raw)
+    merged.update(selection)
+    merged["model_auto_deploy"] = mode == "auto"
+    return merged
 
 
 def _validate_market_config_keys(raw: dict[str, Any], *, path: Path) -> None:
@@ -192,6 +239,7 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         raw = yaml.safe_load(handle) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"Market config must be a YAML mapping: {path}")
+    raw = _apply_model_selection(raw, market_config_path=path)
     _validate_market_config_keys(raw, path=path)
 
     market = str(raw.get("market") or raw.get("id") or path.stem).strip()
@@ -209,6 +257,15 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         fold_id=_optional_int(raw.get("fold_id")),
         checkpoint_path=_optional_str(raw.get("checkpoint_path") or raw.get("checkpoint")),
         weights_path=_optional_str(raw.get("weights_path")),
+        model_selection_path=_optional_str(raw.get("model_selection_path")),
+        model_scoped_live_output=_bool_value(raw.get("model_scoped_live_output"), False),
+        model_candidate_output_dirs=_str_tuple(raw.get("model_candidate_output_dirs")),
+        model_candidate_config_paths=_str_tuple(raw.get("model_candidate_config_paths")),
+        model_deployment_manifest=_optional_str(raw.get("model_deployment_manifest")),
+        model_auto_deploy=_bool_value(raw.get("model_auto_deploy"), False),
+        model_auto_deploy_interval_seconds=max(
+            10, int(raw.get("model_auto_deploy_interval_seconds") or 60)
+        ),
         panel_date=str(raw.get("panel_date") or "latest"),
         price_source=str(raw.get("price_source") or "panel"),
         prices_csv=_optional_str(raw.get("prices_csv")),
@@ -232,6 +289,9 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         history_frequency=str(raw.get("history_frequency") or "daily"),
         pre_signal_command=_command_tuple(raw.get("pre_signal_command")),
         pre_signal_timeout_seconds=int(raw.get("pre_signal_timeout_seconds") or 900),
+        previous_signal_backfill_limit=max(
+            0, int(raw.get("previous_signal_backfill_limit") or 32)
+        ),
         holidays=_str_tuple(raw.get("holidays")),
         benchmark_window_days=int(raw.get("benchmark_window_days") or 20),
         max_turnover_warning=float(raw.get("max_turnover_warning") or 1.5),

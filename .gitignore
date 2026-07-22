@@ -198,6 +198,7 @@ data_yahoo/*
 data_peperstone/*
 artifacts/*
 *.7z
+*.tar.zst
 artifacts_test/*
 artifacts_smoke/*
 data_forex_frankfurter/*
