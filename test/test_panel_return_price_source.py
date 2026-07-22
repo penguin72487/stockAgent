@@ -8,6 +8,7 @@ import polars as pl
 import pytest
 
 from stockagent.data.panel import (
+    DAY_TRADE_OPEN_GAP_FEATURE,
     LOG_RETURN_FEATURE_COLUMNS,
     build_panel,
     _load_symbol_arrays_polars_lazy,
@@ -55,6 +56,62 @@ def test_return_label_uses_adjclose_but_execution_price_uses_close() -> None:
     assert math.isclose(float(rows[0]["return_1d"]), math.log(105.0 / 100.0), rel_tol=1e-7)
     assert math.isclose(float(rows[1]["return_1d"]), 0.0, abs_tol=1e-7)
     assert math.isclose(float(rows[1]["close_logret_1d"]), math.log(110.0 / 100.0), rel_tol=1e-7)
+
+
+@pytest.mark.parametrize("panel_backend", ["pyarrow", "polars_lazy"])
+def test_explicit_day_trade_open_gap_is_next_open_over_current_close(
+    tmp_path: Path,
+    panel_backend: str,
+) -> None:
+    path = tmp_path / "2330_features.parquet"
+    pl.DataFrame(
+        {
+            "date": ["2024-01-02", "2024-01-03", "2024-01-04"],
+            "open": [100.0, 110.0, 121.0],
+            "max": [102.0, 112.0, 123.0],
+            "min": [99.0, 104.0, 118.0],
+            "close": [100.0, 105.0, 120.0],
+            "adjclose": [100.0, 105.0, 120.0],
+            # Deliberately unrelated values: volume must not enter the feature.
+            "Trading_Volume": [1.0, 999999.0, 7.0],
+        }
+    ).write_parquet(path)
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="2330",
+        panel_backend=panel_backend,
+        panel_load_workers=0,
+        trading_volume_policy="required",
+        feature_include=["close_logret_1d", DAY_TRADE_OPEN_GAP_FEATURE],
+    )
+
+    gap_idx = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
+    np.testing.assert_allclose(
+        panel.features[:, 0, gap_idx],
+        np.asarray([math.log(110.0 / 100.0), math.log(121.0 / 105.0), 0.0]),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_day_trade_open_gap_is_not_in_default_panel_schema(tmp_path: Path) -> None:
+    _write_symbol(
+        tmp_path / "2330_features.parquet",
+        ["2024-01-02", "2024-01-03"],
+        [100.0, 101.0],
+        [1000.0, 1000.0],
+    )
+
+    panel = build_panel(
+        tmp_path,
+        benchmark_name="2330",
+        panel_backend="pyarrow",
+        panel_load_workers=0,
+        trading_volume_policy="required",
+    )
+
+    assert DAY_TRADE_OPEN_GAP_FEATURE not in panel.feature_names
 
 
 def test_kbar_ratios_reject_invalid_ohlc_and_define_flat_bar(tmp_path: Path) -> None:

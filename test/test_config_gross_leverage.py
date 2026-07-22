@@ -124,6 +124,28 @@ def test_load_config_rejects_permanently_disabled_snapshot_features(
         load_config(config_path)
 
 
+def test_open_aware_feature_requires_day_trade_execution(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["day_trade_open_feature"] = True
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="only with trading.execution_mode='tw_day_trade'"):
+        load_config(config_path)
+
+
+def test_open_aware_day_trade_config_appends_causal_feature(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["day_trade_open_feature"] = True
+    payload["trading"]["execution_mode"] = "tw_day_trade"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.data.feature_include[-1] == "next_session_open_gap_logret"
+
+
 def test_load_config_migrates_legacy_leverage_to_reporting_leverage(tmp_path: Path) -> None:
     config_path = _write_minimal_config(tmp_path)
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))

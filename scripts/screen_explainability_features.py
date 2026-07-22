@@ -284,7 +284,10 @@ def _aggregate(
             descending=[True, False],
         )
     )
-    output_path = screening_root / "feature_importance_21folds.csv"
+    # Fold count depends on the configured panel horizon.  Encoding a fixed
+    # "21folds" suffix made shorter, otherwise valid experiments look as if
+    # they had coverage they did not actually compute.
+    output_path = screening_root / f"feature_importance_{expected_folds}folds.csv"
     aggregate.write_csv(output_path)
     per_fold_rows: dict[str, int] = {}
     for fold_id in fold_ids:
@@ -311,6 +314,7 @@ def _aggregate(
         ),
         "zero_in_all_folds": int(aggregate.filter(pl.col("zero_in_all_folds")).height),
         "disable_candidates": int(aggregate.filter(pl.col("disable_candidate")).height),
+        "aggregate_file": output_path.name,
     }
     (screening_root / "feature_screening_summary.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),

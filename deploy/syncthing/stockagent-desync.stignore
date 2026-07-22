@@ -1,0 +1,6 @@
+// Local transactional state must never leave this node.
+(?d).local-state
+(?d).local-state/**
+// Materialized trees are local caches, not replication inputs.
+(?d)materialized
+(?d)materialized/**

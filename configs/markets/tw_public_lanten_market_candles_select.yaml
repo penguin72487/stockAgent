@@ -43,17 +43,16 @@ data:
   # are forward-filled from their first known observation. Before first
   # availability (and for unresolved missing cells), panel construction fills
   # the value with 0 instead of deleting the entire feature family.
-  # Feature-screening contract (latest run: 2026-07-18 16:04 UTC): evaluate all
-  # 21 folds using only the first calendar year of each fold's test split. Keep
+  # Feature-screening contract (latest run: 2026-07-20 UTC): evaluate all 12/12
+  # available checkpoints using only the first calendar year of each fold's test split. Keep
   # a feature when Gradient x Input or IG is non-zero in at least one fold;
   # disable only features that are exactly zero for both methods in every fold.
-  # The historical screen kept 73/131 features and disabled 58. The permanent
-  # snapshot-only denylist additionally removes twpub_insider_transfer_shares_log,
-  # so this legacy selection currently has 72 live features. Re-screen from the
-  # 98-feature snapshot-safe full run before using it for a new experiment.
-  # Historical evidence is recorded under:
-  # artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds/
-  # feature_screening_first_test_year/feature_importance_21folds.csv
+  # The snapshot-safe98 screen kept 71/98 features and disabled 27. Features
+  # excluded from the full model as snapshot-only remain permanently disabled
+  # and were deliberately not reconsidered by this attribution run.
+  # Evidence:
+  # artifacts/markets/tw_public_candles_snapshot_safe98_gross_tw_day_trade_2014plus/
+  # feature_screening_first_test_year/feature_importance_12folds.csv
   feature_include:
     # Base price log returns
     - open_logret_1d
@@ -109,20 +108,20 @@ data:
     - twpub_institutional_net_buy_flow
 
     # TDCC shareholding distribution
-    # - twpub_tdcc_retail_holder_ratio  # disabled: 21-fold zero
-    # - twpub_tdcc_large_holder_ratio  # disabled: 21-fold zero
-    # - twpub_tdcc_holder_count_log  # disabled: 21-fold zero
+    # - twpub_tdcc_retail_holder_ratio  # permanently disabled: snapshot-only
+    # - twpub_tdcc_large_holder_ratio  # permanently disabled: snapshot-only
+    # - twpub_tdcc_holder_count_log  # permanently disabled: snapshot-only
 
     # Company profile and categorical identity
-    # - twpub_company_paidin_capital_log  # disabled: 21-fold zero
-    # - twpub_company_issued_shares_log  # disabled: 21-fold zero
-    # - twpub_company_private_shares_log  # disabled: 21-fold zero
-    # - twpub_company_age_years  # disabled: 21-fold zero
-    # - twpub_company_listed_age_years  # disabled: 21-fold zero
-    # - twpub_company_par_value_log  # disabled: 21-fold zero
-    # - twpub_company_industry_code  # disabled: 21-fold zero
-    # - twpub_company_is_foreign  # disabled: 21-fold zero
-    # - twpub_company_has_preferred_stock  # disabled: 21-fold zero
+    # - twpub_company_paidin_capital_log  # permanently disabled: snapshot-only
+    # - twpub_company_issued_shares_log  # permanently disabled: snapshot-only
+    # - twpub_company_private_shares_log  # permanently disabled: snapshot-only
+    # - twpub_company_age_years  # permanently disabled: snapshot-only
+    # - twpub_company_listed_age_years  # permanently disabled: snapshot-only
+    # - twpub_company_par_value_log  # permanently disabled: snapshot-only
+    # - twpub_company_industry_code  # permanently disabled: snapshot-only
+    # - twpub_company_is_foreign  # permanently disabled: snapshot-only
+    # - twpub_company_has_preferred_stock  # permanently disabled: snapshot-only
 
     # Dividend announcements and ex-dividend information
     - twpub_dividend_cash_per_share
@@ -131,49 +130,49 @@ data:
     - twpub_dividend_total_stock_log
     - twpub_dividend_confirmed
     - twpub_dividend_board_approved
-    # - twpub_exdiv_known  # disabled: 21-fold zero
-    # - twpub_exdiv_cash_dividend  # disabled: 21-fold zero
-    # - twpub_exdiv_stock_dividend_ratio  # disabled: 21-fold zero
-    # - twpub_exdiv_subscription_ratio  # disabled: 21-fold zero
-    # - twpub_exdiv_subscription_price_log  # disabled: 21-fold zero
+    # - twpub_exdiv_known  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_exdiv_cash_dividend  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_exdiv_stock_dividend_ratio  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_exdiv_subscription_ratio  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_exdiv_subscription_price_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
 
     # Material events, attention stocks, and disposal stocks
-    # - twpub_material_event_count_log  # disabled: 21-fold zero
-    # - twpub_material_clause_log  # disabled: 21-fold zero
-    # - twpub_material_fact_lag_days  # disabled: 21-fold zero
-    # - twpub_attention_count_log  # disabled: 21-fold zero
-    # - twpub_attention_close_log  # disabled: 21-fold zero
-    # - twpub_attention_pe_log  # disabled: 21-fold zero
-    - twpub_disposal_count_log
+    # - twpub_material_event_count_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_material_clause_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_material_fact_lag_days  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_attention_count_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_attention_close_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_attention_pe_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_disposal_count_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
 
     # Point-in-time monthly revenue
-    # - twpub_monthly_revenue_log  # disabled: 21-fold zero
-    # - twpub_monthly_revenue_mom  # disabled: 21-fold zero
-    # - twpub_monthly_revenue_yoy  # disabled: 21-fold zero
-    # - twpub_cumulative_revenue_yoy  # disabled: 21-fold zero
+    # - twpub_monthly_revenue_log  # permanently disabled: snapshot-only
+    # - twpub_monthly_revenue_mom  # permanently disabled: snapshot-only
+    # - twpub_monthly_revenue_yoy  # permanently disabled: snapshot-only
+    # - twpub_cumulative_revenue_yoy  # permanently disabled: snapshot-only
 
     # Point-in-time income statement and balance sheet
-    # - twpub_financial_eps  # disabled: 21-fold zero
-    # - twpub_financial_revenue_log  # disabled: 21-fold zero
-    # - twpub_financial_net_income_asinh  # disabled: 21-fold zero
-    # - twpub_financial_gross_margin  # disabled: 21-fold zero
-    # - twpub_financial_operating_margin  # disabled: 21-fold zero
-    # - twpub_financial_net_margin  # disabled: 21-fold zero
-    # - twpub_financial_assets_log  # disabled: 21-fold zero
-    # - twpub_financial_debt_ratio  # disabled: 21-fold zero
-    # - twpub_financial_current_ratio  # disabled: 21-fold zero
-    # - twpub_financial_equity_ratio  # disabled: 21-fold zero
-    # - twpub_financial_book_value_per_share_log  # disabled: 21-fold zero
+    # - twpub_financial_eps  # permanently disabled: snapshot-only
+    # - twpub_financial_revenue_log  # permanently disabled: snapshot-only
+    # - twpub_financial_net_income_asinh  # permanently disabled: snapshot-only
+    # - twpub_financial_gross_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_operating_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_net_margin  # permanently disabled: snapshot-only
+    # - twpub_financial_assets_log  # permanently disabled: snapshot-only
+    # - twpub_financial_debt_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_current_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_equity_ratio  # permanently disabled: snapshot-only
+    # - twpub_financial_book_value_per_share_log  # permanently disabled: snapshot-only
 
     # Insider ownership and announced transfers
-    # - twpub_insider_holdings_log  # disabled: 21-fold zero
-    # - twpub_insider_pledge_ratio  # disabled: 21-fold zero
+    # - twpub_insider_holdings_log  # permanently disabled: snapshot-only
+    # - twpub_insider_pledge_ratio  # permanently disabled: snapshot-only
     # - twpub_insider_transfer_shares_log  # permanently disabled: snapshot-only
 
     # Securities borrowing and short-sale availability
-    # - twpub_borrow_available_log  # disabled: 21-fold zero
-    # - twpub_sbl_balance_log  # disabled: 21-fold zero
-    # - twpub_short_sale_available_log  # disabled: 21-fold zero
+    # - twpub_borrow_available_log  # permanently disabled: snapshot-only
+    # - twpub_sbl_balance_log  # permanently disabled: snapshot-only
+    # - twpub_short_sale_available_log  # permanently disabled: snapshot-only
 
     # TAIEX and USD/TWD market state
     - twpub_twse_taiex_log
@@ -209,21 +208,21 @@ data:
     - twpub_mof_business_tax_log
 
     # TAIFEX futures and options market activity
-    # - twpub_taifex_tx_volume_log  # disabled: 21-fold zero
-    # - twpub_taifex_tx_open_interest_log  # disabled: 21-fold zero
-    # - twpub_taifex_tx_settlement_logret_1d  # disabled: 21-fold zero
-    # - twpub_taifex_txo_call_volume_log  # disabled: 21-fold zero
-    # - twpub_taifex_txo_put_volume_log  # disabled: 21-fold zero
-    # - twpub_taifex_txo_put_call_volume_ratio  # disabled: 21-fold zero
-    # - twpub_taifex_txo_call_oi_log  # disabled: 21-fold zero
-    # - twpub_taifex_txo_put_oi_log  # disabled: 21-fold zero
-    # - twpub_taifex_txo_put_call_oi_ratio  # disabled: 21-fold zero
-    # - twpub_taifex_dealer_net_oi_asinh  # disabled: 21-fold zero
-    # - twpub_taifex_foreign_net_oi_asinh  # disabled: 21-fold zero
-    # - twpub_taifex_trust_net_oi_asinh  # disabled: 21-fold zero
-    # - twpub_taifex_tx_top5_long_ratio  # disabled: 21-fold zero
-    # - twpub_taifex_tx_top10_long_ratio  # disabled: 21-fold zero
-    # - twpub_taifex_tx_large_oi_log  # disabled: 21-fold zero
+    # - twpub_taifex_tx_volume_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_tx_open_interest_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_tx_settlement_logret_1d  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_txo_call_volume_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_txo_put_volume_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_txo_put_call_volume_ratio  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_txo_call_oi_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_txo_put_oi_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_txo_put_call_oi_ratio  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_dealer_net_oi_asinh  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_foreign_net_oi_asinh  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_trust_net_oi_asinh  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_tx_top5_long_ratio  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_tx_top10_long_ratio  # disabled: exact zero in Gradient x Input and IG across all 12 folds
+    # - twpub_taifex_tx_large_oi_log  # disabled: exact zero in Gradient x Input and IG across all 12 folds
     - twpub_taifex_tx_final_settlement_logret
   feature_exclude: []
   feature_zero_fill: []
