@@ -102,6 +102,12 @@ def _resolve_short_maintenance_ratio(value: float) -> float:
     return ratio
 
 
+def _state_materiality_tolerance(dtype: torch.dtype) -> float:
+    """Return the normalized-NAV threshold below the dtype's finance precision."""
+
+    return max(1.0e-12, float(torch.finfo(dtype).eps) * 16.0)
+
+
 def _validate_normalized_state_eager(
     *,
     risky: torch.Tensor,
@@ -489,18 +495,49 @@ def _prepare_cash_short_state(
     )
 
     if not torch.compiler.is_compiling():
-        short_positions = risky < -1.0e-12
+        # A compiled FP32 recurrence can leave sub-ULP signed dust after a
+        # position is fully covered.  Classifying that numerical residue with
+        # a fixed 1e-12 cutoff made the next eager batch boundary report a
+        # fabricated naked short.  Use the same scale as the ledger's existing
+        # FP32 maintenance buffer while keeping float64 callers strict.
+        short_position_tolerance = _state_materiality_tolerance(risky.dtype)
+        raw_short_positions = risky < 0.0
+        total_short_notional = (-risky).clamp_min(0.0).sum()
         complete_collateral = (short_sale > 1.0e-12) & (short_margin > 1.0e-12)
         supplied_collateral = (short_sale > 1.0e-12) | (short_margin > 1.0e-12)
-        if bool((short_positions & ~complete_collateral).any().item()):
+        uncollateralized_short_notional = torch.where(
+            raw_short_positions & ~complete_collateral,
+            (-risky).clamp_min(0.0),
+            torch.zeros_like(risky),
+        )
+        total_uncollateralized_short = uncollateralized_short_notional.sum()
+        if bool((total_uncollateralized_short > short_position_tolerance).item()):
+            invalid_carried_shorts = uncollateralized_short_notional > 0.0
+            invalid_count = int(invalid_carried_shorts.sum().item())
+            max_invalid_short = float(uncollateralized_short_notional.amax().item())
+            total_invalid_short = float(total_uncollateralized_short.item())
             raise ValueError(
                 "negative initial_weights require nonzero per-symbol "
                 "short-sale and short-margin collateral; naked or "
-                "single-pool carried shorts are invalid"
+                "single-pool carried shorts are invalid "
+                f"(invalid_symbols={invalid_count}, "
+                f"max_invalid_short={max_invalid_short:.9g}, "
+                f"total_invalid_short={total_invalid_short:.9g}, "
+                f"materiality_tolerance={short_position_tolerance:.9g})"
             )
-        if bool((~short_positions.any() & supplied_collateral.any()).item()):
+        if bool((~raw_short_positions.any() & supplied_collateral.any()).item()):
+            max_short_sale = float(short_sale.amax().item())
+            total_short_sale = float(short_sale.sum().item())
+            max_short_margin = float(short_margin.amax().item())
+            total_short_margin = float(short_margin.sum().item())
             raise ValueError(
-                "short collateral requires at least one carried short position"
+                "short collateral requires at least one carried short position "
+                f"(max_short_sale={max_short_sale:.9g}, "
+                f"total_short_sale={total_short_sale:.9g}, "
+                f"max_short_margin={max_short_margin:.9g}, "
+                f"total_short_margin={total_short_margin:.9g}, "
+                f"total_short_notional={float(total_short_notional.item()):.9g}, "
+                f"materiality_tolerance={short_position_tolerance:.9g})"
             )
 
     if initial_cash is None:

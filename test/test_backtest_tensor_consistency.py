@@ -2655,6 +2655,93 @@ def test_deployment_test_indices_assign_next_year_warmup_to_previous_model() -> 
     )
 
 
+def test_panel_history_hands_new_year_first_target_to_new_model() -> None:
+    lookback = 4
+    dates = np.concatenate(
+        [
+            np.arange(f"{year}-01-01", f"{year}-01-11", dtype="datetime64[D]")
+            for year in range(2020, 2024)
+        ]
+    )
+    rows = int(dates.size)
+    mask = np.ones((rows, 2), dtype=bool)
+    panel = PanelData(
+        dates=dates,
+        symbols=["A", "B"],
+        feature_names=["f0"],
+        features=np.arange(rows, dtype=np.float32)[:, None, None].repeat(2, axis=1),
+        returns_1d=np.ones((rows, 2), dtype=np.float32) * 0.001,
+        raw_close_returns_1d=np.ones((rows, 2), dtype=np.float32) * 0.001,
+        tradable_mask=mask,
+        can_buy_mask=mask.copy(),
+        can_sell_mask=mask.copy(),
+        alive_mask=mask.copy(),
+        benchmark_returns=np.zeros((rows,), dtype=np.float32),
+        close_prices=np.ones((rows, 2), dtype=np.float32),
+        unresolved_corporate_action_mask=np.zeros((rows, 2), dtype=bool),
+    )
+    folds = build_expanding_year_folds(
+        dates,
+        min_train_years=1,
+        val_years=1,
+        require_future_test_year=True,
+    )
+
+    first_indices = _deployment_test_indices(
+        panel,
+        folds[0],
+        folds[1],
+        lookback,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    )
+    second_indices = _deployment_test_indices(
+        panel,
+        folds[1],
+        None,
+        lookback,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    )
+    first_ds = CrossSectionalDataset(
+        panel,
+        first_indices,
+        lookback,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    )
+    second_ds = CrossSectionalDataset(
+        panel,
+        second_indices,
+        lookback,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    )
+
+    assert panel.dates[first_ds.valid_indices[0]] == np.datetime64("2022-01-01")
+    assert panel.dates[first_ds.valid_indices[-1]] == np.datetime64("2022-01-10")
+    assert panel.dates[second_ds.valid_indices[0]] == np.datetime64("2023-01-01")
+    assert second_ds[0]["x"][:, 0, 0].tolist() == [26.0, 27.0, 28.0, 29.0]
+    assert np.intersect1d(first_ds.valid_indices, second_ds.valid_indices).size == 0
+
+    first_full_ds = CrossSectionalDataset(
+        panel,
+        folds[0].test_indices,
+        lookback,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    )
+    assert _deployment_test_prefix_rows(
+        panel,
+        folds[0],
+        folds[1],
+        lookback,
+        first_full_ds.valid_indices,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    ) == len(first_ds)
+
+
 def test_full_test_survives_zero_row_experimental_deployment_handoff() -> None:
     lookback = 4
     dates = np.concatenate(

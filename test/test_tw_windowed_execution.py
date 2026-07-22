@@ -6,7 +6,10 @@ import torch
 
 from stockagent.data.panel import PanelData
 from stockagent.data.walkforward import WalkForwardFold
-from stockagent.explainability import _first_test_year_dataset
+from stockagent.explainability import (
+    _estimated_first_test_year_explain_rows,
+    _first_test_year_dataset,
+)
 from stockagent.training.dataset import CrossSectionalDataset
 from stockagent.training.trainer import (
     _PanelSlabForwardWrapper,
@@ -138,6 +141,89 @@ def test_dataset_conversion_preserves_mode_and_uses_only_pre_session_features() 
     # feature dates 0 and 1.  Feature date 2 would be same-session leakage.
     assert materialized_x[0, :, 0, 0].tolist() == [0.0, 1.0]
     assert split.future_log_returns[split.valid_indices[0], 0].item() == pytest.approx(0.27)
+
+
+def test_panel_history_makes_split_row_zero_use_prior_causal_features() -> None:
+    panel = _panel(rows=8, symbols=2)
+    split_indices = np.arange(4, 8, dtype=np.int64)
+    legacy = CrossSectionalDataset(
+        panel,
+        split_indices,
+        lookback=2,
+        execution_mode="tw_cash",
+    )
+    contextual = CrossSectionalDataset(
+        panel,
+        split_indices,
+        lookback=2,
+        execution_mode="tw_cash",
+        lookback_context="panel_history",
+    )
+
+    # tw_cash target t sees only [t-2, t-1]. The target and every executor-side
+    # tensor still come from t=4, the first row owned by this split.
+    assert contextual.valid_indices.tolist() == [4, 5, 6, 7]
+    assert legacy.valid_indices.tolist() == [6, 7]
+    assert contextual[0]["x"][:, 0, 0].tolist() == [2.0, 3.0]
+    assert contextual[0]["future_log_returns"][0].item() == pytest.approx(0.04)
+    np.testing.assert_array_equal(
+        _split_valid_indices(
+            panel,
+            split_indices,
+            2,
+            "tw_cash",
+            "panel_history",
+        ),
+        contextual.valid_indices,
+    )
+
+    windowed = dataset_to_windowed_tensors(contextual)
+    materialized, *_ = windowed.materialize_windows()
+    torch.testing.assert_close(materialized[0], contextual[0]["x"])
+    slab = windowed.panel_slab_batch_by_rows(
+        0,
+        len(windowed),
+        torch.device("cpu"),
+        non_blocking=False,
+    )
+    assert slab is not None
+    assert slab["feature_slab"][:, 0, 0].tolist() == [2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_explainability_load_estimate_uses_panel_history_dataset_contract() -> None:
+    panel = _panel(rows=8, symbols=2)
+    split_indices = np.arange(4, 8, dtype=np.int64)
+    fold = WalkForwardFold(
+        fold_id=1,
+        train_indices=np.arange(0, 2, dtype=np.int64),
+        val_indices=np.arange(2, 4, dtype=np.int64),
+        test_indices=split_indices,
+        train_years=[1970],
+        val_years=[1970],
+        test_years=[1970],
+    )
+
+    common = {
+        "fold": fold,
+        "panel": panel,
+        "lookback": 4,
+        "max_rows": 0,
+        "execution_mode": "tw_day_trade",
+        "short_capacity_limit_enabled": True,
+        "tw_corporate_action_mode": "avoid",
+    }
+    assert _estimated_first_test_year_explain_rows(
+        **common,
+        lookback_context="panel_history",
+    ) == 4
+    assert _estimated_first_test_year_explain_rows(
+        **common,
+        lookback_context="split_only",
+    ) == 0
+    assert _estimated_first_test_year_explain_rows(
+        **(common | {"max_rows": 2}),
+        lookback_context="panel_history",
+    ) == 2
 
 
 @pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_day_trade"])

@@ -452,6 +452,10 @@ def _run_fold(
         fold_panel,
         fold,
         config.training.lookback,
+        execution_mode=config.trading.execution_mode,
+        lookback_context=config.walk_forward.lookback_context,
+        short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+        tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
     )
     split_rows = len(dataset)
     batch_source = _sample_dataset_source(
@@ -587,6 +591,7 @@ def _run(args: argparse.Namespace) -> None:
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
     )
     selected_fold_ids = _configured_fold_ids(folds, training_output_dir)
     folds_by_id = {int(fold.fold_id): fold for fold in folds}

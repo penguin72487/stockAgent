@@ -1249,7 +1249,7 @@ class BacktestResultTensor:
 
 @dataclass(slots=True)
 class HoldingsRecord:
-    """Single holding record for one date/symbol, sorted by absolute holding ratio."""
+    """Single position or execution record for one date/symbol."""
 
     date: str
     symbol: str
@@ -1258,6 +1258,8 @@ class HoldingsRecord:
     market_value: float
     holding_ratio: float
     is_cash: bool
+    record_type: str = "position"
+    side: str = ""
 
 
 def holding_record_abs_sort_key(record: HoldingsRecord) -> tuple[float, str]:
@@ -2927,15 +2929,16 @@ def _tw_integer_holdings_records(
     result: TaiwanIntegerBacktestResult,
     *,
     close_prices: np.ndarray,
+    open_prices: np.ndarray | None = None,
     symbols: list[str],
     dates: np.ndarray | None,
 ) -> list[HoldingsRecord]:
-    """Render end-of-session holdings while keeping settlement in audit fields.
+    """Render cash holdings and exact per-symbol execution detail.
 
-    A day-trade account is flat at every close, so it emits only the economic
-    cash row.  Its exact intraday signed quantities remain available through
-    ``BacktestResult.shares_history`` rather than being mislabeled as overnight
-    holdings.
+    Cash execution emits end-of-session positions.  A day-trade account is flat
+    at every close, so its non-cash rows are explicitly labeled
+    ``day_trade_open`` and record the signed quantity and opening execution
+    price instead of pretending those quantities are overnight holdings.
     """
 
     t_len, n_symbols = result.positions.shape
@@ -2943,6 +2946,13 @@ def _tw_integer_holdings_records(
         raise ValueError(f"symbols must contain exactly {n_symbols} entries")
     if np.asarray(close_prices).shape != (t_len, n_symbols):
         raise ValueError(f"close_prices must have shape [{t_len}, {n_symbols}]")
+    open_values: np.ndarray | None = None
+    if result.final_state.mode == "tw_day_trade":
+        if open_prices is None:
+            raise ValueError("tw_day_trade holdings records require open_prices")
+        open_values = np.asarray(open_prices, dtype=np.float64)
+        if open_values.shape != (t_len, n_symbols):
+            raise ValueError(f"open_prices must have shape [{t_len}, {n_symbols}]")
     if dates is None:
         date_text = [f"t{idx:04d}" for idx in range(t_len)]
     else:
@@ -2981,11 +2991,7 @@ def _tw_integer_holdings_records(
             if margin_collateral_history is None
             else float(np.sum(margin_collateral_history[t]))
         )
-        nonzero = (
-            np.flatnonzero(result.positions[t] != 0)
-            if result.final_state.mode == "tw_cash"
-            else np.empty(0, dtype=np.int64)
-        )
+        nonzero = np.flatnonzero(result.positions[t] != 0)
         if result.final_state.mode == "tw_cash":
             # ``strategy_returns[t]`` already includes close[t] -> the next
             # causal valuation mark, whereas holdings are audited at close[t].
@@ -3031,10 +3037,42 @@ def _tw_integer_holdings_records(
                     "asset-liability identity"
                 )
         else:
-            # A day-trade account is flat after its mandatory closing leg.
-            execution_nav = free_cash_and_claims
-            market_values = np.empty(0, dtype=np.float64)
-            reconstructed_prices = np.empty(0, dtype=np.float64)
+            assert open_values is not None
+            # These are opening executions, not closing holdings.  Use the
+            # exact integer quantity and opening quote that produced the public
+            # shares/weights histories.  Session-t close must not alter them.
+            execution_nav = float(result.execution_nav_history[t])
+            reconstructed_prices = open_values[t, nonzero]
+            market_values = (
+                result.positions[t, nonzero].astype(np.float64, copy=False)
+                * reconstructed_prices
+            )
+            invalid_entries = (
+                ~np.isfinite(reconstructed_prices)
+                | (reconstructed_prices <= 0.0)
+                | ~np.isfinite(market_values)
+            )
+            if np.any(invalid_entries):
+                raise ValueError(
+                    "integer day-trade result has invalid opening execution "
+                    f"prices at time index {t}, symbol indices "
+                    f"{nonzero[invalid_entries][:8].tolist()}"
+                )
+            expected_weights = np.divide(
+                market_values,
+                execution_nav,
+                out=np.zeros_like(market_values),
+                where=execution_nav > 0.0,
+            )
+            if not np.allclose(
+                expected_weights,
+                result.weights[t, nonzero],
+                rtol=2e-12,
+                atol=1e-12,
+            ):
+                raise RuntimeError(
+                    "integer day-trade opening records disagree with execution weights"
+                )
         denominator = execution_nav if execution_nav > 0.0 else 1.0
         day_rows = [
             HoldingsRecord(
@@ -3047,6 +3085,7 @@ def _tw_integer_holdings_records(
                     free_cash_and_claims / denominator if execution_nav > 0.0 else 0.0
                 ),
                 is_cash=True,
+                record_type="cash",
             )
         ]
         for label, value in (
@@ -3063,20 +3102,34 @@ def _tw_integer_holdings_records(
                         market_value=value,
                         holding_ratio=value / denominator,
                         is_cash=True,
+                        record_type="collateral",
                     )
                 )
-        if result.final_state.mode == "tw_cash" and execution_nav > 0.0:
+        if execution_nav > 0.0:
             for offset, idx in enumerate(nonzero.tolist()):
                 market_value = float(market_values[offset])
+                signed_shares = int(result.positions[t, idx])
                 day_rows.append(
                     HoldingsRecord(
                         date=date_text[t],
                         symbol=symbols[idx],
-                        shares=int(result.positions[t, idx]),
+                        shares=signed_shares,
                         price=float(reconstructed_prices[offset]),
                         market_value=market_value,
                         holding_ratio=market_value / denominator,
                         is_cash=False,
+                        record_type=(
+                            "position"
+                            if result.final_state.mode == "tw_cash"
+                            else "day_trade_open"
+                        ),
+                        side=(
+                            ""
+                            if result.final_state.mode == "tw_cash"
+                            else "BUY"
+                            if signed_shares > 0
+                            else "SELL"
+                        ),
                     )
                 )
         day_rows.sort(key=holding_record_abs_sort_key)
@@ -3494,6 +3547,7 @@ def run_backtest_integer_shares(
             _tw_integer_holdings_records(
                 integer_result,
                 close_prices=close_real,
+                open_prices=open_real if execution_mode == "tw_day_trade" else None,
                 symbols=active_symbols,
                 dates=dates,
             )
