@@ -87,6 +87,7 @@ def _probe_seed(config, panel, fold, seed: int, device: torch.device, batch_size
         fold.train_indices,
         int(config.training.lookback),
         execution_mode=config.trading.execution_mode,
+        lookback_context=config.walk_forward.lookback_context,
         short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
         tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
     )
@@ -214,6 +215,7 @@ def main() -> None:
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
     )
     fold = folds[min(max(0, int(args.fold_index)), len(folds) - 1)]
     batch_size = int(args.batch_size) if args.batch_size is not None else int(config.training.batch_size_train)

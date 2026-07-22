@@ -59,6 +59,35 @@ def test_expanding_folds_overlap_uses_full_validation_window_when_val_years_gt_o
     assert np.array_equal(folds[-1].val_indices, folds[-1].test_indices)
 
 
+def test_split_start_year_keeps_older_panel_years_context_only() -> None:
+    dates = _year_end_dates(2012, 2018)
+    folds = build_expanding_year_folds(
+        dates,
+        min_train_years=1,
+        val_years=1,
+        require_future_test_year=True,
+        split_start_year=2014,
+    )
+
+    assert folds[0].train_years == [2014]
+    assert folds[0].val_years == [2015]
+    assert folds[0].test_years == [2016, 2017, 2018]
+    assert set(folds[0].train_indices.tolist()) == {2}
+    owned = np.concatenate(
+        [folds[0].train_indices, folds[0].val_indices, folds[0].test_indices]
+    )
+    assert not np.isin([0, 1], owned).any()
+
+
+def test_split_start_year_must_exist_in_panel() -> None:
+    with pytest.raises(ValueError, match="split_start_year is absent"):
+        build_expanding_year_folds(
+            _year_end_dates(2012, 2018),
+            min_train_years=1,
+            split_start_year=2011,
+        )
+
+
 def test_walk_forward_year_contract_rejects_first_year_shift() -> None:
     with pytest.raises(ValueError, match="expected=2000, actual=2004"):
         validate_walk_forward_year_contract(
