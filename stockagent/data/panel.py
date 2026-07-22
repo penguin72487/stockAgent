@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, time
 import fnmatch
 from pathlib import Path
 import csv
@@ -922,6 +922,8 @@ def _load_external_feature_arrays(
     market_symbol: str = DEFAULT_EXTERNAL_MARKET_SYMBOL,
     include_features: bool = True,
     include_rules: bool = True,
+    date_start: date | None = None,
+    date_end: date | None = None,
 ) -> _ExternalFeatureArrays:
     if pl is None or pq is None:
         raise RuntimeError("external TW public features require polars and pyarrow")
@@ -953,12 +955,38 @@ def _load_external_feature_arrays(
     # Rules-only TW runs should not materialize millions of rows across every
     # public model feature. Arrow projection keeps I/O and peak RAM proportional
     # to the independently enabled column families.
+    date_type = pq.read_schema(path).field("date").type
+
+    def filter_value(value: date) -> date | datetime | str:
+        if pa.types.is_string(date_type) or pa.types.is_large_string(date_type):
+            return value.isoformat()
+        if pa.types.is_timestamp(date_type):
+            return datetime.combine(value, time.min)
+        return value
+
+    filters: list[tuple[str, str, date | datetime | str]] = []
+    if date_start is not None:
+        filters.append(("date", ">=", filter_value(date_start)))
+    if date_end is not None:
+        filters.append(("date", "<=", filter_value(date_end)))
     frame = pl.from_arrow(
         pq.read_table(
             path,
             columns=["date", "symbol", *value_columns],
+            filters=filters or None,
             memory_map=True,
         )
+    )
+    rule_frame = (
+        pl.from_arrow(
+            pq.read_table(
+                path,
+                columns=["date", "symbol", *rule_names],
+                memory_map=True,
+            )
+        )
+        if filters and rule_names
+        else None
     )
     if not feature_names:
         if not rule_names:
@@ -973,21 +1001,35 @@ def _load_external_feature_arrays(
                 official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
             )
 
-    frame = (
-        frame.with_columns(
-            [
-                _polars_datetime_ns_expr(frame.schema, "date"),
-                pl.col("symbol").cast(pl.Utf8, strict=False).str.strip_chars().str.to_uppercase().alias("symbol"),
-                *[pl.col(name).cast(pl.Float64, strict=False).alias(name) for name in value_columns],
-            ]
+    def prepare_frame(source: Any, columns: list[str]) -> Any:
+        return (
+            source.with_columns(
+                [
+                    _polars_datetime_ns_expr(source.schema, "date"),
+                    pl.col("symbol")
+                    .cast(pl.Utf8, strict=False)
+                    .str.strip_chars()
+                    .str.to_uppercase()
+                    .alias("symbol"),
+                    *[
+                        pl.col(name).cast(pl.Float64, strict=False).alias(name)
+                        for name in columns
+                    ],
+                ]
+            )
+            .drop_nulls(["date", "symbol"])
+            .filter(pl.col("symbol") != "")
+            .group_by(["date", "symbol"])
+            .agg([pl.col(name).drop_nulls().last().alias(name) for name in columns])
+            .sort(["symbol", "date"])
         )
-        .drop_nulls(["date", "symbol"])
-        .filter(pl.col("symbol") != "")
-        .group_by(["date", "symbol"])
-        .agg([pl.col(name).drop_nulls().last().alias(name) for name in value_columns])
-        .sort(["symbol", "date"])
-    )
-    if frame.is_empty():
+
+    frame = prepare_frame(frame, value_columns)
+    if rule_frame is not None:
+        rule_frame = prepare_frame(rule_frame, rule_names)
+    else:
+        rule_frame = frame
+    if frame.is_empty() and (rule_frame is None or rule_frame.is_empty()):
         return _ExternalFeatureArrays(
             feature_names=feature_names,
             market_dates=np.empty((0,), dtype="datetime64[ns]"),
@@ -999,44 +1041,71 @@ def _load_external_feature_arrays(
             official_session_dates=np.empty((0,), dtype="datetime64[ns]"),
         )
 
+    # `frame` is already sorted by symbol/date. Convert each column family once,
+    # then retain zero-copy contiguous symbol slices instead of materializing
+    # thousands of tiny Polars frames during live inference.
+    all_dates, all_feature_values = _external_frame_to_arrays(frame, feature_names)
+    all_symbols = frame["symbol"].to_numpy()
+    if all_dates.size != all_symbols.size:
+        raise RuntimeError("external feature date/symbol arrays are misaligned")
+
     market_key = str(market_symbol).strip().upper()
-    market_frame = frame.filter(pl.col("symbol") == market_key).sort("date")
-    market_dates, market_values = _external_frame_to_arrays(market_frame, feature_names)
-    _, market_rule_values = _external_frame_to_arrays(
-        market_frame,
+    market_mask = all_symbols == market_key
+    market_dates = all_dates[market_mask]
+    market_values = all_feature_values[market_mask]
+
+    rule_dates, all_rule_values = _external_frame_to_arrays(
+        rule_frame,
         rule_names,
         dtype=np.float64,
     )
+    rule_symbols = rule_frame["symbol"].to_numpy()
+    if rule_dates.size != rule_symbols.size:
+        raise RuntimeError("external rule date/symbol arrays are misaligned")
+    rule_market_mask = rule_symbols == market_key
+    market_rule_dates = rule_dates[rule_market_mask]
+    market_rule_values = all_rule_values[rule_market_mask]
 
+    official_session_dates = np.empty((0,), dtype="datetime64[ns]")
+    official_idx = (
+        rule_names.index("_twpub_official_traded")
+        if "_twpub_official_traded" in rule_names
+        else None
+    )
+    if official_idx is not None and market_rule_dates.size:
+        traded = np.nan_to_num(market_rule_values[:, official_idx], nan=0.0) > 0.0
+        if bool(traded.any()):
+            official_session_dates = np.unique(market_rule_dates[traded])
+
+    stock_mask = ~market_mask
+    stock_symbols = all_symbols[stock_mask]
+    stock_dates = all_dates[stock_mask]
+    stock_feature_values = all_feature_values[stock_mask]
     by_symbol: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     by_symbol_rules: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    stock_frame = frame.filter(pl.col("symbol") != market_key)
-    official_session_dates = np.empty((0,), dtype="datetime64[ns]")
-    if "_twpub_official_traded" in rule_names and not market_frame.is_empty():
-        # Only the receipt-derived TAIEX market row defines exchange sessions.
-        # Stock rows are sparse and macro market rows can occur on holidays, so
-        # neither is a safe calendar authority.
-        official_frame = (
-            market_frame.filter(pl.col("_twpub_official_traded").fill_null(0.0) > 0.0)
-            .select("date")
-            .unique()
-            .sort("date")
-        )
-        if not official_frame.is_empty():
-            official_session_dates = official_frame["date"].to_numpy().astype(
-                "datetime64[ns]", copy=False
+    if stock_symbols.size:
+        boundaries = np.flatnonzero(stock_symbols[1:] != stock_symbols[:-1]) + 1
+        starts = np.concatenate((np.array([0]), boundaries))
+        stops = np.concatenate((boundaries, np.array([stock_symbols.size])))
+        for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
+            key = str(stock_symbols[start]).upper()
+            dates = stock_dates[start:stop]
+            by_symbol[key] = (dates, stock_feature_values[start:stop])
+
+    rule_stock_mask = ~rule_market_mask
+    stock_rule_symbols = rule_symbols[rule_stock_mask]
+    stock_rule_dates = rule_dates[rule_stock_mask]
+    stock_rule_values = all_rule_values[rule_stock_mask]
+    if stock_rule_symbols.size:
+        boundaries = np.flatnonzero(stock_rule_symbols[1:] != stock_rule_symbols[:-1]) + 1
+        starts = np.concatenate((np.array([0]), boundaries))
+        stops = np.concatenate((boundaries, np.array([stock_rule_symbols.size])))
+        for start, stop in zip(starts.tolist(), stops.tolist(), strict=True):
+            key = str(stock_rule_symbols[start]).upper()
+            by_symbol_rules[key] = (
+                stock_rule_dates[start:stop],
+                stock_rule_values[start:stop],
             )
-    if not stock_frame.is_empty():
-        for symbol, symbol_frame in stock_frame.partition_by("symbol", as_dict=True).items():
-            key = symbol[0] if isinstance(symbol, tuple) else symbol
-            dates, values = _external_frame_to_arrays(symbol_frame.sort("date"), feature_names)
-            by_symbol[str(key).upper()] = (dates, values)
-            rule_dates, rule_values = _external_frame_to_arrays(
-                symbol_frame.sort("date"),
-                rule_names,
-                dtype=np.float64,
-            )
-            by_symbol_rules[str(key).upper()] = (rule_dates, rule_values)
 
     print(
         f"[panel] external features loaded path={path} "
@@ -1066,11 +1135,19 @@ def _external_frame_to_arrays(
             np.empty((0, len(feature_names)), dtype=dtype),
         )
     dates = frame["date"].to_numpy().astype("datetime64[ns]", copy=False)
-    values = (
-        frame.select([pl.col(name).cast(pl.Float64, strict=False).fill_null(float("nan")) for name in feature_names])
-        .to_numpy()
-        .astype(dtype, copy=False)
-    )
+    if feature_names:
+        values = (
+            frame.select(
+                [
+                    pl.col(name).cast(pl.Float64, strict=False).fill_null(float("nan"))
+                    for name in feature_names
+                ]
+            )
+            .to_numpy()
+            .astype(dtype, copy=False)
+        )
+    else:
+        values = np.empty((int(dates.size), 0), dtype=dtype)
     valid_dates = ~np.isnat(dates)
     if not bool(valid_dates.all()):
         dates = dates[valid_dates]
@@ -3244,12 +3321,39 @@ def build_tail_panel(
         if arrays is not None:
             valid_arrays.append(arrays)
 
+    external_date_source = np.empty((0,), dtype="datetime64[ns]")
+    if valid_arrays:
+        benchmark_idx = _resolve_benchmark_index(
+            [item.symbol for item in valid_arrays],
+            benchmark_name,
+        )
+        if benchmark_idx is not None and valid_arrays[benchmark_idx].dates.size:
+            external_date_source = valid_arrays[benchmark_idx].dates
+        else:
+            external_date_source = np.concatenate(
+                [item.dates for item in valid_arrays if item.dates.size]
+            )
+
     external_features = (
         _load_external_feature_arrays(
             external_feature_path,
             market_symbol=external_market_symbol,
             include_features=external_include_features,
             include_rules=external_include_rules,
+            date_start=(
+                date.fromisoformat(
+                    str(external_date_source.min().astype("datetime64[D]"))
+                )
+                if external_date_source.size
+                else None
+            ),
+            date_end=(
+                date.fromisoformat(
+                    str(external_date_source.max().astype("datetime64[D]"))
+                )
+                if external_date_source.size
+                else None
+            ),
         )
         if external_feature_path is not None
         else None
