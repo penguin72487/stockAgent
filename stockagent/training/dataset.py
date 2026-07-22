@@ -9,6 +9,7 @@ from stockagent.backtest.tw_execution import (
     official_tw_short_initial_margin_rates,
 )
 from stockagent.data.panel import PanelData
+from stockagent.data.walkforward import normalize_lookback_context
 
 
 def execution_feature_lag(execution_mode: str) -> int:
@@ -35,11 +36,15 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         allow_empty: bool = False,
         include_volume_notional: bool = True,
         execution_mode: str = "naive",
+        lookback_context: str = "split_only",
         short_capacity_limit_enabled: bool = True,
         tw_corporate_action_mode: str = "avoid",
     ) -> None:
         self.lookback = int(lookback)
+        if self.lookback <= 0:
+            raise ValueError(f"lookback must be positive, got {lookback!r}")
         self.execution_mode = normalize_execution_mode(execution_mode)
+        self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
         self.tw_corporate_action_mode = str(tw_corporate_action_mode).strip().lower()
         if self.tw_corporate_action_mode not in {"avoid", "exact"}:
@@ -251,14 +256,19 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             if not allow_empty:
                 raise ValueError("Fold has no dates after split filtering.")
         else:
-            # Keep only indices that have a full lookback window inside this fold.
-            fold_start_idx = int(self.date_indices[0])
             # Real Taiwan execution uses close-complete information through
             # t-1.  The opt-in day-trade open-gap channel is stored on that row
             # but represents only the already-observed open[t] quote.  Naive
             # preserves the historical same-row feature contract.
             feature_lag = execution_feature_lag(self.execution_mode)
-            min_valid_idx = fold_start_idx + self.lookback - 1 + feature_lag
+            if self.lookback_context == "panel_history":
+                # Targets, returns, masks, ledger state, and metrics still begin
+                # at the split boundary. Only the causal feature window may read
+                # earlier global panel rows.
+                min_valid_idx = self.lookback - 1 + feature_lag
+            else:
+                fold_start_idx = int(self.date_indices[0])
+                min_valid_idx = fold_start_idx + self.lookback - 1 + feature_lag
             valid_indices = self.date_indices[self.date_indices >= min_valid_idx]
             if valid_indices.size > 0 and self.execution_mode == "naive":
                 executable_or_terminal = (
@@ -269,8 +279,10 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self.valid_indices = valid_indices
 
         if len(self.valid_indices) == 0 and not allow_empty:
+            scope = "panel" if self.lookback_context == "panel_history" else "split"
             raise ValueError(
-                f"Fold has insufficient data for lookback={self.lookback}. Need at least {self.lookback} dates."
+                f"Fold has insufficient data: {scope} history for lookback={self.lookback}. "
+                f"Need at least {self.lookback} causal feature dates."
             )
 
         if self.execution_mode == "naive":

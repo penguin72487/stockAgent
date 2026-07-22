@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,6 +23,56 @@ from stockagent.explainability import (
 )
 from stockagent.explainability_cross_asset import CrossAssetTransmissionSettings, _auto_row_chunk_size
 from stockagent.data.walkforward import WalkForwardFold
+
+
+def test_explainability_distributed_init_creates_long_timeout_gloo_barrier_group(
+    monkeypatch,
+) -> None:
+    calls: dict[str, object] = {}
+    barrier_group = object()
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("STOCKAGENT_EXPLAINABILITY_BARRIER_TIMEOUT_SECONDS", "4096")
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda rank: calls.setdefault("device", rank))
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: calls.setdefault("init", kwargs),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "new_group",
+        lambda **kwargs: calls.setdefault("new_group", kwargs) and barrier_group,
+    )
+    monkeypatch.setattr(explainability_module.atexit, "register", lambda fn: calls.setdefault("atexit", fn))
+    monkeypatch.setattr(explainability_module, "_EXPLAINABILITY_BARRIER_GROUP", None)
+
+    assert explainability_module._initialize_explainability_process_group() is True
+    assert calls["device"] == 0
+    assert calls["init"] == {"backend": "nccl", "timeout": timedelta(seconds=4096)}
+    assert calls["new_group"] == {"backend": "gloo", "timeout": timedelta(seconds=4096)}
+    assert explainability_module._EXPLAINABILITY_BARRIER_GROUP is barrier_group
+
+
+def test_explainability_distributed_barrier_prefers_cpu_group(monkeypatch) -> None:
+    barrier_group = object()
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        explainability_module,
+        "_EXPLAINABILITY_BARRIER_GROUP",
+        barrier_group,
+    )
+
+    explainability_module._distributed_barrier()
+
+    assert calls == [{"group": barrier_group}]
 
 
 def test_streaming_parquet_csv_export_handles_nested_batches(tmp_path: Path) -> None:

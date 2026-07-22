@@ -5,6 +5,27 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def normalize_lookback_context(value: str) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "split": "split_only",
+        "split_only": "split_only",
+        "fold": "split_only",
+        "fold_only": "split_only",
+        "panel": "panel_history",
+        "history": "panel_history",
+        "panel_history": "panel_history",
+        "cross_split": "panel_history",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "lookback_context must be 'split_only' or 'panel_history', got "
+            f"{value!r}"
+        ) from exc
+
+
 @dataclass(slots=True)
 class WalkForwardFold:
     fold_id: int
@@ -50,6 +71,7 @@ def build_expanding_year_folds(
     min_train_years: int,
     val_years: int = 1,
     require_future_test_year: bool = True,
+    split_start_year: int | None = None,
 ) -> list[WalkForwardFold]:
     """Build expanding-window folds.
 
@@ -62,9 +84,23 @@ def build_expanding_year_folds(
     allowed with no future test year. In that final fold, the validation window
     is reused as the test window. This intentionally overlaps val/test and is
     useful only for latest-year experiments, not unbiased model selection.
+
+    ``split_start_year`` removes older panel years from target ownership without
+    removing their rows from the panel. They can therefore serve as causal
+    feature context without renumbering the requested folds.
     """
     years = np.asarray(dates, dtype="datetime64[Y]").astype(np.int64) + 1970
-    unique_years = sorted(np.unique(years).astype(int).tolist())
+    panel_years = sorted(np.unique(years).astype(int).tolist())
+    if split_start_year is None:
+        unique_years = panel_years
+    else:
+        requested_start = int(split_start_year)
+        unique_years = [year for year in panel_years if year >= requested_start]
+        if not unique_years or unique_years[0] != requested_start:
+            raise ValueError(
+                "walk-forward split_start_year is absent from panel dates: "
+                f"requested={requested_start}, panel_years={panel_years[:3]}...{panel_years[-3:]}"
+            )
     folds: list[WalkForwardFold] = []
 
     total_years = len(unique_years)

@@ -1,0 +1,4 @@
+// Only synchronize the Taiwan public dataset.
+!data_tw_public
+!data_tw_public/**
+*

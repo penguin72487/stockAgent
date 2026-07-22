@@ -659,6 +659,45 @@ def test_tw_day_trade_open_sizing_is_invariant_to_the_later_close() -> None:
     assert doubled.turnovers[0].item() == pytest.approx(0.75)
 
 
+@pytest.mark.parametrize(
+    ("target", "intraday_return", "can_buy_close", "can_sell_close"),
+    [
+        # Buy at an inside-band open, then sell after the stock reaches its
+        # upper limit.  A close-side buy block must not cancel the long trade.
+        (1.0, math.log(1.10), False, True),
+        # Sell first at an inside-band open, then buy back after the stock
+        # reaches its lower limit.  A close-side sell block must not cancel the
+        # short trade.
+        (-1.0, math.log(0.90), True, False),
+    ],
+)
+def test_tw_day_trade_executes_when_limit_is_reached_after_the_open(
+    target: float,
+    intraday_return: float,
+    can_buy_close: bool,
+    can_sell_close: bool,
+) -> None:
+    shape = (1, 1)
+    open_mask = torch.ones(shape, dtype=torch.bool)
+    result = run_tw_day_trade_continuous(
+        torch.tensor([[target]], dtype=torch.float64),
+        torch.tensor([[intraday_return]], dtype=torch.float64),
+        torch.ones(shape, dtype=torch.bool),
+        torch.full(shape, can_buy_close, dtype=torch.bool),
+        torch.full(shape, can_sell_close, dtype=torch.bool),
+        open_mask,
+        open_mask,
+        torch.zeros(1, dtype=torch.float64),
+        torch.zeros(1, dtype=torch.float64),
+        day_trade_can_buy_open_mask=open_mask,
+        day_trade_can_sell_open_mask=open_mask,
+    )
+
+    assert result.strategy_returns[0].item() == pytest.approx(math.log(1.10))
+    assert result.turnovers[0].item() > 0.0
+    assert result.weights_history[0, 0].item() != pytest.approx(0.0)
+
+
 def test_tw_continuous_rejects_non_scalar_initial_state_fields_cleanly() -> None:
     values = torch.zeros((1, 1), dtype=torch.float64)
     mask = torch.ones_like(values, dtype=torch.bool)
@@ -812,6 +851,111 @@ def test_tw_cash_carried_short_requires_both_nonzero_collateral_pools(
             initial_cash=torch.tensor(0.55, dtype=torch.float64),
             initial_short_sale_collateral=sale_collateral,
             initial_short_margin_collateral=margin_collateral,
+        )
+
+
+def test_tw_cash_float32_carried_short_roundoff_dust_is_not_a_naked_short() -> None:
+    # The compiled FP32 recurrence can leave a sub-ULP signed residue after a
+    # full cover.  It remains part of the normalized ledger, but is not an
+    # economically open short requiring fabricated collateral.
+    target = torch.zeros((1, 1), dtype=torch.float32)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    result = run_tw_cash_continuous(
+        target,
+        target,
+        mask,
+        mask,
+        mask,
+        torch.zeros(1, dtype=torch.float32),
+        torch.zeros(1, dtype=torch.float32),
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
+        initial_weights=torch.tensor([-1.02039709e-12], dtype=torch.float32),
+        initial_cash=torch.tensor(1.0, dtype=torch.float32),
+        initial_short_sale_collateral=torch.zeros(1, dtype=torch.float32),
+        initial_short_margin_collateral=torch.zeros(1, dtype=torch.float32),
+    )
+
+    assert result.final_alive is not None and bool(result.final_alive)
+    assert result.final_weights[0].item() == pytest.approx(0.0, abs=2.0e-12)
+    _assert_tw_cash_margin_identity(result)
+
+
+def test_tw_cash_float32_distributed_small_shorts_use_account_materiality() -> None:
+    # Each carried short is below the FP32 per-symbol threshold, while their
+    # aggregate is material.  Complete collateral makes this a valid account,
+    # not an orphaned-collateral state.
+    initial_weights = torch.tensor([-1.0e-6, -1.0e-6, -1.0e-6], dtype=torch.float32)
+    sale = torch.full((3,), 1.0e-6, dtype=torch.float32)
+    margin = torch.full((3,), 0.9e-6, dtype=torch.float32)
+    target = torch.zeros((1, 3), dtype=torch.float32)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    initial_cash = 1.0 - initial_weights.sum() - sale.sum() - margin.sum()
+
+    result = run_tw_cash_continuous(
+        target,
+        target,
+        mask,
+        mask,
+        mask,
+        torch.zeros(3, dtype=torch.float32),
+        torch.zeros(3, dtype=torch.float32),
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
+        initial_weights=initial_weights,
+        initial_cash=initial_cash,
+        initial_short_sale_collateral=sale,
+        initial_short_margin_collateral=margin,
+    )
+
+    assert result.final_alive is not None and bool(result.final_alive)
+    _assert_tw_cash_margin_identity(result)
+
+
+def test_tw_cash_float32_collateralized_short_does_not_magnify_naked_dust() -> None:
+    initial_weights = torch.tensor([-0.25, -1.02039709e-12], dtype=torch.float32)
+    sale = torch.tensor([0.25, 0.0], dtype=torch.float32)
+    margin = torch.tensor([0.225, 0.0], dtype=torch.float32)
+    target = torch.zeros((1, 2), dtype=torch.float32)
+    mask = torch.ones_like(target, dtype=torch.bool)
+    initial_cash = 1.0 - initial_weights.sum() - sale.sum() - margin.sum()
+
+    result = run_tw_cash_continuous(
+        target,
+        target,
+        mask,
+        mask,
+        mask,
+        torch.zeros(2, dtype=torch.float32),
+        torch.zeros(2, dtype=torch.float32),
+        unresolved_corporate_action_mask=torch.zeros_like(mask),
+        initial_weights=initial_weights,
+        initial_cash=initial_cash,
+        initial_short_sale_collateral=sale,
+        initial_short_margin_collateral=margin,
+    )
+
+    assert result.final_alive is not None and bool(result.final_alive)
+    _assert_tw_cash_margin_identity(result)
+
+
+def test_tw_cash_float32_distributed_material_short_still_requires_collateral() -> None:
+    initial_weights = torch.tensor([-1.0e-6, -1.0e-6, -1.0e-6], dtype=torch.float32)
+    target = torch.zeros((1, 3), dtype=torch.float32)
+    mask = torch.ones_like(target, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="nonzero per-symbol"):
+        run_tw_cash_continuous(
+            target,
+            target,
+            mask,
+            mask,
+            mask,
+            torch.zeros(3, dtype=torch.float32),
+            torch.zeros(3, dtype=torch.float32),
+            unresolved_corporate_action_mask=torch.zeros_like(mask),
+            initial_weights=initial_weights,
+            initial_cash=1.0 - initial_weights.sum(),
+            initial_short_sale_collateral=torch.zeros(3, dtype=torch.float32),
+            initial_short_margin_collateral=torch.zeros(3, dtype=torch.float32),
         )
 
 
