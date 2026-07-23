@@ -1,5 +1,19 @@
-"""Content-addressed dataset snapshot synchronization helpers."""
+"""Distributed, reproducible dataset snapshot helpers."""
 
-from .desync_snapshots import SnapshotError, init_sync_root, publish_snapshot
+from stockagent.data_sync.desync_snapshots import (
+    HLC,
+    SnapshotError,
+    fetch_snapshot,
+    publish_snapshot,
+    resolve_latest,
+    verify_snapshot,
+)
 
-__all__ = ["SnapshotError", "init_sync_root", "publish_snapshot"]
+__all__ = [
+    "HLC",
+    "SnapshotError",
+    "fetch_snapshot",
+    "publish_snapshot",
+    "resolve_latest",
+    "verify_snapshot",
+]
