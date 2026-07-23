@@ -1,22 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="1.0.3"
-case "$(uname -s):$(uname -m)" in
-  Linux:x86_64) platform="linux_amd64"; expected="ad4dd9e91b57eef8627d2038df09281d7f38dca02eeca0e66592b54087619953" ;;
-  Linux:aarch64|Linux:arm64) platform="linux_arm64"; expected="9008e297f527634efe94688f67c7a49a534c561bf43d223e50f64bec899c15ca" ;;
-  Darwin:x86_64) platform="darwin_amd64"; expected="ab029448074428dc757d2235109dd557e9f34e4865052432a6ea7c431f0a5a19" ;;
-  Darwin:arm64) platform="darwin_arm64"; expected="d3082017b9f12d8716aa1fb4b33f80a4e781305971508db45bf777fc110a657d" ;;
-  *) echo "unsupported platform: $(uname -s) $(uname -m)" >&2; exit 2 ;;
+DESYNC_VERSION=${DESYNC_VERSION:-1.0.3}
+INSTALL_DIR=${1:-"${HOME}/.local/bin"}
+OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
+MACHINE=$(uname -m)
+
+case "${MACHINE}" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *)
+    echo "unsupported architecture: ${MACHINE}" >&2
+    exit 2
+    ;;
 esac
 
-asset="desync_${version}_${platform}.tar.gz"
-tmp_dir="$(mktemp -d)"
-archive="$tmp_dir/$asset"
-curl -fsSL "https://github.com/folbricht/desync/releases/download/v${version}/${asset}" -o "$archive"
-printf '%s  %s\n' "$expected" "$archive" | sha256sum -c -
-tar -xzf "$archive" -C "$tmp_dir" desync
-install -d -m 0755 "${HOME}/.local/bin"
-install -m 0755 "$tmp_dir/desync" "${HOME}/.local/bin/desync"
-"${HOME}/.local/bin/desync" help >/dev/null
-echo "installed desync v${version} at ${HOME}/.local/bin/desync"
+case "${OS_NAME}" in
+  linux|darwin) ;;
+  *)
+    echo "unsupported operating system: ${OS_NAME}" >&2
+    exit 2
+    ;;
+esac
+
+ARCHIVE="desync_${DESYNC_VERSION}_${OS_NAME}_${ARCH}.tar.gz"
+BASE_URL="https://github.com/folbricht/desync/releases/download/v${DESYNC_VERSION}"
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/stockagent-desync.XXXXXX")
+trap 'rm -rf -- "${WORK_DIR}"' EXIT
+
+curl --fail --location --silent --show-error \
+  --output "${WORK_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}"
+curl --fail --location --silent --show-error \
+  --output "${WORK_DIR}/checksums.txt" "${BASE_URL}/checksums.txt"
+(
+  cd "${WORK_DIR}"
+  grep "  ${ARCHIVE}$" checksums.txt | sha256sum --check --strict -
+  tar -xzf "${ARCHIVE}"
+)
+
+mkdir -p -- "${INSTALL_DIR}"
+install -m 0755 "${WORK_DIR}/desync" "${INSTALL_DIR}/desync"
+echo "installed desync v${DESYNC_VERSION}: ${INSTALL_DIR}/desync"

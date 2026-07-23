@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "$repo_root/scripts/runtime_env.sh"
-export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
-export PATH="${HOME}/.local/bin:$PATH"
-run_fintech_python "$repo_root/scripts/desync_snapshot.py" "$@"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
+
+# shellcheck source=scripts/runtime_env.sh
+source "${SCRIPT_DIR}/runtime_env.sh"
+run_fintech_python "${REPO_ROOT}/scripts/desync_snapshot.py" "$@"

@@ -1,57 +1,162 @@
-"""Multi-writer dataset snapshots backed by desync and Syncthing.
-
-Syncthing transports immutable chunks, indexes and manifests.  Each publisher
-writes only its own head file; a deterministic hybrid logical clock selects the
-latest complete snapshot without multiple machines writing the same file.
-"""
-
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import datetime as dt
 import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
-import tempfile
 import time
-from pathlib import Path
-from typing import Any, Iterable
+import uuid
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SNAPSHOT_SCHEMA_VERSION = 1
+HEAD_SCHEMA_VERSION = 1
+DEFAULT_CHUNK_SIZE_KIB = "256:1024:4096"
+DEFAULT_MAX_CLOCK_SKEW_SECONDS = 300
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_STIGNORE = """// Local transactional state must never leave this node.
+(?d).local-state
+(?d).local-state/**
+// Materialized trees are local caches, not replication inputs.
+(?d)materialized
+(?d)materialized/**
+"""
 
 
 class SnapshotError(RuntimeError):
-    """A snapshot cannot safely be published, resolved, or restored."""
+    """A dataset snapshot could not be safely published or consumed."""
 
 
-def _name(value: str, kind: str) -> str:
-    if not _NAME_RE.fullmatch(value):
-        raise SnapshotError(f"invalid {kind}: {value!r}")
-    return value
+@dataclasses.dataclass(frozen=True, order=True)
+class HLC:
+    """A deterministic Hybrid Logical Clock stamp.
+
+    The physical component gives last-write-wins behavior when clocks are
+    healthy. The logical component preserves causal ordering when a publisher
+    has already observed an equal or later remote stamp. ``node_id`` provides a
+    stable final tie-break for concurrent writes.
+    """
+
+    physical_ns: int
+    logical: int
+    node_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "physical_ns": self.physical_ns,
+            "logical": self.logical,
+            "node_id": self.node_id,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "HLC":
+        try:
+            stamp = cls(
+                physical_ns=int(value["physical_ns"]),
+                logical=int(value["logical"]),
+                node_id=validate_slug(str(value["node_id"]), "HLC node_id"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SnapshotError(f"invalid HLC: {value!r}") from exc
+        if stamp.physical_ns <= 0 or stamp.logical < 0:
+            raise SnapshotError(f"invalid HLC values: {value!r}")
+        return stamp
 
 
-def _json_bytes(value: Any) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+@dataclasses.dataclass(frozen=True)
+class ResolvedSnapshot:
+    manifest: dict[str, Any]
+    manifest_path: Path
+    manifest_sha256: str
+    head_path: Path | None
+    diagnostics: tuple[str, ...] = ()
 
 
-def _atomic_write(path: Path, data: bytes, mode: int = 0o660) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    tmp = Path(raw_tmp)
+def validate_slug(value: str, label: str) -> str:
+    text = str(value).strip()
+    if not _SLUG_RE.fullmatch(text) or text in {".", ".."}:
+        raise SnapshotError(f"{label} must match {_SLUG_RE.pattern!r}; got {value!r}")
+    return text
+
+
+def _utc_iso_from_ns(timestamp_ns: int) -> str:
+    seconds, nanos = divmod(int(timestamp_ns), 1_000_000_000)
+    base = dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
+    return f"{base.strftime('%Y-%m-%dT%H:%M:%S')}.{nanos:09d}Z"
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def sha256_file(path: Path, *, block_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(block_size):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
     try:
-        with os.fdopen(fd, "wb") as handle:
-            os.fchmod(handle.fileno(), mode)
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
     finally:
-        tmp.unlink(missing_ok=True)
+        os.close(fd)
+
+
+def atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / (
+        f".syncthing.{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("xb") as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    atomic_write_bytes(path, _canonical_json_bytes(value))
+
+
+def write_immutable_json(path: Path, value: Any) -> str:
+    content = _canonical_json_bytes(value)
+    digest = hashlib.sha256(content).hexdigest()
+    if path.exists():
+        existing = path.read_bytes()
+        if existing != content:
+            raise SnapshotError(f"immutable metadata collision at {path}")
+        return digest
+    atomic_write_bytes(path, content)
+    return digest
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -60,298 +165,818 @@ def _load_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise SnapshotError(f"cannot read valid JSON from {path}: {exc}") from exc
     if not isinstance(value, dict):
-        raise SnapshotError(f"expected JSON object in {path}")
+        raise SnapshotError(f"JSON root must be an object: {path}")
     return value
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def _safe_relative_path(value: str, label: str) -> PurePosixPath:
+    path = PurePosixPath(str(value))
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise SnapshotError(f"unsafe {label}: {value!r}")
+    return path
 
 
-def _paths(sync_root: Path) -> dict[str, Path]:
-    return {
-        "local": sync_root / ".local-state",
-        "heads": sync_root / "heads",
-        "indices": sync_root / "indices",
-        "manifests": sync_root / "manifests",
-        "stores": sync_root / "stores",
-    }
+def _path_under(root: Path, relative: str, label: str) -> Path:
+    rel = _safe_relative_path(relative, label)
+    return root.joinpath(*rel.parts)
 
 
-def init_sync_root(sync_root: Path, node_id: str, ignore_template: Path | None = None) -> dict[str, Any]:
-    node_id = _name(node_id, "node ID")
+def _contains_git_metadata(path: Path) -> Path | None:
+    resolved = path.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    left = first.resolve()
+    right = second.resolve()
+    return left == right or left in right.parents or right in left.parents
+
+
+def default_node_id() -> str:
+    host = re.sub(r"[^A-Za-z0-9._-]+", "-", socket.gethostname()).strip("-.")
+    host = host or "node"
+    machine_id = ""
+    for candidate in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        try:
+            machine_id = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if machine_id:
+            break
+    suffix_source = machine_id or f"{host}-{uuid.getnode()}"
+    suffix = hashlib.sha256(suffix_source.encode("utf-8")).hexdigest()[:12]
+    return validate_slug(f"{host[:80]}-{suffix}", "node_id")
+
+
+def initialize_layout(
+    sync_root: Path,
+    *,
+    node_id: str | None = None,
+    replace_ignore: bool = False,
+    replace_node_id: bool = False,
+) -> str:
     sync_root = sync_root.resolve()
-    paths = _paths(sync_root)
-    sync_root.mkdir(parents=True, exist_ok=True)
-    for path in paths.values():
-        path.mkdir(parents=True, exist_ok=True)
-    node_file = paths["local"] / "node-id"
-    if node_file.exists():
-        current = node_file.read_text(encoding="utf-8").strip()
-        if current != node_id:
+    if git_root := _contains_git_metadata(sync_root):
+        raise SnapshotError(
+            f"sync root {sync_root} is inside Git worktree {git_root}; "
+            "use a separate data-only directory"
+        )
+    resolved_node_id = validate_slug(node_id or default_node_id(), "node_id")
+    for relative in (
+        "heads",
+        "indices",
+        "manifests",
+        "stores",
+        ".local-state/locks",
+        ".local-state/staging",
+    ):
+        (sync_root / relative).mkdir(parents=True, exist_ok=True)
+    ignore_path = sync_root / ".stignore"
+    if replace_ignore or not ignore_path.exists():
+        atomic_write_bytes(ignore_path, _STIGNORE.encode("utf-8"))
+    node_path = sync_root / ".local-state" / "node-id"
+    if node_path.exists():
+        existing = node_path.read_text(encoding="utf-8").strip()
+        if existing:
+            existing = validate_slug(existing, "stored node_id")
+            if node_id is None:
+                return existing
+            if existing != resolved_node_id and not replace_node_id:
+                raise SnapshotError(
+                    f"node_id is already {existing}; refusing to change it to "
+                    f"{resolved_node_id} without --replace-node-id"
+                )
+    atomic_write_bytes(node_path, f"{resolved_node_id}\n".encode("utf-8"), mode=0o600)
+    return resolved_node_id
+
+
+def resolve_node_id(sync_root: Path, explicit: str | None = None) -> str:
+    requested = validate_slug(explicit, "node_id") if explicit else None
+    if from_env := os.environ.get("STOCKAGENT_SYNC_NODE_ID"):
+        env_node = validate_slug(from_env, "STOCKAGENT_SYNC_NODE_ID")
+        if requested is not None and requested != env_node:
             raise SnapshotError(
-                f"sync root belongs to node {current!r}, refusing to replace it with {node_id!r}"
+                f"--node-id {requested} disagrees with STOCKAGENT_SYNC_NODE_ID {env_node}"
             )
-    else:
-        _atomic_write(node_file, f"{node_id}\n".encode(), mode=0o600)
-    if ignore_template is not None:
-        _atomic_write(sync_root / ".stignore", ignore_template.read_bytes())
-    return {"sync_root": str(sync_root), "node_id": node_id, "schema": SCHEMA_VERSION}
-
-
-def _node_id(sync_root: Path) -> str:
-    path = sync_root / ".local-state" / "node-id"
+        requested = env_node
+    node_path = sync_root / ".local-state" / "node-id"
     try:
-        return _name(path.read_text(encoding="utf-8").strip(), "node ID")
+        stored = node_path.read_text(encoding="utf-8").strip()
     except OSError as exc:
-        raise SnapshotError(f"missing node ID; run init first: {path}") from exc
+        raise SnapshotError(
+            f"node identity is not initialized under {sync_root}; run init first"
+        ) from exc
+    stored = validate_slug(stored, "stored node_id")
+    if requested is not None and requested != stored:
+        raise SnapshotError(
+            f"requested node_id {requested} disagrees with initialized node_id {stored}"
+        )
+    return stored
 
 
-def _inventory(root: Path, *, portable: bool = False) -> dict[str, Any]:
+@contextlib.contextmanager
+def _exclusive_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def scan_tree(root: Path) -> dict[str, Any]:
+    """Return cheap portable and mutation-detection fingerprints.
+
+    The portable fingerprint intentionally excludes timestamps and ownership so
+    a ``desync tar --no-time`` extraction can be compared across machines. The
+    stability fingerprint includes inode metadata and is used only to detect a
+    live source changing while its archive is being produced. Chunk and index
+    hashes remain the content-integrity authority.
+    """
+
+    root = root.resolve()
     if not root.is_dir():
         raise SnapshotError(f"snapshot source is not a directory: {root}")
-    digest = hashlib.sha256()
-    files = directories = total_bytes = 0
-    for current, dir_names, file_names in os.walk(root, topdown=True, followlinks=False):
+    portable = hashlib.sha256()
+    stability = hashlib.sha256()
+    files = directories = symlinks = logical_bytes = 0
+
+    def update_entry(
+        relative: str, kind: str, info: os.stat_result, extra: str
+    ) -> None:
+        nonlocal files, directories, symlinks, logical_bytes
+        path_bytes = relative.encode("utf-8", errors="surrogateescape")
+        extra_bytes = extra.encode("utf-8", errors="surrogateescape")
+        portable_size = info.st_size if kind == "F" else 0
+        portable.update(kind.encode("ascii") + b"\0" + path_bytes + b"\0")
+        portable.update(
+            str(portable_size).encode("ascii") + b"\0" + extra_bytes + b"\n"
+        )
+        stability.update(kind.encode("ascii") + b"\0" + path_bytes + b"\0")
+        stability.update(
+            (
+                f"{info.st_size}:{info.st_mode}:{info.st_mtime_ns}:"
+                f"{info.st_ctime_ns}:{info.st_dev}:{info.st_ino}:"
+            ).encode("ascii")
+            + extra_bytes
+            + b"\n"
+        )
+        if kind == "F":
+            files += 1
+            logical_bytes += info.st_size
+        elif kind == "D":
+            directories += 1
+        elif kind == "L":
+            symlinks += 1
+
+    for current, dir_names, file_names in os.walk(
+        root, topdown=True, followlinks=False
+    ):
         dir_names.sort()
         file_names.sort()
         current_path = Path(current)
-        for name in [*dir_names, *file_names]:
+        for name in list(dir_names):
             path = current_path / name
-            rel = path.relative_to(root).as_posix()
             info = path.lstat()
-            mode = stat.S_IFMT(info.st_mode)
-            target = os.readlink(path) if stat.S_ISLNK(info.st_mode) else ""
-            # desync v1.0.3 restores file mtimes but directory mtimes change as
-            # children are created. Keep them in the publish stability check,
-            # but omit them from the portable materialization fingerprint.
-            is_directory = stat.S_ISDIR(info.st_mode)
-            mtime_ns = 0 if portable and is_directory else info.st_mtime_ns
-            size = 0 if portable and is_directory else info.st_size
-            record = f"{rel}\0{mode}\0{info.st_mode & 0o7777}\0{size}\0{mtime_ns}\0{target}\n"
-            digest.update(record.encode("utf-8", "surrogateescape"))
-            if is_directory:
-                directories += 1
+            relative = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(info.st_mode):
+                dir_names.remove(name)
+                update_entry(relative, "L", info, os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                update_entry(relative, "D", info, "")
             else:
-                files += 1
-                total_bytes += info.st_size
+                raise SnapshotError(f"unsupported directory entry type: {path}")
+        for name in file_names:
+            path = current_path / name
+            info = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if stat.S_ISREG(info.st_mode):
+                update_entry(relative, "F", info, "")
+            elif stat.S_ISLNK(info.st_mode):
+                update_entry(relative, "L", info, os.readlink(path))
+            else:
+                raise SnapshotError(f"special files are not snapshot-safe: {path}")
+
     return {
-        "fingerprint": digest.hexdigest(),
         "files": files,
         "directories": directories,
-        "bytes": total_bytes,
+        "symlinks": symlinks,
+        "logical_bytes": logical_bytes,
+        "portable_fingerprint_sha256": portable.hexdigest(),
+        "stability_fingerprint_sha256": stability.hexdigest(),
     }
 
 
-def _run_desync(desync_bin: str, args: Iterable[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
-    command = [desync_bin, *args]
+def _resolve_desync_binary(explicit: str | None = None) -> Path:
+    candidates: list[str] = []
+    if explicit:
+        candidates.append(explicit)
+    if from_env := os.environ.get("DESYNC_BIN"):
+        candidates.append(from_env)
+    if found := shutil.which("desync"):
+        candidates.append(found)
+    candidates.append(str(Path.home() / ".local" / "bin" / "desync"))
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return path.resolve()
+    raise SnapshotError(
+        "desync executable not found; run scripts/install_desync.sh or set DESYNC_BIN"
+    )
+
+
+def _run_desync(
+    binary: Path,
+    arguments: Sequence[str],
+    *,
+    capture_stdout: bool = False,
+) -> str:
+    command = [str(binary), *map(str, arguments)]
     try:
-        return subprocess.run(
+        completed = subprocess.run(
             command,
             check=True,
             text=True,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
+            stdout=subprocess.PIPE if capture_stdout else None,
+            stderr=None,
         )
-    except FileNotFoundError as exc:
-        raise SnapshotError(f"desync executable not found: {desync_bin}") from exc
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or str(exc)).strip()
-        raise SnapshotError(f"desync failed: {detail}") from exc
+        raise SnapshotError(
+            f"desync command failed with exit code {exc.returncode}: {' '.join(command)}"
+        ) from exc
+    return completed.stdout or ""
 
 
-def _head_files(sync_root: Path, dataset: str) -> list[Path]:
-    directory = sync_root / "heads" / dataset
-    return sorted(directory.glob("*.json")) if directory.is_dir() else []
+def _desync_index_info(binary: Path, store: Path, index: Path) -> dict[str, Any]:
+    output = _run_desync(
+        binary,
+        ["info", "--format=json", "--store", str(store), str(index)],
+        capture_stdout=True,
+    )
+    try:
+        info = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise SnapshotError(f"desync info returned invalid JSON for {index}") from exc
+    if not isinstance(info, dict):
+        raise SnapshotError(f"desync info returned an invalid object for {index}")
+    unique = int(info.get("unique", -1))
+    in_store = int(info.get("in-store", -1))
+    if unique < 0 or in_store < 0:
+        raise SnapshotError(f"desync info omitted chunk counts for {index}")
+    if in_store != unique:
+        raise SnapshotError(
+            f"incomplete desync store for {index.name}: {in_store}/{unique} unique chunks"
+        )
+    return info
 
 
-def _clock_tuple(head: dict[str, Any]) -> tuple[int, int, str]:
-    clock = head.get("hlc")
-    if not isinstance(clock, dict):
-        raise SnapshotError("head has no HLC")
-    return int(clock["physical_ms"]), int(clock["logical"]), str(head["publisher"])
+def _git_state(repo_root: Path | None) -> dict[str, Any] | None:
+    if repo_root is None:
+        return None
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=repo_root,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {"commit": commit, "tracked_worktree_dirty": dirty}
 
 
-def _next_clock(sync_root: Path, dataset: str, publisher: str) -> dict[str, int]:
-    clocks: list[tuple[int, int, str]] = []
-    for path in _head_files(sync_root, dataset):
-        clocks.append(_clock_tuple(_load_json(path)))
-    now = time.time_ns() // 1_000_000
-    if not clocks:
-        return {"physical_ms": now, "logical": 0}
-    physical, logical, _ = max(clocks)
-    if now > physical:
-        return {"physical_ms": now, "logical": 0}
-    same_physical = [item[1] for item in clocks if item[0] == physical]
-    return {"physical_ms": physical, "logical": max(same_physical) + 1}
+def _validate_clock(stamp: HLC, *, now_ns: int, max_clock_skew_seconds: int) -> None:
+    future_ns = stamp.physical_ns - now_ns
+    limit_ns = int(max_clock_skew_seconds) * 1_000_000_000
+    if future_ns > limit_ns:
+        raise SnapshotError(
+            f"head from {stamp.node_id} is {future_ns / 1e9:.3f}s in the future; "
+            "repair NTP/clock synchronization before resolving latest"
+        )
+
+
+def next_hlc(
+    observed: Sequence[HLC],
+    *,
+    node_id: str,
+    now_ns: int | None = None,
+) -> HLC:
+    node_id = validate_slug(node_id, "node_id")
+    physical_now = time.time_ns() if now_ns is None else int(now_ns)
+    max_physical = max((stamp.physical_ns for stamp in observed), default=0)
+    physical = max(physical_now, max_physical)
+    if physical == max_physical:
+        logical = (
+            max(
+                (stamp.logical for stamp in observed if stamp.physical_ns == physical),
+                default=-1,
+            )
+            + 1
+        )
+    else:
+        logical = 0
+    return HLC(physical_ns=physical, logical=logical, node_id=node_id)
+
+
+def _validate_manifest(manifest: Mapping[str, Any]) -> HLC:
+    if int(manifest.get("schema_version", -1)) != SNAPSHOT_SCHEMA_VERSION:
+        raise SnapshotError("unsupported snapshot manifest schema")
+    dataset = validate_slug(str(manifest.get("dataset", "")), "manifest dataset")
+    snapshot_id = validate_slug(
+        str(manifest.get("snapshot_id", "")), "manifest snapshot_id"
+    )
+    publisher = manifest.get("publisher")
+    archive = manifest.get("archive")
+    if not isinstance(publisher, Mapping) or not isinstance(archive, Mapping):
+        raise SnapshotError(
+            f"manifest {snapshot_id} is missing publisher/archive objects"
+        )
+    publisher_node = validate_slug(
+        str(publisher.get("node_id", "")), "publisher node_id"
+    )
+    stamp = HLC.from_mapping(manifest.get("hlc", {}))
+    if stamp.node_id != publisher_node:
+        raise SnapshotError(f"manifest {snapshot_id} has inconsistent publisher HLC")
+    _safe_relative_path(str(archive.get("index_relpath", "")), "index_relpath")
+    _safe_relative_path(str(archive.get("store_relpath", "")), "store_relpath")
+    index_sha = str(archive.get("index_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", index_sha):
+        raise SnapshotError(f"manifest {snapshot_id} has invalid index SHA-256")
+    if not dataset or not snapshot_id:
+        raise SnapshotError("manifest dataset/snapshot_id is empty")
+    return stamp
+
+
+def _head_candidates(
+    sync_root: Path,
+    dataset: str,
+    *,
+    now_ns: int,
+    max_clock_skew_seconds: int,
+    verify_index: bool,
+) -> tuple[list[ResolvedSnapshot], list[str], list[tuple[HLC | None, str]]]:
+    candidates: list[ResolvedSnapshot] = []
+    diagnostics: list[str] = []
+    incomplete_canonical_heads: list[tuple[HLC | None, str]] = []
+    head_root = sync_root / "heads" / dataset
+    for path in sorted(head_root.glob("*.json")):
+        head_stamp: HLC | None = None
+        canonical_head = False
+        try:
+            head = _load_json(path)
+            if int(head.get("schema_version", -1)) != HEAD_SCHEMA_VERSION:
+                raise SnapshotError("unsupported head schema")
+            head_dataset = validate_slug(str(head.get("dataset", "")), "head dataset")
+            node_id = validate_slug(str(head.get("node_id", "")), "head node_id")
+            if head_dataset != dataset:
+                raise SnapshotError(
+                    f"head dataset is {head_dataset}, expected {dataset}"
+                )
+            canonical_head = path.name == f"{node_id}.json"
+            if not canonical_head:
+                raise SnapshotError(
+                    "head filename does not match its unique node_id; duplicate node IDs "
+                    "or Syncthing conflict copies are not valid publishers"
+                )
+            head_stamp = HLC.from_mapping(head.get("hlc", {}))
+            _validate_clock(
+                head_stamp,
+                now_ns=now_ns,
+                max_clock_skew_seconds=max_clock_skew_seconds,
+            )
+            manifest_path = _path_under(
+                sync_root, str(head.get("manifest_relpath", "")), "manifest_relpath"
+            )
+            expected_manifest_sha = str(head.get("manifest_sha256", ""))
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha):
+                raise SnapshotError("head has invalid manifest SHA-256")
+            actual_manifest_sha = sha256_file(manifest_path)
+            if actual_manifest_sha != expected_manifest_sha:
+                raise SnapshotError(
+                    f"manifest checksum mismatch: expected {expected_manifest_sha}, "
+                    f"got {actual_manifest_sha}"
+                )
+            manifest = _load_json(manifest_path)
+            manifest_stamp = _validate_manifest(manifest)
+            if manifest_stamp != head_stamp:
+                raise SnapshotError("head and manifest HLC differ")
+            if str(manifest["snapshot_id"]) != str(head.get("snapshot_id", "")):
+                raise SnapshotError("head and manifest snapshot IDs differ")
+            if verify_index:
+                archive = manifest["archive"]
+                index_path = _path_under(
+                    sync_root, str(archive["index_relpath"]), "index_relpath"
+                )
+                if sha256_file(index_path) != str(archive["index_sha256"]):
+                    raise SnapshotError("index checksum mismatch")
+            candidates.append(
+                ResolvedSnapshot(
+                    manifest=dict(manifest),
+                    manifest_path=manifest_path,
+                    manifest_sha256=actual_manifest_sha,
+                    head_path=path,
+                )
+            )
+        except (OSError, SnapshotError) as exc:
+            message = f"{path.name}: {exc}"
+            diagnostics.append(message)
+            if canonical_head or (
+                head_stamp is None and ".sync-conflict-" not in path.name
+            ):
+                incomplete_canonical_heads.append((head_stamp, message))
+    return candidates, diagnostics, incomplete_canonical_heads
+
+
+def resolve_latest(
+    sync_root: Path,
+    dataset: str,
+    *,
+    max_clock_skew_seconds: int = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+    now_ns: int | None = None,
+    verify_index: bool = True,
+) -> ResolvedSnapshot:
+    sync_root = sync_root.resolve()
+    dataset = validate_slug(dataset, "dataset")
+    current_ns = time.time_ns() if now_ns is None else int(now_ns)
+    candidates, diagnostics, incomplete_heads = _head_candidates(
+        sync_root,
+        dataset,
+        now_ns=current_ns,
+        max_clock_skew_seconds=max_clock_skew_seconds,
+        verify_index=verify_index,
+    )
+    if not candidates:
+        detail = "; ".join(diagnostics) if diagnostics else "no per-node heads found"
+        raise SnapshotError(f"no valid snapshot for dataset {dataset}: {detail}")
+    winner = max(
+        candidates,
+        key=lambda candidate: (
+            HLC.from_mapping(candidate.manifest["hlc"]),
+            str(candidate.manifest["snapshot_id"]),
+        ),
+    )
+    winner_stamp = HLC.from_mapping(winner.manifest["hlc"])
+    blocking = [
+        message
+        for stamp, message in incomplete_heads
+        if stamp is None or stamp >= winner_stamp
+    ]
+    if blocking:
+        raise SnapshotError(
+            "newest canonical head is not locally complete; refusing to fall back "
+            f"to {winner.manifest['snapshot_id']}: {'; '.join(blocking)}"
+        )
+    return dataclasses.replace(winner, diagnostics=tuple(diagnostics))
+
+
+def resolve_snapshot_id(
+    sync_root: Path, dataset: str, snapshot_id: str
+) -> ResolvedSnapshot:
+    sync_root = sync_root.resolve()
+    dataset = validate_slug(dataset, "dataset")
+    snapshot_id = validate_slug(snapshot_id, "snapshot_id")
+    path = sync_root / "manifests" / dataset / f"{snapshot_id}.json"
+    manifest_sha = sha256_file(path)
+    manifest = _load_json(path)
+    _validate_manifest(manifest)
+    if manifest.get("dataset") != dataset or manifest.get("snapshot_id") != snapshot_id:
+        raise SnapshotError(f"manifest identity mismatch: {path}")
+    archive = manifest["archive"]
+    index_path = _path_under(sync_root, archive["index_relpath"], "index_relpath")
+    if sha256_file(index_path) != archive["index_sha256"]:
+        raise SnapshotError(f"index checksum mismatch for {snapshot_id}")
+    return ResolvedSnapshot(
+        manifest=manifest,
+        manifest_path=path,
+        manifest_sha256=manifest_sha,
+        head_path=None,
+    )
+
+
+def _observed_stamps(
+    sync_root: Path,
+    dataset: str,
+    *,
+    now_ns: int,
+    max_clock_skew_seconds: int,
+) -> list[HLC]:
+    candidates, diagnostics, incomplete_heads = _head_candidates(
+        sync_root,
+        dataset,
+        now_ns=now_ns,
+        max_clock_skew_seconds=max_clock_skew_seconds,
+        verify_index=False,
+    )
+    blocking_errors = [item for item in diagnostics if "in the future" in item]
+    blocking_errors.extend(message for _, message in incomplete_heads)
+    if blocking_errors:
+        raise SnapshotError("; ".join(blocking_errors))
+    return [HLC.from_mapping(candidate.manifest["hlc"]) for candidate in candidates]
 
 
 def publish_snapshot(
+    sync_root: Path,
     dataset: str,
     source: Path,
-    sync_root: Path,
-    metadata: dict[str, str] | None = None,
-    desync_bin: str = "desync",
-) -> dict[str, Any]:
-    dataset = _name(dataset, "dataset")
+    *,
+    node_id: str | None = None,
+    desync_binary: str | None = None,
+    chunk_size_kib: str = DEFAULT_CHUNK_SIZE_KIB,
+    preserve_times: bool = False,
+    max_clock_skew_seconds: int = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+    metadata: Mapping[str, str] | None = None,
+    repo_root: Path | None = None,
+) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     source = source.resolve()
-    publisher = _node_id(sync_root)
-    paths = _paths(sync_root)
-    lock_path = paths["local"] / "publish.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        before = _inventory(source)
-        tmp_dir = paths["local"] / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        fd, raw_index = tempfile.mkstemp(prefix=f"{dataset}.", suffix=".caidx", dir=tmp_dir)
-        os.close(fd)
-        tmp_index = Path(raw_index)
-        tmp_index.unlink()
-        try:
-            _run_desync(
-                desync_bin,
-                ["tar", "-i", "-x", "-s", str(paths["stores"]), str(tmp_index), str(source)],
-            )
-            after = _inventory(source)
-            if before != after:
-                raise SnapshotError("source changed while publishing; no head was created")
-            snapshot_id = _sha256(tmp_index)
-            index_path = paths["indices"] / dataset / f"{snapshot_id}.caidx"
-            index_path.parent.mkdir(parents=True, exist_ok=True)
-            if index_path.exists():
-                if _sha256(index_path) != snapshot_id:
-                    raise SnapshotError(f"existing immutable index is corrupt: {index_path}")
-                tmp_index.unlink()
-            else:
-                os.replace(tmp_index, index_path)
-            manifest = {
-                "schema": SCHEMA_VERSION,
-                "dataset": dataset,
-                "snapshot_id": snapshot_id,
-                "publisher": publisher,
-                "created_unix_ns": time.time_ns(),
-                "index": f"indices/{dataset}/{snapshot_id}.caidx",
-                "index_sha256": snapshot_id,
-                "inventory": _inventory(source, portable=True),
-                "metadata": dict(sorted((metadata or {}).items())),
-            }
-            manifest_path = paths["manifests"] / dataset / f"{snapshot_id}.json"
-            manifest_bytes = _json_bytes(manifest)
-            if manifest_path.exists() and manifest_path.read_bytes() != manifest_bytes:
-                raise SnapshotError(f"immutable manifest collision: {manifest_path}")
-            if not manifest_path.exists():
-                _atomic_write(manifest_path, manifest_bytes)
-            head = {
-                "schema": SCHEMA_VERSION,
-                "dataset": dataset,
-                "snapshot_id": snapshot_id,
-                "publisher": publisher,
-                "hlc": _next_clock(sync_root, dataset, publisher),
-                "manifest": f"manifests/{dataset}/{snapshot_id}.json",
-                "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-            }
-            _atomic_write(paths["heads"] / dataset / f"{publisher}.json", _json_bytes(head))
-            return {**head, "inventory": manifest["inventory"], "metadata": manifest["metadata"]}
-        finally:
-            tmp_index.unlink(missing_ok=True)
-
-
-def resolve_status(dataset: str, sync_root: Path, desync_bin: str = "desync") -> dict[str, Any]:
-    dataset = _name(dataset, "dataset")
-    sync_root = sync_root.resolve()
-    candidates: list[dict[str, Any]] = []
-    for path in _head_files(sync_root, dataset):
-        head = _load_json(path)
-        if head.get("dataset") != dataset:
-            raise SnapshotError(f"dataset mismatch in {path}")
-        candidates.append(head)
-    if not candidates:
-        raise SnapshotError(f"no heads found for dataset {dataset!r}")
-    head = max(candidates, key=_clock_tuple)
-    manifest_path = sync_root / str(head["manifest"])
-    manifest_bytes = manifest_path.read_bytes()
-    if hashlib.sha256(manifest_bytes).hexdigest() != head["manifest_sha256"]:
-        raise SnapshotError(f"manifest checksum mismatch: {manifest_path}")
-    manifest = json.loads(manifest_bytes)
-    index_path = sync_root / str(manifest["index"])
-    if _sha256(index_path) != manifest["index_sha256"]:
-        raise SnapshotError(f"index checksum mismatch: {index_path}")
-    inspected = _run_desync(
-        desync_bin, ["inspect-chunks", "-s", str(sync_root / "stores"), str(index_path)], capture=True
-    )
-    chunks = json.loads(inspected.stdout or "[]")
-    missing = [item["id"] for item in chunks if not item.get("compressed_size")]
-    if missing:
+    if _paths_overlap(sync_root, source):
         raise SnapshotError(
-            f"latest head is present but {len(missing)} chunks are missing; wait for Syncthing"
+            "snapshot source and sync root overlap; this can recursively archive the "
+            "chunk store or expose live data to Syncthing"
         )
-    return {
-        **head,
-        "manifest_path": str(manifest_path),
-        "index_path": str(index_path),
-        "inventory": manifest["inventory"],
-        "metadata": manifest.get("metadata", {}),
-        "chunks": len(chunks),
-        "complete": True,
+    dataset = validate_slug(dataset, "dataset")
+    node_identity_path = sync_root / ".local-state" / "node-id"
+    initialize_layout(
+        sync_root,
+        node_id=node_id if not node_identity_path.exists() else None,
+    )
+    publisher_node = resolve_node_id(sync_root, node_id)
+    binary = _resolve_desync_binary(desync_binary)
+    lock_path = (
+        sync_root
+        / ".local-state"
+        / "locks"
+        / f"publish-{dataset}-{publisher_node}.lock"
+    )
+
+    with _exclusive_lock(lock_path):
+        before = scan_tree(source)
+        staging_dir = sync_root / ".local-state" / "staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        temporary_index = staging_dir / f"{dataset}-{uuid.uuid4().hex}.caidx"
+        store_relpath = PurePosixPath("stores") / f"{dataset}.castr"
+        store_path = sync_root.joinpath(*store_relpath.parts)
+        store_path.mkdir(parents=True, exist_ok=True)
+        command = [
+            "tar",
+            "--index",
+            "--one-file-system",
+            "--store",
+            str(store_path),
+            "--chunk-size",
+            chunk_size_kib,
+        ]
+        if not preserve_times:
+            command.append("--no-time")
+        command.extend([str(temporary_index), str(source)])
+        _run_desync(binary, command)
+        after = scan_tree(source)
+        if (
+            before["stability_fingerprint_sha256"]
+            != after["stability_fingerprint_sha256"]
+        ):
+            raise SnapshotError(
+                "source tree changed while desync archived it; publish from a frozen "
+                "filesystem snapshot or under the downloader's dataset lock"
+            )
+
+        info = _desync_index_info(binary, store_path, temporary_index)
+        index_sha = sha256_file(temporary_index)
+        wall_time_ns = time.time_ns()
+        observed = _observed_stamps(
+            sync_root,
+            dataset,
+            now_ns=wall_time_ns,
+            max_clock_skew_seconds=max_clock_skew_seconds,
+        )
+        stamp = next_hlc(observed, node_id=publisher_node, now_ns=wall_time_ns)
+        seconds, subsecond_ns = divmod(stamp.physical_ns, 1_000_000_000)
+        timestamp_slug = (
+            dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc).strftime(
+                "%Y%m%dT%H%M%S"
+            )
+            + f"{subsecond_ns:09d}Z"
+        )
+        snapshot_id = validate_slug(
+            f"{dataset[:40]}-{timestamp_slug}-l{stamp.logical}-"
+            f"{publisher_node[:40]}-{index_sha[:16]}",
+            "snapshot_id",
+        )
+        index_relpath = PurePosixPath("indices") / dataset / f"{snapshot_id}.caidx"
+        index_path = sync_root.joinpath(*index_relpath.parts)
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        if index_path.exists():
+            if sha256_file(index_path) != index_sha:
+                raise SnapshotError(f"immutable index collision at {index_path}")
+            temporary_index.unlink()
+        else:
+            os.replace(temporary_index, index_path)
+            _fsync_directory(index_path.parent)
+
+        manifest: dict[str, Any] = {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "dataset": dataset,
+            "snapshot_id": snapshot_id,
+            "published_at": _utc_iso_from_ns(wall_time_ns),
+            "hlc": stamp.to_dict(),
+            "publisher": {"node_id": publisher_node},
+            "source": {
+                "snapshot_root_name": source.name,
+                **{
+                    key: value
+                    for key, value in before.items()
+                    if key != "stability_fingerprint_sha256"
+                },
+            },
+            "archive": {
+                "format": "desync-caidx-v1",
+                "index_relpath": index_relpath.as_posix(),
+                "index_sha256": index_sha,
+                "store_relpath": store_relpath.as_posix(),
+                "chunk_size_kib": chunk_size_kib,
+                "total_chunks": int(info["total"]),
+                "unique_chunks": int(info["unique"]),
+                "archive_stream_bytes": int(info["size"]),
+                "desync_binary_sha256": sha256_file(binary),
+            },
+            "metadata": dict(sorted((metadata or {}).items())),
+        }
+        if git_state := _git_state(repo_root):
+            manifest["git"] = git_state
+        manifest_relpath = PurePosixPath("manifests") / dataset / f"{snapshot_id}.json"
+        manifest_path = sync_root.joinpath(*manifest_relpath.parts)
+        manifest_sha = write_immutable_json(manifest_path, manifest)
+        head = {
+            "schema_version": HEAD_SCHEMA_VERSION,
+            "dataset": dataset,
+            "node_id": publisher_node,
+            "snapshot_id": snapshot_id,
+            "hlc": stamp.to_dict(),
+            "updated_at": _utc_iso_from_ns(wall_time_ns),
+            "manifest_relpath": manifest_relpath.as_posix(),
+            "manifest_sha256": manifest_sha,
+        }
+        head_path = sync_root / "heads" / dataset / f"{publisher_node}.json"
+        atomic_write_json(head_path, head)
+        return ResolvedSnapshot(
+            manifest=manifest,
+            manifest_path=manifest_path,
+            manifest_sha256=manifest_sha,
+            head_path=head_path,
+        )
+
+
+def verify_snapshot(
+    sync_root: Path,
+    resolved: ResolvedSnapshot,
+    *,
+    desync_binary: str | None = None,
+    materialized_path: Path | None = None,
+) -> dict[str, Any]:
+    sync_root = sync_root.resolve()
+    binary = _resolve_desync_binary(desync_binary)
+    manifest = resolved.manifest
+    _validate_manifest(manifest)
+    if sha256_file(resolved.manifest_path) != resolved.manifest_sha256:
+        raise SnapshotError(
+            f"manifest changed after resolution: {resolved.manifest_path}"
+        )
+    archive = manifest["archive"]
+    index_path = _path_under(sync_root, archive["index_relpath"], "index_relpath")
+    store_path = _path_under(sync_root, archive["store_relpath"], "store_relpath")
+    actual_index_sha = sha256_file(index_path)
+    if actual_index_sha != archive["index_sha256"]:
+        raise SnapshotError(
+            f"index checksum mismatch: expected {archive['index_sha256']}, "
+            f"got {actual_index_sha}"
+        )
+    info = _desync_index_info(binary, store_path, index_path)
+    result: dict[str, Any] = {
+        "snapshot_id": manifest["snapshot_id"],
+        "manifest_sha256": resolved.manifest_sha256,
+        "index_sha256": actual_index_sha,
+        "chunks": {"unique": int(info["unique"]), "in_store": int(info["in-store"])},
+        "materialized_verified": False,
     }
+    if materialized_path is not None:
+        inventory = scan_tree(materialized_path)
+        expected = manifest["source"]["portable_fingerprint_sha256"]
+        actual = inventory["portable_fingerprint_sha256"]
+        if actual != expected:
+            raise SnapshotError(
+                f"materialized tree fingerprint mismatch: expected {expected}, got {actual}"
+            )
+        result["materialized_verified"] = True
+        result["materialized"] = inventory
+    return result
 
 
 def fetch_snapshot(
-    dataset: str,
     sync_root: Path,
     materialized_root: Path,
-    pin: Path | None = None,
-    desync_bin: str = "desync",
-) -> dict[str, Any]:
-    status_value = resolve_status(dataset, sync_root, desync_bin)
-    snapshot_id = status_value["snapshot_id"]
-    target_parent = materialized_root.resolve() / _name(dataset, "dataset")
-    target = target_parent / snapshot_id
-    target_parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists():
-        tmp = Path(tempfile.mkdtemp(prefix=f".{snapshot_id}.", dir=target_parent))
-        try:
-            _run_desync(
-                desync_bin,
-                [
-                    "untar",
-                    "-i",
-                    "-s",
-                    str(Path(sync_root).resolve() / "stores"),
-                    status_value["index_path"],
-                    str(tmp),
-                ],
+    resolved: ResolvedSnapshot,
+    *,
+    desync_binary: str | None = None,
+) -> Path:
+    sync_root = sync_root.resolve()
+    materialized_root = materialized_root.resolve()
+    if _paths_overlap(sync_root, materialized_root):
+        raise SnapshotError(
+            "materialized root must be outside the Syncthing/desync sync root"
+        )
+    binary = _resolve_desync_binary(desync_binary)
+    manifest = resolved.manifest
+    dataset = validate_slug(str(manifest["dataset"]), "dataset")
+    snapshot_id = validate_slug(str(manifest["snapshot_id"]), "snapshot_id")
+    dataset_root = materialized_root / dataset
+    target = dataset_root / snapshot_id
+    ready_path = dataset_root / f".{snapshot_id}.READY.json"
+    lock_path = materialized_root / ".locks" / f"fetch-{dataset}-{snapshot_id}.lock"
+
+    with _exclusive_lock(lock_path):
+        verification = verify_snapshot(
+            sync_root,
+            resolved,
+            desync_binary=str(binary),
+        )
+        if target.exists():
+            verify_snapshot(
+                sync_root,
+                resolved,
+                desync_binary=str(binary),
+                materialized_path=target,
             )
-            if _inventory(tmp, portable=True) != status_value["inventory"]:
-                raise SnapshotError("materialized snapshot inventory does not match its manifest")
-            os.replace(tmp, target)
-        finally:
-            if tmp.exists():
-                shutil.rmtree(tmp)
-    pin_value = {
-        "schema": SCHEMA_VERSION,
-        "dataset": dataset,
-        "snapshot_id": snapshot_id,
-        "publisher": status_value["publisher"],
-        "path": str(target),
-    }
-    if pin is not None:
-        _atomic_write(pin.resolve(), _json_bytes(pin_value))
-    return pin_value
+            if not ready_path.exists():
+                atomic_write_json(
+                    ready_path,
+                    {
+                        "snapshot_id": snapshot_id,
+                        "manifest_sha256": resolved.manifest_sha256,
+                        "verified_at": _utc_iso_from_ns(time.time_ns()),
+                    },
+                )
+            return target
+
+        dataset_root.mkdir(parents=True, exist_ok=True)
+        staging = dataset_root / f".{snapshot_id}.partial.{uuid.uuid4().hex}"
+        archive = manifest["archive"]
+        index_path = _path_under(sync_root, archive["index_relpath"], "index_relpath")
+        store_path = _path_under(sync_root, archive["store_relpath"], "store_relpath")
+        _run_desync(
+            binary,
+            [
+                "untar",
+                "--index",
+                "--no-same-owner",
+                "--store",
+                str(store_path),
+                str(index_path),
+                str(staging),
+            ],
+        )
+        inventory = scan_tree(staging)
+        expected = manifest["source"]["portable_fingerprint_sha256"]
+        if inventory["portable_fingerprint_sha256"] != expected:
+            raise SnapshotError(
+                f"extracted snapshot fingerprint mismatch; partial tree retained at {staging}"
+            )
+        os.replace(staging, target)
+        _fsync_directory(dataset_root)
+        atomic_write_json(
+            ready_path,
+            {
+                "snapshot_id": snapshot_id,
+                "manifest_sha256": resolved.manifest_sha256,
+                "index_sha256": verification["index_sha256"],
+                "verified_at": _utc_iso_from_ns(time.time_ns()),
+            },
+        )
+        return target
 
 
-def verify_snapshot(dataset: str, sync_root: Path, desync_bin: str = "desync") -> dict[str, Any]:
-    status_value = resolve_status(dataset, sync_root, desync_bin)
-    _run_desync(desync_bin, ["verify", "-s", str(Path(sync_root).resolve() / "stores")])
-    return {
-        "dataset": dataset,
-        "snapshot_id": status_value["snapshot_id"],
-        "publisher": status_value["publisher"],
-        "verified": True,
-    }
+def write_pin(path: Path, resolved: ResolvedSnapshot) -> None:
+    atomic_write_json(
+        path,
+        {
+            "schema_version": 1,
+            "resolved_at": _utc_iso_from_ns(time.time_ns()),
+            "manifest_sha256": resolved.manifest_sha256,
+            "manifest": resolved.manifest,
+        },
+    )

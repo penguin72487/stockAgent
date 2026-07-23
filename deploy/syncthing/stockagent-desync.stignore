@@ -1,5 +1,6 @@
-// Node identity and local work files must never cross machines.
+// Local transactional state must never leave this node.
 (?d).local-state
-
-// Atomic writer temporaries are not protocol objects.
-(?d)(?i)*.tmp
+(?d).local-state/**
+// Materialized trees are local caches, not replication inputs.
+(?d)materialized
+(?d)materialized/**
