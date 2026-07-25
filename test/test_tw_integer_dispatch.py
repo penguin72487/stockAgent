@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -12,6 +15,7 @@ from stockagent.backtest.tw_integer_execution import run_tw_cash_integer
 from stockagent.training.trainer import (
     _ExecutionRuntime,
     _integer_execution_runtime_kwargs,
+    _save_holdings_table,
 )
 
 
@@ -505,16 +509,51 @@ def test_tw_day_trade_dispatch_uses_point_in_time_eligibility_sides_and_lots() -
     np.testing.assert_array_equal(result.shares_history[0], [-1_000, 1_500])
     assert result.final_integer_state is not None
     np.testing.assert_array_equal(result.final_integer_state.holdings, [0, 0])
-    # The account remains flat after the close, while the holdings artifact
-    # records only the opening snapshot used for that session's round trip.
-    assert {record.symbol for record in records} == {"CASH", "SYM_0000", "SYM_0001"}
+    # The account is flat at the close, but holdings.csv must still audit the
+    # exact signed opening executions rather than emitting cash-only rows.
     by_symbol = {record.symbol: record for record in records}
+    assert set(by_symbol) == {"CASH", "SYM_0000", "SYM_0001"}
+    assert by_symbol["SYM_0000"].record_type == "day_trade_open"
+    assert by_symbol["SYM_0000"].side == "SELL"
     assert by_symbol["SYM_0000"].shares == -1_000
     assert by_symbol["SYM_0000"].price == pytest.approx(100.0)
+    assert by_symbol["SYM_0000"].market_value == pytest.approx(-100_000.0)
+    assert by_symbol["SYM_0001"].record_type == "day_trade_open"
+    assert by_symbol["SYM_0001"].side == "BUY"
     assert by_symbol["SYM_0001"].shares == 1_500
     assert by_symbol["SYM_0001"].price == pytest.approx(100.0)
+    assert by_symbol["SYM_0001"].market_value == pytest.approx(150_000.0)
     assert sum(record.market_value for record in records) == pytest.approx(300_000.0)
     assert sum(record.holding_ratio for record in records) == pytest.approx(1.0)
+
+
+def test_tw_day_trade_holdings_csv_labels_opening_trades(tmp_path: Path) -> None:
+    values = np.array([[1.0]], dtype=np.float64)
+    _, records = run_backtest_integer_shares(
+        values,
+        **_base_inputs(1, 1),
+        close_prices=np.array([[105.0]], dtype=np.float64),
+        open_prices=np.array([[100.0]], dtype=np.float64),
+        execution_mode="tw_day_trade",
+        portfolio_activation="pre_normalized",
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        lot_sizes=np.ones(1, dtype=np.int64),
+        day_trade_eligible_mask=np.ones((1, 1), dtype=np.bool_),
+        **_open_masks(values),
+        initial_capital=1_000.0,
+    )
+    path = tmp_path / "holdings.csv"
+
+    _save_holdings_table(path, records)
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    trade = next(row for row in rows if row["symbol"] == "SYM_0000")
+    assert trade["record_type"] == "day_trade_open"
+    assert trade["side"] == "BUY"
+    assert int(trade["shares"]) == 10
+    assert float(trade["price"]) == pytest.approx(100.0)
 
 
 def test_tw_day_trade_volume_then_turnover_cap_rounds_to_whole_lots() -> None:

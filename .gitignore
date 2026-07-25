@@ -120,6 +120,7 @@ activemq-data/
 
 # Environments
 .env
+.env.trade
 .envrc
 .venv
 env/
@@ -127,6 +128,11 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Broker certificates and private keys
+*.pfx
+*.p12
+*.pem
 
 # Spyder project settings
 .spyderproject
@@ -205,3 +211,5 @@ data_tw_public/*
 .codex/*
 codex/*
 data_openBB/*
+data_tw_microstructure/*
+.env.trade.example

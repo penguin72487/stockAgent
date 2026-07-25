@@ -1046,6 +1046,7 @@ def main() -> None:
         min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
+        split_start_year=config.walk_forward.split_start_year,
     )
     fold = next((item for item in folds if int(item.fold_id) == int(args.fold)), None)
     if fold is None:
@@ -1067,6 +1068,7 @@ def main() -> None:
         _split_indices(fold, args.split),
         config.training.lookback,
         execution_mode=config.trading.execution_mode,
+        lookback_context=config.walk_forward.lookback_context,
         short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
         tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
     )

@@ -1947,6 +1947,12 @@ def _tw_open_limit_masks_from_arrays(
     from yesterday's close (with any source-provided ex-right/ex-dividend
     adjustment).  Shifting the open itself would compare against yesterday's
     open and is mathematically the wrong Taiwan price-limit contract.
+
+    Session-t high, low, and close must not affect these masks.  A security
+    that opens inside its price band remains eligible to enter even if it
+    reaches a limit later in the session.  Conversely, an opening print at the
+    upper limit blocks only buy-first entry, while an opening print at the
+    lower limit blocks only sell-first entry.
     """
 
     open_px = _round_half_up(np.asarray(open_raw, dtype=np.float64), decimals=2)
@@ -1970,6 +1976,9 @@ def _tw_open_limit_masks_from_arrays(
     # on the eventual close and reported daily volume, neither of which exists
     # when the opening order is submitted.
     base = np.isfinite(open_px) & (open_px > 0.0)
+    # Legal TW opening prints cannot cross the daily price band, so >= / <= are
+    # equivalent to equality for valid data while also failing closed on an
+    # invalid vendor print beyond the legal limit.
     is_limit_up = np.isfinite(reference) & (open_px >= (limit_up - 1e-9))
     is_limit_down = np.isfinite(reference) & (open_px <= (limit_down + 1e-9))
     return base & ~is_limit_up, base & ~is_limit_down

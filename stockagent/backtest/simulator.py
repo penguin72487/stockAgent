@@ -1249,7 +1249,7 @@ class BacktestResultTensor:
 
 @dataclass(slots=True)
 class HoldingsRecord:
-    """Single holding record for one date/symbol, sorted by absolute holding ratio."""
+    """Single position or execution record for one date/symbol."""
 
     date: str
     symbol: str
@@ -1258,6 +1258,8 @@ class HoldingsRecord:
     market_value: float
     holding_ratio: float
     is_cash: bool
+    record_type: str = "position"
+    side: str = ""
 
 
 def holding_record_abs_sort_key(record: HoldingsRecord) -> tuple[float, str]:
@@ -2931,11 +2933,12 @@ def _tw_integer_holdings_records(
     symbols: list[str],
     dates: np.ndarray | None,
 ) -> list[HoldingsRecord]:
-    """Render the economically relevant position snapshot for each mode.
+    """Render cash holdings and exact per-symbol execution detail.
 
-    Cash mode records close holdings. Day-trade mode records only the opening
-    position snapshot; its formal result still realizes every position at that
-    session's close and remains flat overnight.
+    Cash execution emits end-of-session positions.  A day-trade account is flat
+    at every close, so its non-cash rows are explicitly labeled
+    ``day_trade_open`` and record the signed quantity and opening execution
+    price instead of pretending those quantities are overnight holdings.
     """
 
     t_len, n_symbols = result.positions.shape
@@ -2944,12 +2947,13 @@ def _tw_integer_holdings_records(
     if np.asarray(close_prices).shape != (t_len, n_symbols):
         raise ValueError(f"close_prices must have shape [{t_len}, {n_symbols}]")
     mode = str(result.final_state.mode)
+    open_values: np.ndarray | None = None
     if mode == "tw_day_trade":
-        if open_prices is None or np.asarray(open_prices).shape != (t_len, n_symbols):
-            raise ValueError(f"tw_day_trade open_prices must have shape [{t_len}, {n_symbols}]")
+        if open_prices is None:
+            raise ValueError("tw_day_trade holdings records require open_prices")
         open_values = np.asarray(open_prices, dtype=np.float64)
-    else:
-        open_values = None
+        if open_values.shape != (t_len, n_symbols):
+            raise ValueError(f"open_prices must have shape [{t_len}, {n_symbols}]")
     if dates is None:
         date_text = [f"t{idx:04d}" for idx in range(t_len)]
     else:
@@ -3036,18 +3040,41 @@ def _tw_integer_holdings_records(
             cash_snapshot_value = free_cash_and_claims
         else:
             assert open_values is not None
+            # These are opening executions, not closing holdings.  Use the
+            # exact integer quantity and opening quote that produced the public
+            # shares/weights histories.  Session-t close must not alter them.
             execution_nav = float(result.execution_nav_history[t])
             reconstructed_prices = open_values[t, nonzero]
             market_values = (
                 result.positions[t, nonzero].astype(np.float64, copy=False)
                 * reconstructed_prices
             )
-            if np.any(
+            invalid_entries = (
                 ~np.isfinite(reconstructed_prices)
                 | (reconstructed_prices <= 0.0)
                 | ~np.isfinite(market_values)
+            )
+            if np.any(invalid_entries):
+                raise ValueError(
+                    "integer day-trade result has invalid opening execution "
+                    f"prices at time index {t}, symbol indices "
+                    f"{nonzero[invalid_entries][:8].tolist()}"
+                )
+            expected_weights = np.divide(
+                market_values,
+                execution_nav,
+                out=np.zeros_like(market_values),
+                where=execution_nav > 0.0,
+            )
+            if not np.allclose(
+                expected_weights,
+                result.weights[t, nonzero],
+                rtol=2e-12,
+                atol=1e-12,
             ):
-                raise ValueError(f"day-trade opening holdings contain invalid prices at time index {t}")
+                raise RuntimeError(
+                    "integer day-trade opening records disagree with execution weights"
+                )
             # Synthetic cash at the opening snapshot makes signed stock values
             # plus cash reconcile exactly to opening NAV. Settlement cash and
             # T+2 claims remain in the dedicated settlement audit artifact.
@@ -3064,6 +3091,7 @@ def _tw_integer_holdings_records(
                     cash_snapshot_value / denominator if execution_nav > 0.0 else 0.0
                 ),
                 is_cash=True,
+                record_type="cash",
             )
         ]
         for label, value in (
@@ -3080,20 +3108,34 @@ def _tw_integer_holdings_records(
                         market_value=value,
                         holding_ratio=value / denominator,
                         is_cash=True,
+                        record_type="collateral",
                     )
                 )
         if execution_nav > 0.0:
             for offset, idx in enumerate(nonzero.tolist()):
                 market_value = float(market_values[offset])
+                signed_shares = int(result.positions[t, idx])
                 day_rows.append(
                     HoldingsRecord(
                         date=date_text[t],
                         symbol=symbols[idx],
-                        shares=int(result.positions[t, idx]),
+                        shares=signed_shares,
                         price=float(reconstructed_prices[offset]),
                         market_value=market_value,
                         holding_ratio=market_value / denominator,
                         is_cash=False,
+                        record_type=(
+                            "position"
+                            if result.final_state.mode == "tw_cash"
+                            else "day_trade_open"
+                        ),
+                        side=(
+                            ""
+                            if result.final_state.mode == "tw_cash"
+                            else "BUY"
+                            if signed_shares > 0
+                            else "SELL"
+                        ),
                     )
                 )
         day_rows.sort(key=holding_record_abs_sort_key)

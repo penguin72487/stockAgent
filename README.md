@@ -314,8 +314,6 @@ run_fintech_python -m torch.distributed.run \
   --nproc-per-node=2 \
   scripts/screen_explainability_features.py \
   --config configs/markets/tw_public_lanten_market_candles.yaml \
-  --output-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds \
-  --screening-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds/feature_screening_first_test_year \
   --device cuda \
   --cpu-threads 16 \
   --row-chunk-size 16 \
@@ -342,8 +340,7 @@ run_fintech_python -m torch.distributed.run \
   --nnodes=1 \
   --nproc-per-node=2 \
   explain_model.py \
-  --config configs/markets/tw_public_lanten_market_candles.yaml \
-  --output-dir artifacts/markets/tw_public_candles_full_gross_naive_dual5090_all_folds \
+  --config configs/markets/tw_public_lanten_market_candles_day_trade_2006plus.yaml/
   --device cuda \
   --cpu-threads 16 \
   --max-rows 0 \
@@ -375,3 +372,22 @@ run_fintech_python -m torch.distributed.run \
   --no-interactive-plots \
   --strict-no-fallback \
   --progress
+
+
+
+# shioaji
+
+# 查看狀態
+systemctl status stockagent-shioaji-top200.service
+
+# 即時查看 log
+journalctl -u stockagent-shioaji-top200.service -f
+
+# 重新啟動
+systemctl restart stockagent-shioaji-top200.service
+
+# 停止
+systemctl stop stockagent-shioaji-top200.service
+
+# 停止並取消開機啟動
+systemctl disable --now stockagent-shioaji-top200.service

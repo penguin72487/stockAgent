@@ -97,6 +97,38 @@ def test_panel_start_date_rejects_mismatched_walk_forward_year(tmp_path: Path) -
         load_config(config_path)
 
 
+def test_load_config_normalizes_panel_history_lookback_context(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["panel_start_date"] = "2012-01-01"
+    payload["walk_forward"].update(
+        {
+            "expected_first_year": 2012,
+            "split_start_year": 2014,
+            "lookback_context": "panel",
+        }
+    )
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.walk_forward.lookback_context == "panel_history"
+    assert config.walk_forward.split_start_year == 2014
+
+
+def test_panel_start_date_rejects_earlier_split_start_year(tmp_path: Path) -> None:
+    config_path = _write_minimal_config(tmp_path)
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["data"]["panel_start_date"] = "2012-01-01"
+    payload["walk_forward"].update(
+        {"expected_first_year": 2012, "split_start_year": 2011}
+    )
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="split_start_year cannot precede"):
+        load_config(config_path)
+
+
 @pytest.mark.parametrize(
     "feature",
     [
@@ -716,11 +748,12 @@ def test_tw_public_select_uses_full_gross_long_short_l1_contract() -> None:
     assert config.trading.portfolio_activation == "pre_normalized"
 
 
-def test_tw_public_candles_select_uses_dual_5090_tw_cash_contract() -> None:
+def test_tw_public_candles_select_preserves_open_aware_day_trade_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles_select.yaml")
 
     model = config.training.financial_transformer
-    assert config.trading.execution_mode == "tw_cash"
+    assert config.trading.execution_mode == "tw_day_trade"
+    assert config.data.day_trade_open_feature is True
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.trading.long_only is False
@@ -735,13 +768,16 @@ def test_tw_public_candles_select_uses_dual_5090_tw_cash_contract() -> None:
     assert config.environment.torch_compile_threads == 16
 
 
-def test_tw_public_candles_all_folds_uses_runnable_tw_day_trade_contract() -> None:
+def test_tw_public_candles_all_folds_uses_long_history_tw_cash_contract() -> None:
     config = load_config("configs/markets/tw_public_lanten_market_candles.yaml")
 
-    assert config.trading.execution_mode == "tw_day_trade"
-    assert config.data.panel_start_date == "2014-01-01"
+    assert config.trading.execution_mode == "tw_cash"
+    assert config.data.panel_start_date == "2012-01-01"
     assert config.data.benchmark_name == "2330"
-    assert config.walk_forward.expected_first_year == 2014
+    assert config.walk_forward.expected_first_year == 2012
+    assert config.walk_forward.split_start_year == 2014
+    assert config.walk_forward.lookback_context == "panel_history"
+    assert config.training.lookback == 256
     assert config.trading.tw_corporate_action_mode == "avoid"
     assert config.trading.tw_short_capacity_limit_enabled is False
     assert config.training.financial_transformer.portfolio_output_mode == "l1"
