@@ -1,16 +1,16 @@
-experiment_name: tw-financial-transformer-candles-snapshot-safe98-gross-tw-day-trade-2014plus-v9-dual5090
+experiment_name: tw-financial-transformer-candles-snapshot-safe98-gross-tw-cash-lookback256-panel-history-v1-dual5090
 
 runner:
   # The 98-slot snapshot-safe schema is checkpoint-incompatible with both the
   # old 64-slot experiment and the existing 131-slot v8 checkpoints.
-  output_dir: artifacts/markets/tw_public_candles_snapshot_safe98_gross_tw_day_trade_2014plus
+  output_dir: artifacts/markets/tw_public_candles_snapshot_safe98_gross_tw_cash_lookback256_panel_history
   mode: train
   # Keep all older artifacts for audit, but never resume their optimizer state
   # into this fresh root. Later interruptions within this 98-slot run remain
   # resumable here.
   resume: true
   post_train_infer: true
-  # Day-trade eligibility begins in 2014; fold9 validates on 2023.
+  # Target-owning folds still begin in 2014; 2012-2013 are context-only rows.
   start_fold: 1
 environment:
   device: cuda
@@ -25,13 +25,13 @@ data:
   # Canonical rows prefer TWSE/TPEx; audited Yahoo rows only fill missing 2000+ OHLCV.
   # Run downloader/download_tw_official_data.py before training.
   parquet_root: data_tw_public/stocks
-  # Point-in-time day-trade eligibility is identically false before 2014 and
-  # first becomes executable on 2014-01-06. Starting in 2005 makes the loss a
-  # constant zero for the early folds, so those years must not be training rows.
-  panel_start_date: "2014-01-01"
-  # Reporting comparator: 2330 adjusted-close buy-and-hold. For day-trade row
-  # t this is aligned to close[t-1] -> close[t], the same wall-clock session as
-  # the strategy's open[t] -> close[t] position.
+  # Load two extra calendar years so the first 2014 target has at least 256
+  # prior exchange sessions. walk_forward.split_start_year prevents these
+  # context-only rows from becoming train/validation/test targets.
+  panel_start_date: "2012-01-01"
+  # Reporting comparator: 2330 adjusted-close buy-and-hold. tw_cash target row
+  # t enters at close[t] and carries to the next close under the same forward
+  # return clock as the canonical cash ledger.
   benchmark_name: "2330"
   usd_only_trading_pairs: false
   panel_backend: auto
@@ -225,9 +225,11 @@ data:
 walk_forward:
   min_train_years: 1
   val_years: 1
-  # Fold IDs are part of the experiment identity: fold9/10/11 mean validation
-  # years 2023/2024/2025 when the day-trade panel begins in 2014.
-  expected_first_year: 2014
+  # Panel coverage begins in 2012, but fold IDs and target ownership begin in
+  # 2014. The first day of every owned year is therefore local row 0.
+  expected_first_year: 2012
+  split_start_year: 2014
+  lookback_context: panel_history
   require_contiguous_years: true
   # false adds an experimental final fold where the latest year is both val and test.
   require_future_test_year: false
@@ -238,7 +240,7 @@ trading:
   # The receipt-verified MOPS entitlement archive is incomplete, and avoid-mode
   # mandatory covers are not executable on every historical action date. Use
   # the research-only executor instead of fabricating exact cash entitlements.
-  execution_mode: tw_day_trade
+  execution_mode: tw_cash
   tw_corporate_action_mode: avoid
   tw_short_capacity_limit_enabled: false
   tw_corporate_action_claim_queue_sessions: 256
@@ -293,9 +295,9 @@ training:
   loss_portfolio_activation: pre_normalized
   warm_start_from_previous_fold: false
   chunk_rows: 0
-  # Fold20 RTX 5070 Ti validation/test completed safely with 64-row model
-  # chunks. Pin the power-of-two shape to avoid redundant VRAM probes.
-  eval_model_chunk_rows: 64
+  # Lookback256 validation with 64-row chunks peaked at 30.71GiB/rank and OOMed
+  # in temporal RoPE on dual RTX 5090. Keep the measured-safe power-of-two shape.
+  eval_model_chunk_rows: 32
   # Validation/test run every epoch, so amortize a distinct inference-mode
   # fixed-shape graph instead of paying the eager model cost 2,000 times.
   compile_eval_model: true
@@ -305,7 +307,7 @@ training:
   # full weights-history artifact is forced through the identical eager
   # recurrence so it never creates a non-amortizable output-ABI graph.
   eval_backtest_compile: true
-  eval_auto_chunk_rows_cap: 64
+  eval_auto_chunk_rows_cap: 32
   # Fixed full width eliminates the duplicate 6.7GB compact train base, shares
   # one immutable base with val/test, and makes fold20/fold21 graph-identical.
   train_symbol_compaction: none
@@ -321,11 +323,15 @@ training:
   backtest_checkpoint_chunk_rows: 0
   runtime_shape_check: false
   allow_dynamic_symbols: false
-  lookback: 32
-  # Dual RTX 5090 full-workflow measurements favored global batch128 over 256;
-  # DDP therefore uses the power-of-two local batch64 on each rank.
-  batch_size_train: 128
-  batch_size_eval: 128
+  # tw_cash consumes close-complete rows through t-1. Target day t therefore
+  # reads exactly the 256 prior panel sessions, including prior years, without
+  # importing their returns or settlement state into the owned split.
+  lookback: 256
+  # The actual lookback256 full-workflow probe showed global batch128/local64
+  # leaving less than 1GiB free per rank before validation. Global batch64 keeps
+  # power-of-two local batch32 and enough headroom for model plus settlement.
+  batch_size_train: 64
+  batch_size_eval: 64
   epochs: 1000
   early_stopping_no_improve_ratio: 0.1
   val_interval_epochs: 1
@@ -401,10 +407,10 @@ training:
   postprocess_benchmark_strict: false
   cache_train_tensors_on_gpu: true
   cache_eval_tensors_on_gpu: true
-  # Keep feature storage FP32 because the enabled company categorical columns
-  # must be converted to exact embedding indices. The shared CPU base avoids
-  # three copies; the 8GB compiled-workspace reserve deliberately rejects a
-  # full 7.64GB GPU cache on this 16GB card.
+  # FinancialTransformer's CandleEncoder deliberately reconstructs FP32 inputs
+  # before normalization, so pre-quantizing the immutable feature cache would
+  # alter the data contract. Keep FP32 storage and let the shared-base cache
+  # make exactly one copy per 32GB RTX 5090 rank.
   cache_train_features_in_amp_dtype: false
   learning_rate: 0.0003
   enable_lr_scheduler: false
@@ -425,7 +431,7 @@ training:
   loss_type: log_utility
   min_batch_size: 1
   auto_batch_size: false
-  vram_budget_gb: 16
+  vram_budget_gb: 32
   vram_safety_margin_gb: 1.5
   target_vram_fraction: 0.85
   # Model branches. Only the block named by training.model_name is active.

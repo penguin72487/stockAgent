@@ -1,0 +1,16 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+# Open-aware day-trade experiment.  This is intentionally a new checkpoint
+# schema/root: the inherited close-complete model has 98 features, while this
+# model has one additional causal feature available at the opening auction.
+experiment_name: tw-financial-transformer-candles_select
+
+runner:
+  output_dir: artifacts/markets/tw_public_candles_tw_day_trade_select
+  resume: false
+
+data:
+  # Adds next_session_open_gap_logret.  On the model window's final t-1 row it
+  # equals log(open[t] / close[t-1]); no session-t high/low/close/volume enters
+  # the feature tensor.
+  day_trade_open_feature: true

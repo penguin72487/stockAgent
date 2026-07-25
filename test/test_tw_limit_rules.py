@@ -13,7 +13,11 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from stockagent.backtest.simulator import run_backtest_integer_shares
-from stockagent.data.panel import _compute_tw_limit_masks, _tw_limit_price
+from stockagent.data.panel import (
+    _compute_tw_limit_masks,
+    _tw_limit_price,
+    _tw_open_limit_masks_from_arrays,
+)
 
 
 def _assert_close(actual: float, expected: float, tol: float = 1e-9) -> None:
@@ -111,6 +115,56 @@ def test_limit_masks_split_reference_price() -> None:
 
     assert bool(can_buy[1]) is False
     assert bool(can_sell[1]) is True
+
+
+def _open_limit_masks(
+    *,
+    prior_close: float,
+    session_open: float,
+    session_close: float,
+) -> tuple[bool, bool]:
+    open_prices = np.asarray([prior_close, session_open], dtype=np.float64)
+    close_prices = np.asarray([prior_close, session_close], dtype=np.float64)
+    tradable = np.ones(2, dtype=bool)
+    zeros = np.zeros(2, dtype=np.float64)
+    can_buy_open, can_sell_open = _tw_open_limit_masks_from_arrays(
+        open_prices,
+        close_prices,
+        tradable,
+        zeros,
+        zeros,
+    )
+    return bool(can_buy_open[1]), bool(can_sell_open[1])
+
+
+def test_open_limit_masks_block_only_the_locked_opening_direction() -> None:
+    # Prior close 100 gives legal opening bounds [90, 110].  The upper bound
+    # blocks buy-first entry only; the lower bound blocks sell-first entry only.
+    assert _open_limit_masks(
+        prior_close=100.0,
+        session_open=110.0,
+        session_close=110.0,
+    ) == (False, True)
+    assert _open_limit_masks(
+        prior_close=100.0,
+        session_open=90.0,
+        session_close=90.0,
+    ) == (True, False)
+
+
+def test_open_limit_masks_ignore_a_limit_reached_after_the_open() -> None:
+    # The same session later closes at its limit, but the opening print was
+    # inside the band.  Both opening directions therefore remain executable.
+    assert _open_limit_masks(
+        prior_close=100.0,
+        session_open=105.0,
+        session_close=110.0,
+    ) == (True, True)
+    assert _open_limit_masks(
+        prior_close=100.0,
+        session_open=95.0,
+        session_close=90.0,
+    ) == (True, True)
 
 
 def test_no_buy_on_limit_up_day() -> None:

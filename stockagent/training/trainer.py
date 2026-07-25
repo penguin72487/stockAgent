@@ -75,7 +75,7 @@ from stockagent.backtest.tw_integer_execution import (
 from stockagent.config import ExperimentConfig
 from stockagent.data.panel import PanelData
 from stockagent.data.panel_cache import array_content_fingerprint
-from stockagent.data.walkforward import WalkForwardFold
+from stockagent.data.walkforward import WalkForwardFold, normalize_lookback_context
 from stockagent.evaluation.metrics import compute_ic_series_torch, ic_summary
 from stockagent.models.factory import (
     _feature_indices_from_patterns,
@@ -95,7 +95,10 @@ from stockagent.portfolio_contract import (
 )
 from stockagent.profiling import PROFILE_RANGES_ENABLED, profile_range
 from stockagent.runtime_env import normalize_cuda_env
-from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
+from stockagent.training.dataset import (
+    CrossSectionalDataset,
+    execution_feature_lag,
+)
 from stockagent.training.execution_coverage import (
     validate_training_execution_coverage,
 )
@@ -5258,13 +5261,30 @@ def _checkpoint_manifest(
         "symbols": symbols,
         "feature_names": feature_names,
     }
+    walk_forward_contract = asdict(config.walk_forward)
+    pre_lookback_context_walk_forward_contract = dict(walk_forward_contract)
+    # Checkpoint schemas 1-4 existed before cross-split feature context was a
+    # configurable contract. Their only honest interpretation is today's
+    # split_only + no context-only panel years default.
+    pre_lookback_context_walk_forward_contract.pop("lookback_context", None)
+    pre_lookback_context_walk_forward_contract.pop("split_start_year", None)
+    uses_historical_lookback_defaults = (
+        normalize_lookback_context(config.walk_forward.lookback_context)
+        == "split_only"
+        and config.walk_forward.split_start_year is None
+    )
+    historical_walk_forward_contract = (
+        pre_lookback_context_walk_forward_contract
+        if uses_historical_lookback_defaults
+        else walk_forward_contract
+    )
     contracts = {
         "data": data_contract,
         "model": model_contract,
         "training": _training_checkpoint_contract(config),
         "evaluation": asdict(config.evaluation),
         "trading": _trading_checkpoint_contract(config),
-        "walk_forward": asdict(config.walk_forward),
+        "walk_forward": walk_forward_contract,
     }
     fingerprints = {
         name: _stable_fingerprint(contract) for name, contract in contracts.items()
@@ -5304,7 +5324,7 @@ def _checkpoint_manifest(
         "training": _training_checkpoint_contract_schema_3(config),
         "evaluation": asdict(config.evaluation),
         "trading": _trading_checkpoint_contract_schema_3(config),
-        "walk_forward": asdict(config.walk_forward),
+        "walk_forward": historical_walk_forward_contract,
     }
     schema_3_fingerprints = {
         name: _stable_fingerprint(contract)
@@ -5359,6 +5379,12 @@ def _checkpoint_manifest(
         )
         schema_2_interval_contracts[interval] = interval_contracts
         schema_2_interval_fingerprints[interval] = interval_fingerprints
+    schema_4_pre_lookback_context_fingerprints: dict[str, str] = {}
+    if uses_historical_lookback_defaults:
+        schema_4_pre_lookback_context_fingerprints = dict(fingerprints)
+        schema_4_pre_lookback_context_fingerprints["walk_forward"] = (
+            _stable_fingerprint(pre_lookback_context_walk_forward_contract)
+        )
     return {
         "schema_version": 4,
         "contracts": contracts,
@@ -5370,6 +5396,7 @@ def _checkpoint_manifest(
         "configuration": configuration_snapshot,
         "configuration_fingerprint": _stable_fingerprint(configuration_snapshot),
         "compatibility_fingerprints": {
+            "schema_4_pre_lookback_context": schema_4_pre_lookback_context_fingerprints,
             "schema_3": schema_3_fingerprints,
             "schema_3_without_force_exit": schema_3_without_force_exit_fingerprints,
             "schema_3_lr_interval_step": schema_3_interval_fingerprints["step"],
@@ -5664,6 +5691,17 @@ def _validate_checkpoint_manifest(
                     break
         else:
             expected_fingerprints = expected.get("fingerprints", {})
+            compatibility = expected.get("compatibility_fingerprints", {})
+            pre_context = compatibility.get(
+                "schema_4_pre_lookback_context",
+                {},
+            )
+            if (
+                actual_fingerprints.get("walk_forward")
+                == pre_context.get("walk_forward")
+            ):
+                expected_fingerprints = dict(expected_fingerprints)
+                expected_fingerprints["walk_forward"] = pre_context["walk_forward"]
         expected_for_validation = {"fingerprints": expected_fingerprints}
         mismatches = [
             name
@@ -7451,6 +7489,8 @@ def _save_holdings_table(
             "market_value": [float(row.market_value) for row in ordered],
             "holding_ratio": [float(row.holding_ratio) for row in ordered],
             "is_cash": [bool(row.is_cash) for row in ordered],
+            "record_type": [str(row.record_type) for row in ordered],
+            "side": [str(row.side) for row in ordered],
         },
         output_path,
     )
@@ -8577,17 +8617,14 @@ def _split_valid_indices(
     date_indices: np.ndarray,
     lookback: int,
     execution_mode: str = "naive",
+    lookback_context: str = "split_only",
 ) -> np.ndarray:
     indices = np.array(sorted(np.asarray(date_indices, dtype=np.int64).tolist()), dtype=np.int64)
     if indices.size == 0:
         return indices
-    fold_start_idx = int(indices[0])
-    min_valid_idx = (
-        fold_start_idx
-        + int(lookback)
-        - 1
-        + execution_feature_lag(execution_mode)
-    )
+    context = normalize_lookback_context(lookback_context)
+    history_origin = 0 if context == "panel_history" else int(indices[0])
+    min_valid_idx = history_origin + int(lookback) - 1 + execution_feature_lag(execution_mode)
     valid_indices = indices[indices >= min_valid_idx]
     if valid_indices.size > 0 and normalize_execution_mode(execution_mode) == "naive":
         target_mask = panel.tradable_mask & np.isfinite(panel.returns_1d)
@@ -8617,13 +8654,14 @@ def _deployment_test_indices(
     next_fold: WalkForwardFold | None,
     lookback: int,
     execution_mode: str = "naive",
+    lookback_context: str = "split_only",
 ) -> np.ndarray:
     """Raw test date indices owned by this fold's model.
 
-    CrossSectionalDataset later drops the in-split lookback warmup plus the
-    execution-mode feature lag. The interval ends just before the next fold's
-    first valid row, so the new year's warmup days remain assigned to the
-    previous model instead of being prepended to the next model's backtest.
+    The interval ends just before the next fold's first valid row. Under the
+    legacy split-only policy this leaves the new year's warmup with the prior
+    model. Under panel-history policy the next model owns its first target day
+    because its feature window can read causal rows from earlier years.
     """
     indices = np.array(sorted(np.asarray(fold.test_indices, dtype=np.int64).tolist()), dtype=np.int64)
     if indices.size == 0 or next_fold is None:
@@ -8633,6 +8671,7 @@ def _deployment_test_indices(
         next_fold.test_indices,
         lookback,
         execution_mode,
+        lookback_context,
     )
     if next_valid.size == 0:
         return indices
@@ -8646,6 +8685,7 @@ def _deployment_test_prefix_rows(
     lookback: int,
     full_valid_indices: np.ndarray,
     execution_mode: str = "naive",
+    lookback_context: str = "split_only",
 ) -> int:
     """Return the stitched-deployment prefix length inside a full test split.
 
@@ -8662,12 +8702,14 @@ def _deployment_test_prefix_rows(
         next_fold,
         lookback,
         execution_mode,
+        lookback_context,
     )
     deployment_valid = _split_valid_indices(
         panel,
         deployment_indices,
         lookback,
         execution_mode,
+        lookback_context,
     )
     full_valid = np.asarray(full_valid_indices, dtype=np.int64)
     deployment_rows = int(deployment_valid.size)
@@ -8863,6 +8905,11 @@ def _upgrade_full_horizon_artifacts_without_inference(
         fold.test_indices,
         config.training.lookback,
         getattr(getattr(config, "trading", None), "execution_mode", "naive"),
+        getattr(
+            getattr(config, "walk_forward", None),
+            "lookback_context",
+            "split_only",
+        ),
     )
     expected_dates = np.asarray(
         panel.dates[expected_indices],
@@ -8881,6 +8928,11 @@ def _upgrade_full_horizon_artifacts_without_inference(
                 getattr(config, "trading", None),
                 "execution_mode",
                 "naive",
+            ),
+            getattr(
+                getattr(config, "walk_forward", None),
+                "lookback_context",
+                "split_only",
             ),
         )
         if next_valid.size > 0:
@@ -14829,6 +14881,7 @@ def _run_training_tree_models(
             train_reference.train_indices,
             config.training.lookback,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
@@ -14854,6 +14907,7 @@ def _run_training_tree_models(
                 fold.val_indices,
                 config.training.lookback,
                 execution_mode=config.trading.execution_mode,
+                lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             )
@@ -14863,6 +14917,7 @@ def _run_training_tree_models(
                 config.training.lookback,
                 allow_empty=True,
                 execution_mode=config.trading.execution_mode,
+                lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             )
@@ -14876,6 +14931,7 @@ def _run_training_tree_models(
                 config.training.lookback,
                 test_ds.valid_indices,
                 execution_mode=config.trading.execution_mode,
+                lookback_context=config.walk_forward.lookback_context,
             )
 
             fold_dir = _fold_dir(output_path, fold.fold_id)
@@ -15276,6 +15332,7 @@ def _run_inference_tree_models(
             fold.val_indices,
             config.training.lookback,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
@@ -15285,6 +15342,7 @@ def _run_inference_tree_models(
             config.training.lookback,
             allow_empty=True,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
@@ -15298,6 +15356,7 @@ def _run_inference_tree_models(
             config.training.lookback,
             test_ds.valid_indices,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
         )
 
         val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
@@ -15729,6 +15788,7 @@ def _run_inference_neural_models(
             config.training.lookback,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
@@ -15739,6 +15799,7 @@ def _run_inference_neural_models(
             allow_empty=True,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
@@ -15752,6 +15813,7 @@ def _run_inference_neural_models(
             config.training.lookback,
             test_ds.valid_indices,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
         )
 
         val_windowed = _prepare_windowed_split(
@@ -16190,6 +16252,7 @@ def run_training(
         execution_mode=config.trading.execution_mode,
         long_only=config.trading.long_only,
         lookback=config.training.lookback,
+        lookback_context=config.walk_forward.lookback_context,
     )
     if execution_coverage is not None and _distributed_is_rank0():
         earliest = execution_coverage.first_actionable_date
@@ -16646,6 +16709,7 @@ def run_training(
             config.training.lookback,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
@@ -16775,6 +16839,7 @@ def run_training(
                 config.training.lookback,
                 include_volume_notional=include_volume_notional,
                 execution_mode=config.trading.execution_mode,
+                lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             )
@@ -16785,6 +16850,7 @@ def run_training(
                 allow_empty=True,
                 include_volume_notional=include_volume_notional,
                 execution_mode=config.trading.execution_mode,
+                lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
             )
@@ -16799,6 +16865,7 @@ def run_training(
                 config.training.lookback,
                 test_ds.valid_indices,
                 execution_mode=config.trading.execution_mode,
+                lookback_context=config.walk_forward.lookback_context,
             )
 
             val_batch_size = _split_batch_size(len(val_ds), config.training.batch_size_eval)
@@ -16887,6 +16954,7 @@ def run_training(
             allow_empty=True,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
