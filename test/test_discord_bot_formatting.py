@@ -18,6 +18,7 @@ from services.discord_bot.bot import (
     _daily_summary_message,
     _ensure_signal_ready,
     _filter_watchlist_rows,
+    _formal_history_latest_date,
     _guide_message,
     _latest_changes_pages,
     _latest_signal_message,
@@ -41,6 +42,8 @@ from services.discord_bot.bot import (
     _resolve_pre_signal_command,
     _remove_user_subscription,
     _replace_user_watch_symbol,
+    _run_artifact_backfill_sync,
+    _run_day_trade_settlement_backfill,
     _risk_message,
     _scheduled_detail_page_groups,
     _scheduled_markets,
@@ -63,6 +66,7 @@ from services.discord_bot.bot import (
     _watch_crash_delay_seconds,
     _watch_delay_seconds,
     _watch_poll_seconds,
+    _wait_for_existing_tw_data_update,
 )
 
 
@@ -158,6 +162,134 @@ def test_artifact_backfill_key_uses_backfill_time_and_skips_interval_markets(mon
     assert _artifact_backfill_key(daily_cfg, now) == "2026-07-06:tw:artifact_backfill"
     assert _artifact_backfill_key(daily_cfg, now.replace(hour=13, minute=29)) is None
     assert _artifact_backfill_key(interval_cfg, now) is None
+
+
+def test_formal_history_latest_date_reads_settled_returns(monkeypatch, tmp_path) -> None:
+    fold_dir = tmp_path / "fold_11"
+    fold_dir.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-07-20", "2026-07-21"],
+            "portfolio_return": [0.01, -0.02],
+        }
+    ).write_parquet(fold_dir / "daily_portfolio_returns.parquet")
+    monkeypatch.setattr("services.discord_bot.bot._market_fold_dir", lambda cfg: fold_dir)
+
+    assert _formal_history_latest_date(SimpleNamespace()) == "2026-07-21"
+
+
+def test_day_trade_settlement_backfill_skips_current_history(monkeypatch) -> None:
+    cfg = SimpleNamespace(market="tw_day_trade", fold_id=11)
+    status = SimpleNamespace(
+        data=SimpleNamespace(
+            expected_latest_date="2026-07-21",
+            last_data_date="2026-07-21",
+            panel_date=None,
+        )
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._formal_history_latest_date",
+        lambda cfg: "2026-07-21",
+    )
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("current formal history must not rerun inference")
+
+    monkeypatch.setattr("services.discord_bot.bot.subprocess.run", fail_run)
+
+    assert not _run_day_trade_settlement_backfill(cfg, status)
+
+
+def test_day_trade_settlement_backfill_runs_formal_fold_inference(monkeypatch, tmp_path) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        fold_id=11,
+        config_path=tmp_path / "tw_day_trade.yaml",
+        output_dir=tmp_path / "artifacts",
+        pre_signal_timeout_seconds=123,
+    )
+    status = SimpleNamespace(
+        data=SimpleNamespace(
+            expected_latest_date="2026-07-22",
+            last_data_date="2026-07-21",
+            panel_date=None,
+        )
+    )
+    dates = iter(["2026-07-17", "2026-07-22"])
+    monkeypatch.setattr(
+        "services.discord_bot.bot._formal_history_latest_date",
+        lambda cfg: next(dates),
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("services.discord_bot.bot.subprocess.run", fake_run)
+
+    assert _run_day_trade_settlement_backfill(cfg, status)
+    command, kwargs = calls[0]
+    assert command[1].endswith("train.py")
+    assert command[command.index("--mode") + 1] == "infer"
+    assert command[command.index("--start-fold") + 1] == "11"
+    assert command[command.index("--multi-gpu-strategy") + 1] == "none"
+    assert kwargs["timeout"] == 123
+
+
+def test_naive_artifact_backfill_runs_formal_history_inference(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw",
+        signal_kwargs=lambda **kwargs: kwargs,
+    )
+    status = SimpleNamespace(
+        data=SimpleNamespace(
+            fresh=True,
+            expected_latest_date="2026-07-23",
+            last_data_date="2026-07-23",
+            panel_date="2026-07-23",
+        )
+    )
+    calls = []
+    monkeypatch.setattr("services.discord_bot.bot._effective_market_config", lambda value: value)
+    monkeypatch.setattr("services.discord_bot.bot._ensure_signal_ready", lambda value: status)
+    monkeypatch.setattr("services.discord_bot.bot._market_execution_mode", lambda value: "naive")
+    monkeypatch.setattr(
+        "services.discord_bot.bot._run_pre_signal_command",
+        lambda value: calls.append("download"),
+    )
+    monkeypatch.setattr("services.discord_bot.bot._clear_runtime_status_cache", lambda: None)
+    monkeypatch.setattr("services.discord_bot.bot._runtime_status", lambda value: status)
+    monkeypatch.setattr("services.discord_bot.bot._market_notice", lambda runtime: None)
+    monkeypatch.setattr(
+        "services.discord_bot.bot._require_fresh_data_for_artifact_generation",
+        lambda value, runtime: calls.append("fresh"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._run_formal_history_backfill",
+        lambda value, runtime: calls.append("infer"),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_has_panel_close_signal_for_date",
+        lambda value, date_text: False,
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot.generate_live_signal",
+        lambda **kwargs: calls.append(("signal", kwargs["price_source"])) or object(),
+    )
+    monkeypatch.setattr(
+        "services.discord_bot.bot._sync_latest_live_weights_to_market_artifact",
+        lambda value: calls.append("sync"),
+    )
+
+    assert _run_artifact_backfill_sync(cfg) is not None
+    assert calls == [
+        "download",
+        "fresh",
+        "infer",
+        ("signal", "panel"),
+        "sync",
+    ]
 
 
 def test_market_has_live_signal_for_date_uses_summary_data_fields(monkeypatch) -> None:
@@ -261,6 +393,32 @@ def test_prepare_realtime_signal_refreshes_interval_market(monkeypatch) -> None:
     assert resolved_status is status
     assert refreshed
     assert calls == [cfg]
+
+
+def test_tw_pre_signal_waits_for_existing_data_update(monkeypatch, tmp_path) -> None:
+    import fcntl
+
+    lock_path = tmp_path / "tw.lock"
+    holder = lock_path.open("a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    command = [
+        "python",
+        "downloader/download_tw_official_data.py",
+        "--lock-file",
+        str(lock_path),
+    ]
+    sleeps = []
+
+    def release_lock(_seconds):
+        sleeps.append(_seconds)
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    monkeypatch.setattr("services.discord_bot.bot.time.sleep", release_lock)
+    try:
+        assert _wait_for_existing_tw_data_update(command, timeout_seconds=5)
+    finally:
+        holder.close()
+    assert sleeps == [1.0]
 
 
 def test_can_reuse_latest_signal_now_for_closed_fresh_panel_close() -> None:
@@ -409,6 +567,50 @@ def test_can_reuse_latest_signal_now_for_recent_open_yahoo(monkeypatch) -> None:
 
     assert reusable
     assert reason == "cached_open_yahoo_age=30s"
+
+
+def test_open_day_trade_cache_requires_current_decision_panel(monkeypatch) -> None:
+    cfg = SimpleNamespace(
+        market="tw_day_trade",
+        market_type="tw",
+        history_frequency="daily",
+        display_timezone="Asia/Taipei",
+        timezone="Asia/Taipei",
+    )
+    status = SimpleNamespace(market_open=True, data=SimpleNamespace(fresh=True))
+    summary = {
+        "asof_date": "2026-07-21 12:10:46",
+        "panel_date": "2026-07-17 13:30:00",
+        "price_source": "twse_tpex:mis",
+        "price_timestamp": "2026-07-21T04:10:43+00:00",
+        "price_available_count": 2000,
+        "execution_mode": "tw_day_trade",
+        "live_session_open_feature_applied": False,
+    }
+    monkeypatch.setattr("services.discord_bot.bot._summary_age_seconds", lambda summary, cfg: 10.0)
+
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg,
+        status,
+        summary,
+        requested_price_source="auto",
+    )
+
+    assert not reusable
+    assert reason == "day_trade_live_open_feature_missing"
+
+    summary.update(
+        panel_date="2026-07-21 12:10:43",
+        live_session_open_feature_applied=True,
+    )
+    reusable, reason = _can_reuse_latest_signal_now(
+        cfg,
+        status,
+        summary,
+        requested_price_source="auto",
+    )
+    assert reusable
+    assert reason == "cached_open_tw_mis_age=10s"
 
 
 def test_signal_now_refreshes_automatically_when_data_is_stale() -> None:
@@ -1127,14 +1329,32 @@ def test_portfolio_history_can_prepend_latest_signal_day(tmp_path) -> None:
     assert summary_path in result.source_paths
 
 
-def test_portfolio_history_prepend_uses_panel_data_date_before_asof(tmp_path) -> None:
+def test_portfolio_history_prepend_uses_weights_date_before_panel_date(tmp_path) -> None:
     result = SimpleNamespace(
-        rows=[{"date": "2026-06-23", "changes": [], "change_counts": {}}],
+        rows=[
+            {
+                "date": "2026-06-23",
+                "portfolio_return": 0.0,
+                "benchmark_return": 0.0,
+                "profit_value": 0.0,
+                "changes": [],
+                "change_counts": {},
+            }
+        ],
+        source_paths=(),
+        days=1,
+        top_changes=1,
+        start_date="2026-06-23",
         end_date="2026-06-23",
+        period_return=0.0,
+        benchmark_return=0.0,
+        profit_value=0.0,
+        capital=SimpleNamespace(capital=None),
     )
     summary = {
-        "asof_date": "2026-06-23 11:42:00",
+        "asof_date": "2026-06-24 11:42:00",
         "panel_data_date": "2026-06-23",
+        "weights_date": "2026-06-24 11:41:55",
     }
 
     inserted = _prepend_latest_signal_row_to_portfolio_history(
@@ -1144,8 +1364,31 @@ def test_portfolio_history_prepend_uses_panel_data_date_before_asof(tmp_path) ->
         max_rows=2,
     )
 
+    assert inserted is True
+    assert [row["date"] for row in result.rows] == [
+        "2026-06-24 11:41:55",
+        "2026-06-23",
+    ]
+
+
+def test_portfolio_history_never_persists_day_trade_signal_preview(tmp_path) -> None:
+    result = SimpleNamespace(rows=[{"date": "2026-07-17"}], end_date="2026-07-17")
+    summary = {
+        "asof_date": "2026-07-22 10:30:00",
+        "panel_data_date": "2026-07-22",
+        "execution_mode": "tw_day_trade",
+        "execution_preview_only": True,
+    }
+
+    inserted = _prepend_latest_signal_row_to_portfolio_history(
+        result,
+        summary_path=tmp_path / "summary.json",
+        summary=summary,
+        max_rows=32,
+    )
+
     assert inserted is False
-    assert [row["date"] for row in result.rows] == ["2026-06-23"]
+    assert result.rows == [{"date": "2026-07-17"}]
 
 
 def test_portfolio_history_prepend_keeps_panel_display_time(tmp_path) -> None:
@@ -1197,6 +1440,7 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
     )
     cfg = SimpleNamespace(market="tw", live_output_dir=str(tmp_path))
     summaries = []
+    previous_date = "2026-06-25"
     for date_text, ret in (("2026-06-26", 0.02), ("2026-06-30", -0.01)):
         signal_dir = tmp_path / date_text
         signal_dir.mkdir()
@@ -1217,6 +1461,8 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
             "asof_date": f"{date_text} 13:15:00",
             "panel_date": f"{date_text} 13:30:00",
             "panel_data_date": date_text,
+            "weights_date": f"{date_text} 13:30:00",
+            "previous_weights_data_date": previous_date,
             "portfolio_simple_return": ret,
             "benchmark_simple_return": 0.0,
             "display_capital": 1_000.0,
@@ -1226,15 +1472,58 @@ def test_portfolio_history_includes_all_newer_live_signals(monkeypatch, tmp_path
         }
         summary_path.write_text("{}", encoding="utf-8")
         summaries.append((summary_path, summary))
+        previous_date = date_text
 
     monkeypatch.setattr("services.discord_bot.bot._market_signals", lambda cfg: summaries)
 
     _include_live_signals_in_portfolio_history(cfg, result, max_rows=3)
 
-    assert [row["date"] for row in result.rows] == ["2026-06-30", "2026-06-26", "2026-06-25"]
+    assert [row["date"] for row in result.rows] == [
+        "2026-06-30 13:30:00",
+        "2026-06-26 13:30:00",
+        "2026-06-25",
+    ]
     assert np.isclose(result.period_return, 1.01 * 1.02 * 0.99 - 1.0)
     assert result.rows[0]["source"] == "latest_live_signal"
     assert result.rows[1]["source"] == "latest_live_signal"
+
+
+def test_portfolio_history_does_not_bridge_missing_live_signal_dates(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    result = SimpleNamespace(
+        rows=[{"date": "2026-06-25", "portfolio_return": 0.01}],
+        source_paths=(),
+        days=2,
+        top_changes=0,
+        start_date="2026-06-25",
+        end_date="2026-06-25",
+        period_return=0.01,
+        benchmark_return=None,
+        profit_value=0.0,
+        capital=SimpleNamespace(capital=None),
+    )
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text("{}", encoding="utf-8")
+    summary = {
+        "weights_date": "2026-07-14 13:30:00",
+        "panel_data_date": "2026-07-14",
+        "previous_weights_data_date": "2026-07-13",
+        "portfolio_simple_return": 0.50,
+    }
+    monkeypatch.setattr(
+        "services.discord_bot.bot._market_signals",
+        lambda cfg: [(summary_path, summary)],
+    )
+
+    _include_live_signals_in_portfolio_history(
+        SimpleNamespace(market="tw", live_output_dir=str(tmp_path)),
+        result,
+        max_rows=2,
+    )
+
+    assert result.rows == [{"date": "2026-06-25", "portfolio_return": 0.01}]
 
 
 def test_portfolio_history_excludes_signal_after_canonical_live_weights(
@@ -1263,6 +1552,8 @@ def test_portfolio_history_excludes_signal_after_canonical_live_weights(
     summary_path.write_text("{}", encoding="utf-8")
     bad_summary = {
         "panel_data_date": "2026-07-16 00:00:00",
+        "weights_date": "2026-07-16 00:00:00",
+        "previous_weights_data_date": "2026-07-15 00:00:00",
         "portfolio_simple_return": -0.18,
     }
     monkeypatch.setattr(

@@ -843,6 +843,7 @@ def main() -> None:
 
     from stockagent.data.panel import build_panel
     from stockagent.data.walkforward import (
+        build_checkpoint_inference_fold,
         build_expanding_year_folds,
         validate_walk_forward_year_contract,
     )
@@ -1006,6 +1007,43 @@ def main() -> None:
         val_years=config.walk_forward.val_years,
         require_future_test_year=config.walk_forward.require_future_test_year,
     )
+    if mode == "infer" and start_fold is not None:
+        checkpoint_path = (
+            Path(output_dir)
+            / f"fold_{int(start_fold):02d}"
+            / "checkpoint_best.pt"
+        )
+        if checkpoint_path.exists():
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            checkpoint_fold = build_checkpoint_inference_fold(
+                panel.dates,
+                checkpoint,
+            )
+            if checkpoint_fold.fold_id != int(start_fold):
+                raise ValueError(
+                    "requested inference fold does not match checkpoint metadata: "
+                    f"requested={int(start_fold)} saved={checkpoint_fold.fold_id}"
+                )
+            all_folds = sorted(
+                [
+                    fold
+                    for fold in all_folds
+                    if int(fold.fold_id) != int(start_fold)
+                ]
+                + [checkpoint_fold],
+                key=lambda fold: int(fold.fold_id),
+            )
+            print(
+                "[runner] restored checkpoint-defined inference fold "
+                f"fold={checkpoint_fold.fold_id} "
+                f"train={checkpoint_fold.train_years[0]}-{checkpoint_fold.train_years[-1]} "
+                f"val={checkpoint_fold.val_years} test={checkpoint_fold.test_years}",
+                flush=True,
+            )
     startup_timing.checkpoint(
         "walk_forward_validation_and_fold_build",
         folds=int(len(all_folds)),
