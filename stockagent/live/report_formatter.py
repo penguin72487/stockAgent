@@ -128,7 +128,7 @@ def _fmt_tz_label(summary: dict[str, Any]) -> str:
 def _period_title(summary: dict[str, Any]) -> str:
     label = str(summary.get("previous_period_label") or "上個訊號到現在").strip() or "上個訊號到現在"
     start = summary.get("previous_weights_date") or summary.get("drift_base_date")
-    end = summary.get("asof_date") or summary.get("panel_date")
+    end = summary.get("price_timestamp") or summary.get("asof_date") or summary.get("panel_date")
     if start and end:
         return f"**{label}** `{_fmt_time(start, summary)}`..`{_fmt_time(end, summary)}`"
     return f"**{label}**"
@@ -149,6 +149,8 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
     portfolio_return = _float_or_none(summary.get("portfolio_simple_return"))
     baseline_return = _float_or_none(summary.get("benchmark_simple_return"))
     period_excess = None if portfolio_return is None or baseline_return is None else portfolio_return - baseline_return
+    execution_mode = str(summary.get("execution_mode") or "naive").strip().lower()
+    execution_preview_only = bool(summary.get("execution_preview_only"))
 
     market_label = str(summary.get("market_label") or summary.get("market") or "").strip()
     title = "**stockAgent live signal**"
@@ -160,21 +162,40 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
     ]
     if summary.get("price_timestamp"):
         price_pairs.append(("price_time", _fmt_time(summary.get("price_timestamp", "n/a"), summary)))
+    if summary.get("feature_cutoff_date"):
+        price_pairs.append(("features_through", _fmt_time(summary.get("feature_cutoff_date", "n/a"), summary)))
 
     lines = [
         f"{title}",
         f"`{_fmt_time(summary.get('asof_date', 'latest'), summary)}`  `tz={_fmt_tz_label(summary)}`",
         _kv_line(*price_pairs),
-        "",
-        _period_title(summary),
-        _kv_line(
-            ("portfolio", _fmt_signed_pct(portfolio_return)),
-            ("baseline", _fmt_signed_pct(baseline_return)),
-            ("excess", _fmt_signed_pct(period_excess)),
-            ("turnover", _fmt_pct(summary.get("turnover"), 2)),
-            ("fees", _fmt_pct(summary.get("estimated_trade_cost"), 3)),
-        ),
     ]
+    if execution_preview_only:
+        lines.extend(
+            [
+                _kv_line(("mode", execution_mode), ("output", "model_target_preview")),
+                "",
+                "**模型目標配置**",
+                _kv_line(("gross", _fmt_pct(target_risk.get("gross"))), ("entry_change", _fmt_pct(summary.get("turnover"), 2))),
+            ]
+        )
+        constraints_notice = str(summary.get("execution_constraints_notice") or "").strip()
+        if constraints_notice:
+            lines.append(f"warning: {constraints_notice}")
+    else:
+        lines.extend(
+            [
+                "",
+                _period_title(summary),
+                _kv_line(
+                    ("portfolio", _fmt_signed_pct(portfolio_return)),
+                    ("baseline", _fmt_signed_pct(baseline_return)),
+                    ("excess", _fmt_signed_pct(period_excess)),
+                    ("turnover", _fmt_pct(summary.get("turnover"), 2)),
+                    ("fees", _fmt_pct(summary.get("estimated_trade_cost"), 3)),
+                ),
+            ]
+        )
     if _float_or_none(summary.get("portfolio_pnl_value")) is not None:
         lines.append(
             _kv_line(
@@ -187,7 +208,7 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
     lines.extend(
         [
             "",
-            "**風險**",
+            "**模型配置風險**" if execution_preview_only else "**風險**",
             _kv_line(
                 ("gross", _fmt_pct(target_risk.get("gross"))),
                 ("long", _fmt_pct(target_risk.get("long_gross"))),
@@ -232,14 +253,14 @@ def format_signal_message(summary: dict[str, Any], *, max_rows: int = 12, debug:
 
     if top_positions:
         lines.append("")
-        lines.append("**目標持倉 Top**")
+        lines.append("**模型目標配置 Top**" if execution_preview_only else "**目標持倉 Top**")
         for index, row in enumerate(top_positions, start=1):
             lines.append(f"{index}. {_label(row)}")
             lines.append(_kv_line(("weight", _fmt_pct(row.get("weight"))), ("px", _fmt_float(row.get("current_price"), 2))))
 
     if rebalance:
         lines.append("")
-        lines.append("**調倉 Top**")
+        lines.append("**模型進場方向 Top**" if execution_preview_only else "**調倉 Top**")
         for index, row in enumerate(rebalance, start=1):
             delta = float(row.get("delta_weight", 0.0) or 0.0)
             side = str(row.get("action") or ("BUY" if delta > 0 else "SELL"))

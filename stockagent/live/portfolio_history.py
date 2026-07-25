@@ -35,6 +35,7 @@ class PortfolioHistoryResult:
     profit_value: float | None
     capital: CapitalScale
     frequency: str
+    execution_mode: str = "naive"
 
 
 def _latest_holdings_by_date_symbol(holdings):
@@ -148,22 +149,53 @@ def _float_or_none(value: Any) -> float | None:
 
 
 class _PriceLookup:
-    def __init__(self, price_root: str | Path | None, *, frequency: str | None):
+    def __init__(
+        self,
+        price_root: str | Path | None,
+        *,
+        frequency: str | None,
+        execution_mode: str = "naive",
+    ):
         self.price_root = price_root
         self.frequency = frequency
+        self.execution_mode = str(execution_mode).strip().lower()
         self.cache: dict[str, dict[str, float]] = {}
+        self.open_cache: dict[str, dict[str, float]] = {}
+        self.close_cache: dict[str, dict[str, float]] = {}
         self.paths: list[Path] = []
+
+    def _load(self, symbol: str, *, price_column: str | None) -> dict[str, float]:
+        target = (
+            self.open_cache
+            if price_column == "open"
+            else self.close_cache
+            if price_column == "close"
+            else self.cache
+        )
+        key = str(symbol)
+        if key not in target:
+            prices, path = _read_price_history_map(
+                self.price_root,
+                key,
+                frequency=self.frequency,
+                price_column=price_column,
+            )
+            target[key] = prices
+            if path is not None and path not in self.paths:
+                self.paths.append(path)
+        return target[key]
 
     def get(self, symbol: str, date: str | None) -> float | None:
         if self.price_root is None or not date:
             return None
-        key = str(symbol)
-        if key not in self.cache:
-            prices, path = _read_price_history_map(self.price_root, key, frequency=self.frequency)
-            self.cache[key] = prices
-            if path is not None and path not in self.paths:
-                self.paths.append(path)
-        value = self.cache.get(key, {}).get(str(date))
+        price_column = "open" if self.execution_mode == "tw_day_trade" else None
+        value = self._load(symbol, price_column=price_column).get(str(date))
+        return float(value) if value is not None else None
+
+    def get_close(self, symbol: str, date: str | None) -> float | None:
+        if self.price_root is None or not date:
+            return None
+        value = self._load(symbol, price_column="close").get(str(date))
         return float(value) if value is not None else None
 
 
@@ -177,6 +209,7 @@ def _change_row(
     price_lookup: _PriceLookup | None,
     symbol_names: dict[str, str] | None,
     resolve_missing_prices: bool = True,
+    execution_mode: str = "naive",
 ) -> dict[str, Any]:
     shares = int((current or {}).get("shares") or 0)
     prev_shares = int((previous or {}).get("shares") or 0)
@@ -192,9 +225,16 @@ def _change_row(
     prev_price = _float_or_none((previous or {}).get("price"))
     if resolve_missing_prices and prev_price is None and price_lookup is not None:
         prev_price = price_lookup.get(symbol, previous_date)
-    price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
-    stock_return = position_adjusted_stock_return(prev_holding_ratio, price_return)
-    portfolio_contribution = position_portfolio_contribution(prev_holding_ratio, price_return)
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
+    exit_price = price_lookup.get_close(symbol, date) if day_trade and price_lookup is not None else None
+    if day_trade:
+        price_return = exit_price / price - 1.0 if price is not None and exit_price is not None and price > 0.0 else None
+        return_weight = holding_ratio
+    else:
+        price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
+        return_weight = prev_holding_ratio
+    stock_return = position_adjusted_stock_return(return_weight, price_return)
+    portfolio_contribution = position_portfolio_contribution(return_weight, price_return)
     action = classify_stock_history_action(
         prev_shares,
         shares,
@@ -209,6 +249,8 @@ def _change_row(
         "prev_shares": prev_shares,
         "share_delta": shares - prev_shares,
         "price": price,
+        "entry_price": price if day_trade else None,
+        "exit_price": exit_price,
         "prev_price": prev_price,
         "price_return": price_return,
         "stock_return": stock_return,
@@ -219,6 +261,7 @@ def _change_row(
         "holding_ratio": holding_ratio,
         "prev_holding_ratio": prev_holding_ratio,
         "holding_ratio_delta": holding_ratio - prev_holding_ratio,
+        "execution_mode": str(execution_mode),
     }
 
 
@@ -228,6 +271,7 @@ def _enrich_change_row_prices(
     date: str,
     previous_date: str | None,
     price_lookup: _PriceLookup | None,
+    execution_mode: str = "naive",
 ) -> dict[str, Any]:
     if price_lookup is None:
         return row
@@ -243,14 +287,23 @@ def _enrich_change_row_prices(
         prev_price = price_lookup.get(symbol, previous_date)
     if price is None:
         price = prev_price
-    price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
-    prev_holding_ratio = float(row.get("prev_holding_ratio") or 0.0)
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
+    exit_price = price_lookup.get_close(symbol, date) if day_trade else None
+    if day_trade:
+        price_return = exit_price / price - 1.0 if price is not None and exit_price is not None and price > 0.0 else None
+        return_weight = float(row.get("holding_ratio") or 0.0)
+    else:
+        price_return = price / prev_price - 1.0 if price is not None and prev_price is not None and prev_price > 0.0 else None
+        return_weight = float(row.get("prev_holding_ratio") or 0.0)
     enriched = dict(row)
     enriched["price"] = price
+    enriched["entry_price"] = price if day_trade else None
+    enriched["exit_price"] = exit_price
     enriched["prev_price"] = prev_price
     enriched["price_return"] = price_return
-    enriched["stock_return"] = position_adjusted_stock_return(prev_holding_ratio, price_return)
-    enriched["portfolio_contribution"] = position_portfolio_contribution(prev_holding_ratio, price_return)
+    enriched["stock_return"] = position_adjusted_stock_return(return_weight, price_return)
+    enriched["portfolio_contribution"] = position_portfolio_contribution(return_weight, price_return)
+    enriched["execution_mode"] = str(execution_mode)
     return enriched
 
 
@@ -278,6 +331,7 @@ def _daily_changes(
     top_changes: int,
     capital_scale: float,
     price_lookup: _PriceLookup | None,
+    execution_mode: str = "naive",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     current = holdings_by_date.get(date, {})
     previous = holdings_by_date.get(previous_date or "", {})
@@ -294,6 +348,7 @@ def _daily_changes(
             price_lookup=price_lookup,
             symbol_names=symbol_names,
             resolve_missing_prices=False,
+            execution_mode=execution_mode,
         )
         action = str(row["action"])
         if action == "HOLD":
@@ -320,6 +375,7 @@ def _daily_changes(
                 date=date,
                 previous_date=previous_date,
                 price_lookup=price_lookup,
+                execution_mode=execution_mode,
             )
             for row in selected
         ]
@@ -349,6 +405,7 @@ def load_portfolio_history(
     symbol_names: dict[str, str] | None = None,
     frequency: str | None = "daily",
     price_root: str | Path | None = None,
+    execution_mode: str = "naive",
 ) -> PortfolioHistoryResult:
     root = Path(fold_dir)
     holdings_path = _artifact_path(root, "holdings")
@@ -363,7 +420,11 @@ def load_portfolio_history(
     if missing:
         raise ValueError(f"{holdings_path} missing columns: {', '.join(missing)}")
     history_frequency = "bar" if is_bar_frequency(frequency) else "daily"
-    price_lookup = _PriceLookup(price_root, frequency=history_frequency)
+    price_lookup = _PriceLookup(
+        price_root,
+        frequency=history_frequency,
+        execution_mode=execution_mode,
+    )
     returns, returns_path = _read_returns(root, frequency=history_frequency)
     holdings = holdings.with_row_index(_ROW_INDEX_COL).select(
         [
@@ -443,6 +504,7 @@ def load_portfolio_history(
                 top_changes=top_changes,
                 capital_scale=capital.scale,
                 price_lookup=price_lookup,
+                execution_mode=execution_mode,
             )
         else:
             changes, change_counts = [], {}
@@ -470,4 +532,5 @@ def load_portfolio_history(
         profit_value=profit_value,
         capital=capital,
         frequency=history_frequency,
+        execution_mode=str(execution_mode),
     )

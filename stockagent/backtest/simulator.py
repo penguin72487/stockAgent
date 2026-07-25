@@ -2927,15 +2927,15 @@ def _tw_integer_holdings_records(
     result: TaiwanIntegerBacktestResult,
     *,
     close_prices: np.ndarray,
+    open_prices: np.ndarray | None = None,
     symbols: list[str],
     dates: np.ndarray | None,
 ) -> list[HoldingsRecord]:
-    """Render end-of-session holdings while keeping settlement in audit fields.
+    """Render the economically relevant position snapshot for each mode.
 
-    A day-trade account is flat at every close, so it emits only the economic
-    cash row.  Its exact intraday signed quantities remain available through
-    ``BacktestResult.shares_history`` rather than being mislabeled as overnight
-    holdings.
+    Cash mode records close holdings. Day-trade mode records only the opening
+    position snapshot; its formal result still realizes every position at that
+    session's close and remains flat overnight.
     """
 
     t_len, n_symbols = result.positions.shape
@@ -2943,6 +2943,13 @@ def _tw_integer_holdings_records(
         raise ValueError(f"symbols must contain exactly {n_symbols} entries")
     if np.asarray(close_prices).shape != (t_len, n_symbols):
         raise ValueError(f"close_prices must have shape [{t_len}, {n_symbols}]")
+    mode = str(result.final_state.mode)
+    if mode == "tw_day_trade":
+        if open_prices is None or np.asarray(open_prices).shape != (t_len, n_symbols):
+            raise ValueError(f"tw_day_trade open_prices must have shape [{t_len}, {n_symbols}]")
+        open_values = np.asarray(open_prices, dtype=np.float64)
+    else:
+        open_values = None
     if dates is None:
         date_text = [f"t{idx:04d}" for idx in range(t_len)]
     else:
@@ -2981,12 +2988,8 @@ def _tw_integer_holdings_records(
             if margin_collateral_history is None
             else float(np.sum(margin_collateral_history[t]))
         )
-        nonzero = (
-            np.flatnonzero(result.positions[t] != 0)
-            if result.final_state.mode == "tw_cash"
-            else np.empty(0, dtype=np.int64)
-        )
-        if result.final_state.mode == "tw_cash":
+        nonzero = np.flatnonzero(result.positions[t] != 0)
+        if mode == "tw_cash":
             # ``strategy_returns[t]`` already includes close[t] -> the next
             # causal valuation mark, whereas holdings are audited at close[t].
             # A halted holding has no raw execution quote on that row, so derive
@@ -3030,21 +3033,35 @@ def _tw_integer_holdings_records(
                     "integer cash holdings report violates the execution-time "
                     "asset-liability identity"
                 )
+            cash_snapshot_value = free_cash_and_claims
         else:
-            # A day-trade account is flat after its mandatory closing leg.
-            execution_nav = free_cash_and_claims
-            market_values = np.empty(0, dtype=np.float64)
-            reconstructed_prices = np.empty(0, dtype=np.float64)
+            assert open_values is not None
+            execution_nav = float(result.execution_nav_history[t])
+            reconstructed_prices = open_values[t, nonzero]
+            market_values = (
+                result.positions[t, nonzero].astype(np.float64, copy=False)
+                * reconstructed_prices
+            )
+            if np.any(
+                ~np.isfinite(reconstructed_prices)
+                | (reconstructed_prices <= 0.0)
+                | ~np.isfinite(market_values)
+            ):
+                raise ValueError(f"day-trade opening holdings contain invalid prices at time index {t}")
+            # Synthetic cash at the opening snapshot makes signed stock values
+            # plus cash reconcile exactly to opening NAV. Settlement cash and
+            # T+2 claims remain in the dedicated settlement audit artifact.
+            cash_snapshot_value = execution_nav - float(np.sum(market_values))
         denominator = execution_nav if execution_nav > 0.0 else 1.0
         day_rows = [
             HoldingsRecord(
                 date=date_text[t],
                 symbol="CASH",
-                shares=int(_trunc_to_int64(free_cash_and_claims).item()),
+                shares=int(_trunc_to_int64(cash_snapshot_value).item()),
                 price=1.0,
-                market_value=free_cash_and_claims,
+                market_value=cash_snapshot_value,
                 holding_ratio=(
-                    free_cash_and_claims / denominator if execution_nav > 0.0 else 0.0
+                    cash_snapshot_value / denominator if execution_nav > 0.0 else 0.0
                 ),
                 is_cash=True,
             )
@@ -3065,7 +3082,7 @@ def _tw_integer_holdings_records(
                         is_cash=True,
                     )
                 )
-        if result.final_state.mode == "tw_cash" and execution_nav > 0.0:
+        if execution_nav > 0.0:
             for offset, idx in enumerate(nonzero.tolist()):
                 market_value = float(market_values[offset])
                 day_rows.append(
@@ -3494,6 +3511,7 @@ def run_backtest_integer_shares(
             _tw_integer_holdings_records(
                 integer_result,
                 close_prices=close_real,
+                open_prices=open_real if execution_mode == "tw_day_trade" else None,
                 symbols=active_symbols,
                 dates=dates,
             )

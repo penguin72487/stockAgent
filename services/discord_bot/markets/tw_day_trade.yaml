@@ -1,16 +1,18 @@
-market: tw
-label: 台股・Naive
+market: tw_day_trade
+label: 台股・當沖
 enabled: true
 market_type: tw
 timezone: Asia/Taipei
 open_time: "09:00"
 close_time: "13:30"
-schedule_time: "13:15"
 summary_time: "14:00"
 data_ready_time: "13:30"
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
 holidays: []
+
+# Data is shared with the other TW modes. There is no independent automatic
+# broadcast schedule; users opt in through /watch or request /signal_now.
 pre_signal_command:
   - "{python}"
   - downloader/download_tw_official_data.py
@@ -36,26 +38,22 @@ pre_signal_command:
 pre_signal_timeout_seconds: 1800
 previous_signal_backfill_limit: 512
 
-model_selection_path: ../models/tw.yaml
-
-# Fallback used only if the model selection file is removed from this config.
-config_path: configs/deployments/tw_naive_fold25.yaml
-output_dir: artifacts/markets/tw
-live_output_dir: artifacts/live_signals/tw
-fold_id: 25
-checkpoint_path: artifacts/markets/tw/fold_25/checkpoint_best.pt
-weights_path: artifacts/markets/tw/fold_25/daily_weights.parquet
+model_selection_path: ../models/tw_day_trade.yaml
+config_path: configs/deployments/tw_day_trade.yaml
+output_dir: artifacts/markets/tw_public_candles_tw_day_trade_select
+live_output_dir: artifacts/live_signals/tw_day_trade
+fold_id: 11
+checkpoint_path: artifacts/markets/tw_public_candles_tw_day_trade_select/fold_11/checkpoint_best.pt
+weights_path: artifacts/markets/tw_public_candles_tw_day_trade_select/fold_11/daily_weights.parquet
 
 panel_date: latest
 device: cuda
 price_source: panel
-prices_csv:
 yahoo_chunk_size: 200
-
 top_n: 2400
 min_abs_delta: 0.001
 benchmark_window_days: 32
 max_turnover_warning: 1.5
 max_top_weight_warning: 0.1
 max_gross_warning: 1.05
-unsupported_message: "**台股** 目前不支援：尚未上線可用模型。之後模型上線後就會支援。"
+unsupported_message: "**台股・當沖** 模型尚未準備完成。"

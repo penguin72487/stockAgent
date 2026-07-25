@@ -4,6 +4,7 @@ import numpy as np
 import polars as pl
 
 from stockagent.backtest.simulator import HoldingsRecord, holding_record_abs_sort_key
+from stockagent.data.panel import PanelData
 from stockagent.live.market_config import LiveMarketConfig
 from stockagent.live.portfolio_state import build_rebalance_rows, classify_rebalance_action, estimate_drifted_weights
 from stockagent.live.quote_provider import PriceSnapshot
@@ -13,11 +14,13 @@ from stockagent.live.signal_engine import (
     _build_decision_rows,
     _daily_bar_timestamp,
     _daily_price_timestamp,
+    _day_trade_live_model_window,
     _date_string,
     _decision_weights_timestamp,
     _live_weights_has_date,
     _load_previous_weights,
     _previous_usable_panel_date,
+    _price_snapshot,
     _require_supported_live_execution,
     _resolve_usable_panel_index,
     _top_position_rows_from_weights,
@@ -39,6 +42,44 @@ def test_realtime_daily_decision_uses_quote_time_for_weights_history() -> None:
         resolved_asof="2026-07-17 11:05:24",
         uses_realtime_daily_prices=False,
     ) == "2026-07-16"
+
+
+def test_day_trade_live_window_uses_current_open_without_incomplete_daily_bar() -> None:
+    panel = PanelData(
+        dates=np.array(["2026-07-16", "2026-07-17"], dtype="datetime64[D]"),
+        symbols=["2330", "HALT"],
+        feature_names=["base", "next_session_open_gap_logret"],
+        features=np.zeros((2, 2, 2), dtype=np.float32),
+        returns_1d=np.zeros((2, 2), dtype=np.float32),
+        tradable_mask=np.ones((2, 2), dtype=bool),
+        alive_mask=np.ones((2, 2), dtype=bool),
+        benchmark_returns=np.zeros((2,), dtype=np.float32),
+        close_prices=np.array([[90.0, 40.0], [100.0, 50.0]], dtype=np.float32),
+    )
+    snapshot = PriceSnapshot(
+        prices=np.array([105.0, 50.0]),
+        source="twse_tpex:mis",
+        timestamp="2026-07-21T04:10:43+00:00",
+        available_count=2,
+        open_prices=np.array([102.0, np.nan]),
+    )
+
+    window, cutoff, decision_time, live_session, observed_open = _day_trade_live_model_window(
+        panel,
+        panel_idx=1,
+        lookback=2,
+        price_snapshot=snapshot,
+        resolved_asof="2026-07-21 12:10:46",
+        source_timezone="Asia/Taipei",
+    )
+
+    assert cutoff == "2026-07-17"
+    assert decision_time == "2026-07-21 12:10:43"
+    assert live_session
+    assert observed_open.tolist() == [True, False]
+    assert np.isclose(window[-1, 0, 1], np.log(102.0 / 100.0))
+    assert window[-1, 1, 1] == 0.0
+    assert np.array_equal(window[:, :, 0], panel.features[:, :, 0])
 
 
 def test_top_positions_hide_weights_below_one_basis_point() -> None:
@@ -79,14 +120,61 @@ def test_signal_message_hides_weights_below_one_basis_point() -> None:
     assert "CHANGED" in message
 
 
-def test_live_signal_real_execution_modes_fail_closed_without_broker_ledger() -> None:
+def test_live_signal_execution_modes_resolve_without_naive_fallback() -> None:
     assert _require_supported_live_execution("naive") == "naive"
-    for mode in ("tw_cash", "tw_day_trade"):
-        with np.testing.assert_raises_regex(
-            RuntimeError,
-            "Refusing to fall back to naive execution",
-        ):
-            _require_supported_live_execution(mode)
+    assert _require_supported_live_execution("tw_cash") == "tw_cash"
+    assert _require_supported_live_execution("tw_day_trade") == "tw_day_trade"
+
+
+def test_live_signal_execution_preview_is_not_presented_as_executed_holdings() -> None:
+    summary = {
+        "market_label": "台股・當沖",
+        "asof_date": "2026-07-21 10:00:00",
+        "panel_date": "2026-07-20 13:30:00",
+        "execution_mode": "tw_day_trade",
+        "execution_preview_only": True,
+        "turnover": 0.5,
+        "target_risk": {"gross": 0.5, "long_gross": 0.3, "short_gross": 0.2},
+        "top_positions": [{"symbol": "2330", "weight": 0.3, "current_price": 1000.0}],
+        "rebalance": [
+            {
+                "symbol": "2330",
+                "action": "BUY",
+                "delta_weight": 0.3,
+                "current_weight": 0.0,
+                "target_weight": 0.3,
+                "current_price": 1000.0,
+            }
+        ],
+    }
+
+    message = format_signal_message(summary, max_rows=10)
+
+    assert "output=model_target_preview" in message
+    assert "模型目標配置 Top" in message
+    assert "模型進場方向 Top" in message
+    assert "目標持倉 Top" not in message
+    assert "上個交易日到現在" not in message
+
+
+def test_live_signal_execution_preview_displays_missing_constraint_notice() -> None:
+    summary = {
+        "market_label": "台股・當沖",
+        "asof_date": "2026-07-21 10:00:00",
+        "panel_date": "2026-07-20 13:30:00",
+        "execution_mode": "tw_day_trade",
+        "execution_preview_only": True,
+        "execution_constraints_complete": False,
+        "execution_constraints_notice": "缺少該交易日的官方現股當沖資格快照。",
+        "turnover": 0.0,
+        "target_risk": {"gross": 0.0},
+        "top_positions": [],
+        "rebalance": [],
+    }
+
+    message = format_signal_message(summary)
+
+    assert "缺少該交易日的官方現股當沖資格快照" in message
 
 
 def test_estimate_drifted_weights_marks_signed_portfolio_to_market() -> None:
@@ -193,6 +281,52 @@ def test_daily_price_timestamp_clamps_realtime_after_close_to_market_close() -> 
         )
         == "2026-07-09 13:30:00"
     )
+
+
+def test_period_title_ends_at_price_timestamp_when_live_quote_falls_back() -> None:
+    message = format_signal_message(
+        {
+            "market": "tw",
+            "market_label": "台股",
+            "asof_date": "2026-07-21 13:16:28",
+            "panel_date": "2026-07-20 13:30:00",
+            "price_source": "panel_close:fallback_tw_mis_unavailable",
+            "price_timestamp": "2026-07-20 13:30:00",
+            "previous_period_label": "上個交易日到現在",
+            "previous_weights_date": "2026-07-17 13:30:00",
+            "target_risk": {},
+        }
+    )
+
+    assert "`2026-07-17 13:30:00`..`2026-07-20 13:30:00`" in message
+    assert "`2026-07-17 13:30:00`..`2026-07-21 13:16:28`" not in message
+
+
+def test_tw_quote_with_zero_coverage_falls_back_without_claiming_realtime(monkeypatch) -> None:
+    fallback = np.array([10.0, 20.0])
+    monkeypatch.setattr(
+        "stockagent.live.signal_engine.fetch_tw_mis_last_prices",
+        lambda *args, **kwargs: PriceSnapshot(
+            prices=fallback.copy(),
+            source="twse_tpex:mis",
+            timestamp=None,
+            available_count=0,
+        ),
+    )
+
+    snapshot = _price_snapshot(
+        source="tw",
+        symbols=["2330", "2317"],
+        fallback_prices=fallback,
+        parquet_root="unused",
+        prices_csv=None,
+        yahoo_chunk_size=80,
+    )
+
+    assert snapshot.source == "panel_close:fallback_tw_mis_unavailable"
+    assert snapshot.available_count == 0
+    assert snapshot.timestamp is None
+    np.testing.assert_array_equal(snapshot.prices, fallback)
 
 
 def test_live_market_config_passes_close_time_as_daily_bar_time() -> None:
@@ -543,9 +677,57 @@ def test_load_stock_history_prefers_live_signal_weights_over_fold_daily_weights(
 
     assert [row["date"] for row in result.rows[:3]] == ["2026-07-01", "2026-06-30", "2026-06-25"]
     assert np.isclose(result.rows[0]["model_weight"], -0.25)
+    assert np.isclose(result.rows[0]["holding_ratio"], -0.25)
+    assert result.rows[0]["position_source"] == "signal_target"
     assert np.isclose(result.rows[1]["model_weight"], 0.50)
+    assert np.isclose(result.rows[1]["holding_ratio"], 0.50)
     assert np.isclose(result.rows[1]["model_weight_delta"], 0.40)
     assert any(path.name == LIVE_SIGNAL_WEIGHTS_NAME for path in result.source_paths)
+
+
+def test_load_stock_history_live_target_does_not_fake_position_exit(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_25"
+    fold_dir.mkdir()
+    pl.DataFrame({"date": ["2026-07-22"], "AAA": [-0.20]}).write_parquet(
+        fold_dir / "daily_weights.parquet"
+    )
+    pl.DataFrame({"date": ["2026-07-22"], "AAA": [-0.18]}).write_parquet(
+        fold_dir / "integer_share_daily_weights.parquet"
+    )
+    pl.DataFrame(
+        {
+            "date": ["2026-07-22"],
+            "symbol": ["AAA"],
+            "shares": [-5],
+            "price": [20.0],
+            "market_value": [-100.0],
+            "holding_ratio": [-0.18],
+            "is_cash": [False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    write_live_weights_history(
+        fold_dir,
+        {"weights_date": "2026-07-23 00:00:00"},
+        [{"symbol": "AAA", "target_weight": -0.25}],
+    )
+
+    result = load_stock_history(
+        fold_dir,
+        "AAA",
+        limit=1,
+        changes_only=False,
+    )
+
+    row = result.rows[0]
+    assert row["date"] == "2026-07-23"
+    assert row["position_source"] == "signal_target"
+    assert row["prev_shares"] == -5
+    assert row["shares"] == -5
+    assert row["share_delta"] == 0
+    assert row["action"] == "ADJUST_WEIGHT"
+    assert np.isclose(row["prev_holding_ratio"], -0.18)
+    assert np.isclose(row["holding_ratio"], -0.25)
+    assert row["market_value"] is None
 
 
 def test_load_stock_history_uses_price_root_and_previous_position_for_exit_short(tmp_path) -> None:
@@ -588,6 +770,53 @@ def test_load_stock_history_uses_price_root_and_previous_position_for_exit_short
     assert row["prev_shares"] == -5
     assert np.isclose(row["price"], 90.0)
     assert np.isclose(row["prev_price"], 100.0)
+    assert np.isclose(row["price_return"], -0.10)
+    assert np.isclose(row["stock_return"], 0.10)
+    assert np.isclose(row["portfolio_contribution"], 0.05)
+
+
+def test_day_trade_stock_history_uses_same_session_open_to_close(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_11"
+    price_root = tmp_path / "prices"
+    fold_dir.mkdir()
+    price_root.mkdir()
+    pl.DataFrame({"date": ["2026-01-02"], "AAA": [-0.50]}).write_parquet(
+        fold_dir / "daily_weights.parquet"
+    )
+    pl.DataFrame({"date": ["2026-01-02"], "AAA": [-0.50]}).write_parquet(
+        fold_dir / "integer_share_daily_weights.parquet"
+    )
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02"],
+            "symbol": ["CASH", "AAA"],
+            "shares": [1500, -5],
+            "price": [1.0, 100.0],
+            "market_value": [1500.0, -500.0],
+            "holding_ratio": [1.5, -0.5],
+            "is_cash": [True, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {"date": ["2026-01-02"], "portfolio_return": [0.05], "benchmark_return": [0.01], "turnover": [1.0]}
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+    pl.DataFrame({"date": ["2026-01-02"], "open": [100.0], "close": [90.0]}).write_parquet(
+        price_root / "AAA_features.parquet"
+    )
+
+    result = load_stock_history(
+        fold_dir,
+        "AAA",
+        limit=0,
+        changes_only=False,
+        price_root=price_root,
+        execution_mode="tw_day_trade",
+    )
+
+    row = result.rows[0]
+    assert np.isclose(row["price"], 100.0)
+    assert np.isclose(row["entry_price"], 100.0)
+    assert np.isclose(row["exit_price"], 90.0)
     assert np.isclose(row["price_return"], -0.10)
     assert np.isclose(row["stock_return"], 0.10)
     assert np.isclose(row["portfolio_contribution"], 0.05)
@@ -803,6 +1032,52 @@ def test_load_portfolio_history_uses_price_root_and_previous_position_for_exit_s
     assert np.isclose(row["portfolio_contribution"], 0.05)
 
 
+def test_day_trade_portfolio_history_changes_use_open_snapshot_and_close_pnl(tmp_path) -> None:
+    fold_dir = tmp_path / "fold_11"
+    price_root = tmp_path / "prices"
+    fold_dir.mkdir()
+    price_root.mkdir()
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-02", "2026-01-05", "2026-01-05"],
+            "symbol": ["CASH", "AAA", "CASH", "AAA"],
+            "shares": [900, 10, 800, 20],
+            "price": [1.0, 10.0, 1.0, 10.0],
+            "market_value": [900.0, 100.0, 800.0, 200.0],
+            "holding_ratio": [0.9, 0.1, 0.8, 0.2],
+            "is_cash": [True, False, True, False],
+        }
+    ).write_parquet(fold_dir / "holdings.parquet")
+    pl.DataFrame(
+        {
+            "date": ["2026-01-02", "2026-01-05"],
+            "portfolio_return": [0.01, 0.02],
+            "benchmark_return": [0.0, 0.0],
+            "turnover": [0.2, 0.4],
+        }
+    ).write_parquet(fold_dir / "integer_share_daily_portfolio_returns.parquet")
+    pl.DataFrame(
+        {"date": ["2026-01-02", "2026-01-05"], "open": [10.0, 10.0], "close": [11.0, 9.0]}
+    ).write_parquet(price_root / "AAA_features.parquet")
+
+    result = load_portfolio_history(
+        fold_dir,
+        days=1,
+        top_changes=2,
+        price_root=price_root,
+        execution_mode="tw_day_trade",
+    )
+
+    row = result.rows[0]["changes"][0]
+    assert result.execution_mode == "tw_day_trade"
+    assert np.isclose(row["price"], 10.0)
+    assert np.isclose(row["entry_price"], 10.0)
+    assert np.isclose(row["exit_price"], 9.0)
+    assert np.isclose(row["price_return"], -0.10)
+    assert np.isclose(row["stock_return"], -0.10)
+    assert np.isclose(row["portfolio_contribution"], -0.02)
+
+
 def test_load_portfolio_history_scales_values_from_current_capital(tmp_path) -> None:
     fold_dir = tmp_path / "fold_25"
     fold_dir.mkdir()
@@ -1015,6 +1290,27 @@ def test_format_signal_message_shows_period_and_recent_baseline_pnl() -> None:
     assert "`strategy=+8.00%`" in message
     assert "`baseline=+3.00%`" in message
     assert "`excess_pnl=+5,000`" in message
+
+
+def test_format_signal_message_shows_day_trade_feature_cutoff() -> None:
+    summary = {
+        "market_label": "台股・當沖",
+        "asof_date": "2026-07-21 12:10:46",
+        "panel_date": "2026-07-21 12:10:43",
+        "feature_cutoff_date": "2026-07-17 13:30:00",
+        "price_source": "twse_tpex:mis",
+        "price_timestamp": "2026-07-21T04:10:43+00:00",
+        "data_timezone": "Asia/Taipei",
+        "display_timezone": "Asia/Taipei",
+        "execution_mode": "tw_day_trade",
+        "execution_preview_only": True,
+    }
+
+    message = format_signal_message(summary, max_rows=0)
+
+    assert "`panel=2026-07-21 12:10:43`" in message
+    assert "`price_time=2026-07-21 12:10:43`" in message
+    assert "`features_through=2026-07-17 13:30:00`" in message
 
 
 def test_format_signal_message_uses_daily_previous_period_label() -> None:

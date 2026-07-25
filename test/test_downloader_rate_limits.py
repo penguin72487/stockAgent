@@ -36,7 +36,7 @@ def test_requested_interval_is_clamped_to_configured_limit() -> None:
     assert resolve_request_interval("okx_history_candles", 1.0) == 1.0
 
 
-def test_unpublished_and_unknown_providers_default_to_eight_rps() -> None:
+def test_unpublished_and_unknown_providers_default_to_ten_rps() -> None:
     providers = (
         "frankfurter_public",
         "tw_public",
@@ -47,7 +47,7 @@ def test_unpublished_and_unknown_providers_default_to_eight_rps() -> None:
     for provider in providers:
         profile = provider_rate_limit(provider)
         assert profile.requests_per_second == DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND
-        assert resolve_request_interval(provider, None) == 0.125
+        assert resolve_request_interval(provider, None) == 0.1
 
 
 def test_named_limiters_share_host_global_schedule_and_cooldown(tmp_path) -> None:

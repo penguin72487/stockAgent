@@ -505,9 +505,16 @@ def test_tw_day_trade_dispatch_uses_point_in_time_eligibility_sides_and_lots() -
     np.testing.assert_array_equal(result.shares_history[0], [-1_000, 1_500])
     assert result.final_integer_state is not None
     np.testing.assert_array_equal(result.final_integer_state.holdings, [0, 0])
-    # End-of-session holdings are flat; exact intraday executions live in
-    # shares_history, so the public holdings report contains only economic cash.
-    assert [record.symbol for record in records] == ["CASH"]
+    # The account remains flat after the close, while the holdings artifact
+    # records only the opening snapshot used for that session's round trip.
+    assert {record.symbol for record in records} == {"CASH", "SYM_0000", "SYM_0001"}
+    by_symbol = {record.symbol: record for record in records}
+    assert by_symbol["SYM_0000"].shares == -1_000
+    assert by_symbol["SYM_0000"].price == pytest.approx(100.0)
+    assert by_symbol["SYM_0001"].shares == 1_500
+    assert by_symbol["SYM_0001"].price == pytest.approx(100.0)
+    assert sum(record.market_value for record in records) == pytest.approx(300_000.0)
+    assert sum(record.holding_ratio for record in records) == pytest.approx(1.0)
 
 
 def test_tw_day_trade_volume_then_turnover_cap_rounds_to_whole_lots() -> None:

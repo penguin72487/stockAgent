@@ -9,6 +9,14 @@ discord = pytest.importorskip("discord")
 from services.discord_bot import bot as discord_bot  # noqa: E402
 
 
+def test_guide_lists_all_three_tw_execution_modes() -> None:
+    guide = discord_bot._guide_message()
+
+    assert "`tw` 舊版 Naive" in guide
+    assert "`tw_cash` 現股/T+2" in guide
+    assert "`tw_day_trade` 現股當沖" in guide
+
+
 def test_discord_page_size_and_top_n_floor_to_ten() -> None:
     assert discord_bot._page_size(1) == 10
     assert discord_bot._page_size(5) == 10

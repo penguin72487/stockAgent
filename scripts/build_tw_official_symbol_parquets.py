@@ -1100,6 +1100,45 @@ def _yahoo_input_receipt_is_valid(
     )
 
 
+def _detached_receipt_is_well_formed(receipt: Any) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    digest = str(receipt.get("sha256", "")).strip().lower()
+    try:
+        size = int(receipt.get("size", -1))
+    except (TypeError, ValueError):
+        return False
+    return (
+        bool(str(receipt.get("path", "")).strip())
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and size >= 0
+    )
+
+
+def _detached_yahoo_input_receipt_is_valid(
+    receipt: Any,
+    *,
+    start: date,
+    end: date,
+) -> bool:
+    if not _detached_receipt_is_well_formed(receipt):
+        return False
+    try:
+        requested_start = date.fromisoformat(str(receipt.get("requested_start")))
+        checked_through = date.fromisoformat(str(receipt.get("checked_through")))
+    except (TypeError, ValueError):
+        return False
+    return (
+        bool(str(receipt.get("symbol", "")).strip())
+        and receipt.get("venue") in {None, "TW", "TWO"}
+        and receipt.get("source") == "yahoo"
+        and receipt.get("asset_class") == "tw_stocks"
+        and requested_start <= start
+        and checked_through >= end
+    )
+
+
 def _validate_yahoo_fallback_archive(path: Path) -> None:
     summary_path = path.with_suffix(".summary.json")
     input_manifest_path = path.with_suffix(".inputs.json")
@@ -1161,7 +1200,12 @@ def _validate_yahoo_fallback_archive(path: Path) -> None:
     )
     input_dir = Path(raw_input_dir) if raw_input_dir else path.parent / ".missing-input-dir"
     resolve_path = _receipt_path_resolver(input_dir, path.parent)
-    input_files_valid = (
+    resolved_input_paths = (
+        [resolve_path(receipt) for receipt in input_files]
+        if isinstance(input_files, list)
+        else []
+    )
+    attached_input_files_valid = (
         valid_date_range
         and isinstance(input_files, list)
         and all(
@@ -1224,6 +1268,28 @@ def _validate_yahoo_fallback_archive(path: Path) -> None:
         if terminal_report_path is not None
         else None
     )
+    detached_archive = (
+        _int_field(summary, "schema_version") >= 3
+        and isinstance(input_files, list)
+        and bool(input_files)
+        and all(resolved is None for resolved in resolved_input_paths)
+        and symbol_manifest_path is None
+        and terminal_report_path is None
+    )
+    detached_input_files_valid = (
+        detached_archive
+        and valid_date_range
+        and all(
+            _detached_yahoo_input_receipt_is_valid(
+                receipt,
+                start=start,
+                end=end,
+            )
+            for receipt in input_files
+        )
+    )
+    if detached_archive:
+        manifest_codes = input_codes | terminal_code_set
     try:
         archive_schema_valid = {
             "date",
@@ -1302,20 +1368,34 @@ def _validate_yahoo_fallback_archive(path: Path) -> None:
             and terminal_code_set <= manifest_codes
             and manifest_codes == input_codes | terminal_code_set
         ),
-        "input_manifest_files": input_files_valid
+        "input_manifest_files": (
+            attached_input_files_valid or detached_input_files_valid
+        )
         and len(input_paths) == len(set(input_paths)),
-        "symbol_manifest_receipt": symbol_manifest_path is not None
-        and _receipt_matches(symbol_manifest_path, symbol_manifest_receipt),
+        "symbol_manifest_receipt": (
+            symbol_manifest_path is not None
+            and _receipt_matches(symbol_manifest_path, symbol_manifest_receipt)
+        )
+        or (detached_archive and _detached_receipt_is_well_formed(symbol_manifest_receipt)),
         "terminal_report_receipt": (
             terminal_unavailable_count == 0
             and terminal_report_receipt is None
         )
         or (
             terminal_unavailable_count > 0
-            and terminal_report_path is not None
-            and _receipt_matches(terminal_report_path, terminal_report_receipt)
-            and terminal_report_codes is not None
-            and terminal_code_set == terminal_report_codes & (manifest_codes or set())
+            and (
+                (
+                    terminal_report_path is not None
+                    and _receipt_matches(terminal_report_path, terminal_report_receipt)
+                    and terminal_report_codes is not None
+                    and terminal_code_set
+                    == terminal_report_codes & (manifest_codes or set())
+                )
+                or (
+                    detached_archive
+                    and _detached_receipt_is_well_formed(terminal_report_receipt)
+                )
+            )
         ),
     }
     failed = [name for name, passed in checks.items() if not passed]

@@ -7302,88 +7302,89 @@ def _weight_table_symbols(fold_dir: Path) -> tuple[list[str], Path] | tuple[None
     return None, None
 
 
-def _subset_panel_symbols(panel: PanelData, symbols: Sequence[str]) -> PanelData:
+def _subset_panel_symbols(
+    panel: PanelData,
+    symbols: Sequence[str],
+    *,
+    allow_missing_masked: bool = False,
+) -> PanelData:
     index_by_symbol = {str(symbol): idx for idx, symbol in enumerate(panel.symbols)}
     missing = [str(symbol) for symbol in symbols if str(symbol) not in index_by_symbol]
-    if missing:
+    if missing and not allow_missing_masked:
         preview = ", ".join(missing[:10])
         raise ValueError(
             f"Cannot align panel to checkpoint universe; {len(missing)} trained symbols are missing "
             f"from the current panel: {preview}"
         )
-    indices = np.asarray([index_by_symbol[str(symbol)] for symbol in symbols], dtype=np.int64)
+    if missing:
+        print(
+            f"[inference] restoring {len(missing)} checkpoint-only symbols "
+            "as permanently masked slots"
+        )
+    indices = np.asarray(
+        [index_by_symbol.get(str(symbol), -1) for symbol in symbols],
+        dtype=np.int64,
+    )
+    present = indices >= 0
+    shape_2d = (panel.num_dates, len(symbols))
+
+    def aligned_3d(values: np.ndarray, fill: int | float | bool) -> np.ndarray:
+        out = np.full((*shape_2d, values.shape[2]), fill, dtype=values.dtype)
+        out[:, present, :] = values[:, indices[present], :]
+        return out
+
+    def aligned_2d(
+        values: np.ndarray | None,
+        fill: int | float | bool,
+    ) -> np.ndarray | None:
+        if values is None:
+            return None
+        out = np.full(shape_2d, fill, dtype=values.dtype)
+        out[:, present] = values[:, indices[present]]
+        return out
+
     return PanelData(
         dates=panel.dates,
         symbols=[str(symbol) for symbol in symbols],
         feature_names=list(panel.feature_names),
-        features=panel.features[:, indices, :],
-        returns_1d=panel.returns_1d[:, indices],
-        tradable_mask=panel.tradable_mask[:, indices],
-        alive_mask=panel.alive_mask[:, indices],
+        features=aligned_3d(panel.features, 0.0),
+        returns_1d=aligned_2d(panel.returns_1d, 0.0),
+        tradable_mask=aligned_2d(panel.tradable_mask, False),
+        alive_mask=aligned_2d(panel.alive_mask, False),
         benchmark_returns=panel.benchmark_returns,
-        close_prices=panel.close_prices[:, indices],
-        can_buy_mask=panel.can_buy_mask[:, indices] if panel.can_buy_mask is not None else None,
-        can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
-        can_short_open_mask=(
-            panel.can_short_open_mask[:, indices] if panel.can_short_open_mask is not None else None
+        close_prices=aligned_2d(panel.close_prices, np.nan),
+        can_buy_mask=aligned_2d(panel.can_buy_mask, False),
+        can_sell_mask=aligned_2d(panel.can_sell_mask, False),
+        can_short_open_mask=aligned_2d(panel.can_short_open_mask, False),
+        force_short_cover_mask=aligned_2d(panel.force_short_cover_mask, False),
+        force_exit_mask=aligned_2d(panel.force_exit_mask, False),
+        daily_volumes=aligned_2d(panel.daily_volumes, 0.0),
+        open_prices=aligned_2d(panel.open_prices, np.nan),
+        intraday_returns=aligned_2d(panel.intraday_returns, 0.0),
+        day_trade_eligible_mask=aligned_2d(panel.day_trade_eligible_mask, False),
+        day_trade_can_short_open_mask=aligned_2d(
+            panel.day_trade_can_short_open_mask, False
         ),
-        force_short_cover_mask=(
-            panel.force_short_cover_mask[:, indices] if panel.force_short_cover_mask is not None else None
+        day_trade_can_buy_open_mask=aligned_2d(
+            panel.day_trade_can_buy_open_mask, False
         ),
-        force_exit_mask=(
-            panel.force_exit_mask[:, indices] if panel.force_exit_mask is not None else None
+        day_trade_can_sell_open_mask=aligned_2d(
+            panel.day_trade_can_sell_open_mask, False
         ),
-        daily_volumes=(
-            panel.daily_volumes[:, indices] if panel.daily_volumes is not None else None
+        raw_close_returns_1d=aligned_2d(panel.raw_close_returns_1d, 0.0),
+        corporate_action_avoidance_mask=aligned_2d(
+            panel.corporate_action_avoidance_mask, False
         ),
-        open_prices=(
-            panel.open_prices[:, indices] if panel.open_prices is not None else None
+        unresolved_corporate_action_mask=aligned_2d(
+            panel.unresolved_corporate_action_mask, False
         ),
-        intraday_returns=(
-            panel.intraday_returns[:, indices]
-            if panel.intraday_returns is not None
-            else None
+        cash_dividend_yield=aligned_2d(panel.cash_dividend_yield, 0.0),
+        cash_dividend_payment_delay_sessions=aligned_2d(
+            panel.cash_dividend_payment_delay_sessions, 0
         ),
-        day_trade_eligible_mask=(
-            panel.day_trade_eligible_mask[:, indices]
-            if panel.day_trade_eligible_mask is not None
-            else None
-        ),
-        day_trade_can_short_open_mask=(
-            panel.day_trade_can_short_open_mask[:, indices]
-            if panel.day_trade_can_short_open_mask is not None
-            else None
-        ),
-        day_trade_can_buy_open_mask=(
-            panel.day_trade_can_buy_open_mask[:, indices]
-            if panel.day_trade_can_buy_open_mask is not None
-            else None
-        ),
-        day_trade_can_sell_open_mask=(
-            panel.day_trade_can_sell_open_mask[:, indices]
-            if panel.day_trade_can_sell_open_mask is not None
-            else None
-        ),
-        raw_close_returns_1d=(
-            panel.raw_close_returns_1d[:, indices]
-            if panel.raw_close_returns_1d is not None
-            else None
-        ),
-        unresolved_corporate_action_mask=(
-            panel.unresolved_corporate_action_mask[:, indices]
-            if panel.unresolved_corporate_action_mask is not None
-            else None
-        ),
-        cash_dividend_yield=(
-            panel.cash_dividend_yield[:, indices]
-            if panel.cash_dividend_yield is not None
-            else None
-        ),
-        cash_dividend_payment_delay_sessions=(
-            panel.cash_dividend_payment_delay_sessions[:, indices]
-            if panel.cash_dividend_payment_delay_sessions is not None
-            else None
-        ),
+        short_capacity_shares=aligned_2d(panel.short_capacity_shares, 0),
+        short_margin_rate=aligned_2d(panel.short_margin_rate, np.nan),
+        content_fingerprints=None,
     )
 
 
@@ -7393,6 +7394,7 @@ def _align_panel_to_state_dict_universe(
     state_dict: Mapping[str, Any],
     *,
     context: str = "inference",
+    allow_missing_masked: bool = False,
 ) -> PanelData:
     expected_symbols = _state_dict_symbol_count(state_dict)
     if expected_symbols is None:
@@ -7427,7 +7429,11 @@ def _align_panel_to_state_dict_universe(
         )
     else:
         print(f"[{context}] reordering panel symbols to match checkpoint universe from {weights_path}")
-    return _subset_panel_symbols(panel, trained_symbols)
+    return _subset_panel_symbols(
+        panel,
+        trained_symbols,
+        allow_missing_masked=allow_missing_masked,
+    )
 
 
 def _save_holdings_table(
@@ -15695,6 +15701,11 @@ def _run_inference_neural_models(
             fold_dir,
             model_state_dict,
             context=f"inference fold {fold.fold_id}",
+            # Keep the checkpoint's symbol axis and positional embeddings
+            # stable when a newer official universe no longer contains old
+            # listings. Missing symbols remain permanently non-alive and
+            # non-tradable, matching the live-signal inference contract.
+            allow_missing_masked=True,
         )
         fold_execution_runtime = _build_execution_runtime(fold_panel, config, device)
         model = build_model(
