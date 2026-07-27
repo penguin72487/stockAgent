@@ -6,7 +6,10 @@ from typing import Any
 
 import torch
 
-from stockagent.backtest.tw_execution import normalize_execution_mode
+from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
+    normalize_execution_mode,
+)
 from stockagent.training.dataset import CrossSectionalDataset, execution_feature_lag
 
 
@@ -25,6 +28,7 @@ class WindowedSplitTensors:
     overnight_log_returns: torch.Tensor | None = None
     volume_notional: torch.Tensor | None = None
     can_short_open_mask: torch.Tensor | None = None
+    can_short_open_open_mask: torch.Tensor | None = None
     force_short_cover_mask: torch.Tensor | None = None
     force_exit_mask: torch.Tensor | None = None
     sample_mask: torch.Tensor | None = None
@@ -230,13 +234,14 @@ class WindowedSplitTensors:
                     f"!= {expected_shape}"
                 )
         if (
-            self.execution_mode == "tw_cash"
+            self.execution_mode in TW_CARRYING_EXECUTION_MODES
             and self.unresolved_corporate_action_mask is None
         ):
             raise ValueError(
-                "tw_cash requires unresolved_corporate_action_mask; raw-price "
-                "holdings cannot safely consume adjusted total returns without a "
-                "verified corporate-action ledger"
+                f"{self.execution_mode} requires "
+                "unresolved_corporate_action_mask; raw-price holdings cannot "
+                "safely consume adjusted total returns without a verified "
+                "corporate-action ledger"
             )
         if (self.cash_dividend_yield is None) != (
             self.cash_dividend_payment_delay_sessions is None
@@ -266,7 +271,7 @@ class WindowedSplitTensors:
         if self.can_short_open_mask is None:
             self.can_short_open_mask = (
                 torch.zeros_like(self.can_sell_mask, dtype=torch.bool)
-                if self.execution_mode == "tw_cash"
+                if self.execution_mode in TW_CARRYING_EXECUTION_MODES
                 else self.can_sell_mask.clone()
             )
         else:
@@ -277,21 +282,33 @@ class WindowedSplitTensors:
                 f"future_log_returns: {tuple(self.can_short_open_mask.shape)} "
                 f"!= {expected_symbol_shape}"
             )
-        if self.execution_mode == "tw_cash":
+        if self.can_short_open_open_mask is None:
+            # An old panel/cache has no causal opening-auction short mask.
+            # Never infer it from the close mask; fail closed instead.
+            self.can_short_open_open_mask = torch.zeros_like(
+                self.can_sell_mask,
+                dtype=torch.bool,
+            )
+        else:
+            self.can_short_open_open_mask = (
+                self.can_short_open_open_mask.to(dtype=torch.bool)
+            )
+        if tuple(self.can_short_open_open_mask.shape) != expected_symbol_shape:
+            raise ValueError(
+                "can_short_open_open_mask must have shape [T,S] matching "
+                "future_log_returns: "
+                f"{tuple(self.can_short_open_open_mask.shape)} "
+                f"!= {expected_symbol_shape}"
+            )
+        if self.execution_mode in TW_CARRYING_EXECUTION_MODES:
+            capacity_available = self.short_capacity_shares > 0
             self.can_short_open_mask = (
                 self.can_short_open_mask
                 & self.can_sell_mask.to(dtype=torch.bool)
-                & (self.short_capacity_shares > 0)
+                & capacity_available
             )
-            self.short_capacity_shares = torch.where(
-                self.can_short_open_mask,
-                self.short_capacity_shares,
-                torch.zeros_like(self.short_capacity_shares),
-            )
-            self.short_capacity_notional = torch.where(
-                self.can_short_open_mask,
-                self.short_capacity_notional,
-                torch.zeros_like(self.short_capacity_notional),
+            self.can_short_open_open_mask = (
+                self.can_short_open_open_mask & capacity_available
             )
         if self.force_short_cover_mask is None:
             self.force_short_cover_mask = torch.zeros_like(self.tradable_mask, dtype=torch.bool)
@@ -637,6 +654,10 @@ class WindowedSplitTensors:
                 else self.volume_notional.to(device=device, non_blocking=non_blocking)
             ),
             can_short_open_mask=self.can_short_open_mask.to(device=device, non_blocking=non_blocking),
+            can_short_open_open_mask=self.can_short_open_open_mask.to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
             short_capacity_shares=self.short_capacity_shares.to(
                 device=device, non_blocking=non_blocking
             ),
@@ -717,6 +738,9 @@ class WindowedSplitTensors:
             lookback=self.lookback,
             volume_notional=None if self.volume_notional is None else _pin(self.volume_notional),
             can_short_open_mask=_pin(self.can_short_open_mask),
+            can_short_open_open_mask=_pin(
+                self.can_short_open_open_mask
+            ),
             short_capacity_shares=_pin(self.short_capacity_shares),
             short_margin_rate=_pin(self.short_margin_rate),
             short_capacity_notional=_pin(self.short_capacity_notional),
@@ -786,6 +810,12 @@ class WindowedSplitTensors:
                 else self.volume_notional.index_select(1, local_indices)
             ),
             can_short_open_mask=self.can_short_open_mask.index_select(1, local_indices),
+            can_short_open_open_mask=(
+                self.can_short_open_open_mask.index_select(
+                    1,
+                    local_indices,
+                )
+            ),
             short_capacity_shares=self.short_capacity_shares.index_select(
                 1, local_indices
             ),
@@ -881,6 +911,10 @@ class WindowedSplitTensors:
             lookback=self.lookback,
             volume_notional=None if self.volume_notional is None else _pad_symbol_dim(self.volume_notional, 0.0),
             can_short_open_mask=_pad_symbol_dim(self.can_short_open_mask, False),
+            can_short_open_open_mask=_pad_symbol_dim(
+                self.can_short_open_open_mask,
+                False,
+            ),
             short_capacity_shares=_pad_symbol_dim(
                 self.short_capacity_shares, 0
             ),
@@ -951,6 +985,7 @@ class WindowedSplitTensors:
             lookback=self.lookback,
             volume_notional=self.volume_notional,
             can_short_open_mask=self.can_short_open_mask,
+            can_short_open_open_mask=self.can_short_open_open_mask,
             short_capacity_shares=self.short_capacity_shares,
             short_margin_rate=self.short_margin_rate,
             short_capacity_notional=self.short_capacity_notional,
@@ -1050,6 +1085,7 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask[date_idx]
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
+        can_short_open_open_mask = self.can_short_open_open_mask[date_idx]
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1080,6 +1116,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1166,6 +1208,7 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask[date_idx]
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
+        can_short_open_open_mask = self.can_short_open_open_mask[date_idx]
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1204,6 +1247,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1286,6 +1335,7 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask[date_idx]
         can_sell_mask = self.can_sell_mask[date_idx]
         can_short_open_mask = self.can_short_open_mask[date_idx]
+        can_short_open_open_mask = self.can_short_open_open_mask[date_idx]
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1324,6 +1374,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1411,6 +1467,11 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask.narrow(0, date_start, rows)
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
+        can_short_open_open_mask = self.can_short_open_open_mask.narrow(
+            0,
+            date_start,
+            rows,
+        )
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1441,6 +1502,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1534,6 +1601,11 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask.narrow(0, date_start, rows)
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
+        can_short_open_open_mask = self.can_short_open_open_mask.narrow(
+            0,
+            date_start,
+            rows,
+        )
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1566,6 +1638,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1660,6 +1738,11 @@ class WindowedSplitTensors:
         can_buy_mask = self.can_buy_mask.narrow(0, date_start, rows)
         can_sell_mask = self.can_sell_mask.narrow(0, date_start, rows)
         can_short_open_mask = self.can_short_open_mask.narrow(0, date_start, rows)
+        can_short_open_open_mask = self.can_short_open_open_mask.narrow(
+            0,
+            date_start,
+            rows,
+        )
         (
             short_capacity_shares,
             short_margin_rate,
@@ -1690,6 +1773,12 @@ class WindowedSplitTensors:
             "can_buy_mask": self._to_device(can_buy_mask, device, non_blocking, prepare_timing),
             "can_sell_mask": self._to_device(can_sell_mask, device, non_blocking, prepare_timing),
             "can_short_open_mask": self._to_device(can_short_open_mask, device, non_blocking, prepare_timing),
+            "can_short_open_open_mask": self._to_device(
+                can_short_open_open_mask,
+                device,
+                non_blocking,
+                prepare_timing,
+            ),
             "short_capacity_shares": self._to_device(
                 short_capacity_shares, device, non_blocking, prepare_timing
             ),
@@ -1959,6 +2048,7 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         lookback=dataset.lookback,
         volume_notional=dataset.volume_notional_t,
         can_short_open_mask=dataset.can_short_open_mask_t,
+        can_short_open_open_mask=dataset.can_short_open_open_mask_t,
         short_capacity_shares=dataset.short_capacity_shares_t,
         short_margin_rate=dataset.short_margin_rate_t,
         short_capacity_notional=dataset.short_capacity_notional_t,

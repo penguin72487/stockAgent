@@ -186,9 +186,19 @@ def test_cash_keeps_empty_exchange_sessions_while_naive_filter_is_unchanged() ->
     assert not empty_session["can_sell_mask"].any()
     assert empty_session["session_advance_mask"].item() is True
     torch.testing.assert_close(empty_session["x"][:, 0, 0], torch.tensor([0.0, 1.0]))
+    expected_overnight = torch.full(
+        (panel.num_symbols,),
+        float(np.log(90.0 / 100.0)),
+        dtype=torch.float32,
+    )
     torch.testing.assert_close(
-        empty_session["future_log_returns"],
-        torch.from_numpy(panel.raw_close_returns_1d[2]),
+        empty_session["overnight_log_returns"],
+        expected_overnight,
+    )
+    torch.testing.assert_close(
+        empty_session["overnight_log_returns"]
+        + empty_session["future_log_returns"],
+        torch.from_numpy(panel.raw_close_returns_1d[1]),
     )
 
 
@@ -248,21 +258,39 @@ def test_cash_raw_close_returns_reset_basis_after_corporate_action() -> None:
     )
 
 
-def test_tw_cash_dataset_execution_inputs_ignore_same_session_label_and_volume() -> None:
-    baseline_panel = _make_panel(include_day_trade_inputs=False)
-    perturbed_panel = _make_panel(include_day_trade_inputs=False)
+def test_tw_cash_dual_phase_targets_shift_and_both_decisions_use_t_minus_one() -> None:
+    baseline_panel = _make_panel()
+    perturbed_panel = _make_panel()
     target_session = 4
+    raw_forward = np.asarray(
+        [
+            [0.01, 0.02],
+            [0.11, 0.12],
+            [0.21, 0.22],
+            [0.31, 0.32],
+            [0.41, 0.42],
+            [0.51, 0.52],
+        ],
+        dtype=np.float32,
+    )
+    baseline_panel.raw_close_returns_1d[:] = raw_forward
+    perturbed_panel.raw_close_returns_1d[:] = raw_forward
     # Missing completed-session volume means no demonstrated fill capacity.
     assert baseline_panel.daily_volumes is not None
     assert perturbed_panel.daily_volumes is not None
     baseline_panel.daily_volumes[target_session - 1, 0] = np.nan
     perturbed_panel.daily_volumes[target_session - 1, 0] = np.nan
-    # These two quantities are known only after the target session.  They may
-    # change the supervised label, but never the signal window, outer/side
-    # masks, or causal participation reference used to size the order.
+    # None of the target-session feature, completed volume, or forward close
+    # label exists when either session-t decision is committed.  The opening
+    # quote can split the realized return between phases, but it is execution
+    # data and must not enter the shared model feature window.
+    perturbed_panel.features[target_session, :, 0] = [777.0, 888.0]
     assert perturbed_panel.raw_close_returns_1d is not None
     perturbed_panel.raw_close_returns_1d[target_session] = [7.0, -7.0]
     perturbed_panel.daily_volumes[target_session] = [1.0, 9_999_999.0]
+    perturbed_panel.close_prices[target_session] = [8_000.0, 12_000.0]
+    assert perturbed_panel.open_prices is not None
+    perturbed_panel.open_prices[target_session] = [80.0, 120.0]
 
     baseline = CrossSectionalDataset(
         baseline_panel,
@@ -286,17 +314,56 @@ def test_tw_cash_dataset_execution_inputs_ignore_same_session_label_and_volume()
         "can_buy_mask",
         "can_sell_mask",
         "volume_notional",
+        "day_trade_can_buy_open_mask",
+        "day_trade_can_sell_open_mask",
     ):
         torch.testing.assert_close(baseline_sample[key], perturbed_sample[key])
+
+    # Both phase decisions see exactly [t-2, t-1]. Same-session features first
+    # become available in the following session's decision.
+    assert baseline_sample["x"][:, 0, 0].tolist() == [2.0, 3.0]
+    assert perturbed_sample["x"][:, 0, 0].tolist() == [2.0, 3.0]
+    assert not torch.equal(
+        baseline_sample["overnight_log_returns"],
+        perturbed_sample["overnight_log_returns"],
+    )
     assert not torch.equal(
         baseline_sample["future_log_returns"],
         perturbed_sample["future_log_returns"],
+    )
+    torch.testing.assert_close(
+        baseline_sample["overnight_log_returns"]
+        + baseline_sample["future_log_returns"],
+        torch.from_numpy(raw_forward[target_session - 1]),
+    )
+    torch.testing.assert_close(
+        perturbed_sample["overnight_log_returns"]
+        + perturbed_sample["future_log_returns"],
+        torch.from_numpy(raw_forward[target_session - 1]),
+    )
+
+    next_index = int(
+        np.flatnonzero(baseline.valid_indices == target_session + 1)[0]
+    )
+    baseline_next = baseline[next_index]
+    perturbed_next = perturbed[next_index]
+    assert baseline_next["x"][-1, :, 0].tolist() == [4.0, 4.0]
+    assert perturbed_next["x"][-1, :, 0].tolist() == [777.0, 888.0]
+    torch.testing.assert_close(
+        baseline_next["overnight_log_returns"]
+        + baseline_next["future_log_returns"],
+        torch.from_numpy(raw_forward[target_session]),
+    )
+    torch.testing.assert_close(
+        perturbed_next["overnight_log_returns"]
+        + perturbed_next["future_log_returns"],
+        torch.tensor([7.0, -7.0]),
     )
     assert baseline_sample["volume_notional"][0].item() == 0.0
     assert baseline_sample["volume_notional"][1].item() == pytest.approx(
         float(
             baseline_panel.daily_volumes[target_session - 1, 1]
-            * baseline_panel.close_prices[target_session, 1]
+            * baseline_panel.close_prices[target_session - 1, 1]
         )
     )
 
@@ -341,7 +408,13 @@ def test_day_trade_uses_only_t_minus_one_features_and_same_day_return() -> None:
     assert second["session_advance_mask"].item() is True
 
 
-def test_day_trade_window_exposes_current_open_gap_without_current_session_row() -> None:
+@pytest.mark.parametrize(
+    "execution_mode",
+    ["tw_day_trade", "tw_cash", "tw_overnight"],
+)
+def test_phase_window_exposes_current_open_gap_without_current_session_row(
+    execution_mode: str,
+) -> None:
     panel = _make_panel()
     # Row r stores the gap observed at open[r+1].  For target t=2, row 1 is
     # therefore the one legal current-session input while all other channels
@@ -357,7 +430,7 @@ def test_day_trade_window_exposes_current_open_gap_without_current_session_row()
         panel,
         np.arange(panel.num_dates),
         lookback=2,
-        execution_mode="tw_day_trade",
+        execution_mode=execution_mode,
     )
     first = dataset[0]
 
@@ -418,7 +491,9 @@ def test_day_trade_open_inputs_do_not_leak_close_label_or_full_day_volume() -> N
 
 def test_tw_cash_dataset_preserves_missing_return_for_active_state_validation() -> None:
     panel = _make_panel()
-    panel.raw_close_returns_1d[2, 0] = np.nan
+    target_session = 3
+    panel.raw_close_returns_1d[target_session - 1, 0] = np.nan
+    panel.intraday_returns[target_session, 0] = np.nan
     dataset = CrossSectionalDataset(
         panel,
         np.arange(panel.num_dates),
@@ -426,7 +501,12 @@ def test_tw_cash_dataset_preserves_missing_return_for_active_state_validation() 
         execution_mode="tw_cash",
     )
 
-    assert torch.isnan(dataset[0]["future_log_returns"][0])
+    sample_index = int(
+        np.flatnonzero(dataset.valid_indices == target_session)[0]
+    )
+    sample = dataset[sample_index]
+    assert torch.isfinite(sample["overnight_log_returns"][0])
+    assert torch.isnan(sample["future_log_returns"][0])
 
 
 def test_tw_cash_shorting_requires_capacity_and_preserves_forced_cover() -> None:
@@ -525,7 +605,9 @@ def test_tw_cash_short_capacity_notional_fails_closed_on_invalid_price(
         dtype=np.int64,
     )
     panel.short_capacity_shares[3, 0] = 7_000
-    panel.close_prices[3, 0] = bad_close
+    # Session-3 open/close capacity is valued from the completed session-2
+    # close, never the not-yet-known session-3 closing auction.
+    panel.close_prices[2, 0] = bad_close
 
     dataset = CrossSectionalDataset(
         panel,
@@ -546,7 +628,7 @@ def test_tw_cash_short_capacity_notional_multiplies_exact_integer_shares() -> No
         dtype=np.int64,
     )
     panel.short_capacity_shares[3, 0] = exact_shares
-    panel.close_prices[3, 0] = np.float32(3.0)
+    panel.close_prices[2, 0] = np.float32(3.0)
 
     dataset = CrossSectionalDataset(
         panel,
@@ -612,6 +694,10 @@ def test_short_margin_rate_uses_non_contiguous_official_historical_floors() -> N
         alive_mask=np.ones(shape, dtype=bool),
         benchmark_returns=np.zeros(rows, dtype=np.float32),
         close_prices=np.full(shape, 100.0, dtype=np.float32),
+        open_prices=np.full(shape, 100.0, dtype=np.float32),
+        intraday_returns=np.zeros(shape, dtype=np.float32),
+        day_trade_can_buy_open_mask=np.ones(shape, dtype=bool),
+        day_trade_can_sell_open_mask=np.ones(shape, dtype=bool),
         raw_close_returns_1d=np.zeros(shape, dtype=np.float32),
         short_capacity_shares=np.full(shape, 1_000, dtype=np.int64),
         short_margin_rate=raw_margin_rate,
@@ -1102,6 +1188,10 @@ def test_avoid_mode_keeps_full_exact_action_exit_interval() -> None:
         alive_mask=mask.copy(),
         benchmark_returns=np.zeros(dates.size, dtype=np.float32),
         close_prices=np.full((dates.size, 1), 100.0, dtype=np.float32),
+        open_prices=np.full((dates.size, 1), 100.0, dtype=np.float32),
+        intraday_returns=np.zeros((dates.size, 1), dtype=np.float32),
+        day_trade_can_buy_open_mask=mask.copy(),
+        day_trade_can_sell_open_mask=mask.copy(),
     )
     reference = _CorporateActionReference(
         event_dates_by_symbol={

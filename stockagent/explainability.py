@@ -1495,6 +1495,18 @@ def _selection_from_weights(
     Every finite, tradable, non-zero position is included and weighted by its
     share of gross exposure.
     """
+    if weights.dim() != 2 or mask.dim() != 2 or weights.shape != mask.shape:
+        if weights.dim() == 3:
+            raise ValueError(
+                "Explainability does not yet support phase actions [B,P,S]; "
+                "P2 OPEN/CLOSE targets and the P3 due-exit fraction require a "
+                "phase-labelled attribution contract and must not be treated "
+                "as ordinary [B,S] portfolio weights."
+            )
+        raise ValueError(
+            "explainability weights and mask must have matching [B,S] shapes, "
+            f"got {tuple(weights.shape)} and {tuple(mask.shape)}"
+        )
     valid_weights = weights.masked_fill(~mask, 0.0)
     finite_nonzero = mask & torch.isfinite(valid_weights) & (valid_weights != 0.0)
     selected = finite_nonzero
@@ -8906,6 +8918,11 @@ def _subset_panel_symbols(panel: PanelData, symbols: list[str]) -> PanelData:
         can_sell_mask=panel.can_sell_mask[:, indices] if panel.can_sell_mask is not None else None,
         can_short_open_mask=(
             panel.can_short_open_mask[:, indices] if panel.can_short_open_mask is not None else None
+        ),
+        can_short_open_open_mask=(
+            panel.can_short_open_open_mask[:, indices]
+            if panel.can_short_open_open_mask is not None
+            else None
         ),
         force_short_cover_mask=(
             panel.force_short_cover_mask[:, indices] if panel.force_short_cover_mask is not None else None
