@@ -14,3 +14,15 @@ data:
   # equals log(open[t] / close[t-1]); no session-t high/low/close/volume enters
   # the feature tensor.
   day_trade_open_feature: true
+  panel_start_date: "2014-01-01"
+
+walk_forward:
+  expected_first_year: 2014
+  split_start_year: null
+  lookback_context: split_only
+
+trading:
+  execution_mode: tw_day_trade
+
+training:
+  lookback: 128

@@ -128,6 +128,29 @@ def _require_supported_live_execution(execution_mode: object) -> str:
     return normalize_execution_mode(execution_mode)
 
 
+def _require_single_target_live_weights(
+    weights: torch.Tensor,
+    *,
+    execution_mode: str,
+    expected_symbols: int,
+) -> torch.Tensor:
+    """Fail closed instead of collapsing phase-aware actions into legacy targets."""
+
+    if weights.dim() == 3:
+        raise RuntimeError(
+            f"{execution_mode} produced phase-aware model actions with shape "
+            f"{tuple(weights.shape)} ([B,P,S]); live signal preview currently "
+            "supports only single-target [B,S] output and will not choose or "
+            "collapse an open/close phase."
+        )
+    if weights.dim() != 2 or tuple(weights.shape) != (1, int(expected_symbols)):
+        raise RuntimeError(
+            "live signal model output must have shape [1,S]; "
+            f"got {tuple(weights.shape)} for S={int(expected_symbols)}"
+        )
+    return weights
+
+
 def _emit_progress(
     callback: ProgressCallback | None,
     *,
@@ -324,6 +347,11 @@ def _tail_panel_dates(panel: PanelData, rows: int) -> PanelData:
         can_buy_mask=panel.can_buy_mask[slc] if panel.can_buy_mask is not None else None,
         can_sell_mask=panel.can_sell_mask[slc] if panel.can_sell_mask is not None else None,
         can_short_open_mask=panel.can_short_open_mask[slc] if panel.can_short_open_mask is not None else None,
+        can_short_open_open_mask=(
+            panel.can_short_open_open_mask[slc]
+            if panel.can_short_open_open_mask is not None
+            else None
+        ),
         force_short_cover_mask=panel.force_short_cover_mask[slc] if panel.force_short_cover_mask is not None else None,
         force_exit_mask=panel.force_exit_mask[slc] if panel.force_exit_mask is not None else None,
         daily_volumes=panel.daily_volumes[slc] if panel.daily_volumes is not None else None,
@@ -1839,6 +1867,11 @@ def generate_live_signal(
         with _autocast_context(runtime_device, amp_dtype):
             model_output = _call_model(model, x, mask, return_aux=True)
             model_weights_t, aux = _extract_weights_and_aux(model_output)
+            model_weights_t = _require_single_target_live_weights(
+                model_weights_t,
+                execution_mode=execution_mode,
+                expected_symbols=panel.num_symbols,
+            )
         _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
         model_weights = model_weights_t[0].detach().float().cpu().numpy().astype(np.float64)
         if execution_preview_only:

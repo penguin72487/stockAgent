@@ -10,6 +10,9 @@ from stockagent.portfolio_contract import (
 )
 from stockagent.profiling import profile_range
 
+PORTFOLIO_L1_EPS = 1.0e-8
+
+
 def apply_portfolio_activation(logits: torch.Tensor, activation: str | None = None) -> torch.Tensor:
     with profile_range("portfolio.activation"):
         activation_name = normalize_portfolio_activation(activation)
@@ -70,7 +73,7 @@ def masked_activation_l1_weights(
     *,
     long_only: bool = False,
     activation: str | None = None,
-    eps: float = 1e-8,
+    eps: float = PORTFOLIO_L1_EPS,
 ) -> torch.Tensor:
     """Convert scores to portfolio weights via optional activation + L1 normalization.
 
@@ -297,7 +300,7 @@ def masked_softsign_l1_weights(
     mask: torch.Tensor | None,
     *,
     long_only: bool = False,
-    eps: float = 1e-8,
+    eps: float = PORTFOLIO_L1_EPS,
 ) -> torch.Tensor:
     """Backward-compatible explicit softsign + L1 normalizer."""
     return masked_activation_l1_weights(
@@ -314,7 +317,7 @@ def masked_tanh_l1_weights(
     mask: torch.Tensor | None,
     *,
     long_only: bool = False,
-    eps: float = 1e-8,
+    eps: float = PORTFOLIO_L1_EPS,
 ) -> torch.Tensor:
     """Backward-compatible explicit tanh + L1 normalizer."""
     return masked_activation_l1_weights(

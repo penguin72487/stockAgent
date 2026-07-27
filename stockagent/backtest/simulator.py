@@ -17,6 +17,19 @@ from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
     run_tw_day_trade_continuous,
 )
+from stockagent.backtest.tw_dual_session import (
+    run_tw_cash_dual_session,
+    run_tw_overnight_dual_session,
+)
+from stockagent.backtest.tw_dual_session_compiled import (
+    run_tw_cash_dual_session_compiled,
+    run_tw_overnight_dual_session_compiled,
+)
+from stockagent.backtest.tw_dual_session_integer import (
+    TaiwanDualSessionIntegerBacktestResult,
+    run_tw_cash_dual_session_integer,
+    run_tw_overnight_dual_session_integer,
+)
 from stockagent.backtest.tw_execution import (
     TW_CARRYING_EXECUTION_MODES,
     normalize_execution_mode,
@@ -29,7 +42,9 @@ from stockagent.backtest.tw_integer_execution import (
 )
 from stockagent.models.normalization import (
     DEFAULT_PORTFOLIO_ACTIVATION,
+    PORTFOLIO_L1_EPS,
     apply_portfolio_activation,
+    masked_activation_l1_weights,
     normalize_portfolio_activation,
 )
 from stockagent.runtime_env import normalize_cuda_env
@@ -326,10 +341,19 @@ def _normalize_target_weights_numpy(
         l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
         gross = np.float32(gross_budget)
         scale = np.ones_like(l1, dtype=np.float32)
-        np.divide(gross, np.clip(l1, 1e-12, None), out=scale, where=l1 > gross)
+        np.divide(
+            gross,
+            np.clip(l1, PORTFOLIO_L1_EPS, None),
+            out=scale,
+            where=l1 > gross,
+        )
         return (out * scale).astype(np.float32, copy=False)
     l1 = np.abs(out).sum(axis=1, keepdims=True).astype(np.float32)
-    out = out / np.clip(l1, 1e-12, None)
+    out = np.where(
+        l1 > 0.0,
+        out / np.clip(l1, PORTFOLIO_L1_EPS, None),
+        np.zeros_like(out),
+    )
     out *= np.float32(gross_budget)
     return out.astype(np.float32, copy=False)
 
@@ -349,11 +373,11 @@ def _normalize_target_weights_row_numpy(
     l1 = float(np.abs(row).sum(dtype=np.float64))
     if activation_name == "pre_normalized":
         gross = float(gross_budget)
-        if l1 > gross and l1 > 1e-12:
+        if l1 > gross and l1 > PORTFOLIO_L1_EPS:
             row = row * (gross / l1)
         return row
-    if l1 > 1e-12:
-        row = row / l1
+    if l1 > 0.0:
+        row = row / max(l1, PORTFOLIO_L1_EPS)
     else:
         row = np.zeros_like(row, dtype=np.float64)
     row *= float(gross_budget)
@@ -369,18 +393,35 @@ def _normalize_target_weights_torch(
 ) -> torch.Tensor:
     """Torch normalization via bounded activation + L1 and gross budget scaling."""
     activation_name = normalize_portfolio_activation(portfolio_activation)
-    out = apply_portfolio_activation(weights, activation_name)
-    if long_only:
-        out = out.clamp_min(0.0)
-    leverage = torch.as_tensor(gross_budget, device=out.device, dtype=out.dtype)
     if activation_name == "pre_normalized":
+        out = apply_portfolio_activation(weights, activation_name)
+        if long_only:
+            out = out.clamp_min(0.0)
+        leverage = torch.as_tensor(
+            gross_budget,
+            device=out.device,
+            dtype=out.dtype,
+        )
         l1 = out.abs().sum(dim=1, keepdim=True)
-        scale = torch.where(l1 > leverage, leverage / l1.clamp_min(1e-12), torch.ones_like(l1))
+        scale = torch.where(
+            l1 > leverage,
+            leverage / l1.clamp_min(PORTFOLIO_L1_EPS),
+            torch.ones_like(l1),
+        )
         return out * scale
-    l1 = out.abs().sum(dim=1, keepdim=True).clamp_min(1e-12)
-    out = out / l1
-    out = out * leverage
-    return out
+    normalized = masked_activation_l1_weights(
+        weights,
+        None,
+        long_only=long_only,
+        activation=activation_name,
+        eps=PORTFOLIO_L1_EPS,
+    )
+    leverage = torch.as_tensor(
+        gross_budget,
+        device=normalized.device,
+        dtype=normalized.dtype,
+    )
+    return normalized * leverage
 
 
 def _apply_min_trade_weight_numpy(weights: np.ndarray, min_trade_weight: float) -> np.ndarray:
@@ -1174,6 +1215,18 @@ class BacktestResult:
     # gates, settlement, turnover, or participation constraints.  Integer-share
     # audit must replay these requests, not renormalize already-executed weights.
     requested_weights_history: np.ndarray | None = None
+    # Dual-session audit fields.  Event axes are ordered [OPEN, CLOSE].
+    open_weights_history: np.ndarray | None = None
+    close_weights_history: np.ndarray | None = None
+    event_turnovers: np.ndarray | None = None
+    executed_buy_weights: np.ndarray | None = None
+    executed_sell_weights: np.ndarray | None = None
+    executed_long_buy_weights: np.ndarray | None = None
+    executed_long_sell_weights: np.ndarray | None = None
+    executed_short_open_weights: np.ndarray | None = None
+    executed_short_cover_weights: np.ndarray | None = None
+    due_weights_history: np.ndarray | None = None
+    final_due_weights: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -1202,6 +1255,18 @@ class BacktestResultTensor:
     final_short_sale_collateral: torch.Tensor | None = None
     final_short_margin_collateral: torch.Tensor | None = None
     requested_weights_history: torch.Tensor | None = None
+    # Dual-session audit fields.  Event axes are ordered [OPEN, CLOSE].
+    open_weights_history: torch.Tensor | None = None
+    close_weights_history: torch.Tensor | None = None
+    event_turnovers: torch.Tensor | None = None
+    executed_buy_weights: torch.Tensor | None = None
+    executed_sell_weights: torch.Tensor | None = None
+    executed_long_buy_weights: torch.Tensor | None = None
+    executed_long_sell_weights: torch.Tensor | None = None
+    executed_short_open_weights: torch.Tensor | None = None
+    executed_short_cover_weights: torch.Tensor | None = None
+    due_weights_history: torch.Tensor | None = None
+    final_due_weights: torch.Tensor | None = None
 
     def to_numpy(self) -> BacktestResult:
         # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
@@ -1221,6 +1286,25 @@ class BacktestResultTensor:
             turnovers=as_float32(self.turnovers),
             weights_history=as_float32(self.weights_history),
             requested_weights_history=optional_float32(self.requested_weights_history),
+            open_weights_history=optional_float32(self.open_weights_history),
+            close_weights_history=optional_float32(self.close_weights_history),
+            event_turnovers=optional_float32(self.event_turnovers),
+            executed_buy_weights=optional_float32(self.executed_buy_weights),
+            executed_sell_weights=optional_float32(self.executed_sell_weights),
+            executed_long_buy_weights=optional_float32(
+                self.executed_long_buy_weights
+            ),
+            executed_long_sell_weights=optional_float32(
+                self.executed_long_sell_weights
+            ),
+            executed_short_open_weights=optional_float32(
+                self.executed_short_open_weights
+            ),
+            executed_short_cover_weights=optional_float32(
+                self.executed_short_cover_weights
+            ),
+            due_weights_history=optional_float32(self.due_weights_history),
+            final_due_weights=optional_float32(self.final_due_weights),
             execution_mode=self.execution_mode,
             settlement_ledger_unit=self.settlement_ledger_unit,
             cash_history=optional_float32(self.cash_history),
@@ -2073,6 +2157,7 @@ def _prepare_tw_phase_actions(
         neginf=0.0,
     )
     signal_mask = tradable_mask.to(device=safe.device, dtype=torch.bool)
+    safe = safe.masked_fill(~signal_mask[:, None, :], 0.0)
     gross_budget = _resolve_exposure_budget(gross_leverage)
 
     if mode == "tw_cash":
@@ -2098,7 +2183,36 @@ def _prepare_tw_phase_actions(
         else torch.sigmoid(raw_exit)
     ).masked_fill(~signal_mask, 0.0)
     rows, _phases, symbols = safe.shape
-    flat_entries = safe[:, 1:].reshape(int(rows), 2 * int(symbols))
+    if activation_name == "pre_normalized":
+        entry_logits = safe[:, 1:]
+        opposite_same_day_entry = (
+            (entry_logits[:, 0].abs() > 1.0e-10)
+            & (entry_logits[:, 1].abs() > 1.0e-10)
+            & ((entry_logits[:, 0] > 0.0) != (entry_logits[:, 1] > 0.0))
+        )
+        # Fail closed without a CUDA host synchronization in the per-batch
+        # preparation hot path.  The direct ledger APIs still reject malformed
+        # P3 requests; this model-output adapter turns an impossible
+        # same-session reversal into no new position for that symbol.
+        entry_logits = entry_logits.masked_fill(
+            opposite_same_day_entry[:, None, :],
+            0.0,
+        )
+    else:
+        raw_open_entry = safe[:, 1]
+        raw_close_entry = safe[:, 2]
+        direction_logits = 0.5 * (raw_open_entry + raw_close_entry)
+        close_entry_fraction = torch.sigmoid(
+            raw_close_entry - raw_open_entry
+        )
+        entry_logits = torch.stack(
+            (
+                direction_logits * (1.0 - close_entry_fraction),
+                direction_logits * close_entry_fraction,
+            ),
+            dim=1,
+        )
+    flat_entries = entry_logits.reshape(int(rows), 2 * int(symbols))
     flat_entries = _normalize_target_weights_torch(
         flat_entries,
         long_only=long_only,
@@ -2483,7 +2597,6 @@ def run_backtest(
     short_handling_fee_rate: np.ndarray | float = 0.0,
     force_exit_mask: np.ndarray | None = None,
     volume_limit_weights: np.ndarray | None = None,
-    overnight_returns: np.ndarray | None = None,
     execution_mode: str = "naive",
     buy_fee_rates: np.ndarray | None = None,
     sell_fee_rates: np.ndarray | None = None,
@@ -2505,6 +2618,8 @@ def run_backtest(
     initial_equity_scale: np.ndarray | float | None = None,
     initial_short_sale_collateral: np.ndarray | None = None,
     initial_short_margin_collateral: np.ndarray | None = None,
+    overnight_returns: np.ndarray | None = None,
+    can_short_open_open_mask: np.ndarray | None = None,
 ) -> BacktestResult:
     """Simulate daily portfolio execution from model weights."""
     mode = normalize_execution_mode(execution_mode)
@@ -2527,6 +2642,7 @@ def run_backtest(
             can_buy_mask=tensor(can_buy_mask),
             can_sell_mask=tensor(can_sell_mask),
             can_short_open_mask=tensor(can_short_open_mask),
+            can_short_open_open_mask=tensor(can_short_open_open_mask),
             force_short_cover_mask=tensor(force_short_cover_mask),
             short_margin_rate=tensor(short_margin_rate),
             short_capacity_weights=tensor(short_capacity_weights),
@@ -2616,7 +2732,6 @@ def run_backtest_torch(
     initial_weights: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     volume_limit_weights: torch.Tensor | None = None,
-    overnight_returns: torch.Tensor | None = None,
     execution_mode: str = "naive",
     buy_fee_rates: torch.Tensor | None = None,
     sell_fee_rates: torch.Tensor | None = None,
@@ -2636,6 +2751,8 @@ def run_backtest_torch(
     initial_equity_scale: torch.Tensor | None = None,
     initial_short_sale_collateral: torch.Tensor | None = None,
     initial_short_margin_collateral: torch.Tensor | None = None,
+    overnight_returns: torch.Tensor | None = None,
+    can_short_open_open_mask: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
@@ -2673,6 +2790,12 @@ def run_backtest_torch(
                 name
                 for name, value in (
                     ("can_short_open_mask", can_short_open_mask),
+                    (
+                        "can_short_open_open_mask",
+                        can_short_open_open_mask
+                        if weights.dim() == 3
+                        else can_short_open_mask,
+                    ),
                     ("short_capacity_weights", short_capacity_weights),
                     ("short_margin_rate", short_margin_rate),
                 )
@@ -2704,17 +2827,176 @@ def run_backtest_torch(
                 "tw_day_trade requires explicit point-in-time open-side buy/sell masks"
             )
 
-        prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
-            weights,
-            tradable_mask,
-            can_buy_mask,
-            can_sell_mask,
-            long_only,
-            gross_leverage,
-            min_trade_weight,
-            portfolio_activation,
-            side_masks_require_tradable=(mode != "tw_cash"),
-        )
+        phase_execution = mode in TW_CARRYING_EXECUTION_MODES and weights.dim() == 3
+        if mode == "tw_overnight" and not phase_execution:
+            raise ValueError(
+                "tw_overnight requires actions with shape [T,3,S]"
+            )
+        if phase_execution:
+            if overnight_returns is None:
+                raise ValueError(
+                    f"{mode} phase execution requires prior-close-to-open "
+                    "overnight_returns"
+                )
+            if can_buy_mask is None or can_sell_mask is None:
+                raise ValueError(
+                    f"{mode} phase execution requires explicit close-session "
+                    "buy/sell masks"
+                )
+            if (
+                day_trade_can_buy_open_mask is None
+                or day_trade_can_sell_open_mask is None
+            ):
+                raise ValueError(
+                    f"{mode} phase execution requires explicit point-in-time "
+                    "open-session buy/sell masks"
+                )
+            prepped_weights = _prepare_tw_phase_actions(
+                weights,
+                tradable_mask,
+                execution_mode=mode,
+                long_only=long_only,
+                gross_leverage=gross_leverage,
+                min_trade_weight=min_trade_weight,
+                portfolio_activation=portfolio_activation,
+            )
+            device = prepped_weights.device
+            daily_tradable = tradable_mask.to(device=device, dtype=torch.bool)
+            close_buy = can_buy_mask.to(device=device, dtype=torch.bool)
+            close_sell = can_sell_mask.to(device=device, dtype=torch.bool)
+            open_buy = day_trade_can_buy_open_mask.to(
+                device=device,
+                dtype=torch.bool,
+            )
+            open_sell = day_trade_can_sell_open_mask.to(
+                device=device,
+                dtype=torch.bool,
+            )
+            phase_tradable = daily_tradable[:, None, :].expand(-1, 2, -1)
+            phase_buy = torch.stack((open_buy, close_buy), dim=1)
+            phase_sell = torch.stack((open_sell, close_sell), dim=1)
+            if long_only:
+                phase_short_open = None
+            else:
+                assert can_short_open_mask is not None
+                assert can_short_open_open_mask is not None
+                phase_short_open = torch.stack(
+                    (
+                        can_short_open_open_mask.to(
+                            device=device,
+                            dtype=torch.bool,
+                        ),
+                        can_short_open_mask.to(
+                            device=device,
+                            dtype=torch.bool,
+                        ),
+                    ),
+                    dim=1,
+                )
+
+            def repeated_phase_mask(
+                value: torch.Tensor | None,
+            ) -> torch.Tensor | None:
+                if value is None:
+                    return None
+                daily = value.to(device=device, dtype=torch.bool)
+                return daily[:, None, :].expand(-1, 2, -1)
+
+            phase_force_exit = None
+            if force_exit_mask is not None:
+                close_exit = force_exit_mask.to(device=device, dtype=torch.bool)
+                phase_force_exit = torch.stack(
+                    (torch.zeros_like(close_exit), close_exit),
+                    dim=1,
+                )
+            phase_margin_rate: torch.Tensor | float | None = short_margin_rate
+            if isinstance(short_margin_rate, torch.Tensor) and short_margin_rate.dim() == 2:
+                phase_margin_rate = short_margin_rate.to(
+                    device=device,
+                    dtype=prepped_weights.dtype,
+                )[:, None, :].expand(-1, 2, -1)
+            compile_phase_ledger = bool(
+                prepped_weights.device.type == "cuda"
+                and _compile_stateful_enabled()
+                and _compile_enabled()
+            )
+            if compile_phase_ledger:
+                phase_runner = (
+                    run_tw_cash_dual_session_compiled
+                    if mode == "tw_cash"
+                    else run_tw_overnight_dual_session_compiled
+                )
+            else:
+                phase_runner = (
+                    run_tw_cash_dual_session
+                    if mode == "tw_cash"
+                    else run_tw_overnight_dual_session
+                )
+            phase_runner_extra: dict[str, bool] = {}
+            if compile_phase_ledger:
+                phase_runner_extra["strict_compile"] = (
+                    _strict_no_fallback_enabled()
+                )
+            tw_result = phase_runner(
+                prepped_weights,
+                overnight_returns.to(
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                future_returns.to(
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                phase_tradable,
+                phase_buy,
+                phase_sell,
+                buy_fee_rates,
+                sell_fee_rates,
+                can_short_open_mask=phase_short_open,
+                force_short_cover_mask=repeated_phase_mask(
+                    None if long_only else force_short_cover_mask
+                ),
+                short_margin_rate=phase_margin_rate,
+                short_capacity_weights=short_capacity_weights,
+                short_maintenance_ratio=short_maintenance_ratio,
+                short_handling_fee_rate=short_handling_fee_rate,
+                unresolved_corporate_action_mask=repeated_phase_mask(
+                    unresolved_corporate_action_mask
+                ),
+                cash_dividend_yield=cash_dividend_yield,
+                cash_dividend_payment_delay_sessions=(
+                    cash_dividend_payment_delay_sessions
+                ),
+                claim_queue_sessions=claim_queue_sessions,
+                force_exit_mask=phase_force_exit,
+                settlement_lag_sessions=settlement_lag_sessions,
+                gross_budget=_resolve_exposure_budget(gross_leverage),
+                max_turnover_ratio=max_turnover_ratio,
+                volume_limit_weights=volume_limit_weights,
+                state_advance_mask=state_advance_mask,
+                return_weights_history=return_weights_history,
+                initial_weights=initial_weights,
+                initial_cash=initial_cash,
+                initial_payables=initial_payables,
+                initial_receivables=initial_receivables,
+                initial_alive=initial_alive,
+                initial_equity_scale=initial_equity_scale,
+                initial_short_sale_collateral=initial_short_sale_collateral,
+                initial_short_margin_collateral=initial_short_margin_collateral,
+                **phase_runner_extra,
+            )
+        else:
+            prepped_weights, prepped_tradable, prepped_buy, prepped_sell = _prepare_scan_inputs(
+                weights,
+                tradable_mask,
+                can_buy_mask,
+                can_sell_mask,
+                long_only,
+                gross_leverage,
+                min_trade_weight,
+                portfolio_activation,
+                side_masks_require_tradable=(mode != "tw_cash"),
+            )
         prepped_volume = (
             None
             if volume_limit_weights is None
@@ -2723,7 +3005,9 @@ def run_backtest_torch(
                 dtype=prepped_weights.dtype,
             )
         )
-        if mode == "tw_cash":
+        if phase_execution:
+            pass
+        elif mode == "tw_cash":
             prepped_short_open = (
                 torch.zeros_like(prepped_tradable)
                 if can_short_open_mask is None
@@ -2785,7 +3069,7 @@ def run_backtest_torch(
                 initial_short_sale_collateral=initial_short_sale_collateral,
                 initial_short_margin_collateral=initial_short_margin_collateral,
             )
-        else:
+        elif mode == "tw_day_trade":
             prepped_buy_open = (
                 day_trade_can_buy_open_mask.to(
                     device=prepped_weights.device,
@@ -2840,6 +3124,8 @@ def run_backtest_torch(
                 initial_alive=initial_alive,
                 initial_equity_scale=initial_equity_scale,
             )
+        else:
+            raise AssertionError(f"unhandled execution mode {mode!r}")
         return BacktestResultTensor(
             # The model may run under BF16/FP16 AMP, but settlement state and
             # finance reductions remain FP32.  Do not quantize recurrent cash
@@ -2852,6 +3138,53 @@ def run_backtest_torch(
             turnovers=tw_result.turnovers,
             weights_history=tw_result.weights_history,
             requested_weights_history=(weights if return_weights_history else None),
+            open_weights_history=getattr(
+                tw_result,
+                "open_weights_history",
+                None,
+            ),
+            close_weights_history=getattr(
+                tw_result,
+                "close_weights_history",
+                None,
+            ),
+            event_turnovers=getattr(tw_result, "event_turnovers", None),
+            executed_buy_weights=getattr(
+                tw_result,
+                "executed_buy_weights",
+                None,
+            ),
+            executed_sell_weights=getattr(
+                tw_result,
+                "executed_sell_weights",
+                None,
+            ),
+            executed_long_buy_weights=getattr(
+                tw_result,
+                "executed_long_buy_weights",
+                None,
+            ),
+            executed_long_sell_weights=getattr(
+                tw_result,
+                "executed_long_sell_weights",
+                None,
+            ),
+            executed_short_open_weights=getattr(
+                tw_result,
+                "executed_short_open_weights",
+                None,
+            ),
+            executed_short_cover_weights=getattr(
+                tw_result,
+                "executed_short_cover_weights",
+                None,
+            ),
+            due_weights_history=getattr(
+                tw_result,
+                "due_weights_history",
+                None,
+            ),
+            final_due_weights=getattr(tw_result, "final_due_weights", None),
             final_weights=tw_result.final_weights,
             final_alive=tw_result.final_alive,
             execution_mode=mode,
@@ -2975,7 +3308,7 @@ def _select_integer_time_symbol_parameter(
 
 
 def _tw_integer_public_result(
-    result: TaiwanIntegerBacktestResult,
+    result: TaiwanIntegerBacktestResult | TaiwanDualSessionIntegerBacktestResult,
     benchmark_returns: np.ndarray,
 ) -> BacktestResult:
     state = result.final_state
@@ -3018,11 +3351,68 @@ def _tw_integer_public_result(
         final_weights=result.final_weights.copy(),
         shares_history=result.positions,
         final_integer_state=state,
+        open_weights_history=(
+            result.open_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        close_weights_history=(
+            result.weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        event_turnovers=(
+            result.event_turnovers.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        executed_buy_weights=(
+            result.executed_buy_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        executed_sell_weights=(
+            result.executed_sell_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        executed_long_buy_weights=(
+            result.executed_long_buy_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        executed_long_sell_weights=(
+            result.executed_long_sell_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        executed_short_open_weights=(
+            result.executed_short_open_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        executed_short_cover_weights=(
+            result.executed_short_cover_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            else None
+        ),
+        due_weights_history=(
+            result.weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            and result.mode == "tw_overnight"
+            else None
+        ),
+        final_due_weights=(
+            result.final_weights.copy()
+            if isinstance(result, TaiwanDualSessionIntegerBacktestResult)
+            and result.mode == "tw_overnight"
+            else None
+        ),
     )
 
 
 def _tw_integer_holdings_records(
-    result: TaiwanIntegerBacktestResult,
+    result: TaiwanIntegerBacktestResult | TaiwanDualSessionIntegerBacktestResult,
     *,
     close_prices: np.ndarray,
     open_prices: np.ndarray | None = None,
@@ -3089,7 +3479,7 @@ def _tw_integer_holdings_records(
             else float(np.sum(margin_collateral_history[t]))
         )
         nonzero = np.flatnonzero(result.positions[t] != 0)
-        if mode == "tw_cash":
+        if mode in TW_CARRYING_EXECUTION_MODES:
             # ``strategy_returns[t]`` already includes close[t] -> the next
             # causal valuation mark, whereas holdings are audited at close[t].
             # A halted holding has no raw execution quote on that row, so derive
@@ -3222,12 +3612,12 @@ def _tw_integer_holdings_records(
                         is_cash=False,
                         record_type=(
                             "position"
-                            if result.final_state.mode == "tw_cash"
+                            if result.final_state.mode in TW_CARRYING_EXECUTION_MODES
                             else "day_trade_open"
                         ),
                         side=(
                             ""
-                            if result.final_state.mode == "tw_cash"
+                            if result.final_state.mode in TW_CARRYING_EXECUTION_MODES
                             else "BUY"
                             if signed_shares > 0
                             else "SELL"
@@ -3279,6 +3669,7 @@ def run_backtest_integer_shares(
     short_maintenance_ratio: float = 1.30,
     short_handling_fee_rate: np.ndarray | float = 0.0,
     open_prices: np.ndarray | None = None,
+    can_short_open_open_mask: np.ndarray | None = None,
     day_trade_eligible_mask: np.ndarray | None = None,
     day_trade_can_buy_open_mask: np.ndarray | None = None,
     day_trade_can_sell_open_mask: np.ndarray | None = None,
@@ -3301,7 +3692,11 @@ def run_backtest_integer_shares(
     - Cash is a virtual asset with 0 daily return.
 
     Taiwan modes require explicit per-symbol fee vectors and exact prices.
-    ``tw_cash`` uses share/lot holdings plus session-delayed net settlement;
+    ``tw_cash`` accepts either the legacy close-only ``[T,S]`` request or the
+    canonical dual-session ``[T,2,S]`` OPEN/CLOSE request. ``tw_overnight``
+    requires ``[T,3,S]`` as exit-at-open fraction plus OPEN/CLOSE entries.
+    Both dual-session modes use exact auction prices, one shared daily
+    capacity budget, and one net settlement claim enqueued after CLOSE.
     ``tw_day_trade`` requires point-in-time eligibility, exact open and close,
     two executable legs, and finishes each session flat.  When participation
     limiting is enabled, ``cash_close_volume_reference`` or
@@ -3323,23 +3718,49 @@ def run_backtest_integer_shares(
     mode = normalize_execution_mode(execution_mode)
     if mode != "naive":
         raw_weights = np.asarray(weights, dtype=np.float64)
-        if raw_weights.ndim != 2:
-            raise ValueError("weights must have shape [time, symbols]")
-        t_len_real, n_symbols_real = raw_weights.shape
+        phase_execution = (
+            mode in TW_CARRYING_EXECUTION_MODES and raw_weights.ndim == 3
+        )
+        if phase_execution:
+            expected_phases = 2 if mode == "tw_cash" else 3
+            if (
+                raw_weights.shape[0] <= 0
+                or raw_weights.shape[1] != expected_phases
+                or raw_weights.shape[2] <= 0
+            ):
+                raise ValueError(
+                    f"{mode} weights must have shape [T,{expected_phases},S]"
+                )
+            t_len_real = int(raw_weights.shape[0])
+            n_symbols_real = int(raw_weights.shape[2])
+        elif raw_weights.ndim == 2:
+            if mode == "tw_overnight":
+                raise ValueError("tw_overnight weights must have shape [T,3,S]")
+            t_len_real, n_symbols_real = raw_weights.shape
+        else:
+            expected = (
+                "[T,2,S]"
+                if mode == "tw_cash"
+                else "[T,3,S]"
+                if mode == "tw_overnight"
+                else "[T,S]"
+            )
+            raise ValueError(f"{mode} weights must have shape {expected}")
+        daily_shape = (t_len_real, n_symbols_real)
         returns_real = np.asarray(future_returns)
         tradable_real = np.asarray(tradable_mask)
         benchmark_real = np.asarray(benchmark_returns)
-        if returns_real.shape != raw_weights.shape:
-            raise ValueError("future_returns shape must match weights")
-        if tradable_real.shape != raw_weights.shape or tradable_real.dtype != np.bool_:
-            raise ValueError("tradable_mask must be boolean with the same shape as weights")
+        if returns_real.shape != daily_shape:
+            raise ValueError("future_returns must have shape [T,S]")
+        if tradable_real.shape != daily_shape or tradable_real.dtype != np.bool_:
+            raise ValueError("tradable_mask must be boolean with shape [T,S]")
         if benchmark_real.shape != (t_len_real,):
             raise ValueError(f"benchmark_returns must have shape [{t_len_real}]")
         if close_prices is None:
             raise ValueError(f"{mode} requires exact close_prices")
         close_real = np.asarray(close_prices, dtype=np.float64)
-        if close_real.shape != raw_weights.shape:
-            raise ValueError("close_prices shape must match weights")
+        if close_real.shape != daily_shape:
+            raise ValueError("close_prices must have shape [T,S]")
         if buy_fee_rates is None or sell_fee_rates is None:
             raise ValueError(
                 f"{mode} requires explicit per-symbol buy_fee_rates and sell_fee_rates"
@@ -3413,21 +3834,130 @@ def run_backtest_integer_shares(
             posinf=0.0,
             neginf=0.0,
         )
-        target_weights = np.stack(
-            [
-                _apply_min_trade_weight_row_numpy(
-                    _normalize_target_weights_row_numpy(
-                        row,
-                        long_only=long_only,
-                        gross_budget=gross_budget,
-                        portfolio_activation=portfolio_activation,
-                    ),
-                    min_trade_weight,
+        if phase_execution:
+            # Match the tensor/model phase boundary: a symbol outside the
+            # point-in-time selection mask must not consume OPEN/CLOSE gross
+            # budget before it is zeroed.  Masking only after normalization
+            # makes an arbitrary invalid-column logit dilute every valid order.
+            clean_weights = np.where(
+                tradable_real[:, None, :],
+                clean_weights,
+                0.0,
+            )
+            if mode == "tw_cash":
+                flat_actions = clean_weights.reshape(
+                    t_len_real * 2,
+                    n_symbols_real,
                 )
-                for row in clean_weights
-            ],
-            axis=0,
-        )
+                normalized_flat = np.stack(
+                    [
+                        _apply_min_trade_weight_row_numpy(
+                            _normalize_target_weights_row_numpy(
+                                row,
+                                long_only=long_only,
+                                gross_budget=gross_budget,
+                                portfolio_activation=portfolio_activation,
+                            ),
+                            min_trade_weight,
+                        )
+                        for row in flat_actions
+                    ],
+                    axis=0,
+                )
+                target_weights = normalized_flat.reshape(
+                    t_len_real,
+                    2,
+                    n_symbols_real,
+                )
+            else:
+                activation_name = normalize_portfolio_activation(
+                    portfolio_activation
+                )
+                raw_exit = clean_weights[:, 0]
+                if activation_name == "pre_normalized":
+                    exit_fraction = np.clip(raw_exit, 0.0, 1.0)
+                else:
+                    positive = raw_exit >= 0.0
+                    exit_fraction = np.empty_like(raw_exit)
+                    exit_fraction[positive] = 1.0 / (
+                        1.0 + np.exp(-raw_exit[positive])
+                    )
+                    negative_exp = np.exp(raw_exit[~positive])
+                    exit_fraction[~positive] = negative_exp / (
+                        1.0 + negative_exp
+                    )
+                if activation_name == "pre_normalized":
+                    entry_logits = clean_weights[:, 1:]
+                else:
+                    raw_open_entry = clean_weights[:, 1]
+                    raw_close_entry = clean_weights[:, 2]
+                    direction_logits = 0.5 * (
+                        raw_open_entry + raw_close_entry
+                    )
+                    timing_delta = raw_close_entry - raw_open_entry
+                    positive_timing = timing_delta >= 0.0
+                    close_entry_fraction = np.empty_like(timing_delta)
+                    close_entry_fraction[positive_timing] = 1.0 / (
+                        1.0 + np.exp(-timing_delta[positive_timing])
+                    )
+                    negative_timing_exp = np.exp(
+                        timing_delta[~positive_timing]
+                    )
+                    close_entry_fraction[~positive_timing] = (
+                        negative_timing_exp
+                        / (1.0 + negative_timing_exp)
+                    )
+                    entry_logits = np.stack(
+                        (
+                            direction_logits * (1.0 - close_entry_fraction),
+                            direction_logits * close_entry_fraction,
+                        ),
+                        axis=1,
+                    )
+                flat_entries = entry_logits.reshape(
+                    t_len_real,
+                    2 * n_symbols_real,
+                )
+                normalized_entries = np.stack(
+                    [
+                        _apply_min_trade_weight_row_numpy(
+                            _normalize_target_weights_row_numpy(
+                                row,
+                                long_only=long_only,
+                                gross_budget=gross_budget,
+                                portfolio_activation=portfolio_activation,
+                            ),
+                            min_trade_weight,
+                        )
+                        for row in flat_entries
+                    ],
+                    axis=0,
+                ).reshape(t_len_real, 2, n_symbols_real)
+                target_weights = np.concatenate(
+                    (exit_fraction[:, None, :], normalized_entries),
+                    axis=1,
+                )
+            target_weights = np.where(
+                tradable_real[:, None, :],
+                target_weights,
+                0.0,
+            )
+        else:
+            target_weights = np.stack(
+                [
+                    _apply_min_trade_weight_row_numpy(
+                        _normalize_target_weights_row_numpy(
+                            row,
+                            long_only=long_only,
+                            gross_budget=gross_budget,
+                            portfolio_activation=portfolio_activation,
+                        ),
+                        min_trade_weight,
+                    )
+                    for row in clean_weights
+                ],
+                axis=0,
+            )
 
         _require_side_masks_if_strict(
             can_buy_mask,
@@ -3442,9 +3972,9 @@ def run_backtest_integer_shares(
             if value is None:
                 return
             candidate = np.asarray(value)
-            if candidate.shape != raw_weights.shape or candidate.dtype != np.bool_:
+            if candidate.shape != daily_shape or candidate.dtype != np.bool_:
                 raise ValueError(
-                    f"{name} must be boolean with the same shape as weights"
+                    f"{name} must be boolean with shape [T,S]"
                 )
             if np.any(candidate):
                 raise ValueError(f"{mode} does not support active {name} entries")
@@ -3495,7 +4025,188 @@ def run_backtest_integer_shares(
                     "symbol_indices must map a full-universe list"
                 )
 
-        if mode == "tw_cash":
+        open_real: np.ndarray | None = None
+        if phase_execution:
+            if open_prices is None:
+                raise ValueError(f"{mode} phase execution requires exact open_prices")
+            open_real = np.asarray(open_prices, dtype=np.float64)
+            if open_real.shape != daily_shape:
+                raise ValueError("open_prices must have shape [T,S]")
+            if can_buy_mask is None or can_sell_mask is None:
+                raise ValueError(
+                    f"{mode} phase execution requires explicit close-side "
+                    "can_buy_mask and can_sell_mask"
+                )
+            if (
+                day_trade_can_buy_open_mask is None
+                or day_trade_can_sell_open_mask is None
+            ):
+                raise ValueError(
+                    f"{mode} phase execution requires explicit open-side buy "
+                    "and sell masks"
+                )
+            if unresolved_corporate_action_mask is None:
+                raise ValueError(
+                    f"{mode} requires the receipt-verified official "
+                    "corporate-action avoidance mask"
+                )
+
+            def required_daily_bool(
+                name: str,
+                value: np.ndarray,
+            ) -> np.ndarray:
+                selected = np.asarray(value)
+                if selected.shape != daily_shape or selected.dtype != np.bool_:
+                    raise ValueError(f"{name} must be boolean with shape [T,S]")
+                return selected
+
+            close_buy = required_daily_bool("can_buy_mask", can_buy_mask)
+            close_sell = required_daily_bool("can_sell_mask", can_sell_mask)
+            open_buy = required_daily_bool(
+                "day_trade_can_buy_open_mask",
+                day_trade_can_buy_open_mask,
+            )
+            open_sell = required_daily_bool(
+                "day_trade_can_sell_open_mask",
+                day_trade_can_sell_open_mask,
+            )
+            unresolved_daily = required_daily_bool(
+                "unresolved_corporate_action_mask",
+                unresolved_corporate_action_mask,
+            )
+            phase_tradable = np.repeat(
+                tradable_real[:, None, :],
+                2,
+                axis=1,
+            )
+            phase_buy = np.stack((open_buy, close_buy), axis=1)
+            phase_sell = np.stack((open_sell, close_sell), axis=1)
+            phase_unresolved = np.repeat(
+                unresolved_daily[:, None, :],
+                2,
+                axis=1,
+            )
+
+            if long_only:
+                phase_short_open = None
+            else:
+                missing_short_contract = [
+                    name
+                    for name, value in (
+                        ("can_short_open_mask", can_short_open_mask),
+                        (
+                            "can_short_open_open_mask",
+                            can_short_open_open_mask,
+                        ),
+                        ("short_capacity_shares", short_capacity_shares),
+                        ("short_margin_rate", short_margin_rate),
+                    )
+                    if value is None
+                ]
+                if missing_short_contract:
+                    raise ValueError(
+                        f"long/short {mode} requires independent OPEN/CLOSE "
+                        "short eligibility, demonstrated capacity, and "
+                        "initial-margin rates; missing "
+                        + ", ".join(missing_short_contract)
+                    )
+                close_short = required_daily_bool(
+                    "can_short_open_mask",
+                    can_short_open_mask,
+                )
+                open_short = required_daily_bool(
+                    "can_short_open_open_mask",
+                    can_short_open_open_mask,
+                )
+                phase_short_open = np.stack(
+                    (open_short, close_short),
+                    axis=1,
+                )
+
+            phase_force_cover = None
+            if force_short_cover_mask is not None:
+                force_cover_daily = required_daily_bool(
+                    "force_short_cover_mask",
+                    force_short_cover_mask,
+                )
+                phase_force_cover = np.repeat(
+                    force_cover_daily[:, None, :],
+                    2,
+                    axis=1,
+                )
+            phase_force_exit = None
+            if force_exit_mask is not None:
+                force_exit_daily = required_daily_bool(
+                    "force_exit_mask",
+                    force_exit_mask,
+                )
+                phase_force_exit = np.stack(
+                    (
+                        np.zeros_like(force_exit_daily),
+                        force_exit_daily,
+                    ),
+                    axis=1,
+                )
+
+            if max_volume_participation > 0.0:
+                if cash_close_volume_reference is None:
+                    raise ValueError(
+                        f"{mode} with max_volume_participation > 0 requires "
+                        "an explicit causal completed-session volume reference"
+                    )
+                cash_volume = np.asarray(
+                    cash_close_volume_reference,
+                    dtype=np.float64,
+                )
+                if cash_volume.shape != daily_shape:
+                    raise ValueError(
+                        "cash_close_volume_reference must have shape [T,S]"
+                    )
+            else:
+                cash_volume = None
+
+            phase_runner = (
+                run_tw_cash_dual_session_integer
+                if mode == "tw_cash"
+                else run_tw_overnight_dual_session_integer
+            )
+            integer_result = phase_runner(
+                target_weights,
+                open_real,
+                close_real,
+                phase_tradable,
+                phase_buy,
+                phase_sell,
+                selected_buy_fees,
+                selected_sell_fees,
+                can_short_open_mask=phase_short_open,
+                force_short_cover_mask=phase_force_cover,
+                short_margin_rate=selected_short_margin_rate,
+                short_capacity_shares=selected_short_capacity,
+                short_lot_sizes=selected_short_lots,
+                short_handling_fee_rate=selected_short_handling_fee,
+                short_maintenance_ratio=short_maintenance_ratio,
+                unresolved_corporate_action_mask=phase_unresolved,
+                cash_dividend_yield=cash_dividend_yield,
+                cash_dividend_payment_delay_sessions=(
+                    cash_dividend_payment_delay_sessions
+                ),
+                claim_queue_sessions=claim_queue_sessions,
+                force_exit_mask=phase_force_exit,
+                minimum_commission=minimum_commission,
+                commission_rounding=commission_rounding,
+                tax_rounding=tax_rounding,
+                lot_sizes=selected_lots,
+                daily_volumes=cash_volume,
+                max_volume_participation=max_volume_participation,
+                max_turnover_ratio=max_turnover_ratio,
+                gross_budget=gross_budget,
+                state_advance_mask=state_advance_mask,
+                settlement_lag_sessions=settlement_lag_sessions,
+                initial_cash=initial_capital,
+                initial_state=initial_integer_state,
+            )
+        elif mode == "tw_cash":
             if not long_only:
                 missing_short_contract = [
                     name
@@ -3649,7 +4360,7 @@ def run_backtest_integer_shares(
             _tw_integer_holdings_records(
                 integer_result,
                 close_prices=close_real,
-                open_prices=open_real if execution_mode == "tw_day_trade" else None,
+                open_prices=open_real if mode == "tw_day_trade" else None,
                 symbols=active_symbols,
                 dates=dates,
             )
