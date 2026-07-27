@@ -189,6 +189,7 @@ run_fintech_python scripts/manage_gpu_jobs.py status \
 ### Daily All-Market Update
 
 - Use `bash downloader/run_daily_all_markets.sh` to run daily updates across all configured markets.
+- Use `bash downloader/daily_downloader_daemon.sh start` for unattended market-close updates and `bash downloader/daily_downloader_daemon.sh status` to verify the scheduler. Taiwan updates start at 13:40 Asia/Taipei by default, after the 13:30 close. The TW pipeline retries the complete official-data build with `TW_PUBLIC_PIPELINE_ATTEMPTS` and `TW_PUBLIC_PIPELINE_RETRY_SECONDS`; a market date is marked complete only after the strict TW audit succeeds.
 - The script runs only the source-of-truth feed for each configured market by default: Alpaca `us_stocks`, Taiwan TWSE/TPEx public data plus feature rebuild and official OHLCV sync, Frankfurter forex incremental update to `data_yahoo/forex`, and OKX/Bybit perpetual 15-minute crypto updates. Yahoo and Pepperstone grouped downloads are opt-in fallback or research paths, not the fast daily default.
 - Independent provider groups run concurrently by default; set `DAILY_PARALLEL_GROUPS=0` to force the old serial order.
 - Set `RUN_TW_PUBLIC_DATA=0` to skip the Taiwan public data downloader. The first enabled run may backfill many historical official-data dates.

@@ -4,6 +4,7 @@ from datetime import date
 import json
 import math
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -1106,6 +1107,62 @@ def test_yahoo_fallback_archive_cli_writes_a_verifiable_receipt(
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
     with pytest.raises(RuntimeError, match="input_manifest_files"):
         _validate_yahoo_fallback_archive(output)
+
+
+def test_yahoo_fallback_archive_remains_verifiable_after_source_detaches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "yahoo"
+    official_dir = tmp_path / "official"
+    output = tmp_path / "fallback" / "yahoo_tw_ohlcv.parquet"
+    input_dir.mkdir()
+    official_dir.mkdir()
+    pl.DataFrame(
+        {
+            "code": ["2330"],
+            "name": ["TSMC"],
+            "market": ["TWSE"],
+            "yahoo_symbol": ["2330.TW"],
+        }
+    ).write_csv(input_dir / "symbols.csv")
+    _write_yahoo_source_parquet(
+        pl.DataFrame(
+            {
+                "date": [date(2000, 1, 4), date(2000, 1, 5)],
+                "open": [100.0, 102.0],
+                "max": [101.0, 103.0],
+                "min": [99.0, 101.0],
+                "close": [100.0, 102.0],
+                "adjclose": [50.0, 51.0],
+                "Trading_Volume": [1000.0, 1200.0],
+            }
+        ),
+        input_dir / "2330_features.parquet",
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "build_tw_yahoo_fallback_archive.py",
+            "--input-dir",
+            str(input_dir),
+            "--official-input-dir",
+            str(official_dir),
+            "--output-path",
+            str(output),
+            "--start-date",
+            "2000-01-01",
+            "--end-date",
+            "2000-01-31",
+            "--workers",
+            "1",
+        ],
+    )
+
+    build_yahoo_fallback_archive()
+    shutil.rmtree(input_dir)
+
+    _validate_yahoo_fallback_archive(output)
 
 
 def test_yahoo_whitelist_resolves_a_single_successful_venue(tmp_path: Path) -> None:

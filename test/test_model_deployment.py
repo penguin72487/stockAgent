@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from stockagent.live.market_config import load_market_config
+from stockagent.live.market_config import load_market_config, load_market_configs
 from stockagent.live.model_deployment import (
     attempt_model_deployment,
     discover_model_candidate,
@@ -135,3 +135,25 @@ def test_manual_model_selection_pins_requested_fold(tmp_path: Path) -> None:
     assert cfg.output_dir == "artifacts/candidate"
     assert cfg.fold_id == 20
     assert cfg.model_scoped_live_output is True
+
+
+def test_repo_tw_modes_have_independent_market_and_artifact_routes() -> None:
+    root = Path(__file__).resolve().parents[1]
+    configs = load_market_configs(root / "services/discord_bot/markets")
+
+    assert {"tw", "tw_cash", "tw_day_trade"}.issubset(configs)
+    naive = configs["tw"]
+    assert naive.market_type == "tw"
+    assert naive.fold_id == 25
+    assert naive.config_path == "configs/deployments/tw_naive_fold25.yaml"
+    assert naive.output_dir == "artifacts/markets/tw"
+    assert naive.checkpoint_path == "artifacts/markets/tw/fold_25/checkpoint_best.pt"
+    assert configs["tw_cash"].output_dir != configs["tw"].output_dir
+    day_trade = configs["tw_day_trade"]
+    assert day_trade.fold_id == 11
+    assert day_trade.config_path == "configs/deployments/tw_day_trade.yaml"
+    assert day_trade.output_dir == "artifacts/markets/tw_public_candles_tw_day_trade_select"
+    assert day_trade.checkpoint_path == (
+        "artifacts/markets/tw_public_candles_tw_day_trade_select/"
+        "fold_11/checkpoint_best.pt"
+    )

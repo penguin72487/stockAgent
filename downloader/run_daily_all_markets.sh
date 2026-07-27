@@ -89,6 +89,8 @@ TW_PUBLIC_YAHOO_WORKERS="${TW_PUBLIC_YAHOO_WORKERS:-1}"
 TW_PUBLIC_YAHOO_RETRIES="${TW_PUBLIC_YAHOO_RETRIES:-3}"
 TW_PUBLIC_YAHOO_REQUEST_INTERVAL="${TW_PUBLIC_YAHOO_REQUEST_INTERVAL:-1.5}"
 TW_PUBLIC_SKIP_YAHOO_DOWNLOAD="${TW_PUBLIC_SKIP_YAHOO_DOWNLOAD:-0}"
+TW_PUBLIC_PIPELINE_ATTEMPTS="${TW_PUBLIC_PIPELINE_ATTEMPTS:-3}"
+TW_PUBLIC_PIPELINE_RETRY_SECONDS="${TW_PUBLIC_PIPELINE_RETRY_SECONDS:-60}"
 RUN_TW_PUBLIC_FEATURES="${RUN_TW_PUBLIC_FEATURES:-1}"
 RUN_TW_SHORT_RESTRICTIONS="${RUN_TW_SHORT_RESTRICTIONS:-1}"
 TW_PUBLIC_FEATURE_PATH="${TW_PUBLIC_FEATURE_PATH:-data_tw_public/features/tw_public_stock_daily.parquet}"
@@ -102,7 +104,7 @@ AUDIT_DAILY_GAP_DAYS="${AUDIT_DAILY_GAP_DAYS:-10}"
 AUDIT_INTRADAY_GAP_MULTIPLE="${AUDIT_INTRADAY_GAP_MULTIPLE:-4}"
 
 TW_CLOSE_TZ="${TW_CLOSE_TZ:-Asia/Taipei}"
-TW_CLOSE_TIME="${TW_CLOSE_TIME:-13:30}"
+TW_CLOSE_TIME="${TW_CLOSE_TIME:-13:40}"
 US_CLOSE_TZ="${US_CLOSE_TZ:-America/New_York}"
 US_CLOSE_TIME="${US_CLOSE_TIME:-16:20}"
 FOREX_CLOSE_TZ="${FOREX_CLOSE_TZ:-America/New_York}"
@@ -513,6 +515,7 @@ run_cex_incremental() {
 
 run_tw_public_data_update() {
   local rc=0
+  local attempt=1
   local -a cmd=()
 
   if [[ "$RUN_TW_PUBLIC_DATA" != "1" ]]; then
@@ -560,7 +563,22 @@ run_tw_public_data_update() {
     cmd+=(--skip-feature-build)
   fi
 
-  run_step tw_public_data_daily_update "${cmd[@]}" || rc=1
+  while (( attempt <= TW_PUBLIC_PIPELINE_ATTEMPTS )); do
+    log "step=tw_public_data_daily_update pipeline_attempt=${attempt}/${TW_PUBLIC_PIPELINE_ATTEMPTS}"
+    if "${cmd[@]}"; then
+      log "step=tw_public_data_daily_update pipeline_attempt=${attempt} status=done"
+      return 0
+    fi
+    rc=1
+    if (( attempt < TW_PUBLIC_PIPELINE_ATTEMPTS )); then
+      log "step=tw_public_data_daily_update pipeline_attempt=${attempt} status=failed retry_in_sec=${TW_PUBLIC_PIPELINE_RETRY_SECONDS}"
+      sleep "$TW_PUBLIC_PIPELINE_RETRY_SECONDS"
+    fi
+    attempt="$((attempt + 1))"
+  done
+
+  log "step=tw_public_data_daily_update failed attempts=${TW_PUBLIC_PIPELINE_ATTEMPTS}"
+  record_failure tw_public_data_daily_update
 
   return "$rc"
 }
@@ -770,6 +788,14 @@ validate_settings() {
   fi
   if [[ "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" != "0" && "$TW_PUBLIC_SKIP_YAHOO_DOWNLOAD" != "1" ]]; then
     echo "[daily] TW_PUBLIC_SKIP_YAHOO_DOWNLOAD must be 0 or 1" >&2
+    exit 2
+  fi
+  if ! [[ "$TW_PUBLIC_PIPELINE_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[daily] TW_PUBLIC_PIPELINE_ATTEMPTS must be a positive integer" >&2
+    exit 2
+  fi
+  if ! [[ "$TW_PUBLIC_PIPELINE_RETRY_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "[daily] TW_PUBLIC_PIPELINE_RETRY_SECONDS must be an integer >= 0" >&2
     exit 2
   fi
   if [[ "$RUN_YAHOO" != "0" && "$RUN_YAHOO" != "1" ]]; then

@@ -523,6 +523,8 @@ def test_tw_day_trade_dispatch_uses_point_in_time_eligibility_sides_and_lots() -
     assert by_symbol["SYM_0001"].shares == 1_500
     assert by_symbol["SYM_0001"].price == pytest.approx(100.0)
     assert by_symbol["SYM_0001"].market_value == pytest.approx(150_000.0)
+    assert sum(record.market_value for record in records) == pytest.approx(300_000.0)
+    assert sum(record.holding_ratio for record in records) == pytest.approx(1.0)
 
 
 def test_tw_day_trade_holdings_csv_labels_opening_trades(tmp_path: Path) -> None:
