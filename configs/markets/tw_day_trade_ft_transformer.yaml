@@ -1,0 +1,21 @@
+base_config: tw_day_trade_model_experiments_common.yaml
+
+experiment_name: tw-day-trade-ft-transformer-lookback32-v1
+runner:
+  output_dir: artifacts/model_experiments/tw_day_trade/ft_transformer
+
+training:
+  model_name: ft_transformer
+  # The optimized implementation projects each feature's full 32-session
+  # history into one token, retaining temporal context with 99 rather than
+  # 32*99 attention tokens.
+  lookback: 32
+  batch_size_train: 32
+  batch_size_eval: 8
+  ft_transformer:
+    d_token: 16
+    n_layers: 2
+    n_heads: 4
+    ffn_dim: 64
+    dropout: 0.15
+    use_cls_token: true

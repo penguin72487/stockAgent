@@ -8431,9 +8431,13 @@ def _load_backtest_artifact(output_path: Path) -> tuple[BacktestResult, np.ndarr
 
 def _dataset_to_tensors(
     dataset: CrossSectionalDataset,
+    *,
+    materialize_x: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     valid_indices = torch.as_tensor(dataset.valid_indices, dtype=torch.long)
-    if dataset.lookback == 1 and dataset.execution_mode != "tw_day_trade":
+    if not materialize_x:
+        x = _DatasetWindowView(dataset)  # type: ignore[assignment]
+    elif dataset.lookback == 1 and dataset.execution_mode != "tw_day_trade":
         x = dataset.features_t[valid_indices].unsqueeze(1)
     else:
         x = torch.stack([dataset[i]["x"] for i in range(len(dataset))], dim=0)
@@ -8443,6 +8447,35 @@ def _dataset_to_tensors(
     can_sell_masks = dataset.can_sell_mask_t[valid_indices]
     bench = dataset.benchmark_t[valid_indices]
     return x, returns, masks, can_buy_masks, can_sell_masks, bench
+
+
+class _DatasetWindowView:
+    """Materialize only the requested row slice of a dataset's windows."""
+
+    def __init__(self, dataset: CrossSectionalDataset) -> None:
+        self.dataset = dataset
+
+    def size(self, dim: int | None = None) -> torch.Size | int:
+        shape = torch.Size(
+            (
+                len(self.dataset),
+                int(self.dataset.lookback),
+                int(self.dataset.features_t.size(1)),
+                int(self.dataset.features_t.size(-1)),
+            )
+        )
+        return shape if dim is None else int(shape[dim])
+
+    def __getitem__(self, item: slice) -> torch.Tensor:
+        if not isinstance(item, slice):
+            raise TypeError("_DatasetWindowView only supports slice access")
+        start, stop, step = item.indices(len(self.dataset))
+        if step != 1:
+            raise ValueError("_DatasetWindowView requires contiguous slices")
+        return torch.stack(
+            [self.dataset[index]["x"] for index in range(start, stop)],
+            dim=0,
+        )
 
 
 def _dataset_volume_notional_to_tensor(dataset: CrossSectionalDataset) -> torch.Tensor:
@@ -14849,7 +14882,9 @@ def _run_training_tree_models(
     device = torch.device("cpu")
     amp_dtype: torch.dtype | None = None
     non_blocking = False
-    eval_chunk_rows = 2048
+    # A full lookback-32 TW test window is tens of GB. Tree inference must
+    # materialize bounded row slices instead of the complete suffix at once.
+    eval_chunk_rows = 8
     loss_objective = _normalize_risk_objective(config.training.loss_type)
     execution_runtime = _build_execution_runtime(panel, config, device)
 
@@ -14931,7 +14966,9 @@ def _run_training_tree_models(
             fold_dir = _fold_dir(output_path, fold.fold_id)
             fold_dir.mkdir(parents=True, exist_ok=True)
 
-            val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+            val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(
+                val_ds, materialize_x=False
+            )
             val_short_open_masks, val_force_cover_masks, val_force_exit_masks = _dataset_short_rule_masks_to_tensors(val_ds)
             val_short_capacity_notional, val_short_margin_rate = (
                 _dataset_short_contract_to_tensors(val_ds)
@@ -15015,7 +15052,9 @@ def _run_training_tree_models(
                 val_bt_t.turnovers,
             )
 
-            test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+            test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(
+                test_ds, materialize_x=False
+            )
             test_short_open_masks, test_force_cover_masks, test_force_exit_masks = _dataset_short_rule_masks_to_tensors(test_ds)
             test_short_capacity_notional, test_short_margin_rate = (
                 _dataset_short_contract_to_tensors(test_ds)
@@ -15353,7 +15392,9 @@ def _run_inference_tree_models(
             lookback_context=config.walk_forward.lookback_context,
         )
 
-        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(val_ds)
+        val_x, val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _dataset_to_tensors(
+            val_ds, materialize_x=False
+        )
         val_short_open_masks, val_force_cover_masks, val_force_exit_masks = _dataset_short_rule_masks_to_tensors(val_ds)
         val_short_capacity_notional, val_short_margin_rate = (
             _dataset_short_contract_to_tensors(val_ds)
@@ -15369,7 +15410,7 @@ def _run_inference_tree_models(
             _dataset_cash_dividend_terms_to_tensors(val_ds)
         )
         val_volume_notional = _dataset_volume_notional_to_tensor(val_ds)
-        val_chunk_rows = max(1, min(2048, int(val_x.size(0))))
+        val_chunk_rows = max(1, min(8, int(val_x.size(0))))
         val_bt_t, val_ic, _ = _evaluate_tensor_batch(
             model,
             val_x,
@@ -15438,7 +15479,9 @@ def _run_inference_tree_models(
             val_bt_t.turnovers,
         )
 
-        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(test_ds)
+        test_x, test_returns, test_masks, test_buy_masks, test_sell_masks, test_bench = _dataset_to_tensors(
+            test_ds, materialize_x=False
+        )
         test_short_open_masks, test_force_cover_masks, test_force_exit_masks = _dataset_short_rule_masks_to_tensors(test_ds)
         test_short_capacity_notional, test_short_margin_rate = (
             _dataset_short_contract_to_tensors(test_ds)
@@ -15454,7 +15497,7 @@ def _run_inference_tree_models(
             _dataset_cash_dividend_terms_to_tensors(test_ds)
         )
         test_volume_notional = _dataset_volume_notional_to_tensor(test_ds)
-        test_chunk_rows = max(1, min(2048, int(test_x.size(0))))
+        test_chunk_rows = max(1, min(8, int(test_x.size(0))))
         test_bt_t, test_ic, test_met = _evaluate_tensor_batch(
             model,
             test_x,

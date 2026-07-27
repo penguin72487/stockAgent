@@ -1,0 +1,16 @@
+base_config: tw_day_trade_model_experiments_common.yaml
+
+experiment_name: tw-day-trade-mlp-lookback32-v1
+runner:
+  output_dir: artifacts/model_experiments/tw_day_trade/mlp
+
+training:
+  model_name: mlp
+  lookback: 32
+  batch_size_train: 32
+  mlp:
+    embedding_dim: 128
+    hidden_dim: 256
+    hidden_layers: 3
+    dropout: 0.15
+
