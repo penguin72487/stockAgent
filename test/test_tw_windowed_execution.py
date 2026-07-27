@@ -54,6 +54,7 @@ def _panel(rows: int = 7, symbols: int = 3) -> PanelData:
         can_buy_mask=tradable.copy(),
         can_sell_mask=tradable.copy(),
         can_short_open_mask=tradable.copy(),
+        can_short_open_open_mask=np.roll(eligibility, shift=1, axis=0),
         short_capacity_shares=short_capacity,
         short_margin_rate=short_margin_rate,
         benchmark_returns=np.arange(rows, dtype=np.float32),
@@ -95,6 +96,7 @@ def _direct_day_trade_split(
         can_buy_mask=torch.ones((rows, symbols), dtype=torch.bool),
         can_sell_mask=torch.ones((rows, symbols), dtype=torch.bool),
         can_short_open_mask=torch.ones((rows, symbols), dtype=torch.bool),
+        can_short_open_open_mask=torch.roll(eligibility, shifts=1, dims=0),
         benchmark=torch.arange(rows, dtype=torch.float32),
         lookback=2,
         short_capacity_shares=short_capacity,
@@ -165,7 +167,17 @@ def test_panel_history_makes_split_row_zero_use_prior_causal_features() -> None:
     assert contextual.valid_indices.tolist() == [4, 5, 6, 7]
     assert legacy.valid_indices.tolist() == [6, 7]
     assert contextual[0]["x"][:, 0, 0].tolist() == [2.0, 3.0]
-    assert contextual[0]["future_log_returns"][0].item() == pytest.approx(0.04)
+    first = contextual[0]
+    expected_overnight = float(np.log(90.0 / 100.0))
+    assert first["overnight_log_returns"][0].item() == pytest.approx(
+        expected_overnight
+    )
+    assert first["future_log_returns"][0].item() == pytest.approx(
+        0.03 - expected_overnight
+    )
+    assert (
+        first["overnight_log_returns"][0] + first["future_log_returns"][0]
+    ).item() == pytest.approx(0.03)
     np.testing.assert_array_equal(
         _split_valid_indices(
             panel,
@@ -188,6 +200,28 @@ def test_panel_history_makes_split_row_zero_use_prior_causal_features() -> None:
     )
     assert slab is not None
     assert slab["feature_slab"][:, 0, 0].tolist() == [2.0, 3.0, 4.0, 5.0, 6.0]
+
+
+def test_panel_slab_densify_preserves_panel_history_owned_start() -> None:
+    panel = _panel(rows=8)
+    date_indices = np.asarray([4, 5, 6, 7], dtype=np.int64)
+    dataset = CrossSectionalDataset(
+        panel,
+        date_indices,
+        lookback=2,
+        execution_mode="tw_overnight",
+        lookback_context="panel_history",
+    )
+    split = dataset_to_windowed_tensors(dataset)
+
+    assert split.valid_indices.tolist() == [4, 5, 6, 7]
+    dense = _densify_windowed_training_split_for_panel_slab(
+        split,
+        date_indices,
+    )
+
+    assert dense.valid_indices.tolist() == [4, 5, 6, 7]
+    assert dense.sample_mask is None
 
 
 def test_explainability_load_estimate_uses_panel_history_dataset_contract() -> None:
@@ -252,14 +286,79 @@ def test_explainability_dataset_uses_real_execution_alignment(
     assert dataset.execution_mode == execution_mode
     assert dataset.valid_indices[0] == 2
     assert dataset[0]["x"][:, 0, 0].tolist() == [0.0, 1.0]
-    expected_return = (
-        panel.intraday_returns[2, 0]
-        if execution_mode == "tw_day_trade"
-        else panel.returns_1d[2, 0]
+    if execution_mode == "tw_day_trade":
+        assert dataset[0]["overnight_log_returns"][0].item() == 0.0
+        assert dataset[0]["future_log_returns"][0].item() == pytest.approx(
+            float(panel.intraday_returns[2, 0])
+        )
+    else:
+        expected_total = float(panel.raw_close_returns_1d[1, 0])
+        expected_overnight = float(np.log(90.0 / 100.0))
+        assert dataset[0]["overnight_log_returns"][0].item() == pytest.approx(
+            expected_overnight
+        )
+        assert dataset[0]["future_log_returns"][0].item() == pytest.approx(
+            expected_total - expected_overnight
+        )
+        assert (
+            dataset[0]["overnight_log_returns"][0]
+            + dataset[0]["future_log_returns"][0]
+        ).item() == pytest.approx(expected_total)
+
+
+def test_tw_cash_windowed_batches_preserve_shifted_dual_phase_targets() -> None:
+    panel = _panel()
+    panel.raw_close_returns_1d[:] = np.broadcast_to(
+        np.arange(panel.num_dates, dtype=np.float32)[:, None] / 10.0,
+        panel.raw_close_returns_1d.shape,
     )
-    assert dataset[0]["future_log_returns"][0].item() == pytest.approx(
-        float(expected_return)
+    dataset = CrossSectionalDataset(
+        panel,
+        np.arange(panel.num_dates),
+        lookback=2,
+        execution_mode="tw_cash",
     )
+    split = dataset_to_windowed_tensors(dataset)
+    cpu = torch.device("cpu")
+    batches = [
+        split.batch_by_rows(0, len(split), cpu, non_blocking=False),
+        split.batch_metadata_by_rows(0, len(split), cpu, non_blocking=False),
+        split.batch_by_batch_indices(
+            torch.arange(len(split)),
+            cpu,
+            non_blocking=False,
+        ),
+        split.batch_metadata_by_batch_indices(
+            torch.arange(len(split)),
+            cpu,
+            non_blocking=False,
+        ),
+    ]
+    slab = split.panel_slab_batch_by_rows(
+        0,
+        len(split),
+        cpu,
+        non_blocking=False,
+    )
+    assert slab is not None
+    batches.append(slab)
+
+    target_rows = split.valid_indices
+    expected_total = torch.from_numpy(
+        panel.raw_close_returns_1d[target_rows.numpy() - 1]
+    )
+    for batch in batches:
+        torch.testing.assert_close(
+            batch["overnight_log_returns"] + batch["future_log_returns"],
+            expected_total,
+        )
+        # Targets begin at t=2. The common phase-decision window ends at t-1.
+        if "x" in batch:
+            assert batch["x"][0, :, 0, 0].tolist() == [0.0, 1.0]
+        elif "feature_slab" in batch:
+            assert batch["feature_slab"][:2, 0, 0].tolist() == [0.0, 1.0]
+        else:
+            assert batch["date_indices"][0].item() == 2
 
 
 def test_day_trade_alignment_matches_indexed_contiguous_and_panel_slab_paths() -> None:
@@ -528,6 +627,10 @@ def test_trainer_windowed_rebuilders_preserve_execution_contract() -> None:
             source.day_trade_can_sell_open_mask,
         )
         assert torch.equal(
+            candidate.can_short_open_open_mask,
+            source.can_short_open_open_mask,
+        )
+        assert torch.equal(
             candidate.unresolved_corporate_action_mask,
             source.unresolved_corporate_action_mask,
         )
@@ -546,6 +649,7 @@ def test_trainer_windowed_rebuilders_preserve_execution_contract() -> None:
         tradable_mask=source.tradable_mask,
         can_buy_mask=source.can_buy_mask,
         can_sell_mask=source.can_sell_mask,
+        can_short_open_open_mask=source.can_short_open_open_mask,
         benchmark=source.benchmark,
         lookback=source.lookback,
         execution_mode="naive",
@@ -615,6 +719,14 @@ def test_trainer_windowed_rebuilders_preserve_execution_contract() -> None:
     )
     assert combined.execution_mode == "tw_day_trade"
     assert combined.day_trade_eligible_mask is not None
+    assert torch.equal(
+        combined.can_short_open_open_mask,
+        torch.from_numpy(
+            panel.day_trade_can_short_open_mask
+            & panel.day_trade_eligible_mask
+            & panel.day_trade_can_sell_open_mask
+        ),
+    )
     assert lengths == [3, 3]
 
 
@@ -634,7 +746,10 @@ def test_day_trade_windowed_split_fails_closed_without_historical_eligibility() 
         )
 
 
-def test_cash_dataset_fails_closed_without_corporate_action_mask() -> None:
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+def test_carrying_dataset_fails_closed_without_corporate_action_mask(
+    execution_mode: str,
+) -> None:
     panel = _panel()
     panel.unresolved_corporate_action_mask = None
 
@@ -643,11 +758,14 @@ def test_cash_dataset_fails_closed_without_corporate_action_mask() -> None:
             panel,
             np.arange(panel.num_dates),
             lookback=2,
-            execution_mode="tw_cash",
+            execution_mode=execution_mode,
         )
 
 
-def test_cash_dataset_fails_closed_without_raw_close_returns() -> None:
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+def test_carrying_dataset_fails_closed_without_raw_close_returns(
+    execution_mode: str,
+) -> None:
     panel = _panel()
     panel.raw_close_returns_1d = None
 
@@ -656,7 +774,7 @@ def test_cash_dataset_fails_closed_without_raw_close_returns() -> None:
             panel,
             np.arange(panel.num_dates),
             lookback=2,
-            execution_mode="tw_cash",
+            execution_mode=execution_mode,
         )
 
 

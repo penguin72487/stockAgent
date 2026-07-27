@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from stockagent.backtest.simulator import _prepare_tw_phase_actions
 from stockagent.config import load_config
 from stockagent.models.factory import build_model
 from stockagent.models.financial_transformer import FinancialTransformerModel
@@ -192,7 +193,10 @@ def test_tw_overnight_postprocess_bounds_due_exit_and_shares_entry_budget(
         )
         actual_targets = target_model(x, mask, return_aux=False)
 
-    assert logits_model.action_schema == "due_exit_open_close_entries_v1"
+    assert (
+        logits_model.action_schema
+        == "due_exit_open_close_entries_v2_shared_direction"
+    )
     assert logits_model.action_channel_names == (
         "due_exit_fraction",
         "open_entry_target",
@@ -214,11 +218,123 @@ def test_tw_overnight_postprocess_bounds_due_exit_and_shares_entry_budget(
         atol=1e-6,
     )
     assert torch.all(processed[:, 1:].abs().sum(dim=2) < 1.0)
+    assert torch.all(
+        processed[:, 1] * processed[:, 2] >= -torch.finfo(processed.dtype).eps
+    )
     torch.testing.assert_close(
         actual_targets,
         expected_targets,
         rtol=1e-6,
         atol=1e-7,
+    )
+
+
+def test_phase_prepare_masks_logits_before_allocating_gross_budget() -> None:
+    model = _make_model(
+        execution_mode="tw_overnight",
+        portfolio_output_mode="logits",
+    ).eval()
+    mask = torch.tensor([[True, False]], dtype=torch.bool)
+    logits = torch.tensor(
+        [[[0.0, 0.0], [1.0, 100.0], [1.0, 100.0]]],
+        dtype=torch.float32,
+    )
+
+    expected = model.postprocess_action_logits(logits, mask)
+    actual = _prepare_tw_phase_actions(
+        logits,
+        mask,
+        execution_mode="tw_overnight",
+        long_only=False,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="identity",
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        actual[0, 1:, 0],
+        torch.tensor([0.5, 0.5]),
+    )
+    assert torch.count_nonzero(actual[0, :, 1]).item() == 0
+
+    pre_normalized = torch.tensor(
+        [[[0.5, 100.0], [0.6, 100.0]]],
+        dtype=torch.float32,
+    )
+    pre_normalized_actual = _prepare_tw_phase_actions(
+        pre_normalized,
+        mask,
+        execution_mode="tw_cash",
+        long_only=False,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="pre_normalized",
+    )
+    torch.testing.assert_close(
+        pre_normalized_actual,
+        torch.tensor([[[0.5, 0.0], [0.6, 0.0]]]),
+    )
+
+
+def test_phase_prepare_fails_closed_on_opposite_overnight_entries() -> None:
+    actions = torch.tensor(
+        [[[0.5, 0.0], [0.75, 0.0], [-0.25, 0.0]]],
+        dtype=torch.float32,
+    )
+    tradable = torch.ones((1, 2), dtype=torch.bool)
+
+    actual = _prepare_tw_phase_actions(
+        actions,
+        tradable,
+        execution_mode="tw_overnight",
+        long_only=False,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="pre_normalized",
+    )
+
+    torch.testing.assert_close(actual[:, 0], actions[:, 0])
+    assert torch.count_nonzero(actual[:, 1:, 0]).item() == 0
+
+
+@pytest.mark.parametrize("entry_logit", [0.0, 1.0e-10])
+def test_phase_prepare_matches_model_tiny_logit_forward_and_gradient(
+    entry_logit: float,
+) -> None:
+    model = _make_model(
+        execution_mode="tw_overnight",
+        portfolio_output_mode="logits",
+    ).eval()
+    mask = torch.ones((1, 1), dtype=torch.bool)
+    model_logits = torch.tensor(
+        [[[0.0], [entry_logit], [entry_logit]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    simulator_logits = model_logits.detach().clone().requires_grad_(True)
+
+    expected = model.postprocess_action_logits(model_logits, mask)
+    actual = _prepare_tw_phase_actions(
+        simulator_logits,
+        mask,
+        execution_mode="tw_overnight",
+        long_only=False,
+        gross_leverage=1.0,
+        min_trade_weight=0.0,
+        portfolio_activation="identity",
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    expected[:, 1:].sum().backward()
+    actual[:, 1:].sum().backward()
+    assert model_logits.grad is not None
+    assert simulator_logits.grad is not None
+    torch.testing.assert_close(
+        simulator_logits.grad,
+        model_logits.grad,
+        rtol=0.0,
+        atol=0.0,
     )
 
 

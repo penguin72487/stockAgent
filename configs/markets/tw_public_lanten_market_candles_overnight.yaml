@@ -1,0 +1,15 @@
+base_config: tw_public_lanten_market_candles.yaml
+
+# Strict one-session carrying experiment. Both entry heads use completed data
+# through t-1 plus the dedicated open[t]/close[t-1] gap channel. No session-t
+# high/low/close/full-day-volume field enters the model. Yesterday's cohort
+# must exit no later than today's closing auction.
+experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gross-tw-overnight-lookback256-panel-history-v1-dual5090
+
+runner:
+  output_dir: artifacts/markets/tw_public_candles_snapshot_safe99_open_aware_gross_tw_overnight_lookback256_panel_history
+  resume: true
+  start_fold: 1
+
+trading:
+  execution_mode: tw_overnight

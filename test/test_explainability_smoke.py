@@ -28,6 +28,7 @@ from stockagent.explainability import (
     _save_matplotlib_figure,
     _score_head_surrogate_shap,
     _score_head_surrogate_shap_chunked,
+    _selection_from_weights,
     _streaming_aux_umap_samples,
     _write_decision_inventory_streaming,
     _with_numeric,
@@ -81,6 +82,14 @@ def test_evenly_spaced_sample_indices_stay_in_bounds_above_float32_exact_range()
     assert bool(torch.all(indices[1:] > indices[:-1]))
     assert int(indices.min()) >= 0
     assert int(indices.max()) < n_points
+
+
+def test_phase_actions_fail_closed_before_portfolio_explainability() -> None:
+    weights = torch.zeros((2, 3, 4), dtype=torch.float32)
+    mask = torch.ones((2, 4), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match=r"phase actions \[B,P,S\]"):
+        _selection_from_weights(weights, mask)
 
 
 def test_portfolio_j_lens_is_complete_and_faithfulness_checked() -> None:

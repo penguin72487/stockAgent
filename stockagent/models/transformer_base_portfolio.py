@@ -38,7 +38,7 @@ _ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
     "naive": "single_target_v1",
     "tw_day_trade": "single_target_v1",
     "tw_cash": "open_close_targets_v1",
-    "tw_overnight": "due_exit_open_close_entries_v1",
+    "tw_overnight": "due_exit_open_close_entries_v2_shared_direction",
 }
 
 
@@ -2104,7 +2104,24 @@ class TransformerBasePortfolioModel(nn.Module):
                 ~mask_bool,
                 0.0,
             )
-            entry_logits = action_logits[:, 1:]
+            raw_open_entry = action_logits[:, 1]
+            raw_close_entry = action_logits[:, 2]
+            # A strict one-session cohort cannot be long and short in the same
+            # symbol at two entry events on the same date: netting those orders
+            # would silently create a same-day round trip.  Parameterize one
+            # signed daily direction plus a differentiable OPEN/CLOSE timing
+            # split, then expose the resolved pair through the public P3 ABI.
+            direction_logits = 0.5 * (raw_open_entry + raw_close_entry)
+            close_entry_fraction = torch.sigmoid(
+                raw_close_entry - raw_open_entry
+            )
+            entry_logits = torch.stack(
+                (
+                    direction_logits * (1.0 - close_entry_fraction),
+                    direction_logits * close_entry_fraction,
+                ),
+                dim=1,
+            )
             entry_mask = mask_bool[:, None, :].expand(
                 int(batch_size),
                 2,
@@ -2131,6 +2148,10 @@ class TransformerBasePortfolioModel(nn.Module):
                 parts = {
                     "due_exit_fraction": due_exit_fraction,
                     "entry_gross_exposure": entry_weights.abs().sum(dim=(1, 2)),
+                    "close_entry_fraction": close_entry_fraction.masked_fill(
+                        ~mask_bool,
+                        0.0,
+                    ),
                     "implicit_entry_cash_weight": (
                         1.0 - entry_weights.abs().sum(dim=(1, 2))
                     ).clamp_min(0.0),

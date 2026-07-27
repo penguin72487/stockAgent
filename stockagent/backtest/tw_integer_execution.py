@@ -30,6 +30,11 @@ from stockagent.backtest.tw_execution import normalize_fee_rounding
 
 
 ExecutionMode = Literal["tw_cash", "tw_day_trade"]
+TaiwanIntegerStateMode = Literal[
+    "tw_cash",
+    "tw_day_trade",
+    "tw_overnight",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +46,7 @@ class TaiwanIntegerState:
     closing ledger value and therefore makes chunked return calculation exact.
     """
 
-    mode: ExecutionMode
+    mode: TaiwanIntegerStateMode
     settled_cash: float
     holdings: np.ndarray
     payable_queue: np.ndarray
@@ -725,7 +730,7 @@ def _cash_dividend_inputs(
 
 
 def _new_state(
-    mode: ExecutionMode,
+    mode: TaiwanIntegerStateMode,
     symbols: int,
     settlement_lag_sessions: int,
     claim_queue_sessions: int,
@@ -750,7 +755,7 @@ def _new_state(
 def _copy_validate_state(
     state: TaiwanIntegerState | None,
     *,
-    mode: ExecutionMode,
+    mode: TaiwanIntegerStateMode,
     symbols: int,
     settlement_lag_sessions: int,
     claim_queue_sessions: int,
@@ -2190,7 +2195,7 @@ def _run_tw_cash_integer_signed(
                 if not np.any(remaining_short):
                     # Once every short liability is extinguished, all old
                     # collateral is releasable, including excess retained in
-                    # a previously covered symbol's original per-symbol pool.
+                    # the portfolio-wide collateral pool.
                     released_sale = short_sale_collateral.copy()
                     released_margin = short_margin_collateral.copy()
                 else:

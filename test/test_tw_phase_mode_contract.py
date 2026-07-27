@@ -13,6 +13,7 @@ from stockagent.backtest.tw_execution import (
     normalize_execution_mode,
 )
 from stockagent.config import DAY_TRADE_OPEN_GAP_FEATURE, load_config
+from stockagent.training.trainer import _format_ic_summary_for_console
 
 
 def _write_config(
@@ -21,8 +22,14 @@ def _write_config(
     execution_mode: object,
     model_name: object = "transformer_base_portfolio",
     loss_type: object = "log_utility",
+    model_output_mode: str = "logits",
+    trading_activation: str = "identity",
+    loss_activation: str = "auto",
     day_trade_open_feature: bool = False,
     feature_include: list[str] | None = None,
+    return_rank_ic_weight: float = 0.0,
+    direction_weight: float = 0.0,
+    explain_after_each_fold: bool = False,
 ) -> Path:
     path = tmp_path / "phase-mode.yaml"
     path.write_text(
@@ -51,11 +58,21 @@ def _write_config(
                     "sell_fee_rate": 0.0037,
                     "long_only": False,
                     "execution_mode": execution_mode,
+                    "portfolio_activation": trading_activation,
                 },
                 "training": {
                     "non_blocking_transfer": True,
                     "model_name": model_name,
                     "loss_type": loss_type,
+                    "loss_portfolio_activation": loss_activation,
+                    "transformer_base_portfolio": {
+                        "portfolio_output_mode": model_output_mode,
+                    },
+                    "multitask_loss": {
+                        "return_rank_ic_weight": return_rank_ic_weight,
+                        "direction_weight": direction_weight,
+                    },
+                    "explain_after_each_fold": explain_after_each_fold,
                 },
                 "evaluation": {},
             }
@@ -90,6 +107,21 @@ def test_overnight_alias_is_canonicalized_during_config_load(
     )
 
     assert config.trading.execution_mode == "tw_overnight"
+
+
+def test_overnight_market_template_loads_open_aware_phase_contract() -> None:
+    config = load_config(
+        Path(
+            "configs/markets/"
+            "tw_public_lanten_market_candles_overnight.yaml"
+        )
+    )
+
+    assert config.trading.execution_mode == "tw_overnight"
+    assert config.data.day_trade_open_feature is True
+    assert DAY_TRADE_OPEN_GAP_FEATURE in config.data.feature_include
+    assert config.training.tw_continuous_compile_chunk_rows == 32
+    assert config.training.tw_continuous_gradient_horizon_rows == 32
 
 
 def test_overnight_uses_ordinary_sell_tax_not_day_trade_tax() -> None:
@@ -248,25 +280,66 @@ def test_phase_modes_reject_noncanonical_or_scalar_target_objectives(
 
 
 @pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
-@pytest.mark.parametrize("enable_via_flag", [False, True])
-def test_strict_phase_auctions_reject_same_open_quote_features(
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("return_rank_ic_weight", 0.1),
+        ("direction_weight", 0.1),
+    ],
+)
+def test_phase_modes_reject_undefined_scalar_auxiliary_targets(
     tmp_path: Path,
     execution_mode: str,
-    enable_via_flag: bool,
+    field_name: str,
+    field_value: float,
 ) -> None:
-    with pytest.raises(ValueError, match="strict opening-auction"):
+    kwargs = {field_name: field_value}
+    with pytest.raises(ValueError, match=r"multi-phase \[T,P,S\].*must be 0"):
         load_config(
             _write_config(
                 tmp_path,
                 execution_mode=execution_mode,
-                day_trade_open_feature=enable_via_flag,
-                feature_include=(
-                    []
-                    if enable_via_flag
-                    else [DAY_TRADE_OPEN_GAP_FEATURE]
-                ),
+                **kwargs,
             )
         )
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+def test_phase_modes_reject_unlabelled_explainability(
+    tmp_path: Path,
+    execution_mode: str,
+) -> None:
+    with pytest.raises(ValueError, match=r"phase actions \[B,P,S\]"):
+        load_config(
+            _write_config(
+                tmp_path,
+                execution_mode=execution_mode,
+                explain_after_each_fold=True,
+            )
+        )
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+@pytest.mark.parametrize("enable_via_flag", [False, True])
+def test_phase_auctions_accept_causal_current_open_quote_feature(
+    tmp_path: Path,
+    execution_mode: str,
+    enable_via_flag: bool,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            execution_mode=execution_mode,
+            day_trade_open_feature=enable_via_flag,
+            feature_include=(
+                []
+                if enable_via_flag
+                else [DAY_TRADE_OPEN_GAP_FEATURE]
+            ),
+        )
+    )
+
+    assert DAY_TRADE_OPEN_GAP_FEATURE in config.data.feature_include
 
 
 def test_naive_and_day_trade_keep_their_existing_model_objective_contracts(
@@ -298,6 +371,74 @@ def test_naive_and_day_trade_keep_their_existing_model_objective_contracts(
     assert DAY_TRADE_OPEN_GAP_FEATURE in day_trade.data.feature_include
 
 
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+@pytest.mark.parametrize(
+    "model_output_mode",
+    ["l1", "projection_l1", "signed_softmax"],
+)
+def test_phase_modes_require_pre_normalized_consumers_for_resolved_model_outputs(
+    tmp_path: Path,
+    execution_mode: str,
+    model_output_mode: str,
+) -> None:
+    with pytest.raises(ValueError, match="must be 'pre_normalized'"):
+        load_config(
+            _write_config(
+                tmp_path,
+                execution_mode=execution_mode,
+                model_output_mode=model_output_mode,
+                trading_activation="identity",
+                loss_activation="auto",
+            )
+        )
+
+    config = load_config(
+        _write_config(
+            tmp_path,
+            execution_mode=execution_mode,
+            model_output_mode=model_output_mode,
+            trading_activation="pre_normalized",
+            loss_activation="pre_normalized",
+        )
+    )
+    assert config.trading.portfolio_activation == "pre_normalized"
+    assert config.training.loss_portfolio_activation == "pre_normalized"
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+def test_phase_modes_reject_semantically_inert_activation_l1(
+    tmp_path: Path,
+    execution_mode: str,
+) -> None:
+    with pytest.raises(ValueError, match="silently replace.*identity"):
+        load_config(
+            _write_config(
+                tmp_path,
+                execution_mode=execution_mode,
+                model_output_mode="activation_l1",
+                trading_activation="pre_normalized",
+                loss_activation="pre_normalized",
+            )
+        )
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+def test_phase_modes_reject_pre_normalized_consumers_for_raw_logits(
+    tmp_path: Path,
+    execution_mode: str,
+) -> None:
+    with pytest.raises(ValueError, match="unresolved raw phase logits"):
+        load_config(
+            _write_config(
+                tmp_path,
+                execution_mode=execution_mode,
+                model_output_mode="logits",
+                trading_activation="pre_normalized",
+                loss_activation="pre_normalized",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "bad_mode",
     ["tw_swing", "tomorrow", "", None, 1],
@@ -310,3 +451,19 @@ def test_unknown_execution_mode_remains_fail_closed(
         load_config(
             _write_config(tmp_path, execution_mode=bad_mode)
         )
+
+
+def test_phase_console_reports_unavailable_scalar_ic_without_crashing() -> None:
+    assert _format_ic_summary_for_console({}) == "IC=N/A  IC_IR=N/A"
+    assert (
+        _format_ic_summary_for_console(
+            {"ic_mean": float("nan"), "ic_ir": 0.0}
+        )
+        == "IC=N/A  IC_IR=N/A"
+    )
+    assert (
+        _format_ic_summary_for_console(
+            {"ic_mean": 0.125, "ic_ir": -0.5}
+        )
+        == "IC=+0.1250  IC_IR=-0.5000"
+    )

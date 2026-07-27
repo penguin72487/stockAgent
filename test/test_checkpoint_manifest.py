@@ -716,7 +716,7 @@ def test_schema7_prior_backtest_contract_cannot_resume_but_can_infer(
     expected = _checkpoint_manifest(_panel(), _config())
     assert (
         expected["contracts"]["trading"]["canonical_backtest_contract_version"]
-        == 8
+        == 9
     )
     prior_contract = copy.deepcopy(expected)
     prior_contract["contracts"]["trading"]["canonical_backtest_contract_version"] = 7
@@ -753,14 +753,15 @@ def test_taiwan_settlement_gradient_horizon_is_checkpoint_semantic() -> None:
         == _checkpoint_manifest(panel, naive_changed)["fingerprints"]["training"]
     )
 
-    taiwan = copy.deepcopy(naive)
-    taiwan.trading.execution_mode = "tw_cash"
-    taiwan_changed = copy.deepcopy(taiwan)
-    taiwan_changed.training.tw_continuous_gradient_horizon_rows += 8
-    assert (
-        _checkpoint_manifest(panel, taiwan)["fingerprints"]["training"]
-        != _checkpoint_manifest(panel, taiwan_changed)["fingerprints"]["training"]
-    )
+    for execution_mode in ("tw_cash", "tw_day_trade", "tw_overnight"):
+        taiwan = copy.deepcopy(naive)
+        taiwan.trading.execution_mode = execution_mode
+        taiwan_changed = copy.deepcopy(taiwan)
+        taiwan_changed.training.tw_continuous_gradient_horizon_rows += 8
+        assert (
+            _checkpoint_manifest(panel, taiwan)["fingerprints"]["training"]
+            != _checkpoint_manifest(panel, taiwan_changed)["fingerprints"]["training"]
+        )
 
 
 def test_taiwan_short_execution_settings_are_checkpoint_semantics() -> None:

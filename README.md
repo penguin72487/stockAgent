@@ -22,6 +22,23 @@ Multi-asset Taiwan stock trading research workspace.
 - Source `scripts/runtime_env.sh` once per shell, then run Python entrypoints with `run_fintech_python`; it discovers the local `fintech` environment without assuming an absolute installation path.
 - Run Taiwan training with `run_fintech_python train.py --config configs/markets/tw.yaml`; outputs go to that market config's `runner.output_dir`.
 - Run the independent Taiwan public-data experiment with `run_fintech_python train.py --config configs/markets/tw_public.yaml`; outputs go to `artifacts/markets/tw_public_official_2005_v1`.
+- Taiwan carrying execution has two explicit phase-action contracts. `tw_cash`
+  emits signed opening- and closing-auction targets while retaining the T+2
+  account ledger. `tw_overnight` emits a next-session exit fraction plus signed
+  open/close entry allocations; every cohort must be closed by the next
+  session's close. Its model head shares one per-symbol entry direction and
+  learns the open/close timing split, preventing an implicit same-day reversal.
+  Both heads use completed daily features through `t-1` plus the dedicated
+  `open[t]/close[t-1]` gap channel. They never see session-`t` high/low/close
+  or full-day volume; phase fill masks and the closing price remain
+  executor-only. Training, tensor backtests, and exact integer-share audit are
+  supported; the existing single-target live preview and portfolio
+  explainability paths reject phase outputs until they have phase-labelled
+  account-state contracts.
+- Run the one-session carrying template with
+  `run_fintech_python train.py --config configs/markets/tw_public_lanten_market_candles_overnight.yaml`.
+- Reproduce the fixed-shape eager/compiled settlement benchmark with
+  `run_fintech_python scripts/benchmark_tw_dual_session_compile.py --symbols 2735 --rows 32 --repeats 7`.
 - `data.use_tw_public_rules` applies official TW execution masks independently from
   model inputs. TW configs enable it by default and fail fast if the configured
   public parquet is missing. `configs/markets/tw_public.yaml` additionally enables
