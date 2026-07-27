@@ -17,7 +17,7 @@ import torch
 
 from stockagent.backtest.simulator import run_backtest_torch
 from stockagent.backtest.tw_execution import normalize_execution_mode
-from stockagent.config import ExperimentConfig, load_config
+from stockagent.config import DAY_TRADE_OPEN_GAP_FEATURE, ExperimentConfig, load_config
 from stockagent.data.panel import PanelData, build_panel, build_tail_panel
 from stockagent.live.portfolio_state import (
     build_rebalance_rows,
@@ -118,25 +118,37 @@ def _remember_live_panel(key: str, panel: PanelData) -> None:
 
 
 def _require_supported_live_execution(execution_mode: object) -> str:
-    """Fail closed until live signals carry an authoritative settlement ledger.
+    """Resolve the live execution contract without fabricating account state.
 
     Historical inference has the complete recurrent cash/claim state inside the
     canonical executor.  The live signal store currently persists only weights,
-    so pretending that pending T+2 payables/receivables are zero could approve a
-    purchase that the broker account cannot fund.  Day-trade signals also need a
-    morning-session eligibility snapshot and must not be persisted as overnight
-    holdings.  Refuse both real modes instead of silently dispatching ``naive``.
+    so non-naive modes are emitted as model-target previews below.  They must not
+    be passed through the naive simulator or persisted as executed holdings.
     """
+    return normalize_execution_mode(execution_mode)
 
-    mode = normalize_execution_mode(execution_mode)
-    if mode != "naive":
+
+def _require_single_target_live_weights(
+    weights: torch.Tensor,
+    *,
+    execution_mode: str,
+    expected_symbols: int,
+) -> torch.Tensor:
+    """Fail closed instead of collapsing phase-aware actions into legacy targets."""
+
+    if weights.dim() == 3:
         raise RuntimeError(
-            f"live signal generation does not yet support execution_mode={mode}; "
-            "it requires broker-sourced settled cash plus pending T+2 claims, "
-            "and tw_day_trade additionally requires a session-bound morning "
-            "eligibility snapshot. Refusing to fall back to naive execution."
+            f"{execution_mode} produced phase-aware model actions with shape "
+            f"{tuple(weights.shape)} ([B,P,S]); live signal preview currently "
+            "supports only single-target [B,S] output and will not choose or "
+            "collapse an open/close phase."
         )
-    return mode
+    if weights.dim() != 2 or tuple(weights.shape) != (1, int(expected_symbols)):
+        raise RuntimeError(
+            "live signal model output must have shape [1,S]; "
+            f"got {tuple(weights.shape)} for S={int(expected_symbols)}"
+        )
+    return weights
 
 
 def _emit_progress(
@@ -335,6 +347,11 @@ def _tail_panel_dates(panel: PanelData, rows: int) -> PanelData:
         can_buy_mask=panel.can_buy_mask[slc] if panel.can_buy_mask is not None else None,
         can_sell_mask=panel.can_sell_mask[slc] if panel.can_sell_mask is not None else None,
         can_short_open_mask=panel.can_short_open_mask[slc] if panel.can_short_open_mask is not None else None,
+        can_short_open_open_mask=(
+            panel.can_short_open_open_mask[slc]
+            if panel.can_short_open_open_mask is not None
+            else None
+        ),
         force_short_cover_mask=panel.force_short_cover_mask[slc] if panel.force_short_cover_mask is not None else None,
         force_exit_mask=panel.force_exit_mask[slc] if panel.force_exit_mask is not None else None,
         daily_volumes=panel.daily_volumes[slc] if panel.daily_volumes is not None else None,
@@ -674,12 +691,20 @@ def _price_snapshot(
             chunk_size=yahoo_chunk_size,
         )
     if source_norm in {"tw", "twse", "tpex", "mis", "tw_mis"}:
-        return fetch_tw_mis_last_prices(
+        snapshot = fetch_tw_mis_last_prices(
             symbols,
             fallback_prices,
             parquet_root=parquet_root,
             chunk_size=yahoo_chunk_size,
         )
+        if snapshot.available_count <= 0:
+            return PriceSnapshot(
+                prices=np.asarray(fallback_prices, dtype=np.float64).copy(),
+                source="panel_close:fallback_tw_mis_unavailable",
+                available_count=0,
+                available_mask=np.zeros((len(symbols),), dtype=bool),
+            )
+        return snapshot
     raise ValueError(f"price_source must be one of panel/csv/yahoo/tw, got {source!r}")
 
 
@@ -810,6 +835,79 @@ def _daily_price_timestamp(
         if asof_dt >= close_dt:
             return close_dt.strftime("%Y-%m-%d %H:%M:%S")
     return price_snapshot.timestamp or resolved_asof
+
+
+def _snapshot_local_timestamp(
+    snapshot: PriceSnapshot,
+    *,
+    timezone_name: str | None,
+    fallback: str,
+) -> str:
+    raw = str(snapshot.timestamp or fallback).strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        parsed = None
+    if parsed is None:
+        return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_display_zone(timezone_name))
+    return parsed.astimezone(_display_zone(timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _day_trade_live_model_window(
+    panel: PanelData,
+    *,
+    panel_idx: int,
+    lookback: int,
+    price_snapshot: PriceSnapshot,
+    resolved_asof: str,
+    source_timezone: str | None,
+) -> tuple[np.ndarray, str, str, bool, np.ndarray]:
+    """Build an open-aware window without treating an incomplete session as a daily bar."""
+
+    start = int(panel_idx) - int(lookback) + 1
+    window = np.asarray(panel.features[start : panel_idx + 1], dtype=np.float32).copy()
+    feature_cutoff = _date_string(panel.dates[panel_idx])
+    source = str(price_snapshot.source or "").strip().lower()
+    if source.startswith("panel"):
+        return window, feature_cutoff, feature_cutoff, False, np.zeros((panel.num_symbols,), dtype=bool)
+
+    decision_time = _snapshot_local_timestamp(
+        price_snapshot,
+        timezone_name=source_timezone,
+        fallback=resolved_asof,
+    )
+    live_session = decision_time[:10] > feature_cutoff[:10]
+    observed_open = np.zeros((panel.num_symbols,), dtype=bool)
+    if not live_session:
+        return window, feature_cutoff, decision_time, False, observed_open
+
+    opens = price_snapshot.open_prices
+    if opens is None:
+        return window, feature_cutoff, decision_time, True, observed_open
+    opens_np = np.asarray(opens, dtype=np.float64)
+    closes_np = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
+    observed_open = (
+        np.isfinite(opens_np)
+        & (opens_np > 0.0)
+        & np.isfinite(closes_np)
+        & (closes_np > 0.0)
+    )
+    try:
+        gap_idx = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
+    except ValueError:
+        return window, feature_cutoff, decision_time, True, observed_open
+    gap = np.zeros((panel.num_symbols,), dtype=np.float32)
+    gap[observed_open] = np.log(opens_np[observed_open] / closes_np[observed_open]).astype(
+        np.float32,
+        copy=False,
+    )
+    # Taiwan's ordinary daily limit is far below this bound. Extreme values
+    # indicate a stale quote, corporate action, or mismatched symbol mapping.
+    gap[~np.isfinite(gap) | (np.abs(gap) > 0.5)] = 0.0
+    window[-1, :, gap_idx] = gap
+    return window, feature_cutoff, decision_time, True, observed_open
 
 
 def _decision_weights_timestamp(
@@ -1444,7 +1542,8 @@ def generate_live_signal(
     progress_name = str(progress_label or f"live-signal:{market or 'default'}").strip()
     _emit_progress(progress_callback, label=progress_name, step=1, total=progress_total, message="load config")
     config = load_config(config_path)
-    _require_supported_live_execution(config.trading.execution_mode)
+    execution_mode = _require_supported_live_execution(config.trading.execution_mode)
+    execution_preview_only = execution_mode != "naive"
     if device is not None:
         config.environment.device = str(device)
     os.environ["STOCKAGENT_STRICT_NO_FALLBACK"] = "1" if config.training.strict_no_fallback else "0"
@@ -1491,6 +1590,7 @@ def generate_live_signal(
         resolved_output_dir / f"fold_{resolved_fold_id:02d}",
         state_dict,
         context=f"live signal {market_id or resolved_fold_id}",
+        allow_missing_masked=True,
     )
     saved_fold_id = checkpoint_payload.get("fold_id")
     if saved_fold_id is not None and int(saved_fold_id) != int(resolved_fold_id):
@@ -1532,13 +1632,61 @@ def generate_live_signal(
         prices_csv=prices_csv,
         yahoo_chunk_size=yahoo_chunk_size,
     )
+    if str(price_snapshot.source).startswith("panel_close:fallback_tw_mis_unavailable"):
+        quote_notice = (
+            "TWSE/TPEx MIS 本次未回傳任何盤中報價；本訊號明確改用最後完整收盤價，"
+            "不視為盤中即時價格。"
+        )
+        market_notice = (
+            f"{str(market_notice).strip()} {quote_notice}".strip()
+            if market_notice
+            else quote_notice
+        )
+    elif (
+        str(price_snapshot.source).startswith("twse_tpex:mis")
+        and int(price_snapshot.available_count) < int(panel.num_symbols)
+    ):
+        quote_notice = (
+            f"TWSE/TPEx MIS 即時報價覆蓋 {price_snapshot.available_count}/{panel.num_symbols}；"
+            "未取得報價的標的沿用最後完整收盤價。"
+        )
+        market_notice = (
+            f"{str(market_notice).strip()} {quote_notice}".strip()
+            if market_notice
+            else quote_notice
+        )
     current_prices = price_snapshot.prices
+    day_trade_model_window: np.ndarray | None = None
+    day_trade_feature_cutoff: str | None = None
+    day_trade_live_session = False
+    day_trade_observed_open = np.zeros((panel.num_symbols,), dtype=bool)
+    if execution_mode == "tw_day_trade":
+        (
+            day_trade_model_window,
+            day_trade_feature_cutoff,
+            day_trade_decision_time,
+            day_trade_live_session,
+            day_trade_observed_open,
+        ) = _day_trade_live_model_window(
+            panel,
+            panel_idx=panel_idx,
+            lookback=config.training.lookback,
+            price_snapshot=price_snapshot,
+            resolved_asof=resolved_asof,
+            source_timezone=source_timezone,
+        )
+        if day_trade_live_session:
+            panel_date_str = day_trade_decision_time[:10]
+            panel_display_date = day_trade_decision_time
     _emit_progress(
         progress_callback,
         label=progress_name,
         step=7,
         total=progress_total,
-        message=f"prices source={price_snapshot.source} available={price_snapshot.available_count}/{panel.num_symbols}",
+        message=(
+            f"prices source={price_snapshot.source} available={price_snapshot.available_count}/{panel.num_symbols} "
+            f"decision={panel_display_date}"
+        ),
     )
 
     previous_price_source = str(price_snapshot.source or "").strip().lower()
@@ -1551,6 +1699,8 @@ def generate_live_signal(
     expected_previous_data_date = (
         panel_date_str if uses_realtime_daily_prices else _previous_usable_panel_date(panel, panel_idx, config.training.lookback)
     )
+    if execution_mode == "tw_day_trade" and day_trade_live_session:
+        expected_previous_data_date = day_trade_feature_cutoff
     fold_dir = checkpoint.parent
     _emit_progress(progress_callback, label=progress_name, step=8, total=progress_total, message="check previous signal")
     if (
@@ -1656,7 +1806,12 @@ def generate_live_signal(
     _emit_progress(progress_callback, label=progress_name, step=11, total=progress_total, message="model ready")
 
     start = panel_idx - int(config.training.lookback) + 1
-    x_np = np.nan_to_num(panel.features[start : panel_idx + 1], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    raw_model_window = (
+        day_trade_model_window
+        if day_trade_model_window is not None
+        else panel.features[start : panel_idx + 1]
+    )
+    x_np = np.nan_to_num(raw_model_window, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     mask_np = np.asarray(panel.tradable_mask[panel_idx], dtype=bool)
     can_buy_np = np.asarray(panel.can_buy_mask[panel_idx] if panel.can_buy_mask is not None else mask_np, dtype=bool)
     can_sell_np = np.asarray(panel.can_sell_mask[panel_idx] if panel.can_sell_mask is not None else mask_np, dtype=bool)
@@ -1678,7 +1833,33 @@ def generate_live_signal(
         else np.zeros_like(mask_np, dtype=bool),
         dtype=bool,
     )
+    if execution_mode == "tw_day_trade" and day_trade_live_session:
+        mask_np = np.asarray(panel.alive_mask[panel_idx], dtype=bool) & day_trade_observed_open
+        can_buy_np = mask_np.copy()
+        can_sell_np = mask_np.copy()
+        opens_np = np.asarray(price_snapshot.open_prices, dtype=np.float64)
+        upper_np = (
+            np.asarray(price_snapshot.upper_limit_prices, dtype=np.float64)
+            if price_snapshot.upper_limit_prices is not None
+            else np.full((panel.num_symbols,), np.nan, dtype=np.float64)
+        )
+        lower_np = (
+            np.asarray(price_snapshot.lower_limit_prices, dtype=np.float64)
+            if price_snapshot.lower_limit_prices is not None
+            else np.full((panel.num_symbols,), np.nan, dtype=np.float64)
+        )
+        can_buy_np &= ~(np.isfinite(upper_np) & np.isclose(opens_np, upper_np, rtol=0.0, atol=1e-8))
+        can_sell_np &= ~(np.isfinite(lower_np) & np.isclose(opens_np, lower_np, rtol=0.0, atol=1e-8))
+        can_short_open_np = can_sell_np.copy()
+        force_short_cover_np = np.zeros_like(mask_np)
+        force_exit_np = np.zeros_like(mask_np)
+    execution_constraints_complete = True
+    execution_constraints_notice: str | None = None
     current_weights = np.asarray(drift.weights, dtype=np.float64).copy()
+    if execution_mode == "tw_day_trade":
+        # Day-trade positions are opened and closed in the same session.  The
+        # prior day's intraday exposure is not an overnight holding.
+        current_weights = np.zeros_like(current_weights)
 
     with torch.inference_mode():
         x = torch.from_numpy(x_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking)
@@ -1686,43 +1867,102 @@ def generate_live_signal(
         with _autocast_context(runtime_device, amp_dtype):
             model_output = _call_model(model, x, mask, return_aux=True)
             model_weights_t, aux = _extract_weights_and_aux(model_output)
+            model_weights_t = _require_single_target_live_weights(
+                model_weights_t,
+                execution_mode=execution_mode,
+                expected_symbols=panel.num_symbols,
+            )
         _emit_progress(progress_callback, label=progress_name, step=12, total=progress_total, message="model inference done")
-        zero_returns = torch.zeros_like(model_weights_t, dtype=torch.float32)
-        initial = torch.from_numpy(current_weights.astype(np.float32)).to(device=runtime_device, non_blocking=non_blocking)
-        backtest = run_backtest_torch(
-            model_weights_t.float(),
-            zero_returns,
-            mask,
-            torch.zeros((1,), device=runtime_device, dtype=torch.float32),
-            buy_fee_rate=config.trading.buy_fee_rate,
-            sell_fee_rate=config.trading.sell_fee_rate,
-            long_only=config.trading.long_only,
-            max_turnover_ratio=config.trading.max_turnover_ratio,
-            gross_leverage=1.0,
-            min_trade_weight=config.trading.min_trade_weight,
-            portfolio_activation=config.trading.portfolio_activation,
-            can_buy_mask=torch.from_numpy(can_buy_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
-            can_sell_mask=torch.from_numpy(can_sell_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
-            can_short_open_mask=torch.from_numpy(can_short_open_np).unsqueeze(0).to(
-                device=runtime_device,
-                non_blocking=non_blocking,
-            ),
-            force_short_cover_mask=torch.from_numpy(force_short_cover_np).unsqueeze(0).to(
-                device=runtime_device,
-                non_blocking=non_blocking,
-            ),
-            force_exit_mask=torch.from_numpy(force_exit_np).unsqueeze(0).to(
-                device=runtime_device,
-                non_blocking=non_blocking,
-            ),
-            return_weights_history=True,
-            initial_weights=initial,
-        )
         model_weights = model_weights_t[0].detach().float().cpu().numpy().astype(np.float64)
-        target_weights = backtest.final_weights.detach().float().cpu().numpy().astype(np.float64)
-        turnover = float(backtest.turnovers[0].detach().float().cpu().item())
-        estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
+        if execution_preview_only:
+            target_weights = model_weights.copy()
+            if execution_mode == "tw_day_trade":
+                if day_trade_live_session or panel.day_trade_eligible_mask is None:
+                    execution_constraints_complete = False
+                    execution_constraints_notice = (
+                        "盤中決策列尚未取得同日官方現股當沖資格快照；以下已套用即時開盤"
+                        "報價與漲跌停限制，但保留未套用同日資格限制的模型目標，僅供研究，"
+                        "不能視為可執行委託。"
+                    )
+                else:
+                    eligible = np.asarray(
+                        panel.day_trade_eligible_mask[panel_idx],
+                        dtype=bool,
+                    )
+                    can_buy_open = np.asarray(
+                        panel.day_trade_can_buy_open_mask[panel_idx]
+                        if panel.day_trade_can_buy_open_mask is not None
+                        else np.zeros_like(mask_np),
+                        dtype=bool,
+                    )
+                    can_sell_open = np.asarray(
+                        panel.day_trade_can_sell_open_mask[panel_idx]
+                        if panel.day_trade_can_sell_open_mask is not None
+                        else np.zeros_like(mask_np),
+                        dtype=bool,
+                    )
+                    long_allowed = eligible & can_buy_open & can_sell_np
+                    short_allowed = eligible & can_sell_open & can_buy_np & can_short_open_np
+                    target_weights[(target_weights > 0.0) & ~long_allowed] = 0.0
+                    target_weights[(target_weights < 0.0) & ~short_allowed] = 0.0
+            else:
+                target_weights[(target_weights > 0.0) & ~can_buy_np] = 0.0
+                target_weights[(target_weights < 0.0) & ~can_short_open_np] = 0.0
+            target_weights[~mask_np] = 0.0
+            turnover = float(np.abs(target_weights - current_weights).sum())
+            estimated_trade_cost = None
+        else:
+            zero_returns = torch.zeros_like(model_weights_t, dtype=torch.float32)
+            initial = torch.from_numpy(current_weights.astype(np.float32)).to(
+                device=runtime_device,
+                non_blocking=non_blocking,
+            )
+            backtest = run_backtest_torch(
+                model_weights_t.float(),
+                zero_returns,
+                mask,
+                torch.zeros((1,), device=runtime_device, dtype=torch.float32),
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                long_only=config.trading.long_only,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=1.0,
+                min_trade_weight=config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
+                can_buy_mask=torch.from_numpy(can_buy_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
+                can_sell_mask=torch.from_numpy(can_sell_np).unsqueeze(0).to(device=runtime_device, non_blocking=non_blocking),
+                can_short_open_mask=torch.from_numpy(can_short_open_np).unsqueeze(0).to(
+                    device=runtime_device,
+                    non_blocking=non_blocking,
+                ),
+                force_short_cover_mask=torch.from_numpy(force_short_cover_np).unsqueeze(0).to(
+                    device=runtime_device,
+                    non_blocking=non_blocking,
+                ),
+                force_exit_mask=torch.from_numpy(force_exit_np).unsqueeze(0).to(
+                    device=runtime_device,
+                    non_blocking=non_blocking,
+                ),
+                return_weights_history=True,
+                initial_weights=initial,
+            )
+            target_weights = backtest.final_weights.detach().float().cpu().numpy().astype(np.float64)
+            turnover = float(backtest.turnovers[0].detach().float().cpu().item())
+            estimated_trade_cost = -float(backtest.strategy_returns[0].detach().float().cpu().item())
     _emit_progress(progress_callback, label=progress_name, step=13, total=progress_total, message="trading constraints applied")
+
+    if execution_preview_only:
+        preview_notice = (
+            f"{execution_mode} 目前顯示模型目標配置；尚未接入券商的即時可用現金、"
+            "T+2 待交割款與成交回報，因此不代表已成交持倉。"
+        )
+        if execution_mode == "tw_day_trade":
+            preview_notice += " 當沖配置僅限本交易時段，收盤前必須平倉，不會留作隔夜持倉。"
+        market_notice = (
+            f"{str(market_notice).strip()} {preview_notice}".strip()
+            if market_notice
+            else preview_notice
+        )
 
     score_values: np.ndarray | None = None
     if aux is not None:
@@ -1880,8 +2120,20 @@ def generate_live_signal(
         "market_label": market_name,
         "panel_date": panel_display_date,
         "panel_data_date": panel_date_str,
+        "feature_cutoff_date": (
+            _daily_bar_timestamp(day_trade_feature_cutoff, daily_bar_time)
+            if day_trade_feature_cutoff
+            else None
+        ),
+        "live_session_open_feature_applied": bool(
+            execution_mode == "tw_day_trade" and day_trade_live_session
+        ),
         "weights_date": weights_timestamp,
         "trading_frequency": trading_frequency,
+        "execution_mode": execution_mode,
+        "execution_preview_only": execution_preview_only,
+        "execution_constraints_complete": execution_constraints_complete,
+        "execution_constraints_notice": execution_constraints_notice,
         "previous_period_label": "上個訊號到現在" if intraday_frequency else "上個交易日到現在",
         "previous_weights_policy": (
             "live_signal_before_asof"
@@ -1908,8 +2160,8 @@ def generate_live_signal(
         "price_available_count": int(price_snapshot.available_count),
         "symbol_count": int(panel.num_symbols),
         "valid_price_count": int(drift.valid_price_count),
-        "portfolio_simple_return": float(drift.simple_return),
-        "portfolio_log_return": float(drift.log_return),
+        "portfolio_simple_return": None if execution_preview_only else float(drift.simple_return),
+        "portfolio_log_return": None if execution_preview_only else float(drift.log_return),
         "benchmark_simple_return": float(benchmark_simple),
         "turnover": turnover,
         "estimated_trade_cost": estimated_trade_cost,
@@ -1966,7 +2218,11 @@ def generate_live_signal(
     if write:
         result.output_dir = _write_outputs_to_dir(result, summary["output_dir"])
         result.summary["output_dir"] = result.output_dir
-        live_weights_path = write_live_weights_history(checkpoint.parent, result.summary, result.weights_rows)
+        live_weights_path = (
+            None
+            if execution_preview_only
+            else write_live_weights_history(checkpoint.parent, result.summary, result.weights_rows)
+        )
         if live_weights_path:
             result.summary["live_weights_path"] = live_weights_path
         (Path(result.output_dir) / "summary.json").write_text(

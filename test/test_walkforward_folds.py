@@ -7,6 +7,7 @@ import pytest
 
 from stockagent.data.walkforward import (
     WalkForwardFold,
+    build_checkpoint_inference_fold,
     build_expanding_year_folds,
     validate_walk_forward_year_contract,
 )
@@ -106,6 +107,42 @@ def test_walk_forward_year_contract_rejects_missing_whole_year() -> None:
             expected_first_year=2000,
             require_contiguous_years=True,
         )
+
+
+def test_checkpoint_inference_fold_preserves_saved_id_and_year_contract() -> None:
+    dates = np.asarray(
+        ["2004-01-02", "2024-12-31", "2025-01-02", "2026-01-02"],
+        dtype="datetime64[D]",
+    )
+    checkpoint = {
+        "fold_id": 25,
+        "train_years": list(range(2000, 2025)),
+        "val_years": [2025],
+        "test_years": [2026],
+    }
+
+    fold = build_checkpoint_inference_fold(dates, checkpoint)
+
+    assert fold.fold_id == 25
+    assert fold.train_years == list(range(2000, 2025))
+    assert fold.val_years == [2025]
+    assert fold.test_years == [2026]
+    np.testing.assert_array_equal(fold.train_indices, [0, 1])
+    np.testing.assert_array_equal(fold.val_indices, [2])
+    np.testing.assert_array_equal(fold.test_indices, [3])
+
+
+def test_checkpoint_inference_fold_requires_saved_test_year() -> None:
+    dates = np.asarray(["2024-01-02", "2025-01-02"], dtype="datetime64[D]")
+    checkpoint = {
+        "fold_id": 25,
+        "train_years": list(range(2000, 2025)),
+        "val_years": [2025],
+        "test_years": [2026],
+    }
+
+    with pytest.raises(ValueError, match=r"missing_test_years=\[2026\]"):
+        build_checkpoint_inference_fold(dates, checkpoint)
 
 
 def _day_trade_panel(actionable: bool) -> SimpleNamespace:

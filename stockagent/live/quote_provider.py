@@ -29,6 +29,13 @@ class PriceSnapshot:
     source: str
     timestamp: str | None = None
     available_count: int = 0
+    available_mask: np.ndarray | None = None
+    open_prices: np.ndarray | None = None
+    high_prices: np.ndarray | None = None
+    low_prices: np.ndarray | None = None
+    volumes: np.ndarray | None = None
+    upper_limit_prices: np.ndarray | None = None
+    lower_limit_prices: np.ndarray | None = None
 
 
 def load_symbol_yahoo_map(parquet_root: str | Path) -> dict[str, str]:
@@ -157,13 +164,22 @@ def fetch_tw_mis_last_prices(
     yahoo_map = load_symbol_yahoo_map(parquet_root)
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
     filled = np.zeros((len(symbols),), dtype=bool)
+    open_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    high_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    low_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    volumes = np.full((len(symbols),), np.nan, dtype=np.float64)
+    upper_limit_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
+    lower_limit_prices = np.full((len(symbols),), np.nan, dtype=np.float64)
     last_timestamp_ms: int | None = None
 
     ex_channels: list[tuple[int, str]] = []
     for idx, symbol in enumerate(symbols):
         for ex_ch in _tw_mis_candidates(str(symbol), yahoo_map.get(str(symbol))):
             ex_channels.append((idx, ex_ch))
-    chunk_len = max(1, int(chunk_size))
+    # MIS silently returns partial/empty payloads when ex_ch grows too large.
+    # Keep the public caller knob for smaller probes, but never exceed the
+    # stable endpoint batch used by the full-universe fetcher.
+    chunk_len = max(1, min(int(chunk_size), 80))
     chunks = [ex_channels[start : start + chunk_len] for start in range(0, len(ex_channels), chunk_len)]
     max_parallel = int(os.getenv("STOCKAGENT_TW_MIS_PARALLEL_REQUESTS", "8") or "8")
     workers = max(1, min(len(chunks) or 1, max_parallel))
@@ -181,7 +197,9 @@ def fetch_tw_mis_last_prices(
             session_local.session = sess
         return sess
 
-    def fetch_chunk(items: list[tuple[int, str]]) -> list[tuple[int, float, int | None]]:
+    def fetch_chunk(
+        items: list[tuple[int, str]],
+    ) -> list[tuple[int, float, int | None, float | None, float | None, float | None, float | None, float | None, float | None]]:
         if not items:
             return []
         ex_ch = "|".join(ex for _, ex in items)
@@ -199,7 +217,19 @@ def fetch_tw_mis_last_prices(
             payload = response.json()
         except Exception:
             return []
-        rows: list[tuple[int, float, int | None]] = []
+        rows: list[
+            tuple[
+                int,
+                float,
+                int | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+                float | None,
+            ]
+        ] = []
         for item in payload.get("msgArray") or []:
             code = str(item.get("c") or "").strip()
             if not code:
@@ -212,22 +242,56 @@ def fetch_tw_mis_last_prices(
             except Exception:
                 timestamp_ms = None
             for idx in code_to_indices.get(code, []):
-                rows.append((idx, value, timestamp_ms))
+                rows.append(
+                    (
+                        idx,
+                        value,
+                        timestamp_ms,
+                        _float_or_none(item.get("o")),
+                        _float_or_none(item.get("h")),
+                        _float_or_none(item.get("l")),
+                        _float_or_none(item.get("v")),
+                        _float_or_none(item.get("u")),
+                        _float_or_none(item.get("w")),
+                    )
+                )
         return rows
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tw-mis-quote") as executor:
         futures = [executor.submit(fetch_chunk, chunk) for chunk in chunks]
         for future in as_completed(futures):
-            for idx, value, timestamp_ms in future.result():
+            for idx, value, timestamp_ms, open_px, high_px, low_px, volume, upper_px, lower_px in future.result():
                 prices[idx] = value
                 filled[idx] = True
+                for target, observed in (
+                    (open_prices, open_px),
+                    (high_prices, high_px),
+                    (low_prices, low_px),
+                    (volumes, volume),
+                    (upper_limit_prices, upper_px),
+                    (lower_limit_prices, lower_px),
+                ):
+                    if observed is not None:
+                        target[idx] = observed
                 if timestamp_ms is not None and (last_timestamp_ms is None or timestamp_ms > last_timestamp_ms):
                     last_timestamp_ms = timestamp_ms
 
     timestamp = None
     if last_timestamp_ms is not None:
         timestamp = datetime.fromtimestamp(last_timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
-    return PriceSnapshot(prices=prices, source="twse_tpex:mis", timestamp=timestamp, available_count=int(filled.sum()))
+    return PriceSnapshot(
+        prices=prices,
+        source="twse_tpex:mis",
+        timestamp=timestamp,
+        available_count=int(filled.sum()),
+        available_mask=filled,
+        open_prices=open_prices,
+        high_prices=high_prices,
+        low_prices=low_prices,
+        volumes=volumes,
+        upper_limit_prices=upper_limit_prices,
+        lower_limit_prices=lower_limit_prices,
+    )
 
 
 def _yahoo_session_and_crumb() -> tuple[requests.Session, str | None]:

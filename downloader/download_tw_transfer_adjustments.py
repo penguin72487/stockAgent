@@ -1164,6 +1164,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _run(args: argparse.Namespace) -> int:
     output_path = Path(args.output_path)
     summary_path = _summary_path(output_path)
+    failure_summary_path = output_path.with_suffix(".failed.json")
     raw_root = output_path.parent / "raw" / DATASET_NAME
     interval = _configure_tw_public_rate_limiter(args.request_interval)
     print(f"[tw-transfer-adjustment] {describe_rate_limit('tw_public', interval)}", flush=True)
@@ -1178,6 +1179,15 @@ def _run(args: argparse.Namespace) -> int:
     candidate_keys: list[str] = []
     discovery_exclusions: list[dict[str, Any]] = []
     old_output_receipt = _file_receipt(output_path) if output_path.is_file() else None
+    try:
+        old_summary = _read_json_object(summary_path) if summary_path.is_file() else {}
+    except TransferAdjustmentError:
+        old_summary = {}
+    preserve_old_summary = (
+        old_output_receipt is not None
+        and old_summary.get("coverage_complete") is True
+        and _receipt_matches(output_path, old_summary.get("output_receipt"))
+    )
 
     try:
         start = date.fromisoformat(str(args.start_date)[:10])
@@ -1392,6 +1402,7 @@ def _run(args: argparse.Namespace) -> int:
             "replacement_promoted": True,
         }
         _write_json_atomic(summary_path, summary)
+        failure_summary_path.unlink(missing_ok=True)
         print(
             f"[tw-transfer-adjustment] coverage complete rows={artifact.height} "
             f"output={output_path}",
@@ -1430,7 +1441,10 @@ def _run(args: argparse.Namespace) -> int:
             "requests_per_second": 1.0 / interval if interval > 0 else None,
             "replacement_promoted": False,
         }
-        _write_json_atomic(summary_path, summary)
+        _write_json_atomic(
+            failure_summary_path if preserve_old_summary else summary_path,
+            summary,
+        )
         print(f"[tw-transfer-adjustment] coverage incomplete: {fatal_error}", file=sys.stderr)
         return 1
 

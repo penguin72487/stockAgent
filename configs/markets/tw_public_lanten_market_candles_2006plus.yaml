@@ -5,12 +5,12 @@ base_config: tw_public_lanten_market_candles.yaml
 # benchmark coverage in 2004. Keeping 2004-2005 context-only makes the first
 # owned 2006 target use exactly the prior 256 exchange sessions without
 # projecting today's universe backward.
-experiment_name: tw-financial-transformer-candles-snapshot-safe98-gross-tw-cash-lookback256-panel-history-2006plus-v1-dual5090
+experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gross-tw-cash-lookback256-panel-history-2006plus-v1-dual5090
 
 runner:
   # The target-year contract differs from the active 2014+ experiment, so its
   # optimizer/checkpoints must live in a separate artifact root.
-  output_dir: artifacts/markets/tw_public_candles_tw_cash_lookback256_panel_history_2006plus
+  output_dir: artifacts/markets/tw_public_candles_open_aware_tw_cash_lookback256_panel_history_2006plus
   resume: true
   start_fold: 1
 
