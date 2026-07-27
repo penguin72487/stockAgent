@@ -1,5 +1,5 @@
 market: tw
-label: 台股
+label: 台股・Naive
 enabled: true
 market_type: tw
 timezone: Asia/Taipei
@@ -39,12 +39,12 @@ previous_signal_backfill_limit: 512
 model_selection_path: ../models/tw.yaml
 
 # Fallback used only if the model selection file is removed from this config.
-config_path: configs/markets/tw_public.yaml
-output_dir: artifacts/markets/tw_public_lantent
+config_path: configs/deployments/tw_naive_fold25.yaml
+output_dir: artifacts/markets/tw
 live_output_dir: artifacts/live_signals/tw
-fold_id: 20
-checkpoint_path: artifacts/markets/tw_public_lantent/fold_20/checkpoint_best.pt
-weights_path: artifacts/markets/tw_public_lantent/fold_20/daily_weights.parquet
+fold_id: 25
+checkpoint_path: artifacts/markets/tw/fold_25/checkpoint_best.pt
+weights_path: artifacts/markets/tw/fold_25/daily_weights.parquet
 
 panel_date: latest
 device: cuda

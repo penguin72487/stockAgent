@@ -317,6 +317,46 @@ def test_failed_run_preserves_existing_artifact_and_writes_incomplete_summary(
     assert summary["previous_output_receipt"] == before
 
 
+def test_failed_probe_does_not_replace_valid_production_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _args(tmp_path)
+    output = Path(args.output_path)
+    output.write_bytes(b"existing-production-artifact")
+    output_receipt = transfer._file_receipt(output)
+    summary_path = transfer._summary_path(output)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "coverage_complete": True,
+                "output_receipt": output_receipt,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    summary_before = summary_path.read_bytes()
+    monkeypatch.setattr(
+        transfer,
+        "_configure_tw_public_rate_limiter",
+        lambda _value: 0.1,
+    )
+    monkeypatch.setattr(
+        transfer,
+        "_validate_official_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            transfer.TransferAdjustmentError("receipt chain is incomplete")
+        ),
+    )
+
+    assert transfer._run(args) == 1
+    assert summary_path.read_bytes() == summary_before
+    failed = json.loads(output.with_suffix(".failed.json").read_text(encoding="utf-8"))
+    assert failed["coverage_complete"] is False
+    assert failed["production_preserved"] is True
+    assert failed["previous_output_receipt"] == output_receipt
+
+
 def test_successful_orchestration_writes_machine_verifiable_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

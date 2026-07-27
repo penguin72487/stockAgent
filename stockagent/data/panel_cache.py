@@ -31,6 +31,7 @@ REQUIRED_ARRAY_NAMES = (
     "daily_volumes",
 )
 OPTIONAL_ARRAY_NAMES = (
+    "can_short_open_open_mask",
     "short_capacity_shares",
     "short_margin_rate",
     "open_prices",

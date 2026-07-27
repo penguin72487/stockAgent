@@ -299,6 +299,71 @@ The project goal is to keep train, validation, test, and inference return logic 
 
 Rules:
 
+- `tw_cash` is now a two-auction carrying contract: model actions have shape
+  `[T,2,S]` in `[OPEN,CLOSE]` order and each channel is a signed post-event
+  target. Both auctions share one daily volume/turnover/borrow-capacity budget,
+  their gross fees are charged separately, and their cash flows are netted into
+  exactly one T+2 claim after the close.
+- `tw_overnight` is a strict one-session cohort contract with actions
+  `[T,3,S]`: resolved exit-at-open fraction, signed open entry, and signed close
+  entry. New entries cannot exit on their entry date; the prior cohort must be
+  completely closed by the next close or the account enters absorbing default.
+  Same-direction rollover is still an explicit gross exit plus re-entry. The
+  raw model head parameterizes one signed daily entry direction plus a
+  differentiable OPEN/CLOSE timing split; the resolved entry channels must
+  therefore have the same sign per symbol. Never net opposing same-day entry
+  directions, because that would silently create a day trade.
+- Both carrying-mode heads use completed daily features through `t-1` plus the
+  dedicated final-row `log(open[t] / close[t-1])` channel. This is the user's
+  explicit observed-open contract, matching the existing open-aware day-trade
+  approximation. No session-`t` high/low/close/full-day-volume field may enter
+  either head; quote availability, limits, fill masks, and close[t] remain
+  executor-only. Opening short eligibility has its own
+  `can_short_open_open_mask` and must never be inferred from a closing mask.
+- Phase-action preparation must mask non-tradable symbols before activation/L1
+  allocation, and model plus simulator normalization must share the same
+  `PORTFOLIO_L1_EPS`. For P3, OPEN/CLOSE entry allocations share one direction;
+  the model adapter fail-closes an impossible opposite-sign pair to zero and
+  the direct ledger APIs reject it.
+- Apply permissions, volume, turnover, and borrow capacity to the requested
+  signed endpoint before splitting it into buy/sell/short-cover/short-open
+  legs. A cross-zero transition must first reduce the existing side; blocked
+  reductions cannot be bypassed by opening the opposite side. Phase volume and
+  short-capacity inputs are prior-close-valued share equivalents and are
+  revalued at each auction; a disabled short-capacity ceiling is represented
+  by positive infinity and must remain infinity-safe.
+- Public phase turnover and executed-leg weights use the day's opening NAV as
+  their common audit denominator. Execution histories are recorded after the
+  auction but before cash-dividend entitlement; recurrent `final_weights` and
+  `final_due_weights` use the post-entitlement closing NAV.
+- Voluntary short-cover funding must use actual account-wide maintenance
+  release. Affordability along a producer-first cover ray can be non-monotone:
+  a small cover may be unaffordable while a larger cover unlocks collateral.
+  The continuous hot path therefore evaluates the finite analytic breakpoints
+  and affine roots and takes the global maximum feasible point in O(S); never
+  replace it with a prefix bisection. The integer oracle must examine exact
+  rational lot endpoints in descending order, including minimum commissions
+  and rounding. Mandatory covers bypass voluntary funding and may create a
+  later absorbing T+2 default.
+- The P2/P3 dual-session CUDA executor keeps the eager ledger as its semantic
+  oracle and processes fixed 32-session blocks by reusing one
+  `fullgraph=True, dynamic=False` daily kernel with CUDA graphs disabled.
+  Recurrent cash, T+2 queues, due cohorts, collateral, alive state, and
+  autograd remain connected across all 32 calls; only a non-aligned tail is
+  eager. Do not replace this with a fully unrolled 32-day FX graph: its
+  Inductor scheduling/codegen cost is pathological, while measured two-day and
+  four-day kernels were slower or much more expensive to compile.
+- Phase modes currently fail closed for scalar rank/direction auxiliary losses,
+  `activation_l1` with the shared consumer/model activation field,
+  per-fold explainability, and the single-target live signal preview. Do not
+  flatten `[B,P,S]` into `[B,S]`; P3 due-exit fractions are not signed exposure.
+- On the measured RTX 5070 Ti at `T=32, S=2735` (median of seven steady
+  repetitions), P2 cash forward was `57.54ms` versus `1302.96ms` eager and
+  forward+backward was `160.05ms` versus `2826.10ms` eager. P3 overnight
+  forward was `54.73ms` versus `1940.13ms` eager and forward+backward was
+  `192.64ms` versus `4062.07ms` eager. Maximum action-gradient differences
+  were `5.37e-7` and `4.85e-7`; every run used one unique graph with zero graph
+  breaks and fallbacks.
 - Do not fork separate train/inference return formulas.
 - Prefer the canonical tensor backtest in `stockagent/backtest/simulator.py` and loss integration in `stockagent/training/loss.py`.
 - Keep computations GPU/tensor-friendly where possible.
@@ -344,6 +409,11 @@ Rules:
   lookback of 32 deliberately starts evaluation at the split's 32nd trading row
   (drops the first 31 rows). Do not prepend rows from the preceding split to make a
   fold appear to start on its first calendar trading day.
+- The explicit `lookback_context: panel_history` exception owns only the
+  already-computed `valid_indices` as targets while allowing their windows to
+  read earlier panel rows. Panel-slab densification and dynamic-symbol upper
+  bounds must preserve those target endpoints; do not recompute a split-only
+  start and silently drop its first `lookback-1` valid rows.
 - For stitched deployment tests, the warmup rows before the next model's first valid
   row remain owned by the preceding model. This preserves chronological coverage
   without changing the per-fold lookback rule.
@@ -553,19 +623,20 @@ Rules:
   they must not influence training, validation, test, inference, or feature
   importance.
 
-### TW Day-Trade Open-Aware Feature Contract
+### TW Phase-Aware Current-Open Feature Contract
 
 - The only model-visible session-`t` opening quote is the opt-in normalized
   feature `next_session_open_gap_logret`. Panel row `r` stores
-  `log(open[r+1] / close[r])`; because `tw_day_trade` keeps its ordinary
+  `log(open[r+1] / close[r])`; because phase-aware Taiwan modes keep their
   execution feature lag at one, the final row of a target-`t` window exposes
   exactly `log(open[t] / close[t-1])`.
 - Do not replace this with a raw nominal opening-price feature. The normalized
   gap is invariant to stock price scale and does not let the model identify a
   symbol merely from its price level.
-- This feature is opt-in and legal only with `trading.execution_mode:
-  tw_day_trade`. Empty/wildcard panel feature selection must retain the
-  close-complete schema and must not silently include a next-session quote.
+- This feature is opt-in and legal only with the phase-aware
+  `tw_day_trade`, `tw_cash`, and `tw_overnight` execution modes.
+  Empty/wildcard panel feature selection must retain the close-complete schema
+  and must not silently include a next-session quote.
 - No session-`t` high, low, close, or volume may enter the model window used to
   submit its opening order. Same-session full-day volume is future information.
   Execution participation limits must continue to use completed session `t-1`

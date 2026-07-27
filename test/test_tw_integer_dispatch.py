@@ -226,6 +226,176 @@ def test_tw_cash_dispatch_realizes_canonical_forward_return_on_same_row() -> Non
     assert stock_record.holding_ratio == pytest.approx(1.0)
 
 
+def test_tw_cash_p2_dispatch_exposes_complete_open_close_integer_audit() -> None:
+    actions = np.array([[[1.0], [0.0]]], dtype=np.float64)
+    daily = np.ones((1, 1), dtype=np.bool_)
+    result, _ = run_backtest_integer_shares(
+        actions,
+        future_returns=np.zeros((1, 1), dtype=np.float64),
+        tradable_mask=daily,
+        can_buy_mask=daily,
+        can_sell_mask=daily,
+        benchmark_returns=np.zeros(1, dtype=np.float64),
+        open_prices=np.array([[10.0]], dtype=np.float64),
+        close_prices=np.array([[20.0]], dtype=np.float64),
+        execution_mode="tw_cash",
+        portfolio_activation="pre_normalized",
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        lot_sizes=np.ones(1, dtype=np.int64),
+        unresolved_corporate_action_mask=np.zeros((1, 1), dtype=np.bool_),
+        day_trade_can_buy_open_mask=daily,
+        day_trade_can_sell_open_mask=daily,
+        initial_capital=10_000.0,
+        collect_holdings=False,
+    )
+
+    assert result.requested_weights_history is not None
+    np.testing.assert_array_equal(result.requested_weights_history, actions)
+    np.testing.assert_allclose(result.open_weights_history, [[1.0]])
+    np.testing.assert_allclose(result.close_weights_history, [[0.0]])
+    np.testing.assert_allclose(result.weights_history, [[0.0]])
+    np.testing.assert_array_equal(result.shares_history, [[0]])
+    assert result.event_turnovers is not None
+    assert result.executed_buy_weights is not None
+    assert result.executed_sell_weights is not None
+    np.testing.assert_allclose(
+        result.event_turnovers,
+        (
+            result.executed_buy_weights
+            + result.executed_sell_weights
+        ).sum(axis=2),
+    )
+
+
+def test_tw_overnight_p3_dispatch_enforces_one_session_due_cohort() -> None:
+    actions = np.array(
+        [
+            [[0.0], [0.5], [0.5]],
+            [[1.0], [0.0], [0.0]],
+        ],
+        dtype=np.float64,
+    )
+    daily = np.ones((2, 1), dtype=np.bool_)
+    result, _ = run_backtest_integer_shares(
+        actions,
+        future_returns=np.zeros((2, 1), dtype=np.float64),
+        tradable_mask=daily,
+        can_buy_mask=daily,
+        can_sell_mask=daily,
+        benchmark_returns=np.zeros(2, dtype=np.float64),
+        open_prices=np.array([[10.0], [11.0]], dtype=np.float64),
+        close_prices=np.array([[10.0], [11.0]], dtype=np.float64),
+        execution_mode="tw_overnight",
+        portfolio_activation="pre_normalized",
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        lot_sizes=np.ones(1, dtype=np.int64),
+        unresolved_corporate_action_mask=np.zeros((2, 1), dtype=np.bool_),
+        day_trade_can_buy_open_mask=daily,
+        day_trade_can_sell_open_mask=daily,
+        initial_capital=10_000.0,
+        collect_holdings=False,
+    )
+
+    np.testing.assert_array_equal(result.shares_history[:, 0], [1_000, 0])
+    assert result.due_weights_history is not None
+    assert result.final_due_weights is not None
+    assert result.due_weights_history[0, 0] == pytest.approx(1.0)
+    assert result.due_weights_history[1, 0] == pytest.approx(0.0)
+    assert result.final_due_weights[0] == pytest.approx(0.0)
+    assert not np.any(result.settlement_default)
+
+
+def test_tw_overnight_public_dividend_keeps_execution_and_terminal_boundaries() -> None:
+    actions = np.zeros((1, 3, 1), dtype=np.float64)
+    actions[0, 2, 0] = 0.5
+    daily = np.ones((1, 1), dtype=np.bool_)
+    result, records = run_backtest_integer_shares(
+        actions,
+        future_returns=np.zeros((1, 1), dtype=np.float64),
+        tradable_mask=daily,
+        can_buy_mask=daily,
+        can_sell_mask=daily,
+        benchmark_returns=np.zeros(1, dtype=np.float64),
+        open_prices=np.array([[10.0]], dtype=np.float64),
+        close_prices=np.array([[10.0]], dtype=np.float64),
+        execution_mode="tw_overnight",
+        portfolio_activation="pre_normalized",
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        lot_sizes=np.ones(1, dtype=np.int64),
+        unresolved_corporate_action_mask=np.zeros((1, 1), dtype=np.bool_),
+        cash_dividend_yield=np.array([[0.1]], dtype=np.float64),
+        cash_dividend_payment_delay_sessions=np.array(
+            [[3]],
+            dtype=np.int64,
+        ),
+        claim_queue_sessions=3,
+        day_trade_can_buy_open_mask=daily,
+        day_trade_can_sell_open_mask=daily,
+        initial_capital=1_000.0,
+        symbols=["DIVIDEND"],
+        dates=np.array(["2024-01-02"], dtype="datetime64[D]"),
+        collect_holdings=True,
+    )
+
+    np.testing.assert_allclose(result.weights_history, [[0.5]])
+    np.testing.assert_allclose(result.close_weights_history, [[0.5]])
+    assert result.due_weights_history is not None
+    np.testing.assert_allclose(result.due_weights_history, [[0.5]])
+    assert result.final_weights is not None
+    np.testing.assert_allclose(result.final_weights, [0.5 / 1.05])
+    assert result.final_due_weights is not None
+    np.testing.assert_allclose(result.final_due_weights, [0.5 / 1.05])
+    assert result.receivables_history is not None
+    np.testing.assert_allclose(result.receivables_history[0], [0.0, 0.0, 50.0])
+
+    by_symbol = {record.symbol: record for record in records}
+    assert by_symbol["CASH"].market_value == pytest.approx(500.0)
+    assert by_symbol["DIVIDEND"].market_value == pytest.approx(500.0)
+    assert by_symbol["DIVIDEND"].shares == 50
+    assert by_symbol["DIVIDEND"].price == pytest.approx(10.0)
+    assert by_symbol["CASH"].holding_ratio == pytest.approx(0.5)
+    assert by_symbol["DIVIDEND"].holding_ratio == pytest.approx(0.5)
+    assert sum(record.holding_ratio for record in records) == pytest.approx(1.0)
+
+
+def test_phase_integer_dispatch_never_backfills_open_short_from_close_mask() -> None:
+    actions = np.array([[[-1.0], [0.0]]], dtype=np.float64)
+    daily = np.ones((1, 1), dtype=np.bool_)
+    result, _ = run_backtest_integer_shares(
+        actions,
+        future_returns=np.zeros((1, 1), dtype=np.float64),
+        tradable_mask=daily,
+        can_buy_mask=daily,
+        can_sell_mask=daily,
+        can_short_open_mask=daily,
+        can_short_open_open_mask=np.zeros((1, 1), dtype=np.bool_),
+        benchmark_returns=np.zeros(1, dtype=np.float64),
+        open_prices=np.array([[100.0]], dtype=np.float64),
+        close_prices=np.array([[100.0]], dtype=np.float64),
+        execution_mode="tw_cash",
+        portfolio_activation="pre_normalized",
+        long_only=False,
+        buy_fee_rates=np.zeros(1),
+        sell_fee_rates=np.zeros(1),
+        lot_sizes=np.ones(1, dtype=np.int64),
+        short_lot_sizes=np.ones(1, dtype=np.int64),
+        short_margin_rate=np.ones((1, 1), dtype=np.float64),
+        short_capacity_shares=np.full((1, 1), 1_000, dtype=np.int64),
+        unresolved_corporate_action_mask=np.zeros((1, 1), dtype=np.bool_),
+        day_trade_can_buy_open_mask=daily,
+        day_trade_can_sell_open_mask=daily,
+        initial_capital=100_000.0,
+        collect_holdings=False,
+    )
+
+    np.testing.assert_array_equal(result.shares_history, [[0]])
+    assert result.executed_short_open_weights is not None
+    np.testing.assert_array_equal(result.executed_short_open_weights, 0.0)
+
+
 def test_tw_integer_symbol_indices_reorder_equal_length_fee_and_lot_vectors() -> None:
     common = dict(
         future_returns=np.zeros((1, 2)),
@@ -523,6 +693,8 @@ def test_tw_day_trade_dispatch_uses_point_in_time_eligibility_sides_and_lots() -
     assert by_symbol["SYM_0001"].shares == 1_500
     assert by_symbol["SYM_0001"].price == pytest.approx(100.0)
     assert by_symbol["SYM_0001"].market_value == pytest.approx(150_000.0)
+    assert sum(record.market_value for record in records) == pytest.approx(300_000.0)
+    assert sum(record.holding_ratio for record in records) == pytest.approx(1.0)
 
 
 def test_tw_day_trade_holdings_csv_labels_opening_trades(tmp_path: Path) -> None:

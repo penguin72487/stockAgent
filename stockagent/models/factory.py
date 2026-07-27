@@ -393,6 +393,7 @@ def build_model(
             ),
             categorical_embedding_dim=tbp_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=tbp_cfg.categorical_embedding_cardinality,
+            execution_mode=getattr(config.trading, "execution_mode", "naive"),
         )
 
     if model_name in _FINANCIAL_TRANSFORMER_NAMES:
@@ -459,6 +460,7 @@ def build_model(
             categorical_embedding_dim=fin_cfg.categorical_embedding_dim,
             categorical_embedding_cardinality=fin_cfg.categorical_embedding_cardinality,
             candle_dropout=fin_cfg.candle_dropout,
+            execution_mode=getattr(config.trading, "execution_mode", "naive"),
         )
 
     if model_name in _GRADIENT_BOOSTED_PORTFOLIO_TRANSFORMER_NAMES:

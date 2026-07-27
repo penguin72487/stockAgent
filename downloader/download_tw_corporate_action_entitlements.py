@@ -132,7 +132,7 @@ def parse_args() -> argparse.Namespace:
         "--request-interval",
         type=float,
         default=None,
-        help="Provider-global request interval; default follows project 8 req/s policy.",
+        help="Provider-global request interval; default follows project 10 req/s policy.",
     )
     parser.add_argument(
         "--max-list-requests",
@@ -1163,8 +1163,8 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _reset_raw_receipt_requests()
-    _configure_tw_public_rate_limiter(args.request_interval)
-    print(describe_rate_limit("tw_public", args.request_interval))
+    request_interval = _configure_tw_public_rate_limiter(args.request_interval)
+    print(describe_rate_limit("tw_public", request_interval))
 
     reference, universe, reference_receipt, universe_receipt = _load_reference(args)
     joined = reference.join(universe, on="symbol", how="left")

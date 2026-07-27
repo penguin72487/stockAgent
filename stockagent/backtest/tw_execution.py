@@ -19,7 +19,16 @@ import numpy as np
 from stockagent.data.tw_security import classify_tw_stock_or_etf
 
 
-EXECUTION_MODES: Final[tuple[str, ...]] = ("naive", "tw_cash", "tw_day_trade")
+EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "naive",
+    "tw_cash",
+    "tw_day_trade",
+    "tw_overnight",
+)
+TW_CARRYING_EXECUTION_MODES: Final[tuple[str, ...]] = (
+    "tw_cash",
+    "tw_overnight",
+)
 FEE_ROUNDING_MODES: Final[tuple[str, ...]] = ("none", "floor", "half_up")
 
 # These are market-wide statutory floors, not per-security margin schedules.
@@ -50,6 +59,17 @@ _EXECUTION_MODE_ALIASES: Final[dict[str, str]] = {
     "tw_spot": "tw_cash",
     "現股": "tw_cash",
     "台股現股": "tw_cash",
+    # Taiwan next-session round-trip execution.  Every cohort opened on
+    # session t must be closed no later than session t+1 close.
+    "tw_overnight": "tw_overnight",
+    "tw_overnight_trade": "tw_overnight",
+    "taiwan_overnight": "tw_overnight",
+    "overnight": "tw_overnight",
+    "overnight_trade": "tw_overnight",
+    "next_day_trade": "tw_overnight",
+    "next_session_trade": "tw_overnight",
+    "隔日沖": "tw_overnight",
+    "台股隔日沖": "tw_overnight",
     # Taiwan same-day round-trip execution.
     "tw_day_trade": "tw_day_trade",
     "tw_daytrade": "tw_day_trade",
@@ -72,13 +92,15 @@ def normalize_execution_mode(mode: object) -> str:
 
     if not isinstance(mode, str):
         raise ValueError(
-            "execution_mode must be one of 'naive', 'tw_cash', or 'tw_day_trade'"
+            "execution_mode must be one of "
+            "'naive', 'tw_cash', 'tw_day_trade', or 'tw_overnight'"
         )
     normalized = "_".join(mode.strip().casefold().replace("-", "_").split())
     canonical = _EXECUTION_MODE_ALIASES.get(normalized)
     if canonical is None:
         raise ValueError(
-            "execution_mode must be one of 'naive', 'tw_cash', or 'tw_day_trade'"
+            "execution_mode must be one of "
+            "'naive', 'tw_cash', 'tw_day_trade', or 'tw_overnight'"
         )
     return canonical
 
@@ -455,12 +477,14 @@ def effective_fee_rate_vectors(
     buy_fees = np.full(num_symbols, commission, dtype=np.float64)
     sell_fees = np.empty(num_symbols, dtype=np.float64)
 
-    if mode == "tw_cash":
+    if mode in TW_CARRYING_EXECUTION_MODES:
         stock_tax = schedule.stock_sell_tax
         etf_tax = schedule.etf_sell_tax
-    else:
+    elif mode == "tw_day_trade":
         stock_tax = schedule.day_trade_stock_sell_tax
         etf_tax = schedule.day_trade_etf_sell_tax
+    else:  # normalize_execution_mode above makes this an internal contract check.
+        raise AssertionError(f"unhandled Taiwan execution mode: {mode}")
 
     for index, security_type in enumerate(resolved_types):
         sell_fees[index] = commission + (stock_tax if security_type == "stock" else etf_tax)
@@ -497,10 +521,15 @@ def lot_size_vector(
     # Fail closed for warrants, ETNs, rights, and any other unsupported product.
     _resolve_security_types(normalized_symbols, security_types)
 
-    if mode == "tw_cash":
+    if mode in TW_CARRYING_EXECUTION_MODES:
         if per_symbol_lot_sizes is not None:
-            raise ValueError("per_symbol_lot_sizes is supported only for tw_day_trade")
+            raise ValueError(
+                "per_symbol_lot_sizes is supported only for tw_day_trade"
+            )
         return np.full(len(normalized_symbols), schedule.cash_lot_size, dtype=np.int64)
+
+    if mode != "tw_day_trade":
+        raise AssertionError(f"unhandled Taiwan execution mode: {mode}")
 
     lot_sizes = np.full(
         len(normalized_symbols),
@@ -560,6 +589,7 @@ __all__ = [
     "DEFAULT_TAIWAN_FEE_SCHEDULE",
     "DEFAULT_TAIWAN_MARGIN_SHORT_SCHEDULE",
     "EXECUTION_MODES",
+    "TW_CARRYING_EXECUTION_MODES",
     "FEE_ROUNDING_MODES",
     "TaiwanFeeSchedule",
     "TaiwanMarginShortSchedule",

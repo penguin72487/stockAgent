@@ -5,9 +5,13 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import hashlib
+import http.client
+import ipaddress
+import json
 import os
 from pathlib import Path
 from queue import Queue
+import socket
 import threading
 import tempfile
 import time
@@ -23,6 +27,108 @@ from tqdm import tqdm
 
 TItem = TypeVar("TItem")
 TResult = TypeVar("TResult")
+
+
+_SYSTEM_GETADDRINFO = socket.getaddrinfo
+_DNS_FALLBACK_LOCK = threading.Lock()
+_DNS_FALLBACK_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+_DNS_FALLBACK_INSTALLED = False
+
+
+def _dns_over_https_addresses(host: str) -> tuple[str, ...]:
+    now = time.monotonic()
+    with _DNS_FALLBACK_LOCK:
+        cached = _DNS_FALLBACK_CACHE.get(host)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+    addresses: list[str] = []
+    ttl = 60
+    for record_type, answer_type in (("A", 1), ("AAAA", 28)):
+        connection = http.client.HTTPSConnection("1.1.1.1", timeout=5)
+        try:
+            connection.request(
+                "GET",
+                f"/dns-query?name={host}&type={record_type}",
+                headers={"Accept": "application/dns-json"},
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            if response.status != 200 or int(payload.get("Status", -1)) != 0:
+                continue
+            for answer in payload.get("Answer") or []:
+                if int(answer.get("type", -1)) != answer_type:
+                    continue
+                value = str(answer.get("data") or "").strip()
+                try:
+                    ipaddress.ip_address(value)
+                except ValueError:
+                    continue
+                addresses.append(value)
+                ttl = min(ttl, max(10, int(answer.get("TTL") or 60)))
+        finally:
+            connection.close()
+    unique = tuple(dict.fromkeys(addresses))
+    if not unique:
+        raise socket.gaierror(f"DNS-over-HTTPS returned no address for {host}")
+    with _DNS_FALLBACK_LOCK:
+        _DNS_FALLBACK_CACHE[host] = (now + min(ttl, 300), unique)
+    return unique
+
+
+def install_dns_over_https_fallback() -> None:
+    """Use DoH only after the host resolver fails; TLS still verifies the original host."""
+
+    global _DNS_FALLBACK_INSTALLED
+    if _DNS_FALLBACK_INSTALLED:
+        return
+    if os.getenv("STOCKAGENT_DNS_OVER_HTTPS_FALLBACK", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return
+
+    def resilient_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        try:
+            return _SYSTEM_GETADDRINFO(host, port, family, type, proto, flags)
+        except socket.gaierror as original_error:
+            text = str(host or "").strip()
+            try:
+                ipaddress.ip_address(text)
+            except ValueError:
+                pass
+            else:
+                raise original_error
+            try:
+                addresses = _dns_over_https_addresses(text)
+            except Exception:
+                raise original_error
+            resolved: list[tuple] = []
+            for address in addresses:
+                address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
+                if family not in {0, socket.AF_UNSPEC, address_family}:
+                    continue
+                resolved.extend(
+                    _SYSTEM_GETADDRINFO(
+                        address,
+                        port,
+                        address_family,
+                        type,
+                        proto,
+                        flags | socket.AI_NUMERICHOST,
+                    )
+                )
+            if not resolved:
+                raise original_error
+            return resolved
+
+    socket.getaddrinfo = resilient_getaddrinfo
+    _DNS_FALLBACK_INSTALLED = True
+
+
+install_dns_over_https_fallback()
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +149,7 @@ class ProviderRateLimit:
         return 1.0 / self.requests_per_second
 
 
-DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND = 8.0
+DEFAULT_UNSPECIFIED_REQUESTS_PER_SECOND = 10.0
 
 
 PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
@@ -78,7 +184,7 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="client-side safety policy; no upstream numeric limit documented",
         source_url="https://openapi.twse.com.tw/",
         note=(
-            "Default 8 req/s is a stockAgent policy, not an official "
+            "Default 10 req/s is a stockAgent policy, not an official "
             "TWSE/TPEx/data.gov.tw limit."
         ),
     ),
@@ -89,7 +195,7 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         basis="client-side safety policy; no upstream numeric limit documented",
         source_url="https://finance.yahoo.com/",
         note=(
-            "CLI default is 8 req/s when no interval is supplied. Large TW "
+            "CLI default is 10 req/s when no interval is supplied. Large TW "
             "fallback bootstraps explicitly use a slower 1.5-second interval."
         ),
     ),
@@ -207,7 +313,7 @@ class SharedRateLimiter:
         Reset after a full missed interval so a suspended process never emits
         a catch-up burst.  For normal sub-interval scheduler/GIL latency, keep
         the original cadence: otherwise adding the latency to every ticket
-        permanently lowers an 8 req/s policy to roughly 6 req/s under load.
+        permanently lowers a 10 req/s policy to roughly 8 req/s under load.
         """
         interval = self.interval_seconds
         if interval <= 0.0:
@@ -401,7 +507,7 @@ def provider_rate_limit(provider: str) -> ProviderRateLimit:
         seconds=1,
         basis="client-side safety policy; no upstream numeric limit documented",
         source_url="n/a",
-        note="Unregistered providers default to 8 requests per second.",
+        note="Unregistered providers default to 10 requests per second.",
     )
 
 

@@ -12,7 +12,10 @@ from stockagent.backtest.simulator import (
     _resolve_exposure_budget,
     run_backtest_torch,
 )
-from stockagent.backtest.tw_execution import normalize_execution_mode
+from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
+    normalize_execution_mode,
+)
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -361,6 +364,7 @@ def factor_generalization_loss(
     worst_fraction: float = 0.25,
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Train scores as a stable, tradable cross-sectional characteristic factor."""
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
@@ -451,6 +455,11 @@ def factor_generalization_loss(
         can_short_open_mask=(
             can_short_open_mask.to(dtype=torch.bool, device=weights.device)
             if can_short_open_mask is not None
+            else None
+        ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(dtype=torch.bool, device=weights.device)
+            if can_short_open_open_mask is not None
             else None
         ),
         force_short_cover_mask=(
@@ -624,6 +633,7 @@ def portfolio_autoencoder_loss(
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
     autoencoder_lambda_latent: float = 0.001,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Portfolio-level objective evaluated by the canonical execution simulator."""
 
@@ -694,6 +704,11 @@ def portfolio_autoencoder_loss(
         can_short_open_mask=(
             can_short_open_mask.to(device=weights.device, dtype=torch.bool)
             if can_short_open_mask is not None
+            else None
+        ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(device=weights.device, dtype=torch.bool)
+            if can_short_open_open_mask is not None
             else None
         ),
         force_short_cover_mask=(
@@ -1097,6 +1112,8 @@ def risk_aware_loss(
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
     autoencoder_lambda_latent: float = 0.001,
+    overnight_log_returns: Tensor | None = None,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1104,13 +1121,44 @@ def risk_aware_loss(
     _loss_timer_stop("normalize_weights", normalize_start)
 
     prepare_start = _loss_timer_start()
+    mode = normalize_execution_mode(execution_mode)
     execution_returns, returns = _execution_and_safe_returns(
         future_log_returns,
         reference=weights,
-        execution_mode=execution_mode,
+        execution_mode=mode,
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if mode in TW_CARRYING_EXECUTION_MODES:
+        phase_actions = mode == "tw_overnight" or weights.dim() == 3
+        expected_channels = 2 if mode == "tw_cash" else 3
+        if phase_actions and (
+            weights.dim() != 3 or int(weights.size(1)) != expected_channels
+        ):
+            raise ValueError(
+                f"{mode} requires model actions with shape "
+                f"[T,{expected_channels},S], got {tuple(weights.shape)}"
+            )
+        if not phase_actions and (mode != "tw_cash" or weights.dim() != 2):
+            raise ValueError(
+                f"{mode} received an unsupported action shape {tuple(weights.shape)}"
+            )
+        if phase_actions and objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                f"{mode} currently supports only canonical log-utility "
+                "objectives; phase logits do not have a single unbiased "
+                "cross-sectional rank label"
+            )
+        if phase_actions and overnight_log_returns is None:
+            raise ValueError(
+                f"{mode} requires prior-close-to-open overnight_log_returns"
+            )
     _loss_timer_stop("prepare_inputs", prepare_start)
 
     if objective_norm in {"portfolio_autoencoder", "bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
@@ -1122,6 +1170,7 @@ def risk_aware_loss(
             can_buy_mask=can_buy_mask,
             can_sell_mask=can_sell_mask,
             can_short_open_mask=can_short_open_mask,
+            can_short_open_open_mask=can_short_open_open_mask,
             force_short_cover_mask=force_short_cover_mask,
             force_exit_mask=force_exit_mask,
             sample_mask=sample_mask,
@@ -1167,6 +1216,7 @@ def risk_aware_loss(
             can_buy_mask=can_buy_mask,
             can_sell_mask=can_sell_mask,
             can_short_open_mask=can_short_open_mask,
+            can_short_open_open_mask=can_short_open_open_mask,
             force_short_cover_mask=force_short_cover_mask,
             force_exit_mask=force_exit_mask,
             sample_mask=sample_mask,
@@ -1380,6 +1430,11 @@ def risk_aware_loss(
             if can_short_open_mask is not None
             else None
         ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(dtype=torch.bool, device=weights.device)
+            if can_short_open_open_mask is not None
+            else None
+        ),
         force_short_cover_mask=(
             force_short_cover_mask.to(dtype=torch.bool, device=weights.device)
             if force_short_cover_mask is not None
@@ -1414,6 +1469,7 @@ def risk_aware_loss(
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
         symbol_indices=symbol_indices,
+        overnight_returns=overnight_log_returns,
     )
     _loss_timer_stop("backtest", backtest_start)
 

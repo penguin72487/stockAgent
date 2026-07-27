@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from stockagent.backtest.tw_execution import normalize_execution_mode
 from stockagent.models.latent_factor_market_token_portfolio import _safe_attention_mask
 from stockagent.models.normalization import (
     dual_branch_softmax,
@@ -20,6 +21,32 @@ from stockagent.models.normalization import (
 )
 from stockagent.portfolio_contract import normalize_portfolio_mode, normalize_portfolio_output_mode
 from stockagent.profiling import PROFILE_RANGES_ENABLED, _torch_is_compiling, profile_range
+
+
+_ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE: dict[str, tuple[str, ...]] = {
+    "naive": ("target",),
+    "tw_day_trade": ("target",),
+    "tw_cash": ("open_target", "close_target"),
+    "tw_overnight": (
+        "due_exit_fraction",
+        "open_entry_target",
+        "close_entry_target",
+    ),
+}
+
+_ACTION_SCHEMA_BY_EXECUTION_MODE: dict[str, str] = {
+    "naive": "single_target_v1",
+    "tw_day_trade": "single_target_v1",
+    "tw_cash": "open_close_targets_v1",
+    "tw_overnight": "due_exit_open_close_entries_v2_shared_direction",
+}
+
+
+def action_channels_for_execution_mode(execution_mode: str) -> tuple[str, ...]:
+    """Return the fixed model-output channels for one canonical execution mode."""
+
+    canonical = normalize_execution_mode(execution_mode)
+    return _ACTION_CHANNEL_NAMES_BY_EXECUTION_MODE[canonical]
 
 
 def _sanitize_scores_to_dtype(scores: torch.Tensor) -> torch.Tensor:
@@ -635,12 +662,19 @@ class TransformerBasePortfolioModel(nn.Module):
         categorical_embedding_cardinality: int = 512,
         use_latent_factors: bool | None = None,
         use_market_tokens: bool | None = None,
+        execution_mode: str = "naive",
     ) -> None:
         super().__init__()
         self.lookback = int(lookback)
         self.num_features = int(num_features)
         self.num_symbols = int(num_symbols)
         self.d_model = int(d_model)
+        self.execution_mode = normalize_execution_mode(execution_mode)
+        self.action_channel_names = action_channels_for_execution_mode(
+            self.execution_mode
+        )
+        self.num_action_channels = len(self.action_channel_names)
+        self.action_schema = _ACTION_SCHEMA_BY_EXECUTION_MODE[self.execution_mode]
         resolved_symbol_capacity = (
             self.num_symbols if symbol_position_capacity is None else int(symbol_position_capacity)
         )
@@ -834,16 +868,19 @@ class TransformerBasePortfolioModel(nn.Module):
             # exact trainable-parameter contract.
             self.stock_market_gate.requires_grad_(False)
 
-        def make_scalar_head() -> nn.Sequential:
+        def make_score_head(output_dim: int) -> nn.Sequential:
             head: list[nn.Module] = []
             in_dim = self.d_model
             for _ in range(max(0, int(head_layers))):
                 head.append(GatedProjection(in_dim, int(head_hidden_dim), float(dropout), self.ffn_type))
                 in_dim = int(head_hidden_dim)
-            head.append(nn.Linear(in_dim, 1))
+            head.append(nn.Linear(in_dim, int(output_dim)))
             return nn.Sequential(*head)
 
-        self.score_head = make_scalar_head()
+        # P=1 deliberately reconstructs the exact historical module tree and
+        # parameter shapes so old strict checkpoints remain byte-for-byte
+        # schema compatible.  Multi-action modes widen only the final head.
+        self.score_head = make_score_head(self.num_action_channels)
 
     def enable_legacy_dynamic_token_checkpoint_compatibility(
         self,
@@ -1868,6 +1905,391 @@ class TransformerBasePortfolioModel(nn.Module):
             return_scores=return_scores,
         )
 
+    def _postprocess_flat_target_logits(
+        self,
+        target_logits: torch.Tensor,
+        mask_bool: torch.Tensor,
+        *,
+        output_mode: str,
+        portfolio_activation: str,
+        return_parts: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Apply the existing single-portfolio transform to ``[N,S]`` logits."""
+
+        resolved_mode = normalize_portfolio_output_mode(output_mode)
+        if resolved_mode == "logits":
+            # This helper is the explicit logits -> executable-target boundary.
+            # Callers that want raw logits do not call it.
+            resolved_mode = "activation_l1"
+
+        output_aux: dict[str, torch.Tensor] = {}
+        long_only = self.portfolio_mode == "long_only"
+        if resolved_mode in {
+            "signed_softmax",
+            "signed_sparsemax",
+            "signed_entmax15",
+        }:
+            transform = {
+                "signed_softmax": "softmax",
+                "signed_sparsemax": "sparsemax",
+                "signed_entmax15": "entmax15",
+            }[resolved_mode]
+            action_output = masked_signed_action_weights(
+                target_logits,
+                mask_bool,
+                transform=transform,
+                long_only=long_only,
+                return_parts=return_parts,
+            )
+            if return_parts:
+                weights, output_aux = action_output
+            else:
+                weights = action_output
+        elif resolved_mode == "projection_l1":
+            weights = masked_l1_projection_weights(
+                target_logits,
+                mask_bool,
+                long_only=long_only,
+            )
+            if return_parts:
+                output_aux = {
+                    "projection_gross_exposure": weights.abs().sum(dim=1),
+                    "implicit_cash_weight": (
+                        1.0 - weights.abs().sum(dim=1)
+                    ).clamp_min(0.0),
+                }
+        else:
+            activation = (
+                "identity"
+                if resolved_mode == "l1"
+                else normalize_portfolio_activation(portfolio_activation)
+            )
+            if long_only:
+                weights = masked_softmax(
+                    target_logits,
+                    mask_bool,
+                    activation=activation,
+                )
+            else:
+                weights = dual_branch_softmax(
+                    target_logits,
+                    mask_bool,
+                    activation=activation,
+                )
+
+        weights = weights.masked_fill(~mask_bool, 0.0)
+        return weights, output_aux
+
+    @staticmethod
+    def _reshape_phase_aux(
+        values: dict[str, torch.Tensor],
+        *,
+        batch_size: int,
+        phases: int,
+        symbols: int,
+    ) -> dict[str, torch.Tensor]:
+        reshaped: dict[str, torch.Tensor] = {}
+        phase_rows = int(batch_size) * int(phases)
+        for name, value in values.items():
+            if int(value.size(0)) != phase_rows:
+                reshaped[name] = value
+            elif value.dim() == 1:
+                reshaped[name] = value.reshape(batch_size, phases)
+            elif value.dim() == 2 and int(value.size(1)) == int(symbols):
+                reshaped[name] = value.reshape(batch_size, phases, symbols)
+            else:
+                reshaped[name] = value
+        return reshaped
+
+    def postprocess_action_logits(
+        self,
+        action_logits: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        *,
+        output_mode: str | None = None,
+        portfolio_activation: str | None = None,
+        return_parts: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Convert raw action logits into executable action-schema values.
+
+        ``portfolio_output_mode="logits"`` deliberately leaves model forward
+        outputs raw.  Canonical loss/execution code can call this method at the
+        explicit post-processing boundary.  For ``tw_cash`` each phase owns a
+        separate gross budget.  For ``tw_overnight`` the two entry phases share
+        one budget across ``phase * symbol`` while channel 0 becomes an
+        independent per-symbol due-exit fraction in ``[0, 1]``.
+        """
+
+        if self.num_action_channels == 1:
+            if action_logits.dim() != 2:
+                raise ValueError(
+                    "single-target action_logits must have shape [B,S]"
+                )
+            batch_size, symbols = action_logits.shape
+        else:
+            if action_logits.dim() != 3:
+                raise ValueError(
+                    "multi-action action_logits must have shape [B,P,S]"
+                )
+            batch_size, phases, symbols = action_logits.shape
+            if int(phases) != self.num_action_channels:
+                raise ValueError(
+                    f"expected P={self.num_action_channels} action channels, "
+                    f"got {int(phases)}"
+                )
+
+        if mask is None:
+            mask_bool = torch.ones(
+                (int(batch_size), int(symbols)),
+                device=action_logits.device,
+                dtype=torch.bool,
+            )
+        else:
+            expected = (int(batch_size), int(symbols))
+            if tuple(mask.shape) != expected:
+                raise ValueError(
+                    f"expected action mask shape {expected}, got {tuple(mask.shape)}"
+                )
+            mask_bool = mask.to(device=action_logits.device, dtype=torch.bool)
+
+        resolved_mode = normalize_portfolio_output_mode(
+            self.portfolio_output_mode if output_mode is None else output_mode
+        )
+        resolved_activation = normalize_portfolio_activation(
+            self.portfolio_activation
+            if portfolio_activation is None
+            else portfolio_activation
+        )
+
+        if self.num_action_channels == 1:
+            weights, parts = self._postprocess_flat_target_logits(
+                action_logits,
+                mask_bool,
+                output_mode=resolved_mode,
+                portfolio_activation=resolved_activation,
+                return_parts=return_parts,
+            )
+        elif self.execution_mode == "tw_cash":
+            phase_mask = mask_bool[:, None, :].expand(
+                int(batch_size),
+                self.num_action_channels,
+                int(symbols),
+            )
+            flat_weights, flat_parts = self._postprocess_flat_target_logits(
+                action_logits.reshape(
+                    int(batch_size) * self.num_action_channels,
+                    int(symbols),
+                ),
+                phase_mask.reshape(
+                    int(batch_size) * self.num_action_channels,
+                    int(symbols),
+                ),
+                output_mode=resolved_mode,
+                portfolio_activation=resolved_activation,
+                return_parts=return_parts,
+            )
+            weights = flat_weights.reshape(
+                int(batch_size),
+                self.num_action_channels,
+                int(symbols),
+            )
+            parts = self._reshape_phase_aux(
+                flat_parts,
+                batch_size=int(batch_size),
+                phases=self.num_action_channels,
+                symbols=int(symbols),
+            )
+        elif self.execution_mode == "tw_overnight":
+            due_exit_fraction = torch.sigmoid(action_logits[:, 0]).masked_fill(
+                ~mask_bool,
+                0.0,
+            )
+            raw_open_entry = action_logits[:, 1]
+            raw_close_entry = action_logits[:, 2]
+            # A strict one-session cohort cannot be long and short in the same
+            # symbol at two entry events on the same date: netting those orders
+            # would silently create a same-day round trip.  Parameterize one
+            # signed daily direction plus a differentiable OPEN/CLOSE timing
+            # split, then expose the resolved pair through the public P3 ABI.
+            direction_logits = 0.5 * (raw_open_entry + raw_close_entry)
+            close_entry_fraction = torch.sigmoid(
+                raw_close_entry - raw_open_entry
+            )
+            entry_logits = torch.stack(
+                (
+                    direction_logits * (1.0 - close_entry_fraction),
+                    direction_logits * close_entry_fraction,
+                ),
+                dim=1,
+            )
+            entry_mask = mask_bool[:, None, :].expand(
+                int(batch_size),
+                2,
+                int(symbols),
+            )
+            flat_entry_weights, flat_parts = self._postprocess_flat_target_logits(
+                entry_logits.reshape(int(batch_size), 2 * int(symbols)),
+                entry_mask.reshape(int(batch_size), 2 * int(symbols)),
+                output_mode=resolved_mode,
+                portfolio_activation=resolved_activation,
+                return_parts=return_parts,
+            )
+            entry_weights = flat_entry_weights.reshape(
+                int(batch_size),
+                2,
+                int(symbols),
+            )
+            weights = torch.cat(
+                [due_exit_fraction.unsqueeze(1), entry_weights],
+                dim=1,
+            )
+            parts = {}
+            if return_parts:
+                parts = {
+                    "due_exit_fraction": due_exit_fraction,
+                    "entry_gross_exposure": entry_weights.abs().sum(dim=(1, 2)),
+                    "close_entry_fraction": close_entry_fraction.masked_fill(
+                        ~mask_bool,
+                        0.0,
+                    ),
+                    "implicit_entry_cash_weight": (
+                        1.0 - entry_weights.abs().sum(dim=(1, 2))
+                    ).clamp_min(0.0),
+                }
+                for name, value in flat_parts.items():
+                    entry_name = f"entry_{name}"
+                    if value.dim() == 2 and int(value.size(1)) == 2 * int(symbols):
+                        parts[entry_name] = value.reshape(
+                            int(batch_size),
+                            2,
+                            int(symbols),
+                        )
+                    else:
+                        parts[entry_name] = value
+        else:
+            raise AssertionError(
+                f"unhandled multi-action execution mode {self.execution_mode!r}"
+            )
+
+        if return_parts:
+            return weights, parts
+        return weights
+
+    def _multi_action_outputs_from_stock_embeddings(
+        self,
+        z_stock: torch.Tensor,
+        mask_bool: torch.Tensor,
+        aux: dict[str, torch.Tensor],
+        *,
+        temperature: float | torch.Tensor | None = None,
+        return_aux: bool | None = None,
+        return_scores: bool = False,
+    ):
+        z_stock = z_stock.masked_fill(~mask_bool.unsqueeze(-1), 0.0)
+        scores = self.score_head(z_stock).movedim(-1, 1)
+        scores = _sanitize_scores_to_dtype(scores)
+        phase_mask = mask_bool[:, None, :].expand_as(scores)
+        masked_scores = scores.masked_fill(
+            ~phase_mask,
+            finite_mask_fill_value(scores),
+        )
+
+        if temperature is None:
+            temp = masked_scores.new_tensor(self.default_temperature)
+        elif isinstance(temperature, torch.Tensor):
+            temp = temperature.to(
+                device=masked_scores.device,
+                dtype=masked_scores.dtype,
+            )
+        else:
+            temp = masked_scores.new_tensor(float(temperature))
+        temp = torch.clamp(temp, min=0.05)
+
+        centered_scores = scores
+        if self.portfolio_mode == "long_short" and self.center_long_short_logits:
+            first_entry_channel = 1 if self.execution_mode == "tw_overnight" else 0
+            entry_scores = scores[:, first_entry_channel:]
+            entry_mask = phase_mask[:, first_entry_channel:]
+            batch_size, phases, symbols = entry_scores.shape
+            flat_scores = entry_scores.reshape(
+                int(batch_size) * int(phases),
+                int(symbols),
+            )
+            flat_mask = entry_mask.reshape(
+                int(batch_size) * int(phases),
+                int(symbols),
+            )
+            centered_entries = (
+                flat_scores
+                - masked_cross_sectional_mean_finite(flat_scores, flat_mask)
+            ).reshape(int(batch_size), int(phases), int(symbols))
+            if first_entry_channel:
+                centered_scores = torch.cat(
+                    [scores[:, :first_entry_channel], centered_entries],
+                    dim=1,
+                )
+            else:
+                centered_scores = centered_entries
+
+        action_logits = (centered_scores / temp).masked_fill(~phase_mask, 0.0)
+        include_action_aux = bool(
+            return_aux is True
+            or (
+                return_aux is None
+                and self.return_aux
+                and self.return_aux_details
+            )
+        )
+        output_aux: dict[str, torch.Tensor] = {}
+        if self.portfolio_output_mode == "logits":
+            actions = action_logits
+        else:
+            processed = self.postprocess_action_logits(
+                action_logits,
+                mask_bool,
+                output_mode=self.portfolio_output_mode,
+                portfolio_activation=self.portfolio_activation,
+                return_parts=include_action_aux,
+            )
+            if include_action_aux:
+                actions, output_aux = processed
+            else:
+                actions = processed
+
+        if return_scores:
+            return actions, masked_scores
+        if return_aux is True:
+            aux = dict(aux)
+            aux.update(
+                {
+                    "z_stock": z_stock,
+                    "scores": masked_scores,
+                    "score_logits": scores,
+                    "rank_logits": scores,
+                    "centered_score_logits": centered_scores,
+                    "action_logits": action_logits,
+                }
+            )
+            aux.update(output_aux)
+            return actions, masked_scores, aux
+        if return_aux is None and self.return_aux:
+            output = {
+                "weights": actions,
+                "scores": masked_scores,
+                "score_logits": scores,
+                "rank_logits": scores,
+                "centered_score_logits": centered_scores,
+                "action_logits": action_logits,
+            }
+            if self.return_aux_details:
+                aux = dict(aux)
+                aux.update(output)
+                aux.update(output_aux)
+                output["aux"] = aux
+                output.update(aux)
+            return output
+        return actions
+
     def _portfolio_outputs_from_stock_embeddings(
         self,
         z_stock: torch.Tensor,
@@ -1878,6 +2300,15 @@ class TransformerBasePortfolioModel(nn.Module):
         return_aux: bool | None = None,
         return_scores: bool = False,
     ):
+        if self.num_action_channels > 1:
+            return self._multi_action_outputs_from_stock_embeddings(
+                z_stock,
+                mask_bool,
+                aux,
+                temperature=temperature,
+                return_aux=return_aux,
+                return_scores=return_scores,
+            )
 
         if PROFILE_RANGES_ENABLED:
             with profile_range("model.portfolio.mask_z_stock"):

@@ -537,7 +537,7 @@ class ProviderRatePolicy:
 
 
 # The operator contract is intentionally explicit: use the documented
-# instantaneous/sustained ceiling when one exists; otherwise use 8 req/s.
+# instantaneous/sustained ceiling when one exists; otherwise use 10 req/s.
 # Hourly/daily allocations do not imply a lower instantaneous rate.  Those are
 # enforced independently through durable quota cooldowns when the provider
 # reports exhaustion.
@@ -8869,7 +8869,7 @@ def _install_yfinance_http_limiter(runtime: ProviderRuntime) -> None:
 
     A yfinance command can fetch a cookie, mint or refresh a crumb, retry a
     rejected query, and then fetch the requested resource.  Counting that as
-    one request allowed the archive to exceed the operator's 8 req/s Yahoo
+    one request allowed the archive to exceed the operator's 10 req/s Yahoo
     contract even though outer-task telemetry looked correct.  Patch the
     concrete yfinance session class so every Yahoo-host request shares the one
     provider limiter; unrelated curl/requests traffic is left untouched.

@@ -1006,10 +1006,9 @@ def _run(args: argparse.Namespace) -> int:
         if args.mode == "daily" and (
             not canonical_path.is_file()
             or previous_summary.get("baseline_established") is not True
-            or previous_summary.get("coverage_complete") is not True
         ):
             raise RuntimeError(
-                "daily mode requires a coverage-complete rebuild/repair TAIEX baseline"
+                "daily mode requires an established rebuild/repair TAIEX baseline"
             )
 
         if not bool(args.resume):

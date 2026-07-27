@@ -101,6 +101,7 @@ def _read_price_symbol_series(
     *,
     frequency: str | None = "daily",
     alias: str = "price_from_data",
+    price_column: str | None = None,
 ):
     import polars as pl
 
@@ -110,7 +111,10 @@ def _read_price_symbol_series(
     frame = _read_table(path)
     if "date" not in frame.columns:
         return None, None, path
-    price_col = "close" if "close" in frame.columns else "adjclose" if "adjclose" in frame.columns else None
+    if price_column is not None:
+        price_col = price_column if price_column in frame.columns else None
+    else:
+        price_col = "close" if "close" in frame.columns else "adjclose" if "adjclose" in frame.columns else None
     if price_col is None:
         return None, None, path
     selected = frame.with_row_index(_ROW_INDEX_COL).select(
@@ -131,8 +135,15 @@ def _read_price_history_map(
     symbol: str,
     *,
     frequency: str | None = "daily",
+    price_column: str | None = None,
 ) -> tuple[dict[str, float], Path | None]:
-    frame, _, path = _read_price_symbol_series(price_root, symbol, frequency=frequency, alias="price")
+    frame, _, path = _read_price_symbol_series(
+        price_root,
+        symbol,
+        frequency=frequency,
+        alias="price",
+        price_column=price_column,
+    )
     if frame is None:
         return {}, path
     rows = frame.drop_nulls(["date", "price"]).to_dicts()
@@ -459,13 +470,14 @@ def classify_stock_history_action(
     return "HOLD"
 
 
-def _coalesce_stock_history_columns(frame):
+def _coalesce_stock_history_columns(frame, *, execution_mode: str = "naive"):
     import polars as pl
 
     defaults = {
         "shares": pl.lit(None, dtype=pl.Int64),
         "price": pl.lit(None, dtype=pl.Float64),
         "price_from_data": pl.lit(None, dtype=pl.Float64),
+        "exit_price_from_data": pl.lit(None, dtype=pl.Float64),
         "market_value": pl.lit(None, dtype=pl.Float64),
         "holding_ratio_from_holdings": pl.lit(None, dtype=pl.Float64),
         "model_weight": pl.lit(None, dtype=pl.Float64),
@@ -478,23 +490,45 @@ def _coalesce_stock_history_columns(frame):
     if missing_exprs:
         frame = frame.with_columns(missing_exprs)
 
-    return (
+    naive = str(execution_mode).strip().lower() == "naive"
+    has_holdings = pl.col("holding_ratio_from_holdings").is_not_null()
+    has_actual = pl.col("actual_weight").is_not_null()
+    has_model = pl.col("model_weight").is_not_null()
+    signal_target = pl.lit(naive) & ~has_holdings & ~has_actual & has_model
+    prepared = (
         frame.with_columns(
             [
                 pl.coalesce([pl.col("shares"), pl.lit(0)]).cast(pl.Int64).alias("shares"),
                 pl.coalesce([pl.col("price"), pl.col("price_from_data")]).cast(pl.Float64).alias("price"),
-                pl.coalesce([pl.col("market_value"), pl.lit(0.0)]).cast(pl.Float64).alias("market_value"),
+                pl.when(signal_target)
+                .then(None)
+                .otherwise(pl.coalesce([pl.col("market_value"), pl.lit(0.0)]))
+                .cast(pl.Float64)
+                .alias("market_value"),
                 pl.coalesce([pl.col("model_weight"), pl.lit(0.0)]).cast(pl.Float64).alias("model_weight"),
-                pl.coalesce([pl.col("actual_weight"), pl.lit(0.0)]).cast(pl.Float64).alias("actual_weight"),
+                pl.when(signal_target)
+                .then(None)
+                .otherwise(pl.coalesce([pl.col("actual_weight"), pl.lit(0.0)]))
+                .cast(pl.Float64)
+                .alias("actual_weight"),
                 pl.coalesce(
                     [
                         pl.col("holding_ratio_from_holdings"),
                         pl.col("actual_weight"),
+                        pl.col("model_weight") if naive else pl.lit(None),
                         pl.lit(0.0),
                     ]
                 )
                 .cast(pl.Float64)
                 .alias("holding_ratio"),
+                pl.when(has_holdings)
+                .then(pl.lit("holdings"))
+                .when(has_actual)
+                .then(pl.lit("integer_execution"))
+                .when(signal_target)
+                .then(pl.lit("signal_target"))
+                .otherwise(pl.lit("none"))
+                .alias("position_source"),
             ]
         )
         .sort("date")
@@ -508,30 +542,66 @@ def _coalesce_stock_history_columns(frame):
             ]
         )
         .with_columns(
+            pl.when(pl.col("position_source") == "signal_target")
+            .then(pl.col("prev_shares"))
+            .otherwise(pl.col("shares"))
+            .alias("shares")
+        )
+        .with_columns(
             [
                 (pl.col("shares") - pl.col("prev_shares")).alias("share_delta"),
                 (pl.col("holding_ratio") - pl.col("prev_holding_ratio")).alias("holding_ratio_delta"),
                 (pl.col("actual_weight") - pl.col("prev_actual_weight")).alias("actual_weight_delta"),
                 (pl.col("model_weight") - pl.col("prev_model_weight")).alias("model_weight_delta"),
-                pl.when((pl.col("price").is_not_null()) & (pl.col("prev_price").is_not_null()) & (pl.col("prev_price") > 0.0))
-                .then(pl.col("price") / pl.col("prev_price") - 1.0)
+            ]
+        )
+    )
+    if str(execution_mode).strip().lower() == "tw_day_trade":
+        return prepared.with_columns(
+            [
+                pl.col("price").alias("entry_price"),
+                pl.col("exit_price_from_data").alias("exit_price"),
+                pl.when(
+                    pl.col("price").is_not_null()
+                    & pl.col("exit_price_from_data").is_not_null()
+                    & (pl.col("price") > 0.0)
+                )
+                .then(pl.col("exit_price_from_data") / pl.col("price") - 1.0)
                 .otherwise(None)
                 .alias("price_return"),
             ]
-        )
-        .with_columns(
+        ).with_columns(
             [
                 pl.when(pl.col("price_return").is_null())
                 .then(None)
-                .when(pl.col("prev_holding_ratio").abs() < 1e-12)
+                .when(pl.col("holding_ratio").abs() < 1e-12)
                 .then(0.0)
-                .when(pl.col("prev_holding_ratio") > 0.0)
+                .when(pl.col("holding_ratio") > 0.0)
                 .then(pl.col("price_return"))
                 .otherwise(-pl.col("price_return"))
                 .alias("stock_return"),
-                (pl.col("prev_holding_ratio") * pl.col("price_return")).alias("portfolio_contribution"),
+                (pl.col("holding_ratio") * pl.col("price_return")).alias("portfolio_contribution"),
             ]
         )
+    return prepared.with_columns(
+        [
+            pl.when((pl.col("price").is_not_null()) & (pl.col("prev_price").is_not_null()) & (pl.col("prev_price") > 0.0))
+            .then(pl.col("price") / pl.col("prev_price") - 1.0)
+            .otherwise(None)
+            .alias("price_return"),
+        ]
+    ).with_columns(
+        [
+            pl.when(pl.col("price_return").is_null())
+            .then(None)
+            .when(pl.col("prev_holding_ratio").abs() < 1e-12)
+            .then(0.0)
+            .when(pl.col("prev_holding_ratio") > 0.0)
+            .then(pl.col("price_return"))
+            .otherwise(-pl.col("price_return"))
+            .alias("stock_return"),
+            (pl.col("prev_holding_ratio") * pl.col("price_return")).alias("portfolio_contribution"),
+        ]
     )
 
 
@@ -546,12 +616,14 @@ def load_stock_history(
     symbol_names: dict[str, str] | None = None,
     frequency: str | None = "daily",
     price_root: str | Path | None = None,
+    execution_mode: str = "naive",
 ) -> StockHistoryResult:
     root = Path(fold_dir)
     if not root.exists():
         raise FileNotFoundError(root)
 
     frames = []
+    price_frames = []
     source_paths: list[Path] = []
     resolved_symbol: str | None = None
 
@@ -593,16 +665,30 @@ def load_stock_history(
         frames.append(holdings_frame)
         resolved_symbol = resolved_symbol or holdings_symbol
 
+    day_trade = str(execution_mode).strip().lower() == "tw_day_trade"
     price_frame, price_symbol, price_path = _read_price_symbol_series(
         price_root,
         resolved_symbol or symbol,
         frequency=frequency,
+        price_column="open" if day_trade else None,
     )
     if price_path is not None:
         source_paths.append(price_path)
     if price_frame is not None:
-        frames.append(price_frame)
+        price_frames.append(price_frame)
         resolved_symbol = resolved_symbol or price_symbol
+    if day_trade:
+        exit_frame, _, exit_path = _read_price_symbol_series(
+            price_root,
+            resolved_symbol or symbol,
+            frequency=frequency,
+            alias="exit_price_from_data",
+            price_column="close",
+        )
+        if exit_path is not None:
+            source_paths.append(exit_path)
+        if exit_frame is not None:
+            price_frames.append(exit_frame)
 
     returns_frame, returns_path = _read_returns(root, frequency=frequency)
     if returns_path is not None:
@@ -625,10 +711,14 @@ def load_stock_history(
     frame = frames[0]
     for other in frames[1:]:
         frame = frame.join(other, on="date", how="full", coalesce=True)
+    # Quotes enrich a model/execution/return timeline; they must never create
+    # price-only history rows for dates that have not been inferred/settled.
+    for price_data in price_frames:
+        frame = frame.join(price_data, on="date", how="left", coalesce=True)
 
     import polars as pl
 
-    frame = _coalesce_stock_history_columns(frame)
+    frame = _coalesce_stock_history_columns(frame, execution_mode=execution_mode)
     capital = resolve_fold_capital_scale(root, initial_capital=initial_capital, current_capital=current_capital)
     if capital.scale != 1.0:
         frame = frame.with_columns((pl.col("market_value") * capital.scale).alias("market_value"))
@@ -640,6 +730,7 @@ def load_stock_history(
     )
     rows = frame.to_dicts()
     for row in rows:
+        row["execution_mode"] = str(execution_mode)
         row["symbol"] = resolved_symbol
         row["name"] = _symbol_name(symbol_names, resolved_symbol)
         row["action"] = classify_stock_history_action(
