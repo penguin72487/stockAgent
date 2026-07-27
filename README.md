@@ -289,6 +289,13 @@ sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo sn
 cd /root/stockAgent
 mamba activate fintech
 mamba update --all
+
+
+
+mamba activate fintech
+scripts/run_openbb_archive_until_complete.sh
+
+
 # train
 
 cd /root/stockAgent
