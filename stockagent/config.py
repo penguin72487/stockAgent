@@ -10,6 +10,7 @@ from typing import Any, get_args, get_type_hints
 import yaml
 
 from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
     TaiwanFeeSchedule,
     TaiwanMarginShortSchedule,
     normalize_execution_mode,
@@ -38,6 +39,84 @@ FORBIDDEN_SNAPSHOT_ONLY_FEATURE_PATTERNS = (
     "twpub_company_*",
 )
 DAY_TRADE_OPEN_GAP_FEATURE = "next_session_open_gap_logret"
+
+# The first multi-action execution contract is deliberately narrow.  These are
+# the two model families whose final stock scorer has an explicit action-channel
+# axis; every other model still emits one scalar target per symbol.
+_TW_PHASE_HEAD_MODEL_NAMES = frozenset(
+    {
+        "transformer_base_portfolio",
+        "transformer_base_portfolio_model",
+        "flash_transformer_portfolio",
+        "scalable_transformer_portfolio",
+        "multi_axis_transformer_portfolio",
+        "tbp",
+        "financial_transformer",
+        "financial_transformer_model",
+        "financial_token_transformer",
+        "financial_tokenized_transformer",
+    }
+)
+
+# Keep this synchronized with the canonical phase-action boundary in
+# stockagent.training.loss.risk_aware_loss.  Rank/factor/autoencoder objectives
+# need a different label and attribution contract for [T,P,S] actions and must
+# not silently flatten or select one phase.
+_TW_PHASE_RETURN_OBJECTIVES = frozenset(
+    {
+        "log_utility",
+        "log_util",
+        "kelly",
+        "growth",
+        "mean_log_return",
+    }
+)
+
+
+def _normalized_contract_name(value: object) -> str:
+    return str(value).strip().lower().replace("-", "_")
+
+
+def _validate_tw_phase_mode_contract(
+    *,
+    execution_mode: str,
+    model_name: object,
+    loss_type: object,
+    day_trade_open_feature: bool,
+    feature_include: list[str],
+) -> None:
+    """Fail closed before a phase action is interpreted as a scalar target."""
+
+    if execution_mode not in TW_CARRYING_EXECUTION_MODES:
+        return
+
+    if day_trade_open_feature or DAY_TRADE_OPEN_GAP_FEATURE in feature_include:
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} is a strict "
+            "opening-auction phase mode and cannot enable "
+            "data.day_trade_open_feature or include "
+            f"{DAY_TRADE_OPEN_GAP_FEATURE!r}; open[t] is the execution price "
+            "and is unavailable when the opening-auction order is submitted"
+        )
+
+    normalized_model = _normalized_contract_name(model_name)
+    if normalized_model not in _TW_PHASE_HEAD_MODEL_NAMES:
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} requires a model with "
+            "an explicit phase-action head; supported training.model_name "
+            "families are 'transformer_base_portfolio' and "
+            f"'financial_transformer', got {model_name!r}"
+        )
+
+    normalized_objective = _normalized_contract_name(loss_type)
+    if normalized_objective not in _TW_PHASE_RETURN_OBJECTIVES:
+        raise ValueError(
+            f"trading.execution_mode={execution_mode!r} currently supports only "
+            "canonical path-dependent log-utility objectives "
+            f"{sorted(_TW_PHASE_RETURN_OBJECTIVES)}; rank, factor, "
+            "autoencoder, and other scalar-target objectives are not defined "
+            f"for phase actions, got training.loss_type={loss_type!r}"
+        )
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -1687,6 +1766,13 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             )
     _set_dataclass_defaults(trading, TradingConfig)
     trading["execution_mode"] = normalize_execution_mode(trading["execution_mode"])
+    _validate_tw_phase_mode_contract(
+        execution_mode=trading["execution_mode"],
+        model_name=training["model_name"],
+        loss_type=training["loss_type"],
+        day_trade_open_feature=data["day_trade_open_feature"],
+        feature_include=data["feature_include"],
+    )
     if (
         DAY_TRADE_OPEN_GAP_FEATURE in data["feature_include"]
         and trading["execution_mode"] != "tw_day_trade"

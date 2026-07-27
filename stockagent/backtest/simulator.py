@@ -17,7 +17,10 @@ from stockagent.backtest.tw_continuous import (
     run_tw_cash_continuous,
     run_tw_day_trade_continuous,
 )
-from stockagent.backtest.tw_execution import normalize_execution_mode
+from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
+    normalize_execution_mode,
+)
 from stockagent.backtest.tw_integer_execution import (
     TaiwanIntegerBacktestResult,
     TaiwanIntegerState,
@@ -40,12 +43,11 @@ except Exception:  # pragma: no cover - Numba is an acceleration dependency
 INT64_MIN_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).min), 0.0)
 INT64_MAX_FLOAT_SAFE = np.nextafter(float(np.iinfo(np.int64).max + 1), 0.0)
 SCAN_CHUNK_CANDIDATES = (64, 128, 256, 512)
-# v8 replaces data-dependent CUDA assertions in the TW continuous executor
-# with deterministic execution semantics: impossible mandatory exits produce
-# an absorbing account default, invalid day-trade round trips do not open, and
-# pre-existing maintenance deficits release no collateral. Old checkpoints
-# must not silently resume an optimizer trajectory across this return change.
-CANONICAL_BACKTEST_CONTRACT_VERSION = 8
+# v9 adds the causal open/close action ABI for Taiwan T+2 cash execution and
+# the one-session cohort ledger for ``tw_overnight``.  The event order, gross
+# phase fees, recurrent state, and daily return alignment all change, so an
+# older optimizer trajectory must not resume under this contract.
+CANONICAL_BACKTEST_CONTRACT_VERSION = 9
 
 _SCAN_CHUNK_CACHE: dict[tuple, int] = {}
 _SCAN_COMPILED_CACHE: dict[
@@ -2027,6 +2029,93 @@ def _prepare_scan_inputs(
         return eager_runner(weights, tradable_mask, buy_input, sell_input)
 
 
+def _prepare_tw_phase_actions(
+    actions: torch.Tensor,
+    tradable_mask: torch.Tensor,
+    *,
+    execution_mode: str,
+    long_only: bool,
+    gross_leverage: float,
+    min_trade_weight: float,
+    portfolio_activation: str,
+) -> torch.Tensor:
+    """Resolve raw phase logits/requests into the canonical action ABI.
+
+    The last axis is always symbols.  ``tw_cash`` owns an independent gross
+    budget at open and close.  ``tw_overnight`` has one exit-fraction channel
+    plus two entry channels that share a single daily gross budget.  This
+    explicit boundary mirrors the model helper while keeping the canonical
+    executor independent from any particular model class.
+    """
+
+    mode = normalize_execution_mode(execution_mode)
+    if mode not in TW_CARRYING_EXECUTION_MODES:
+        raise ValueError(
+            "_prepare_tw_phase_actions supports tw_cash and tw_overnight only"
+        )
+    expected_channels = 2 if mode == "tw_cash" else 3
+    if actions.dim() != 3 or int(actions.size(1)) != expected_channels:
+        raise ValueError(
+            f"{mode} actions must have shape [T,{expected_channels},S], "
+            f"got {tuple(actions.shape)}"
+        )
+    expected_mask_shape = (int(actions.size(0)), int(actions.size(2)))
+    if tuple(tradable_mask.shape) != expected_mask_shape:
+        raise ValueError(
+            "tradable_mask must have shape [T,S] matching phase actions: "
+            f"{tuple(tradable_mask.shape)} != {expected_mask_shape}"
+        )
+
+    safe = torch.nan_to_num(
+        actions.to(dtype=torch.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    signal_mask = tradable_mask.to(device=safe.device, dtype=torch.bool)
+    gross_budget = _resolve_exposure_budget(gross_leverage)
+
+    if mode == "tw_cash":
+        rows, phases, symbols = safe.shape
+        flat = safe.reshape(int(rows) * int(phases), int(symbols))
+        flat = _normalize_target_weights_torch(
+            flat,
+            long_only=long_only,
+            gross_budget=gross_budget,
+            portfolio_activation=portfolio_activation,
+        )
+        flat = _apply_min_trade_weight_torch(flat, min_trade_weight)
+        return flat.reshape(int(rows), int(phases), int(symbols)).masked_fill(
+            ~signal_mask[:, None, :],
+            0.0,
+        )
+
+    activation_name = normalize_portfolio_activation(portfolio_activation)
+    raw_exit = safe[:, 0]
+    exit_fraction = (
+        raw_exit.clamp(0.0, 1.0)
+        if activation_name == "pre_normalized"
+        else torch.sigmoid(raw_exit)
+    ).masked_fill(~signal_mask, 0.0)
+    rows, _phases, symbols = safe.shape
+    flat_entries = safe[:, 1:].reshape(int(rows), 2 * int(symbols))
+    flat_entries = _normalize_target_weights_torch(
+        flat_entries,
+        long_only=long_only,
+        gross_budget=gross_budget,
+        portfolio_activation=portfolio_activation,
+    )
+    flat_entries = _apply_min_trade_weight_torch(
+        flat_entries,
+        min_trade_weight,
+    )
+    entries = flat_entries.reshape(int(rows), 2, int(symbols)).masked_fill(
+        ~signal_mask[:, None, :],
+        0.0,
+    )
+    return torch.cat((exit_fraction[:, None, :], entries), dim=1)
+
+
 def _vectorized_backtest_torch(
     weights: torch.Tensor,
     future_returns: torch.Tensor,
@@ -2394,6 +2483,7 @@ def run_backtest(
     short_handling_fee_rate: np.ndarray | float = 0.0,
     force_exit_mask: np.ndarray | None = None,
     volume_limit_weights: np.ndarray | None = None,
+    overnight_returns: np.ndarray | None = None,
     execution_mode: str = "naive",
     buy_fee_rates: np.ndarray | None = None,
     sell_fee_rates: np.ndarray | None = None,
@@ -2444,6 +2534,7 @@ def run_backtest(
             short_handling_fee_rate=tensor(short_handling_fee_rate),
             force_exit_mask=tensor(force_exit_mask),
             volume_limit_weights=tensor(volume_limit_weights),
+            overnight_returns=tensor(overnight_returns),
             execution_mode=mode,
             buy_fee_rates=tensor(buy_fee_rates),
             sell_fee_rates=tensor(sell_fee_rates),
@@ -2525,6 +2616,7 @@ def run_backtest_torch(
     initial_weights: torch.Tensor | None = None,
     initial_alive: torch.Tensor | None = None,
     volume_limit_weights: torch.Tensor | None = None,
+    overnight_returns: torch.Tensor | None = None,
     execution_mode: str = "naive",
     buy_fee_rates: torch.Tensor | None = None,
     sell_fee_rates: torch.Tensor | None = None,
@@ -2548,6 +2640,7 @@ def run_backtest_torch(
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
     if mode != "naive":
+        n_symbols = int(weights.size(-1))
         if buy_fee_rates is None or sell_fee_rates is None:
             raise ValueError(
                 f"{mode} requires explicit per-symbol buy_fee_rates and sell_fee_rates"
@@ -2557,7 +2650,7 @@ def run_backtest_torch(
                 device=buy_fee_rates.device,
                 dtype=torch.long,
             )
-            if tuple(active_symbol_indices.shape) != (int(weights.size(1)),):
+            if tuple(active_symbol_indices.shape) != (n_symbols,):
                 raise ValueError("symbol_indices must contain one index per active symbol")
             buy_fee_rates = buy_fee_rates.index_select(0, active_symbol_indices)
             active_symbol_indices_sell = symbol_indices.to(
@@ -2565,17 +2658,17 @@ def run_backtest_torch(
                 dtype=torch.long,
             )
             sell_fee_rates = sell_fee_rates.index_select(0, active_symbol_indices_sell)
-        elif int(buy_fee_rates.numel()) != int(weights.size(1)):
+        elif int(buy_fee_rates.numel()) != n_symbols:
             raise ValueError(
                 "buy_fee_rates length differs from the active symbol dimension; "
                 "symbol_indices is required for compact symbol batches"
             )
-        elif int(sell_fee_rates.numel()) != int(weights.size(1)):
+        elif int(sell_fee_rates.numel()) != n_symbols:
             raise ValueError(
                 "sell_fee_rates length differs from the active symbol dimension; "
                 "symbol_indices is required for compact symbol batches"
             )
-        if mode == "tw_cash" and not long_only:
+        if mode in TW_CARRYING_EXECUTION_MODES and not long_only:
             missing_short_contract = [
                 name
                 for name, value in (
@@ -2587,13 +2680,16 @@ def run_backtest_torch(
             ]
             if missing_short_contract:
                 raise ValueError(
-                    "long/short tw_cash requires explicit point-in-time margin-short "
+                    f"long/short {mode} requires explicit point-in-time margin-short "
                     "eligibility, demonstrated capacity, and initial-margin rates; "
                     "missing " + ", ".join(missing_short_contract)
                 )
-        if mode == "tw_cash" and unresolved_corporate_action_mask is None:
+        if (
+            mode in TW_CARRYING_EXECUTION_MODES
+            and unresolved_corporate_action_mask is None
+        ):
             raise ValueError(
-                "tw_cash requires the receipt-verified official "
+                f"{mode} requires the receipt-verified official "
                 "corporate-action avoidance mask"
             )
         if mode == "tw_day_trade" and day_trade_eligible_mask is None:

@@ -12,7 +12,10 @@ from stockagent.backtest.simulator import (
     _resolve_exposure_budget,
     run_backtest_torch,
 )
-from stockagent.backtest.tw_execution import normalize_execution_mode
+from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
+    normalize_execution_mode,
+)
 from stockagent.models.normalization import DEFAULT_PORTFOLIO_ACTIVATION
 
 
@@ -1024,6 +1027,7 @@ def risk_aware_loss(
     future_log_returns: Tensor,
     tradable_mask: Tensor,
     benchmark_returns: Tensor | None = None,
+    overnight_log_returns: Tensor | None = None,
     can_buy_mask: Tensor | None = None,
     can_sell_mask: Tensor | None = None,
     can_short_open_mask: Tensor | None = None,
@@ -1104,13 +1108,37 @@ def risk_aware_loss(
     _loss_timer_stop("normalize_weights", normalize_start)
 
     prepare_start = _loss_timer_start()
+    mode = normalize_execution_mode(execution_mode)
     execution_returns, returns = _execution_and_safe_returns(
         future_log_returns,
         reference=weights,
-        execution_mode=execution_mode,
+        execution_mode=mode,
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if mode in TW_CARRYING_EXECUTION_MODES:
+        expected_channels = 2 if mode == "tw_cash" else 3
+        if weights.dim() != 3 or int(weights.size(1)) != expected_channels:
+            raise ValueError(
+                f"{mode} requires model actions with shape "
+                f"[T,{expected_channels},S], got {tuple(weights.shape)}"
+            )
+        if objective_norm not in {
+            "log_utility",
+            "log_util",
+            "kelly",
+            "growth",
+            "mean_log_return",
+        }:
+            raise ValueError(
+                f"{mode} currently supports only canonical log-utility "
+                "objectives; phase logits do not have a single unbiased "
+                "cross-sectional rank label"
+            )
+        if overnight_log_returns is None:
+            raise ValueError(
+                f"{mode} requires prior-close-to-open overnight_log_returns"
+            )
     _loss_timer_stop("prepare_inputs", prepare_start)
 
     if objective_norm in {"portfolio_autoencoder", "bottleneck_portfolio_autoencoder", "autoencoder_portfolio"}:
@@ -1414,6 +1442,7 @@ def risk_aware_loss(
         initial_short_sale_collateral=initial_short_sale_collateral,
         initial_short_margin_collateral=initial_short_margin_collateral,
         symbol_indices=symbol_indices,
+        overnight_returns=overnight_log_returns,
     )
     _loss_timer_stop("backtest", backtest_start)
 

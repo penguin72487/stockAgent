@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import Dataset
 
 from stockagent.backtest.tw_execution import (
+    TW_CARRYING_EXECUTION_MODES,
     normalize_execution_mode,
     official_tw_short_initial_margin_rates,
 )
@@ -26,6 +27,86 @@ def execution_feature_lag(execution_mode: str) -> int:
     return 0 if normalize_execution_mode(execution_mode) == "naive" else 1
 
 
+def _dual_session_return_components(
+    panel: PanelData,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split prior-close-to-current-close valuation into two causal phases.
+
+    ``PanelData.raw_close_returns_1d[t]`` is aligned as close[t] to the next
+    reconstructed close mark.  Open/close execution rows instead own the
+    current exchange session, so row ``t`` needs close[t-1] -> open[t] and
+    open[t] -> close[t].  The split below deliberately preserves the raw cash
+    ledger's stale-mark/corporate-action convention: whenever the reconstructed
+    close-to-close return is finite, both components add back to it exactly.
+
+    Missing opening quotes receive a zero overnight component and the complete
+    close-to-close movement is recognized in the close phase.  This is correct
+    for a carried position and open-side masks prohibit fabricating an order.
+    """
+
+    if panel.raw_close_returns_1d is None:
+        raise ValueError(
+            "dual-session Taiwan execution requires "
+            "PanelData.raw_close_returns_1d"
+        )
+    if panel.open_prices is None or panel.intraday_returns is None:
+        raise ValueError(
+            "dual-session Taiwan execution requires PanelData.open_prices and "
+            "PanelData.intraday_returns"
+        )
+    raw_forward = np.asarray(panel.raw_close_returns_1d, dtype=np.float64)
+    opens = np.asarray(panel.open_prices, dtype=np.float64)
+    closes = np.asarray(panel.close_prices, dtype=np.float64)
+    direct_intraday = np.asarray(panel.intraday_returns, dtype=np.float64)
+    expected = panel.tradable_mask.shape
+    if any(
+        values.shape != expected
+        for values in (raw_forward, opens, closes, direct_intraday)
+    ):
+        raise ValueError(
+            "dual-session return inputs must all match tradable_mask [T,S]"
+        )
+
+    rows = int(raw_forward.shape[0])
+    session_total = np.full(expected, np.nan, dtype=np.float64)
+    if rows > 1:
+        session_total[1:] = raw_forward[:-1]
+
+    prior_closes = np.full(expected, np.nan, dtype=np.float64)
+    if rows > 1:
+        prior_closes[1:] = closes[:-1]
+    valid_gap = (
+        np.isfinite(opens)
+        & (opens > 0.0)
+        & np.isfinite(prior_closes)
+        & (prior_closes > 0.0)
+    )
+    opening = np.zeros(expected, dtype=np.float64)
+    opening[valid_gap] = np.log(opens[valid_gap] / prior_closes[valid_gap])
+
+    closing = np.full(expected, np.nan, dtype=np.float64)
+    finite_total = np.isfinite(session_total)
+    closing[finite_total] = session_total[finite_total] - opening[finite_total]
+
+    # The first panel row has no preceding cash mark.  It can still open a new
+    # position and earn the observed open-to-close interval.
+    if rows:
+        opening[0] = 0.0
+        first_direct = np.isfinite(direct_intraday[0])
+        closing[0, first_direct] = direct_intraday[0, first_direct]
+
+    # A fresh incarnation after a reset may have no close-to-close transition
+    # but can still support a same-session entry.  Use only its direct
+    # open-to-close return; no prior position is allowed to bridge the reset.
+    direct_only = ~finite_total & np.isfinite(direct_intraday)
+    closing[direct_only] = direct_intraday[direct_only]
+    opening[direct_only] = 0.0
+    return (
+        opening.astype(np.float32, copy=False),
+        closing.astype(np.float32, copy=False),
+    )
+
+
 class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
@@ -44,6 +125,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if self.lookback <= 0:
             raise ValueError(f"lookback must be positive, got {lookback!r}")
         self.execution_mode = normalize_execution_mode(execution_mode)
+        carrying_execution = self.execution_mode in TW_CARRYING_EXECUTION_MODES
         self.lookback_context = normalize_lookback_context(lookback_context)
         self.short_capacity_limit_enabled = bool(short_capacity_limit_enabled)
         self.tw_corporate_action_mode = str(tw_corporate_action_mode).strip().lower()
@@ -83,13 +165,13 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 raise ValueError(
                     "PanelData exact cash-dividend tensors must match tradable_mask"
                 )
-        if self.execution_mode == "tw_cash" and self.tw_corporate_action_mode == "exact":
+        if carrying_execution and self.tw_corporate_action_mode == "exact":
             if cash_dividend_yield is None:
                 raise ValueError(
                     "exact tw_cash requires a receipt-verified MOPS cash-dividend "
                     "amount/payment archive"
                 )
-        elif self.execution_mode == "tw_cash":
+        elif carrying_execution:
             # Avoid mode needs the full interval beginning at the last close
             # where both a long and short can be flattened. A single exact
             # yield cell at the last cum-right close is insufficient when that
@@ -105,7 +187,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 )
             cash_dividend_yield = None
             cash_dividend_delay = None
-        if self.execution_mode == "tw_cash" and unresolved_corporate_action is None:
+        if carrying_execution and unresolved_corporate_action is None:
             raise ValueError(
                 "tw_cash requires PanelData.unresolved_corporate_action_mask; "
                 "cash positions require receipt-verified official ex-date "
@@ -127,6 +209,10 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 "PanelData.corporate_action_avoidance_mask must match "
                 "tradable_mask shape"
             )
+        overnight_returns = np.zeros(
+            panel.tradable_mask.shape,
+            dtype=np.float32,
+        )
         if self.execution_mode == "tw_day_trade":
             if panel.intraday_returns is None:
                 raise ValueError(
@@ -185,17 +271,30 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     "PanelData.day_trade_can_sell_open_mask must match "
                     "tradable_mask shape"
                 )
-        elif self.execution_mode == "tw_cash":
-            if panel.raw_close_returns_1d is None:
-                raise ValueError(
-                    "tw_cash requires PanelData.raw_close_returns_1d; adjusted "
-                    "total returns cannot value an exact-share cash ledger"
-                )
-            target_returns = np.asarray(panel.raw_close_returns_1d)
+        elif carrying_execution:
+            overnight_returns, target_returns = _dual_session_return_components(
+                panel
+            )
             if target_returns.shape != panel.tradable_mask.shape:
                 raise ValueError(
-                    "PanelData.raw_close_returns_1d must match tradable_mask shape"
+                    "dual-session return components must match tradable_mask shape"
                 )
+            if (
+                panel.day_trade_can_buy_open_mask is None
+                or panel.day_trade_can_sell_open_mask is None
+            ):
+                raise ValueError(
+                    f"{self.execution_mode} requires explicit open-session "
+                    "buy/sell masks; close-session masks cannot be reused"
+                )
+            day_trade_can_buy_open = np.asarray(
+                panel.day_trade_can_buy_open_mask,
+                dtype=bool,
+            )
+            day_trade_can_sell_open = np.asarray(
+                panel.day_trade_can_sell_open_mask,
+                dtype=bool,
+            )
         else:
             target_returns = panel.returns_1d
 
@@ -209,7 +308,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             # point-in-time eligibility gate is visible to the model; the
             # signed open-side fill masks are applied later by the executor.
             tradable = day_trade_eligible.copy()
-        elif self.execution_mode == "tw_cash":
+        elif carrying_execution:
             # The cash signal is committed before session-t close.  Its outer
             # cross-sectional mask may therefore use only the last completed
             # session's known universe, never whether close[t] traded or the
@@ -227,7 +326,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             close_tradable = np.asarray(panel.tradable_mask, dtype=bool)
         else:
             tradable = close_tradable
-        if self.execution_mode == "tw_day_trade":
+        if self.execution_mode == "tw_day_trade" or carrying_execution:
             # A session-t day trade is held from open[t] to close[t].  Its
             # buy-and-hold comparator must cover the same wall-clock session:
             # adjusted close[t-1] to adjusted close[t].  Panel benchmark labels
@@ -424,10 +523,10 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             np.asarray(panel.can_short_open_mask, dtype=bool)
             if panel.can_short_open_mask is not None
             else np.zeros_like(can_sell, dtype=bool)
-            if self.execution_mode == "tw_cash"
+            if carrying_execution
             else can_sell.copy()
         )
-        if self.execution_mode == "tw_cash":
+        if carrying_execution:
             # Eligibility and demonstrated broker inventory are distinct.
             # The default contract requires both; an explicit no-capacity-limit
             # counterfactual keeps the receipt-backed eligibility mask while a
@@ -507,6 +606,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             features = np.ascontiguousarray(features)
         self.features_t = torch.from_numpy(features)
         self.future_log_returns_t = torch.from_numpy(returns)
+        self.overnight_log_returns_t = torch.from_numpy(
+            np.asarray(overnight_returns, dtype=np.float32)
+        )
         self.volume_notional_t: torch.Tensor | None = None
         if bool(include_volume_notional):
             daily_volumes = getattr(panel, "daily_volumes", None)
@@ -607,6 +709,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         sample = {
             "x": self.features_t[start_idx:feature_end],
             "future_log_returns": self.future_log_returns_t[date_idx],
+            "overnight_log_returns": self.overnight_log_returns_t[date_idx],
             "tradable_mask": self.tradable_mask_t[date_idx],
             "can_buy_mask": self.can_buy_mask_t[date_idx],
             "can_sell_mask": self.can_sell_mask_t[date_idx],
@@ -647,6 +750,9 @@ def collate_batch(
         batch = {
             "x": torch.stack([s["x"] for s in samples]),
             "future_log_returns": torch.stack([s["future_log_returns"] for s in samples]),
+            "overnight_log_returns": torch.stack(
+                [s["overnight_log_returns"] for s in samples]
+            ),
             "tradable_mask": torch.stack([s["tradable_mask"] for s in samples]),
             "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
             "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
@@ -706,6 +812,7 @@ def collate_batch(
     batch = {
         "x": _pad_tensor_list("x"),
         "future_log_returns": _pad_tensor_list("future_log_returns"),
+        "overnight_log_returns": _pad_tensor_list("overnight_log_returns"),
         "tradable_mask": _pad_tensor_list("tradable_mask"),
         "can_buy_mask": _pad_tensor_list("can_buy_mask"),
         "can_sell_mask": _pad_tensor_list("can_sell_mask"),

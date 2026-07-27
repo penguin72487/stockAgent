@@ -1850,6 +1850,7 @@ def _loss_from_backtest_result(
 def _evaluated_backtest_loss(
     backtest: BacktestResultTensor,
     future_log_returns: torch.Tensor,
+    overnight_log_returns: torch.Tensor | None,
     tradable_mask: torch.Tensor,
     can_buy_mask: torch.Tensor,
     can_sell_mask: torch.Tensor,
@@ -1879,6 +1880,7 @@ def _evaluated_backtest_loss(
         future_log_returns,
         tradable_mask,
         benchmark_returns=benchmark_returns,
+        overnight_log_returns=overnight_log_returns,
         can_buy_mask=can_buy_mask,
         can_sell_mask=can_sell_mask,
         can_short_open_mask=can_short_open_mask,
@@ -2222,6 +2224,7 @@ def _evaluate_windowed_aux_objective_loss(
     )
     weights_chunks: list[torch.Tensor] = []
     returns_chunks: list[torch.Tensor] = []
+    overnight_return_chunks: list[torch.Tensor] = []
     tradable_chunks: list[torch.Tensor] = []
     buy_chunks: list[torch.Tensor] = []
     sell_chunks: list[torch.Tensor] = []
@@ -2303,6 +2306,7 @@ def _evaluate_windowed_aux_objective_loss(
 
             weights_chunks.append(weights_chunk.float())
             returns_chunks.append(returns_chunk)
+            overnight_return_chunks.append(batch["overnight_log_returns"])
             tradable_chunks.append(mask_chunk)
             buy_chunks.append(batch["can_buy_mask"])
             sell_chunks.append(batch["can_sell_mask"])
@@ -2349,6 +2353,7 @@ def _evaluate_windowed_aux_objective_loss(
 
     weights_all = torch.cat(weights_chunks, dim=0)
     returns_all = torch.cat(returns_chunks, dim=0)
+    overnight_returns_all = torch.cat(overnight_return_chunks, dim=0)
     tradable_all = torch.cat(tradable_chunks, dim=0)
     benchmark_all = torch.cat(benchmark_chunks, dim=0)
     aux_all = dict(aux_static)
@@ -2436,6 +2441,7 @@ def _evaluate_windowed_aux_objective_loss(
         returns_all,
         tradable_all,
         benchmark_returns=benchmark_all,
+        overnight_log_returns=overnight_returns_all,
         can_buy_mask=torch.cat(buy_chunks, dim=0),
         can_sell_mask=torch.cat(sell_chunks, dim=0),
         can_short_open_mask=torch.cat(short_open_chunks, dim=0),
@@ -9160,6 +9166,7 @@ def _combine_datasets_to_windowed(
         features=first.features,
         valid_indices=torch.cat(valid_indices, dim=0),
         future_log_returns=first.future_log_returns,
+        overnight_log_returns=first.overnight_log_returns,
         tradable_mask=first.tradable_mask,
         can_buy_mask=first.can_buy_mask,
         can_sell_mask=first.can_sell_mask,
@@ -9195,6 +9202,7 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             features=split.features,
             valid_indices=split.valid_indices,
             future_log_returns=split.future_log_returns,
+            overnight_log_returns=split.overnight_log_returns,
             tradable_mask=split.tradable_mask,
             can_buy_mask=split.can_buy_mask,
             can_sell_mask=split.can_sell_mask,
@@ -9244,6 +9252,7 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         features=split.features,
         valid_indices=valid_indices,
         future_log_returns=split.future_log_returns,
+        overnight_log_returns=split.overnight_log_returns,
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
@@ -9322,6 +9331,7 @@ def _densify_windowed_training_split_for_panel_slab(
         features=split.features,
         valid_indices=dense_indices,
         future_log_returns=split.future_log_returns,
+        overnight_log_returns=split.overnight_log_returns,
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
@@ -9594,6 +9604,7 @@ def _prepare_windowed_split(
             features=shared_base.features,
             valid_indices=valid_indices,
             future_log_returns=shared_base.future_log_returns,
+            overnight_log_returns=shared_base.overnight_log_returns,
             tradable_mask=shared_base.tradable_mask,
             can_buy_mask=shared_base.can_buy_mask,
             can_sell_mask=shared_base.can_sell_mask,
@@ -9635,6 +9646,10 @@ def _prepare_windowed_split(
         features=_prepare_host_tensor(split.features, pin_memory),
         valid_indices=_prepare_host_tensor(split.valid_indices, pin_memory),
         future_log_returns=_prepare_host_tensor(split.future_log_returns, pin_memory),
+        overnight_log_returns=_prepare_host_tensor(
+            split.overnight_log_returns,
+            pin_memory,
+        ),
         tradable_mask=_prepare_host_tensor(split.tradable_mask, pin_memory),
         can_buy_mask=_prepare_host_tensor(split.can_buy_mask, pin_memory),
         can_sell_mask=_prepare_host_tensor(split.can_sell_mask, pin_memory),
@@ -9722,6 +9737,7 @@ def _windowed_base_tensors(split: WindowedSplitTensors) -> tuple[torch.Tensor | 
         split.short_capacity_shares,
         split.short_margin_rate,
         split.short_capacity_notional,
+        split.overnight_log_returns,
     )
 
 
@@ -9741,6 +9757,7 @@ def _with_windowed_base(
         features=base_tensors[0],
         valid_indices=split.valid_indices,
         future_log_returns=base_tensors[1],
+        overnight_log_returns=base_tensors[20],
         tradable_mask=base_tensors[2],
         can_buy_mask=base_tensors[3],
         can_sell_mask=base_tensors[4],
@@ -9774,6 +9791,7 @@ def _with_windowed_metadata(
         features=split.features,
         valid_indices=metadata_tensors[0],
         future_log_returns=split.future_log_returns,
+        overnight_log_returns=split.overnight_log_returns,
         tradable_mask=split.tradable_mask,
         can_buy_mask=split.can_buy_mask,
         can_sell_mask=split.can_sell_mask,
@@ -9880,6 +9898,7 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
     attrs = (
         "features",
         "future_log_returns",
+        "overnight_log_returns",
         "tradable_mask",
         "can_buy_mask",
         "can_sell_mask",
@@ -9955,6 +9974,7 @@ def _maybe_share_windowed_base_from_cached(
         features=cached_base.features,
         valid_indices=valid_indices,
         future_log_returns=cached_base.future_log_returns,
+        overnight_log_returns=cached_base.overnight_log_returns,
         tradable_mask=cached_base.tradable_mask,
         can_buy_mask=cached_base.can_buy_mask,
         can_sell_mask=cached_base.can_sell_mask,
@@ -10222,6 +10242,7 @@ def _run_eval_backtest_from_weight_buffers(
     timing: TimingBreakdown,
     reset_at_rows: Sequence[int] | None,
     portfolio_activation: str = DEFAULT_PORTFOLIO_ACTIVATION,
+    overnight_log_returns_all: torch.Tensor | None = None,
     volume_notional_all: torch.Tensor | None = None,
     short_capacity_notional_all: torch.Tensor | None = None,
     short_margin_rate_all: torch.Tensor | None = None,
@@ -10238,7 +10259,7 @@ def _run_eval_backtest_from_weight_buffers(
     symbol_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
-    num_symbols = int(weights_all.size(1))
+    num_symbols = int(weights_all.size(-1))
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
@@ -10264,7 +10285,9 @@ def _run_eval_backtest_from_weight_buffers(
     if return_weights_history:
         weights_history_out = torch.empty((total_rows, num_symbols), device=device, dtype=output_dtype)
         requested_weights_history_out: torch.Tensor | None = torch.empty(
-            (total_rows, num_symbols), device=device, dtype=output_dtype
+            (total_rows, *tuple(weights_all.shape[1:])),
+            device=device,
+            dtype=output_dtype,
         )
     else:
         weights_history_out = torch.empty((0, num_symbols), device=device, dtype=output_dtype)
@@ -10326,6 +10349,14 @@ def _run_eval_backtest_from_weight_buffers(
         backtest_prepare_start = time.perf_counter()
         weights_chunk = weights_all[start:end]
         returns_chunk = future_log_returns_all[start:end].to(device=device, non_blocking=non_blocking)
+        overnight_returns_chunk = (
+            None
+            if overnight_log_returns_all is None
+            else overnight_log_returns_all[start:end].to(
+                device=device,
+                non_blocking=non_blocking,
+            )
+        )
         mask_chunk = tradable_mask_all[start:end].to(device=device, non_blocking=non_blocking)
         buy_mask_chunk = can_buy_mask_all[start:end].to(device=device, non_blocking=non_blocking)
         sell_mask_chunk = can_sell_mask_all[start:end].to(device=device, non_blocking=non_blocking)
@@ -10437,6 +10468,12 @@ def _run_eval_backtest_from_weight_buffers(
             int(weights_chunk.size(0)),
             fill_value=False,
         )
+        if overnight_returns_chunk is not None:
+            overnight_returns_chunk = _pad_rows(
+                overnight_returns_chunk,
+                int(weights_chunk.size(0)),
+                fill_value=0.0,
+            )
         force_cover_mask_chunk = _pad_rows(
             force_cover_mask_chunk,
             int(weights_chunk.size(0)),
@@ -10593,6 +10630,7 @@ def _run_eval_backtest_from_weight_buffers(
                     initial_weights=initial_weights_chunk,
                     initial_alive=prev_alive,
                     volume_limit_weights=volume_limit_chunk,
+                    overnight_returns=overnight_returns_chunk,
                     execution_mode=execution_mode,
                     buy_fee_rates=(
                         None if execution_runtime is None else execution_runtime.buy_fee_rates
@@ -12793,6 +12831,9 @@ def _probe_compiled_loss_forward_backward(
             future_log_returns = _all_gather_no_grad(
                 batch["future_log_returns"].contiguous()
             )
+            overnight_log_returns = _all_gather_no_grad(
+                batch["overnight_log_returns"].contiguous()
+            )
             tradable_mask = _all_gather_no_grad(batch["tradable_mask"].contiguous())
             can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
             can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
@@ -12870,6 +12911,7 @@ def _probe_compiled_loss_forward_backward(
         else:
             weights = local_weights
             future_log_returns = batch["future_log_returns"]
+            overnight_log_returns = batch["overnight_log_returns"]
             tradable_mask = batch["tradable_mask"]
             can_buy_mask = batch["can_buy_mask"]
             can_sell_mask = batch["can_sell_mask"]
@@ -12963,6 +13005,7 @@ def _probe_compiled_loss_forward_backward(
                 future_log_returns,
                 tradable_mask,
                 benchmark_returns=benchmark,
+                overnight_log_returns=overnight_log_returns,
                 can_buy_mask=can_buy_mask,
                 can_sell_mask=can_sell_mask,
                 can_short_open_mask=can_short_open_mask,
@@ -13952,6 +13995,7 @@ def _train_epoch_windowed_tensor(
                         batch_ret,
                         batch_mask,
                         benchmark_returns=batch_bench,
+                        overnight_log_returns=batch["overnight_log_returns"],
                         can_buy_mask=batch_buy_mask,
                         can_sell_mask=batch_sell_mask,
                         can_short_open_mask=batch["can_short_open_mask"],
@@ -14402,6 +14446,9 @@ def _train_epoch_windowed_tensor_ddp(
             gather_start = time.perf_counter()
             weights = _all_gather_autograd(local_weights.contiguous())
             future_returns = _all_gather_no_grad(batch["future_log_returns"].contiguous())
+            overnight_returns = _all_gather_no_grad(
+                batch["overnight_log_returns"].contiguous()
+            )
             tradable_mask = _all_gather_no_grad(batch["tradable_mask"].contiguous())
             can_buy_mask = _all_gather_no_grad(batch["can_buy_mask"].contiguous())
             can_sell_mask = _all_gather_no_grad(batch["can_sell_mask"].contiguous())
@@ -14523,6 +14570,7 @@ def _train_epoch_windowed_tensor_ddp(
                     future_returns,
                     tradable_mask,
                     benchmark_returns=benchmark,
+                    overnight_log_returns=overnight_returns,
                     can_buy_mask=can_buy_mask,
                     can_sell_mask=can_sell_mask,
                     can_short_open_mask=can_short_open_mask,
@@ -14987,6 +15035,7 @@ def _run_training_tree_models(
                 _evaluated_backtest_loss(
                     val_bt_t,
                     val_returns,
+                    None,
                     val_masks,
                     val_buy_masks,
                     val_sell_masks,
@@ -15410,6 +15459,7 @@ def _run_inference_tree_models(
             _evaluated_backtest_loss(
                 val_bt_t,
                 val_returns,
+                None,
                 val_masks,
                 val_buy_masks,
                 val_sell_masks,
@@ -15875,6 +15925,7 @@ def _run_inference_neural_models(
                 _evaluated_backtest_loss(
                     val_bt_t,
                     val_returns,
+                    None,
                     val_masks,
                     val_buy_masks,
                     val_sell_masks,
