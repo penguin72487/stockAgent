@@ -16,6 +16,102 @@ Multi-asset Taiwan stock trading research workspace.
 3. Run yearly expanding-window walk-forward validation.
 4. Train GPU-enabled reference models first, then portfolio and RL policies.
 
+## Dataset snapshot sync (desync + Syncthing)
+
+Git synchronizes the code repository. Syncthing synchronizes only the immutable
+desync store at `/srv/stockagent-sync`; do not use Syncthing to synchronize the
+Git working tree or a live dataset directory.
+
+Install the pinned desync release and initialize each machine once. Every
+machine must use a different permanent node ID:
+
+```bash
+cd /path/to/stockAgent
+./scripts/install_desync.sh
+
+# Machine A
+./scripts/run_desync_snapshot.sh init \
+  --sync-root /srv/stockagent-sync \
+  --node-id trainer-a
+
+# Machine B uses trainer-b instead.
+```
+
+Check which complete `tw-public` snapshot currently wins:
+
+```bash
+./scripts/run_desync_snapshot.sh status tw-public \
+  --sync-root /srv/stockagent-sync
+```
+
+Fetch the latest complete snapshot into a read-only training location and save
+an exact pin:
+
+```bash
+./scripts/run_desync_snapshot.sh fetch tw-public \
+  --sync-root /srv/stockagent-sync \
+  --materialized-root /srv/stockagent-snapshots \
+  --pin /srv/stockagent-snapshots/tw-public.pin.json
+```
+
+The command prints the materialized directory. It has the form:
+
+```text
+/srv/stockagent-snapshots/tw-public/<SNAPSHOT_ID>
+```
+
+Inspect the saved pin and verify the materialized tree:
+
+```bash
+jq . /srv/stockagent-snapshots/tw-public.pin.json
+
+snapshot_id="$(
+  jq -r '.manifest.snapshot_id' \
+    /srv/stockagent-snapshots/tw-public.pin.json
+)"
+
+snapshot_path="$(
+  printf '/srv/stockagent-snapshots/tw-public/%s\n' \
+    "$snapshot_id"
+)"
+
+./scripts/run_desync_snapshot.sh verify tw-public \
+  --sync-root /srv/stockagent-sync \
+  --materialized "$snapshot_path"
+```
+
+For resume or reproduction, fetch the pinned snapshot ID explicitly instead of
+resolving `latest` again:
+
+```bash
+snapshot_id="$(
+  jq -r '.manifest.snapshot_id' \
+    /srv/stockagent-snapshots/tw-public.pin.json
+)"
+
+./scripts/run_desync_snapshot.sh fetch tw-public \
+  --snapshot-id "$snapshot_id" \
+  --sync-root /srv/stockagent-sync \
+  --materialized-root /srv/stockagent-snapshots
+```
+
+Publish only from a frozen source directory while downloaders, repair jobs, and
+other writers are stopped:
+
+```bash
+./scripts/run_desync_snapshot.sh publish tw-public \
+  data_tw_public \
+  --sync-root /srv/stockagent-sync \
+  --metadata storage_frequency=daily \
+  --metadata audit=strict
+```
+
+Before training, require the dedicated Syncthing folder
+`stockagent-desync` to be `Up to Date` with zero pending items and zero errors.
+Training and resume jobs must read the pinned materialized path, never the live
+source tree or an implicitly re-resolved latest snapshot. See
+`docs/desync_multiwriter_sync.md` for the consistency and recovery contract.
+
 ## Training
 
 - Install dependencies from `requirements.txt` inside the `fintech` environment.
