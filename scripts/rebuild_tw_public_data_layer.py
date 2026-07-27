@@ -461,7 +461,13 @@ def _probe_daily_yahoo_refresh_symbols(
             flush=True,
         )
         return []
-    symbols = _daily_yahoo_refresh_symbols(summary_path)
+    failure_summary_path = summary_path.with_name(
+        summary_path.name.removesuffix(".summary.json") + ".failed.json"
+    )
+    probe_summary_path = (
+        failure_summary_path if failure_summary_path.is_file() else summary_path
+    )
+    symbols = _daily_yahoo_refresh_symbols(probe_summary_path)
     preview = ",".join(symbols[:20])
     suffix = "..." if len(symbols) > 20 else ""
     print(
@@ -1048,7 +1054,22 @@ def main() -> None:
         )
 
     if not args.skip_symbol_build and args.ohlcv_fallback == "yahoo":
-        yahoo_fallback_dir.mkdir(parents=True, exist_ok=True)
+        yahoo_source_manifest = yahoo_fallback_dir / "symbols.csv"
+        detached_yahoo_archive = (
+            args.mode == "daily"
+            and yahoo_fallback_archive.is_file()
+            and yahoo_fallback_archive.with_suffix(".summary.json").is_file()
+            and yahoo_fallback_archive.with_suffix(".inputs.json").is_file()
+            and not yahoo_source_manifest.is_file()
+        )
+        if detached_yahoo_archive:
+            print(
+                "[tw-data-rebuild] reusing detached immutable Yahoo fallback archive; "
+                "official TWSE/TPEx daily data will advance independently",
+                flush=True,
+            )
+        else:
+            yahoo_fallback_dir.mkdir(parents=True, exist_ok=True)
         yahoo_bootstrap = not any(yahoo_fallback_dir.glob("*_features.parquet"))
         if yahoo_bootstrap:
             yahoo_mode = "download"
@@ -1061,7 +1082,12 @@ def main() -> None:
         else:
             yahoo_mode = "repair"
         daily_yahoo_symbols: list[str] | None = None
-        if args.mode == "daily" and not args.skip_yahoo_download and not args.dry_run:
+        if (
+            args.mode == "daily"
+            and not detached_yahoo_archive
+            and not args.skip_yahoo_download
+            and not args.dry_run
+        ):
             daily_yahoo_symbols = _probe_daily_yahoo_refresh_symbols(
                 _transfer_adjustment_command(
                     args,
@@ -1083,7 +1109,7 @@ def main() -> None:
                 f"{len(daily_yahoo_symbols)}",
                 flush=True,
             )
-        if not args.skip_yahoo_download:
+        if not detached_yahoo_archive and not args.skip_yahoo_download:
             yahoo_command = _python_command(
                 "downloader/download_yahoo_ohlcv.py",
                 "--mode",
@@ -1133,50 +1159,51 @@ def main() -> None:
                         )
                     ),
                 )
-        runner.run(
-            "tw_transfer_adjustment_reference",
-            _transfer_adjustment_command(
-                args,
-                public_dir=public_dir,
-                yahoo_source_dir=yahoo_fallback_dir,
-                output_path=transfer_adjustment_reference,
-            ),
-            outputs=[
-                transfer_adjustment_reference,
-                transfer_adjustment_reference.with_suffix(".summary.json"),
-            ],
-            validate_outputs=lambda: _validate_transfer_adjustment_reference(
-                transfer_adjustment_reference,
-                start=fallback_start,
-                end=requested_end,
-            ),
-        )
-        runner.run(
-            "yahoo_ohlcv_fallback_archive",
-            _python_command(
-                "scripts/build_tw_yahoo_fallback_archive.py",
-                "--input-dir",
-                str(yahoo_fallback_dir),
-                "--official-input-dir",
-                str(public_dir),
-                "--output-path",
-                str(yahoo_fallback_archive),
-                "--start-date",
-                fallback_start.isoformat(),
-                "--end-date",
-                args.end_date,
-                "--workers",
-                str(args.workers),
-                "--transfer-adjustment-reference",
-                str(transfer_adjustment_reference),
-            ),
-            outputs=[
-                yahoo_fallback_archive,
-                yahoo_fallback_archive.with_suffix(".inputs.json"),
-                yahoo_fallback_archive.with_suffix(".summary.json"),
-                yahoo_fallback_archive.with_suffix(".report.csv"),
-            ],
-        )
+        if not detached_yahoo_archive:
+            runner.run(
+                "tw_transfer_adjustment_reference",
+                _transfer_adjustment_command(
+                    args,
+                    public_dir=public_dir,
+                    yahoo_source_dir=yahoo_fallback_dir,
+                    output_path=transfer_adjustment_reference,
+                ),
+                outputs=[
+                    transfer_adjustment_reference,
+                    transfer_adjustment_reference.with_suffix(".summary.json"),
+                ],
+                validate_outputs=lambda: _validate_transfer_adjustment_reference(
+                    transfer_adjustment_reference,
+                    start=fallback_start,
+                    end=requested_end,
+                ),
+            )
+            runner.run(
+                "yahoo_ohlcv_fallback_archive",
+                _python_command(
+                    "scripts/build_tw_yahoo_fallback_archive.py",
+                    "--input-dir",
+                    str(yahoo_fallback_dir),
+                    "--official-input-dir",
+                    str(public_dir),
+                    "--output-path",
+                    str(yahoo_fallback_archive),
+                    "--start-date",
+                    fallback_start.isoformat(),
+                    "--end-date",
+                    args.end_date,
+                    "--workers",
+                    str(args.workers),
+                    "--transfer-adjustment-reference",
+                    str(transfer_adjustment_reference),
+                ),
+                outputs=[
+                    yahoo_fallback_archive,
+                    yahoo_fallback_archive.with_suffix(".inputs.json"),
+                    yahoo_fallback_archive.with_suffix(".summary.json"),
+                    yahoo_fallback_archive.with_suffix(".report.csv"),
+                ],
+            )
 
     if not args.skip_symbol_build:
         symbol_build_command = _python_command(

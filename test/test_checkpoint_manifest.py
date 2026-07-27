@@ -55,6 +55,44 @@ def test_checkpoint_alignment_treats_weight_table_as_authoritative_universe(tmp_
     assert aligned is panel
 
 
+def test_live_alignment_restores_missing_checkpoint_symbols_as_masked_slots(
+    tmp_path: Path,
+) -> None:
+    panel = _panel()
+    fold_dir = tmp_path / "fold_00"
+    fold_dir.mkdir()
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pq.write_table(
+        pa.table(
+            {
+                "date": ["2024-01-02"],
+                "1101": [0.1],
+                "MISSING": [0.0],
+                "2330": [0.2],
+            }
+        ),
+        fold_dir / "daily_weights.parquet",
+    )
+    state_dict = {"symbol_position": torch.zeros((1, 1, 3, 8))}
+
+    aligned = _align_panel_to_state_dict_universe(
+        panel,
+        fold_dir,
+        state_dict,
+        allow_missing_masked=True,
+    )
+
+    assert aligned.symbols == ["1101", "MISSING", "2330"]
+    assert np.array_equal(aligned.features[:, 0], panel.features[:, 0])
+    assert np.array_equal(aligned.features[:, 2], panel.features[:, 1])
+    assert not aligned.tradable_mask[:, 1].any()
+    assert not aligned.alive_mask[:, 1].any()
+    assert np.isnan(aligned.close_prices[:, 1]).all()
+    assert aligned.content_fingerprints is None
+
+
 def _panel() -> PanelData:
     dates = np.arange(
         np.datetime64("2024-01-02"),

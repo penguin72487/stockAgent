@@ -3042,8 +3042,9 @@ def _tw_integer_holdings_records(
         raise ValueError(f"symbols must contain exactly {n_symbols} entries")
     if np.asarray(close_prices).shape != (t_len, n_symbols):
         raise ValueError(f"close_prices must have shape [{t_len}, {n_symbols}]")
+    mode = str(result.final_state.mode)
     open_values: np.ndarray | None = None
-    if result.final_state.mode == "tw_day_trade":
+    if mode == "tw_day_trade":
         if open_prices is None:
             raise ValueError("tw_day_trade holdings records require open_prices")
         open_values = np.asarray(open_prices, dtype=np.float64)
@@ -3088,7 +3089,7 @@ def _tw_integer_holdings_records(
             else float(np.sum(margin_collateral_history[t]))
         )
         nonzero = np.flatnonzero(result.positions[t] != 0)
-        if result.final_state.mode == "tw_cash":
+        if mode == "tw_cash":
             # ``strategy_returns[t]`` already includes close[t] -> the next
             # causal valuation mark, whereas holdings are audited at close[t].
             # A halted holding has no raw execution quote on that row, so derive
@@ -3132,6 +3133,7 @@ def _tw_integer_holdings_records(
                     "integer cash holdings report violates the execution-time "
                     "asset-liability identity"
                 )
+            cash_snapshot_value = free_cash_and_claims
         else:
             assert open_values is not None
             # These are opening executions, not closing holdings.  Use the
@@ -3169,16 +3171,20 @@ def _tw_integer_holdings_records(
                 raise RuntimeError(
                     "integer day-trade opening records disagree with execution weights"
                 )
+            # Synthetic cash at the opening snapshot makes signed stock values
+            # plus cash reconcile exactly to opening NAV. Settlement cash and
+            # T+2 claims remain in the dedicated settlement audit artifact.
+            cash_snapshot_value = execution_nav - float(np.sum(market_values))
         denominator = execution_nav if execution_nav > 0.0 else 1.0
         day_rows = [
             HoldingsRecord(
                 date=date_text[t],
                 symbol="CASH",
-                shares=int(_trunc_to_int64(free_cash_and_claims).item()),
+                shares=int(_trunc_to_int64(cash_snapshot_value).item()),
                 price=1.0,
-                market_value=free_cash_and_claims,
+                market_value=cash_snapshot_value,
                 holding_ratio=(
-                    free_cash_and_claims / denominator if execution_nav > 0.0 else 0.0
+                    cash_snapshot_value / denominator if execution_nav > 0.0 else 0.0
                 ),
                 is_cash=True,
                 record_type="cash",
