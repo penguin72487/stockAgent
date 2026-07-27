@@ -1,0 +1,24 @@
+base_config: tw_day_trade_model_experiments_common.yaml
+
+experiment_name: tw-day-trade-lightgbm-lookback32-v1
+runner:
+  output_dir: artifacts/model_experiments/tw_day_trade/lightgbm
+
+training:
+  model_name: lightgbm
+  multi_gpu_strategy: none
+  enable_torch_compile: false
+  compile_eval_model: false
+  lookback: 32
+  lightgbm:
+    use_gpu: true
+    gpu_device_id: 0
+    n_estimators: 800
+    num_leaves: 63
+    max_depth: -1
+    learning_rate: 0.03
+    subsample: 0.85
+    colsample_bytree: 0.8
+    reg_lambda: 2.0
+    n_jobs: 32
+    random_state: 42
