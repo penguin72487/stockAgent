@@ -212,11 +212,11 @@ def test_all_resolved_experiment_configs_define_matching_financial_transformer()
 
     for path in config_paths:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        if "training" in raw:
+        if "financial_transformer" in raw.get("training", {}):
             assert "financial_transformer" in raw["training"], path
         else:
-            # Thin market variants inherit the complete training contract from
-            # base_config; validate the resolved config below.
+            # Thin market variants may still override unrelated training
+            # scalars while inheriting the complete model contract.
             assert raw.get("base_config"), path
 
         config = load_config(path)

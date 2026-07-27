@@ -43,6 +43,17 @@ def _write_config(tmp_path: Path, trading_overrides: dict[str, object] | None = 
                 "training": {
                     "non_blocking_transfer": True,
                     "model_name": "transformer_base_portfolio",
+                    "loss_type": "log_utility",
+                    # Keep this generic config helper valid for phase-aware
+                    # execution without applying an already-resolved action
+                    # transform twice.
+                    "transformer_base_portfolio": {
+                        "portfolio_output_mode": "logits",
+                    },
+                    "multitask_loss": {
+                        "return_rank_ic_weight": 0.0,
+                        "direction_weight": 0.0,
+                    },
                 },
                 "evaluation": {},
             }
@@ -221,6 +232,7 @@ def test_disabled_short_capacity_limit_allows_missing_capacity_but_not_eligibili
         can_buy_mask=mask.copy(),
         can_sell_mask=mask.copy(),
         can_short_open_mask=mask.copy(),
+        can_short_open_open_mask=mask.copy(),
         unresolved_corporate_action_mask=np.zeros(shape, dtype=np.bool_),
         short_capacity_shares=None,
     )

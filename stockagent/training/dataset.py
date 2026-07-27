@@ -16,12 +16,12 @@ from stockagent.data.walkforward import normalize_lookback_context
 def execution_feature_lag(execution_mode: str) -> int:
     """Return the number of complete sessions available before execution.
 
-    ``naive`` preserves the historical same-row tensor contract.  Both Taiwan
-    execution modes submit a signal for session ``t`` from close-complete rows
-    through ``t-1``: cash orders execute in the session-t closing auction and
-    day trades enter at the session-t open.  An explicitly enabled day-trade
-    opening-gap channel may carry only the already-observed ``open[t]`` quote on
-    that final row; it does not relax the lag for any other feature.
+    ``naive`` preserves the historical same-row tensor contract.  Every
+    exchange-aware Taiwan mode uses close-complete rows through ``t-1``. An
+    explicitly enabled opening-gap channel is stored on the final ``t-1`` row
+    and exposes only ``open[t] / close[t-1]`` to day-trade and carrying heads.
+    The lag remains one because no session-``t`` row, realised close, high/low,
+    or full-session volume enters the feature window.
     """
 
     return 0 if normalize_execution_mode(execution_mode) == "naive" else 1
@@ -168,8 +168,8 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if carrying_execution and self.tw_corporate_action_mode == "exact":
             if cash_dividend_yield is None:
                 raise ValueError(
-                    "exact tw_cash requires a receipt-verified MOPS cash-dividend "
-                    "amount/payment archive"
+                    f"exact {self.execution_mode} requires a receipt-verified "
+                    "MOPS cash-dividend amount/payment archive"
                 )
         elif carrying_execution:
             # Avoid mode needs the full interval beginning at the last close
@@ -182,16 +182,18 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 (cash_dividend_yield > 0.0).any()
             ):
                 raise ValueError(
-                    "avoid tw_cash requires PanelData.corporate_action_avoidance_mask "
-                    "when exact entitlement events are present"
+                    f"avoid {self.execution_mode} requires "
+                    "PanelData.corporate_action_avoidance_mask when exact "
+                    "entitlement events are present"
                 )
             cash_dividend_yield = None
             cash_dividend_delay = None
         if carrying_execution and unresolved_corporate_action is None:
             raise ValueError(
-                "tw_cash requires PanelData.unresolved_corporate_action_mask; "
-                "cash positions require receipt-verified official ex-date "
-                "avoidance transitions"
+                f"{self.execution_mode} requires "
+                "PanelData.unresolved_corporate_action_mask; cash positions "
+                "require receipt-verified official ex-date avoidance "
+                "transitions"
             )
         if (
             unresolved_corporate_action is not None
@@ -526,54 +528,96 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             if carrying_execution
             else can_sell.copy()
         )
+        can_short_open_open = (
+            np.asarray(panel.can_short_open_open_mask, dtype=bool)
+            if panel.can_short_open_open_mask is not None
+            else np.zeros_like(can_sell, dtype=bool)
+        )
+        if can_short_open.shape != panel.tradable_mask.shape:
+            raise ValueError(
+                "PanelData.can_short_open_mask must match tradable_mask shape"
+            )
+        if can_short_open_open.shape != panel.tradable_mask.shape:
+            raise ValueError(
+                "PanelData.can_short_open_open_mask must match "
+                "tradable_mask shape"
+            )
         if carrying_execution:
+            assert day_trade_can_sell_open is not None
+            # The two auctions have distinct point-in-time execution facts.
+            # In particular, never use can_sell (which may include close[t]'s
+            # realized limit state) to decide whether an open[t] short fills.
+            can_short_open = can_short_open & can_sell
+            can_short_open_open = (
+                can_short_open_open & day_trade_can_sell_open
+            )
             # Eligibility and demonstrated broker inventory are distinct.
             # The default contract requires both; an explicit no-capacity-limit
             # counterfactual keeps the receipt-backed eligibility mask while a
             # one-share sentinel preserves tensor shape until the trainer
             # replaces capacity with its non-binding execution value.
             if not self.short_capacity_limit_enabled:
-                can_short_open = can_short_open & can_sell
                 short_capacity_shares = np.where(
-                    can_short_open,
+                    can_short_open | can_short_open_open,
                     np.ones_like(can_sell, dtype=np.int64),
                     np.zeros_like(can_sell, dtype=np.int64),
                 )
             elif short_capacity_shares is None:
                 can_short_open = np.zeros_like(can_sell, dtype=bool)
+                can_short_open_open = np.zeros_like(can_sell, dtype=bool)
             else:
-                can_short_open = (
-                    can_short_open
-                    & can_sell
-                    & (short_capacity_shares > 0)
+                capacity_available = short_capacity_shares > 0
+                can_short_open = can_short_open & capacity_available
+                can_short_open_open = (
+                    can_short_open_open & capacity_available
                 )
-                short_capacity_shares = np.where(
-                    can_short_open,
-                    short_capacity_shares,
-                    0,
-                ).astype(np.int64, copy=False)
         short_capacity_notional: np.ndarray | None = None
         if short_capacity_shares is not None:
-            cash_execution_close = np.asarray(panel.close_prices, dtype=np.float64)
-            if cash_execution_close.shape != panel.tradable_mask.shape:
+            close_prices = np.asarray(panel.close_prices, dtype=np.float64)
+            if close_prices.shape != panel.tradable_mask.shape:
                 raise ValueError(
                     "PanelData.close_prices must match tradable_mask shape"
                 )
-            valid_capacity_price = (
-                (short_capacity_shares > 0)
-                & np.isfinite(cash_execution_close)
-                & (cash_execution_close > 0.0)
+            valid_capacity_price = np.zeros(
+                panel.tradable_mask.shape,
+                dtype=bool,
             )
             capacity_notional_f64 = np.zeros(
                 panel.tradable_mask.shape,
                 dtype=np.float64,
             )
-            np.multiply(
-                short_capacity_shares,
-                cash_execution_close,
-                out=capacity_notional_f64,
-                where=valid_capacity_price,
-            )
+            if carrying_execution:
+                # Both session-t phases size the shared official inventory from
+                # the latest completed mark.  close[t] does not exist when an
+                # open[t] order is chosen, so using it here would leak future
+                # information into the opening capacity ceiling.
+                if panel.num_dates > 1:
+                    reference_prices = close_prices[:-1]
+                    reference_shares = short_capacity_shares[1:]
+                    valid_reference = (
+                        (reference_shares > 0)
+                        & np.isfinite(reference_prices)
+                        & (reference_prices > 0.0)
+                    )
+                    valid_capacity_price[1:] = valid_reference
+                    np.multiply(
+                        reference_shares,
+                        reference_prices,
+                        out=capacity_notional_f64[1:],
+                        where=valid_reference,
+                    )
+            else:
+                valid_capacity_price = (
+                    (short_capacity_shares > 0)
+                    & np.isfinite(close_prices)
+                    & (close_prices > 0.0)
+                )
+                np.multiply(
+                    short_capacity_shares,
+                    close_prices,
+                    out=capacity_notional_f64,
+                    where=valid_capacity_price,
+                )
             valid_capacity_notional = (
                 valid_capacity_price
                 & np.isfinite(capacity_notional_f64)
@@ -594,6 +638,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 & day_trade_eligible
                 & day_trade_can_sell_open
             )
+            can_short_open_open = can_short_open.copy()
         force_short_cover = (
             panel.force_short_cover_mask
             if panel.force_short_cover_mask is not None
@@ -625,8 +670,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     # A fill at today's open or close cannot be sized from the
                     # eventual full-session volume (which includes the closing
                     # auction). Use the last completed session's shares as the
-                    # causal reference and value them at today's execution
-                    # price only to convert the cap into portfolio-weight units.
+                    # causal reference.
                     causal_volumes = np.zeros_like(daily_volumes_arr)
                     causal_volumes[1:] = daily_volumes_arr[:-1]
                     daily_volumes_arr = np.where(
@@ -634,19 +678,60 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                         causal_volumes,
                         0.0,
                     )
-                price_source = (
-                    panel.open_prices
-                    if self.execution_mode == "tw_day_trade"
-                    and panel.open_prices is not None
-                    else panel.close_prices
-                )
+                if carrying_execution:
+                    # Preserve the capacity as prior-close-valued,
+                    # share-equivalent inventory. The dual-session executor
+                    # revalues the same remaining shares at OPEN and CLOSE,
+                    # preventing both close[t] leakage and price-dependent
+                    # over/under-filling across the two auctions.
+                    price_source = np.zeros_like(
+                        panel.close_prices,
+                        dtype=np.float32,
+                    )
+                    price_source[1:] = panel.close_prices[:-1]
+                else:
+                    price_source = (
+                        panel.open_prices
+                        if self.execution_mode == "tw_day_trade"
+                        and panel.open_prices is not None
+                        else panel.close_prices
+                    )
                 prices_arr = np.asarray(price_source, dtype=np.float32)
-                volume_notional = (daily_volumes_arr * prices_arr).astype(np.float32, copy=False)
+                if self.execution_mode == "naive":
+                    volume_notional = (daily_volumes_arr * prices_arr).astype(
+                        np.float32,
+                        copy=False,
+                    )
+                else:
+                    # Taiwan execution must fail closed when either the causal
+                    # share reference or its valuation mark is unavailable.
+                    # In particular, 0 * NaN must remain a zero capacity rather
+                    # than becoming NaN and later being interpreted as an
+                    # unbounded fill ceiling.
+                    valid_notional = (
+                        np.isfinite(daily_volumes_arr)
+                        & (daily_volumes_arr >= 0.0)
+                        & np.isfinite(prices_arr)
+                        & (prices_arr > 0.0)
+                    )
+                    volume_notional = np.zeros_like(
+                        daily_volumes_arr,
+                        dtype=np.float32,
+                    )
+                    np.multiply(
+                        daily_volumes_arr,
+                        prices_arr,
+                        out=volume_notional,
+                        where=valid_notional,
+                    )
             self.volume_notional_t = torch.from_numpy(volume_notional)
         self.tradable_mask_t = torch.from_numpy(tradable)
         self.can_buy_mask_t = torch.from_numpy(can_buy)
         self.can_sell_mask_t = torch.from_numpy(can_sell)
         self.can_short_open_mask_t = torch.from_numpy(can_short_open)
+        self.can_short_open_open_mask_t = torch.from_numpy(
+            can_short_open_open
+        )
         self.short_capacity_shares_t = (
             torch.zeros((), dtype=torch.int64).expand(panel.tradable_mask.shape)
             if short_capacity_shares is None
@@ -714,6 +799,9 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             "can_buy_mask": self.can_buy_mask_t[date_idx],
             "can_sell_mask": self.can_sell_mask_t[date_idx],
             "can_short_open_mask": self.can_short_open_mask_t[date_idx],
+            "can_short_open_open_mask": self.can_short_open_open_mask_t[
+                date_idx
+            ],
             "short_capacity_shares": self.short_capacity_shares_t[date_idx],
             "short_capacity_notional": self.short_capacity_notional_t[date_idx],
             "short_margin_rate": self.short_margin_rate_t[date_idx],
@@ -757,6 +845,9 @@ def collate_batch(
             "can_buy_mask": torch.stack([s["can_buy_mask"] for s in samples]),
             "can_sell_mask": torch.stack([s["can_sell_mask"] for s in samples]),
             "can_short_open_mask": torch.stack([s["can_short_open_mask"] for s in samples]),
+            "can_short_open_open_mask": torch.stack(
+                [s["can_short_open_open_mask"] for s in samples]
+            ),
             "short_capacity_shares": torch.stack(
                 [s["short_capacity_shares"] for s in samples]
             ),
@@ -817,6 +908,9 @@ def collate_batch(
         "can_buy_mask": _pad_tensor_list("can_buy_mask"),
         "can_sell_mask": _pad_tensor_list("can_sell_mask"),
         "can_short_open_mask": _pad_tensor_list("can_short_open_mask"),
+        "can_short_open_open_mask": _pad_tensor_list(
+            "can_short_open_open_mask"
+        ),
         "short_capacity_shares": _pad_tensor_list("short_capacity_shares"),
         "short_capacity_notional": _pad_tensor_list("short_capacity_notional"),
         "short_margin_rate": torch.stack(

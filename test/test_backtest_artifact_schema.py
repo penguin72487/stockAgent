@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from torch import nn
 
-from stockagent.backtest.simulator import BacktestResult
+from stockagent.backtest.simulator import BacktestResult, run_backtest_integer_shares
 from stockagent.backtest.tw_integer_execution import TaiwanIntegerState
 from stockagent.training.trainer import (
     FoldResult,
@@ -99,6 +99,350 @@ def _continuous_result() -> BacktestResult:
     )
 
 
+_PHASE_AUDIT_FIELDS = (
+    "open_weights_history",
+    "close_weights_history",
+    "event_turnovers",
+    "executed_buy_weights",
+    "executed_sell_weights",
+    "executed_long_buy_weights",
+    "executed_long_sell_weights",
+    "executed_short_open_weights",
+    "executed_short_cover_weights",
+)
+
+
+def _phase_result(execution_mode: str) -> BacktestResult:
+    rows, symbols = 3, 2
+    phases = 2 if execution_mode == "tw_cash" else 3
+    weights = np.asarray(
+        [[0.10, 0.20], [0.20, 0.10], [0.15, 0.25]],
+        dtype=np.float32,
+    )
+    requested = (
+        np.arange(rows * phases * symbols, dtype=np.float32).reshape(
+            rows, phases, symbols
+        )
+        / np.float32(100.0)
+    )
+    event_base = (
+        np.arange(rows * 2 * symbols, dtype=np.float32).reshape(
+            rows, 2, symbols
+        )
+        / np.float32(1000.0)
+    )
+    payables = np.asarray(
+        [[0.0, 0.10], [0.10, 0.20], [0.20, 0.30]],
+        dtype=np.float32,
+    )
+    receivables = np.asarray(
+        [[0.0, 0.05], [0.05, 0.10], [0.10, 0.15]],
+        dtype=np.float32,
+    )
+    due = None
+    final_due = None
+    if execution_mode == "tw_overnight":
+        due = np.asarray(
+            [[0.0, 0.0], [0.10, 0.20], weights[-1]],
+            dtype=np.float32,
+        )
+        final_due = weights[-1].copy()
+    return BacktestResult(
+        strategy_returns=np.asarray([0.01, -0.02, 0.03], dtype=np.float32),
+        benchmark_returns=np.asarray([0.0, 0.01, -0.01], dtype=np.float32),
+        turnovers=np.asarray([0.10, 0.20, 0.30], dtype=np.float32),
+        weights_history=weights,
+        execution_mode=execution_mode,
+        settlement_ledger_unit="nav_ratio",
+        requested_weights_history=requested,
+        open_weights_history=np.asarray(
+            [[0.05, 0.10], [0.15, 0.05], [0.10, 0.20]],
+            dtype=np.float32,
+        ),
+        close_weights_history=weights.copy(),
+        event_turnovers=np.asarray(
+            [[0.04, 0.06], [0.08, 0.12], [0.11, 0.19]],
+            dtype=np.float32,
+        ),
+        executed_buy_weights=event_base + np.float32(0.001),
+        executed_sell_weights=event_base + np.float32(0.002),
+        executed_long_buy_weights=event_base + np.float32(0.003),
+        executed_long_sell_weights=event_base + np.float32(0.004),
+        executed_short_open_weights=event_base + np.float32(0.005),
+        executed_short_cover_weights=event_base + np.float32(0.006),
+        due_weights_history=due,
+        cash_history=np.asarray([0.80, 0.75, 0.70], dtype=np.float32),
+        payables_history=payables,
+        receivables_history=receivables,
+        settlement_default=np.zeros(rows, dtype=np.bool_),
+        equity_scale_history=np.asarray([1.00, 0.99, 1.01], dtype=np.float32),
+        short_sale_collateral_history=np.zeros(
+            (rows, symbols), dtype=np.float32
+        ),
+        short_margin_collateral_history=np.zeros(
+            (rows, symbols), dtype=np.float32
+        ),
+        final_weights=weights[-1].copy(),
+        final_due_weights=final_due,
+        final_cash=np.asarray(0.70, dtype=np.float32),
+        final_payables=payables[-1].copy(),
+        final_receivables=receivables[-1].copy(),
+        final_alive=np.asarray(True, dtype=np.bool_),
+        final_equity_scale=np.asarray(1.01, dtype=np.float32),
+        final_short_sale_collateral=np.zeros(symbols, dtype=np.float32),
+        final_short_margin_collateral=np.zeros(symbols, dtype=np.float32),
+    )
+
+
+def _rewrite_npz_without(
+    source: Path,
+    target: Path,
+    *omitted: str,
+    replacements: dict[str, np.ndarray] | None = None,
+) -> None:
+    with np.load(source, allow_pickle=False) as archive:
+        payload = {
+            key: np.asarray(archive[key]).copy()
+            for key in archive.files
+            if key not in set(omitted)
+        }
+    if replacements:
+        payload.update(replacements)
+    np.savez(target, **payload)
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "phases"),
+    [("tw_cash", 2), ("tw_overnight", 3)],
+)
+def test_schema_five_phase_round_trip_and_slice_preserve_complete_audit(
+    tmp_path: Path,
+    execution_mode: str,
+    phases: int,
+) -> None:
+    result = _phase_result(execution_mode)
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    path = tmp_path / f"{execution_mode}.npz"
+
+    _save_backtest_artifact(path, result, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+
+    assert loaded.execution_mode == execution_mode
+    assert loaded.requested_weights_history is not None
+    assert loaded.requested_weights_history.shape == (3, phases, 2)
+    np.testing.assert_array_equal(loaded_dates, dates)
+    for field in (
+        "requested_weights_history",
+        *_PHASE_AUDIT_FIELDS,
+        "due_weights_history",
+        "final_due_weights",
+    ):
+        expected = getattr(result, field)
+        actual = getattr(loaded, field)
+        if expected is None:
+            assert actual is None
+        else:
+            np.testing.assert_array_equal(actual, expected, err_msg=field)
+
+    partial = _slice_backtest_rows(
+        loaded,
+        0,
+        2,
+        preserve_terminal_state=True,
+    )
+    assert partial.requested_weights_history is not None
+    assert partial.requested_weights_history.shape == (2, phases, 2)
+    for field in _PHASE_AUDIT_FIELDS:
+        assert getattr(partial, field).shape[0] == 2
+    assert partial.final_weights is None
+    assert partial.final_due_weights is None
+    if execution_mode == "tw_overnight":
+        assert partial.due_weights_history is not None
+        np.testing.assert_array_equal(
+            partial.due_weights_history,
+            result.due_weights_history[:2],
+        )
+    else:
+        assert partial.due_weights_history is None
+
+    terminal = _slice_backtest_rows(
+        loaded,
+        1,
+        3,
+        preserve_terminal_state=True,
+    )
+    np.testing.assert_array_equal(terminal.final_weights, result.final_weights)
+    if execution_mode == "tw_overnight":
+        np.testing.assert_array_equal(
+            terminal.final_due_weights,
+            result.final_due_weights,
+        )
+    else:
+        assert terminal.final_due_weights is None
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+@pytest.mark.parametrize("missing_field", _PHASE_AUDIT_FIELDS)
+def test_schema_five_phase_artifact_rejects_any_missing_execution_audit(
+    tmp_path: Path,
+    execution_mode: str,
+    missing_field: str,
+) -> None:
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    incomplete = _phase_result(execution_mode)
+    setattr(incomplete, missing_field, None)
+    with pytest.raises(ValueError, match="phase audit|execution audit"):
+        _save_backtest_artifact(
+            tmp_path / f"save-missing-{missing_field}.npz",
+            incomplete,
+            dates,
+        )
+
+    valid_path = tmp_path / f"valid-{missing_field}.npz"
+    broken_path = tmp_path / f"load-missing-{missing_field}.npz"
+    _save_backtest_artifact(valid_path, _phase_result(execution_mode), dates)
+    _rewrite_npz_without(valid_path, broken_path, missing_field)
+    with pytest.raises(ValueError, match="missing phase audit"):
+        _load_backtest_artifact(broken_path)
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "wrong_phases"),
+    [("tw_cash", 3), ("tw_overnight", 2)],
+)
+def test_schema_five_phase_artifact_rejects_wrong_requested_phase_shape(
+    tmp_path: Path,
+    execution_mode: str,
+    wrong_phases: int,
+) -> None:
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    wrong = np.zeros((3, wrong_phases, 2), dtype=np.float32)
+    invalid = _phase_result(execution_mode)
+    invalid.requested_weights_history = wrong
+    with pytest.raises(ValueError, match="requested_weights_history must have shape"):
+        _save_backtest_artifact(tmp_path / "save-wrong-phases.npz", invalid, dates)
+
+    valid_path = tmp_path / "valid-phases.npz"
+    broken_path = tmp_path / "load-wrong-phases.npz"
+    _save_backtest_artifact(valid_path, _phase_result(execution_mode), dates)
+    _rewrite_npz_without(
+        valid_path,
+        broken_path,
+        replacements={"requested_weights_history": wrong},
+    )
+    with pytest.raises(ValueError, match="invalid phase shape"):
+        _load_backtest_artifact(broken_path)
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "event_turnovers",
+        "executed_buy_weights",
+        "executed_sell_weights",
+        "executed_long_buy_weights",
+        "executed_long_sell_weights",
+        "executed_short_open_weights",
+        "executed_short_cover_weights",
+    ],
+)
+def test_schema_five_phase_artifact_rejects_non_open_close_audit_axis(
+    tmp_path: Path,
+    execution_mode: str,
+    field: str,
+) -> None:
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    wrong = (
+        np.zeros((3, 3), dtype=np.float32)
+        if field == "event_turnovers"
+        else np.zeros((3, 3, 2), dtype=np.float32)
+    )
+    invalid = _phase_result(execution_mode)
+    setattr(invalid, field, wrong)
+    with pytest.raises(ValueError, match="OPEN,CLOSE|event"):
+        _save_backtest_artifact(
+            tmp_path / f"save-wrong-{field}.npz",
+            invalid,
+            dates,
+        )
+
+    valid_path = tmp_path / f"valid-{field}.npz"
+    broken_path = tmp_path / f"load-wrong-{field}.npz"
+    _save_backtest_artifact(valid_path, _phase_result(execution_mode), dates)
+    _rewrite_npz_without(
+        valid_path,
+        broken_path,
+        replacements={field: wrong},
+    )
+    with pytest.raises(ValueError, match="OPEN,CLOSE|event"):
+        _load_backtest_artifact(broken_path)
+
+
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
+def test_schema_five_phase_audit_requires_requested_actions(
+    tmp_path: Path,
+    execution_mode: str,
+) -> None:
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    invalid = _phase_result(execution_mode)
+    invalid.requested_weights_history = None
+    with pytest.raises(ValueError, match="requested_weights_history"):
+        _save_backtest_artifact(tmp_path / "save-missing-requested.npz", invalid, dates)
+
+    valid_path = tmp_path / "valid-requested.npz"
+    broken_path = tmp_path / "load-missing-requested.npz"
+    _save_backtest_artifact(valid_path, _phase_result(execution_mode), dates)
+    _rewrite_npz_without(
+        valid_path,
+        broken_path,
+        "requested_weights_history",
+    )
+    with pytest.raises(ValueError, match="requested_weights_history"):
+        _load_backtest_artifact(broken_path)
+
+
+@pytest.mark.parametrize("missing_field", ["due_weights_history", "final_due_weights"])
+def test_schema_five_overnight_requires_due_and_terminal_due_state(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    dates = np.asarray(
+        ["2026-01-02", "2026-01-05", "2026-01-06"],
+        dtype="datetime64[D]",
+    )
+    invalid = _phase_result("tw_overnight")
+    setattr(invalid, missing_field, None)
+    with pytest.raises(ValueError, match="due"):
+        _save_backtest_artifact(
+            tmp_path / f"save-missing-{missing_field}.npz",
+            invalid,
+            dates,
+        )
+
+    valid_path = tmp_path / f"valid-{missing_field}.npz"
+    broken_path = tmp_path / f"load-missing-{missing_field}.npz"
+    _save_backtest_artifact(valid_path, _phase_result("tw_overnight"), dates)
+    _rewrite_npz_without(valid_path, broken_path, missing_field)
+    with pytest.raises(ValueError, match="due"):
+        _load_backtest_artifact(broken_path)
+
+
 def test_integer_backtest_npz_round_trip_preserves_precision_units_and_terminal_state(
     tmp_path: Path,
 ) -> None:
@@ -131,7 +475,7 @@ def test_integer_backtest_npz_round_trip_preserves_precision_units_and_terminal_
         result.final_integer_state.last_weights,  # type: ignore[union-attr]
     )
     with np.load(path, allow_pickle=False) as archive:
-        assert int(archive["artifact_schema_version"].item()) == 4
+        assert int(archive["artifact_schema_version"].item()) == 5
         assert archive["settlement_ledger_unit"].item() == "currency"
         assert int(archive["payable_queue_sessions"].item()) == 2
         assert int(archive["receivable_queue_sessions"].item()) == 2
@@ -179,9 +523,81 @@ def test_schema_four_round_trip_preserves_longer_dividend_receivable_queue(
     assert loaded.final_integer_state.payable_queue.shape == (2,)
     assert loaded.final_integer_state.receivable_queue.shape == (4,)
     with np.load(path, allow_pickle=False) as archive:
-        assert int(archive["artifact_schema_version"].item()) == 4
+        assert int(archive["artifact_schema_version"].item()) == 5
         assert int(archive["payable_queue_sessions"].item()) == 2
         assert int(archive["receivable_queue_sessions"].item()) == 4
+
+
+def test_phase_integer_artifact_reallocates_collateral_off_flat_symbol(
+    tmp_path: Path,
+) -> None:
+    actions = np.zeros((2, 2, 2), dtype=np.float64)
+    actions[0, 1] = [-0.3, -0.3]
+    actions[1, 0] = [0.0, -9.0 / 14.0]
+    actions[1, 1] = [0.0, -9.0 / 14.0]
+    daily = np.ones((2, 2), dtype=np.bool_)
+    prices = np.asarray(
+        [[100.0, 100.0], [150.0, 150.0]],
+        dtype=np.float64,
+    )
+    result, _ = run_backtest_integer_shares(
+        actions,
+        future_returns=np.zeros((2, 2), dtype=np.float64),
+        tradable_mask=daily,
+        can_buy_mask=daily,
+        can_sell_mask=daily,
+        can_short_open_mask=daily,
+        benchmark_returns=np.zeros(2, dtype=np.float64),
+        open_prices=prices,
+        close_prices=prices,
+        execution_mode="tw_cash",
+        portfolio_activation="pre_normalized",
+        long_only=False,
+        buy_fee_rates=np.zeros(2, dtype=np.float64),
+        sell_fee_rates=np.zeros(2, dtype=np.float64),
+        lot_sizes=np.ones(2, dtype=np.int64),
+        short_lot_sizes=np.ones(2, dtype=np.int64),
+        short_margin_rate=np.full((2, 2), 0.9, dtype=np.float64),
+        short_capacity_shares=np.full((2, 2), 10_000, dtype=np.int64),
+        can_short_open_open_mask=daily,
+        day_trade_can_buy_open_mask=daily,
+        day_trade_can_sell_open_mask=daily,
+        unresolved_corporate_action_mask=np.zeros(
+            (2, 2),
+            dtype=np.bool_,
+        ),
+        initial_capital=100_000.0,
+        collect_holdings=False,
+    )
+    assert result.final_integer_state is not None
+    np.testing.assert_array_equal(
+        result.final_integer_state.holdings,
+        [0, -300],
+    )
+    assert result.final_short_sale_collateral is not None
+    assert result.final_short_margin_collateral is not None
+    assert result.final_short_sale_collateral[0] == 0.0
+    assert result.final_short_margin_collateral[0] == 0.0
+
+    path = tmp_path / "phase-collateral.npz"
+    dates = np.asarray(["2026-01-02", "2026-01-05"], dtype="datetime64[D]")
+    _save_backtest_artifact(path, result, dates)
+    loaded, loaded_dates = _load_backtest_artifact(path)
+
+    np.testing.assert_array_equal(loaded_dates, dates)
+    assert loaded.final_integer_state is not None
+    np.testing.assert_array_equal(
+        loaded.final_integer_state.holdings,
+        [0, -300],
+    )
+    np.testing.assert_array_equal(
+        loaded.final_integer_state.short_sale_collateral,
+        result.final_short_sale_collateral,
+    )
+    np.testing.assert_array_equal(
+        loaded.final_integer_state.short_margin_collateral,
+        result.final_short_margin_collateral,
+    )
 
 
 def test_schema_two_integer_artifact_without_state_weights_upgrades_losslessly(
@@ -320,10 +736,13 @@ def test_schema_three_rejects_zero_inference_for_negative_tw_cash_positions(
         )
 
 
+@pytest.mark.parametrize("execution_mode", ["tw_cash", "tw_overnight"])
 def test_settlement_audit_keeps_each_due_session_column_and_declares_units(
     tmp_path: Path,
+    execution_mode: str,
 ) -> None:
     result = _integer_result()
+    result.execution_mode = execution_mode
     result.short_sale_collateral_history = np.asarray(
         [[1.0, 2.0], [3.0, 4.0]], dtype=np.float64
     )
@@ -344,7 +763,7 @@ def test_settlement_audit_keeps_each_due_session_column_and_declares_units(
 
     with base.with_suffix(".csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert rows[0]["execution_mode"] == "tw_cash"
+    assert rows[0]["execution_mode"] == execution_mode
     assert rows[0]["settlement_ledger_unit"] == "currency"
     assert rows[0]["payable_t_plus_1"] == "0.0"
     assert float(rows[0]["payable_t_plus_2"]) == pytest.approx(12.345678901234)
@@ -357,7 +776,7 @@ def test_settlement_audit_keeps_each_due_session_column_and_declares_units(
     summary = json.loads(
         (tmp_path / "settlement_audit_summary.json").read_text(encoding="utf-8")
     )
-    assert summary["execution_mode"] == "tw_cash"
+    assert summary["execution_mode"] == execution_mode
     assert summary["settlement_ledger_unit"] == "currency"
     assert summary["payable_queue_sessions"] == 2
     assert summary["receivable_queue_sessions"] == 2

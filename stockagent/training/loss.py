@@ -364,6 +364,7 @@ def factor_generalization_loss(
     worst_fraction: float = 0.25,
     regime_up_threshold: float = 0.002,
     regime_down_threshold: float = -0.002,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Train scores as a stable, tradable cross-sectional characteristic factor."""
     weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
@@ -454,6 +455,11 @@ def factor_generalization_loss(
         can_short_open_mask=(
             can_short_open_mask.to(dtype=torch.bool, device=weights.device)
             if can_short_open_mask is not None
+            else None
+        ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(dtype=torch.bool, device=weights.device)
+            if can_short_open_open_mask is not None
             else None
         ),
         force_short_cover_mask=(
@@ -627,6 +633,7 @@ def portfolio_autoencoder_loss(
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
     autoencoder_lambda_latent: float = 0.001,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Portfolio-level objective evaluated by the canonical execution simulator."""
 
@@ -697,6 +704,11 @@ def portfolio_autoencoder_loss(
         can_short_open_mask=(
             can_short_open_mask.to(device=weights.device, dtype=torch.bool)
             if can_short_open_mask is not None
+            else None
+        ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(device=weights.device, dtype=torch.bool)
+            if can_short_open_open_mask is not None
             else None
         ),
         force_short_cover_mask=(
@@ -1027,7 +1039,6 @@ def risk_aware_loss(
     future_log_returns: Tensor,
     tradable_mask: Tensor,
     benchmark_returns: Tensor | None = None,
-    overnight_log_returns: Tensor | None = None,
     can_buy_mask: Tensor | None = None,
     can_sell_mask: Tensor | None = None,
     can_short_open_mask: Tensor | None = None,
@@ -1101,6 +1112,8 @@ def risk_aware_loss(
     autoencoder_lambda_turnover: float = 0.1,
     autoencoder_lambda_concentration: float = 0.01,
     autoencoder_lambda_latent: float = 0.001,
+    overnight_log_returns: Tensor | None = None,
+    can_short_open_open_mask: Tensor | None = None,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1117,13 +1130,20 @@ def risk_aware_loss(
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
     if mode in TW_CARRYING_EXECUTION_MODES:
+        phase_actions = mode == "tw_overnight" or weights.dim() == 3
         expected_channels = 2 if mode == "tw_cash" else 3
-        if weights.dim() != 3 or int(weights.size(1)) != expected_channels:
+        if phase_actions and (
+            weights.dim() != 3 or int(weights.size(1)) != expected_channels
+        ):
             raise ValueError(
                 f"{mode} requires model actions with shape "
                 f"[T,{expected_channels},S], got {tuple(weights.shape)}"
             )
-        if objective_norm not in {
+        if not phase_actions and (mode != "tw_cash" or weights.dim() != 2):
+            raise ValueError(
+                f"{mode} received an unsupported action shape {tuple(weights.shape)}"
+            )
+        if phase_actions and objective_norm not in {
             "log_utility",
             "log_util",
             "kelly",
@@ -1135,7 +1155,7 @@ def risk_aware_loss(
                 "objectives; phase logits do not have a single unbiased "
                 "cross-sectional rank label"
             )
-        if overnight_log_returns is None:
+        if phase_actions and overnight_log_returns is None:
             raise ValueError(
                 f"{mode} requires prior-close-to-open overnight_log_returns"
             )
@@ -1150,6 +1170,7 @@ def risk_aware_loss(
             can_buy_mask=can_buy_mask,
             can_sell_mask=can_sell_mask,
             can_short_open_mask=can_short_open_mask,
+            can_short_open_open_mask=can_short_open_open_mask,
             force_short_cover_mask=force_short_cover_mask,
             force_exit_mask=force_exit_mask,
             sample_mask=sample_mask,
@@ -1195,6 +1216,7 @@ def risk_aware_loss(
             can_buy_mask=can_buy_mask,
             can_sell_mask=can_sell_mask,
             can_short_open_mask=can_short_open_mask,
+            can_short_open_open_mask=can_short_open_open_mask,
             force_short_cover_mask=force_short_cover_mask,
             force_exit_mask=force_exit_mask,
             sample_mask=sample_mask,
@@ -1406,6 +1428,11 @@ def risk_aware_loss(
         can_short_open_mask=(
             can_short_open_mask.to(dtype=torch.bool, device=weights.device)
             if can_short_open_mask is not None
+            else None
+        ),
+        can_short_open_open_mask=(
+            can_short_open_open_mask.to(dtype=torch.bool, device=weights.device)
+            if can_short_open_open_mask is not None
             else None
         ),
         force_short_cover_mask=(

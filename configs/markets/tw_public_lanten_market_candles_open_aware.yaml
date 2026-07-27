@@ -1,8 +1,8 @@
 base_config: tw_public_lanten_market_candles.yaml
 
-# Open-aware day-trade experiment.  This is intentionally a new checkpoint
-# schema/root: the inherited close-complete model has 98 features, while this
-# model has one additional causal feature available at the opening auction.
+# Open-aware day-trade experiment. The base carrying model now shares the same
+# 99-feature causal current-open schema, but this distinct execution objective
+# and action head still require their own checkpoint root.
 experiment_name: tw-financial-transformer-candles-snapshot-safe99-open-aware-gross-tw-day-trade-2014plus-v1-dual5090
 
 runner:
